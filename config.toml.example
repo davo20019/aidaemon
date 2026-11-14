@@ -175,6 +175,8 @@ working_memory_cap = 50
 # encryption_key = "${AIDAEMON_ENCRYPTION_KEY}"
 # upgrade_backups = 2               # Snapshots kept in backups/ next to the database, one written
 #                                   # when a new aidaemon version first starts on it (0 = off)
+# sqlite_cache_mib = 64             # Total SQLite page cache (MiB) across all connections;
+#                                   # lower for small devices, raise on machines with RAM to spare
 
 # Long-term memory for agent turns. "daemon" (default) is the built-in memory
 # in the state database; "sdk" uses the aidaemon-memory crate (build with

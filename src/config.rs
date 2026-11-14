@@ -818,6 +818,11 @@ pub struct StateConfig {
     /// `0` turns it off.
     #[serde(default = "default_upgrade_backups")]
     pub upgrade_backups: usize,
+    /// Total SQLite page cache in MiB, shared across the database's pooled
+    /// connections. Larger keeps more of the database decoded in memory;
+    /// smaller suits low-memory devices. Each connection gets at least 1 MiB.
+    #[serde(default = "default_sqlite_cache_mib")]
+    pub sqlite_cache_mib: u32,
     /// Context window management (trimming, summarization, progressive facts).
     #[serde(default)]
     pub context_window: ContextWindowConfig,
@@ -922,6 +927,7 @@ impl fmt::Debug for StateConfig {
             .field("daily_token_budget", &self.daily_token_budget)
             .field("retention", &self.retention)
             .field("upgrade_backups", &self.upgrade_backups)
+            .field("sqlite_cache_mib", &self.sqlite_cache_mib)
             .field("context_window", &self.context_window)
             .finish()
     }
@@ -938,6 +944,7 @@ impl Default for StateConfig {
             daily_token_budget: None,
             retention: RetentionConfig::default(),
             upgrade_backups: default_upgrade_backups(),
+            sqlite_cache_mib: default_sqlite_cache_mib(),
             context_window: ContextWindowConfig::default(),
         }
     }
@@ -945,6 +952,10 @@ impl Default for StateConfig {
 
 fn default_upgrade_backups() -> usize {
     2
+}
+
+fn default_sqlite_cache_mib() -> u32 {
+    aidaemon_runtime::state::DEFAULT_CACHE_MIB
 }
 
 fn default_db_path() -> String {

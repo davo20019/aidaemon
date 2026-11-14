@@ -43,7 +43,7 @@ pub async fn open_daemon_state(
         config.state.working_memory_cap,
         config.state.encryption_key.as_deref(),
         embeddings,
-        StoreOptions::DAEMON,
+        StoreOptions::DAEMON.with_cache_mib(config.state.sqlite_cache_mib),
     )
     .await
 }

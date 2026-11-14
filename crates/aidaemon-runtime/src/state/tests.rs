@@ -5250,3 +5250,39 @@ async fn only_rendered_memory_counts_as_recalled() {
     assert_eq!(updated[0].recall_count, 1);
     assert!(updated[0].last_recalled_at.is_some());
 }
+
+/// The configured total cache is split across the pool: every connection
+/// gets its share, and a setting too small to split still leaves 1 MiB each.
+#[tokio::test]
+async fn sqlite_cache_mib_is_split_across_pooled_connections() {
+    async fn cache_sizes(cache_mib: u32) -> Vec<i64> {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteStateStore::open(
+            db_file.path().to_str().unwrap(),
+            100,
+            None,
+            Arc::new(EmbeddingService::deterministic()),
+            StoreOptions::SCRATCH.with_cache_mib(cache_mib),
+        )
+        .await
+        .unwrap();
+        // Hold several connections at once so each answers for itself.
+        let mut held = Vec::new();
+        let mut sizes = Vec::new();
+        for _ in 0..3 {
+            let mut conn = store.pool().acquire().await.unwrap();
+            let size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+                .fetch_one(&mut *conn)
+                .await
+                .unwrap();
+            sizes.push(size);
+            held.push(conn);
+        }
+        sizes
+    }
+
+    // 640 MiB over 10 connections: 64 MiB each.
+    assert_eq!(cache_sizes(640).await, vec![-65536; 3]);
+    // 0 MiB: the 1 MiB floor.
+    assert_eq!(cache_sizes(0).await, vec![-1024; 3]);
+}

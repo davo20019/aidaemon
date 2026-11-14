@@ -144,21 +144,47 @@ impl Journal {
     }
 }
 
+/// Connections in the store's pool. Each keeps its own page cache.
+const POOL_CONNECTIONS: u32 = 10;
+
+/// Total page cache, across all pooled connections, when the caller does not
+/// choose one.
+pub const DEFAULT_CACHE_MIB: u32 = 64;
+
 /// What a caller decides when it opens a [`SqliteStateStore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreOptions {
     pub journal: Journal,
+    /// Total SQLite page cache in MiB, split evenly across the pool's
+    /// connections. Every connection fills its own cache, so this is the
+    /// ceiling the caches reach together, not a per-connection size.
+    pub cache_mib: u32,
 }
 
 impl StoreOptions {
     /// The daemon's own database.
     pub const DAEMON: Self = Self {
         journal: Journal::Wal,
+        cache_mib: DEFAULT_CACHE_MIB,
     };
     /// A throwaway database a test opens and drops.
     pub const SCRATCH: Self = Self {
         journal: Journal::Delete,
+        cache_mib: DEFAULT_CACHE_MIB,
     };
+
+    /// These options with a total page cache of `cache_mib` MiB.
+    pub const fn with_cache_mib(self, cache_mib: u32) -> Self {
+        Self { cache_mib, ..self }
+    }
+
+    /// The `cache_size` pragma value for one pooled connection: negative
+    /// means KiB to SQLite. At least 1 MiB per connection, so a tiny or zero
+    /// setting still leaves a working cache.
+    fn per_connection_cache_pragma(self) -> String {
+        let kib = (u64::from(self.cache_mib) * 1024 / u64::from(POOL_CONNECTIONS)).max(1024);
+        format!("-{kib}")
+    }
 }
 
 impl SqliteStateStore {
@@ -213,8 +239,8 @@ impl SqliteStateStore {
             // app crashes, only loses the very last transaction on an OS/power crash,
             // and avoids an fsync on every commit (the dominant write cost under FULL).
             .synchronous(SqliteSynchronous::Normal)
-            // Larger page cache (negative = KiB, so 64 MiB) keeps hot tables resident.
-            .pragma("cache_size", "-65536")
+            // Each connection's share of the configured total page cache.
+            .pragma("cache_size", options.per_connection_cache_pragma())
             // Memory-mapped reads (256 MiB) cut syscall overhead on read-heavy paths.
             .pragma("mmap_size", "268435456")
             // Keep temp B-trees (ORDER BY / GROUP BY spills) in RAM instead of on disk.
@@ -242,7 +268,7 @@ impl SqliteStateStore {
         }
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(10)
+            .max_connections(POOL_CONNECTIONS)
             .acquire_timeout(std::time::Duration::from_secs(30))
             .connect_with(opts)
             .await?;
