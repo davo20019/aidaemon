@@ -10,9 +10,6 @@ A self-hosted AI agent that runs on your machine and talks to you on Telegram, S
 
 I built this because I wanted to control my computer from my phone, from anywhere. Send a message on Telegram, and it runs a command, checks a log, deploys something, or researches a topic — then replies with the result. I also wanted it to run on cheap hardware: a Raspberry Pi, an old laptop, a $5/month VPS.
 
-<!-- TODO: Add a GIF/screenshot showing a Telegram conversation with aidaemon doing something cool -->
-<!-- ![Demo](docs/assets/demo.gif) -->
-
 ## What makes it different
 
 - **It's yours** — runs on your machine, your API keys, your data. Nothing goes to a third party beyond the LLM API calls you choose to make.
@@ -57,6 +54,11 @@ Telegram owners can also run `/terminal [agent] [working_dir]` to launch the hos
 40+ built-in tools including terminal execution, file operations, git, web browser (headless Chrome), web search, HTTP requests with auth profiles, and MCP server integration. Tools declare their risk level — read-only operations run freely, side effects require approval.
 
 Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude, Gemini, Codex, Aider — auto-discovered).
+
+`manage_api` onboards an API from its OpenAPI spec or GraphQL schema and derives a safe verification probe from it (GraphQL reuses introspection when no `verify_url` is given). Credentials stay in the OS keychain by default, or in the configured `.env` file when `AIDAEMON_NO_KEYCHAIN=1`.
+
+### Computer use (macOS)
+Built with `--features computer_use-macos`, the agent can operate native macOS apps: it reads an app's accessibility tree, takes a screenshot, and clicks, types and scrolls to finish a task. It is off by default: build with the feature and enable it in config. Setup and permissions: [COMPUTER_USE_MACOS.md](COMPUTER_USE_MACOS.md).
 
 ### Memory
 SQLite-backed persistent memory with vector embeddings (AllMiniLML6V2). Background consolidation extracts durable facts from conversations. Semantic episode recall is the coarse discovery layer; `search_history` adds authorized FTS5 search over exact retained user/assistant messages, anchored context, task bookends, and signed forward/backward paging. Exact recall follows `state.retention.messages_days` (90 by default; `0` opts into permanent active-database history), independently of short-lived diagnostic events. Database encrypted at rest by default.
@@ -383,18 +385,46 @@ For external APIs, the built-in auth flow is:
 
 `learn_api` now prefers OpenAPI/Swagger when available, crawls multiple docs pages on the same host when needed, discovers linked specs from docs, bundles remote OpenAPI `$ref` documents, and can switch to GraphQL schema introspection when a GraphQL endpoint is available.
 
-`manage_api` can now auto-derive a safe verification probe from a learned OpenAPI spec, and for GraphQL onboarding it can reuse introspection as the verification probe when you didn’t provide a separate `verify_url`.
+## Build your own agent (SDK)
 
-Both paths keep secrets in the keychain by default, or in the configured `.env` file when `AIDAEMON_NO_KEYCHAIN=1`.
+The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every SDK crate shares one version (0.20.0); the public-contract crates are semver-checked in CI.
+
+The SDK is not on crates.io yet, so depend on the repository:
+
+```toml
+[dependencies]
+aidaemon-sdk = { git = "https://github.com/davo20019/aidaemon" }
+```
+
+```rust
+use aidaemon_sdk::prelude::*;
+
+/// Today's weather for a city.
+#[tool(read_only)]
+async fn forecast(city: String) -> String {
+    format!("{city}: 21°C and sunny")
+}
+
+let agent = preset("weather")
+    .provider_from_env() // ANTHROPIC_API_KEY or OPENAI_API_KEY
+    .instructions("Answer in one sentence.")
+    .tool(Forecast)
+    .build()
+    .await?;
+let outcome = agent.run("cli:me", "Weather in Lisbon?").await?;
+```
+
+Try it without an API key: `cargo run -p aidaemon-sdk --example quickstart --features testing`. Other examples cover sub-agents, approvals, scheduled workers, your own channel, resuming after a crash and a coding agent ([crates/aidaemon-sdk/examples](crates/aidaemon-sdk/examples)). Guide: [docs.aidaemon.ai](https://docs.aidaemon.ai/).
 
 ## Building from Source
 
 ```bash
-cargo build --release                              # standard build
-cargo build --release --features "slack,discord"    # with Slack and Discord
-cargo build --release --features "browser"          # with headless Chrome
-cargo test                                          # run tests
+cargo build --release                                   # default build
+cargo build --release --features computer_use-macos     # add macOS computer use
+cargo test                                              # run tests
 ```
+
+The default build includes Slack, Discord, the headless browser, database encryption, the Docker execution backend, the terminal bridge and OpenTelemetry export (`otel`).
 
 See [CLAUDE.md](CLAUDE.md) for architecture details, module map, and contributor guidance.
 
