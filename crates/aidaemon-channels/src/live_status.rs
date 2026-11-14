@@ -35,11 +35,12 @@ pub struct CardView<'a> {
     pub helpers: Vec<(HelperView, Option<Duration>)>,
     /// The turn's own current step and how long it has run.
     pub activity: Option<(&'a Step, Duration)>,
-    /// The turn finished itself work a failed helper left: its measured
-    /// time.
-    /// The request finished in the turn after its helpers: what the
-    /// runtime measured ([`finished_block`]).
-    pub finished: Option<&'a str>,
+    /// The work the turn finished itself after a helper ended, as the
+    /// runtime measured and worded it ("Finished by me after the helper:
+    /// …" and its measured line).
+    pub by_me: Option<&'a str>,
+    /// The request's total once the turn finished after its helpers.
+    pub request_total: Option<&'a str>,
 }
 
 impl CardView<'_> {
@@ -75,12 +76,18 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
     // step, so its line is the card's one line for it (live 2026-11-13: a
     // background shell loop showed "Run your shell loop…" from its plan
     // above "Running in the background: a shell loop" for the same work).
-    if let Some(plan) = view
+    let shown_plan = view
         .plan
-        .filter(|plan| plan.steps > 1 || view.helpers.is_empty())
-    {
+        .filter(|plan| plan.steps > 1 || view.helpers.is_empty());
+    let plan_shown = shown_plan.is_some();
+    if let Some(plan) = shown_plan {
         parts.push(plan_with_run_header(plan, &current));
     }
+    // The turn's own finishing work is the latest attempt at the steps of
+    // the helper it took over from: said once, on that helper's line, with
+    // its measured time.
+    let by_turn = superseded.contains(&Some(SupersededBy::Turn));
+    let by_me_measured = view.by_me.and_then(|line| line.trim().split_once('\n'));
     for (index, (helper, elapsed)) in view.helpers.iter().enumerate() {
         match superseded[index] {
             Some(SupersededBy::Run(later)) => parts.push(superseded_line(
@@ -89,15 +96,21 @@ pub fn render_card(view: &CardView<'_>) -> Option<String> {
                 records[later],
                 attempts[later],
             )),
-            Some(SupersededBy::Turn) => parts.push(finished_by_turn_line(helper, attempts[index])),
+            Some(SupersededBy::Turn) => {
+                let line = finished_by_turn_line(helper, attempts[index]);
+                parts.push(match by_me_measured {
+                    Some((_, measured)) => format!("{line}\n{}", measured.trim()),
+                    None => line,
+                })
+            }
             None => parts.push(helper_block(helper, *elapsed)),
         }
     }
     if let Some(total) = since_request_total(&view.helpers, &current) {
         parts.push(total);
     }
-    if let Some(finished) = view.finished {
-        parts.push(finished.trim().to_string());
+    if let Some(finished) = finished_lines(view, plan_shown, by_turn) {
+        parts.push(finished);
     }
     let done = view
         .plan
@@ -179,6 +192,28 @@ fn since_request_total(
         last.words.trim(),
         ended.join(", ")
     ))
+}
+
+/// The card's lines under the runs for a request the turn finished after
+/// its helpers. A plan on the card is the one list its header counts: the
+/// turn's own work there is a step's latest attempt, said on the line of the
+/// helper it took the step over from (`by_turn`), never a second ✅ row the
+/// count leaves out (live 2026-11-14: "Finished · 3 of 3 done" over four
+/// rows, the fourth "✅ Finished by me after the helper"). Work after a
+/// helper that no step names stays a measured note, without a step's mark.
+/// With no plan, [`finished_block`].
+fn finished_lines(view: &CardView<'_>, plan_shown: bool, by_turn: bool) -> Option<String> {
+    if !plan_shown {
+        return finished_block(view.by_me, view.request_total);
+    }
+    let lines: Vec<String> = [view.by_me.filter(|_| !by_turn), view.request_total]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The card's lines for a request the turn finished after its helpers:
@@ -276,9 +311,10 @@ pub struct LiveStatus {
     /// Each helper's record, in the order they started, and when its
     /// latest step began.
     helpers: Vec<(HelperView, std::time::Instant)>,
-    /// The measured time of work the turn finished itself after a helper
-    /// failed.
-    finished: Option<String>,
+    /// The work the turn finished itself after a helper, and the
+    /// request's total, as the runtime measured them.
+    by_me: Option<String>,
+    request_total: Option<String>,
     /// What the surface shows now, so an unchanged card is never re-sent.
     shown: Option<String>,
     edit_supported: bool,
@@ -309,7 +345,8 @@ impl LiveStatus {
             checklist: None,
             activity: None,
             helpers: Vec::new(),
-            finished: None,
+            by_me: None,
+            request_total: None,
             shown: None,
             edit_supported: true,
         }
@@ -328,7 +365,8 @@ impl LiveStatus {
                 .then_some(self.activity.as_ref())
                 .flatten()
                 .map(|(step, since)| (step, since.elapsed())),
-            finished: self.finished.as_deref(),
+            by_me: self.by_me.as_deref(),
+            request_total: self.request_total.as_deref(),
         }
     }
 
@@ -368,7 +406,8 @@ impl LiveStatus {
             }
             StatusUpdate::Helper(helper) => self.note_helper(helper.clone()),
             StatusUpdate::Finished { by_me, total } => {
-                self.finished = finished_block(by_me.as_deref(), total.as_deref());
+                self.by_me = by_me.clone();
+                self.request_total = total.clone();
                 true
             }
             _ => false,
@@ -583,14 +622,15 @@ mod tests {
         let mut helper = HelperView::running("Drupal install", false, None);
         helper.phase = RunPhase::Succeeded;
         helper.took = Some("Took 7m 54s (12:30:56 PM to 12:38:50 PM ET).".into());
-        let finished = finished_block(
-            Some("Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM to 12:41:34 PM ET)."),
-            Some("Answer sent 11m 10s after your request (12:30:24 PM to 12:41:34 PM ET)."),
-        )
-        .unwrap();
         let card = render_card(&CardView {
             helpers: vec![(helper, None)],
-            finished: Some(&finished),
+            by_me: Some(
+                "Finished by me after the helper: Drupal install\nTook 2m 44s (12:38:50 PM to \
+                 12:41:34 PM ET).",
+            ),
+            request_total: Some(
+                "Answer sent 11m 10s after your request (12:30:24 PM to 12:41:34 PM ET).",
+            ),
             ..Default::default()
         })
         .unwrap();
@@ -1310,7 +1350,10 @@ mod tests {
         let card = render_card(&CardView {
             plan: Some(&done),
             helpers: helpers.clone(),
-            finished: Some("✅ Finished by me after the helper: Install Drupal"),
+            by_me: Some(
+                "Finished by me after the helper: Install Drupal\nTook 1m (11:38:00 AM to \
+                 11:39:00 AM ET).",
+            ),
             ..Default::default()
         })
         .unwrap();
@@ -1321,9 +1364,15 @@ mod tests {
             "{card}"
         );
         assert!(
-            card.contains("Install Drupal: first try didn't finish; I finished it myself"),
+            card.contains(
+                "Install Drupal: first try didn't finish; I finished it myself\nTook 1m \
+                 (11:38:00 AM to 11:39:00 AM ET)."
+            ),
             "{card}"
         );
+        // The header counts the plan's rows, and the turn's work is one of
+        // them, not a row of its own.
+        assert!(!card.contains("Finished by me"), "{card}");
 
         // Its step still open: the helper's end stands.
         let open = plan("✅ Done · 2 of 3 steps\n\n✅ a\n\n⏹️ b\n\n✅ c", 3);
