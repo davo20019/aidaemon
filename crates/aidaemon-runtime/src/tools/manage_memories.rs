@@ -117,28 +117,6 @@ impl ManageMemoriesTool {
             preview
         );
     }
-
-    fn parse_ts(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::parse_from_rfc3339(ts)
-            .ok()
-            .map(|d| d.with_timezone(&chrono::Utc))
-    }
-
-    fn format_age(ts: &str) -> String {
-        let Some(dt) = Self::parse_ts(ts) else {
-            return "n/a".to_string();
-        };
-        let age = chrono::Utc::now() - dt;
-        if age.num_days() > 0 {
-            format!("{}d ago", age.num_days())
-        } else if age.num_hours() > 0 {
-            format!("{}h ago", age.num_hours())
-        } else if age.num_minutes() > 0 {
-            format!("{}m ago", age.num_minutes())
-        } else {
-            "just now".to_string()
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -366,7 +344,7 @@ impl ManageMemoriesTool {
                 );
                 for g in &goals {
                     let notes_count = g.progress_notes.as_ref().map_or(0, |n| n.len());
-                    let age_str = Self::format_age(&g.created_at);
+                    let age_str = aidaemon_tools::duration_format::format_age(&g.created_at);
                     let compatibility =
                         if owner_session.is_some_and(|session| g.session_id == session) {
                             "mandate-source compatible"
