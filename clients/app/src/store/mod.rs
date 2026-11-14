@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, Command, CommandResult, Event, ServerFrame, SystemStatus,
-    TaskSummary, TurnStatus,
+    Approval, ApprovalDecision, Command, CommandResult, Event, MemoryItem, MidRun, SearchHit,
+    ServerFrame, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
@@ -65,6 +65,78 @@ pub enum Page {
     Conversation,
     /// How the daemon itself is doing.
     System,
+    /// What the daemon remembers about the owner.
+    Memory,
+}
+
+/// How much of each turn's tool use the transcript shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivityMode {
+    /// None: replies only.
+    Hidden,
+    /// One line per turn ("Used 4 tools"), opened on demand.
+    #[default]
+    Collapsed,
+    /// Every tool, in order.
+    Expanded,
+}
+
+impl ActivityMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "hidden" => Self::Hidden,
+            "expanded" => Self::Expanded,
+            _ => Self::Collapsed,
+        }
+    }
+
+    /// The next mode, as the palette cycles them.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Hidden => Self::Collapsed,
+            Self::Collapsed => Self::Expanded,
+            Self::Expanded => Self::Hidden,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Collapsed => "one line per reply",
+            Self::Expanded => "every tool",
+        }
+    }
+}
+
+/// A search of every conversation, as last asked.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SearchRead {
+    #[default]
+    Idle,
+    Loading(String),
+    Ready {
+        query: String,
+        hits: Vec<SearchHit>,
+    },
+    Failed(String),
+}
+
+/// The Memory page's data, as last read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum MemoryRead {
+    #[default]
+    NotYet,
+    Loading,
+    Ready(Vec<MemoryItem>),
+    Failed(String),
 }
 
 /// The System page's data, as last read.
@@ -84,6 +156,7 @@ pub enum SystemRead {
 const DRAFT_KEY: &str = "aidaemon.draft.";
 const PINS_KEY: &str = "aidaemon.pins";
 const OPEN_KEY: &str = "aidaemon.open";
+const ACTIVITY_KEY: &str = "aidaemon.activity";
 
 /// Where commands go: the link of this platform.
 pub type Outbox = Box<dyn Fn(String, Command)>;
@@ -134,6 +207,13 @@ pub struct Store {
     pins: Signal<BTreeSet<String>>,
     /// Seconds, for elapsed times (advanced by the shell while work runs).
     tick: Signal<u64>,
+    activity_mode: Signal<ActivityMode>,
+    /// The daemon's slash commands, for the composer's completions.
+    commands: Signal<Vec<SlashCommand>>,
+    search: Signal<SearchRead>,
+    search_request: Stored<Option<String>>,
+    memories: Signal<MemoryRead>,
+    memories_request: Stored<Option<String>>,
 }
 
 /// The draft key of a conversation not started yet.
@@ -168,6 +248,12 @@ impl Store {
             finished: signal(None),
             pins: signal(BTreeSet::new()),
             tick: signal(0),
+            activity_mode: signal(ActivityMode::default()),
+            commands: signal(Vec::new()),
+            search: signal(SearchRead::Idle),
+            search_request: stored(None),
+            memories: signal(MemoryRead::NotYet),
+            memories_request: stored(None),
         }
     }
 
@@ -181,6 +267,9 @@ impl Store {
             .map(str::to_owned)
             .collect();
         self.pins.set(pins);
+        if let Some(mode) = nsh_core::storage::Storage::get_item(ACTIVITY_KEY) {
+            self.activity_mode.set(ActivityMode::from_key(&mode));
+        }
         if let Some(open) =
             nsh_core::storage::Storage::get_item(OPEN_KEY).filter(|id| !id.is_empty())
         {
@@ -213,6 +302,10 @@ impl Store {
                 Line::User { text, at_ms, .. } => ("You", text, at_ms),
                 Line::Assistant { text, at_ms } => ("AIdaemon", text, at_ms),
                 Line::Note { text } => ("Note", text, 0),
+                Line::Activity { tools, .. } => {
+                    out.push_str(&format!("\n_Used: {}_\n", tools.join(", ")));
+                    continue;
+                }
             };
             let when = if at > 0 {
                 format!(
@@ -295,6 +388,9 @@ impl Store {
                     cursor: None,
                     limit: 200,
                 });
+                self.send(Command::ListCommands);
+                // Today's token use, for the sidebar.
+                self.refresh_system();
                 // A reconnect may have missed history: ask again on view.
                 self.fetched.with(BTreeSet::clear);
                 if let Some(id) = self.selected.get_untracked() {
@@ -355,6 +451,75 @@ impl Store {
             {
                 self.system_request.replace(None);
                 self.system.set(SystemRead::Failed(error.message.clone()));
+                return;
+            }
+            ServerFrame::Ack {
+                result: CommandResult::Commands { commands },
+                ..
+            } => {
+                self.commands.set(commands.clone());
+                return;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::SearchResults { hits },
+            } if self
+                .search_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.search_request.replace(None);
+                if let SearchRead::Loading(query) = self.search.get_untracked() {
+                    self.search.set(SearchRead::Ready {
+                        query,
+                        hits: hits.clone(),
+                    });
+                }
+                return;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Memories { memories },
+            } if self
+                .memories_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.memories_request.replace(None);
+                self.memories.set(MemoryRead::Ready(memories.clone()));
+                return;
+            }
+            ServerFrame::Ack {
+                result: CommandResult::Forgotten { memory_id },
+                ..
+            } => {
+                let id = memory_id.clone();
+                self.memories.update(|m| {
+                    if let MemoryRead::Ready(items) = m {
+                        items.retain(|item| item.id != id);
+                    }
+                });
+                self.say("Forgotten");
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .search_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.search_request.replace(None);
+                self.search.set(SearchRead::Failed(error.message.clone()));
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .memories_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.memories_request.replace(None);
+                self.memories.set(MemoryRead::Failed(error.message.clone()));
                 return;
             }
             ServerFrame::Event {
@@ -428,6 +593,169 @@ impl Store {
 
     pub fn system(&self) -> SystemRead {
         self.system.get()
+    }
+
+    /// Tokens used today (the owner's day), when the System read has them.
+    pub fn today_tokens(&self) -> Option<u64> {
+        let SystemRead::Ready { status, .. } = self.system.get() else {
+            return None;
+        };
+        // Usage days are UTC dates; the latest one is today's or nothing.
+        let today = crate::ui::time::utc_date(now_ms());
+        Some(
+            status
+                .usage
+                .iter()
+                .filter(|d| d.day == today)
+                .map(|d| d.input_tokens + d.output_tokens)
+                .sum(),
+        )
+    }
+
+    // ----- The Memory page ---------------------------------------------------
+
+    pub fn open_memory(&self) {
+        self.close_panes();
+        self.page.set(Page::Memory);
+        self.refresh_memories();
+    }
+
+    pub fn refresh_memories(&self) {
+        if self.memories_request.with(|r| r.is_some()) {
+            return;
+        }
+        if !matches!(self.memories.get_untracked(), MemoryRead::Ready(_)) {
+            self.memories.set(MemoryRead::Loading);
+        }
+        let id = self.send(Command::ListMemories);
+        self.memories_request.replace(Some(id));
+    }
+
+    pub fn memories(&self) -> MemoryRead {
+        self.memories.get()
+    }
+
+    pub fn forget_memory(&self, id: &str) {
+        self.send(Command::ForgetMemory {
+            memory_id: id.to_owned(),
+        });
+    }
+
+    // ----- Search of every conversation ------------------------------------
+
+    /// Ask the daemon for messages matching `query`, in every conversation.
+    pub fn search_messages(&self, query: &str) {
+        let query = query.trim().to_owned();
+        if query.chars().count() < 2 {
+            self.search_request.replace(None);
+            self.search.set(SearchRead::Idle);
+            return;
+        }
+        self.search.set(SearchRead::Loading(query.clone()));
+        let id = self.send(Command::SearchMessages { query, limit: 30 });
+        self.search_request.replace(Some(id));
+    }
+
+    pub fn search(&self) -> SearchRead {
+        self.search.get()
+    }
+
+    // ----- How replies show their work --------------------------------------
+
+    pub fn activity_mode(&self) -> ActivityMode {
+        self.activity_mode.get()
+    }
+
+    pub fn cycle_activity_mode(&self) {
+        let next = self.activity_mode.get_untracked().next();
+        self.activity_mode.set(next);
+        let _ = nsh_core::storage::Storage::set_item(ACTIVITY_KEY, next.key());
+        self.say(format!("Tool activity: {}", next.label()));
+    }
+
+    // ----- Composer helpers -------------------------------------------------
+
+    /// Slash commands completing the draft: it starts with `/` and has no
+    /// space yet. At most eight, in the daemon's order.
+    pub fn slash_matches(&self) -> Vec<SlashCommand> {
+        let draft = self.draft();
+        let Some(typed) = draft.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if typed.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let typed = typed.to_lowercase();
+        self.commands.with(|commands| {
+            commands
+                .iter()
+                .filter(|c| c.name.starts_with(&typed) && c.name != typed)
+                .take(8)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Put `/name ` in the composer.
+    pub fn complete_slash(&self, name: &str) {
+        self.set_draft(format!("/{name} "));
+    }
+
+    /// The last thing the owner said in `session`.
+    pub fn last_user_text(&self, session: &str) -> Option<String> {
+        self.lines(session)
+            .into_iter()
+            .rev()
+            .find_map(|line| match line {
+                Line::User { text, .. } => Some(text),
+                _ => None,
+            })
+    }
+
+    /// With an empty composer, bring back the last message sent here.
+    pub fn recall_last(&self) -> bool {
+        if !self.draft().is_empty() {
+            return false;
+        }
+        let Some(session) = self.selected.get_untracked() else {
+            return false;
+        };
+        match self.last_user_text(&session) {
+            Some(text) => {
+                self.set_draft(text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the last turn of `session` failed or was stopped: Retry
+    /// is offered under it.
+    pub fn can_retry(&self, session: &str) -> bool {
+        !self.is_running(session)
+            && self.state.with(|s| {
+                s.sessions.get(session).is_some_and(|v| {
+                    matches!(v.lines.last(), Some(Line::Note { text }) if text == "Stopped." || text.starts_with("Failed:"))
+                })
+            })
+    }
+
+    /// Send the last message of `session` again.
+    pub fn retry(&self, session: &str) {
+        if let Some(text) = self.last_user_text(session) {
+            self.send(Command::SendMessage {
+                session_id: Some(session.to_owned()),
+                text,
+                attachments: Vec::new(),
+                mid_run: None,
+            });
+        }
+    }
+
+    /// Conversations with an approval waiting.
+    pub fn needs_you(&self, id: &str) -> bool {
+        self.state
+            .with(|s| s.approvals.values().any(|a| a.session_id == id))
     }
 
     // ----- Search, unread, stopping ------------------------------------------
@@ -1027,6 +1355,12 @@ impl Store {
     /// Send the draft of the selected conversation (or start one). A
     /// leading `/` runs a slash command in an existing session.
     pub fn submit(&self) {
+        self.submit_placed(None);
+    }
+
+    /// [`Self::submit`], putting a message sent while the conversation works
+    /// where the owner chose: into the running work, or after it.
+    pub fn submit_placed(&self, mid_run: Option<MidRun>) {
         let key = self.selected.get_untracked();
         let text = self
             .drafts
@@ -1050,6 +1384,7 @@ impl Store {
                     session_id: key.clone(),
                     text,
                     attachments: Vec::new(),
+                    mid_run,
                 });
                 if key.is_none() {
                     self.starting.replace(Some(id));

@@ -277,6 +277,7 @@ pub enum Glyph {
     Pinned,
     System,
     Inbox,
+    Memory,
 }
 
 impl Glyph {
@@ -305,6 +306,7 @@ impl Glyph {
             Self::Pinned => "★",
             Self::System => "◫",
             Self::Inbox => "◆",
+            Self::Memory => "◎",
         }
     }
 }
@@ -495,6 +497,40 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
                 .number_of_lines(1)
                 .text_color(colors::MUTED),
         )
+}
+
+/// A quiet line that opens and closes what is under it: a chevron that
+/// turns, then its label. The owner of `open` renders the content.
+pub fn disclosure(
+    label: impl IntoReactive<SharedString>,
+    open: Signal<bool>,
+) -> nsh_base::ButtonElement {
+    button()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .min_h(px(fit::row() - 6.0))
+        .px_1()
+        .rounded(px(radius::SMALL))
+        .transition_colors()
+        .duration(motion::FAST)
+        .hover(|s| s.bg(colors::HOVER))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .child(
+            text(move || if open.get() { "▾" } else { "▸" })
+                .w(px(fit::icon_slot()))
+                .text_center()
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT)
+                .accessibility_elements_hidden(true),
+        )
+        .child(
+            text(label)
+                .number_of_lines(1)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+        )
+        .on_press(move || open.update(|o| *o = !*o))
 }
 
 /// A short identifier in monospace.

@@ -3,11 +3,12 @@
 //! conversation is the same page with no session yet.
 
 use aidaemon_client_core::state::Line;
+use aidaemon_client_protocol::MidRun;
 use nsh_base::{MarkdownOptions, TextViewLinks, input, text_view};
 use nsh_core::prelude::*;
 
 use super::approvals;
-use crate::store::{Connection, Store};
+use crate::store::{ActivityMode, Connection, Store};
 use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
@@ -21,12 +22,17 @@ enum Row {
     /// The reply being written and what the agent is doing.
     Live,
     Approval(String),
+    /// The tools a reply's turn used, and how many seconds it took.
+    Activity(Vec<String>, u64),
+    /// The last turn failed or was stopped: send its message again.
+    Retry,
 }
 
 impl Row {
     fn key(&self, index: usize) -> String {
         match self {
             Self::Live => "live".into(),
+            Self::Retry => "retry".into(),
             Self::Approval(id) => format!("approval-{id}"),
             Self::Day(label) => format!("day-{label}-{index}"),
             _ => format!("line-{index}"),
@@ -36,12 +42,13 @@ impl Row {
 
 fn rows(store: Store, session: &str) -> Vec<Row> {
     let now = crate::store::now_ms();
+    let mode = store.activity_mode();
     let mut rows: Vec<Row> = Vec::new();
     let mut last_day = None;
     for line in store.lines(session) {
         let at = match &line {
             Line::User { at_ms, .. } | Line::Assistant { at_ms, .. } => *at_ms,
-            Line::Note { .. } => 0,
+            Line::Note { .. } | Line::Activity { .. } => 0,
         };
         if at > 0 {
             let day = ui::time::day(at);
@@ -54,10 +61,14 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             Line::User { text, at_ms, .. } => Row::User(text, at_ms),
             Line::Assistant { text, at_ms } => Row::Assistant(text, at_ms),
             Line::Note { text } => Row::Note(text),
+            Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
+            Line::Activity { tools, secs } => Row::Activity(tools, secs),
         });
     }
     if store.live(session).is_some() {
         rows.push(Row::Live);
+    } else if store.can_retry(session) {
+        rows.push(Row::Retry);
     }
     rows.extend(
         store
@@ -337,6 +348,8 @@ fn transcript_list(
                         Row::Live => 3,
                         Row::Approval(_) => 4,
                         Row::Day(_) => 5,
+                        Row::Activity(..) => 6,
+                        Row::Retry => 7,
                     })
                 })
             });
@@ -373,6 +386,13 @@ fn transcript_list(
                         2 => column.child(note(content)),
                         5 => column.child(day_break(content)),
                         3 => column.child(live(store, session)),
+                        6 => column.child(activity(store, move || {
+                            row.with(|r| match r {
+                                Some(Row::Activity(tools, secs)) => (tools.clone(), *secs),
+                                _ => (Vec::new(), 0),
+                            })
+                        })),
+                        7 => column.child(retry(store, session)),
                         _ => column.child(dynamic(move || {
                             let id = row.with(|r| match r {
                                 Some(Row::Approval(id)) => Some(id.clone()),
@@ -404,6 +424,92 @@ fn transcript_list(
     .follow_end(px(48.0))
     .content_padding_top(px(12.0))
     .content_padding_bottom(px(12.0))
+}
+
+/// What a reply's turn did: one quiet line ("Used 4 tools · 12s") that
+/// opens to every tool in order. The owner's activity mode sets whether it
+/// starts open.
+fn activity(store: Store, data: impl Fn() -> (Vec<String>, u64) + Clone + 'static) -> View {
+    let open = signal(untracked(|| store.activity_mode()) == ActivityMode::Expanded);
+    let summary = {
+        let data = data.clone();
+        move || {
+            let (tools, secs) = data();
+            activity_summary(&tools, secs)
+        }
+    };
+    view()
+        .gap_1()
+        .child(ui::disclosure(summary, open).accessibility_label("Tools this reply used"))
+        .child(when(
+            move || open.get(),
+            move || {
+                let data = data.clone();
+                view().pl(px(22.0)).gap(px(2.0)).child(dynamic(move || {
+                    let (tools, _) = data();
+                    Some(untracked(move || {
+                        let mut list = view().gap(px(2.0));
+                        for (n, tool) in tools.iter().enumerate() {
+                            list = list.child(
+                                view()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(
+                                        text(format!("{}.", n + 1))
+                                            .text_size(px(type_scale::XS))
+                                            .text_color(colors::FAINT),
+                                    )
+                                    .child(ui::code(tool.clone()).text_color(colors::MUTED)),
+                            );
+                        }
+                        list
+                    }))
+                }))
+            },
+        ))
+}
+
+/// "Used 4 tools: read_file ×2, web_search, terminal · 12s".
+fn activity_summary(tools: &[String], secs: u64) -> String {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for tool in tools {
+        match counted.iter_mut().find(|(name, _)| name == tool) {
+            Some((_, n)) => *n += 1,
+            None => counted.push((tool, 1)),
+        }
+    }
+    let names = counted
+        .iter()
+        .take(3)
+        .map(|(name, n)| {
+            if *n > 1 {
+                format!("{name} ×{n}")
+            } else {
+                (*name).to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if counted.len() > 3 { ", …" } else { "" };
+    let count = tools.len();
+    let noun = if count == 1 { "tool" } else { "tools" };
+    let took = match secs {
+        0 => String::new(),
+        1..60 => format!(" · {secs}s"),
+        _ => format!(" · {}m {}s", secs / 60, secs % 60),
+    };
+    format!("Used {count} {noun}: {names}{more}{took}")
+}
+
+/// Under a failed or stopped turn: send its message again.
+fn retry(store: Store, session: String) -> View {
+    view().flex_row().child(ui::btn_icon(
+        Glyph::Retry,
+        "Retry",
+        Variant::Outline,
+        Size::Sm,
+        move || store.retry(&session),
+    ))
 }
 
 /// When a message was said, quietly: "3:42 PM".
@@ -512,10 +618,16 @@ fn live(store: Store, session: String) -> View {
         computed(move || store.live(&session).map(|l| l.streamed).unwrap_or_default())
     };
     let status = computed(move || {
-        store
-            .live(&session)
-            .and_then(|l| l.status)
-            .unwrap_or_else(|| "Working…".into())
+        let live = store.live(&session);
+        let status = live
+            .as_ref()
+            .and_then(|l| l.status.clone())
+            .unwrap_or_else(|| "Working…".into());
+        match live.map(|l| l.tools.len()).unwrap_or(0) {
+            0 => status,
+            1 => format!("{status}  ·  1 tool so far"),
+            n => format!("{status}  ·  {n} tools so far"),
+        }
     });
     view()
         .gap_2()
@@ -540,88 +652,205 @@ fn composer(store: Store, session: Option<String>) -> View {
         nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
     );
     let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
-    view().items_center().px_4().pb_4().pt_2().child(
-        ui::surface()
-            .w_full()
-            .max_w(px(size::COLUMN))
-            .p(px(6.0))
-            .gap_1()
-            .focus_within(|s| s.border_color(colors::ACCENT))
-            .child(
-                input()
-                    .element_ref(&field)
-                    .value(move || store.draft())
-                    .on_change(move |text: &str| store.set_draft(text.to_owned()))
-                    .multiline(true)
-                    // Phones keep Return for new lines; Send sends.
-                    .submit_behavior(if touch {
-                        SubmitBehavior::Newline
-                    } else {
-                        SubmitBehavior::Submit
-                    })
-                    .on_submit(move |_: &str| store.submit())
-                    .auto_focus(true)
-                    .placeholder(move || match store.connection() {
-                        Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
-                        Connection::Connecting | Connection::NeedsPairing => {
-                            "Connecting to the daemon…".to_owned()
-                        }
-                        Connection::Offline { .. } => {
-                            "Offline. Messages send once the daemon is back.".to_owned()
-                        }
-                    })
-                    .placeholder_color(|| color(colors::FAINT))
-                    .caret_color(|| color(colors::ACCENT))
-                    .selection_color(|| color(colors::ACCENT))
-                    .on_content_size_change(move |size: &nsh_core::geometry::Size<Points>| {
-                        height.set(size.height.0.clamp(22.0, 180.0));
-                    })
-                    .h(move || px(height.get() + 16.0))
-                    .px(px(8.0))
-                    .py(px(8.0))
-                    .text_size(px(ui::fit::read()))
-                    .line_height(px(ui::fit::read_lh()))
-                    .text_color(colors::TEXT)
-                    .label("Message"),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        text(move || match (running.get(), touch) {
-                            (true, true) => "Working · Stop is at the top".to_owned(),
-                            (true, false) if terminal => {
-                                format!("Working · Esc or {} stops", key_label("mod+c"))
-                            }
-                            (true, false) => "Working · Esc stops".to_owned(),
-                            (false, true) => String::new(),
-                            // Terminals rarely send Shift+Enter; Alt+Enter
-                            // works in all of them.
-                            (false, false) if terminal => {
-                                format!("Enter to send · {} for a new line", key_label("alt+enter"))
-                            }
-                            (false, false) => {
-                                "Enter to send · Shift+Enter for a new line".to_owned()
+    // While the conversation works, Enter adds the message to the work and
+    // Mod+Enter queues it for after; Up on an empty composer brings back
+    // the last message sent here.
+    on_key_with(
+        "mod+enter",
+        KeyOptions {
+            when: nsh_core::keymap::When::Always,
+            ..KeyOptions::default()
+        },
+        move |_| {
+            if running.get_untracked() {
+                store.submit_placed(Some(MidRun::Queue));
+            } else {
+                store.submit();
+            }
+        },
+    );
+    on_key_with(
+        "up",
+        KeyOptions {
+            when: nsh_core::keymap::When::Always,
+            pass_through: true,
+            ..KeyOptions::default()
+        },
+        move |_| {
+            store.recall_last();
+        },
+    );
+    let slash = computed(move || store.slash_matches());
+    view()
+        .items_center()
+        .px_4()
+        .pb_4()
+        .pt_2()
+        .child(when(
+            move || slash.with(|m| !m.is_empty()),
+            move || slash_list(store, slash),
+        ))
+        .child(
+            ui::surface()
+                .w_full()
+                .max_w(px(size::COLUMN))
+                .p(px(6.0))
+                .gap_1()
+                .focus_within(|s| s.border_color(colors::ACCENT))
+                .child(
+                    input()
+                        .element_ref(&field)
+                        .value(move || store.draft())
+                        .on_change(move |text: &str| store.set_draft(text.to_owned()))
+                        .multiline(true)
+                        // Phones keep Return for new lines; Send sends.
+                        .submit_behavior(if touch {
+                            SubmitBehavior::Newline
+                        } else {
+                            SubmitBehavior::Submit
+                        })
+                        .on_submit(move |_: &str| {
+                            if running.get_untracked() {
+                                store.submit_placed(Some(MidRun::Steer));
+                            } else {
+                                store.submit();
                             }
                         })
-                        .flex_1()
+                        .auto_focus(true)
+                        .placeholder(move || match store.connection() {
+                            Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
+                            Connection::Connecting | Connection::NeedsPairing => {
+                                "Connecting to the daemon…".to_owned()
+                            }
+                            Connection::Offline { .. } => {
+                                "Offline. Messages send once the daemon is back.".to_owned()
+                            }
+                        })
+                        .placeholder_color(|| color(colors::FAINT))
+                        .caret_color(|| color(colors::ACCENT))
+                        .selection_color(|| color(colors::ACCENT))
+                        .on_content_size_change(move |size: &nsh_core::geometry::Size<Points>| {
+                            height.set(size.height.0.clamp(22.0, 180.0));
+                        })
+                        .h(move || px(height.get() + 16.0))
                         .px(px(8.0))
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT),
-                    )
-                    .child(
-                        ui::btn_icon(
-                            Glyph::Send,
-                            "Send",
-                            Variant::Primary,
-                            ui::Size::Sm,
-                            move || store.submit(),
+                        .py(px(8.0))
+                        .text_size(px(ui::fit::read()))
+                        .line_height(px(ui::fit::read_lh()))
+                        .text_color(colors::TEXT)
+                        .label("Message"),
+                )
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            text(move || match (running.get(), touch) {
+                                (true, true) => {
+                                    "Working · Add joins the work, Queue waits".to_owned()
+                                }
+                                (true, false) if terminal => format!(
+                                    "Working · Enter adds to it · {} queues · Esc or {} stops",
+                                    key_label("mod+enter"),
+                                    key_label("mod+c")
+                                ),
+                                (true, false) => format!(
+                                    "Working · Enter adds to it · {} queues · Esc stops",
+                                    key_label("mod+enter")
+                                ),
+                                (false, true) => String::new(),
+                                // Terminals rarely send Shift+Enter; Alt+Enter
+                                // works in all of them.
+                                (false, false) if terminal => {
+                                    format!(
+                                        "Enter to send · {} for a new line",
+                                        key_label("alt+enter")
+                                    )
+                                }
+                                (false, false) => {
+                                    "Enter to send · Shift+Enter for a new line".to_owned()
+                                }
+                            })
+                            .flex_1()
+                            .px(px(8.0))
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
                         )
-                        .disabled(move || !can_send())
-                        .accessibility_label("Send"),
-                    ),
-            ),
-    )
+                        .child(when(
+                            move || running.get(),
+                            move || {
+                                ui::btn("Queue", Variant::Ghost, ui::Size::Sm, move || {
+                                    store.submit_placed(Some(MidRun::Queue))
+                                })
+                                .disabled(move || !can_send())
+                                .accessibility_label("Queue: send after the current work")
+                            },
+                        ))
+                        .child(
+                            ui::btn_icon(
+                                Glyph::Send,
+                                "Send",
+                                Variant::Primary,
+                                ui::Size::Sm,
+                                move || {
+                                    if running.get_untracked() {
+                                        store.submit_placed(Some(MidRun::Steer));
+                                    } else {
+                                        store.submit();
+                                    }
+                                },
+                            )
+                            .disabled(move || !can_send())
+                            .accessibility_label(move || {
+                                Some(SharedString::from(if running.get() {
+                                    "Add to the current work"
+                                } else {
+                                    "Send"
+                                }))
+                            }),
+                        ),
+                ),
+        )
+}
+
+/// The slash commands completing what is typed. Tab takes the first.
+fn slash_list(store: Store, matches: Memo<Vec<aidaemon_client_protocol::SlashCommand>>) -> View {
+    on_key_with(
+        "tab",
+        KeyOptions {
+            when: nsh_core::keymap::When::Always,
+            ..KeyOptions::default()
+        },
+        move |_| {
+            if let Some(first) = matches.with_untracked(|m| m.first().cloned()) {
+                store.complete_slash(&first.name);
+            }
+        },
+    );
+    ui::surface()
+        .w_full()
+        .max_w(px(size::COLUMN))
+        .mb_1()
+        .p_1()
+        .child(each(
+            move || matches.get(),
+            |c: &aidaemon_client_protocol::SlashCommand| c.name.clone(),
+            move |c, index| {
+                let name = c.get_untracked().name.clone();
+                let description = c.get_untracked().description.clone();
+                let pick = name.clone();
+                ui::row(|| false, move || store.complete_slash(&pick))
+                    .accessibility_label(format!("/{name}: {description}"))
+                    .child(ui::code(format!("/{name}")))
+                    .child(
+                        text(description)
+                            .flex_1()
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::SM))
+                            .text_color(colors::MUTED),
+                    )
+                    .child(when(move || index.get() == 0, || ui::kbd("Tab")))
+            },
+        ))
 }

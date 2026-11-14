@@ -63,6 +63,7 @@
       "app:s1": {
         "lines": [],
         "live": {
+          "started_ms": 1767225601000,
           "status": "Step 1 of 3: read the notes",
           "streamed": "Looking",
           "turn_id": "t1"

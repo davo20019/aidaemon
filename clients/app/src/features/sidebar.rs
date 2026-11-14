@@ -3,16 +3,45 @@
 
 use nsh_core::prelude::*;
 
-use crate::store::{Connection, Page, Store, now_ms};
+use crate::store::{Connection, Page, SearchRead, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, size, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
 pub fn sidebar(store: Store) -> View {
     let ids = computed(move || store.visible_ids());
+    // Grouped by what each needs: an answer, then work running, then the rest.
+    let needs = computed(move || {
+        ids.with(|ids| {
+            ids.iter()
+                .filter(|id| store.needs_you(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    let working = computed(move || {
+        ids.with(|ids| {
+            ids.iter()
+                .filter(|id| !store.needs_you(id) && store.is_running(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    let rest = computed(move || {
+        ids.with(|ids| {
+            ids.iter()
+                .filter(|id| !store.needs_you(id) && !store.is_running(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
     let query = signal(store.filter());
     effect(move || {
         let q = query.get();
-        untracked(|| store.set_filter(q));
+        untracked(|| {
+            store.set_filter(q.clone());
+            // Every conversation's messages, not only the ones loaded here.
+            store.search_messages(&q);
+        });
     });
     view()
         .w(px(size::SIDEBAR))
@@ -70,18 +99,32 @@ pub fn sidebar(store: Store) -> View {
                     .w_full(),
             ),
         )
-        .child(section_label("Conversations").px_4())
         .child(
             scroll().flex_1().child(
                 view()
                     .px_2()
                     .pb_2()
                     .gap(px(1.0))
+                    .child(group(store, "Needs you", needs))
+                    .child(group(store, "Working", working))
+                    .child(when(
+                        move || !rest.with(Vec::is_empty),
+                        move || {
+                            section_label(move || {
+                                if needs.with(Vec::is_empty) && working.with(Vec::is_empty) {
+                                    "Conversations"
+                                } else {
+                                    "Others"
+                                }
+                            })
+                        },
+                    ))
                     .child(each(
-                        ids,
+                        rest,
                         |id: &String| id.clone(),
                         move |id, _| session_row(store, id.get_untracked()),
                     ))
+                    .child(search_hits(store))
                     .child(when(
                         move || ids.with(Vec::is_empty) && !store.filter().trim().is_empty(),
                         || {
@@ -102,7 +145,29 @@ pub fn sidebar(store: Store) -> View {
                 )
                 .accessibility_label("System: how the daemon is doing")
                 .child(icon(Glyph::System).text_color(colors::MUTED))
-                .child(text("System").flex_1().text_size(px(ui::fit::body()))),
+                .child(text("System").flex_1().text_size(px(ui::fit::body())))
+                .child(
+                    text(move || {
+                        store
+                            .today_tokens()
+                            .filter(|n| *n > 0)
+                            .map(|n| format!("{} today", ui::time::compact_count(n)))
+                            .unwrap_or_default()
+                    })
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                ),
+            ),
+        )
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::Memory,
+                    move || store.open_memory(),
+                )
+                .accessibility_label("Memory: what the daemon remembers")
+                .child(icon(Glyph::Memory).text_color(colors::MUTED))
+                .child(text("Memory").flex_1().text_size(px(ui::fit::body()))),
             ),
         )
         .child(ui::separator())
@@ -199,6 +264,80 @@ fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
                     .text_color(colors::FAINT),
             ),
     )
+}
+
+/// A titled group of conversations, shown only when it has any.
+fn group(store: Store, title: &'static str, ids: Memo<Vec<String>>) -> View {
+    view()
+        .gap(px(1.0))
+        .child(when(
+            move || !ids.with(Vec::is_empty),
+            move || section_label(title),
+        ))
+        .child(each(
+            ids,
+            |id: &String| id.clone(),
+            move |id, _| session_row(store, id.get_untracked()),
+        ))
+}
+
+/// Messages matching the search, from every conversation the daemon has.
+fn search_hits(store: Store) -> View {
+    view().gap(px(1.0)).child(dynamic(move || {
+        let read = store.search();
+        Some(untracked(move || match read {
+            SearchRead::Idle => view(),
+            SearchRead::Loading(_) => view().child(section_label("In messages: searching…")),
+            SearchRead::Failed(error) => view().child(
+                text(error)
+                    .px_2()
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::MUTED),
+            ),
+            SearchRead::Ready { hits, .. } => {
+                let mut list = view().gap(px(1.0)).child(section_label(if hits.is_empty() {
+                    "In messages: nothing"
+                } else {
+                    "In messages"
+                }));
+                for hit in hits {
+                    let open = hit.session_id.clone();
+                    let who = if hit.role == "user" {
+                        "You"
+                    } else {
+                        "AIdaemon"
+                    };
+                    let title = store.title(&hit.session_id);
+                    list = list.child(
+                        row(|| false, move || store.select(Some(open.clone())))
+                            .accessibility_label(format!("{title}: {}", hit.snippet))
+                            .child(
+                                view()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .py_1()
+                                    .child(
+                                        text(hit.snippet.clone())
+                                            .number_of_lines(2)
+                                            .text_size(px(type_scale::SM))
+                                            .text_color(colors::TEXT),
+                                    )
+                                    .child(
+                                        text(format!(
+                                            "{who} · {title} · {}",
+                                            ui::time::ago(hit.at_ms, now_ms())
+                                        ))
+                                        .number_of_lines(1)
+                                        .text_size(px(type_scale::XS))
+                                        .text_color(colors::FAINT),
+                                    ),
+                            ),
+                    );
+                }
+                list
+            }
+        }))
+    }))
 }
 
 fn connection(store: Store) -> View {

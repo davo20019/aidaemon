@@ -54,10 +54,15 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     app.wait_for("terminal")?;
     app.wait_for("git push origin fix-port")?;
     app.wait_for("Allow once")?;
+    // The conversation waits on its owner: it leads the list.
+    app.wait_for("Needs you")?;
+    app.wait_for("text:terminal: cargo test -q...  ·  1 tool so far")?;
     feed([frame(
         r#"{"type":"event","seq":4,"at_ms":6,"session_id":"app:synthetic-1","event":{"type":"turn_completed","turn_id":"t1","text":"It races on the shared port.","state":"completed"}}"#,
     )]);
     app.wait_for("Turn finished.")?;
+    // The reply keeps a line of what its turn did.
+    app.wait_for("Used 1 tool: terminal")?;
     Ok(())
 }
 

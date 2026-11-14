@@ -16,6 +16,23 @@ fn native(registry: &mut Registry) {
     registry.register::<Offline>();
 }
 
+/// What the terminal prints to its normal scrollback after the app leaves
+/// the alternate screen: the open conversation, so it is still there to
+/// scroll, search and copy.
+static PARTING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Keep `text` to print once the terminal app has quit.
+pub fn set_parting_words(text: String) {
+    if let Ok(mut parting) = PARTING.lock() {
+        *parting = Some(text);
+    }
+}
+
+/// What [`set_parting_words`] kept, once.
+pub fn take_parting_words() -> Option<String> {
+    PARTING.lock().ok().and_then(|mut p| p.take())
+}
+
 /// Frames waiting for an [`Offline`] root, from any thread.
 static FEED: std::sync::Mutex<Vec<aidaemon_client_core::Update>> =
     std::sync::Mutex::new(Vec::new());

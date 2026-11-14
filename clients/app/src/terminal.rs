@@ -92,20 +92,29 @@ pub fn run() -> io::Result<()> {
             home.join(".aidaemon").join("app-terminal"),
         ));
     }
-    let _session = Session::enter()?;
+    let session = Session::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut view = AppView::new(options);
     // The first layout gets the terminal's size.
     terminal.draw(|frame| view.render(frame, frame.area()))?;
     view.load(nsh_platform_tui::Root::of::<nsh_app_aidaemon::App>())
         .map_err(|error| io::Error::other(error.to_string()))?;
-    run_app(&mut terminal, &mut view, |wait: Duration| {
+    let result = run_app(&mut terminal, &mut view, |wait: Duration| {
         if event::poll(wait.max(Duration::from_millis(1)))? {
             Ok(nsh_tui_host::convert(event::read()?))
         } else {
             Ok(RunEvent::Idle)
         }
-    })
+    });
+    // Back on the normal screen, the open conversation stays in the
+    // scrollback, as other terminal tools leave their output.
+    drop(session);
+    if let Some(text) = nsh_app_aidaemon::take_parting_words() {
+        let mut out = io::stdout();
+        let _ = writeln!(out, "{}", text.trim_end());
+        let _ = out.flush();
+    }
+    result
 }
 
 #[cfg(test)]

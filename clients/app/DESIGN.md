@@ -55,11 +55,22 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Inbox | Work running | Elapsed time ticks each second; long tool output shows its last 8 lines with Show all / Copy |
 | System | Open | Reads on open and every 30 s; "Needs a look" (warning tint, alert role) leads when anything fails |
 | System | A reply finishes while the app is in the background | "Done: <conversation>" notification; pressing it opens the conversation |
+| Conversation | A reply's turn used tools | One quiet disclosure line above the reply ("Used 4 tools: read_file ×2, … · 12s"); ▸ turns ▾ and lists every tool in order. The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
+| Conversation | Agent working, tools used | The working line adds "· N tools so far" |
+| Composer | Typing while the agent works | Send becomes "Add to the current work" (Enter); Queue (Mod+Enter) waits for its own turn; the hint names both and Esc |
+| Composer | Draft starts with `/` | The daemon's matching commands above the composer; Tab or a press completes the first |
+| Composer | Up on an empty composer | The last message sent here comes back to edit |
+| Conversation | Last turn failed or was stopped | Retry under it sends the same message again |
+| Sidebar | A conversation waits on an approval, or works | "Needs you" first, then "Working", then the others |
+| Sidebar | Searching | Titles filter at once; the daemon's matches in every conversation follow under "In messages" with a snippet, who said it and when |
+| System | A goal ran in the last day | "While you were away": each run with Done, Running, Failed, Stopped or "No report" (warning: finished without saying what it did); failed and silent runs also go to "Needs a look" |
+| Terminal | Quit | The open conversation prints to the normal scrollback as Markdown |
 
 ## Areas
 
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
 - **Inbox** (the right pane): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
+- **Memory:** what the daemon remembers about the owner, newest first, filterable, each with Forget.
 - **System:** daemon version, uptime and models; what needs a look; token use per day; model call times; scheduled goals; background jobs and queues; health checks.
 
 Times are shown in the owner's zone (`ui::time`): the browser's offset on the web, the system's elsewhere.

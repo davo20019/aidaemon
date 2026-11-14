@@ -29,6 +29,13 @@ pub enum Line {
     },
     /// A note from the client itself (a stopped turn, an error).
     Note { text: String },
+    /// What the turn behind the next reply did: the tools it used, in
+    /// order, and how long it took when known.
+    Activity {
+        tools: Vec<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        secs: u64,
+    },
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -41,6 +48,12 @@ pub struct LiveTurn {
     pub turn_id: String,
     pub streamed: String,
     pub status: Option<String>,
+    /// The tools the turn has started, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// When the turn started (ms since the epoch); 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub started_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -187,20 +200,28 @@ impl State {
     fn set_history(&mut self, session_id: &str, messages: Vec<HistoryMessage>) {
         let view = self.session(session_id);
         // History is older than anything live: it goes first.
-        let mut lines: Vec<Line> = messages
-            .into_iter()
-            .map(|m| match m.role.as_str() {
-                "user" => Line::User {
+        let mut lines: Vec<Line> = Vec::with_capacity(messages.len());
+        for m in messages {
+            match m.role.as_str() {
+                "user" => lines.push(Line::User {
                     text: m.text,
                     origin: String::new(),
                     at_ms: m.at_ms,
-                },
-                _ => Line::Assistant {
-                    text: m.text,
-                    at_ms: m.at_ms,
-                },
-            })
-            .collect();
+                }),
+                _ => {
+                    if !m.tools.is_empty() {
+                        lines.push(Line::Activity {
+                            tools: m.tools,
+                            secs: 0,
+                        });
+                    }
+                    lines.push(Line::Assistant {
+                        text: m.text,
+                        at_ms: m.at_ms,
+                    });
+                }
+            }
+        }
         lines.append(&mut view.lines);
         view.lines = lines;
     }
@@ -244,6 +265,7 @@ impl State {
             } => {
                 self.session(&session_id).live = Some(LiveTurn {
                     turn_id,
+                    started_ms: at_ms,
                     ..LiveTurn::default()
                 });
             }
@@ -254,6 +276,9 @@ impl State {
             }
             Event::TurnStatus { turn_id, status } => {
                 if let Some(live) = self.live_turn(&turn_id) {
+                    if let TurnStatus::ToolStarted { name, .. } = &status {
+                        live.tools.push(name.clone());
+                    }
                     live.status = Some(status_text(&status));
                 }
             }
@@ -286,7 +311,19 @@ impl State {
                     }
                     return;
                 };
-                view.live = None;
+                if let Some(live) = view.live.take()
+                    && !live.tools.is_empty()
+                {
+                    let secs = if live.started_ms > 0 && at_ms > live.started_ms {
+                        (at_ms - live.started_ms) / 1000
+                    } else {
+                        0
+                    };
+                    view.lines.push(Line::Activity {
+                        tools: live.tools,
+                        secs,
+                    });
+                }
                 if !text.is_empty() {
                     view.lines.push(Line::Assistant { text, at_ms });
                 }

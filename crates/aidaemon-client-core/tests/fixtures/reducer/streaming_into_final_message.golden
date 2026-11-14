@@ -99,6 +99,13 @@
             "text": "Draft the synthetic report"
           },
           {
+            "kind": "activity",
+            "secs": 1,
+            "tools": [
+              "terminal"
+            ]
+          },
+          {
             "at_ms": 1767225603000,
             "kind": "assistant",
             "text": "Drafted the report."

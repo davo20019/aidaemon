@@ -26,6 +26,23 @@ pub fn day(at_ms: u64) -> i64 {
     local(at_ms).map_or(0, |t| i64::from(t.date().num_days_from_ce()))
 }
 
+/// The UTC date `at_ms` falls on, as `YYYY-MM-DD` (the daemon's usage days).
+pub fn utc_date(at_ms: u64) -> String {
+    i64::try_from(at_ms)
+        .ok()
+        .and_then(DateTime::from_timestamp_millis)
+        .map_or_else(String::new, |t| t.format("%Y-%m-%d").to_string())
+}
+
+/// A count in a few characters: "950", "12.4k", "3.1M".
+pub fn compact_count(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
 /// "3:42 PM".
 pub fn clock(at_ms: u64) -> String {
     local(at_ms).map_or_else(String::new, |t| t.format("%-I:%M %p").to_string())

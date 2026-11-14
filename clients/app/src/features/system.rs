@@ -3,7 +3,7 @@
 //! use, model call timings, scheduled goals, background jobs and health
 //! checks. Read on open, every 30 seconds while open, and on Refresh.
 
-use aidaemon_client_protocol::{CheckStatus, SystemStatus};
+use aidaemon_client_protocol::{CheckStatus, GoalRunInfo, SystemStatus};
 use nsh_core::prelude::*;
 
 use crate::store::{Store, SystemRead, now_ms};
@@ -87,6 +87,7 @@ fn body(store: Store, read: SystemRead) -> View {
         SystemRead::Ready { status, .. } => column
             .child(overview(&status))
             .child(attention(&status))
+            .child(runs(store, &status))
             .child(usage(&status))
             .child(schedules(&status))
             .child(jobs(&status))
@@ -206,6 +207,16 @@ fn attention(s: &SystemStatus) -> View {
                 .unwrap_or_default()
         ));
     }
+    for run in &s.runs {
+        match run_verdict(run) {
+            (RunVerdict::Failed, _) => problems.push(format!("\"{}\" failed", run.description)),
+            (RunVerdict::Silent, _) => problems.push(format!(
+                "\"{}\" finished without reporting anything",
+                run.description
+            )),
+            _ => {}
+        }
+    }
     for queue in s.queues.iter().filter(|q| q.overloaded) {
         problems.push(format!(
             "The {} queue is overloaded ({} of {})",
@@ -308,6 +319,90 @@ fn usage(s: &SystemStatus) -> View {
             .text_size(px(type_scale::XS))
             .text_color(colors::FAINT),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunVerdict {
+    Done,
+    /// Finished, but left no report: green only by its exit, not its work.
+    Silent,
+    Failed,
+    Running,
+    Stopped,
+}
+
+/// A run judged by what it left behind, and the badge that says so.
+fn run_verdict(run: &GoalRunInfo) -> (RunVerdict, (&'static str, Tone)) {
+    match run.status.as_str() {
+        "running" | "pending" => (RunVerdict::Running, ("Running", Tone::Accent)),
+        "failed" | "error" | "blocked" => (RunVerdict::Failed, ("Failed", Tone::Danger)),
+        "cancelled" | "canceled" | "abandoned" => (RunVerdict::Stopped, ("Stopped", Tone::Neutral)),
+        _ if run.outcome.is_none() => (RunVerdict::Silent, ("No report", Tone::Warning)),
+        _ => (RunVerdict::Done, ("Done", Tone::Success)),
+    }
+}
+
+/// What background goals did in the last day, each judged by its report.
+fn runs(store: Store, s: &SystemStatus) -> View {
+    if s.runs.is_empty() {
+        return view();
+    }
+    let now = now_ms();
+    let mut c = card();
+    for run in &s.runs {
+        let (_, (label, tone)) = run_verdict(run);
+        let when = format!(
+            "{} {}",
+            time::day_label(run.started_ms, now),
+            time::clock(run.started_ms)
+        );
+        let took = run
+            .finished_ms
+            .map(|f| format!(" · took {}", seconds(f.saturating_sub(run.started_ms))))
+            .unwrap_or_default();
+        let mut entry = view()
+            .gap(px(2.0))
+            .px_2()
+            .py_1()
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        text(run.description.clone())
+                            .flex_1()
+                            .number_of_lines(2)
+                            .text_size(px(ui::fit::body())),
+                    )
+                    .child(badge(label, tone)),
+            )
+            .child(
+                text(
+                    run.outcome
+                        .clone()
+                        .unwrap_or_else(|| "It left no report of what it did.".into()),
+                )
+                .selectable(true)
+                .number_of_lines(4)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+            );
+        let meta = text(format!("{when}{took}"))
+            .flex_1()
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT);
+        entry = match run.session_id.clone() {
+            Some(session) => entry.child(view().flex_row().items_center().child(meta).child(
+                ui::btn("Open", Variant::Ghost, Size::Sm, move || {
+                    store.select(Some(session.clone()))
+                }),
+            )),
+            None => entry.child(meta),
+        };
+        c = c.child(entry);
+    }
+    section("While you were away").child(c)
 }
 
 fn schedules(s: &SystemStatus) -> View {

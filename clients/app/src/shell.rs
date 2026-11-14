@@ -66,6 +66,9 @@ pub fn shell(store: Store) -> View {
             }
             let now = crate::store::now_ms();
             if now.saturating_sub(armed.replace(now)) < 2_000 {
+                if let Some(text) = store.transcript_markdown() {
+                    crate::set_parting_words(text);
+                }
                 nsh_core::element::desktop::quit();
             } else {
                 store.say("Press Ctrl+C again to quit");
@@ -112,6 +115,11 @@ pub fn shell(store: Store) -> View {
             if store.connection() == Connection::NeedsPairing {
                 return Some(untracked(|| {
                     crate::features::pairing::pairing(store).key("pairing")
+                }));
+            }
+            if store.page() == crate::store::Page::Memory {
+                return Some(untracked(|| {
+                    crate::features::memory::page(store).key("memory")
                 }));
             }
             if store.page() == crate::store::Page::System {
@@ -202,6 +210,17 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .group("View")
             .shortcut("mod+,"),
     );
+    items.push(CommandItem::new("memory", "Memory: what the daemon remembers").group("View"));
+    items.push(
+        CommandItem::new(
+            "activity",
+            format!(
+                "Tool activity in replies: {} (change)",
+                store.activity_mode().label()
+            ),
+        )
+        .group("View"),
+    );
     items.push(
         CommandItem::new("copy-reply", "Copy the last reply")
             .group("Conversation")
@@ -267,6 +286,8 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 "sidebar" => store.open_sidebar(),
                                 "inspector" => store.open_inspector(),
                                 "system" => store.open_system(),
+                                "memory" => store.open_memory(),
+                                "activity" => store.cycle_activity_mode(),
                                 "copy-reply" => copy_reply(store),
                                 "copy-all" => {
                                     if let Some(text) = store.transcript_markdown() {
