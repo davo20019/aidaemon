@@ -12,4 +12,4 @@ memory.remember(NewFact::new("user:1", "person", "daughters", "Mia and Zoe")).aw
 let hits = memory.recall_facts("user:1", "what are my daughters called", 5).await?;
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-memory
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-memory

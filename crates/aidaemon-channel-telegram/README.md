@@ -10,4 +10,4 @@ let channel = std::sync::Arc::new(TelegramChannel::new("000000:SYNTHETIC"));
 // runner_builder.channel(channel)
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-channel-telegram
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-channel-telegram

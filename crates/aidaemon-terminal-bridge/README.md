@@ -10,4 +10,4 @@ let started = aidaemon_terminal_bridge::spawn_if_configured(settings, host, secr
 
 `BridgeSettings` carries what the host's config says (owner, websocket URL, bot tokens or a static connect token, review agents, upload limits). `BridgeHost` gives the bots added at runtime and stores the relay handoff codes and session bindings the host's chat commands share. The bridge key lives in an `aidaemon_secrets::SecretStore`, with an owner-only file as the fallback.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-terminal-bridge
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-terminal-bridge

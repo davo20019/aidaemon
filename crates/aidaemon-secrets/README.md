@@ -12,4 +12,4 @@ store.set("api_key", "sk-...")?;
 let key = store.get("api_key")?;
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-secrets
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-secrets

@@ -10,4 +10,4 @@ let channel = std::sync::Arc::new(DiscordChannel::new("bot-token"));
 // runner_builder.channel(channel)
 ```
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-channel-discord
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-channel-discord

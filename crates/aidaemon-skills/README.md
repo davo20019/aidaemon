@@ -11,4 +11,4 @@ let use_skill = aidaemon_skills::tools::UseSkillTool::new(skills_dir);
 
 Drafts and settings go through `SkillsStore`; `InMemorySkillStore` keeps them in memory.
 
-Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.2.0). MIT licensed. Docs: https://docs.rs/aidaemon-skills
+Part of the [aidaemon SDK](https://github.com/davo20019/aidaemon) (shared version 0.20.0). MIT licensed. Docs: https://docs.rs/aidaemon-skills

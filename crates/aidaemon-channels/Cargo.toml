@@ -31,9 +31,9 @@ http = ["dep:reqwest"]
 checkpoints = ["aidaemon-tools/checkpoints"]
 
 [dependencies]
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core" }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools" }
-aidaemon-events = { version = "0.2.0", path = "../aidaemon-events" }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

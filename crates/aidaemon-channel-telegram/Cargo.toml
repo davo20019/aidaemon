@@ -43,10 +43,10 @@ terminal = [
 ]
 
 [dependencies]
-aidaemon-channels = { version = "0.2.0", path = "../aidaemon-channels", features = ["http"] }
-aidaemon-core = { version = "0.2.0", path = "../aidaemon-core", optional = true }
-aidaemon-events = { version = "0.2.0", path = "../aidaemon-events", optional = true }
-aidaemon-tools = { version = "0.2.0", path = "../aidaemon-tools", optional = true }
+aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", features = ["http"] }
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", optional = true }
+aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }
+aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
 anyhow = { version = "1", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
