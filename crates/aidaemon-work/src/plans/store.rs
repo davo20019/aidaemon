@@ -265,7 +265,17 @@ impl PlanStore {
             .unwrap_or(0);
 
         let _write = PLAN_WRITES.lock().await;
-        if let Some(mut existing) = self.get_incomplete_for_session(session_id).await? {
+        // Only this request's own open plan is reused: a plan belongs to
+        // the request that declared it, and a turn that continues that
+        // request has adopted it ([`Self::carry_into_turn`]). An earlier
+        // request's open plan is never the new request's (live 2026-11-14:
+        // a new request's card showed "✅ Install WordPress … verify the
+        // site" from a run hours before).
+        let reusable = self
+            .get_incomplete_for_session(session_id)
+            .await?
+            .filter(|plan| plan.task_id.as_deref() == task_id);
+        if let Some(mut existing) = reusable {
             // A step a background job is still doing stays with that job:
             // a checklist update cannot finish or drop work it did not do.
             // Only the job's end settles it.
@@ -315,11 +325,6 @@ impl PlanStore {
             existing.steps = steps;
             existing.current_step = current_step;
             existing.updated_at = now;
-            // Refresh task_id so the checklist scopes to the latest turn that
-            // touched it (a reused incomplete plan keeps the right owner).
-            if task_id.is_some() {
-                existing.task_id = task_id.map(|t| t.to_string());
-            }
             existing.sync_active_step();
             self.update(&existing).await?;
             Ok(existing)
@@ -575,6 +580,29 @@ impl PlanStore {
 
         plan.sync_active_step();
         self.update(&plan).await?;
+        Ok(Some(plan))
+    }
+
+    /// A turn that continues the same request (a runtime continuation, a
+    /// resume, or a turn that adopted the request's open obligations)
+    /// carries the request's open checklist: the session's open plan moves
+    /// to this turn's task, so its card, its helpers' links and its outcome
+    /// all read it. A new request calls nothing here and starts its own
+    /// plan. Returns the carried plan.
+    pub async fn carry_into_turn(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<Option<TaskPlan>> {
+        let _write = PLAN_WRITES.lock().await;
+        let Some(mut plan) = self.get_incomplete_for_session(session_id).await? else {
+            return Ok(None);
+        };
+        if plan.task_id.as_deref() != Some(task_id) {
+            plan.task_id = Some(task_id.to_string());
+            plan.updated_at = Utc::now();
+            self.update(&plan).await?;
+        }
         Ok(Some(plan))
     }
 
@@ -1175,6 +1203,78 @@ mod tests {
         // Persisted state reflects the replacement.
         let fetched = store.get(&id).await.unwrap().unwrap();
         assert_eq!(fetched.completed_steps(), 2);
+    }
+
+    /// Each owner request gets its own plan: a new request's checklist
+    /// never reuses (or shows) an earlier request's open plan, while a turn
+    /// that continues the request carries it (live 2026-11-14: a new
+    /// request's card showed "✅ Install WordPress … verify the site").
+    #[tokio::test]
+    async fn a_new_request_gets_its_own_plan_and_a_continuation_carries_it() {
+        use crate::plans::StepStatus;
+        let store = create_test_store().await;
+        let earlier = store
+            .upsert_checklist(
+                "chat",
+                Some("request-1"),
+                "wp",
+                &[
+                    (
+                        "Install WordPress and verify the site".to_string(),
+                        StepStatus::Completed,
+                    ),
+                    ("Send the login link".to_string(), StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let fresh = store
+            .upsert_checklist(
+                "chat",
+                Some("request-2"),
+                "drupal",
+                &[
+                    ("Install Drupal".to_string(), StepStatus::InProgress),
+                    ("Verify Drupal".to_string(), StepStatus::Pending),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_ne!(fresh.id, earlier.id, "a new request starts its own plan");
+        let card = fresh.card().text;
+        assert!(!card.contains("WordPress"), "{card}");
+        let kept = store.get(&earlier.id).await.unwrap().unwrap();
+        assert_eq!(kept.task_id.as_deref(), Some("request-1"));
+        assert_eq!(kept.steps.len(), 2);
+
+        // A later turn of request 2 carries its plan.
+        let carried = store
+            .carry_into_turn("chat", "request-2-turn-2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(carried.id, fresh.id);
+        let again = store
+            .upsert_checklist(
+                "chat",
+                Some("request-2-turn-2"),
+                "drupal",
+                &[
+                    ("Install Drupal".to_string(), StepStatus::Completed),
+                    ("Verify Drupal".to_string(), StepStatus::InProgress),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.id, fresh.id);
+        assert!(
+            store
+                .for_task("chat", "request-2-turn-2")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

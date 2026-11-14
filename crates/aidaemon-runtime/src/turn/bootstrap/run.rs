@@ -236,13 +236,23 @@ async fn finalize_turn_assessment(
     // Presentation follows the request lifecycle, not session recency. A new
     // external request clears it; a structural resume or a validated adoption
     // of unfinished obligations retains the parent artifact.
-    if !(internal_continuation
+    let same_request = internal_continuation
         || structural_resume
-        || turn_context.inherited_outstanding_obligations)
-    {
+        || turn_context.inherited_outstanding_obligations;
+    if !same_request {
         turn_context.completion_contract.response_contract = None;
     }
     turn_context.completion_contract.adopt_for_task(task_id);
+    // The checklist follows the same lifecycle: a turn of the same request
+    // carries its open plan; a new request starts its own and never shows
+    // an earlier request's steps.
+    if same_request
+        && !agent.works_for_mandate()
+        && let Some(plans) = agent.plan_store().await
+        && let Err(error) = plans.carry_into_turn(session_id, task_id).await
+    {
+        warn!(session_id, %error, "Could not carry the request's checklist into its turn");
+    }
 
     // Persist the finalized contract on its own correctness-critical event.
     // Decision points are an optional flight recorder and may be disabled for
