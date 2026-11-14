@@ -150,11 +150,46 @@ pub struct FullRecall {
     source: Arc<RecallSource>,
     host: Arc<dyn RecallHost>,
     turn: RecallTurn,
+    /// The turn's memory block, started by [`Self::prefetch`] before the
+    /// first model call asks for it.
+    pub(super) prefetched: std::sync::Mutex<Option<tokio::task::JoinHandle<String>>>,
 }
 
 impl FullRecall {
     pub fn new(source: Arc<RecallSource>, host: Arc<dyn RecallHost>, turn: RecallTurn) -> Self {
-        Self { source, host, turn }
+        Self {
+            source,
+            host,
+            turn,
+            prefetched: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Starts rendering the turn's memory block now, so the first model
+    /// call finds it ready instead of waiting for every lookup. Only a turn
+    /// that names its request can: the block is rendered for that text,
+    /// whatever query the model call later passes. Outside a Tokio runtime
+    /// nothing starts and the block renders on demand as before.
+    pub fn prefetch(self) -> Self {
+        if self.turn.user_text.is_none() {
+            return self;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return self;
+        };
+        let worker = Self::new(self.source.clone(), self.host.clone(), self.turn.clone());
+        let handle = runtime.spawn(async move { worker.render_block("").await });
+        if let Ok(mut prefetched) = self.prefetched.lock() {
+            *prefetched = Some(handle);
+        }
+        self
+    }
+
+    /// The prefetched block, once; `None` when none was started or it
+    /// failed, so the caller renders it itself.
+    async fn take_prefetched(&self) -> Option<String> {
+        let handle = self.prefetched.lock().ok()?.take()?;
+        handle.await.ok()
     }
 
     /// Starts the recall filter over `facts`, when the host judges
@@ -209,6 +244,54 @@ impl FullRecall {
         }))
     }
 
+    /// Core profile: owner DMs at the top level, with a per-session stable
+    /// entity selection.
+    async fn core_profile(&self, people_enabled: bool) -> String {
+        let turn = &self.turn;
+        let source = &self.source;
+        if !(turn.allowed && turn.personal && turn.depth == 0) {
+            return String::new();
+        }
+        let cached_ids = source
+            .core_profile_ids
+            .read()
+            .await
+            .get(&turn.session_id)
+            .cloned();
+        let (profile_str, new_ids, digest) = or_logged(
+            crate::profile::build_core_profile(source.store.as_ref(), cached_ids, people_enabled)
+                .await,
+            "core_profile",
+        );
+        if let Some(ids) = new_ids {
+            source
+                .core_profile_ids
+                .write()
+                .await
+                .insert(turn.session_id.clone(), ids);
+        }
+        // The selection digest (id + content hash per entity) makes a
+        // profile change self-explaining across turns.
+        if !digest.is_empty() {
+            self.host
+                .decision(
+                    turn,
+                    RecallDecision::CoreProfileSelection,
+                    format!("Core profile selection: {} entities", digest.len()),
+                    json!({
+                        "code": "core_profile_digest",
+                        "count": digest.len(),
+                        "entities": digest
+                            .iter()
+                            .map(|(id, h)| json!({ "id": id, "h": h }))
+                            .collect::<Vec<_>>(),
+                    }),
+                )
+                .await;
+        }
+        profile_str
+    }
+
     /// The memory block: critical facts, core profile, then the query-ranked
     /// memory sections. Channel, role and policy scoping are applied here.
     /// `query` is the request's latest user message, used when the turn
@@ -226,6 +309,7 @@ impl FullRecall {
 
         // Facts: always channel-scoped semantic retrieval, so unrelated facts
         // never bleed into prompts for unrelated queries.
+        let recall_started = std::time::Instant::now();
         let facts = if !allowed {
             vec![]
         } else {
@@ -246,157 +330,159 @@ impl FullRecall {
         // The optional recall filter asks which of these facts matter to the
         // message. It runs beside the lookups below and is awaited where the
         // facts are rendered.
+        let facts_ms = recall_started.elapsed().as_millis() as u64;
         let fact_filter = self.spawn_fact_filter(query, &facts);
 
-        // Critical facts (identity/profile): bounded identity categories only,
-        // owner DMs (delegated agents included).
-        let mut critical_fact_summary = if allowed && inject_personal {
-            let mut identity_facts = Vec::new();
-            for category in IDENTITY_CATEGORIES {
-                identity_facts.append(&mut or_logged(
-                    store.get_facts(Some(category)).await,
-                    "critical_facts",
-                ));
+        // The sections below read independent stores, so they run together:
+        // run one after another they put ten round trips (and the query
+        // embeddings) in front of every turn's first model call.
+        let lookups_started = std::time::Instant::now();
+        let critical_facts = async {
+            // Critical facts (identity/profile): bounded identity categories
+            // only, owner DMs (delegated agents included).
+            if allowed && inject_personal {
+                let mut identity_facts = Vec::new();
+                for category in IDENTITY_CATEGORIES {
+                    identity_facts.append(&mut or_logged(
+                        store.get_facts(Some(category)).await,
+                        "critical_facts",
+                    ));
+                }
+                extract_critical_fact_summary(&identity_facts)
+            } else {
+                Default::default()
             }
-            extract_critical_fact_summary(&identity_facts)
-        } else {
-            Default::default()
         };
-        if let Some(configured_name) = source.settings.assistant_name.clone() {
-            critical_fact_summary.assistant_name = Some(configured_name);
-        }
-
         // Episodes: channel-scoped for non-DM channels.
-        let episodes = if !allowed {
-            vec![]
-        } else if inject_personal {
-            or_logged(store.get_relevant_episodes(query, 3).await, "episodes")
-        } else if public_external {
-            vec![]
-        } else {
-            or_logged(
-                store
-                    .get_relevant_episodes_for_channel(query, 3, turn.channel_id.as_deref())
-                    .await,
-                "episodes",
-            )
+        let episodes = async {
+            if !allowed {
+                vec![]
+            } else if inject_personal {
+                or_logged(store.get_relevant_episodes(query, 3).await, "episodes")
+            } else if public_external {
+                vec![]
+            } else {
+                or_logged(
+                    store
+                        .get_relevant_episodes_for_channel(query, 3, turn.channel_id.as_deref())
+                        .await,
+                    "episodes",
+                )
+            }
         };
-
         // Personal goals/profile remain DM-only. Operational failure patterns
         // are safe more broadly: they encode agent-side recovery guidance, not
         // user-private preferences.
-        let goals = if allowed && inject_personal {
-            or_logged(host.active_goals().await, "goals")
-        } else {
-            vec![]
+        let goals = async {
+            if allowed && inject_personal {
+                or_logged(host.active_goals().await, "goals")
+            } else {
+                vec![]
+            }
         };
-        let patterns = if !allowed || public_external {
-            vec![]
-        } else if inject_personal {
-            or_logged(store.get_behavior_patterns(0.5).await, "patterns")
-        } else {
-            or_logged(store.get_behavior_patterns(0.5).await, "patterns")
-                .into_iter()
-                .filter(|pattern| pattern.pattern_type == "failure")
-                .collect()
+        let patterns = async {
+            if !allowed || public_external {
+                vec![]
+            } else if inject_personal {
+                or_logged(store.get_behavior_patterns(0.5).await, "patterns")
+            } else {
+                or_logged(store.get_behavior_patterns(0.5).await, "patterns")
+                    .into_iter()
+                    .filter(|pattern| pattern.pattern_type == "failure")
+                    .collect()
+            }
         };
         // Procedures and error solutions are operational: always load, except
         // on PublicExternal where everything is restricted.
-        let (procedures, error_solutions) = if !allowed || public_external {
-            (vec![], vec![])
-        } else {
-            (
-                or_logged(store.get_relevant_procedures(query, 5).await, "procedures"),
+        let procedures = async {
+            if !allowed || public_external {
+                vec![]
+            } else {
+                or_logged(store.get_relevant_procedures(query, 5).await, "procedures")
+            }
+        };
+        let error_solutions = async {
+            if !allowed || public_external {
+                vec![]
+            } else {
                 or_logged(
                     store.get_relevant_error_solutions(query, 5).await,
                     "error_solutions",
-                ),
-            )
-        };
-        let profile = if allowed && inject_personal {
-            or_logged(store.get_user_profile().await, "profile")
-        } else {
-            None
-        };
-
-        // People context: resolve the current speaker (only when enabled).
-        let people_enabled = allowed && or_logged(host.people_enabled().await, "people_enabled");
-        let (people, current_person, current_person_facts) = if !people_enabled {
-            (vec![], None, vec![])
-        } else if inject_personal {
-            // In owner DMs the people list only selects the privacy rules; the
-            // owner's own profile arrives through the core profile.
-            (
-                or_logged(store.get_all_people().await, "people"),
-                None,
-                vec![],
-            )
-        } else if let Some(ref sender_id) = turn.sender_id {
-            match store.get_person_by_platform_id(sender_id).await {
-                Ok(Some(person)) => {
-                    if let Err(error) = store.touch_person_interaction(person.id).await {
-                        warn!(%error, "failed to record person interaction");
-                    }
-                    let facts = or_logged(
-                        store.get_person_facts(person.id, None).await,
-                        "person_facts",
-                    );
-                    (vec![], Some(person), facts)
-                }
-                Ok(None) => (vec![], None, vec![]),
-                Err(error) => {
-                    warn!(%error, "memory recall read failed; section left empty");
-                    (vec![], None, vec![])
-                }
-            }
-        } else {
-            (vec![], None, vec![])
-        };
-
-        // Core profile: owner DMs at the top level, with a per-session stable
-        // entity selection.
-        let core_profile = if allowed && inject_personal && turn.depth == 0 {
-            let cached_ids = source
-                .core_profile_ids
-                .read()
-                .await
-                .get(&turn.session_id)
-                .cloned();
-            let (profile_str, new_ids, digest) = or_logged(
-                crate::profile::build_core_profile(store.as_ref(), cached_ids, people_enabled)
-                    .await,
-                "core_profile",
-            );
-            if let Some(ids) = new_ids {
-                source
-                    .core_profile_ids
-                    .write()
-                    .await
-                    .insert(turn.session_id.clone(), ids);
-            }
-            // The selection digest (id + content hash per entity) makes a
-            // profile change self-explaining across turns.
-            if !digest.is_empty() {
-                host.decision(
-                    turn,
-                    RecallDecision::CoreProfileSelection,
-                    format!("Core profile selection: {} entities", digest.len()),
-                    json!({
-                        "code": "core_profile_digest",
-                        "count": digest.len(),
-                        "entities": digest
-                            .iter()
-                            .map(|(id, h)| json!({ "id": id, "h": h }))
-                            .collect::<Vec<_>>(),
-                    }),
                 )
-                .await;
             }
-            profile_str
-        } else {
-            String::new()
         };
+        let profile = async {
+            if allowed && inject_personal {
+                or_logged(store.get_user_profile().await, "profile")
+            } else {
+                None
+            }
+        };
+        // People context, then the core profile, which reads whether people
+        // are enabled.
+        let people_and_core = async {
+            // Resolve the current speaker (only when enabled).
+            let people_enabled =
+                allowed && or_logged(host.people_enabled().await, "people_enabled");
+            let (people, current_person, current_person_facts) = if !people_enabled {
+                (vec![], None, vec![])
+            } else if inject_personal {
+                // In owner DMs the people list only selects the privacy rules;
+                // the owner's own profile arrives through the core profile.
+                (
+                    or_logged(store.get_all_people().await, "people"),
+                    None,
+                    vec![],
+                )
+            } else if let Some(ref sender_id) = turn.sender_id {
+                match store.get_person_by_platform_id(sender_id).await {
+                    Ok(Some(person)) => {
+                        if let Err(error) = store.touch_person_interaction(person.id).await {
+                            warn!(%error, "failed to record person interaction");
+                        }
+                        let facts = or_logged(
+                            store.get_person_facts(person.id, None).await,
+                            "person_facts",
+                        );
+                        (vec![], Some(person), facts)
+                    }
+                    Ok(None) => (vec![], None, vec![]),
+                    Err(error) => {
+                        warn!(%error, "memory recall read failed; section left empty");
+                        (vec![], None, vec![])
+                    }
+                }
+            } else {
+                (vec![], None, vec![])
+            };
+            let core_profile = self.core_profile(people_enabled).await;
+            (people, current_person, current_person_facts, core_profile)
+        };
+        let (
+            mut critical_fact_summary,
+            episodes,
+            goals,
+            patterns,
+            procedures,
+            error_solutions,
+            profile,
+            (people, current_person, current_person_facts, core_profile),
+        ) = tokio::join!(
+            critical_facts,
+            episodes,
+            goals,
+            patterns,
+            procedures,
+            error_solutions,
+            profile,
+            people_and_core
+        );
+        if let Some(configured_name) = source.settings.assistant_name.clone() {
+            critical_fact_summary.assistant_name = Some(configured_name);
+        }
+        let lookups_ms = lookups_started.elapsed().as_millis() as u64;
 
+        let filter_wait_started = std::time::Instant::now();
         let facts = match fact_filter {
             Some(filter) => match filter.await {
                 Ok(Some(drop)) if !drop.is_empty() => {
@@ -416,6 +502,7 @@ impl FullRecall {
             },
             None => facts,
         };
+        let filter_wait_ms = filter_wait_started.elapsed().as_millis() as u64;
 
         let memory_context = MemoryContext {
             facts: &facts,
@@ -480,6 +567,10 @@ impl FullRecall {
             goals = goals.len(),
             patterns = patterns.len(),
             procedures = procedures.len(),
+            elapsed_ms = recall_started.elapsed().as_millis() as u64,
+            facts_ms,
+            lookups_ms,
+            filter_wait_ms,
             "Memory context loaded"
         );
         let mut block =
@@ -492,6 +583,17 @@ impl FullRecall {
         }
         block.push_str(&report.prompt);
         block.trim_start().to_string()
+    }
+}
+
+impl Drop for FullRecall {
+    /// A turn that ends before its first model call stops the prefetch.
+    fn drop(&mut self) {
+        if let Ok(mut prefetched) = self.prefetched.lock()
+            && let Some(handle) = prefetched.take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -521,7 +623,10 @@ impl aidaemon_policies::Recall for FullRecall {
 
     /// The full memory block with its section headings.
     async fn render(&self, _session_id: &str, query: &str, _limit: usize) -> Option<String> {
-        let block = self.render_block(query).await;
+        let block = match self.take_prefetched().await {
+            Some(block) => block,
+            None => self.render_block(query).await,
+        };
         (!block.trim().is_empty()).then_some(block)
     }
 }

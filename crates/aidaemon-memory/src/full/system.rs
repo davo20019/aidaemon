@@ -229,7 +229,9 @@ impl MemorySystem for FullMemory {
                 Some(full) => (full.recall.clone(), full.host.clone(), full.hooks.clone()),
                 None => (plain_turn(turn), Arc::new(NoHost), Vec::new()),
             };
-        let recall = FullRecall::new(self.recall.clone(), host, recall_turn);
+        // Recall starts now, beside the rest of the turn's setup; the
+        // injection hook awaits it at the first model call.
+        let recall = FullRecall::new(self.recall.clone(), host, recall_turn).prefetch();
         let mut hooks: Vec<Arc<dyn Hook>> = vec![Arc::new(MemoryInjection::new(recall))];
         hooks.extend(extra);
         // Only the owner's own turns teach the jobs.
@@ -307,6 +309,57 @@ mod tests {
         .await
         .unwrap();
         assert!(note.contains("teal"), "{note}");
+    }
+
+    /// A recall started early renders the same block the model call would
+    /// have rendered itself, and the first render takes it.
+    #[tokio::test]
+    async fn a_prefetched_recall_renders_the_same_block() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::sqlite::migrate(&pool).await.unwrap();
+        let store = SqliteMemory::new(pool, Arc::new(crate::HashEmbedder::new(384)));
+        crate::stores::FactStore::upsert_fact(
+            &store,
+            "preference",
+            "favorite_color",
+            "teal",
+            "user",
+            None,
+            crate::records::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+        let source = Arc::new(RecallSource::new(
+            Arc::new(store),
+            RecallSettings {
+                max_facts: 10,
+                assistant_name: None,
+            },
+        ));
+        let mut turn = RecallTurn {
+            user_text: Some("what is my favorite color?".into()),
+            ..plain_turn(&MemoryTurn {
+                session_id: "test:synthetic-user".into(),
+                scope: "owner".into(),
+                read: true,
+                write: false,
+                explicit_writes_only: false,
+                learning: Default::default(),
+                host: Default::default(),
+            })
+        };
+        turn.task_id = "task-synthetic-1".into();
+        let plain = FullRecall::new(source.clone(), Arc::new(NoHost), turn.clone())
+            .render_block("")
+            .await;
+        let prefetched = FullRecall::new(source, Arc::new(NoHost), turn).prefetch();
+        assert!(prefetched.prefetched.lock().unwrap().is_some());
+        let note = aidaemon_policies::Recall::render(&prefetched, "test:synthetic-user", "", 5)
+            .await
+            .unwrap();
+        assert!(note.contains("teal"), "{note}");
+        assert_eq!(note, plain);
+        assert!(prefetched.prefetched.lock().unwrap().is_none());
     }
 
     #[tokio::test]
