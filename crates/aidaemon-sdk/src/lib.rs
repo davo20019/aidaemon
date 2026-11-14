@@ -228,8 +228,9 @@ pub mod prelude {
     #[cfg(all(feature = "providers", feature = "policies"))]
     pub use crate::preset::{Preset, PresetError, preset};
 
+    /// `agent.as_tool(..)`: an agent as another agent's tool.
     #[cfg(feature = "agents")]
-    pub use crate::agents;
+    pub use crate::agents::{self, AgentExt};
     #[cfg(feature = "channels")]
     pub use crate::channels;
     #[cfg(feature = "eval")]

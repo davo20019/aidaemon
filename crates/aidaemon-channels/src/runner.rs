@@ -198,7 +198,10 @@ pub struct ChannelRunnerBuilder {
 }
 
 impl ChannelRunnerBuilder {
-    /// Add a channel. Names must be unique; they prefix session ids.
+    /// Add a channel. Names must be unique; they prefix session ids. The
+    /// runner hands it nothing unredacted: every outbound text passes
+    /// [`crate::outbound::RedactingChannel`] first, with the agent's
+    /// [`RedactionScope`](aidaemon_core::RedactionScope).
     pub fn channel(mut self, channel: Arc<dyn Channel>) -> Self {
         self.channels.push(channel);
         self
@@ -312,8 +315,19 @@ impl ChannelRunnerBuilder {
         let permits = Arc::new(Semaphore::new(self.config.max_concurrent_runs));
         Ok(ChannelRunner {
             inner: Arc::new(Inner {
+                // Everything handed to an adapter is redacted first, with
+                // the agent's own secrets, whatever the adapter does.
+                channels: self
+                    .channels
+                    .into_iter()
+                    .map(|channel| {
+                        Arc::new(crate::outbound::RedactingChannel::new(
+                            channel,
+                            self.agent.redaction_scope().clone(),
+                        )) as Arc<dyn Channel>
+                    })
+                    .collect(),
                 agent: self.agent,
-                channels: self.channels,
                 policy: self.policy,
                 router: self.router,
                 store: self.store,

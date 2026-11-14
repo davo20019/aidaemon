@@ -1813,3 +1813,55 @@ async fn the_verdict_survives_a_prompt_too_long_to_fit() {
     assert!(marked.text.ends_with("**Approved**"));
     run.stop().await;
 }
+
+const RUNNER_SECRET: &str = "tok_runner_scope_5f6e7d8c";
+
+async fn leak_secret(_context: CommandContext) -> CommandReply {
+    CommandReply::text(format!("the deploy token is {RUNNER_SECRET}"))
+}
+
+/// A host command's answer never passes the kernel, and an adapter may not
+/// redact (this one only knows the process-wide set): the runner redacts
+/// what it hands the adapter, with the agent's own scope.
+#[tokio::test]
+async fn the_runner_redacts_what_it_hands_any_adapter() {
+    let scope = aidaemon_core::RedactionScope::isolated();
+    scope.register(RUNNER_SECRET).unwrap();
+    let agent = Agent::builder("assistant")
+        .allow_unguarded()
+        .provider(scripted(vec![text("never")]))
+        .model("synthetic-model")
+        .redaction_scope(scope)
+        .build()
+        .expect("agent builds");
+    let channel = Arc::new(TestChannel::new("telegram"));
+    let runner = ChannelRunner::builder(agent)
+        .channel(channel.clone())
+        .access(AccessPolicy::new().owner("telegram", OWNER))
+        .command("token", "Show the token", leak_secret)
+        .build()
+        .expect("runner builds");
+    let shutdown = CancellationToken::new();
+    let handle = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { runner.run(shutdown).await })
+    };
+    channel.inject_message(message(direct("chat-leak"), OWNER, "/token"));
+    assert!(
+        channel
+            .wait_for(WAIT, |c| c
+                .sent_texts("chat-leak")
+                .iter()
+                .any(|t| t.contains("deploy token")))
+            .await
+    );
+    assert_eq!(
+        channel.sent_texts("chat-leak"),
+        vec!["the deploy token is [REDACTED:secret]"]
+    );
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("runner stops")
+        .expect("runner task ok");
+}
