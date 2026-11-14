@@ -114,11 +114,16 @@ pub fn card(store: Store, approval: Approval) -> View {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(ui::icon(Glyph::Approval).text_color(risk_tone.color()))
+                .child(
+                    ui::icon(Glyph::Approval)
+                        .text_color(risk_tone.color())
+                        .accessibility_elements_hidden(true),
+                )
                 .child(
                     text(heading)
                         .flex_1()
-                        .text_size(px(type_scale::BASE))
+                        .role(AccessibilityRole::Header)
+                        .text_size(px(ui::fit::body()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .number_of_lines(2),
                 )
@@ -133,7 +138,11 @@ pub fn card(store: Store, approval: Approval) -> View {
             view()
                 .flex_row()
                 .gap_2()
-                .child(ui::icon(glyph).text_color(tone.color()))
+                .child(
+                    ui::icon(glyph)
+                        .text_color(tone.color())
+                        .accessibility_elements_hidden(true),
+                )
                 .child(
                     text(text_)
                         .flex_1()

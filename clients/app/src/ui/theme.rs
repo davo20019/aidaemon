@@ -159,5 +159,51 @@ pub mod size {
     pub const ICON: f32 = 16.0;
 }
 
+/// A touch screen (a phone or a tablet, a mobile browser included): touch
+/// targets of 44 pt or more, 16 pt reading text, bigger icons.
+pub fn touch() -> bool {
+    matches!(
+        nsh_core::element::idiom(),
+        nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
+    )
+}
+
+/// Sizes that follow the input: pointer (desktop, web, terminal) or touch.
+pub mod fit {
+    use super::touch;
+
+    /// Reading text (messages, the composer). 16 on touch, which also keeps
+    /// mobile browsers from zooming into the composer.
+    pub fn read() -> f32 {
+        if touch() { 16.0 } else { super::text::READ }
+    }
+    pub fn read_lh() -> f32 {
+        if touch() { 24.0 } else { super::text::LH_READ }
+    }
+    /// Body and control text.
+    pub fn body() -> f32 {
+        if touch() { 15.0 } else { super::text::BASE }
+    }
+    /// Secondary text.
+    pub fn small() -> f32 {
+        if touch() { 13.0 } else { super::text::SM }
+    }
+    /// A bar at the top of a pane.
+    pub fn bar() -> f32 {
+        if touch() { 52.0 } else { 44.0 }
+    }
+    /// A list row.
+    pub fn row() -> f32 {
+        if touch() { 52.0 } else { super::size::ROW }
+    }
+    /// An icon's slot and glyph.
+    pub fn icon_slot() -> f32 {
+        if touch() { 22.0 } else { super::size::ICON }
+    }
+    pub fn icon_glyph() -> f32 {
+        if touch() { 18.0 } else { super::text::BASE }
+    }
+}
+
 /// Monospace for code, identifiers and keys.
 pub const MONO: &str = "monospace";

@@ -7,7 +7,7 @@ use nsh_core::element::AutoFill;
 use nsh_core::prelude::*;
 
 use super::motion;
-use super::theme::{MONO, Tone, colors, radius, size, text as type_scale};
+use super::theme::{MONO, Tone, colors, fit, radius, size, text as type_scale, touch};
 
 /// What a button means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,24 +34,29 @@ pub enum Size {
 }
 
 impl Size {
+    /// On touch every size is a full 44 pt target or more.
     fn height(self) -> f32 {
-        match self {
-            Self::Sm => size::CONTROL_SM,
-            Self::Md => size::CONTROL_MD,
+        match (self, touch()) {
+            (Self::Sm, false) => size::CONTROL_SM,
+            (Self::Md, false) => size::CONTROL_MD,
+            (Self::Sm, true) => 44.0,
+            (Self::Md, true) => 48.0,
         }
     }
 
     fn pad_x(self) -> f32 {
-        match self {
-            Self::Sm => 8.0,
-            Self::Md => 12.0,
+        match (self, touch()) {
+            (Self::Sm, false) => 8.0,
+            (Self::Md, false) => 12.0,
+            (_, true) => 16.0,
         }
     }
 
     fn text(self) -> f32 {
-        match self {
-            Self::Sm => type_scale::SM,
-            Self::Md => type_scale::BASE,
+        match (self, touch()) {
+            (Self::Sm, false) => type_scale::SM,
+            (Self::Md, false) => type_scale::BASE,
+            (_, true) => 15.0,
         }
     }
 }
@@ -109,13 +114,16 @@ fn frame(variant: Variant, size: Size, scale: f32) -> nsh_base::ButtonElement {
 
 /// A text button.
 pub fn btn(
-    label: impl IntoReactive<SharedString>,
+    label: impl Into<SharedString>,
     variant: Variant,
     size: Size,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let label = label.into();
     frame(variant, size, motion::PRESS_SCALE)
         .px(px(size.pad_x()))
+        // Screen readers take the name from here, not from the text inside.
+        .accessibility_label(label.clone())
         .on_press(on_press)
         .child(
             text(label)
@@ -129,15 +137,21 @@ pub fn btn(
 /// A button with a leading glyph.
 pub fn btn_icon(
     glyph: Glyph,
-    label: impl IntoReactive<SharedString>,
+    label: impl Into<SharedString>,
     variant: Variant,
     size: Size,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let label = label.into();
     frame(variant, size, motion::PRESS_SCALE)
         .px(px(size.pad_x()))
+        .accessibility_label(label.clone())
         .on_press(on_press)
-        .child(icon(glyph).text_color(ink(variant)))
+        .child(
+            icon(glyph)
+                .text_color(ink(variant))
+                .accessibility_elements_hidden(true),
+        )
         .child(
             text(label)
                 .text_size(px(size.text()))
@@ -161,13 +175,64 @@ pub fn icon_btn(
             .w(px(size.height()))
             .accessibility_label(label)
             .on_press(on_press)
-            .child(icon(glyph).text_color(colors::MUTED)),
+            .child(
+                icon(glyph)
+                    .text_color(colors::MUTED)
+                    .accessibility_elements_hidden(true),
+            ),
     )
 }
 
 /// `control` with the app's tooltip.
 pub fn with_hint(label: impl IntoReactive<SharedString>, control: impl IntoElement) -> View {
     view().tooltip(hint(label)).child(control)
+}
+
+/// A glyph button with a count over it (waiting approvals). `label` names
+/// it for screen readers, with the count.
+pub fn icon_btn_count(
+    glyph: Glyph,
+    label: &'static str,
+    count: impl Fn() -> usize + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> View {
+    with_hint(
+        label,
+        frame(Variant::Ghost, Size::Md, motion::PRESS_SCALE_ICON)
+            .w(px(Size::Md.height()))
+            .accessibility_label(move || {
+                Some(SharedString::from(match count() {
+                    0 => label.to_owned(),
+                    n => format!("{label}, {n} waiting"),
+                }))
+            })
+            .on_press(on_press)
+            .child(
+                icon(glyph)
+                    .text_color(colors::MUTED)
+                    .accessibility_elements_hidden(true),
+            )
+            .child(when(
+                move || count() > 0,
+                move || {
+                    text(move || count().to_string())
+                        .absolute()
+                        .top(px(4.0))
+                        .right(px(2.0))
+                        .min_w(px(18.0))
+                        .h(px(18.0))
+                        .px(px(4.0))
+                        .rounded_full()
+                        .text_center()
+                        .bg(colors::WARNING)
+                        .text_color(colors::ON_STATUS)
+                        .text_size(px(type_scale::XS))
+                        .line_height(px(18.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .accessibility_elements_hidden(true)
+                },
+            )),
+    )
 }
 
 /// The tooltip every control uses.
@@ -239,10 +304,10 @@ impl Glyph {
 /// A glyph in a fixed square slot, so rows keep their lanes.
 pub fn icon(glyph: Glyph) -> Text {
     text(glyph.symbol())
-        .w(px(size::ICON))
+        .w(px(fit::icon_slot()))
         .text_center()
-        .text_size(px(type_scale::BASE))
-        .line_height(px(size::ICON))
+        .text_size(px(fit::icon_glyph()))
+        .line_height(px(fit::icon_slot()))
 }
 
 /// A one-line text field.
@@ -255,9 +320,10 @@ pub fn field(placeholder: &'static str, value: Signal<String>) -> Input {
         .caret_color(|| color(colors::ACCENT))
         .selection_color(|| color(colors::ACCENT))
         .auto_fill(AutoFill::Off)
-        .h(px(size::CONTROL_MD))
+        .h(px(if touch() { 48.0 } else { size::CONTROL_MD }))
         .px_3()
-        .text_size(px(type_scale::BASE))
+        // 16 on touch: mobile browsers zoom into smaller fields.
+        .text_size(px(if touch() { 16.0 } else { type_scale::BASE }))
         .text_color(colors::TEXT)
         .rounded(px(radius::CONTROL))
         .bg(colors::SURFACE)
@@ -302,7 +368,7 @@ pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
             text(label)
                 .flex_1()
                 .min_w(px(0.0))
-                .text_size(px(type_scale::SM))
+                .text_size(px(fit::small()))
                 .number_of_lines(2)
                 .text_color(colors::MUTED),
         )
@@ -354,7 +420,7 @@ pub fn row(
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
     button()
-        .min_h(px(size::ROW))
+        .min_h(px(fit::row()))
         .flex_row()
         .items_center()
         .gap_2()
@@ -388,6 +454,7 @@ pub fn empty(title: &'static str, detail: impl IntoReactive<SharedString>) -> Vi
         .p_8()
         .child(
             text(title)
+                .role(AccessibilityRole::Header)
                 .text_size(px(type_scale::TITLE))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors::TEXT),
@@ -411,7 +478,8 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
             text("●")
                 .text_size(px(8.0))
                 .text_color(colors::ACCENT)
-                .animate_pulse(),
+                .animate_pulse()
+                .accessibility_elements_hidden(true),
         )
         .child(
             text(label)

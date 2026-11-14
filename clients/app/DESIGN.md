@@ -6,7 +6,8 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 - **Desktop and web: one family.** Pointer and keyboard first; compact controls (26/32 pt); persistent sidebar and inspector; hover on everything pressable; tooltips on icon-only controls; shortcuts for frequent commands.
 - **Terminal.** The same panes on whole cells; nsh maps the tokens to terminal colours by meaning. Every action has a key (Cmd/Ctrl+K palette, Cmd/Ctrl+N new, Cmd/Ctrl+B sidebar, Cmd/Ctrl+I activity, Esc stops). No radii or shadows are relied on to separate regions: hairlines and space do.
-- **Mobile** (later): iOS and Android sizes and navigation (a stack per conversation, sheets for the inspector and palette).
+- **Touch (phones, tablets, mobile browsers):** `ui::touch()` switches the size scale (`ui::fit`): controls and rows 44–52 pt, reading text 16 pt (mobile browsers zoom into smaller fields), icons 18 pt in 22 pt slots, 52 pt bars. A narrow window shows one thing at a time: the conversation, or the conversations or activity pane full-screen, reached from the header. Return adds a line; Send sends.
+- **Accessibility:** every control has a role and a name (text buttons name themselves; icon buttons take a label, which is also their tooltip and their terminal text). Decorative glyphs and dots are hidden from screen readers. Pane, conversation and card titles are headings. A conversation row reads as one item ("title, place, working"). Banners use the alert role.
 
 ## Tokens (`src/ui/theme.rs`)
 

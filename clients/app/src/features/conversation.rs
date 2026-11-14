@@ -121,10 +121,10 @@ fn header(store: Store, session: Option<String>) -> View {
     let stop = session.clone();
     let waiting = computed(move || store.approvals().len());
     view()
-        .h(px(44.0))
+        .h(px(ui::fit::bar()))
         .flex_row()
         .items_center()
-        .gap_2()
+        .gap_1()
         .px_2()
         .border_b_1()
         .border_color(colors::LINE)
@@ -144,19 +144,26 @@ fn header(store: Store, session: Option<String>) -> View {
             })
             .flex_1()
             .px_2()
+            .role(AccessibilityRole::Header)
             .number_of_lines(1)
-            .text_size(px(type_scale::BASE))
+            .text_size(px(ui::fit::body()))
             .font_weight(FontWeight::SEMIBOLD),
         )
         .child(when(
             move || running.as_deref().is_some_and(|id| store.is_running(id)),
             move || {
                 let stop = stop.clone();
-                btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, move || {
+                let press = move || {
                     if let Some(id) = &stop {
                         store.stop(id);
                     }
-                })
+                };
+                // A phone's bar keeps room for the title: Stop is a glyph.
+                if ui::touch() || store.is_compact() {
+                    ui::icon_btn(Glyph::Stop, "Stop", Size::Md, press).into_element()
+                } else {
+                    btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, press).into_element()
+                }
             },
         ))
         .child(when(
@@ -170,17 +177,12 @@ fn header(store: Store, session: Option<String>) -> View {
         .child(when(
             move || store.is_compact() || !store.inspector_open(),
             move || {
-                ui::btn_icon(
+                ui::icon_btn_count(
                     Glyph::Approval,
-                    move || match waiting.get() {
-                        0 => "Activity".to_owned(),
-                        n => format!("{n} waiting"),
-                    },
-                    Variant::Ghost,
-                    Size::Sm,
+                    "Activity",
+                    move || waiting.get(),
                     move || store.open_inspector(),
                 )
-                .accessibility_label("Activity")
             },
         ))
 }
@@ -267,8 +269,8 @@ fn user_bubble(content: impl Fn() -> String + 'static) -> View {
         .child(
             text(content)
                 .selectable(true)
-                .text_size(px(type_scale::READ))
-                .line_height(px(type_scale::LH_READ)),
+                .text_size(px(ui::fit::read()))
+                .line_height(px(ui::fit::read_lh())),
         )
 }
 
@@ -296,8 +298,8 @@ fn markdown(
         .links(TextViewLinks::Open)
         .selectable(true)
         .gap_3()
-        .text_size(px(type_scale::READ))
-        .line_height(px(type_scale::LH_READ))
+        .text_size(px(ui::fit::read()))
+        .line_height(px(ui::fit::read_lh()))
         .text_color(colors::TEXT)
 }
 
@@ -374,8 +376,8 @@ fn composer(store: Store, session: Option<String>) -> View {
                     .h(move || px(height.get() + 16.0))
                     .px(px(8.0))
                     .py(px(8.0))
-                    .text_size(px(type_scale::READ))
-                    .line_height(px(type_scale::LH_READ))
+                    .text_size(px(ui::fit::read()))
+                    .line_height(px(ui::fit::read_lh()))
                     .text_color(colors::TEXT)
                     .label("Message"),
             )

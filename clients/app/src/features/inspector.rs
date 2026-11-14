@@ -22,14 +22,15 @@ pub fn inspector(store: Store) -> View {
         .border_color(colors::LINE)
         .child(
             view()
-                .h(px(44.0))
+                .h(px(ui::fit::bar()))
                 .flex_row()
                 .items_center()
                 .px_4()
                 .child(
                     text("Activity")
                         .flex_1()
-                        .text_size(px(type_scale::BASE))
+                        .role(AccessibilityRole::Header)
+                        .text_size(px(ui::fit::body()))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(when(

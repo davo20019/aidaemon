@@ -18,7 +18,7 @@ pub fn sidebar(store: Store) -> View {
         .border_color(colors::LINE)
         .child(
             view()
-                .h(px(44.0))
+                .h(px(ui::fit::bar()))
                 .flex_row()
                 .items_center()
                 .px_3()
@@ -26,7 +26,8 @@ pub fn sidebar(store: Store) -> View {
                 .child(
                     text("AIdaemon")
                         .flex_1()
-                        .text_size(px(type_scale::BASE))
+                        .role(AccessibilityRole::Header)
+                        .text_size(px(ui::fit::body()))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
                 .child(
@@ -73,10 +74,24 @@ pub fn sidebar(store: Store) -> View {
 
 fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
     let (a, b, c, d, e) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+    let label_id = id.clone();
     row(
         move || store.selected().as_deref() == Some(a.as_str()),
         move || store.select(Some(b.clone())),
     )
+    // Read as one item: its name, where it lives and whether it is working.
+    .accessibility_label(move || {
+        let running = if store.is_running(&label_id) {
+            ", working"
+        } else {
+            ""
+        };
+        Some(SharedString::from(format!(
+            "{}, {}{running}",
+            store.title(&label_id),
+            store.place(&label_id)
+        )))
+    })
     .child(
         text(move || if store.is_running(&c) { "●" } else { "○" })
             .w(px(size::ICON))
@@ -97,12 +112,12 @@ fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
             .child(
                 text(move || store.title(&d))
                     .number_of_lines(1)
-                    .text_size(px(type_scale::BASE)),
+                    .text_size(px(ui::fit::body())),
             )
             .child(
                 text(move || store.place(&id))
                     .number_of_lines(1)
-                    .text_size(px(type_scale::XS))
+                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
                     .text_color(colors::FAINT),
             ),
     )
