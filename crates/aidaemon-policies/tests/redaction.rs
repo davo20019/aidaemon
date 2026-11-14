@@ -69,3 +69,45 @@ fn a_too_short_literal_is_an_error_not_a_silent_no_op() {
     let r = Redactor::default().secret("123456").unwrap();
     assert_eq!(r.redact("code 123456 end"), "code [REDACTED:secret] end");
 }
+
+/// A credential a tool printed is registered in the scope the redactor was
+/// given (the agent's own), not the process-wide set.
+#[tokio::test]
+async fn a_printed_credential_is_registered_in_the_redactors_scope() {
+    const PRINTED: &str = "Scope-Printed-Pass-58";
+    let scope = aidaemon_core::RedactionScope::isolated();
+    let tool = FnTool::new(
+        ToolSpec {
+            name: "install".into(),
+            description: "test".into(),
+            parameters: json!({"type": "object"}),
+        },
+        ToolAnnotations::READ_ONLY,
+        |_args: Value| {
+            std::future::ready(Ok(ToolOutput::text(format!(
+                "[success] User password: {PRINTED}"
+            ))))
+        },
+    );
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("c1", "install", json!({}))]),
+        text(format!("Your login is admin / {PRINTED}")),
+    ]));
+    let agent = Agent::builder("r")
+        .model("m")
+        .provider(provider)
+        .tool(tool)
+        .hook(Redactor::default().redaction_scope(scope.clone()))
+        .redaction_scope(scope.clone())
+        .allow_unguarded()
+        .build()
+        .unwrap();
+    let out = agent.run("s", "go").await.unwrap();
+    let final_text = out.final_text.unwrap();
+    assert!(!final_text.contains(PRINTED), "{final_text}");
+    assert_eq!(scope.redact(PRINTED), "[REDACTED:secret]");
+    assert_eq!(
+        aidaemon_core::redaction::redact_registered(PRINTED),
+        PRINTED
+    );
+}

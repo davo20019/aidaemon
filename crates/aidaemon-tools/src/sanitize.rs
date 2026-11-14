@@ -545,15 +545,24 @@ fn redact_secret_shapes(text: &str) -> String {
 /// a secret store handed out, and each credential a tool printed), then the
 /// credential shapes ([`redact_secrets_only`]). A credential seen here for
 /// the first time is registered, so it is hidden wherever it shows later.
+/// Uses the process-wide scope; see [`redact_for_owner_in`].
 pub fn redact_for_owner(text: &str) -> String {
-    let registered = aidaemon_core::redaction::redact_registered(text);
+    redact_for_owner_in(&aidaemon_core::RedactionScope::process(), text)
+}
+
+/// [`redact_for_owner`] with the secrets registered in `scope` (the agent's
+/// own, `AgentBuilder::redaction_scope`), where a credential seen here is
+/// registered too.
+pub fn redact_for_owner_in(scope: &aidaemon_core::RedactionScope, text: &str) -> String {
+    let registered = scope.redact(text);
     let hidden = redact_secrets_only(&registered);
     if hidden != registered.as_ref() {
         // What the labels hid is registered, so it stays hidden where it
         // shows later without a label.
         let shaped = redact_secret_shapes(&registered);
         for value in aidaemon_policies::labelled_credentials(&shaped) {
-            let _ = aidaemon_core::redaction::register_secret(value);
+            // Values under the minimum are never labelled credentials.
+            let _ = scope.register(value);
         }
     }
     hidden
@@ -562,16 +571,28 @@ pub fn redact_for_owner(text: &str) -> String {
 /// Every string in `value` through [`redact_for_owner`]: a platform
 /// request's body, whatever its fields are called.
 pub fn redact_json_for_owner(value: &mut serde_json::Value) {
+    redact_json_for_owner_in(&aidaemon_core::RedactionScope::process(), value);
+}
+
+/// [`redact_json_for_owner`] with the secrets registered in `scope`.
+pub fn redact_json_for_owner_in(
+    scope: &aidaemon_core::RedactionScope,
+    value: &mut serde_json::Value,
+) {
     use serde_json::Value;
     match value {
         Value::String(text) => {
-            let redacted = redact_for_owner(text);
+            let redacted = redact_for_owner_in(scope, text);
             if redacted != *text {
                 *text = redacted;
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(redact_json_for_owner),
-        Value::Object(map) => map.values_mut().for_each(redact_json_for_owner),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_json_for_owner_in(scope, item)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| redact_json_for_owner_in(scope, item)),
         _ => {}
     }
 }

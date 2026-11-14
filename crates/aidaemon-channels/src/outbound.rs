@@ -10,16 +10,30 @@
 //! the credential shapes the kernel's `Redactor` knows, and registers a
 //! labelled credential it sees for the first time.
 
-/// `text` as the owner may see it.
+/// `text` as the owner may see it, with the process-wide secrets
+/// ([`aidaemon_core::RedactionScope::process`]).
 pub fn redact_text(text: &str) -> String {
     aidaemon_tools::sanitize::redact_for_owner(text)
+}
+
+/// [`redact_text`] with the secrets registered in `scope`.
+pub fn redact_text_in(scope: &aidaemon_core::RedactionScope, text: &str) -> String {
+    aidaemon_tools::sanitize::redact_for_owner_in(scope, text)
 }
 
 /// A platform request's body with every string in it redacted, whatever
 /// its fields are called.
 pub fn redact_body(body: &serde_json::Value) -> serde_json::Value {
+    redact_body_in(&aidaemon_core::RedactionScope::process(), body)
+}
+
+/// [`redact_body`] with the secrets registered in `scope`.
+pub fn redact_body_in(
+    scope: &aidaemon_core::RedactionScope,
+    body: &serde_json::Value,
+) -> serde_json::Value {
     let mut body = body.clone();
-    aidaemon_tools::sanitize::redact_json_for_owner(&mut body);
+    aidaemon_tools::sanitize::redact_json_for_owner_in(scope, &mut body);
     body
 }
 

@@ -1,7 +1,8 @@
 //! Secret redaction at the kernel boundary.
 //!
-//! Every value registered here ([`register_secret`], which
-//! `aidaemon_secrets` calls for each secret it hands out) and everything a
+//! Every value registered in the agent's [`RedactionScope`] (by default the
+//! process-wide one, where [`register_secret`] puts a value and
+//! `aidaemon_secrets` registers each secret it hands out) and everything a
 //! hook's [`Redact`] recognizes (the policies crate's `Redactor`: credential
 //! shapes and literals) is replaced with `[REDACTED:...]` in what leaves the
 //! kernel:
@@ -21,7 +22,7 @@
 //! streamed text deltas.
 
 use std::borrow::Cow;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Secrets shorter than this are refused: redacting every `abc` would
 /// destroy output without protecting anything.
@@ -37,41 +38,118 @@ pub struct SecretTooShort {
     pub chars: usize,
 }
 
-fn registry() -> &'static RwLock<Vec<String>> {
-    static REGISTRY: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
-    REGISTRY.get_or_init(RwLock::default)
+/// A set of registered secrets: what an agent's runs redact, beside its
+/// hooks' [`Redact`]ers.
+///
+/// [`RedactionScope::process`] is the process-wide set, every agent's
+/// default ([`crate::AgentBuilder::redaction_scope`]) and the daemon's: a
+/// value registered there is hidden from every run in the process and is
+/// never removed. [`RedactionScope::isolated`] is a set of its own, for an
+/// agent (or a test) whose secrets must not reach other agents' runs, and
+/// whose runs must not depend on what other code registered. Give the same
+/// scope to everything that registers for that agent: its secret store and
+/// its `Redactor` hook. Cheap to clone; clones share the set.
+#[derive(Clone)]
+pub struct RedactionScope {
+    secrets: Arc<RwLock<Vec<String>>>,
 }
 
-/// Redact `value` from everything every run in this process sends out.
-/// Errors (and registers nothing) for a value under [`MIN_SECRET_CHARS`].
-pub fn register_secret(value: &str) -> Result<(), SecretTooShort> {
-    let chars = value.chars().count();
-    if chars < MIN_SECRET_CHARS {
-        return Err(SecretTooShort { chars });
+impl RedactionScope {
+    /// The process-wide set.
+    pub fn process() -> Self {
+        static PROCESS: OnceLock<RedactionScope> = OnceLock::new();
+        PROCESS.get_or_init(Self::isolated).clone()
     }
-    let mut secrets = registry()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !secrets.iter().any(|known| known == value) {
-        secrets.push(value.to_string());
-        // Longest first, so a secret that contains another is fully hidden.
-        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    }
-    Ok(())
-}
 
-/// `text` with every registered secret replaced by `[REDACTED:secret]`.
-pub fn redact_registered(text: &str) -> Cow<'_, str> {
-    let secrets = registry()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut out = Cow::Borrowed(text);
-    for secret in secrets.iter() {
-        if out.contains(secret.as_str()) {
-            out = Cow::Owned(out.replace(secret.as_str(), "[REDACTED:secret]"));
+    /// A new, empty set shared with no one but its clones.
+    pub fn isolated() -> Self {
+        Self {
+            secrets: Arc::default(),
         }
     }
-    out
+
+    /// Whether this is the process-wide set.
+    pub fn is_process(&self) -> bool {
+        Arc::ptr_eq(&self.secrets, &Self::process().secrets)
+    }
+
+    /// Redact `value` from everything this scope's runs send out. Errors
+    /// (and registers nothing) for a value under [`MIN_SECRET_CHARS`].
+    pub fn register(&self, value: &str) -> Result<(), SecretTooShort> {
+        let chars = value.chars().count();
+        if chars < MIN_SECRET_CHARS {
+            return Err(SecretTooShort { chars });
+        }
+        let mut secrets = self
+            .secrets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !secrets.iter().any(|known| known == value) {
+            secrets.push(value.to_string());
+            // Longest first, so a secret that contains another is fully hidden.
+            secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        }
+        Ok(())
+    }
+
+    /// `text` with every secret in this scope replaced by
+    /// `[REDACTED:secret]`.
+    pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let secrets = self
+            .secrets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = Cow::Borrowed(text);
+        for secret in secrets.iter() {
+            if out.contains(secret.as_str()) {
+                out = Cow::Owned(out.replace(secret.as_str(), "[REDACTED:secret]"));
+            }
+        }
+        out
+    }
+
+    /// How many secrets are registered.
+    pub fn len(&self) -> usize {
+        self.secrets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The process-wide set, as for an agent that names none.
+impl Default for RedactionScope {
+    fn default() -> Self {
+        Self::process()
+    }
+}
+
+/// Never the values: which set it is and how many it holds.
+impl std::fmt::Debug for RedactionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedactionScope")
+            .field("process", &self.is_process())
+            .field("secrets", &self.len())
+            .finish()
+    }
+}
+
+/// Register `value` in the process-wide scope
+/// ([`RedactionScope::process`]), which every agent uses unless it is given
+/// another. Errors (and registers nothing) for a value under
+/// [`MIN_SECRET_CHARS`].
+pub fn register_secret(value: &str) -> Result<(), SecretTooShort> {
+    RedactionScope::process().register(value)
+}
+
+/// `text` with every secret registered in the process-wide scope replaced
+/// by `[REDACTED:secret]`.
+pub fn redact_registered(text: &str) -> Cow<'_, str> {
+    RedactionScope::process().redact(text)
 }
 
 /// Something that hides secrets in text. A hook offers one through
@@ -80,16 +158,17 @@ pub trait Redact: Send + Sync {
     fn redact(&self, text: &str) -> String;
 }
 
-/// The kernel's one redaction pass: the registry, then every hook's
-/// [`Redact`].
+/// The kernel's one redaction pass: the agent's [`RedactionScope`], then
+/// every hook's [`Redact`].
 pub(crate) struct Scrubber<'a> {
+    pub scope: &'a RedactionScope,
     pub hooks: &'a [std::sync::Arc<dyn crate::Hook>],
 }
 
 impl Scrubber<'_> {
     /// `text` redacted, or `None` when nothing changed.
     fn changed(&self, text: &str) -> Option<String> {
-        let mut out = match redact_registered(text) {
+        let mut out = match self.scope.redact(text) {
             Cow::Borrowed(_) => None,
             Cow::Owned(owned) => Some(owned),
         };

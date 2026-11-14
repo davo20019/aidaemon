@@ -129,6 +129,7 @@ impl<'a> Driver<'a> {
         // What the caller put in (the user's message, an earlier run's
         // transcript) is redacted before anything reads it.
         let scrub = crate::redaction::Scrubber {
+            scope: &agent.redaction,
             hooks: &agent.hooks,
         };
         for message in &mut state.messages {
@@ -1586,6 +1587,7 @@ impl<'a> Driver<'a> {
 
     fn scrubber(&self) -> crate::redaction::Scrubber<'_> {
         crate::redaction::Scrubber {
+            scope: &self.agent.redaction,
             hooks: &self.agent.hooks,
         }
     }
@@ -2054,6 +2056,7 @@ impl HookGuard<'_> {
     async fn record(&self, event: Event) {
         let mut event = event;
         crate::redaction::Scrubber {
+            scope: &self.agent.redaction,
             hooks: &self.agent.hooks,
         }
         .json(&mut event);

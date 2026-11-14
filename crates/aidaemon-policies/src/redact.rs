@@ -33,6 +33,7 @@ pub(crate) const MIN_LITERAL_LEN: usize = aidaemon_core::redaction::MIN_SECRET_C
 pub struct Redactor {
     patterns: Vec<(&'static str, Regex)>,
     literals: Vec<String>,
+    scope: aidaemon_core::RedactionScope,
 }
 
 impl Default for Redactor {
@@ -122,7 +123,17 @@ impl Redactor {
         Self {
             patterns: secret_patterns().to_vec(),
             literals: Vec::new(),
+            scope: aidaemon_core::RedactionScope::process(),
         }
+    }
+
+    /// Where a credential a tool printed is registered, so it stays hidden
+    /// wherever it shows later: the agent's own scope
+    /// (`AgentBuilder::redaction_scope`). The default is the process-wide
+    /// set.
+    pub fn redaction_scope(mut self, scope: aidaemon_core::RedactionScope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// The `(kind, pattern)` sources in use, for tests.
@@ -216,7 +227,8 @@ impl Hook for Redactor {
         // sends.
         let shaped = self.redact_shapes(&output.content);
         for value in labelled_credentials(&shaped) {
-            let _ = aidaemon_core::redaction::register_secret(value);
+            // Values under the minimum are never labelled credentials.
+            let _ = self.scope.register(value);
         }
         output.content = redact_labelled_credentials(&shaped);
     }
