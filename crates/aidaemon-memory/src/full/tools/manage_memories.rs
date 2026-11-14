@@ -8,14 +8,15 @@ use std::sync::Arc;
 use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::OutcomeTool as Tool;
 use aidaemon_tools::semantics::{
-    ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects, ToolOutcomeStatus, semantics_for_exact_read_actions,
+    ApprovalCall, OwnerApprovalNeed, ToolCallContext, ToolCallMetadata, ToolCallOutcome,
+    ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolOutcomeStatus,
+    semantics_for_exact_read_actions,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::records::FactPrivacy;
+use crate::records::{Fact, FactPrivacy};
 use crate::stores::MemoryStores;
 
 /// The actions this tool runs.
@@ -75,6 +76,58 @@ pub struct ManageMemoriesTool {
 impl ManageMemoriesTool {
     pub fn new(store: Arc<dyn MemoryStores>) -> Self {
         Self { store }
+    }
+
+    /// The active fact a `set_privacy` call names, if any.
+    async fn find_fact(&self, category: &str, key: &str) -> anyhow::Result<Option<Fact>> {
+        Ok(self
+            .store
+            .get_facts(Some(category))
+            .await?
+            .into_iter()
+            .find(|f| f.key == key && f.superseded_at.is_none()))
+    }
+
+    /// The owner card for a `set_privacy` call that widens who may see a
+    /// fact; narrowing, a call naming no active fact, and every other
+    /// action need none. The subject is the exact arguments approved.
+    pub async fn privacy_approval(&self, arguments: &Value) -> OwnerApprovalNeed {
+        let Ok(args) = serde_json::from_value::<ManageArgs>(arguments.clone()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let (Some(category), Some(key), Some(privacy)) = (
+            args.category.as_deref(),
+            args.key.as_deref(),
+            args.privacy.as_deref(),
+        ) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        if args.action != "set_privacy" {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let to = FactPrivacy::from_str_lossy(privacy);
+        let value = match self.find_fact(category, key).await {
+            Ok(Some(fact)) if fact.privacy.widens_to(to) => {
+                format!(" = \"{}\"", crate::text::truncate_chars(&fact.value, 83))
+            }
+            Ok(_) => return OwnerApprovalNeed::NotNeeded,
+            // The lookup failed: ask with what the call names rather than
+            // waving it through (the run reads the store again).
+            Err(_) => String::new(),
+        };
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
+            effects: Vec::new(),
+            summary: format!("Make memory {to}: [{category}] {key}{value}"),
+            subject: json!({"action": "set_privacy", "category": category, "key": key, "privacy": to.to_string()})
+                .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![match to {
+                FactPrivacy::Global => "This will make this memory visible across all channels",
+                _ => "This will make this memory visible in its channel, not only in DMs",
+            }
+            .to_string()],
+        })
     }
 }
 
@@ -206,6 +259,18 @@ impl aidaemon_tools::semantics::ToolSemantics for ManageMemoriesTool {
             idempotent: false,
             high_impact_write: true,
         }
+    }
+
+    /// `set_privacy` asks the owner when it widens who may see a fact.
+    async fn owner_approval_request(
+        &self,
+        call: &ApprovalCall<'_>,
+        _facts: &ToolCallContext,
+    ) -> OwnerApprovalNeed {
+        if call.refused {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        self.privacy_approval(call.arguments).await
     }
 
     /// Reads, `repair` and `forget` touch only the agent's own memory
@@ -439,13 +504,19 @@ impl ManageMemoriesTool {
                 })?;
                 let privacy = FactPrivacy::from_str_lossy(privacy_str);
 
-                let facts = self.store.get_facts(Some(category)).await?;
-                let fact = facts
-                    .iter()
-                    .find(|f| f.key == key && f.superseded_at.is_none());
+                let fact = self.find_fact(category, key).await?;
 
                 match fact {
                     Some(f) => {
+                        // The kernel asked the owner before a widening
+                        // runs; one that reaches here without its
+                        // judgment is refused.
+                        if f.privacy.widens_to(privacy) && facts.kernel_approved.is_none() {
+                            anyhow::bail!(
+                                "widening a memory's privacy requires approval through the agent \
+                                 kernel; it was called outside an approved agent call"
+                            );
+                        }
                         self.store.update_fact_privacy(f.id, privacy).await?;
                         Ok(format!(
                             "Updated privacy: [{}] {} → {}",
@@ -648,5 +719,82 @@ mod tests {
         assert!(!compact.contains('\t'));
         assert!(compact.chars().count() <= 180);
         assert!(compact.ends_with("..."));
+    }
+
+    async fn tool_with_channel_fact() -> (Arc<crate::sqlite::SqliteMemory>, ManageMemoriesTool) {
+        use crate::stores::FactStore as _;
+        let store = crate::full::tools::test_support::memory().await;
+        store
+            .upsert_fact(
+                "preference",
+                "report_format",
+                "short summaries for Alice Rivera",
+                "owner",
+                Some("telegram:synthetic-channel-1"),
+                FactPrivacy::Channel,
+            )
+            .await
+            .unwrap();
+        (store.clone(), ManageMemoriesTool::new(store))
+    }
+
+    async fn privacy_of(store: &crate::sqlite::SqliteMemory) -> FactPrivacy {
+        use crate::stores::FactStore as _;
+        store.get_facts(Some("preference")).await.unwrap()[0].privacy
+    }
+
+    #[tokio::test]
+    async fn widening_privacy_asks_with_its_exact_arguments() {
+        let (_, tool) = tool_with_channel_fact().await;
+        let args = json!({"action": "set_privacy", "category": "preference", "key": "report_format", "privacy": "global"});
+        let OwnerApprovalNeed::Ask(request) = tool.privacy_approval(&args).await else {
+            panic!("widening a fact must ask");
+        };
+        assert_eq!(
+            request.summary,
+            "Make memory global: [preference] report_format = \"short summaries for Alice Rivera\""
+        );
+        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::High);
+        let subject: Value = serde_json::from_str(&request.subject).unwrap();
+        assert_eq!(subject, args);
+        for narrower in [
+            json!({"action": "set_privacy", "category": "preference", "key": "report_format", "privacy": "private"}),
+            json!({"action": "set_privacy", "category": "preference", "key": "absent", "privacy": "global"}),
+            json!({"action": "list"}),
+        ] {
+            assert!(matches!(
+                tool.privacy_approval(&narrower).await,
+                OwnerApprovalNeed::NotNeeded
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn widening_without_the_kernel_is_refused_and_narrowing_is_not() {
+        let (store, tool) = tool_with_channel_fact().await;
+        let widen = r#"{"action":"set_privacy","category":"preference","key":"report_format","privacy":"global"}"#;
+        let err = tool
+            .run(widen, &ToolCallContext::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires approval through the agent kernel"),
+            "{err}"
+        );
+        assert_eq!(privacy_of(&store).await, FactPrivacy::Channel);
+        tool.run(
+            widen,
+            &ToolCallContext {
+                kernel_approved: Some(aidaemon_tools::semantics::ApprovalScope::Call),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(privacy_of(&store).await, FactPrivacy::Global);
+        let narrow = r#"{"action":"set_privacy","category":"preference","key":"report_format","privacy":"private"}"#;
+        tool.run(narrow, &ToolCallContext::default()).await.unwrap();
+        assert_eq!(privacy_of(&store).await, FactPrivacy::Private);
     }
 }

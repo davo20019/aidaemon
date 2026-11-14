@@ -38,6 +38,18 @@ impl FactPrivacy {
             _ => Self::Global,
         }
     }
+
+    /// Whether moving a fact from `self` to `to` lets more chats see it.
+    pub fn widens_to(self, to: Self) -> bool {
+        fn reach(privacy: FactPrivacy) -> u8 {
+            match privacy {
+                FactPrivacy::Private => 0,
+                FactPrivacy::Channel => 1,
+                FactPrivacy::Global => 2,
+            }
+        }
+        reach(to) > reach(self)
+    }
 }
 
 /// A fact stored in Layer 2 memory.

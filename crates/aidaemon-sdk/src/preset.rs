@@ -30,7 +30,7 @@
 //! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`] over the workspace, [`EgressGuard`], [`ApprovalPolicy`] (`DestructiveOnly`), [`Redactor`], [`UntrustedOutput`] | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
-//! | Memory | none | [`Preset::with_memory`] (feature `memory`, on by default): aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus the `remember_fact`, `manage_memories`, `manage_people` and `share_memory` tools), kept in memory; [`Preset::memory_path`]: the same in a SQLite file, where it also learns in the background (episodes, fact consolidation, decay, on the agent's provider); [`Preset::memory`]: any [`MemorySystem`]. A memory system's `services()` run while the agent lives |
+//! | Memory | none | [`Preset::with_memory`] (feature `memory`, on by default): aidaemon's full memory system (`aidaemon_memory::full::FullMemory`: recall plus the `remember_fact`, `manage_memories` and `manage_people` tools), kept in memory; [`Preset::memory_path`]: the same in a SQLite file, where it also learns in the background (episodes, fact consolidation, decay, on the agent's provider); [`Preset::memory`]: any [`MemorySystem`]. A memory system's `services()` run while the agent lives |
 //! | Anything else | | [`Preset::hook`], [`Preset::configure`] (the [`AgentBuilder`]) |
 //!
 //! A destructive call pauses the run for the owner
@@ -404,9 +404,9 @@ impl Preset {
     }
 
     /// Long-term memory: aidaemon's full memory system, kept in memory for
-    /// the life of the agent. It offers the model four tools
-    /// (`remember_fact`, `manage_memories`, `manage_people`,
-    /// `share_memory`) and adds recall to every request.
+    /// the life of the agent. It offers the model three tools
+    /// (`remember_fact`, `manage_memories`, `manage_people`) and adds
+    /// recall to every request.
     #[cfg(feature = "memory")]
     pub fn with_memory(mut self) -> Self {
         self.memory = MemoryChoice::Default(None);

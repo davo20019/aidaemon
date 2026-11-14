@@ -333,11 +333,11 @@ mod tests {
         assert_eq!(decision, RuleDecision::Defer);
     }
 
-    /// Sharing a stored memory asks the owner in every session; a call
-    /// naming no active fact changes nothing and needs no card, nor does a
-    /// call the dispatcher refuses.
+    /// Widening who may see a stored memory asks the owner in every
+    /// session; narrowing it, a call naming no active fact and a call the
+    /// dispatcher refuses need no card.
     #[tokio::test]
-    async fn share_memory_asks_before_widening_a_memory() {
+    async fn set_privacy_asks_before_widening_a_memory() {
         use crate::traits::ToolSemantics;
         use aidaemon_memory::stores::FactStore as _;
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -361,7 +361,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let tool = Arc::new(crate::tools::ShareMemoryTool::new(facts));
+        let tool = Arc::new(aidaemon_memory::full::tools::ManageMemoriesTool::new(facts));
+        let set = |key: &str, privacy: &str| json!({"action": "set_privacy", "category": "preference", "key": key, "privacy": privacy});
         for trusted in [false, true] {
             let rules = AppApprovalRules {
                 tools: ApprovalTools::new([tool.clone() as Arc<dyn crate::traits::Tool>]),
@@ -369,27 +370,25 @@ mod tests {
                 mandate_preapproved: trusted,
                 ..AppApprovalRules::default()
             };
-            let share = sdk::ToolCall::new(
-                "c1",
-                "share_memory",
-                json!({"category": "preference", "key": "report_format"}),
-            );
-            let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &share, &tool_info()).await
+            let widen = sdk::ToolCall::new("c1", "manage_memories", set("report_format", "global"));
+            let RuleDecision::Ask(request) = rules.judge(&hook_ctx(), &widen, &tool_info()).await
             else {
-                panic!("sharing must ask (trusted={trusted})");
+                panic!("widening must ask (trusted={trusted})");
             };
             assert_eq!(request.risk, sdk::ApprovalRisk::High);
-            let missing = sdk::ToolCall::new(
-                "c2",
-                "share_memory",
-                json!({"category": "preference", "key": "absent"}),
-            );
-            assert_eq!(
-                rules.judge(&hook_ctx(), &missing, &tool_info()).await,
-                RuleDecision::Allow
-            );
+            for (id, args) in [
+                ("c2", set("absent", "global")),
+                ("c3", set("report_format", "private")),
+            ] {
+                let call = sdk::ToolCall::new(id, "manage_memories", args);
+                assert_eq!(
+                    rules.judge(&hook_ctx(), &call, &tool_info()).await,
+                    RuleDecision::Allow,
+                    "{id}"
+                );
+            }
         }
-        let args = json!({"category": "preference", "key": "report_format"});
+        let args = set("report_format", "global");
         let refused = crate::traits::ApprovalCall {
             refused: true,
             ..crate::traits::ApprovalCall::as_sent(&args)

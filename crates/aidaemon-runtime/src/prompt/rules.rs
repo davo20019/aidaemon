@@ -24,6 +24,8 @@ pub struct ChannelRulesFacts<'a> {
     /// Whether the memory system owns `manage_memories` (its search and
     /// list actions); goal actions stay on it under any memory system.
     pub memory_owns_manage_memories: bool,
+    /// Whether the agent has `goal_trace` (registered with diagnostics on).
+    pub has_goal_trace: bool,
 }
 
 pub fn infer_assistant_name_from_prompt(prompt: &str) -> Option<String> {
@@ -436,10 +438,16 @@ pub fn channel_rules(
          \n\
          [Recall Priority]\n\
          For questions about recent conversation (for example: \"what did I just ask\", \"what were the last 3 things\", \"summarize our chat\"), use the conversation history already in context FIRST.\n\
-         Do NOT jump to goal/task forensics tools for simple recall.\n\
-         Use `goal_trace` when the user asks about execution history, logs, task timelines, tool failures, retries, \
-         what happened with a previous task, or anything about database/DB logs.\n\
-         \n\
+         Do NOT jump to goal/task forensics tools for simple recall.\n",
+    );
+    if facts.has_goal_trace {
+        rules.push_str(
+            "Use `goal_trace` when the user asks about execution history, logs, task timelines, tool failures, retries, \
+             what happened with a previous task, or anything about database/DB logs.\n",
+        );
+    }
+    rules.push_str(
+        "\n\
          [Self-Inspection]\n\
          You cannot directly access your own database files. Do NOT use terminal to run `find`, `ls`, `sqlite3`, or any command \
          to locate or open database files. Your database is encrypted and not accessible via terminal.\n\
@@ -456,9 +464,15 @@ pub fn channel_rules(
     }
     rules.push_str(
         "- `manage_automations` — scheduled tasks, reminders, mandates and health checks: list, show, edit, pause, resume, cancel, run now, run history, last failure\n\
-         - `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n\
-         - `goal_trace` — execution forensics: `action: \"goal_trace\"` for task timelines; `action: \"tool_trace\"` for per-tool call details\n\
-         When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
+         - `manage_mandates` — create or inspect owner-confirmed mandates; use typed `autonomy_mode: \"autopilot\"` for a hands-off posture, and never infer or widen operation/account authority from that mode\n",
+    );
+    if facts.has_goal_trace {
+        rules.push_str(
+            "- `goal_trace` — execution forensics: `action: \"goal_trace\"` for task timelines; `action: \"tool_trace\"` for per-tool call details\n",
+        );
+    }
+    rules.push_str(
+        "When the user asks to \"check the logs\", \"look in the DB\", \"what happened with X task\", or similar, \
          use these tools — never try to find raw database files.",
     );
 

@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 /// tools are dropped with a warn.
 ///
 /// A declared tool can be missing for ordinary reasons: config disables it
-/// (`git_info` and `project_inspect` are off by default), or the surface does
+/// (`[tools].disabled`), or the surface does
 /// not offer it. That is logged at debug, not warn, so it does not repeat on
 /// every spawn. Misspelled names in the bundled specialists are caught by
 /// `bundled_specialists_name_only_real_tools` instead.

@@ -2491,8 +2491,6 @@ async fn history_traces_and_skill_resources_are_untrusted() {
     let roots = TrustRoots::new(&roots).with_cwd(Some("/tmp/aidaemon-test/ws"));
     let history = crate::tools::SearchHistoryTool::new(harness.state.clone(), 30);
     assert_eq!(history.output_trust(r#"{"query":"x"}"#, &roots), Untrusted);
-    let tool_trace = crate::tools::ToolTraceTool::new(harness.state.clone());
-    assert_eq!(tool_trace.output_trust("{}", &roots), Untrusted);
     let goal_trace = crate::tools::GoalTraceTool::new(harness.state.clone());
     assert_eq!(goal_trace.output_trust("{}", &roots), Untrusted);
     let skills = crate::tools::SkillResourcesTool::new(

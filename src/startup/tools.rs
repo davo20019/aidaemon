@@ -22,13 +22,11 @@ use crate::tools::ReadChannelHistoryTool;
 use crate::tools::terminal::ApprovalRequest;
 use crate::tools::{
     CheckEnvironmentTool, CliAgentTool, ConfigManagerTool, DiagnoseTool, EditFileTool,
-    GenerateImageTool, GitCommitTool, GitInfoTool, GoalTraceTool, HealthProbeTool, HttpRequestTool,
-    ListCheckpointsTool, ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool,
-    ManageMandatesTool, ManageMcpTool, ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool,
-    PolicyMetricsTool, ProjectInspectTool, ReadFileTool, RememberFactTool, RunCommandTool,
-    SearchFilesTool, SearchHistoryTool, SendFileTool, ServiceStatusTool, ShareMemoryTool,
-    SpawnAgentTool, SystemInfoTool, TerminalTool, ToolTraceTool, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    GenerateImageTool, GoalTraceTool, HealthProbeTool, HttpRequestTool, ListCheckpointsTool,
+    ManageApiTool, ManageCliAgentsTool, ManageHttpAuthTool, ManageMandatesTool, ManageMcpTool,
+    ManageMemoriesTool, ManageOAuthTool, ManagePeopleTool, PolicyMetricsTool, ReadFileTool,
+    RememberFactTool, RunCommandTool, SearchFilesTool, SearchHistoryTool, SendFileTool,
+    SpawnAgentTool, SystemInfoTool, TerminalTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use crate::traits::Tool;
 use crate::traits::store_prelude::*;
@@ -227,16 +225,12 @@ enum BaseToolId {
     SystemInfo,
     Terminal,
     RememberFact,
-    ShareMemory,
     ManageMemories,
     SetReminder,
     ScheduleTask,
     ManageMandates,
     ManageAutomations,
     SearchHistory,
-    GoalTrace,
-    ToolTrace,
-    PolicyMetrics,
     ConfigManager,
     WebFetch,
     WebSearch,
@@ -244,12 +238,8 @@ enum BaseToolId {
     WriteFile,
     EditFile,
     SearchFiles,
-    ProjectInspect,
     RunCommand,
-    GitInfo,
-    GitCommit,
     CheckEnvironment,
-    ServiceStatus,
 }
 
 struct BaseToolSpec {
@@ -269,10 +259,6 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::RememberFact,
         name: "remember_fact",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ShareMemory,
-        name: "share_memory",
     },
     BaseToolSpec {
         id: BaseToolId::ManageMemories,
@@ -297,18 +283,6 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
     BaseToolSpec {
         id: BaseToolId::SearchHistory,
         name: "search_history",
-    },
-    BaseToolSpec {
-        id: BaseToolId::GoalTrace,
-        name: "goal_trace",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ToolTrace,
-        name: "tool_trace",
-    },
-    BaseToolSpec {
-        id: BaseToolId::PolicyMetrics,
-        name: "policy_metrics",
     },
     BaseToolSpec {
         id: BaseToolId::ConfigManager,
@@ -339,34 +313,20 @@ const BASE_TOOL_REGISTRY: &[BaseToolSpec] = &[
         name: "search_files",
     },
     BaseToolSpec {
-        id: BaseToolId::ProjectInspect,
-        name: "project_inspect",
-    },
-    BaseToolSpec {
         id: BaseToolId::RunCommand,
         name: "run_command",
     },
     BaseToolSpec {
-        id: BaseToolId::GitInfo,
-        name: "git_info",
-    },
-    BaseToolSpec {
-        id: BaseToolId::GitCommit,
-        name: "git_commit",
-    },
-    BaseToolSpec {
         id: BaseToolId::CheckEnvironment,
         name: "check_environment",
-    },
-    BaseToolSpec {
-        id: BaseToolId::ServiceStatus,
-        name: "service_status",
     },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount, strum::EnumIter)]
 enum OptionalToolId {
     Diagnose,
+    GoalTrace,
+    PolicyMetrics,
     NodeHealth,
     NodeSensors,
     NodeAudio,
@@ -443,6 +403,16 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
     OptionalToolSpec {
         id: OptionalToolId::Diagnose,
         name: "self_diagnose",
+        enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::GoalTrace,
+        name: "goal_trace",
+        enabled_if: optional_enabled_diagnostics,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::PolicyMetrics,
+        name: "policy_metrics",
         enabled_if: optional_enabled_diagnostics,
     },
     OptionalToolSpec {
@@ -753,6 +723,18 @@ pub async fn register_optional_tools(
                     config.diagnostics.max_events,
                     config.diagnostics.include_raw_tool_args,
                 )));
+            }
+            OptionalToolId::GoalTrace => {
+                if !config.tools.is_enabled("goal_trace") {
+                    continue;
+                }
+                tools.push(Arc::new(GoalTraceTool::new(state.clone())));
+            }
+            OptionalToolId::PolicyMetrics => {
+                if !config.tools.is_enabled("policy_metrics") {
+                    continue;
+                }
+                tools.push(Arc::new(PolicyMetricsTool));
             }
             OptionalToolId::NodeSensors => {
                 if !config.tools.is_enabled("read_node_sensors") {
@@ -1224,10 +1206,6 @@ async fn build_base_tool(
             tool: Arc::new(RememberFactTool::new(memory.store.clone())),
             terminal_tool: None,
         },
-        BaseToolId::ShareMemory => BuiltBaseTool {
-            tool: Arc::new(ShareMemoryTool::new(memory.store.clone())),
-            terminal_tool: None,
-        },
         BaseToolId::ManageMemories => BuiltBaseTool {
             tool: Arc::new(ManageMemoriesTool::new(state, memory.store.clone())),
             terminal_tool: None,
@@ -1270,18 +1248,6 @@ async fn build_base_tool(
             },
             terminal_tool: None,
         },
-        BaseToolId::GoalTrace => BuiltBaseTool {
-            tool: Arc::new(GoalTraceTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::ToolTrace => BuiltBaseTool {
-            tool: Arc::new(ToolTraceTool::new(state)),
-            terminal_tool: None,
-        },
-        BaseToolId::PolicyMetrics => BuiltBaseTool {
-            tool: Arc::new(PolicyMetricsTool),
-            terminal_tool: None,
-        },
         BaseToolId::ConfigManager => BuiltBaseTool {
             tool: Arc::new(ConfigManagerTool::new(
                 crate::config::config_file(config_path),
@@ -1313,28 +1279,12 @@ async fn build_base_tool(
             tool: Arc::new(SearchFilesTool::on_backend(execution_backend, daemon_paths)),
             terminal_tool: None,
         },
-        BaseToolId::ProjectInspect => BuiltBaseTool {
-            tool: Arc::new(ProjectInspectTool::new(execution_backend)),
-            terminal_tool: None,
-        },
         BaseToolId::RunCommand => BuiltBaseTool {
             tool: Arc::new(RunCommandTool::new(execution_backend)),
             terminal_tool: None,
         },
-        BaseToolId::GitInfo => BuiltBaseTool {
-            tool: Arc::new(GitInfoTool::new(execution_backend)),
-            terminal_tool: None,
-        },
-        BaseToolId::GitCommit => BuiltBaseTool {
-            tool: Arc::new(GitCommitTool::new(execution_backend)),
-            terminal_tool: None,
-        },
         BaseToolId::CheckEnvironment => BuiltBaseTool {
             tool: Arc::new(CheckEnvironmentTool::new(execution_backend)),
-            terminal_tool: None,
-        },
-        BaseToolId::ServiceStatus => BuiltBaseTool {
-            tool: Arc::new(ServiceStatusTool::new(execution_backend)),
             terminal_tool: None,
         },
     };
@@ -1817,7 +1767,7 @@ mod tests {
             [provider]
             api_key = "test-key"
             [tools]
-            disabled = ["policy_metrics", "goal_trace", "check_environment"]
+            disabled = ["web_search", "check_environment"]
             "#,
         )
         .unwrap();
@@ -1858,10 +1808,25 @@ mod tests {
         .unwrap();
 
         let names: Vec<&str> = bundle.tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"policy_metrics"));
-        assert!(!names.contains(&"goal_trace"));
+        assert!(!names.contains(&"web_search"));
         assert!(!names.contains(&"check_environment"));
         assert!(names.contains(&"terminal"));
+    }
+
+    #[tokio::test]
+    async fn forensics_tools_register_only_with_diagnostics() {
+        for diagnostics in [false, true] {
+            let schemas = build_tool_schemas_for_contract_validation(diagnostics, false, false)
+                .await
+                .unwrap();
+            let names: Vec<&str> = schemas
+                .iter()
+                .filter_map(|schema| schema["function"]["name"].as_str())
+                .collect();
+            for tool in ["goal_trace", "policy_metrics", "self_diagnose"] {
+                assert_eq!(names.contains(&tool), diagnostics, "{tool}");
+            }
+        }
     }
 
     #[tokio::test]

@@ -8,5 +8,4 @@ pub mod manage_mandates;
 pub mod mandate_review;
 pub mod objective_status;
 pub mod scheduled_goal_runs;
-pub mod tool_trace;
 pub mod track_requirements;

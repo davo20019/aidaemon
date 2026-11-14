@@ -11,12 +11,7 @@ use async_trait::async_trait;
 
 /// The daemon's built-in memory tools. Offered only while the active plugin
 /// lists them in [`MemoryParts::owned_daemon_tools`].
-pub const DAEMON_MEMORY_TOOLS: &[&str] = &[
-    "remember_fact",
-    "manage_memories",
-    "manage_people",
-    "share_memory",
-];
+pub const DAEMON_MEMORY_TOOLS: &[&str] = &["remember_fact", "manage_memories", "manage_people"];
 
 /// `manage_memories` actions that manage goals, not memory. They stay with
 /// the daemon whatever the plugin: under a plugin that does not own

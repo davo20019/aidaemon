@@ -828,14 +828,9 @@ async fn channel_round_trip(subject: Subject, dir: PathBuf) -> Result<(), String
 }
 
 /// The daemon memory's own tools.
-const FULL_MEMORY_TOOLS: [&str; 4] = [
-    "remember_fact",
-    "manage_memories",
-    "manage_people",
-    "share_memory",
-];
+const FULL_MEMORY_TOOLS: [&str; 3] = ["remember_fact", "manage_memories", "manage_people"];
 
-/// 7. (FullMemory) The four memory tools are offered.
+/// 7. (FullMemory) The three memory tools are offered.
 async fn full_memory_tools(subject: Subject, dir: PathBuf) -> Result<(), String> {
     let provider = scripted([text("ok")]);
     let agent = subject

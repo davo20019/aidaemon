@@ -135,7 +135,7 @@ pub fn is_recoverable_checkpoint_scope_failure(text: &str) -> bool {
 fn is_file_lookup_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "read_file" | "write_file" | "edit_file" | "search_files" | "project_inspect" | "send_file"
+        "read_file" | "write_file" | "edit_file" | "search_files" | "send_file"
     )
 }
 

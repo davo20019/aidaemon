@@ -56,7 +56,7 @@ pub fn evidence_capabilities_for_tool_call(
     }
 
     match tool_name {
-        "goal_trace" | "tool_trace" => {
+        "goal_trace" => {
             let targeted = string_argument(arguments, "goal_id").is_some()
                 || string_argument(arguments, "task_id").is_some();
             if targeted {
@@ -175,23 +175,11 @@ pub fn evidence_capabilities_for_tool_call(
             // before filesystem I/O and is therefore a host-local outcome.
             capability(HostLocal, &[Outcome], Direct, Current),
         ],
-        "search_files" | "project_inspect" => vec![capability(
+        "search_files" => vec![capability(
             LocalWorkspace,
             &[CurrentState, Content, CausalExplanation],
             Direct,
             Current,
-        )],
-        "git_info" => vec![capability(
-            LocalWorkspace,
-            &[
-                CurrentState,
-                HistoricalRecord,
-                Outcome,
-                Attribution,
-                Content,
-            ],
-            Canonical,
-            Both,
         )],
         "terminal" | "run_command" => vec![
             capability(
@@ -207,7 +195,7 @@ pub fn evidence_capabilities_for_tool_call(
                 Current,
             ),
         ],
-        "system_info" | "service_status" | "check_environment" => vec![capability(
+        "system_info" | "check_environment" => vec![capability(
             HostLocal,
             &[CurrentState, Content, Outcome, CausalExplanation],
             Direct,
@@ -272,7 +260,7 @@ pub fn evidence_capabilities_from_target_hints(
 /// tools. Exact receipt credit always uses `evidence_capabilities_for_tool_call`.
 fn static_evidence_capabilities(tool_name: &str) -> Vec<ToolEvidenceCapability> {
     let representative_calls: &[&str] = match tool_name {
-        "goal_trace" | "tool_trace" => &[r#"{"action":"tool_trace","task_id":"candidate"}"#],
+        "goal_trace" => &[r#"{"action":"tool_trace","task_id":"candidate"}"#],
         "manage_mandates" => &[
             r#"{"action":"list"}"#,
             r#"{"action":"get","mandate_id":"candidate","section":"history"}"#,
@@ -348,7 +336,6 @@ pub fn requirement_has_builtin_evidence_route(requirement: &RequestEvidenceRequi
         "web_search",
         "read_file",
         "search_files",
-        "git_info",
         "terminal",
         "system_info",
         "self_diagnose",

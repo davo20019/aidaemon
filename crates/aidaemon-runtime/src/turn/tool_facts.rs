@@ -42,10 +42,11 @@ pub fn fallback_tool_semantic_scope(tool_name: &str) -> Option<ToolSemanticScope
         "web_search" | "web_fetch" | "http_request" | "browser" => {
             Some(ToolSemanticScope::ExternalRemote)
         }
-        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal"
-        | "project_inspect" => Some(ToolSemanticScope::LocalWorkspace),
+        "read_file" | "search_files" | "edit_file" | "write_file" | "terminal" => {
+            Some(ToolSemanticScope::LocalWorkspace)
+        }
         "read_channel_history" | "search_history" => Some(ToolSemanticScope::ConversationHistory),
-        "manage_goal_tasks" | "schedule_task" | "goal_trace" | "tool_trace" | "manage_mandates"
+        "manage_goal_tasks" | "schedule_task" | "goal_trace" | "manage_mandates"
         | "mandate_review" | "manage_automations" => Some(ToolSemanticScope::GoalState),
         "system_info" | "check_environment" => Some(ToolSemanticScope::HostLocal),
         _ => None,
@@ -104,12 +105,7 @@ fn memory_system_tool_facts(read_only: bool) -> MemoryToolFacts {
     }
 }
 
-const DAEMON_TOOLS: &[&str] = &[
-    "remember_fact",
-    "share_memory",
-    "manage_memories",
-    "manage_people",
-];
+const DAEMON_TOOLS: &[&str] = &["remember_fact", "manage_memories", "manage_people"];
 
 /// The full memory system's tool facts, with `manage_memories` as the
 /// daemon offers it: memory and goal actions in one tool.
