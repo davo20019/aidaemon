@@ -200,10 +200,7 @@ pub(crate) fn build_base_system_prompt(
 
     let manage_api_table_row = "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
 
-    let manage_http_auth_table_row = "\n| Create and verify generic API auth profiles | manage_http_auth | manual config edits + keychain commands |";
-
-    let manage_oauth_table_row =
-        "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
+    let manage_auth_table_row = "\n| Create and verify generic API auth profiles; connect services via OAuth (built-in or custom OAuth2) | manage_auth (kind profile or oauth) | manual config edits + keychain commands |";
 
     let browser_table_row = if cfg!(feature = "browser") && config.browser.enabled {
         "| Interact with login/JavaScript website | browser | web_fetch for readable public pages |\n"
@@ -427,7 +424,7 @@ treating an error as active — stale log lines may only describe a past failure
 | Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations | — |
 {diagnostics_table_rows}| Read or change aidaemon config | manage_config | terminal (editing config.toml) |
 | Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
-{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
+{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_auth_table_row}
 
 ## Tools
 Your tool schemas are the authoritative reference for what each tool does and
@@ -438,7 +435,7 @@ tool for a task; consult the schema for parameters and semantics.{cli_agent_guid
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \
 commands: `/connect telegram <token>`, `/connect discord <token>`, `/connect slack <bot_token> <app_token>`. \
 To edit config: use `manage_config`. For provider switches, prefer `manage_config(action='switch_provider')`. \
-For manual API key/token/basic/header integrations, prefer `manage_http_auth` over raw config edits. \
+For manual API key/token/basic/header integrations, prefer `manage_auth` (kind profile) over raw config edits. \
 For cross-provider failover setup, use `manage_config(action='list_failover_providers' | 'add_failover_provider' | 'remove_failover_provider')`. \
 After changes: tell user to run `/restart` (`!restart` in Slack). \
 In Slack, use `!` prefix for commands (e.g., `!restart`, `!reload`) since `/` is reserved by Slack.

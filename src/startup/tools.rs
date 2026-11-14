@@ -485,8 +485,7 @@ enum RuntimeToolId {
     ManageMcp,
     ManagePeople,
     HttpRequest,
-    ManageHttpAuth,
-    ManageOauth,
+    ManageAuth,
     ManageApi,
     SpawnAgent,
 }
@@ -534,14 +533,8 @@ const RUNTIME_TOOL_MANIFEST: &[RuntimeToolSpec] = &[
         depends_on: &[],
     },
     RuntimeToolSpec {
-        id: RuntimeToolId::ManageHttpAuth,
-        name: "manage_http_auth",
-        enabled_if: runtime_enabled_always,
-        depends_on: &[RuntimeToolId::HttpRequest],
-    },
-    RuntimeToolSpec {
-        id: RuntimeToolId::ManageOauth,
-        name: "manage_oauth",
+        id: RuntimeToolId::ManageAuth,
+        name: "manage_auth",
         enabled_if: runtime_enabled_oauth,
         depends_on: &[RuntimeToolId::HttpRequest],
     },
@@ -549,7 +542,7 @@ const RUNTIME_TOOL_MANIFEST: &[RuntimeToolSpec] = &[
         id: RuntimeToolId::ManageApi,
         name: "manage_api",
         enabled_if: runtime_enabled_always,
-        depends_on: &[RuntimeToolId::HttpRequest, RuntimeToolId::ManageOauth],
+        depends_on: &[RuntimeToolId::HttpRequest, RuntimeToolId::ManageAuth],
     },
     RuntimeToolSpec {
         id: RuntimeToolId::SpawnAgent,
@@ -1053,15 +1046,13 @@ async fn register_runtime_tool_by_id(
             tools.push(tool.clone());
             *http_request_tool = Some(tool);
         }
-        RuntimeToolId::ManageHttpAuth => {
-            tools.push(Arc::new(ManageHttpAuthTool::new(
+        RuntimeToolId::ManageAuth => {
+            let manage_http_auth = ManageHttpAuthTool::new(
                 crate::config::config_file(config_path),
-                http_profiles,
-                state as Arc<dyn crate::traits::StateStore>,
+                http_profiles.clone(),
+                state.clone() as Arc<dyn crate::traits::StateStore>,
                 crate::config::shared_secret_store(),
-            )));
-        }
-        RuntimeToolId::ManageOauth => {
+            );
             let callback_url = config
                 .oauth
                 .callback_url
@@ -1094,16 +1085,22 @@ async fn register_runtime_tool_by_id(
                 http_tool.set_oauth_gateway(gateway.clone()).await;
             }
 
-            tools.push(Arc::new(ManageOAuthTool::new(
+            let manage_oauth = ManageOAuthTool::new(
                 gateway.clone(),
                 state.clone() as Arc<dyn crate::traits::StateStore>,
                 crate::config::config_file(config_path),
-            )));
+            );
+            tools.push(Arc::new(
+                aidaemon_tools::services::manage_auth::ManageAuthTool::new(
+                    manage_http_auth,
+                    manage_oauth,
+                ),
+            ));
             *oauth_gateway = Some(gateway);
         }
         RuntimeToolId::ManageApi => {
             let gateway = oauth_gateway.clone().ok_or_else(|| {
-                anyhow::anyhow!("manage_api requires manage_oauth to be initialized first")
+                anyhow::anyhow!("manage_api requires manage_auth to be initialized first")
             })?;
             let skills_dir = if config.skills.enabled {
                 let dir = config_path
@@ -1642,8 +1639,7 @@ mod tests {
                 "manage_mcp",
                 "manage_people",
                 "http_request",
-                "manage_http_auth",
-                "manage_oauth",
+                "manage_auth",
                 "manage_api",
                 "spawn_agent",
             ]
@@ -1696,8 +1692,8 @@ mod tests {
     #[test]
     fn runtime_manifest_validator_rejects_unknown_dependencies() {
         let manifest = [RuntimeToolSpec {
-            id: RuntimeToolId::ManageOauth,
-            name: "manage_oauth",
+            id: RuntimeToolId::ManageAuth,
+            name: "manage_auth",
             enabled_if: runtime_enabled_always,
             depends_on: &[RuntimeToolId::HttpRequest],
         }];
@@ -1711,8 +1707,8 @@ mod tests {
     fn runtime_manifest_validator_rejects_dependency_order() {
         let manifest = [
             RuntimeToolSpec {
-                id: RuntimeToolId::ManageOauth,
-                name: "manage_oauth",
+                id: RuntimeToolId::ManageAuth,
+                name: "manage_auth",
                 enabled_if: runtime_enabled_always,
                 depends_on: &[RuntimeToolId::HttpRequest],
             },
@@ -1833,8 +1829,7 @@ mod tests {
 
         assert!(names.contains(&"manage_api".to_string()));
         assert!(names.contains(&"http_request".to_string()));
-        assert!(names.contains(&"manage_http_auth".to_string()));
-        assert!(names.contains(&"manage_oauth".to_string()));
+        assert!(names.contains(&"manage_auth".to_string()));
     }
 
     proptest! {

@@ -750,10 +750,61 @@ mod tests {
             "http://localhost:8080".to_string(),
         );
         let concrete = Arc::new(crate::tools::ManageOAuthTool::new(
-            gateway,
-            store as Arc<dyn crate::traits::OAuthStore>,
-            crate::config::config_file(config),
+            gateway.clone(),
+            store.clone() as Arc<dyn crate::traits::OAuthStore>,
+            crate::config::config_file(config.clone()),
         ));
+        // `manage_auth` routes each kind to its tool, with that tool's card.
+        let auth_dir = tempfile::TempDir::new().unwrap();
+        let manage_auth: Arc<dyn crate::traits::Tool> =
+            Arc::new(aidaemon_tools::services::manage_auth::ManageAuthTool::new(
+                crate::tools::ManageHttpAuthTool::new(
+                    crate::config::config_file(synthetic_auth_config(&auth_dir)),
+                    Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                    Arc::new(SyntheticOAuthStore::default()),
+                    crate::config::shared_secret_store(),
+                ),
+                crate::tools::ManageOAuthTool::new(
+                    gateway,
+                    store as Arc<dyn crate::traits::OAuthStore>,
+                    crate::config::config_file(config),
+                ),
+            ));
+        let routed = rules_over(vec![manage_auth], false);
+        let RuleDecision::Ask(disconnect) = judge_call(
+            &routed,
+            "manage_auth",
+            json!({"kind":"oauth","action":"remove","service":"synthetic","confirm_disconnect":true}),
+        )
+        .await
+        else {
+            panic!("a disconnect through manage_auth must ask");
+        };
+        assert_eq!(disconnect.summary, "Disconnect OAuth service 'synthetic'");
+        let RuleDecision::Ask(remove_profile) = judge_call(
+            &routed,
+            "manage_auth",
+            json!({"kind":"profile","action":"remove","profile":"synthetic"}),
+        )
+        .await
+        else {
+            panic!("a profile removal through manage_auth must ask");
+        };
+        assert_eq!(
+            remove_profile.summary,
+            "Remove manual API auth profile 'synthetic' and delete its stored credentials"
+        );
+        for args in [
+            json!({"kind":"oauth","action":"list"}),
+            json!({"kind":"profile","action":"list"}),
+            json!({"action":"remove","profile":"synthetic"}),
+        ] {
+            assert_eq!(
+                judge_call(&routed, "manage_auth", args.clone()).await,
+                RuleDecision::Allow,
+                "{args}"
+            );
+        }
         let tool: Arc<dyn crate::traits::Tool> = concrete.clone();
         for trusted in [false, true] {
             let rules = rules_over(vec![tool.clone()], trusted);
