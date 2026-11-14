@@ -15,6 +15,7 @@ pub fn shell(store: Store) -> View {
     let wide = computed(move || window().width.0 >= 1180.0);
     let roomy = computed(move || window().width.0 >= 760.0);
     store.set_inspector(!terminal);
+    crate::features::notify::approvals(store);
     let palette = signal(false);
 
     on_key("mod+k", move |_| palette.update(|open| *open = !*open));

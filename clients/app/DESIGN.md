@@ -42,6 +42,7 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | Conversation | Agent offers a view move while you type | Banner (accent tint) with Go (Cmd/Ctrl+G) and Dismiss; nothing moves until taken |
 | Conversation | Agent moved the view | Neutral note banner, leaves after 6 s |
 | Approval card | Brought up by a move | Border thickens to accent until answered |
+| System | Approval arrives while the app is in the background | System notification (closed when answered anywhere); waiting count on the app icon; pressing it shows the card |
 
 ## Copy
 

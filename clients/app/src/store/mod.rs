@@ -318,6 +318,16 @@ impl Store {
         }));
     }
 
+    /// Bring a waiting approval into view (a notification was pressed).
+    pub fn show_approval(&self, approval_id: &str) {
+        self.move_view(ViewRequest {
+            action: ViewAction::ShowApproval {
+                approval_id: approval_id.to_owned(),
+            },
+            reason: String::new(),
+        });
+    }
+
     pub fn toast(&self) -> Option<String> {
         self.toast.get()
     }
