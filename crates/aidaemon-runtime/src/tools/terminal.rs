@@ -7674,6 +7674,41 @@ fn terminal_call_semantics(arguments: &str) -> ToolCallSemantics {
     }
 }
 
+/// The literal paths a `run`'s command names, read structurally
+/// (`command_effects::literal_path_operands`), each resolved against the
+/// run's absolute `working_dir` when relative. Empty for a call that is not
+/// a run.
+fn terminal_command_operands(arguments: &str) -> Vec<String> {
+    let Ok(args) = serde_json::from_str::<TerminalArgs>(arguments) else {
+        return Vec::new();
+    };
+    if !TerminalAction::parse(&args.action).runs_command() {
+        return Vec::new();
+    }
+    let Some(text) = args.command.as_deref().or(args.script.as_deref()) else {
+        return Vec::new();
+    };
+    let cwd = args
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| dir.starts_with('/'));
+    aidaemon_tools::command_effects::literal_path_operands(text)
+        .into_iter()
+        .map(|operand| {
+            if operand.starts_with('/') || operand == "~" || operand.starts_with("~/") {
+                operand
+            } else if let Some(cwd) = cwd {
+                aidaemon_tools::BackendPath::new(cwd)
+                    .join(&operand)
+                    .to_string()
+            } else {
+                operand
+            }
+        })
+        .collect()
+}
+
 fn terminal_access_manifest(arguments: &str) -> crate::tools::traits::ToolCallAccessManifest {
     let parsed = serde_json::from_str::<Value>(arguments).ok();
     let execution_cwd = parsed
@@ -8148,6 +8183,19 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
 
     fn call_effects(&self, arguments: &str) -> aidaemon_core::CallEffects {
         terminal_call_effects(&*self.backend, arguments)
+    }
+
+    /// The declared files, plus every path operand the command names
+    /// (`cp <capture> <site>/homepage.png` reads the capture though no
+    /// `read_paths` says so), resolved against the run's directory.
+    fn named_files(&self, arguments: &str) -> Vec<String> {
+        let mut named = aidaemon_tools::semantics::declared_named_files(self, arguments);
+        for operand in terminal_command_operands(arguments) {
+            if !named.contains(&operand) {
+                named.push(operand);
+            }
+        }
+        named
     }
 
     fn call_annotations_in(
@@ -9933,6 +9981,64 @@ mod tests {
                 .mutation_effects
                 .contains(ToolMutationEffects::REMOTE_MUTATION)
         );
+    }
+
+    /// Live 2026-11-14: a helper's `cp` of the request's own browser
+    /// capture (saved in the daemon's inbox during the request) into the
+    /// site folder its work made was carded as "an unrelated inbox image":
+    /// the produced-file fact was looked up only by declared target hints,
+    /// and a terminal command's source is in no hint. The command's
+    /// operands are named files like any tool's targets: the capture is
+    /// found, an inbox file nothing in the request produced is not.
+    #[tokio::test]
+    async fn a_terminal_copy_of_the_requests_own_capture_is_its_own() {
+        use aidaemon_tools::semantics::{DeliverableKind, ProducedFile, ProducedFiles};
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        drop(approval_rx);
+        let tool = TerminalTool::new(
+            aidaemon_tools::testing::active_execution_backend(),
+            vec![],
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
+            1,
+            1000,
+            PermissionMode::Default,
+            pool,
+        )
+        .await;
+        let inbox = tempfile::tempdir().unwrap();
+        let site = tempfile::tempdir().unwrap();
+        let shot = inbox.path().join("d4685978_screenshot.png");
+        let stray = inbox.path().join("0a1b2c3d_screenshot.png");
+        std::fs::write(&shot, b"png").unwrap();
+        std::fs::write(&stray, b"png").unwrap();
+        let produced = ProducedFiles::default();
+        produced.note_capture(
+            &shot.display().to_string(),
+            None,
+            &DeliverableKind::Screenshot {
+                page: "claude-company-drupal-5879.ddev.site".to_string(),
+            },
+        );
+        let copy = |source: &std::path::Path| {
+            serde_json::json!({
+                "action": "run",
+                "command": format!(
+                    "cp {} homepage.png && ls -lh homepage.png && printf 'Saved\\n'",
+                    source.display()
+                ),
+                "working_dir": site.path().display().to_string(),
+            })
+            .to_string()
+        };
+        let own = crate::untrusted::produced_named_by(&tool, &copy(&shot), &produced);
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert!(matches!(own[0].1, ProducedFile::Capture(_)));
+        let unrelated = crate::untrusted::produced_named_by(&tool, &copy(&stray), &produced);
+        assert!(unrelated.is_empty(), "{unrelated:?}");
     }
 
     /// Trust markers in the arguments stand in for nothing: a command the

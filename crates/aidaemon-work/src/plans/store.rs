@@ -216,6 +216,7 @@ impl PlanStore {
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
                 waited_jobs: Vec::new(),
+                made_folders: Vec::new(),
                 not_done: None,
                 // The model's own tick: done on its word until evidence
                 // confirms it.
@@ -318,6 +319,7 @@ impl PlanStore {
                     step.status = StepStatus::Background;
                     step.background_jobs = previous.background_jobs.clone();
                     step.waited_jobs = previous.waited_jobs.clone();
+                    step.made_folders = previous.made_folders.clone();
                     step.started_at = previous.started_at;
                     step.completed_at = None;
                 }
@@ -434,6 +436,27 @@ impl PlanStore {
             plan.wait_on_background_jobs(job_ids)
         })
         .await
+    }
+
+    /// The folders background job `job_id` made, on the session's checklist
+    /// steps it took on ([`TaskPlan::note_job_folders`]).
+    pub async fn note_job_folders(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        folders: &[String],
+    ) -> anyhow::Result<()> {
+        if folders.is_empty() {
+            return Ok(());
+        }
+        let _write = PLAN_WRITES.lock().await;
+        for mut plan in self.get_recent_for_session(session_id, 5).await? {
+            if plan.note_job_folders(job_id, folders) {
+                self.update(&plan).await?;
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// Record the end of background job `job_id` on the session's checklist

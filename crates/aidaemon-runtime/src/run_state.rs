@@ -442,6 +442,10 @@ pub struct RunState {
     pub background: bool,
     /// The chat turn (its task id) whose request started it, when one did.
     pub request: Option<String>,
+    /// The folders its work made, from the claim evidence (each found
+    /// absent before a call that then created it): the real folders, which
+    /// its plan steps name on the card when it ends.
+    pub made_folders: Vec<String>,
 }
 
 /// Which chat card a run's line is drawn on once the turn that started it
@@ -513,6 +517,7 @@ impl RunState {
     /// The helper as every card shows it.
     pub fn view(&self) -> HelperView {
         HelperView {
+            run: Some(self.id.clone()),
             label: self.label.clone(),
             phase: self.phase,
             background: self.background,
@@ -695,6 +700,7 @@ impl RunStates {
             card: RunCard::default(),
             background: true,
             request: None,
+            made_folders: Vec::new(),
         };
         let seq = self
             .order
@@ -819,6 +825,17 @@ impl RunStates {
     pub fn link_steps(&self, id: &str, steps: &[usize]) {
         if let Some(entry) = self.lock().get_mut(id) {
             entry.state.steps = steps.to_vec();
+        }
+    }
+
+    /// Run `id`'s work made `folders` (its claim evidence).
+    pub fn note_folders(&self, id: &str, folders: &[String]) {
+        if let Some(entry) = self.lock().get_mut(id) {
+            for folder in folders {
+                if !entry.state.made_folders.contains(folder) {
+                    entry.state.made_folders.push(folder.clone());
+                }
+            }
         }
     }
 
@@ -1207,6 +1224,7 @@ mod tests {
             card: RunCard::default(),
             background: true,
             request: None,
+            made_folders: Vec::new(),
         };
         let times = state.times().unwrap();
         let line = state.view().took.expect("the card's measured line");

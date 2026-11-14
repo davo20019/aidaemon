@@ -88,6 +88,7 @@ impl TaskPlan {
                 evidence_receipt_ids: Vec::new(),
                 background_jobs: Vec::new(),
                 waited_jobs: Vec::new(),
+                made_folders: Vec::new(),
                 not_done: None,
                 evidence: StepEvidence::Settled,
                 status: if index == 0 {
@@ -551,6 +552,28 @@ impl TaskPlan {
         changed
     }
 
+    /// The folders background job `job_id` made (its claim evidence), on
+    /// the steps it took on, before its end settles them. Returns whether
+    /// any step changed.
+    pub fn note_job_folders(&mut self, job_id: &str, folders: &[String]) -> bool {
+        let mut changed = false;
+        for step in &mut self.steps {
+            if !step.background_jobs.iter().any(|job| job == job_id) {
+                continue;
+            }
+            for folder in folders {
+                if !step.made_folders.contains(folder) {
+                    step.made_folders.push(folder.clone());
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.updated_at = Utc::now();
+        }
+        changed
+    }
+
     /// Record the end of background job `job_id`, as its run record says.
     /// A step handed to several jobs (or waiting on them) settles once the
     /// last of them ended, from all their typed ends: completed when every
@@ -819,21 +842,22 @@ impl TaskPlan {
                 (PlanStatus::Paused, _) => "⏸️",
                 _ => "⏳",
             };
+            let described = step.described();
             return match (step.status, held) {
                 (StepStatus::Completed, _) if step.unverified() => {
-                    format!("{mark} {} ({UNVERIFIED})", step.description)
+                    format!("{mark} {described} ({UNVERIFIED})")
                 }
                 (StepStatus::Failed, _) if step.helper_not_started() => {
-                    format!("{mark} {} ({HELPER_NOT_STARTED})", step.description)
+                    format!("{mark} {described} ({HELPER_NOT_STARTED})")
                 }
                 (StepStatus::Background, _) => {
-                    format!("{mark} {} (running in the background)", step.description)
+                    format!("{mark} {described} (running in the background)")
                 }
-                (StepStatus::Skipped, _) => format!("{mark} {} (not needed)", step.description),
+                (StepStatus::Skipped, _) => format!("{mark} {described} (not needed)"),
                 (_, Some(reason)) => {
-                    format!("{mark} {} (not done: {})", step.description, reason.plain())
+                    format!("{mark} {described} (not done: {})", reason.plain())
                 }
-                _ => format!("{mark} {}", step.description),
+                _ => format!("{mark} {described}"),
             };
         }
         let header = match self.status {
@@ -882,27 +906,27 @@ impl TaskPlan {
         for step in &self.steps {
             let line = match (step.status, step.not_done) {
                 (StepStatus::Completed, _) if step.unverified() => {
-                    format!("☑️ {} ({UNVERIFIED})", step.description)
+                    format!("☑️ {} ({UNVERIFIED})", step.described())
                 }
-                (StepStatus::Completed, _) => format!("✅ {}", step.description),
+                (StepStatus::Completed, _) => format!("✅ {}", step.described()),
                 // Its row says only that it didn't run; why is said once,
                 // under the rows, however many steps it applies to.
                 (StepStatus::Failed, _) if step.helper_not_started() => {
-                    format!("⚠️ {} (didn't run)", step.description)
+                    format!("⚠️ {} (didn't run)", step.described())
                 }
-                (StepStatus::InProgress, _) => format!("▶️ {}", step.description),
+                (StepStatus::InProgress, _) => format!("▶️ {}", step.described()),
                 (StepStatus::Background, _) => {
-                    format!("⏳ {} (running in the background)", step.description)
+                    format!("⏳ {} (running in the background)", step.described())
                 }
                 (StepStatus::Deferred, Some(reason)) => {
-                    format!("⏭️ {} (not done: {})", step.description, reason.plain())
+                    format!("⏭️ {} (not done: {})", step.described(), reason.plain())
                 }
                 // `deferred` is the model's typed "set aside": the owner
                 // reads what it means for them.
-                (StepStatus::Deferred, None) => format!("⏭️ {} (not done)", step.description),
-                (StepStatus::Failed, _) => format!("⚠️ {} (couldn't be done)", step.description),
-                (StepStatus::Skipped, _) => format!("➖ {} (not needed)", step.description),
-                (StepStatus::Pending, _) => format!("○ {}", step.description),
+                (StepStatus::Deferred, None) => format!("⏭️ {} (not done)", step.described()),
+                (StepStatus::Failed, _) => format!("⚠️ {} (couldn't be done)", step.described()),
+                (StepStatus::Skipped, _) => format!("➖ {} (not needed)", step.described()),
+                (StepStatus::Pending, _) => format!("○ {}", step.described()),
             };
             // A blank line between steps: descriptions wrap on a phone, and
             // without a gap the wrapped lines run into the next step.
@@ -1043,6 +1067,15 @@ pub struct PlanStep {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waited_jobs: Vec<String>,
 
+    /// The folders the runs that took this step on made for it, from their
+    /// claim evidence (what each found absent and then created), recorded
+    /// as each run ended. The card names them, so a run that made another
+    /// folder than the step's words named shows the real one (live
+    /// 2026-11-14: the card read claude-drupal-12, the site was made in
+    /// claude-company-drupal-5879).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub made_folders: Vec<String>,
+
     /// Why a step that was not done was left undone, when the daemon knows it
     /// from typed state (never from the step's text). Such a step was held
     /// back correctly, so the card does not show it as a failure.
@@ -1090,6 +1123,27 @@ fn plan_step_node_id(index: usize) -> String {
 }
 
 impl PlanStep {
+    /// Its words on the card, with the folders its runs made that its words
+    /// do not already name: the real folder, from the claim evidence.
+    pub fn described(&self) -> String {
+        let unnamed: Vec<&str> = self
+            .made_folders
+            .iter()
+            .map(|folder| {
+                std::path::Path::new(folder)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(folder)
+            })
+            .filter(|name| !self.description.contains(name))
+            .collect();
+        match unnamed.as_slice() {
+            [] => self.description.clone(),
+            [one] => format!("{} (made {one})", self.description),
+            many => format!("{} (made {})", self.description, many.join(", ")),
+        }
+    }
+
     /// Completed on the model's word alone, and a step that declared a
     /// side effect: the one kind of step the card flags. A step that
     /// changes nothing (a check, a read) needs no receipt: the reply says
@@ -1855,6 +1909,49 @@ mod tests {
         );
         let done_rows = card.lines().filter(|line| line.starts_with('✅')).count();
         assert_eq!(done_rows, plan.card().done, "{card}");
+    }
+
+    /// Live 2026-11-14: the Drupal step read claude-drupal-12, but its
+    /// helper made claude-company-drupal-5879. The folder a job's claim
+    /// evidence recorded goes on the steps it took on, and the card names
+    /// it when the step's words don't; a step that already names it reads
+    /// as before, and a step the job never took on gets nothing.
+    #[test]
+    fn a_step_names_the_folder_its_run_really_made() {
+        let mut plan = TaskPlan::new(
+            "synthetic-session",
+            "synthetic-task",
+            "description",
+            vec![
+                "Install Drupal in claude-drupal-12".into(),
+                "Install WordPress in claude-wordpress-1".into(),
+            ],
+            "track_requirements",
+        );
+        assert!(plan.link_background_job(&[0], "job-drupal"));
+        assert!(plan.link_background_job(&[1], "job-wordpress"));
+        assert!(plan.note_job_folders(
+            "job-drupal",
+            &["/Users/x/projects/claude-company-drupal-5879".to_string()]
+        ));
+        assert!(plan.note_job_folders(
+            "job-wordpress",
+            &["/Users/x/projects/claude-wordpress-1".to_string()]
+        ));
+        assert!(plan.settle_background_job("job-drupal", JobEnd::Succeeded));
+        assert!(plan.settle_background_job("job-wordpress", JobEnd::Succeeded));
+        let card = plan.render_compact_checklist();
+        assert!(
+            card.contains(
+                "✅ Install Drupal in claude-drupal-12 (made claude-company-drupal-5879)"
+            ),
+            "{card}"
+        );
+        assert!(
+            card.contains("✅ Install WordPress in claude-wordpress-1\n")
+                || card.ends_with("✅ Install WordPress in claude-wordpress-1"),
+            "{card}"
+        );
     }
 
     /// Live 2026-11-13: one helper launched for the Drupal step; the

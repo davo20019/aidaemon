@@ -183,7 +183,13 @@ pub fn record_waited_steps(
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
             let update = match update {
-                StatusUpdate::Helper(view) if view.label == label && !view.phase.is_terminal() => {
+                StatusUpdate::Helper(view)
+                    if view
+                        .run
+                        .as_deref()
+                        .map_or(view.label == label, |run| run == id)
+                        && !view.phase.is_terminal() =>
+                {
                     if let Some(step) = view.step.clone() {
                         runs.step(&id, step);
                     }
@@ -288,6 +294,15 @@ pub async fn settle_background_steps(
         .map(|plan| plan.id);
     let settled = match (plan_store, plan_session) {
         (Some(plans), Some(plan_session)) => {
+            // The folders its work made, on the steps it took on, first:
+            // the card then names the real ones.
+            let made = runs
+                .get(job_id)
+                .map(|run| run.made_folders)
+                .unwrap_or_default();
+            if let Err(error) = plans.note_job_folders(plan_session, job_id, &made).await {
+                warn!(%error, job_id, "Could not record the folders a background job made");
+            }
             match plans.settle_background_job(plan_session, job_id, end).await {
                 Ok(plan) => plan,
                 Err(error) => {

@@ -2286,6 +2286,7 @@ mod group_tests {
             card: Default::default(),
             background: true,
             request: None,
+            made_folders: Vec::new(),
         };
         let end = |state: RunState, report: &str| GroupEnd {
             state,
@@ -2389,6 +2390,7 @@ mod group_tests {
                 card: Default::default(),
                 background: true,
                 request: None,
+                made_folders: Vec::new(),
             },
             report: RunReport {
                 text: "I sent a rendered homepage screenshot.".to_string(),

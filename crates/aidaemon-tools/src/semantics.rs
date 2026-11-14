@@ -2825,6 +2825,16 @@ pub trait ToolSemantics: Send + Sync {
         }
     }
 
+    /// Every file or resource this exact call names as something it reads
+    /// or writes, from typed facts only (never its prose): its declared
+    /// target hints, its access manifest and its typed path effects. A tool
+    /// whose arguments name more structurally (a shell command's operands)
+    /// adds them. One reading for every tool, so a fact about a file (the
+    /// request's own work produced it) reaches each call that names it.
+    fn named_files(&self, arguments: &str) -> Vec<String> {
+        declared_named_files(self, arguments)
+    }
+
     /// Authority annotations for this exact call, judged against the turn's
     /// trusted roots: read-only, destructive, idempotent, and whether it
     /// sends data or acts outside the owner's machine and workspace
@@ -3128,20 +3138,57 @@ impl ProducedFiles {
             .collect()
     }
 
-    /// Of the files and resources a call names (its declared target
-    /// hints), the ones this request's work produced, each as named.
-    pub fn named_by(&self, hints: &[ToolTargetHint]) -> Vec<(String, ProducedFile)> {
-        hints
+    /// Of the files and resources a call names (its
+    /// [`ToolSemantics::named_files`]), the ones this request's work
+    /// produced, each as named.
+    pub fn named_by(&self, named: &[String]) -> Vec<(String, ProducedFile)> {
+        named
             .iter()
-            .filter(|hint| {
-                matches!(
-                    hint.kind,
-                    ToolTargetHintKind::Path | ToolTargetHintKind::ResourceId
-                )
-            })
-            .filter_map(|hint| Some((hint.value.clone(), self.get(&hint.value)?)))
+            .filter_map(|name| Some((name.clone(), self.get(name)?)))
             .collect()
     }
+}
+
+/// The files and resources a call names by its declared facts (see
+/// [`ToolSemantics::named_files`]): its path and resource-id target hints,
+/// its access manifest's path targets, and its path effects' targets.
+pub fn declared_named_files<T: ToolSemantics + ?Sized>(tool: &T, arguments: &str) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    let mut add = |value: &str| {
+        let value = value.trim();
+        if !value.is_empty() && !named.iter().any(|known| known == value) {
+            named.push(value.to_string());
+        }
+    };
+    for hint in tool.call_semantics(arguments).target_hints {
+        if matches!(
+            hint.kind,
+            ToolTargetHintKind::Path | ToolTargetHintKind::ResourceId
+        ) {
+            add(&hint.value);
+        }
+    }
+    let manifest = tool.call_access_manifest(arguments);
+    for hint in manifest
+        .read_targets
+        .iter()
+        .chain(manifest.write_targets.iter())
+    {
+        if hint.kind == ToolTargetHintKind::Path {
+            add(&hint.value);
+        }
+    }
+    for key in tool.call_effects(arguments).keys {
+        if matches!(
+            key.class,
+            aidaemon_core::EffectClass::Write
+                | aidaemon_core::EffectClass::Delete
+                | aidaemon_core::EffectClass::Configuration
+        ) {
+            add(&key.target);
+        }
+    }
+    named
 }
 
 /// A produced file's key, whichever spelling names it: a path as it
@@ -3161,7 +3208,7 @@ pub fn produced_files(facts: &ToolCallContext) -> Option<&ProducedFiles> {
 
 #[cfg(test)]
 mod produced_file_tests {
-    use super::{DeliverableKind, ProducedFile, ProducedFiles, ToolTargetHint, ToolTargetHintKind};
+    use super::{DeliverableKind, ProducedFile, ProducedFiles};
 
     /// A capture is found by its path in any spelling and by its resource
     /// id; a file a call created joins, one that existed before does not,
@@ -3204,14 +3251,7 @@ mod produced_file_tests {
         );
         assert_eq!(produced.get(&older.display().to_string()), None);
 
-        let hints: Vec<ToolTargetHint> = [
-            (ToolTargetHintKind::Path, older.display().to_string()),
-            (ToolTargetHintKind::Path, fresh.display().to_string()),
-        ]
-        .into_iter()
-        .filter_map(|(kind, value)| ToolTargetHint::new(kind, value))
-        .collect();
-        let named = produced.named_by(&hints);
+        let named = produced.named_by(&[older.display().to_string(), fresh.display().to_string()]);
         assert_eq!(named.len(), 1);
         assert_eq!(named[0].1, ProducedFile::Created);
     }

@@ -431,7 +431,8 @@ impl LiveStatus {
         }
     }
 
-    /// Note a helper's record: one entry per helper, its latest step
+    /// Note a helper's record: one entry per helper (per run when the
+    /// record names its run, [`HelperView::same_helper`]), its latest step
     /// keeping its start time while it stays the same. `true` when its
     /// header changed (it is new, or it ended): a step alone can wait for
     /// the next refresh.
@@ -440,7 +441,7 @@ impl LiveStatus {
             .helpers
             .iter_mut()
             .rev()
-            .find(|(known, _)| known.label == helper.label)
+            .find(|(known, _)| known.same_helper(&helper))
         {
             Some((known, _)) if *known == helper => false,
             // A helper starting (its first record: running, no step yet)
@@ -735,6 +736,7 @@ mod tests {
 
     fn ended(label: &str, phase: RunPhase, background: bool) -> HelperView {
         HelperView {
+            run: None,
             phase,
             ..HelperView::running(label, background, None)
         }
@@ -750,6 +752,35 @@ mod tests {
         assert_eq!(sink.creates.lock().unwrap().len(), 1);
         assert_eq!(sink.edits.lock().unwrap().len(), 2);
         assert_eq!(sink.edits.lock().unwrap()[0].1, "⏳ Running a command");
+    }
+
+    /// Live 2026-11-14: "Finished in the background … Took 42s" stood on
+    /// the WordPress helper's line while that helper still ran: the card
+    /// found a helper's entry by its name, so another run's record under
+    /// the same name settled it. A record that names its run updates that
+    /// run's entry only; one with no run id is still found by its name.
+    #[test]
+    fn a_card_keys_each_helper_by_its_run_not_its_name() {
+        let mut s = LiveStatus::new();
+        let run = |id: &str, phase: RunPhase| HelperView {
+            phase,
+            took: phase.is_terminal().then(|| "Took 42s.".to_string()),
+            ..HelperView::running("WordPress install", true, None).of_run(Some(id))
+        };
+        assert!(s.note_helper(run("helper:real", RunPhase::Running)));
+        assert!(s.note_helper(run("helper:other", RunPhase::Running)));
+        assert!(s.note_helper(run("helper:other", RunPhase::Succeeded)));
+        assert_eq!(s.helpers.len(), 2);
+        let real = s
+            .helpers
+            .iter()
+            .find(|(view, _)| view.run.as_deref() == Some("helper:real"))
+            .unwrap();
+        assert_eq!(real.0.phase, RunPhase::Running);
+        assert_eq!(real.0.took, None);
+        assert!(s.note_helper(HelperView::running("Count A", true, None)));
+        assert!(!s.note_helper(HelperView::running("Count A", true, None)));
+        assert_eq!(s.helpers.len(), 3);
     }
 
     /// A plan card never hides the step running now or the helpers: each
@@ -837,6 +868,7 @@ mod tests {
         .unwrap();
         assert_eq!(card, "⏳ Running in the background: a shell loop");
         let ended = HelperView {
+            run: None,
             took: Some("Took 30s (8:23:49 AM to 8:24:19 AM ET), started 13s after your request, so it ended 43s after your request.".into()),
             ..ended("a shell loop", RunPhase::Succeeded, true)
         };
@@ -892,6 +924,7 @@ mod tests {
         live.set_activity(&sink, Step::Doing(ActivityKind::Delegate))
             .await;
         live.note_helper(HelperView {
+            run: None,
             took: Some("Took 21s (2:21:16 PM to 2:21:37 PM ET).".into()),
             ..ended("Count lines", RunPhase::Succeeded, false)
         });
@@ -917,6 +950,7 @@ mod tests {
         live.set_activity(&sink, Step::Doing(ActivityKind::Delegate))
             .await;
         let stopped = HelperView {
+            run: None,
             stopped_by_owner: true,
             took: Some("Took 22s.".into()),
             ..ended("Install Claude Drupal", RunPhase::Stopped, false)
@@ -943,6 +977,7 @@ mod tests {
     fn a_settled_plans_header_never_contradicts_its_runs() {
         let running = |label: &str| HelperView::running(label, true, None);
         let succeeded = |label: &str| HelperView {
+            run: None,
             since_request: Some(aidaemon_core::card::SinceRequest {
                 secs: 213,
                 words: "3m 33s after your request (7:31:01 AM to 7:34:34 AM ET)".to_string(),
@@ -985,6 +1020,7 @@ mod tests {
     fn the_header_and_the_total_follow_the_helpers_run_records() {
         let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
         let helper = |label: &str, phase: RunPhase, secs: u64, at: &str| HelperView {
+            run: None,
             took: Some(format!("Took {secs}s.")),
             since_request: Some(aidaemon_core::card::SinceRequest {
                 secs,
@@ -1175,6 +1211,7 @@ mod tests {
 
         // Its end settles the card to the final header.
         let ended = HelperView {
+            run: None,
             phase: RunPhase::Succeeded,
             step: None,
             ..record
@@ -1235,6 +1272,7 @@ mod tests {
                     render_card(&CardView {
                         helpers: vec![(
                             HelperView {
+                                run: None,
                                 label: "Count the letters".into(),
                                 phase,
                                 background,
@@ -1363,6 +1401,7 @@ mod tests {
     fn the_turn_finishing_a_helpers_step_supersedes_its_end() {
         let helper = |label: &str, phase: RunPhase, step: usize| {
             HelperView {
+                run: None,
                 took: Some("Took 2m.".to_string()),
                 since_request: Some(aidaemon_core::card::SinceRequest {
                     secs: 120,
@@ -1421,6 +1460,7 @@ mod tests {
         let plan = plan("✅ Done · 3 of 3 steps\n\n✅ a\n\n✅ b\n\n✅ c", 3);
         let helper = |label: &str, phase: RunPhase, secs: u64, at: &str, step: usize| {
             HelperView {
+                run: None,
                 took: Some(format!("Took {secs}s.")),
                 since_request: Some(aidaemon_core::card::SinceRequest {
                     secs,
@@ -1513,6 +1553,7 @@ mod tests {
             helpers: vec![
                 (
                     HelperView {
+                        run: None,
                         steps: Vec::new(),
                         ..helper(
                             "Install Claude Drupal site",

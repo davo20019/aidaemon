@@ -702,6 +702,57 @@ pub fn path_operands(command: &str) -> Option<Vec<String>> {
     Some(operands)
 }
 
+/// The literal paths a command names, for facts about named files (never
+/// for trust or confinement, which need [`path_operands`]'s all-or-nothing
+/// reading): every absolute or `~/` operand of every reachable command, plus
+/// its relative operands while no command changes directory. An operand
+/// that does not read literally (expansion, quoting the scanner cannot
+/// settle) is skipped, never guessed, and the rest still count.
+pub fn literal_path_operands(command: &str) -> Vec<String> {
+    let literal = |operand: &str| {
+        let rest = operand
+            .strip_prefix("~/")
+            .or_else(|| (operand == "~").then_some(""))
+            .unwrap_or(operand);
+        !operand.is_empty()
+            && !rest.contains(['$', '`', '\\', '{', '}', '*', '?', '[', '~', '"', '\''])
+    };
+    let commands = expanded_commands(command);
+    let moves = commands.iter().any(|tokens| {
+        tokens
+            .first()
+            .is_some_and(|program| matches!(basename(program), "cd" | "pushd" | "popd"))
+    });
+    let mut operands: Vec<String> = Vec::new();
+    let mut add = |operand: &str| {
+        let anchored = operand.starts_with('/') || operand == "~" || operand.starts_with("~/");
+        if literal(operand)
+            && (anchored || !moves)
+            && !operands.iter().any(|known| known == operand)
+        {
+            operands.push(operand.to_string());
+        }
+    };
+    for line in command.replace("\\\n", " ").split('\n') {
+        for target in scan(line).input_targets {
+            add(&target);
+        }
+    }
+    for tokens in &commands {
+        let mut options_done = false;
+        for arg in tokens.iter().skip(1) {
+            if options_done || !arg.starts_with('-') {
+                add(arg);
+            } else if arg == "--" {
+                options_done = true;
+            } else if let Some((_, value)) = arg.split_once('=') {
+                add(value);
+            }
+        }
+    }
+    operands
+}
+
 fn is_local_work_only(command: &str) -> bool {
     every_segment(command, &local_work_args_ok)
 }

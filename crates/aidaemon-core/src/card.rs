@@ -167,6 +167,12 @@ impl Step {
 /// One helper as every card shows it: the runtime's record of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelperView {
+    /// The run it is the record of (its run id), when the sender knows
+    /// it: a card keeps one entry per run, found by this id, so two runs
+    /// under one name never share a line (live 2026-11-14: a "Finished …
+    /// Took 42s" line stood under the WordPress helper's name while that
+    /// helper still ran). `None`: found by its name.
+    pub run: Option<String>,
     /// The name the owner reads for it.
     pub label: String,
     pub phase: RunPhase,
@@ -209,6 +215,7 @@ impl HelperView {
     /// A helper that is running with `step`.
     pub fn running(label: &str, background: bool, step: Option<Step>) -> Self {
         Self {
+            run: None,
             label: label.to_string(),
             phase: RunPhase::Running,
             background,
@@ -229,6 +236,21 @@ impl HelperView {
             return STOPPED_BY_OWNER;
         }
         self.phase.helper_headline(self.background)
+    }
+
+    /// The same record, of run `run` (its id), when known.
+    pub fn of_run(mut self, run: Option<&str>) -> Self {
+        self.run = run.map(str::to_string);
+        self
+    }
+
+    /// Whether `other` is a record of the same helper: the same run when
+    /// both name theirs, else the same name.
+    pub fn same_helper(&self, other: &HelperView) -> bool {
+        match (self.run.as_deref(), other.run.as_deref()) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => self.label == other.label,
+        }
     }
 
     /// The same record, started for the plan steps `steps`.

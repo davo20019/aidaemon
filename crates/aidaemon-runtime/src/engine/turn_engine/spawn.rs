@@ -1858,7 +1858,8 @@ impl TurnEngine<'_> {
                     in_background,
                     None,
                 )
-                .for_steps(&card_steps),
+                .for_steps(&card_steps)
+                .of_run(run.as_deref()),
             ));
         }
         // Emit SubAgentSpawn event
@@ -1970,6 +1971,7 @@ impl TurnEngine<'_> {
             &card_steps,
             in_background,
             listed.as_ref().map(RunningChildEntry::step),
+            run.clone(),
         );
         // Setup is done: from here the child counts toward its request's
         // total even if it then fails.

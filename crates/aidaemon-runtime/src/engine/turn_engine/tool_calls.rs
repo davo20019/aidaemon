@@ -581,6 +581,11 @@ impl TurnEngine<'_> {
                     "A folder this request's work created is its own"
                 );
                 aidaemon_tools::local_sites::note_folders(&site_grant, &claimed);
+                // The helper run this turn is records the real folders its
+                // work made, so its plan steps name them when it ends.
+                if let Some(run) = self.running_children().run_of_session(scope.session_id) {
+                    self.running_children().runs().note_folders(&run, &claimed);
+                }
             }
         }
         let trust =

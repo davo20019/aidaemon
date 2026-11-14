@@ -131,6 +131,7 @@ mod tests {
             card: Default::default(),
             background: true,
             request: None,
+            made_folders: Vec::new(),
         }
     }
 
@@ -2847,11 +2848,15 @@ mod child_runtime_tests {
                 "{case}: {}",
                 seen.running_card
             );
+            // Each line names its run: the card keeps one entry per run.
+            let run = seen.running_lines.first().and_then(|line| line.run.clone());
+            assert!(run.is_some(), "{case}");
             assert_eq!(
                 seen.running_lines,
                 vec![
                     aidaemon_core::card::HelperView::running("Site install", true, None)
                         .for_steps(&[1])
+                        .of_run(run.as_deref())
                 ],
                 "{case}"
             );

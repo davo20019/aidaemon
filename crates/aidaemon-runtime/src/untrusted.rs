@@ -171,9 +171,10 @@ Everything inside the folders this request's work created (listed for you when t
 any) is the work's own, made by it: changing or deleting anything there is consistent, \
 whatever the file. A file this request's own work produced (a capture its own tools \
 saved, a file its own calls created; listed for you when the call names any) is the work's \
-own artifact wherever it is saved: delivering it to the owner, when it is what the request \
-asks for, is consistent, and lying outside the working area or the folders the work created \
-says nothing against it. A file nothing in the request produced is judged like any other. \
+own artifact wherever it is saved: delivering it to the owner, or copying or moving it into \
+the work (its folders, its working area), when that is what the request asks for, is \
+consistent, and lying outside the working area or the folders the work created says nothing \
+against it. A file nothing in the request produced is judged like any other. \
 Credentials the work itself creates for what the request asks are part of that work: \
 setting up a site includes its admin login, so generating that password, keeping it in \
 the working area and reading it back to finish the setup is consistent. \
@@ -333,15 +334,19 @@ pub struct CallFacts<'a> {
     pub produced: &'a [(String, aidaemon_tools::semantics::ProducedFile)],
 }
 
-/// Of the files and resources `arguments` name, by the tool's declared
-/// targets for the call (never its prose), the ones the request's own work
-/// produced: whichever run of the request produced them.
+/// Of the files and resources `arguments` name, by what the tool reads from
+/// the call's typed facts ([`ToolSemantics::named_files`]: declared targets,
+/// access manifest, path effects, a command's operands; never its prose),
+/// the ones the request's own work produced: whichever run of the request
+/// produced them, whichever tool names them.
+///
+/// [`ToolSemantics::named_files`]: aidaemon_tools::semantics::ToolSemantics::named_files
 pub fn produced_named_by<T: aidaemon_tools::semantics::ToolSemantics + ?Sized>(
     tool: &T,
     arguments: &str,
     produced: &aidaemon_tools::semantics::ProducedFiles,
 ) -> Vec<(String, aidaemon_tools::semantics::ProducedFile)> {
-    produced.named_by(&tool.call_semantics(arguments).target_hints)
+    produced.named_by(&tool.named_files(arguments))
 }
 
 /// The files the call names that the request's own work produced, in
