@@ -127,12 +127,39 @@ fn export_runtime_context(config_path: &Path, env_file_path: &Path, working_dir:
     }
 }
 
+/// The variables this process took from its env file (those not already set
+/// in its environment). An in-place restart passes their current values from
+/// the file, since the inherited environment still holds the old ones and the
+/// file never overrides a variable that is set.
+pub(crate) static ENV_FILE_KEYS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Carries [`ENV_FILE_KEYS`] across an in-place restart.
+pub(crate) const ENV_FILE_KEYS_VAR: &str = "AIDAEMON_ENV_FILE_KEYS";
+
 fn load_startup_env_file(env_file_path: &Path) {
     let explicit_override = std::env::var("AIDAEMON_ENV_FILE")
         .ok()
         .is_some_and(|v| !v.trim().is_empty());
 
     if env_file_path.exists() {
+        // A process an in-place restart started was handed its file's values
+        // as ordinary variables; the list of them comes along.
+        let mut from_file: Vec<String> = std::env::var(ENV_FILE_KEYS_VAR)
+            .map(|list| {
+                list.split(',')
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Ok(items) = dotenvy::from_path_iter(env_file_path) {
+            for (key, _) in items.filter_map(Result::ok) {
+                if std::env::var_os(&key).is_none() && !from_file.contains(&key) {
+                    from_file.push(key);
+                }
+            }
+        }
+        let _ = ENV_FILE_KEYS.set(from_file);
         if let Err(e) = dotenvy::from_path(env_file_path) {
             eprintln!(
                 "Warning: failed to load env file '{}': {}",

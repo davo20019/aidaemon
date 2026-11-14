@@ -403,6 +403,38 @@ pub(crate) fn arm_trial(config_path: &Path) -> Option<Arc<Trial>> {
     Some(trial)
 }
 
+/// Give the new process the env file's current values for the variables
+/// this one took from it (a rotated database key, a secret stored there),
+/// and drop those the file no longer has. Variables set outside the file
+/// keep their values.
+#[cfg(unix)]
+fn refresh_env_file_values(command: &mut std::process::Command) {
+    let Some(keys) = crate::ENV_FILE_KEYS.get() else {
+        return;
+    };
+    let Ok(path) = std::env::var(crate::RUNTIME_ENV_FILE_ENV_KEY) else {
+        return;
+    };
+    let current: std::collections::HashMap<String, String> = dotenvy::from_path_iter(&path)
+        .map(|items| items.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    for key in keys {
+        match current.get(key) {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    // Ones added to the file since this process started.
+    let mut taken = keys.clone();
+    for (key, value) in &current {
+        if !keys.contains(key) && std::env::var_os(key).is_none() {
+            command.env(key, value);
+            taken.push(key.clone());
+        }
+    }
+    command.env(crate::ENV_FILE_KEYS_VAR, taken.join(","));
+}
+
 /// Replace this process with a fresh one of itself (same arguments). Returns
 /// only if that failed.
 pub(crate) fn restart_in_place() {
@@ -418,7 +450,10 @@ pub(crate) fn restart_in_place() {
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         info!(exe = %exe.display(), "Exec-ing new process");
-        let err = std::process::Command::new(&exe).args(&args).exec();
+        let mut command = std::process::Command::new(&exe);
+        command.args(&args);
+        refresh_env_file_values(&mut command);
+        let err = command.exec();
         error!("exec failed: {err}");
     }
     #[cfg(not(unix))]
