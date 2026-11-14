@@ -1904,6 +1904,53 @@ async fn mcp_tool_call_passes_kernel_hooks() {
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
 }
 
+/// A tool the owner's config lists read-only runs unasked after a decline in
+/// the run; an unlisted tool of the same server is asked again, and so is
+/// one whose server claims it is read-only. The listed tool's result is
+/// still untrusted content.
+#[tokio::test]
+async fn owner_listed_read_only_mcp_tool_asks_no_card() {
+    let (mut harness, approver) = approvals_harness_with(
+        vec![
+            http_call("POST", "https://h.example.invalid/x", Some("report")),
+            MockProvider::tool_call_response("fake__no_annotations", "{}"),
+            MockProvider::tool_call_response("fake__echo", r#"{"text":"synthetic claim"}"#),
+            MockProvider::tool_call_response("fake__rich", "{}"),
+            MockProvider::text_response("Done."),
+        ],
+        vec![
+            Some(crate::types::ApprovalResponse::Deny),
+            Some(crate::types::ApprovalResponse::Deny),
+            Some(crate::types::ApprovalResponse::Deny),
+        ],
+        None,
+        Vec::new(),
+    )
+    .await;
+    let registry =
+        crate::testing::fake_mcp_registry_with_read_only(harness.state.clone(), &["rich"]).await;
+    harness.agent.set_test_mcp_registry(registry);
+    harness.agent.set_test_tool_filter_enforce(false);
+    run_mcp_owner_turn(&harness).await;
+
+    let results = tool_results(&harness).await;
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[2].contains("[OWNER DECLINED]"), "{results:?}");
+    assert!(results[3].contains("summary"), "{results:?}");
+    // The POST, the unlisted tool and the one claiming read-only: the
+    // listed read added no card.
+    assert_eq!(approver.card_count(), 3, "{results:?}");
+    // The model saw the listed read's result as untrusted data.
+    let seen = all_tool_messages(&harness.provider).await;
+    assert!(
+        seen.iter()
+            .any(|message| message.contains("[UNTRUSTED EXTERNAL DATA from 'fake__rich'")),
+        "{seen:?}"
+    );
+}
+
 /// `manage_mcp` as is, except that it is offered on a Balanced turn
 /// (`high_impact_write` only filters the offer; the judgment and effects are
 /// the real tool's).

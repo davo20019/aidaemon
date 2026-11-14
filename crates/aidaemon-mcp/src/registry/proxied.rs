@@ -1,5 +1,6 @@
 //! An MCP server's tool as the registry hands it to an agent: an
-//! [`OutcomeTool`] judged at its worst whatever the server claims.
+//! [`OutcomeTool`] judged at its worst whatever the server claims, or as a
+//! read of the server when the owner's config lists it read-only.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -8,7 +9,7 @@ use tracing::info;
 use aidaemon_tools::OutcomeTool;
 use aidaemon_tools::semantics::{
     ToolCallContext, ToolCallOutcome, ToolCallSemantics, ToolCapabilities, ToolDispatchFacts,
-    ToolMutationEffects, ToolSemantics, TrustRoots,
+    ToolMutationEffects, ToolSemantics, ToolVerificationMode, TrustRoots,
 };
 
 /// A tool proxied from an MCP server as the registry offers it: the
@@ -19,6 +20,10 @@ pub struct RegisteredMcpTool {
     tool_name: String,
     tool_schema: Value,
     tool: crate::McpTool,
+    /// The owner's config lists this tool read-only
+    /// ([`super::McpServerConfig::read_only_tools`]). Never set from the
+    /// server's own hints.
+    owner_read_only: bool,
 }
 
 /// Every daemon MCP server starts with these: its tools are annotated at
@@ -44,7 +49,20 @@ impl RegisteredMcpTool {
             tool_name,
             tool_schema,
             tool,
+            owner_read_only: false,
         }
+    }
+
+    /// The tool as judged when the owner's config does (`true`) or does not
+    /// list it read-only.
+    pub fn with_owner_read_only(mut self, owner_read_only: bool) -> Self {
+        self.owner_read_only = owner_read_only;
+        self
+    }
+
+    /// Whether the owner's config lists this tool read-only.
+    pub fn owner_read_only(&self) -> bool {
+        self.owner_read_only
     }
 
     /// A tool built as the registry builds one, with no process behind it
@@ -57,7 +75,8 @@ impl RegisteredMcpTool {
     }
 }
 
-/// The capabilities of an MCP server's tool: always the conservative ones
+/// The capabilities of an MCP server's tool the owner did not list
+/// read-only: always the conservative ones
 /// (mutating, open-world, destructive, non-idempotent, needs approval).
 ///
 /// MCP `ToolAnnotations` (`readOnlyHint`, `openWorldHint`,
@@ -73,6 +92,19 @@ pub fn mcp_tool_capabilities() -> ToolCapabilities {
         needs_approval: true,
         idempotent: false,
         high_impact_write: true,
+    }
+}
+
+/// The capabilities of a tool the owner's config lists read-only: a read
+/// that still reaches a process outside the daemon (like `web_search`), so
+/// its output stays untrusted.
+pub fn owner_read_only_capabilities() -> ToolCapabilities {
+    ToolCapabilities {
+        read_only: true,
+        external_side_effect: true,
+        needs_approval: false,
+        idempotent: true,
+        high_impact_write: false,
     }
 }
 
@@ -150,7 +182,11 @@ impl OutcomeTool for RegisteredMcpTool {
 
 impl ToolSemantics for RegisteredMcpTool {
     fn capabilities(&self) -> ToolCapabilities {
-        mcp_tool_capabilities()
+        if self.owner_read_only {
+            owner_read_only_capabilities()
+        } else {
+            mcp_tool_capabilities()
+        }
     }
 
     /// The server is an opaque process: a mandate never delegates its tools.
@@ -161,6 +197,7 @@ impl ToolSemantics for RegisteredMcpTool {
         }
     }
 
+    /// Always untrusted, listed read-only or not: the server wrote it.
     fn output_trust(
         &self,
         _arguments: &str,
@@ -169,28 +206,61 @@ impl ToolSemantics for RegisteredMcpTool {
         aidaemon_core::SourceTrust::Untrusted
     }
 
-    /// An MCP server is opaque: whatever a call does, its effects are not
-    /// declared, so a decline in the run always asks again.
-    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
-        aidaemon_core::CallEffects::unknown()
+    /// The arguments of an owner-listed read go to the server: text the
+    /// model composed, so the untrusted verifier checks them after an
+    /// untrusted read. An unlisted call is egress, checked anyway.
+    fn call_outbound(&self, _arguments: &str) -> aidaemon_core::Outbound {
+        if self.owner_read_only {
+            aidaemon_core::Outbound::Composed
+        } else {
+            aidaemon_core::Outbound::Nothing
+        }
     }
 
-    /// Never from the server's hints ([`server_options`]): every call is
-    /// egress, not read-only, destructive and non-idempotent, so the
+    /// An MCP server is opaque: whatever an unlisted call does, its effects
+    /// are not declared, so a decline in the run always asks again. An
+    /// owner-listed read declares only the server it reaches (the same
+    /// process key `manage_mcp` declares), so a declined start of that
+    /// server binds its reads too.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        if !self.owner_read_only {
+            return aidaemon_core::CallEffects::unknown();
+        }
+        aidaemon_core::CallEffects {
+            keys: vec![aidaemon_core::EffectKey::named(
+                aidaemon_core::EffectClass::Process,
+                &super::manage::server_process_key(self.tool.server_name()),
+            )],
+            complete: true,
+            understood: false,
+        }
+    }
+
+    /// Never from the server's hints ([`server_options`]): every unlisted
+    /// call is egress, not read-only, destructive and non-idempotent, so the
     /// authority hook, the untrusted verifier and the approval policy judge
-    /// it at its worst.
+    /// it at its worst. An owner-listed tool is a read.
     fn call_annotations_in(
         &self,
         _arguments: &str,
         _roots: &TrustRoots<'_>,
     ) -> aidaemon_core::ToolAnnotations {
-        aidaemon_core::Tool::annotations(&self.tool)
+        if self.owner_read_only {
+            aidaemon_core::ToolAnnotations::READ_ONLY
+        } else {
+            aidaemon_core::Tool::annotations(&self.tool)
+        }
     }
 
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        ToolCallSemantics::mutation_with(
-            ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::DESTRUCTIVE),
-        )
+        if self.owner_read_only {
+            ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent)
+        } else {
+            ToolCallSemantics::mutation_with(
+                ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::DESTRUCTIVE),
+            )
+        }
     }
 }
 

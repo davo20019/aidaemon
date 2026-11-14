@@ -19,6 +19,15 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Tools of this server the owner declares read-only, by the name the
+    /// server gives them in `tools/list` (`read_only_tools = ["search"]`).
+    /// A listed tool's calls are judged as reads of the server (no card for
+    /// a read, its output still untrusted); every other tool is judged at
+    /// its worst. The server's own `readOnlyHint` never counts: only this
+    /// owner-written list does. Static config only: a server added through
+    /// `manage_mcp` has none.
+    #[serde(default)]
+    pub read_only_tools: Vec<String>,
 }
 
 /// A running MCP server entry in the registry.
@@ -166,8 +175,26 @@ impl McpRegistry {
         let mut tool_names = Vec::new();
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
+        let advertised: Vec<String> = server
+            .mcp_tools()
+            .iter()
+            .map(|tool| tool.remote_name().to_string())
+            .collect();
+        for listed in &config.read_only_tools {
+            if !advertised.contains(listed) {
+                warn!(
+                    server = name,
+                    tool = %listed,
+                    "read_only_tools names a tool this MCP server does not advertise"
+                );
+            }
+        }
         for tool in server.mcp_tools() {
-            let tool = RegisteredMcpTool::wrap(name, tool);
+            let owner_read_only = config
+                .read_only_tools
+                .iter()
+                .any(|listed| listed == tool.remote_name());
+            let tool = RegisteredMcpTool::wrap(name, tool).with_owner_read_only(owner_read_only);
             tool_names.push(tool.name().to_string());
             tools.push(Arc::new(tool));
         }
@@ -428,6 +455,7 @@ impl McpRegistry {
             command: server.command.clone(),
             args,
             env,
+            read_only_tools: Vec::new(),
         };
 
         let tools = self.add_server(&server.name, config, false).await?;
