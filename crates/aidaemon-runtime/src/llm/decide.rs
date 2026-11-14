@@ -190,6 +190,18 @@ impl SideCallGateway {
                 DecisionOutcome::UseDefault(DefaultReason::Timeout)
             }
         };
+        tracing::info!(
+            decision = spec.purpose,
+            backend = decider.name(),
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome = match &outcome {
+                DecisionOutcome::Decided(_) => "decided",
+                DecisionOutcome::Shadow(_) => "shadow",
+                DecisionOutcome::UseDefault(DefaultReason::Timeout) => "timeout",
+                DecisionOutcome::UseDefault(_) => "default",
+            },
+            "Decision finished"
+        );
         self.record_decision(
             decision,
             mode,

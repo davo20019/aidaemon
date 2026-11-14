@@ -271,6 +271,19 @@ impl SideCallGateway {
                 Err(_) => Err(SideCallError::Deadline(spec.deadline)),
             };
         let elapsed = started.elapsed();
+        // One line per side call, so a turn's latency splits by grep alone.
+        tracing::info!(
+            purpose = spec.purpose,
+            model = %request.model,
+            elapsed_ms = elapsed.as_millis() as u64,
+            outcome = match &result {
+                Ok(_) => "answered",
+                Err(SideCallError::Deadline(_)) => "deadline",
+                Err(SideCallError::Provider(_)) => "failed",
+                Err(SideCallError::Empty) => "empty",
+            },
+            "Side call finished"
+        );
         // An attempt leaves the log before its row is written, so a write
         // cut off here is not written again by the guard.
         if tokio::time::timeout(
