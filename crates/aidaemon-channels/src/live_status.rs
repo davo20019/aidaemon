@@ -176,8 +176,12 @@ fn since_request_total(
             .filter(|(helper, _)| helper.phase == phase)
             .count()
     };
-    let (failed, stopped) = (count(RunPhase::Failed), count(RunPhase::Stopped));
-    if failed == 0 && stopped == 0 {
+    let by_owner = current
+        .iter()
+        .filter(|(helper, _)| helper.phase == RunPhase::Stopped && helper.stopped_by_owner)
+        .count();
+    let (failed, stopped) = (count(RunPhase::Failed), count(RunPhase::Stopped) - by_owner);
+    if failed == 0 && stopped == 0 && by_owner == 0 {
         return Some(format!("All {} done {}.", current.len(), last.words.trim()));
     }
     let mut ended = Vec::new();
@@ -186,6 +190,9 @@ fn since_request_total(
     }
     if stopped > 0 {
         ended.push(format!("{stopped} didn't finish"));
+    }
+    if by_owner > 0 {
+        ended.push(format!("{by_owner} stopped by you"));
     }
     Some(format!(
         "The last of them ended {}; {}.",
@@ -245,6 +252,7 @@ pub fn helper_status_words(helper: &HelperView) -> String {
         (RunPhase::Running, Some(_)) => "Working".to_string(),
         (RunPhase::Running, None) => "Getting started".to_string(),
         (RunPhase::Succeeded, _) => "Finished".to_string(),
+        (RunPhase::Stopped, _) if helper.stopped_by_owner => "Stopped by you".to_string(),
         (RunPhase::Stopped, _) => "Didn't finish".to_string(),
         (RunPhase::Failed, _) => "Failed".to_string(),
     }
@@ -253,11 +261,7 @@ pub fn helper_status_words(helper: &HelperView) -> String {
 /// A helper's lines on a card: its header, then its latest step while it
 /// runs, or how long it took once it ended.
 fn helper_block(helper: &HelperView, elapsed: Option<Duration>) -> String {
-    let mut block = format!(
-        "{}: {}",
-        helper.phase.helper_headline(helper.background),
-        helper.label.trim()
-    );
+    let mut block = format!("{}: {}", helper.headline(), helper.label.trim());
     // Why it failed or stopped, from its record, right under its header.
     if let Some(reason) = helper
         .reason
@@ -902,6 +906,31 @@ mod tests {
         assert_eq!(live.kept_card_message_id().as_deref(), Some("m1"));
     }
 
+    /// An owner cancel is a stop, said plainly: "Stopped by you", never a
+    /// failure or "an error" (live 2026-11-14: "❌ A helper failed … It
+    /// stopped on an error: stopped by the owner").
+    #[tokio::test]
+    async fn a_helper_the_owner_stopped_reads_stopped_by_you() {
+        let sink = FakeSink::new(true);
+        let mut live = LiveStatus::new();
+        live.note_helper(HelperView::running("Install Claude Drupal", false, None));
+        live.set_activity(&sink, Step::Doing(ActivityKind::Delegate))
+            .await;
+        let stopped = HelperView {
+            stopped_by_owner: true,
+            took: Some("Took 22s.".into()),
+            ..ended("Install Claude Drupal", RunPhase::Stopped, false)
+        };
+        assert_eq!(helper_status_words(&stopped), "Stopped by you");
+        live.note_helper(stopped);
+        live.close(&sink).await;
+        let card = sink.edits.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(card, "⏹️ Stopped by you: Install Claude Drupal\nTook 22s.");
+        for wrong in ["failed", "error", "\u{274c}"] {
+            assert!(!card.contains(wrong), "{card}");
+        }
+    }
+
     /// The live turn (2026-11-13): two helpers installed a site each. The
     /// header agrees with how each helper's run ended, and once both ended
     /// the card says how long after the owner's request the last one did.
@@ -1212,6 +1241,7 @@ mod tests {
                                 step: Some(Step::Doing(Search)),
                                 steps: Vec::new(),
                                 reason: None,
+                                stopped_by_owner: false,
                                 took: None,
                                 since_request: None,
                             },

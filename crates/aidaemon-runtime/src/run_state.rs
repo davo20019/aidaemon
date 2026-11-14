@@ -78,6 +78,17 @@ impl RunEnd {
             .or_else(|| evidence.line())
     }
 
+    /// The owner stopped it: a stop the card says plainly ("Stopped by
+    /// you"), never a failure.
+    pub fn stopped_by_owner(&self) -> bool {
+        matches!(
+            self,
+            Self::Stopped(Some(RunFailure::Cancelled {
+                by: CancelledBy::Owner
+            }))
+        )
+    }
+
     /// Why it did not succeed, when known.
     pub fn failure(&self) -> Option<&RunFailure> {
         match self {
@@ -134,13 +145,22 @@ pub enum RunFailure {
     /// password rotation, its screenshot still reached them, and its card
     /// read "its helper stopped before it finished").
     Declined { steps: Vec<String> },
-    /// The owner cancelled it.
-    Cancelled,
+    /// Someone stopped it before it finished: a stop, never a failure and
+    /// never an error (live 2026-11-14: an owner `/cancel` read "❌ A helper
+    /// failed … It stopped on an error: stopped by the owner").
+    Cancelled { by: CancelledBy },
     /// It made no progress for its limit and was stopped.
     NoProgress,
     /// Its end record says it failed and records nothing more: said as
     /// that, so the owner is never left with a bare "failed".
     NoCause,
+}
+
+/// Who stopped a run before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelledBy {
+    /// The owner, from the chat (`/cancel`, or a stop request read as one).
+    Owner,
 }
 
 /// The concrete next step offered for a resource a run ran out of: what
@@ -249,7 +269,9 @@ impl RunFailure {
                 if steps.len() == 1 { "it" } else { "them" },
                 steps.join("; ")
             ),
-            Self::Cancelled => "You cancelled it before it finished.".to_string(),
+            Self::Cancelled {
+                by: CancelledBy::Owner,
+            } => "You stopped it before it finished.".to_string(),
             Self::NoProgress => {
                 "It made no progress for its time limit, so it was stopped.".to_string()
             }
@@ -384,6 +406,17 @@ impl RunState {
         self.failure.as_ref().map(RunFailure::reason)
     }
 
+    /// The owner stopped it ([`RunEnd::stopped_by_owner`]).
+    pub fn stopped_by_owner(&self) -> bool {
+        self.phase == RunPhase::Stopped
+            && matches!(
+                self.failure,
+                Some(RunFailure::Cancelled {
+                    by: CancelledBy::Owner
+                })
+            )
+    }
+
     /// The one plain line under its finish header: why it did not
     /// succeed, else the typed steps left unconfirmed.
     pub fn line(&self) -> Option<String> {
@@ -408,10 +441,13 @@ impl RunState {
             // the run's start is said, not left as a gap between two
             // figures; a run no request started has it under its result.
             // Why it failed or stopped, on its card as in its result.
+            // Stopped by the owner: its header says so, with no reason line.
             reason: match self.phase {
+                _ if self.stopped_by_owner() => None,
                 RunPhase::Failed | RunPhase::Stopped => self.reason(),
                 _ => None,
             },
+            stopped_by_owner: self.stopped_by_owner(),
             took: self
                 .times()
                 .filter(|times| times.requested.is_some())
@@ -1029,7 +1065,9 @@ mod tests {
             RunFailure::Unfinished {
                 undone: vec!["Repair the homepage".into()],
             },
-            RunFailure::Cancelled,
+            RunFailure::Cancelled {
+                by: CancelledBy::Owner,
+            },
             RunFailure::NoProgress,
             RunFailure::NoCause,
         ];

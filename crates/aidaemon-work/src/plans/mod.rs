@@ -568,6 +568,7 @@ impl TaskPlan {
         let short = match end {
             JobEnd::Succeeded => None,
             JobEnd::Declined => Some(NotDoneReason::OwnerDeclined),
+            JobEnd::StoppedByOwner => Some(NotDoneReason::OwnerStopped),
             JobEnd::Stopped => Some(NotDoneReason::HelperStopped),
             JobEnd::Failed => Some(NotDoneReason::WaitedOnFailed),
         };
@@ -876,8 +877,10 @@ impl TaskPlan {
                     format!("☑️ {} ({UNVERIFIED})", step.description)
                 }
                 (StepStatus::Completed, _) => format!("✅ {}", step.description),
+                // Its row says only that it didn't run; why is said once,
+                // under the rows, however many steps it applies to.
                 (StepStatus::Failed, _) if step.helper_not_started() => {
-                    format!("⚠️ {} ({HELPER_NOT_STARTED})", step.description)
+                    format!("⚠️ {} (didn't run)", step.description)
                 }
                 (StepStatus::InProgress, _) => format!("▶️ {}", step.description),
                 (StepStatus::Background, _) => {
@@ -901,16 +904,15 @@ impl TaskPlan {
         if self.status == PlanStatus::PartiallyCompleted && !in_background && held.is_none() {
             out.push_str("\n\nThe reply below says what was left undone and why.");
         }
-        // A finished card says plainly what never ran.
-        let not_run: Vec<&str> = self
+        // Why the steps marked "didn't run" never ran: said once, not on
+        // each row (live 2026-11-14: "(didn't run: its helper didn't
+        // start)" twice on one card, then the same steps again below).
+        if self
             .steps
             .iter()
-            .filter(|step| step.status == StepStatus::Failed && step.helper_not_started())
-            .map(|step| step.description.as_str())
-            .collect();
-        if finished && !in_background && !not_run.is_empty() {
-            out.push_str("\n\nDidn't run: ");
-            out.push_str(&not_run.join("; "));
+            .any(|step| step.status == StepStatus::Failed && step.helper_not_started())
+        {
+            out.push_str("\n\nDidn't run: its helper didn't start.");
         }
         out
     }
@@ -1217,6 +1219,9 @@ pub enum NotDoneReason {
     /// and it ended without finishing (its run record says so): the
     /// owner's answer, never a failure.
     OwnerDeclined,
+    /// The owner stopped the helper it was handed before it finished: a
+    /// stop, never a failure.
+    OwnerStopped,
     /// Nothing ever took it on: no call did it, no job was launched for it,
     /// and the owner was not asked (the run's ledger says so).
     NotAttempted,
@@ -1230,6 +1235,7 @@ impl NotDoneReason {
             Self::LeftOpen => "nothing was left working on it",
             Self::WaitedOnFailed => "the work it waited on failed",
             Self::OwnerDeclined => "you declined a step its helper asked to take",
+            Self::OwnerStopped => "you stopped its helper",
             Self::NotAttempted => "not attempted",
         }
     }
@@ -1243,6 +1249,8 @@ pub enum JobEnd {
     Stopped,
     /// It stopped short because the owner declined one of its steps.
     Declined,
+    /// The owner stopped it before it finished.
+    StoppedByOwner,
     Failed,
 }
 

@@ -1074,13 +1074,15 @@ mod tests {
         let card = plan.render_compact_checklist();
         assert!(card.starts_with("❌ Stopped · 1 of 2 done"), "{card}");
         assert!(
-            card.contains("⚠️ Install the second site (didn't run: its helper didn't start)"),
+            card.contains("⚠️ Install the second site (didn't run)"),
             "{card}"
         );
+        // Why is said once, under the rows.
         assert!(
-            card.ends_with("Didn't run: Install the second site"),
+            card.ends_with("Didn't run: its helper didn't start."),
             "{card}"
         );
+        assert_eq!(card.matches("helper didn't start").count(), 1, "{card}");
 
         let plan = store
             .link_background_job("s1", Some("t1"), &[1], "job-2")

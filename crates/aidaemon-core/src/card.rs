@@ -8,6 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The header of a run the owner stopped.
+const STOPPED_BY_OWNER: &str = "\u{23f9}\u{fe0f} Stopped by you";
+
 /// Where a helper run stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunPhase {
@@ -178,6 +181,10 @@ pub struct HelperView {
     /// Once it failed or stopped, why, in plain words from its run record
     /// (the same sentence its result carries). Never from its reply.
     pub reason: Option<String>,
+    /// It stopped because the owner stopped it: its header says so
+    /// plainly ("Stopped by you"), never as a failure or an error. Set
+    /// only from its run record's typed end.
+    pub stopped_by_owner: bool,
     /// Once it ended, how long it took and when, as the runtime measured it
     /// and already worded for the owner ("Took 21s (2:21:16 PM to 2:21:37 PM
     /// ET)."). Never worked out from anything a model wrote.
@@ -208,9 +215,20 @@ impl HelperView {
             step,
             steps: Vec::new(),
             reason: None,
+            stopped_by_owner: false,
             took: None,
             since_request: None,
         }
+    }
+
+    /// Its header on a card: how it stands, from its typed record. A run
+    /// the owner stopped reads "Stopped by you" whether it ran in the
+    /// background or not.
+    pub fn headline(&self) -> &'static str {
+        if self.phase == RunPhase::Stopped && self.stopped_by_owner {
+            return STOPPED_BY_OWNER;
+        }
+        self.phase.helper_headline(self.background)
     }
 
     /// The same record, started for the plan steps `steps`.

@@ -1043,6 +1043,26 @@ impl ChildTaskFailed {
 /// Why a helper run whose call returned `error` failed: a child whose own
 /// record says it failed gives that record's cause; any other error is the
 /// runtime's own and is the cause as it stands.
+/// How a child's run ended when it returned an error instead of its end
+/// record: the one reading of every child error, for a waited-on child and
+/// a background one alike. The owner stopping it is a stop, never a failure
+/// (live 2026-11-14: a waited-on helper the owner cancelled read "❌ A
+/// helper failed … It stopped on an error: stopped by the owner"); no
+/// progress for its limit is a stop too; anything else failed, with its
+/// reason.
+pub fn end_of_child_error(error: &anyhow::Error) -> crate::run_state::RunEnd {
+    use crate::run_state::{CancelledBy, RunEnd, RunFailure};
+    if error.downcast_ref::<ChildStoppedByOwner>().is_some() {
+        return RunEnd::Stopped(Some(RunFailure::Cancelled {
+            by: CancelledBy::Owner,
+        }));
+    }
+    if error.downcast_ref::<ChildTimedOut>().is_some() {
+        return RunEnd::Stopped(Some(RunFailure::NoProgress));
+    }
+    RunEnd::Failed(failure_of_error(error))
+}
+
 pub fn failure_of_error(error: &anyhow::Error) -> crate::run_state::RunFailure {
     match error.downcast_ref::<ChildTaskFailed>() {
         Some(failed) => failed.failure(),
@@ -1572,6 +1592,29 @@ mod tests {
             nothing_done(TaskOutcome::Succeeded, &checklist(&undone), &undone, false),
             None
         );
+    }
+
+    /// The owner stopping a child is a stop with a typed cause, never a
+    /// failure: one reading of every child error, waited on or in the
+    /// background (live 2026-11-14: "It stopped on an error: stopped by the
+    /// owner").
+    #[test]
+    fn a_child_the_owner_stopped_ended_stopped_by_them() {
+        use crate::run_state::{CancelledBy, RunEnd};
+        let end = end_of_child_error(&anyhow::Error::from(ChildStoppedByOwner));
+        assert_eq!(
+            end,
+            RunEnd::Stopped(Some(RunFailure::Cancelled {
+                by: CancelledBy::Owner
+            }))
+        );
+        assert!(end.stopped_by_owner());
+        assert_eq!(end.phase(), aidaemon_core::card::RunPhase::Stopped);
+        let reason = end.failure().unwrap().reason();
+        assert!(!reason.contains("error"), "{reason}");
+        let other = end_of_child_error(&anyhow::anyhow!("provider down"));
+        assert!(matches!(other, RunEnd::Failed(_)));
+        assert!(!other.stopped_by_owner());
     }
 
     /// Live 2026-11-13: the owner declined the WordPress helper's password

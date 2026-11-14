@@ -57,9 +57,11 @@ pub aidaemon_core::card::HelperView::reason: core::option::Option<alloc::string:
 pub aidaemon_core::card::HelperView::since_request: core::option::Option<aidaemon_core::card::SinceRequest>
 pub aidaemon_core::card::HelperView::step: core::option::Option<aidaemon_core::card::Step>
 pub aidaemon_core::card::HelperView::steps: alloc::vec::Vec<usize>
+pub aidaemon_core::card::HelperView::stopped_by_owner: bool
 pub aidaemon_core::card::HelperView::took: core::option::Option<alloc::string::String>
 impl aidaemon_core::card::HelperView
 pub fn aidaemon_core::card::HelperView::for_steps(self, &[usize]) -> Self
+pub fn aidaemon_core::card::HelperView::headline(&self) -> &'static str
 pub fn aidaemon_core::card::HelperView::running(&str, bool, core::option::Option<aidaemon_core::card::Step>) -> Self
 pub struct aidaemon_core::card::PlanCard
 pub aidaemon_core::card::PlanCard::done: usize

@@ -292,9 +292,13 @@ pub fn render_run_result(
     let mut lead = if on_card {
         String::new()
     } else {
-        format!("{}: {name}", state.phase.headline())
+        format!("{}: {name}", state.view().headline())
     };
-    if let Some(reason) = state.reason() {
+    // A header that already says the owner stopped it needs no reason.
+    if let Some(reason) = state
+        .reason()
+        .filter(|_| on_card || !state.stopped_by_owner())
+    {
         if !lead.is_empty() {
             lead.push('\n');
         }
@@ -344,6 +348,16 @@ pub fn job_end(
             if matches!(failure, Some(crate::run_state::RunFailure::Declined { .. })) =>
         {
             aidaemon_work::plans::JobEnd::Declined
+        }
+        RunPhase::Stopped
+            if matches!(
+                failure,
+                Some(crate::run_state::RunFailure::Cancelled {
+                    by: crate::run_state::CancelledBy::Owner
+                })
+            ) =>
+        {
+            aidaemon_work::plans::JobEnd::StoppedByOwner
         }
         RunPhase::Stopped => aidaemon_work::plans::JobEnd::Stopped,
         RunPhase::Failed | RunPhase::Running => aidaemon_work::plans::JobEnd::Failed,
@@ -1705,8 +1719,13 @@ impl SpawnAgentTool {
         error: anyhow::Error,
     ) -> anyhow::Error {
         // A launch refused because a running helper already does its steps
-        // leaves them with that helper.
-        if error.downcast_ref::<StepsAlreadyRunning>().is_some() {
+        // leaves them with that helper; a helper the owner stopped did
+        // start, and its stop is not a launch failure.
+        if error.downcast_ref::<StepsAlreadyRunning>().is_some()
+            || error
+                .downcast_ref::<crate::spawn::ChildStoppedByOwner>()
+                .is_some()
+        {
             return error;
         }
         let items: Vec<usize> = serde_json::from_str::<Value>(arguments)
@@ -2221,7 +2240,9 @@ impl SpawnAgentTool {
                 // what its receipts left unconfirmed.
                 let (run_end, evidence, report) = match result {
                     _ if cancelled_by_owner => (
-                        RunEnd::Stopped(Some(crate::run_state::RunFailure::Cancelled)),
+                        RunEnd::Stopped(Some(crate::run_state::RunFailure::Cancelled {
+                            by: crate::run_state::CancelledBy::Owner,
+                        })),
                         Default::default(),
                         "It may have done part of the work.".to_string(),
                     ),
@@ -2927,10 +2948,7 @@ impl SpawnAgentTool {
         // How it ended, typed: a failure always with its reason.
         let run_end = match &result {
             Ok(run) => run.end.clone(),
-            Err(error) if error.downcast_ref::<ChildTimedOut>().is_some() => {
-                RunEnd::Stopped(Some(crate::run_state::RunFailure::NoProgress))
-            }
-            Err(error) => RunEnd::Failed(crate::spawn::failure_of_error(error)),
+            Err(error) => crate::spawn::end_of_child_error(error),
         };
         let failed = run_end.phase() == RunPhase::Failed;
         // How long after the owner's request it ended: what the owner means
@@ -2969,7 +2987,13 @@ impl SpawnAgentTool {
                 background: false,
                 step: None,
                 steps: card_steps,
-                reason: run_end.failure().map(crate::run_state::RunFailure::reason),
+                // Stopped by the owner: its header says so, with no reason
+                // line.
+                reason: run_end
+                    .failure()
+                    .filter(|_| !run_end.stopped_by_owner())
+                    .map(crate::run_state::RunFailure::reason),
+                stopped_by_owner: run_end.stopped_by_owner(),
                 took: Some(times.line()),
                 since_request: since,
             }));
@@ -3029,6 +3053,9 @@ impl SpawnAgentTool {
                 outcome.metadata.outcome_status = Some(child_receipt_status(run.end.phase()));
                 Ok(outcome)
             }
+            // The owner stopped it: the stop goes back typed, so nothing
+            // reads it as a failure or as a helper that never started.
+            Err(error) if run_end.stopped_by_owner() => Err(error),
             Err(error) => match error.downcast_ref::<ChildTimedOut>() {
                 None => Err(anyhow::anyhow!("Specialist failed: {error}\n{window}")),
                 Some(timed_out) => {

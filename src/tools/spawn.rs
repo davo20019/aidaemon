@@ -1605,10 +1605,8 @@ mod child_runtime_tests {
 
         let entry = wait_for_notification(&store).await;
         assert!(
-            entry
-                .message
-                .contains("Didn't finish in the background: Report")
-                && entry.message.contains("You cancelled it"),
+            entry.message.contains("Stopped by you: Report")
+                && !entry.message.contains("Didn't finish"),
             "{}",
             entry.message
         );
@@ -2429,7 +2427,7 @@ mod child_runtime_tests {
         assert!(plan.steps[1].helper_not_started());
         assert!(
             plan.render_compact_checklist()
-                .contains("WordPress install in site-b (didn't run: its helper didn't start)"),
+                .contains("WordPress install in site-b (didn't run)"),
             "{}",
             plan.render_compact_checklist()
         );
@@ -2808,7 +2806,7 @@ mod child_runtime_tests {
                 "cancelled",
                 RunPhase::Stopped,
                 true,
-                "⏭️ Install the site (not done: its helper stopped before it finished)",
+                "⏭️ Install the site (not done: you stopped its helper)",
             ),
         ];
         for (case, phase, cancel, step_line) in cases {
@@ -2854,9 +2852,14 @@ mod child_runtime_tests {
 
             // Once it ended: how it ended is on the card, once; the result
             // carries the body and the measured time.
+            let headline = if cancel {
+                "\u{23f9}\u{fe0f} Stopped by you"
+            } else {
+                phase.headline()
+            };
             assert!(
                 seen.final_card
-                    .contains(&format!("{}: Site install", phase.headline())),
+                    .contains(&format!("{headline}: Site install")),
                 "{case}: {}",
                 seen.final_card
             );
@@ -2886,10 +2889,9 @@ mod child_runtime_tests {
                     "{}: Site install\nIt stopped on an error: synthetic failure.",
                     phase.headline()
                 ),
-                (_, true) => format!(
-                    "{}: Site install\nYou cancelled it before it finished.",
-                    phase.headline()
-                ),
+                // Stopped by the owner: the header says it, with no
+                // reason line and nothing of a failure.
+                (_, true) => format!("{headline}: Site install"),
                 _ => format!("{}: Site install", phase.headline()),
             };
             assert!(
