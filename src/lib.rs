@@ -49,6 +49,7 @@ use aidaemon_channels::queue::telemetry as queue_telemetry;
 use aidaemon_work::reminders;
 mod router;
 mod runtime_ports;
+mod setup;
 mod single_instance;
 mod skills;
 mod startup;
@@ -344,13 +345,13 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Wizard: if no config.toml, run interactive setup
+    // No config: setup mode, until the owner connects a model from the app
+    // (here or on another device). The daemon then starts with it.
     if !config_path.exists() {
-        let start_now = wizard::run_wizard(&config_path)?;
-        if !start_now {
-            return Ok(());
-        }
-        // Fall through to load config and start the daemon
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(setup::mode::run(&config_path))?;
     }
 
     // Load config — if corrupted, try restoring from .lastgood first (proven
@@ -592,8 +593,15 @@ fn handle_setup_command(args: &[String], default_config_path: &Path) -> anyhow::
             }
             wizard::run_low_latency_setup(default_config_path)
         }
+        "" if !default_config_path.exists() => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(setup::text::run(default_config_path)),
         "-h" | "--help" | "" => {
             println!("Usage:");
+            println!(
+                "  aidaemon setup              connect a model in this terminal (no config yet)"
+            );
             println!("  aidaemon setup low-latency");
             println!("  aidaemon setup telegram-webhook");
             println!();

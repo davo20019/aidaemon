@@ -357,6 +357,8 @@ impl KeychainSettings {
 pub struct KeychainSecretStore {
     settings: KeychainSettings,
     env: EnvSecretStore,
+    /// A write found no usable keychain and went to the env file instead.
+    fell_back: std::sync::atomic::AtomicBool,
 }
 
 impl KeychainSecretStore {
@@ -365,7 +367,26 @@ impl KeychainSecretStore {
             settings.env_file_vars.clone(),
             settings.default_env_file.clone(),
         );
-        Self { settings, env }
+        Self {
+            settings,
+            env,
+            fell_back: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// When a secret had to go to the env file because this machine has no
+    /// keychain the store can use (a headless server), what to tell the
+    /// owner; `None` otherwise.
+    pub fn fallback_notice(&self) -> Option<String> {
+        self.fell_back
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| {
+                format!(
+                    "This machine has no keychain to use, so secrets are kept in {}, readable \
+                     only by you (as the database key already is).",
+                    self.env.env_file_path().display()
+                )
+            })
     }
 
     /// Register what this store sets and hands out in `scope` instead of
@@ -404,10 +425,14 @@ impl SecretStore for KeychainSecretStore {
         if self.keychain_disabled() {
             return self.env.get(key);
         }
-        self.entry(key)?
-            .get_password()
-            .map(|value| handed_out(&self.env.scope, key, value))
-            .map_err(|e| anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", key, e))
+        match self.entry(key).and_then(|entry| Ok(entry.get_password()?)) {
+            Ok(value) => Ok(handed_out(&self.env.scope, key, value)),
+            // A secret written while no keychain could be used is in the
+            // env file.
+            Err(error) => self.env.get(key).map_err(|_| {
+                anyhow::anyhow!("Failed to read '{}' from OS keychain: {}", key, error)
+            }),
+        }
     }
 
     fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -415,8 +440,21 @@ impl SecretStore for KeychainSecretStore {
         if self.keychain_disabled() {
             return self.env.set(key, value);
         }
-        self.entry(key)?.set_password(value)?;
-        Ok(())
+        match self
+            .entry(key)
+            .and_then(|entry| Ok(entry.set_password(value)?))
+        {
+            Ok(()) => Ok(()),
+            // No usable keychain (a headless server, no secret service):
+            // the owner-only env file, as with the keychain turned off.
+            Err(error) => {
+                tracing::warn!(%error, key, "No usable keychain; keeping the secret in the env file");
+                self.env.set(key, value)?;
+                self.fell_back
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
     }
 
     fn delete(&self, key: &str) -> anyhow::Result<()> {

@@ -244,6 +244,35 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+/// A provider preset, as a setup screen offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetInfo {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    /// The `provider.kind` it writes.
+    pub kind: &'static str,
+    pub base_url: &'static str,
+    pub primary: &'static str,
+    pub needs_api_key: bool,
+    pub requires_custom_base_url: bool,
+}
+
+/// Every provider preset `switch_provider` takes, in its own order.
+pub fn provider_presets() -> Vec<PresetInfo> {
+    PROVIDER_PRESETS
+        .iter()
+        .map(|p| PresetInfo {
+            id: p.id,
+            display_name: p.display_name,
+            kind: p.kind,
+            base_url: p.base_url,
+            primary: p.primary,
+            needs_api_key: p.needs_api_key,
+            requires_custom_base_url: p.requires_custom_base_url,
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 struct ResolvedProviderSelection {
     preset: &'static ProviderPreset,

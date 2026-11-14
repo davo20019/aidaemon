@@ -240,6 +240,71 @@ impl ChatGptCredentialManager {
         Ok(creds)
     }
 
+    /// Start a sign-in in two steps, for a host that shows the address in
+    /// an app instead of a terminal. With `loopback`, the fixed callback
+    /// port is bound now, so a conflict shows before the owner signs in;
+    /// finish with [`Self::finish_on_loopback`]. Otherwise finish with the
+    /// address the browser ended on ([`Self::finish_with_redirect`]).
+    pub async fn start_login(&self, loopback: bool) -> Result<LoginAttempt> {
+        let pkce = PkceChallenge::generate();
+        let url = build_authorize_url(&self.settings.client_id, &pkce.challenge, &pkce.state);
+        let listener = if loopback {
+            Some(bind_callback_listener(&self.settings.app_name).await?)
+        } else {
+            None
+        };
+        Ok(LoginAttempt {
+            url,
+            pkce,
+            listener,
+        })
+    }
+
+    /// Wait for the browser to come back to the loopback listener, then
+    /// store the credentials.
+    pub async fn finish_on_loopback(
+        &self,
+        client: &reqwest::Client,
+        mut attempt: LoginAttempt,
+    ) -> Result<ChatGptCredentials> {
+        let listener = attempt
+            .listener
+            .take()
+            .ok_or_else(|| anyhow!("this sign-in does not listen on this machine"))?;
+        let code = await_callback(listener, &attempt.pkce.state, &self.settings.app_name).await?;
+        self.finish_with_code(client, &attempt, &code).await
+    }
+
+    /// The address the browser ended on (pasted by the owner): store the
+    /// credentials it carries.
+    pub async fn finish_with_redirect(
+        &self,
+        client: &reqwest::Client,
+        attempt: &LoginAttempt,
+        redirect: &str,
+    ) -> Result<ChatGptCredentials> {
+        let code = parse_callback(redirect, &attempt.pkce.state)?;
+        self.finish_with_code(client, attempt, &code).await
+    }
+
+    async fn finish_with_code(
+        &self,
+        client: &reqwest::Client,
+        attempt: &LoginAttempt,
+        code: &str,
+    ) -> Result<ChatGptCredentials> {
+        let creds = exchange_code(
+            client,
+            &self.settings.client_id,
+            code,
+            &attempt.pkce.verifier,
+        )
+        .await?;
+        self.store_credentials(&creds)?;
+        self.replace_cached(Some(creds.clone())).await;
+        Ok(creds)
+    }
+
     async fn refresh(
         &self,
         client: &reqwest::Client,
@@ -457,6 +522,21 @@ pub fn account_id_from_id_token(id_token: &str) -> Result<String> {
                  the account may not have ChatGPT access"
             )
         })
+}
+
+/// A sign-in started with [`ChatGptCredentialManager::start_login`].
+pub struct LoginAttempt {
+    /// Where the owner signs in.
+    pub url: String,
+    pkce: PkceChallenge,
+    listener: Option<TcpListener>,
+}
+
+impl LoginAttempt {
+    /// It waits on this machine's callback port (else for a pasted address).
+    pub fn on_loopback(&self) -> bool {
+        self.listener.is_some()
+    }
 }
 
 /// Generate a PKCE verifier/challenge pair plus a CSRF state value.

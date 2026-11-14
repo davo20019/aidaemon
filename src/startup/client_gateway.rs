@@ -80,6 +80,20 @@ pub(crate) struct DaemonClientHost {
     pub commands: crate::channels::commands::CommandContext,
     pub system: SystemSources,
     pub settings: crate::startup::client_settings::SettingsHost,
+    /// First-run setup's chat step and greeting.
+    pub setup: crate::setup::channel::ChannelSetup,
+}
+
+impl DaemonClientHost {
+    /// The channels of every session, for the chat step's "connected".
+    async fn session_channels(&self) -> Vec<String> {
+        self.sessions()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.channel)
+            .collect()
+    }
 }
 
 /// What the app's System area reads: the daemon's models, token use, model
@@ -471,6 +485,19 @@ impl ClientHost for DaemonClientHost {
         self.settings.client_seen();
     }
 
+    async fn setup(&self) -> Option<aidaemon_client_protocol::SetupState> {
+        let channels = self.session_channels().await;
+        self.setup.state(&channels).await
+    }
+
+    async fn setup_step(
+        &self,
+        action: aidaemon_client_protocol::SetupAction,
+    ) -> Result<aidaemon_client_protocol::SetupState, String> {
+        let channels = self.session_channels().await;
+        self.setup.step(action, &channels).await
+    }
+
     async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         let messages = self.state.get_history(session_id, limit).await?;
         // Runtime continuations and system notices ride as user-role turns
@@ -696,6 +723,11 @@ pub async fn start(
                 system.mcp.take(),
                 Some(deps.command_context()),
             ),
+            setup: crate::setup::channel::ChannelSetup {
+                config_path: commands.config_path.clone(),
+                state: deps.state.clone(),
+                events: system.events.clone(),
+            },
             commands,
             system,
         }),

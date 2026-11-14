@@ -65,6 +65,9 @@ pub struct SetupDeps {
     pub config: ClientGatewayConfig,
     /// The local token's hash.
     pub token_file: PathBuf,
+    /// Cancelled when setup ends: open sockets close, so the daemon can
+    /// serve the full gateway on the same address.
+    pub stop: CancellationToken,
 }
 
 pub struct SetupGateway {
@@ -75,6 +78,7 @@ pub struct SetupGateway {
     token_file: PathBuf,
     /// An owner device exists: the printed code no longer pairs.
     owner_seen: AtomicBool,
+    stop: CancellationToken,
 }
 
 impl SetupGateway {
@@ -100,6 +104,7 @@ impl SetupGateway {
             config: deps.config,
             token_file: deps.token_file,
             owner_seen: AtomicBool::new(seen),
+            stop: deps.stop,
         }))
     }
 
@@ -182,8 +187,9 @@ pub fn router(gateway: Arc<SetupGateway>) -> Router {
         .with_state(gateway)
 }
 
-/// Serve on the configured loopback address until `stop` is cancelled.
-pub async fn serve(gateway: Arc<SetupGateway>, stop: CancellationToken) -> anyhow::Result<()> {
+/// Serve on the configured loopback address until setup stops.
+pub async fn serve(gateway: Arc<SetupGateway>) -> anyhow::Result<()> {
+    let stop = gateway.stop.clone();
     let addr = gateway.config.bind_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "Client Gateway listening for setup");
@@ -482,6 +488,10 @@ async fn run_socket(
                 return Ok(());
             }
             _ = revoked.cancelled() => return Ok(()),
+            _ = gateway.stop.cancelled() => {
+                let _ = socket.send(Message::Close(None)).await;
+                return Ok(());
+            }
         }
     }
 }

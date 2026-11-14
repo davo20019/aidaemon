@@ -61,6 +61,7 @@ async fn fixture() -> Fixture {
         log,
         config: ClientGatewayConfig::default(),
         token_file,
+        stop: tokio_util::sync::CancellationToken::new(),
     })
     .await
     .unwrap();

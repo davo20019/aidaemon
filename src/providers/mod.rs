@@ -3,6 +3,7 @@
 //! `aidaemon-runtime`; the old paths stay.
 
 pub mod chatgpt_login;
+pub(crate) mod connection_test;
 pub(crate) mod factory;
 
 #[cfg(test)]
