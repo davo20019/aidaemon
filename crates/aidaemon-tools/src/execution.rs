@@ -256,8 +256,8 @@ pub async fn build_execution_backend(
             {
                 let _ = config_path;
                 anyhow::bail!(
-                    "execution.backend=\"docker\" requires aidaemon built with \
-                     --features execution-docker; the default binary remains Docker-free"
+                    "execution.backend=\"docker\" requires aidaemon built with the \
+                     `execution-docker` feature (on by default; this build turned it off)"
                 )
             }
         }

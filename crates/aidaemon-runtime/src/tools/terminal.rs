@@ -1682,28 +1682,35 @@ async fn confined_terminal_execution_request_inner(
     )
     .await;
 
-    // The Linux sandbox adapter is a Node.js entrypoint (`#!/usr/bin/env
+    // Linux confines with the Codex sandbox adapter when it is installed,
+    // else with the SDK's scoped bubblewrap profile (`[terminal]
+    // confinement = "sandbox"` must never fail just for a missing adapter).
+    #[cfg(not(target_os = "macos"))]
+    let adapter = {
+        let codex = backend.resolve_executable("codex").await?;
+        let bubblewrap = if codex.is_none() {
+            usable_bubblewrap(backend).await?
+        } else {
+            None
+        };
+        select_linux_sandbox_adapter(codex, bubblewrap)?
+    };
+    // The Codex adapter is a Node.js entrypoint (`#!/usr/bin/env
     // node`). Its interpreter is not necessarily in a base system directory
     // on hosted runners, and the confined child PATH is intentionally reduced
     // to granted runtime prefixes. Grant the adapter's own executable prefix
     // so the outer adapter process can resolve its interpreter without
-    // widening access to unrelated host paths.
+    // widening access to unrelated host paths. (bwrap is a native binary
+    // that runs outside its own sandbox: it needs no grant.)
     #[cfg(not(target_os = "macos"))]
-    let codex = backend
-        .resolve_executable("codex")
-        .await?
-        .ok_or_else(|| anyhow::anyhow!(
-            "confined terminal execution requires a registered native sandbox adapter; Codex sandbox is unavailable"
-        ))?;
-    #[cfg(not(target_os = "macos"))]
-    {
+    if let LinuxSandboxAdapter::Codex(codex) = &adapter {
         if let Some(parent) = codex.parent() {
             runtime_support.add_read(parent.to_string());
             runtime_support.add_path_prefix(parent.to_string());
             runtime_support.add_executable(parent.to_string());
         }
         let canonical = backend
-            .canonicalize(&codex)
+            .canonicalize(codex)
             .await
             .unwrap_or_else(|_| codex.clone());
         if let Some(parent) = canonical.parent() {
@@ -1781,35 +1788,51 @@ async fn confined_terminal_execution_request_inner(
     let policy_writes = writes;
     #[cfg(not(target_os = "macos"))]
     {
-        let sandbox_state =
-            codex_sandbox_state_json(&sandbox_cwd, &reads, &policy_writes, capabilities)?;
-        let mut args = vec![
-            "sandbox".to_string(),
-            "--sandbox-state-json".to_string(),
-            sandbox_state,
-            "--".to_string(),
-            // The sandbox adapter is a process boundary. Supplying these values
-            // only to the outer adapter does not guarantee that its child keeps
-            // them, so carry the registered runtime profile explicitly into the
-            // confined process as well. These are runtime dependencies, not task
-            // authority or ambient owner configuration.
-            "/usr/bin/env".to_string(),
-        ];
-        args.extend(
+        // The sandbox is a process boundary. Supplying these values only to
+        // the outer adapter does not guarantee that its child keeps them, so
+        // carry the registered runtime profile explicitly into the confined
+        // process as well. These are runtime dependencies, not task
+        // authority or ambient owner configuration.
+        let mut confined = vec!["/usr/bin/env".to_string()];
+        confined.extend(
             sandbox_environment
                 .iter()
                 .map(|(name, value)| format!("{name}={value}")),
         );
         if script_via_stdin {
-            args.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+            confined.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
         } else {
-            args.extend([
+            confined.extend([
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 shell_source.to_string(),
             ]);
         }
-        let mut request = ExecutionRequest::argv(codex.to_string(), args);
+        let (program, args) = match &adapter {
+            LinuxSandboxAdapter::Codex(codex) => {
+                let sandbox_state =
+                    codex_sandbox_state_json(&sandbox_cwd, &reads, &policy_writes, capabilities)?;
+                let mut args = vec![
+                    "sandbox".to_string(),
+                    "--sandbox-state-json".to_string(),
+                    sandbox_state,
+                    "--".to_string(),
+                ];
+                args.extend(confined);
+                (codex.to_string(), args)
+            }
+            LinuxSandboxAdapter::Bubblewrap(bwrap) => (
+                bwrap.to_string(),
+                bubblewrap_sandbox_args(
+                    &sandbox_cwd,
+                    &reads,
+                    &policy_writes,
+                    capabilities,
+                    &confined,
+                ),
+            ),
+        };
+        let mut request = ExecutionRequest::argv(program, args);
         request.cwd = cwd;
         request.env.extend(sandbox_environment);
         if script_via_stdin {
@@ -2936,6 +2959,84 @@ fn native_sandbox_search_path_from(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+/// The program that confines a Linux `terminal` command.
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinuxSandboxAdapter {
+    /// The Codex CLI's `codex sandbox` (its manifest-driven Landlock
+    /// adapter): preferred when installed.
+    Codex(aidaemon_tools::BackendPath),
+    /// `bwrap` with the SDK's scoped profile
+    /// ([`aidaemon_tools::BubblewrapSandbox::scoped_args`]): the fallback.
+    Bubblewrap(aidaemon_tools::BackendPath),
+}
+
+/// Pick the Linux sandbox: the Codex adapter when present, else a usable
+/// bubblewrap, else an error naming both (never a silent run on the host).
+#[cfg(any(test, not(target_os = "macos")))]
+fn select_linux_sandbox_adapter(
+    codex: Option<aidaemon_tools::BackendPath>,
+    bubblewrap: Option<aidaemon_tools::BackendPath>,
+) -> anyhow::Result<LinuxSandboxAdapter> {
+    match (codex, bubblewrap) {
+        (Some(codex), _) => Ok(LinuxSandboxAdapter::Codex(codex)),
+        (None, Some(bwrap)) => {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                info!(
+                    bwrap = %bwrap,
+                    "Codex sandbox adapter not found; [terminal] confinement = \"sandbox\" \
+                     confines commands with bubblewrap instead"
+                )
+            });
+            Ok(LinuxSandboxAdapter::Bubblewrap(bwrap))
+        }
+        (None, None) => anyhow::bail!(
+            "confined terminal execution needs a sandbox, and none is available: install the \
+             Codex CLI (its `codex sandbox` adapter) or bubblewrap (`bwrap`, with \
+             unprivileged user namespaces enabled)"
+        ),
+    }
+}
+
+/// `bwrap`, when it is installed where the backend runs and, on this host,
+/// can actually create the namespaces the profile uses (bwrap may be present
+/// while user namespaces are disabled or restricted by AppArmor).
+#[cfg(not(target_os = "macos"))]
+async fn usable_bubblewrap(
+    backend: &SharedExecutionBackend,
+) -> anyhow::Result<Option<aidaemon_tools::BackendPath>> {
+    let Some(bwrap) = backend.resolve_executable("bwrap").await? else {
+        return Ok(None);
+    };
+    if backend.kind() == BackendKind::Local
+        && !aidaemon_tools::Sandbox::is_available(&aidaemon_tools::BubblewrapSandbox::new())
+    {
+        return Ok(None);
+    }
+    Ok(Some(bwrap))
+}
+
+/// The scoped bubblewrap argv for the same manifest the Codex adapter gets.
+#[cfg(any(test, not(target_os = "macos")))]
+fn bubblewrap_sandbox_args(
+    cwd: &str,
+    read_paths: &[String],
+    write_paths: &[String],
+    capabilities: ConfinedCapabilities,
+    confined: &[String],
+) -> Vec<String> {
+    aidaemon_tools::BubblewrapSandbox::scoped_args(
+        &aidaemon_tools::BubblewrapScope {
+            cwd: cwd.to_string(),
+            read_paths: read_paths.to_vec(),
+            write_paths: write_paths.to_vec(),
+            allow_network: capabilities.network,
+        },
+        confined,
+    )
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -9276,6 +9377,69 @@ mod tests {
             .expect("sandbox execution");
         assert_eq!(output.exit_code, 0, "{}", output.stderr_lossy());
         assert_eq!(output.stdout_lossy().trim(), "SYNTHETIC_NESTED_PYTHON_OK");
+    }
+
+    #[test]
+    fn linux_sandbox_prefers_codex_and_falls_back_to_bubblewrap() {
+        let codex = aidaemon_tools::BackendPath::new("/opt/node/bin/codex");
+        let bwrap = aidaemon_tools::BackendPath::new("/usr/bin/bwrap");
+        assert_eq!(
+            select_linux_sandbox_adapter(Some(codex.clone()), Some(bwrap.clone())).unwrap(),
+            LinuxSandboxAdapter::Codex(codex.clone())
+        );
+        assert_eq!(
+            select_linux_sandbox_adapter(Some(codex.clone()), None).unwrap(),
+            LinuxSandboxAdapter::Codex(codex)
+        );
+        assert_eq!(
+            select_linux_sandbox_adapter(None, Some(bwrap.clone())).unwrap(),
+            LinuxSandboxAdapter::Bubblewrap(bwrap)
+        );
+        // Neither: fail closed, naming both ways out, never the host.
+        let error = select_linux_sandbox_adapter(None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("codex sandbox") && error.contains("bwrap"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_fallback_gets_the_codex_manifest() {
+        let confined = vec![
+            "/usr/bin/env".to_string(),
+            "PATH=/usr/bin".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            "ls".into(),
+        ];
+        let args = bubblewrap_sandbox_args(
+            "/work/repo",
+            &["/work/repo".to_string()],
+            &["/work/repo/out".to_string()],
+            ConfinedCapabilities { network: false },
+            &confined,
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--ro-bind-try /work/repo /work/repo"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--bind-try /work/repo/out /work/repo/out"),
+            "{joined}"
+        );
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(joined.ends_with("--chdir /work/repo -- /usr/bin/env PATH=/usr/bin /bin/sh -c ls"));
+        let networked = bubblewrap_sandbox_args(
+            "/",
+            &[],
+            &[],
+            ConfinedCapabilities { network: true },
+            &confined,
+        );
+        assert!(!networked.contains(&"--unshare-net".to_string()));
     }
 
     #[test]

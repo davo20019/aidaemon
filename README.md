@@ -105,14 +105,9 @@ on one coherent filesystem. Configuration, encrypted state, channel transport,
 credentials, approvals, and browser/computer-use sessions remain on the daemon
 host.
 
-Docker support is deliberately optional so the default build remains a
-single-binary, Docker-free installation:
-
-```bash
-cargo install aidaemon --features execution-docker
-```
-
-The Docker backend creates or reuses one persistent container and defaults to
+The Docker backend is built in (the `execution-docker` feature, on by
+default; it drives the `docker` CLI and adds no dependencies), so Docker is
+needed only when `[execution] backend = "docker"` is set. The Docker backend creates or reuses one persistent container and defaults to
 no network access. The SSH backend uses the local OpenSSH client and honors
 existing host aliases, ssh-agent, ProxyJump, known-host, and hardware-key
 configuration. `allow_outside_workspace` confines path-based tools and command

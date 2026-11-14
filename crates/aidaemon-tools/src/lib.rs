@@ -98,10 +98,10 @@ pub use backend::{
 };
 pub use checklist::{Checklist, ChecklistGate, ChecklistItem, ChecklistState, ItemStatus};
 pub use exec::{
-    BubblewrapSandbox, CommandOutput, DockerSandbox, ExecError, HOME_SECRET_PATHS, LocalSandbox,
-    SANDBOX_ENV, Sandbox, SandboxCommand, SandboxKind, SandboxSelection, SeatbeltSandbox,
-    TerminalConfinement, best_available_sandbox, default_deny_read, home_secret_paths,
-    sandbox_preference_from_env, select_sandbox,
+    BubblewrapSandbox, BubblewrapScope, CommandOutput, DockerSandbox, ExecError, HOME_SECRET_PATHS,
+    LocalSandbox, SANDBOX_ENV, Sandbox, SandboxCommand, SandboxKind, SandboxSelection,
+    SeatbeltSandbox, TerminalConfinement, best_available_sandbox, default_deny_read,
+    home_secret_paths, sandbox_preference_from_env, select_sandbox,
 };
 pub use fs::{
     DEFAULT_IGNORE_DIRS, EditFile, FilePolicy, HostFilePolicy, HostFilePolicySettings,

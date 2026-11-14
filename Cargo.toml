@@ -165,10 +165,12 @@ xcap = { version = "0.9", optional = true }
 tikv-jemallocator = "0.7"
 
 [features]
-default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel"]
+default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel", "execution-docker"]
 browser = ["aidaemon-tool-browser/chromium"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
+# The Docker execution backend: code only (it drives the `docker` CLI, no
+# extra crates), so it is on by default and needs Docker only when used.
 execution-docker = ["aidaemon-tools/docker"]
 terminal-bridge = ["dep:aidaemon-terminal-bridge"]
 encryption = ["libsqlite3-sys/bundled-sqlcipher", "aidaemon-runtime/encryption"]
