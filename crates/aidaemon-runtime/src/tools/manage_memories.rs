@@ -159,29 +159,53 @@ struct ManageArgs {
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str =
-    "Memories/goals. search=facts; search_episodes=past chats. Store via remember_fact.";
+const TOOL_DESCRIPTION: &str = "Memories/goals. search=stored facts; search_episodes=generated summaries of past chats (exact messages: search_history). Store via remember_fact.";
+
+/// The personal-goal actions, which are the daemon's work.
+const GOAL_ACTIONS: &[&str] = &[
+    "create_personal_goal",
+    "list_goals",
+    "complete_goal",
+    "abandon_goal",
+];
+
+/// Every action the tool has: the memory actions, then the goal actions.
+fn actions() -> Vec<&'static str> {
+    aidaemon_memory::full::tools::MEMORY_ACTIONS
+        .iter()
+        .chain(GOAL_ACTIONS)
+        .copied()
+        .collect()
+}
 
 fn manage_memories_schema() -> Value {
+    let mut properties = aidaemon_memory::full::tools::memory_parameters();
+    properties.insert(
+        "action".into(),
+        json!({ "type": "string", "enum": actions(), "description": "forget and set_privacy name one fact by category and key; the goal actions are personal goals." }),
+    );
+    properties.insert(
+        "limit".into(),
+        json!({ "type": "integer", "description": "Max results." }),
+    );
+    properties.insert(
+        "goal".into(),
+        json!({ "type": "string", "description": "create_personal_goal: the goal." }),
+    );
+    properties.insert(
+        "priority".into(),
+        json!({ "type": "string", "enum": ["low", "medium", "high", "critical"], "description": "create_personal_goal; default medium." }),
+    );
+    properties.insert(
+        "goal_id".into(),
+        json!({ "type": "string", "description": "complete_goal/abandon_goal: ID or unique prefix." }),
+    );
     json!({
         "name": "manage_memories",
         "description": TOOL_DESCRIPTION,
         "parameters": {
             "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "health", "repair", "forget", "set_privacy", "search", "search_episodes", "create_personal_goal", "list_goals", "complete_goal", "abandon_goal"]
-                },
-                "limit": { "type": "integer" },
-                "category": { "type": "string" },
-                "key": { "type": "string" },
-                "privacy": { "type": "string", "enum": ["global", "channel", "private"] },
-                "query": { "type": "string" },
-                "goal": { "type": "string" },
-                "priority": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
-                "goal_id": { "type": "string" }
-            },
+            "properties": properties,
             "required": ["action"],
             "additionalProperties": false
         }
@@ -418,8 +442,8 @@ impl ManageMemoriesTool {
                 moved_action(action).unwrap_or_default()
             )),
             other => Ok(format!(
-                "Unknown action: '{}'. Use list, health, repair, forget, set_privacy, search, search_episodes, create_personal_goal, list_goals, complete_goal, or abandon_goal. Scheduled work is schedule_task, set_reminder and manage_automations.",
-                other
+                "{} Scheduled work is schedule_task, set_reminder and manage_automations.",
+                aidaemon_memory::full::tools::unknown_action_message(other, &actions())
             )),
         }
     }
@@ -478,5 +502,30 @@ mod tests {
             assert!(is_read_action(action), "{action}");
         }
         assert!(moved_action("search").is_none());
+    }
+
+    /// The unknown-action answer names exactly the actions the schema
+    /// offers: none it dropped, none it lacks.
+    #[tokio::test]
+    async fn unknown_action_names_exactly_the_schema_actions() {
+        let schema = manage_memories_schema();
+        let offered: Vec<String> = schema["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        let message = aidaemon_memory::full::tools::unknown_action_message("synthetic", &actions());
+        for action in &offered {
+            assert!(message.contains(action.as_str()), "{action}");
+        }
+        for (moved, _) in MOVED_ACTIONS {
+            assert!(!offered.iter().any(|action| action == moved), "{moved}");
+            assert!(!message.contains(&format!(" {moved},")), "{moved}");
+        }
+        // Every parameter says what it is for.
+        for (name, property) in schema["parameters"]["properties"].as_object().unwrap() {
+            assert!(property.get("description").is_some(), "{name}");
+        }
     }
 }

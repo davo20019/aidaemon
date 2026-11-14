@@ -63,12 +63,85 @@ struct ManagePeopleArgs {
     within_days: Option<i32>,
     #[serde(default)]
     inactive_days: Option<u32>,
+    #[serde(default)]
+    personal_memory: Option<crate::records::PersonalMemoryWrite>,
 }
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str =
-    "Owner's contacts: people, relationships, facts. Use add_fact to store new info.";
+const TOOL_DESCRIPTION: &str = "People in the owner's life. remember: store people, names, aliases, family and places in personal memory, which recall reads (always on). The other actions are the contacts book (People Intelligence).";
+
+/// The `personal_memory` block `remember` takes: people and places as
+/// entities with call-local ids, their aliases, facts and relationships.
+pub(crate) fn personal_memory_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "remember: entities with call-local ids, then aliases, facts and relationships that refer to those ids. The owner is local_id \"owner\".",
+        "properties": {
+            "entities": {
+                "type": "array",
+                "description": "Each person, organization, project, place or account mentioned.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "local_id": {"type": "string", "description": "Id used by this call only."},
+                        "entity_type": {"type": "string", "enum": ["person", "organization", "project", "place", "account"], "description": "What it is."},
+                        "canonical_name": {"type": "string", "description": "Name as the owner gave it."},
+                        "is_reference": {"type": "boolean", "description": "Resolve existing alias/name; false declares."},
+                        "canonical_name_confirmed": {"type": "boolean", "description": "The owner stated this exact name."}
+                    },
+                    "required": ["local_id", "entity_type", "canonical_name"]
+                }
+            },
+            "aliases": {
+                "type": "array",
+                "description": "Other names an entity goes by.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entity_local_id": {"type": "string", "description": "The entity's local_id."},
+                        "value": {"type": "string", "description": "The alias."},
+                        "alias_type": {"type": "string", "enum": ["legal_name_variant", "preferred_name", "nickname", "username", "online_handle", "account_name"], "description": "Kind of alias."}
+                    },
+                    "required": ["entity_local_id", "value", "alias_type"]
+                }
+            },
+            "facts": {
+                "type": "array",
+                "description": "Attributes of an entity (birthday, residence, ...).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "subject_local_id": {"type": "string", "description": "The entity's local_id."},
+                        "predicate": {"type": "string", "description": "snake_case attribute, e.g. birthday."},
+                        "value": {"type": "string", "description": "Normalized value."},
+                        "display_value": {"type": "string", "description": "Value as written, when it differs."},
+                        "valid_from": {"type": "string", "description": "RFC3339 or date it became true."},
+                        "valid_to": {"type": "string", "description": "When it stopped being true."}
+                    },
+                    "required": ["subject_local_id", "predicate", "value"]
+                }
+            },
+            "relationships": {
+                "type": "array",
+                "description": "Typed links between entities.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source_local_id": {"type": "string", "description": "From entity."},
+                        "relationship_type": {"type": "string", "enum": ["PARENT_OF", "CHILD_OF", "LIVES_WITH", "LIVES_IN", "USES_ALIAS", "USES_HANDLE", "HAS_ACCOUNT"], "description": "source → target."},
+                        "target_local_id": {"type": "string", "description": "To entity."},
+                        "valid_from": {"type": "string", "description": "When it began."},
+                        "valid_to": {"type": "string", "description": "When it ended."}
+                    },
+                    "required": ["source_local_id", "relationship_type", "target_local_id"]
+                }
+            },
+            "correction": {"type": "boolean", "description": "The owner is correcting an earlier value."}
+        },
+        "additionalProperties": false
+    })
+}
 
 fn manage_people_schema() -> Value {
     json!({
@@ -79,7 +152,7 @@ fn manage_people_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["enable", "disable", "status", "add", "list", "view", "brief", "upcoming", "reconnect", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"]
+                    "enum": ["remember", "enable", "disable", "status", "add", "list", "view", "brief", "upcoming", "reconnect", "update", "remove", "add_fact", "remove_fact", "link", "export", "purge", "audit", "confirm"]
                 },
                 "name": { "type": "string" },
                 "id": { "type": "integer" },
@@ -95,7 +168,8 @@ fn manage_people_schema() -> Value {
                 "display_name": { "type": "string" },
                 "fact_id": { "type": "integer" },
                 "within_days": { "type": "integer", "description": "days ahead" },
-                "inactive_days": { "type": "integer" }
+                "inactive_days": { "type": "integer" },
+                "personal_memory": personal_memory_schema()
             },
             "required": ["action"],
             "additionalProperties": false
@@ -120,13 +194,15 @@ impl Tool for ManagePeopleTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &aidaemon_tools::semantics::ToolCallContext,
+        facts: &aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
         let args: ManagePeopleArgs = serde_json::from_str(arguments)?;
 
-        // Toggle actions are always allowed regardless of enabled state
+        // Toggle actions are always allowed regardless of enabled state, and
+        // so is `remember`: personal memory is not the contacts book.
         match args.action.as_str() {
+            "remember" => return self.handle_remember(args, facts.channel_id.as_deref()).await,
             "enable" => return self.handle_enable().await,
             "disable" => return self.handle_disable().await,
             "status" => return self.handle_status().await,
@@ -172,6 +248,13 @@ impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        // `remember` writes the agent's memory, typed as remember_fact's
+        // writes are so a checklist step can be credited by it.
+        if action_of(arguments).as_deref() == Some("remember") {
+            return ToolCallSemantics::mutation_with(
+                ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::MEMORY_WRITE),
+            );
+        }
         semantics_for_exact_read_actions(
             arguments,
             &["status", "list", "view", "brief", "upcoming", "audit"],
@@ -201,8 +284,9 @@ impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
             });
         match action.as_deref() {
             Some(
-                "status" | "add" | "list" | "view" | "brief" | "upcoming" | "reconnect" | "update"
-                | "remove" | "add_fact" | "remove_fact" | "export" | "purge" | "audit" | "confirm",
+                "remember" | "status" | "add" | "list" | "view" | "brief" | "upcoming"
+                | "reconnect" | "update" | "remove" | "add_fact" | "remove_fact" | "export"
+                | "purge" | "audit" | "confirm",
             ) => aidaemon_core::CallEffects::none(),
             // `link` binds a sender to a person, so that person's facts reach
             // the sender's later turns: it widens who sees the owner's notes.
@@ -211,7 +295,46 @@ impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
     }
 }
 
+/// The `action` argument, if any.
+fn action_of(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("action")?
+        .as_str()
+        .map(str::to_string)
+}
+
 impl ManagePeopleTool {
+    /// Store people, aliases, facts and relationships in structured personal
+    /// memory: the store recall projects into the owner's facts and core
+    /// profile.
+    async fn handle_remember(
+        &self,
+        args: ManagePeopleArgs,
+        channel_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let Some(mut personal) = args.personal_memory.filter(|personal| {
+            !(personal.entities.is_empty()
+                && personal.aliases.is_empty()
+                && personal.facts.is_empty()
+                && personal.relationships.is_empty())
+        }) else {
+            return Ok("Missing required field: personal_memory (entities, aliases, facts or relationships)".to_string());
+        };
+        personal.direct_user_statement = true;
+        let result = self
+            .store
+            .reconcile_personal_memory(
+                &personal,
+                "agent",
+                None,
+                channel_id,
+                crate::records::FactPrivacy::Private,
+            )
+            .await?;
+        Ok(format!("Personal memory: {}", result.concise_summary()))
+    }
+
     fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
         use chrono::NaiveDate;
         let trimmed = value.trim();
@@ -910,6 +1033,56 @@ mod tests {
         for action in ["enable", "disable", "link", "unknown"] {
             assert!(!effects(action).complete, "{action}");
         }
+    }
+
+    /// `remember` writes structured personal memory, the store recall
+    /// projects into the owner's facts, and works with the contacts book off.
+    #[tokio::test]
+    async fn remember_writes_personal_memory_that_recall_reads_with_people_off() {
+        let settings = Arc::new(Settings::default());
+        settings
+            .set_setting("people_enabled", "false")
+            .await
+            .unwrap();
+        let store = memory().await;
+        let tool = ManagePeopleTool::new(settings, store.clone());
+        let args = json!({
+            "action": "remember",
+            "personal_memory": {
+                "entities": [
+                    {"local_id": "owner", "entity_type": "person", "canonical_name": "Owner"},
+                    {"local_id": "mia", "entity_type": "person", "canonical_name": "Mia"}
+                ],
+                "facts": [{"subject_local_id": "mia", "predicate": "birthday", "value": "2019-04-02"}],
+                "relationships": [{"source_local_id": "owner", "relationship_type": "PARENT_OF", "target_local_id": "mia"}]
+            }
+        });
+        let out = tool.call(&args.to_string()).await.unwrap();
+        assert!(out.starts_with("Personal memory:"), "{out}");
+        assert!(
+            tool.call_semantics(&args.to_string())
+                .mutation_effects
+                .satisfies(ToolMutationEffects::MEMORY_WRITE)
+        );
+        assert_eq!(
+            tool.call_effects(&args.to_string()),
+            aidaemon_core::CallEffects::none()
+        );
+        let canonical = crate::stores::FactStore::get_canonical_memory_facts(store.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            canonical
+                .iter()
+                .any(|fact| fact.key.contains("Mia") && fact.value == "2019-04-02"),
+            "{canonical:?}"
+        );
+
+        let empty = tool
+            .call(&json!({"action": "remember", "personal_memory": {}}).to_string())
+            .await
+            .unwrap();
+        assert!(empty.starts_with("Missing required field"), "{empty}");
     }
 
     async fn setup_tool() -> ManagePeopleTool {
