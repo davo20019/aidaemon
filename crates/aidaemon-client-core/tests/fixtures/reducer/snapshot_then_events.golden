@@ -157,6 +157,7 @@
       "app:s1": {
         "lines": [
           {
+            "at_ms": 1767225607000,
             "kind": "assistant",
             "text": "The report is queued."
           }
@@ -172,6 +173,7 @@
       "app:s2": {
         "lines": [
           {
+            "at_ms": 1767225605000,
             "kind": "user",
             "origin": "app",
             "text": "Plan the week for Acme Corp"

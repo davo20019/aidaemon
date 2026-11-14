@@ -136,15 +136,18 @@
       "app:s1": {
         "lines": [
           {
+            "at_ms": 1767225601000,
             "kind": "user",
             "origin": "app",
             "text": "first"
           },
           {
+            "at_ms": 1767225602000,
             "kind": "assistant",
             "text": "one"
           },
           {
+            "at_ms": 1767225641000,
             "kind": "assistant",
             "text": "after the gap"
           }
