@@ -1172,8 +1172,12 @@ impl Store {
     }
 
     /// Session ids, newest activity first.
+    /// Conversations, the most recently active first; ones never active
+    /// keep the gateway's order after them.
     pub fn session_ids(&self) -> Vec<String> {
-        self.state.with(|s| s.order.clone())
+        let mut ids = self.state.with(|s| s.order.clone());
+        ids.sort_by_key(|id| std::cmp::Reverse(self.last_activity(id)));
+        ids
     }
 
     /// A conversation's name: the daemon's title, else its first message,

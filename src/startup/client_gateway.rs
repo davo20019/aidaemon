@@ -314,10 +314,33 @@ fn tool_names(json: &str) -> Vec<String> {
         .collect()
 }
 
+/// Markdown as the words a reader sees: links keep their text, emphasis
+/// and code marks go.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '`' => {}
+            // `[text](url)`: keep the text, drop the url.
+            ']' if chars.peek() == Some(&'(') => {
+                for c in chars.by_ref() {
+                    if c == ')' {
+                        break;
+                    }
+                }
+            }
+            '[' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The text around the first of `words` in `text`, on one line.
 fn snippet(text: &str, words: &[String]) -> String {
     const SPAN: usize = 140;
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat: String = plain(text).split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = flat.to_lowercase();
     let at = words
         .iter()
@@ -355,19 +378,48 @@ impl ClientHost for DaemonClientHost {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // A name from what the owner said: an app conversation is about its
+        // first message; a chat (Telegram, Slack...) runs for months, so it
+        // goes by its latest one.
+        let said = |pick: &'static str| {
+            let pool = self.system.pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Option<String>, i64)>(sqlx::AssertSqlSafe(format!(
+                    "SELECT session_id, json_extract(data, '$.content'), {pick}(id) FROM events \
+                     WHERE event_type = 'user_message' GROUP BY session_id"
+                )))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(id, text, _)| Some((id, text?)))
+                .collect::<std::collections::HashMap<String, String>>()
+            }
+        };
+        let (first, latest) = (said("MIN").await, said("MAX").await);
         Ok(self
             .state
             .load_session_channels()
             .await?
             .into_iter()
-            .map(|(id, channel)| SessionSummary {
-                // The app replies into chat conversations too (routed to
-                // their chat by the gateway).
-                writable: true,
-                last_activity_ms: last.get(&id).and_then(|at| stored_ms(at)),
-                id,
-                channel,
-                title: None,
+            .map(|(id, channel)| {
+                let words = if id.starts_with(aidaemon_client_gateway::APP_SESSION_PREFIX) {
+                    first.get(&id)
+                } else {
+                    latest.get(&id)
+                };
+                let title = words
+                    .map(|text| aidaemon_channels::presentation::word_preview(text.trim(), 60))
+                    .filter(|t| !t.is_empty());
+                SessionSummary {
+                    // The app replies into chat conversations too (routed to
+                    // their chat by the gateway).
+                    writable: true,
+                    last_activity_ms: last.get(&id).and_then(|at| stored_ms(at)),
+                    id,
+                    channel,
+                    title,
+                }
             })
             .collect())
     }
@@ -484,7 +536,7 @@ impl ClientHost for DaemonClientHost {
     async fn memories(&self) -> anyhow::Result<Vec<MemoryItem>> {
         let mut facts = self.system.memory.get_facts(None).await?;
         facts.retain(|f| f.superseded_at.is_none());
-        facts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        facts.sort_by_key(|f| std::cmp::Reverse(f.updated_at));
         facts.truncate(500);
         Ok(facts
             .into_iter()
@@ -758,5 +810,12 @@ mod tests {
         assert!(s.starts_with('…') && s.ends_with('…'), "{s}");
         assert!(s.contains("synthetic weekly summary"), "{s}");
         assert_eq!(snippet("Short ünïcode note", &words), "Short ünïcode note");
+        assert_eq!(
+            snippet(
+                "Quito is **17.8°C** now. [Source: Open-Meteo](https://h.example.invalid/x?a=1)",
+                &["quito".into()]
+            ),
+            "Quito is 17.8°C now. Source: Open-Meteo"
+        );
     }
 }
