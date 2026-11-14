@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon-client-core"
-version = "0.2.0"
+version = "0.20.0"
 dependencies = [
  "aidaemon-client-protocol",
  "anyhow",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon-client-protocol"
-version = "0.2.0"
+version = "0.20.0"
 dependencies = [
  "schemars",
  "serde",
@@ -3404,7 +3404,6 @@ dependencies = [
  "nsh-tui-host",
  "ratatui-core",
  "ratatui-crossterm",
- "serde",
  "serde_json",
  "tokio",
  "wasm-bindgen",
