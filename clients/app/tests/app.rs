@@ -389,6 +389,12 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press("New conversation in this project >> nth=0")?;
     app.wait_for("Explain this project")?;
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
+    // A new conversation says where it works: Chat leaves the project and
+    // brings the everyday starters; In a project goes back to one.
+    app.press("Chat")?;
+    app.wait_for("Set a reminder")?;
+    app.press("In a project")?;
+    app.wait_for("Explain this project")?;
     Ok(())
 }
 
@@ -711,5 +717,36 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
         "Then add the event dates",
         std::time::Duration::from_secs(2),
     )?;
+    Ok(())
+}
+
+#[test]
+fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut config = EngineConfig::new(Root::of::<Offline>());
+    config.viewport = Size::new(Points(1280.0), Points(820.0));
+    config.environment.idiom = nsh_core::platform::Idiom::Terminal;
+    let mut app = Headless::start(config).unwrap();
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-11","channel":"app","title":"Run the build","writable":true}]}}"#,
+        ),
+    ]);
+    // The terminal starts on the conversation; the list is a key away.
+    app.press("label:Conversations")?;
+    app.wait_for("Run the build")?;
+    app.press("Run the build >> nth=0")?;
+    app.press("label:Steps")?;
+    feed([
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-11","event":{"type":"turn_started","turn_id":"t11","session_id":"app:synthetic-11","origin":"app"}}"#,
+        ),
+        // Colours, a redrawn progress line and a wide character.
+        frame(
+            r#"{"type":"event","at_ms":2,"session_id":"app:synthetic-11","event":{"type":"turn_status","turn_id":"t11","status":{"kind":"tool_progress","name":"terminal","chunk":"\u001b[32mCompiling\u001b[0m 10%\rCompiling 100%\n✅ 漢字 build ok\n"}}}"#,
+        ),
+    ]);
+    app.wait_for("✅ 漢字 build ok")?;
     Ok(())
 }

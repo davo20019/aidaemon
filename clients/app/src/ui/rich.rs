@@ -68,6 +68,23 @@ pub fn output(
 
     use nsh_base::{Terminal, TerminalApi, terminal};
 
+    // In a terminal the output is its own text: emulating a terminal in a
+    // few cells of one adds nothing, and nsh 0.5.0's emulator panics on a
+    // double-width character in a one-column screen (live 2026-11-15, cargo
+    // output in the Steps pane of `aidaemon-app --tui`).
+    if idiom() == nsh_core::platform::Idiom::Terminal {
+        return view().w_full().child(
+            text(move || {
+                let plain = strip_escapes(&content());
+                let lines: Vec<&str> = plain.lines().collect();
+                let keep = (rows() as usize).max(1);
+                lines[lines.len().saturating_sub(keep)..].join("\n")
+            })
+            .selectable(true)
+            .font_family(MONO)
+            .text_size(px(type_scale::XS)),
+        );
+    }
     const LINE: f32 = 16.0;
     let term = component_ref::<Terminal>();
     let written: Rc<RefCell<String>> = Rc::default();
@@ -102,6 +119,8 @@ pub fn output(
     }
     view()
         .w_full()
+        // Never a screen narrow enough to break the emulator.
+        .min_w(px(120.0))
         .h(move || Length::from(px(rows() as f32 * LINE + 8.0)))
         .child(
             terminal()
@@ -114,6 +133,53 @@ pub fn output(
                 .component_ref(&term)
                 .size_full(),
         )
+}
+
+/// `text` without terminal escape sequences (colours, cursor moves, titles)
+/// and carriage-return overwrites: what a reader of the plain text sees.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters, then one final byte in @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: to BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            // A carriage return alone redraws its line (a progress bar):
+            // keep what came after it.
+            '\r' if chars.peek() != Some(&'\n') => {
+                if let Some(start) = out.rfind('\n') {
+                    out.truncate(start + 1);
+                } else {
+                    out.clear();
+                }
+            }
+            '\r' => {}
+            c if c.is_control() && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Output for a terminal: lines end in a carriage return and a line feed,
@@ -538,6 +604,16 @@ pub fn with_preview(trigger: impl IntoElement + 'static, card: impl FnOnce() -> 
 #[cfg(test)]
 mod tests {
     use super::for_terminal;
+
+    #[test]
+    fn escapes_and_redrawn_lines_leave_the_plain_text() {
+        assert_eq!(
+            super::strip_escapes(
+                "\u{1b}[31mFAILED\u{1b}[0m\nbuilding 10%\rbuilding 99%\n\u{1b}]0;title\u{7}done"
+            ),
+            "FAILED\nbuilding 99%\ndone"
+        );
+    }
 
     #[test]
     fn line_feeds_return_the_carriage() {
