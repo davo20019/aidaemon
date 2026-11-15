@@ -676,6 +676,7 @@ fn server_samples() -> Vec<ServerFrame> {
                     text: "Post the synthetic report for Alice Rivera".into(),
                     at_ms: 1_767_225_600_000,
                     tools: Vec::new(),
+                    calls: Vec::new(),
                 },
                 HistoryMessage {
                     attachments: Vec::new(),
@@ -684,6 +685,12 @@ fn server_samples() -> Vec<ServerFrame> {
                     text: "Posted it.".into(),
                     at_ms: 1_767_225_660_000,
                     tools: vec!["http_request".into()],
+                    calls: vec![ToolCallInfo {
+                        name: "http_request".into(),
+                        input: r#"{"method":"POST","url":"https://reports.example.invalid/weekly"}"#
+                            .into(),
+                        output: "201 Created".into(),
+                    }],
                 },
             ],
             more: true,

@@ -318,6 +318,11 @@ impl ClientHost for Host {
                 } else {
                     Vec::new()
                 },
+                calls: if *role == "assistant" {
+                    demo_calls()
+                } else {
+                    Vec::new()
+                },
             })
             .collect())
     }
@@ -856,4 +861,26 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// What a demo reply's tools were given and gave back.
+fn demo_calls() -> Vec<aidaemon_client_protocol::ToolCallInfo> {
+    let call = |name: &str, input: &str, output: &str| aidaemon_client_protocol::ToolCallInfo {
+        name: name.into(),
+        input: input.into(),
+        output: output.into(),
+    };
+    vec![
+        call(
+            "read_file",
+            "{\n  \"path\": \"notes/synthetic-week.md\"\n}",
+            "# Week\n- Monday: review the synthetic report\n- Tuesday: the demo",
+        ),
+        call(
+            "web_search",
+            "{\n  \"query\": \"Acme Corp demo agenda\"\n}",
+            "1. Acme Corp — Demo day agenda (example.invalid)",
+        ),
+        call("read_file", "{\n  \"path\": \"notes/agenda.md\"\n}", ""),
+    ]
 }

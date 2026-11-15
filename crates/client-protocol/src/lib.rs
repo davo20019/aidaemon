@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 18;
+pub const PROTOCOL_MINOR: u16 = 19;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2002,9 +2002,28 @@ pub struct HistoryMessage {
     /// For a reply: the tools its turn used, in order (protocol 1.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// For a reply: what each of those tools was given and gave back, in
+    /// the same order (protocol 1.19). Trimmed and secrets redacted; empty
+    /// from a daemon that does not send it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ToolCallInfo>,
     /// Files sent with it (protocol 1.11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentRef>,
+}
+
+/// One tool call of a reply's turn, as the owner's app shows it when a
+/// tool is opened (protocol 1.19).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ToolCallInfo {
+    pub name: String,
+    /// What it was given: its arguments, trimmed, secrets redacted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input: String,
+    /// What it gave back, trimmed, secrets redacted. Empty: no result
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
 }
 
 /// One entry of a session's running-work list: a turn, a helper (sub-agent)

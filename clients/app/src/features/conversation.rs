@@ -3,7 +3,7 @@
 //! conversation is the same page with no session yet.
 
 use aidaemon_client_core::state::Line;
-use aidaemon_client_protocol::{AttachmentRef, MidRun};
+use aidaemon_client_protocol::{AttachmentRef, MidRun, ToolCallInfo};
 use nsh_base::{MarkdownOptions, TextViewLinks, button, input, text_view};
 use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
@@ -23,8 +23,9 @@ enum Row {
     /// The reply being written and what the agent is doing.
     Live,
     Approval(String),
-    /// The tools a reply's turn used, and how many seconds it took.
-    Activity(Vec<String>, u64),
+    /// The tools a reply's turn used, how many seconds it took, and what
+    /// each was given and gave back as far as known.
+    Activity(Vec<String>, u64, Vec<ToolCallInfo>),
     /// The last turn failed or was stopped: send its message again.
     Retry,
     /// Work handed to the background runs; its report comes here.
@@ -76,7 +77,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             } => Row::Assistant(text, at_ms, attachments),
             Line::Note { text } => Row::Note(text),
             Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
-            Line::Activity { tools, secs } => Row::Activity(tools, secs),
+            Line::Activity { tools, secs, calls } => Row::Activity(tools, secs, calls),
         });
     }
     if store.live(session).is_some() {
@@ -703,8 +704,10 @@ fn transcript_list(
                         3 => column.child(live(store, session)),
                         6 => column.child(activity(store, move || {
                             row.with(|r| match r {
-                                Some(Row::Activity(tools, secs)) => (tools.clone(), *secs),
-                                _ => (Vec::new(), 0),
+                                Some(Row::Activity(tools, secs, calls)) => {
+                                    (tools.clone(), *secs, calls.clone())
+                                }
+                                _ => (Vec::new(), 0, Vec::new()),
                             })
                         })),
                         7 => column.child(retry(store, session)),
@@ -745,14 +748,18 @@ fn transcript_list(
 }
 
 /// What a reply's turn did: one quiet line ("Used 4 tools · 12s") that
-/// opens to every tool in order. The owner's activity mode sets whether it
-/// starts open.
-fn activity(store: Store, data: impl Fn() -> (Vec<String>, u64) + Clone + 'static) -> View {
+/// opens to every tool in order, and each tool with details opens to what
+/// it was given and gave back. The owner's activity mode sets whether the
+/// list starts open.
+fn activity(
+    store: Store,
+    data: impl Fn() -> (Vec<String>, u64, Vec<ToolCallInfo>) + Clone + 'static,
+) -> View {
     let open = signal(untracked(|| store.activity_mode()) == ActivityMode::Expanded);
     let summary = {
         let data = data.clone();
         move || {
-            let (tools, secs) = data();
+            let (tools, secs, _) = data();
             activity_summary(&tools, secs)
         }
     };
@@ -763,27 +770,40 @@ fn activity(store: Store, data: impl Fn() -> (Vec<String>, u64) + Clone + 'stati
             move || open.get(),
             move || {
                 let data = data.clone();
-                view().pl(px(22.0)).gap(px(2.0)).child(dynamic(move || {
-                    let (tools, _) = data();
+                view().pl(px(4.0)).gap(px(2.0)).child(dynamic(move || {
+                    let (tools, _, calls) = data();
                     Some(untracked(move || {
                         let mut list = view().gap(px(2.0));
                         for (n, tool) in tools.iter().enumerate() {
-                            list = list.child(
-                                view()
-                                    .flex_row()
-                                    .gap_2()
-                                    .child(
-                                        text(format!("{}.", n + 1))
-                                            .text_size(px(type_scale::XS))
-                                            .text_color(colors::FAINT),
-                                    )
-                                    .child(ui::code(tool.clone()).text_color(colors::MUTED)),
-                            );
+                            list = list.child(tool_call(n + 1, tool, call_of(&calls, n, tool)));
                         }
                         list
                     }))
                 }))
             },
+        ))
+}
+
+/// The details recorded for the `n`th tool, when they are its and say
+/// anything.
+fn call_of(calls: &[ToolCallInfo], n: usize, tool: &str) -> Option<ToolCallInfo> {
+    calls
+        .get(n)
+        .filter(|c| c.name == tool && !(c.input.is_empty() && c.output.is_empty()))
+        .cloned()
+}
+
+/// One tool of the list: its row, and what it did once opened.
+fn tool_call(number: usize, tool: &str, call: Option<ToolCallInfo>) -> View {
+    let Some(call) = call else {
+        return ui::tool_row(number, tool.to_owned(), None);
+    };
+    let open = signal(false);
+    view()
+        .child(ui::tool_row(number, tool.to_owned(), Some(open)))
+        .child(when(
+            move || open.get(),
+            move || ui::call_detail(call.input.clone(), call.output.clone()),
         ))
 }
 

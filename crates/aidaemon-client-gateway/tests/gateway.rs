@@ -154,6 +154,7 @@ impl ClientHost for Host {
                 text: format!("message {n}"),
                 at_ms: n,
                 tools: Vec::new(),
+                calls: Vec::new(),
             })
             .collect())
     }

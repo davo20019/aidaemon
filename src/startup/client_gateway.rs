@@ -345,7 +345,20 @@ fn outcome_words(outcome: &str) -> Option<String> {
 }
 
 /// The tool names in a stored `tool_calls_json`, in order.
-fn tool_names(json: &str) -> Vec<String> {
+/// How much of a call's arguments the app is sent.
+const CALL_INPUT_CHARS: usize = 600;
+/// How much of a call's result the app is sent.
+const CALL_OUTPUT_CHARS: usize = 1_500;
+
+/// A call of a reply's turn, still waiting for its result.
+struct PendingCall {
+    id: String,
+    info: aidaemon_client_protocol::ToolCallInfo,
+}
+
+/// The calls a stored assistant message made, in order, each with its
+/// arguments as the owner sees them.
+fn tool_calls(json: &str) -> Vec<PendingCall> {
     let Ok(serde_json::Value::Array(calls)) = serde_json::from_str::<serde_json::Value>(json)
     else {
         return Vec::new();
@@ -353,12 +366,65 @@ fn tool_names(json: &str) -> Vec<String> {
     calls
         .iter()
         .filter_map(|call| {
-            call.get("name")
-                .or_else(|| call.get("function").and_then(|f| f.get("name")))
-                .and_then(|n| n.as_str())
-                .map(str::to_owned)
+            let function = call.get("function");
+            let name = call
+                .get("name")
+                .or_else(|| function.and_then(|f| f.get("name")))
+                .and_then(|n| n.as_str())?;
+            let arguments = call
+                .get("arguments")
+                .or_else(|| function.and_then(|f| f.get("arguments")));
+            Some(PendingCall {
+                id: call
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                info: aidaemon_client_protocol::ToolCallInfo {
+                    name: name.to_owned(),
+                    input: arguments.map(shown_input).unwrap_or_default(),
+                    output: String::new(),
+                },
+            })
         })
         .collect()
+}
+
+/// A call's arguments as the owner's app shows them: one JSON object,
+/// secrets redacted, trimmed. A string holding JSON (the nested shape)
+/// reads as that JSON; `{}` reads as nothing.
+fn shown_input(arguments: &serde_json::Value) -> String {
+    let mut value = match arguments {
+        serde_json::Value::String(text) => {
+            serde_json::from_str(text).unwrap_or_else(|_| arguments.clone())
+        }
+        other => other.clone(),
+    };
+    if value.as_object().is_some_and(|o| o.is_empty()) || value.is_null() {
+        return String::new();
+    }
+    aidaemon_tools::sanitize::redact_json_for_owner(&mut value);
+    let text = match &value {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    };
+    aidaemon_tools::text::truncate_with_note(&text, CALL_INPUT_CHARS)
+}
+
+/// A call's result as the owner's app shows it: without the untrusted-data
+/// frame the model saw it in, secrets redacted, trimmed.
+fn shown_output(content: &str) -> String {
+    let mut text = content.trim();
+    if let Some(rest) = text.strip_prefix(aidaemon_policies::UNTRUSTED_PREFIX)
+        && let Some(rest) = rest
+            .trim_end()
+            .strip_suffix(aidaemon_policies::UNTRUSTED_SUFFIX)
+    {
+        // The frame's first line names the tool; the data follows it.
+        text = rest.split_once('\n').map_or("", |(_, data)| data).trim();
+    }
+    let text = aidaemon_tools::sanitize::redact_for_owner(text);
+    aidaemon_tools::text::truncate_with_note(&text, CALL_OUTPUT_CHARS)
 }
 
 /// Markdown as the words a reader sees: links keep their text, emphasis
@@ -756,7 +822,7 @@ impl ClientHost for DaemonClientHost {
         // for the model; they are not what the owner said. A reply carries
         // the tools its turn used before it.
         let messages = messages.into_iter().filter(|m| {
-            matches!(m.role.as_str(), "user" | "assistant")
+            matches!(m.role.as_str(), "user" | "assistant" | "tool")
                 && !m.annotations.iter().any(|a| {
                     matches!(
                         a,
@@ -765,14 +831,25 @@ impl ClientHost for DaemonClientHost {
                     )
                 })
         });
-        let mut pending: Vec<String> = Vec::new();
+        let mut pending: Vec<PendingCall> = Vec::new();
         let mut out = Vec::new();
         for m in messages {
             if m.role == "user" {
                 pending.clear();
             }
             if let Some(json) = &m.tool_calls_json {
-                pending.extend(tool_names(json));
+                pending.extend(tool_calls(json));
+                continue;
+            }
+            // A tool's result goes to the call it answers.
+            if m.role == "tool" {
+                if let Some(call) = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| pending.iter_mut().rev().find(|c| c.id == id))
+                {
+                    call.info.output = shown_output(m.content.as_deref().unwrap_or_default());
+                }
                 continue;
             }
             // A message's files come as themselves, not as the notes the
@@ -790,11 +867,15 @@ impl ClientHost for DaemonClientHost {
             if text.trim().is_empty() && attachments.is_empty() {
                 continue;
             }
-            let tools = if m.role == "assistant" {
+            let calls: Vec<aidaemon_client_protocol::ToolCallInfo> = if m.role == "assistant" {
                 std::mem::take(&mut pending)
+                    .into_iter()
+                    .map(|c| c.info)
+                    .collect()
             } else {
                 Vec::new()
             };
+            let tools = calls.iter().map(|c| c.name.clone()).collect();
             out.push(HistoryMessage {
                 attachments,
                 id: m.id,
@@ -802,6 +883,7 @@ impl ClientHost for DaemonClientHost {
                 text,
                 at_ms: u64::try_from(m.created_at.timestamp_millis()).unwrap_or(0),
                 tools,
+                calls,
             });
         }
         Ok(out)
@@ -1197,7 +1279,9 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_words, session_ends, snippet, tool_names};
+    use super::{
+        CALL_OUTPUT_CHARS, outcome_words, session_ends, shown_output, snippet, tool_calls,
+    };
 
     #[tokio::test]
     async fn the_conversation_list_reads_each_session_s_first_and_latest_message() {
@@ -1258,13 +1342,39 @@ mod tests {
     }
 
     #[test]
-    fn tool_names_read_both_stored_shapes() {
+    fn tool_calls_read_both_stored_shapes() {
+        let names = |json: &str| -> Vec<String> {
+            tool_calls(json).into_iter().map(|c| c.info.name).collect()
+        };
         let flat =
             r#"[{"id":"1","name":"read_file","arguments":{}},{"id":"2","name":"web_search"}]"#;
-        assert_eq!(tool_names(flat), ["read_file", "web_search"]);
-        let nested = r#"[{"id":"1","function":{"name":"terminal","arguments":"{}"}}]"#;
-        assert_eq!(tool_names(nested), ["terminal"]);
-        assert!(tool_names("not json").is_empty());
+        assert_eq!(names(flat), ["read_file", "web_search"]);
+        let nested =
+            r#"[{"id":"1","function":{"name":"terminal","arguments":"{\"command\":\"ls\"}"}}]"#;
+        let calls = tool_calls(nested);
+        assert_eq!(calls[0].info.name, "terminal");
+        assert_eq!(calls[0].id, "1");
+        assert!(
+            calls[0].info.input.contains("\"command\": \"ls\""),
+            "{}",
+            calls[0].info.input
+        );
+        assert!(tool_calls(flat)[0].info.input.is_empty());
+        assert!(tool_calls("not json").is_empty());
+    }
+
+    #[test]
+    fn a_call_shows_its_data_without_the_frame_and_trimmed() {
+        let framed = aidaemon_policies::wrap_untrusted("web_fetch", "Synthetic page body");
+        assert_eq!(shown_output(&framed), "Synthetic page body");
+        let long = "x".repeat(CALL_OUTPUT_CHARS * 2);
+        let shown = shown_output(&long);
+        assert!(
+            shown.chars().count() < CALL_OUTPUT_CHARS + 40,
+            "{}",
+            shown.len()
+        );
+        assert!(shown.ends_with("(truncated)"));
     }
 
     #[test]

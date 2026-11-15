@@ -9,7 +9,7 @@ use serde::Serialize;
 use aidaemon_client_protocol::{
     Approval, AttachmentRef, CommandResult, ErrorCode, Event, Feature, HistoryMessage,
     ProjectSummary, ServerFrame, SessionSummary, SetupState, Snapshot, TaskState, TaskSummary,
-    TurnState, TurnStatus, ViewAction,
+    ToolCallInfo, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -41,6 +41,12 @@ pub enum Line {
         tools: Vec<String>,
         #[serde(default, skip_serializing_if = "is_zero")]
         secs: u64,
+        /// What each tool was given and gave back, in the same order, as
+        /// far as known: a daemon's full record from history, the live
+        /// status summaries for a turn seen running. May be shorter than
+        /// `tools`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        calls: Vec<ToolCallInfo>,
     },
 }
 
@@ -57,6 +63,10 @@ pub struct LiveTurn {
     /// The tools the turn has started, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// What each started tool was doing (its start summary) and how it
+    /// ended (its completion summary), in the same order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ToolCallInfo>,
     /// When the turn started (ms since the epoch); 0 when unknown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub started_ms: u64,
@@ -205,6 +215,7 @@ impl State {
                 streamed: turn.streamed,
                 status: turn.status.as_ref().map(status_text),
                 tools: turn.tools,
+                calls: Vec::new(),
                 started_ms: turn.started_at_ms,
             });
         }
@@ -297,6 +308,7 @@ impl State {
                         lines.push(Line::Activity {
                             tools: m.tools,
                             secs: 0,
+                            calls: m.calls,
                         });
                     }
                     lines.push(Line::Assistant {
@@ -391,8 +403,27 @@ impl State {
             }
             Event::TurnStatus { turn_id, status } => {
                 if let Some(live) = self.live_turn(&turn_id) {
-                    if let TurnStatus::ToolStarted { name, .. } = &status {
-                        live.tools.push(name.clone());
+                    match &status {
+                        TurnStatus::ToolStarted { name, summary } => {
+                            live.tools.push(name.clone());
+                            live.calls.push(ToolCallInfo {
+                                name: name.clone(),
+                                input: summary.clone(),
+                                output: String::new(),
+                            });
+                        }
+                        // The latest call of that name still running.
+                        TurnStatus::ToolCompleted { name, summary } => {
+                            if let Some(call) = live
+                                .calls
+                                .iter_mut()
+                                .rev()
+                                .find(|c| &c.name == name && c.output.is_empty())
+                            {
+                                call.output = summary.clone();
+                            }
+                        }
+                        _ => {}
                     }
                     live.status = Some(status_text(&status));
                 }
@@ -438,6 +469,7 @@ impl State {
                     };
                     view.lines.push(Line::Activity {
                         tools: live.tools,
+                        calls: live.calls,
                         secs,
                     });
                 }
@@ -653,6 +685,86 @@ mod tests {
         assert_eq!(view.lines.len(), 2, "{:?}", view.lines);
         assert!(view.live.is_none());
         assert_eq!(state.last_seq, Some(3));
+    }
+
+    /// A turn seen running keeps what each tool was doing and how it ended,
+    /// for its activity line to open to.
+    #[test]
+    fn a_finished_turn_keeps_each_tools_start_and_end() {
+        let mut state = State::default();
+        let status = |status: TurnStatus| {
+            event(
+                None,
+                Event::TurnStatus {
+                    turn_id: "t1".into(),
+                    status,
+                },
+            )
+        };
+        state.apply(event(
+            None,
+            Event::TurnStarted {
+                turn_id: "t1".into(),
+                session_id: "app:s1".into(),
+                origin: "app".into(),
+            },
+        ));
+        state.apply(status(TurnStatus::ToolStarted {
+            name: "running a command".into(),
+            summary: "npm run typecheck".into(),
+        }));
+        state.apply(status(TurnStatus::ToolCompleted {
+            name: "running a command".into(),
+            summary: "exit 0".into(),
+        }));
+        state.apply(status(TurnStatus::ToolStarted {
+            name: "reading a file".into(),
+            summary: "src/synthetic.ts".into(),
+        }));
+        state.apply(event(
+            Some(1),
+            Event::TurnCompleted {
+                turn_id: "t1".into(),
+                text: "Typechecked.".into(),
+                attachments: Vec::new(),
+                state: TurnState::Completed,
+                error: None,
+            },
+        ));
+        let Line::Activity { tools, calls, .. } = &state.sessions["app:s1"].lines[0] else {
+            panic!("{:?}", state.sessions["app:s1"].lines);
+        };
+        assert_eq!(tools.len(), 2);
+        assert_eq!(calls[0].input, "npm run typecheck");
+        assert_eq!(calls[0].output, "exit 0");
+        assert_eq!(calls[1].input, "src/synthetic.ts");
+        assert!(calls[1].output.is_empty());
+    }
+
+    /// History's full record of each call reaches the reply's activity line.
+    #[test]
+    fn history_brings_each_calls_input_and_output() {
+        let mut state = State::default();
+        state.set_history(
+            "app:s1",
+            vec![HistoryMessage {
+                id: "m1".into(),
+                role: "assistant".into(),
+                text: "Read it.".into(),
+                at_ms: 1,
+                tools: vec!["read_file".into()],
+                calls: vec![ToolCallInfo {
+                    name: "read_file".into(),
+                    input: "{\"path\": \"notes.md\"}".into(),
+                    output: "Synthetic notes".into(),
+                }],
+                attachments: Vec::new(),
+            }],
+        );
+        let Line::Activity { calls, .. } = &state.sessions["app:s1"].lines[0] else {
+            panic!("{:?}", state.sessions["app:s1"].lines);
+        };
+        assert_eq!(calls[0].output, "Synthetic notes");
     }
 
     #[test]

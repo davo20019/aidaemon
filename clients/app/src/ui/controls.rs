@@ -918,6 +918,97 @@ pub fn disclosure(
         })
 }
 
+/// One tool of a reply's activity list: its number and name. With details
+/// to show it is a button whose chevron turns as `open` flips; the caller
+/// renders the details under it ([`call_detail`]).
+pub fn tool_row(number: usize, name: String, open: Option<Signal<bool>>) -> View {
+    let label = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(
+            text(format!("{number}."))
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        )
+        .child(code(name.clone()).text_color(colors::MUTED));
+    let Some(open) = open else {
+        return view().pl(px(18.0)).child(label);
+    };
+    view().child(
+        button()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .self_start()
+            .min_h(px(fit::row() - 6.0))
+            .pr_2()
+            .rounded(px(radius::CONTROL))
+            .transition_colors()
+            .duration(motion::FAST)
+            .hover(|s| s.bg(colors::HOVER))
+            .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+            .focus(focus_band)
+            .accessibility_label(format!("{name}: show what it was given and returned"))
+            .child(
+                icon(Glyph::Chevron)
+                    .text_color(colors::FAINT)
+                    .rotate(move || deg(if open.get() { 90.0 } else { 0.0 }))
+                    .transition_transform()
+                    .duration(motion::FAST)
+                    .accessibility_elements_hidden(true),
+            )
+            .child(label)
+            .on_press(move || {
+                motion::next_unfold();
+                open.update(|o| *o = !*o)
+            }),
+    )
+}
+
+/// What one tool call was given and gave back, under its [`tool_row`]:
+/// each a quiet label over selectable monospace text on an inset well.
+pub fn call_detail(input: String, output: String) -> View {
+    let part = |label: &'static str, body: String| {
+        view()
+            .gap_1()
+            .child(
+                text(label)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+            )
+            .child(
+                view()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(radius::SMALL))
+                    .bg(colors::INSET)
+                    .child(
+                        text(body)
+                            .selectable(true)
+                            .font_family(MONO)
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::TEXT),
+                    ),
+            )
+    };
+    let mut detail = view().pl(px(22.0)).pb_1().gap_2();
+    if !input.is_empty() {
+        detail = detail.child(part("Input", input));
+    }
+    detail = detail.child(if output.is_empty() {
+        view().child(
+            text("No result recorded")
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        )
+    } else {
+        part("Output", output)
+    });
+    detail
+}
+
 /// A short identifier in monospace.
 pub fn code(value: impl IntoReactive<SharedString>) -> Text {
     text(value)
