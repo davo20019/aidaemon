@@ -295,7 +295,7 @@ fn usage(s: &SystemStatus) -> View {
                         .flex_row()
                         .gap_2()
                         .child(
-                            text(day)
+                            text(day.clone())
                                 .flex_1()
                                 .font_family(ui::theme::MONO)
                                 .text_size(px(type_scale::SM)),
@@ -310,7 +310,7 @@ fn usage(s: &SystemStatus) -> View {
                             .text_color(colors::MUTED),
                         ),
                 )
-                .child(ui::meter(share)),
+                .child(ui::meter_of(format!("{day}: share of the busiest day"), share)),
         );
     }
     section("Token use, last 7 days").child(c).child(

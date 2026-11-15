@@ -493,6 +493,7 @@ impl SettingsHost {
             reload_pending,
             restart_pending,
             notices: settings_upkeep::notices(&self.config_path),
+            providers: crate::setup::model::options(),
             database_path: crate::startup::db_security::resolve_db_path(
                 &self.config_path,
                 &db_path,

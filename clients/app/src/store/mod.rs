@@ -199,6 +199,9 @@ pub struct Store {
     spotlight: Signal<Option<String>>,
     /// What the app last told the owner about a move (or anything else).
     toast: Signal<Option<String>>,
+    /// Why the last settings change was refused: stays until dismissed or
+    /// the next change, as an error is worth reading.
+    settings_error: Signal<Option<String>>,
     outbox: Stored<Option<Outbox>>,
     /// Commands queued before the link was up.
     queued: Stored<Vec<(String, Command)>>,
@@ -269,6 +272,7 @@ impl Store {
             suggestion: signal(None),
             spotlight: signal(None),
             toast: signal(None),
+            settings_error: signal(None),
             outbox: stored(None),
             queued: stored(Vec::new()),
             fetched: stored(BTreeSet::new()),
@@ -772,7 +776,7 @@ impl Store {
                 request_id: Some(request_id),
                 error,
             } if self.settings_changes.with(|c| c.remove(request_id)) => {
-                self.say(error.message.clone());
+                self.settings_error.set(Some(error.message.clone()));
                 return;
             }
             ServerFrame::Event {
@@ -944,8 +948,18 @@ impl Store {
     /// Ask the daemon to make `change`; the answer arrives as a note, and
     /// the page reads the settings again when it lands.
     pub fn change_settings(&self, change: SettingsChange) {
+        self.settings_error.set(None);
         let id = self.send(Command::ChangeSettings { change });
         self.settings_changes.with(|c| c.insert(id));
+    }
+
+    /// Why the last settings change was refused, until dismissed.
+    pub fn settings_error(&self) -> Option<String> {
+        self.settings_error.get()
+    }
+
+    pub fn dismiss_settings_error(&self) {
+        self.settings_error.set(None);
     }
 
     /// Settings changes waiting for an approval.

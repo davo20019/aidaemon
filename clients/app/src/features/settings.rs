@@ -13,8 +13,14 @@ use nsh_core::prelude::*;
 use crate::store::{SettingsRead, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, type_scale};
 
+/// The page's tabs.
+const TABS: [&str; 4] = ["Settings", "Providers", "Connections", "Database"];
+
 pub fn page(store: Store) -> View {
     let filter = signal(String::new());
+    let tab = signal(0_usize);
+    // Open groups survive a refresh (a change landing rereads the page).
+    let open = signal(Vec::<SharedString>::new());
     view().flex_1().min_w(px(0.0)).child(header(store)).child(
         scroll().flex_1().child(
             view().items_center().child(
@@ -24,26 +30,35 @@ pub fn page(store: Store) -> View {
                     .px_4()
                     .py_4()
                     .gap_3()
-                    // What the last change did (or why it did not), until
-                    // dismissed: an error here is worth reading.
+                    // Why the last change was refused, until dismissed: an
+                    // error here is worth reading. What a change did is a
+                    // toast.
                     .child(when(
-                        move || store.toast().is_some(),
+                        move || store.settings_error().is_some(),
                         move || {
-                            ui::banner(move || store.toast().unwrap_or_default(), Tone::Neutral)
-                                .child(ui::btn("Dismiss", Variant::Ghost, Size::Sm, move || {
-                                    store.dismiss_toast()
-                                }))
+                            ui::banner(
+                                move || store.settings_error().unwrap_or_default(),
+                                Tone::Danger,
+                            )
+                            .child(ui::btn("Dismiss", Variant::Ghost, Size::Sm, move || {
+                                store.dismiss_settings_error()
+                            }))
                         },
                     ))
-                    .child(
-                        ui::field("Filter settings", filter)
-                            .label("Filter settings")
-                            .w_full(),
-                    )
+                    .child(ui::tab_bar(tab, &TABS))
+                    .child(when(
+                        move || tab.get() == 0,
+                        move || {
+                            ui::field("Filter settings", filter)
+                                .label("Filter settings")
+                                .w_full()
+                        },
+                    ))
                     .child(dynamic(move || {
                         let read = store.settings();
                         let query = filter.get().trim().to_lowercase();
-                        Some(untracked(move || body(store, read, &query)))
+                        let shown = tab.get();
+                        Some(untracked(move || body(store, read, &query, shown, open)))
                     })),
             ),
         ),
@@ -80,7 +95,13 @@ fn header(store: Store) -> View {
         }))
 }
 
-fn body(store: Store, read: SettingsRead, query: &str) -> View {
+fn body(
+    store: Store,
+    read: SettingsRead,
+    query: &str,
+    tab: usize,
+    open: Signal<Vec<SharedString>>,
+) -> View {
     match read {
         SettingsRead::NotYet | SettingsRead::Loading => {
             view().child(ui::working("Reading settings…"))
@@ -103,7 +124,7 @@ fn body(store: Store, read: SettingsRead, query: &str) -> View {
                 move || store.refresh_settings(),
             )),
         ),
-        SettingsRead::Ready(settings) => ready(store, *settings, query),
+        SettingsRead::Ready(settings) => ready(store, *settings, query, tab, open),
     }
 }
 
@@ -119,7 +140,13 @@ fn faint(words: impl Into<SharedString>) -> Text {
         .text_color(colors::FAINT)
 }
 
-fn ready(store: Store, settings: Settings, query: &str) -> View {
+fn ready(
+    store: Store,
+    settings: Settings,
+    query: &str,
+    tab: usize,
+    open: Signal<Vec<SharedString>>,
+) -> View {
     let mut page = view().gap_3().child(muted(format!(
         "Saved to {}. Changes that widen what the assistant may do ask first.",
         settings.config_path
@@ -141,7 +168,7 @@ fn ready(store: Store, settings: Settings, query: &str) -> View {
                 Tone::Warning,
             )
             .child(ui::btn("Restart", Variant::Primary, Size::Sm, move || {
-                apply(store, ApplyHow::Restart)
+                restart(store)
             })),
         );
     }
@@ -167,7 +194,22 @@ fn ready(store: Store, settings: Settings, query: &str) -> View {
         page = page.child(ui::banner(notice.clone(), Tone::Neutral));
     }
 
+    match tab {
+        1 => return page.child(providers(store, &settings)),
+        2 => {
+            return page
+                .child(bots(store, &settings.bots))
+                .child(mcp_servers(store, &settings.mcp_servers));
+        }
+        3 => {
+            return page
+                .child(database(store, &settings))
+                .child(apply_section(store));
+        }
+        _ => {}
+    }
     let filtering = !query.is_empty();
+    let mut groups = Vec::new();
     for group in &settings.groups {
         let shown: Vec<Setting> = group
             .settings
@@ -183,44 +225,52 @@ fn ready(store: Store, settings: Settings, query: &str) -> View {
         if shown.is_empty() {
             continue;
         }
-        page = page.child(group_section(store, group, shown, filtering));
+        groups.push(group_section(store, group, shown));
     }
+    // Filtering opens every group that matched.
+    let open = if filtering {
+        signal(
+            groups
+                .iter()
+                .map(|(id, _, _)| SharedString::from(id.clone()))
+                .collect(),
+        )
+    } else {
+        open
+    };
+    page = page.child(ui::sections(open, groups));
     if !filtering {
-        page = page
-            .child(other_setting(store))
-            .child(providers(store, &settings))
-            .child(bots(store, &settings.bots))
-            .child(mcp_servers(store, &settings.mcp_servers))
-            .child(database(store, &settings))
-            .child(apply_section(store));
+        page = page.child(other_setting(store));
     }
     page
+}
+
+/// Restart, after asking: every app reconnects.
+fn restart(store: Store) {
+    ui::confirm(
+        "Restart the daemon?",
+        "Running work stops. Apps reconnect on their own.",
+        "Restart",
+        move || apply(store, ApplyHow::Restart),
+    );
 }
 
 fn apply(store: Store, how: ApplyHow) {
     store.change_settings(SettingsChange::Apply { how });
 }
 
-fn group_section(store: Store, group: &SettingGroup, shown: Vec<Setting>, open: bool) -> View {
+/// A group as a section: its id, its heading and its rows.
+fn group_section(store: Store, group: &SettingGroup, shown: Vec<Setting>) -> (String, String, View) {
     let set = shown
         .iter()
         .filter(|s| s.value.is_some() || s.secret_set)
         .count();
     let label = format!("{} · {} set of {}", group.name, set, shown.len());
-    let open = signal(open);
-    view()
-        .gap_1()
-        .child(ui::disclosure(label, open))
-        .child(when(
-            move || open.get(),
-            move || {
-                let mut list = view().gap_1();
-                for setting in shown.clone() {
-                    list = list.child(setting_row(store, setting));
-                }
-                list
-            },
-        ))
+    let mut list = view().gap_1().pb_2();
+    for setting in shown {
+        list = list.child(setting_row(store, setting));
+    }
+    (group.name.clone(), label, list)
 }
 
 /// What a setting shows when closed: its value, "default", or for a secret
@@ -256,6 +306,11 @@ fn setting_row(store: Store, setting: Setting) -> View {
     let guarded = setting.guarded;
     let description = setting.description.clone();
     let editor_setting = setting.clone();
+    let is_bool = setting.kind == SettingKind::Bool;
+    let on = setting.value.as_deref() == Some("true");
+    let can_reset = setting.value.is_some();
+    let (toggle_key, reset_key) = (setting.key.clone(), setting.key.clone());
+    let kind = setting.kind;
     ui::surface()
         .px_3()
         .py_2()
@@ -284,9 +339,28 @@ fn setting_row(store: Store, setting: Setting) -> View {
                         ),
                 )
                 .child(when(move || guarded, || ui::badge("asks", Tone::Warning)))
-                .child(
+                .child(when(is_bool && can_reset, move || {
+                    let k = reset_key.clone();
+                    ui::btn("Use the default", Variant::Ghost, Size::Sm, move || {
+                        store.change_settings(SettingsChange::Set {
+                            key: k.clone(),
+                            value: None,
+                        })
+                    })
+                }))
+                .child(when(is_bool, move || {
+                    let k = toggle_key.clone();
+                    ui::toggle(if on { "On" } else { "Off" }, move || on, move |next: bool| {
+                        store.change_settings(SettingsChange::Set {
+                            key: k.clone(),
+                            value: Some(next.to_string()),
+                        })
+                    })
+                    .accessibility_label(format!("Turn {toggle_key} on or off"))
+                }))
+                .child(when(!is_bool, move || {
                     ui::btn(
-                        if setting.kind == SettingKind::Secret {
+                        if kind == SettingKind::Secret {
                             "Set"
                         } else {
                             "Edit"
@@ -295,8 +369,8 @@ fn setting_row(store: Store, setting: Setting) -> View {
                         Size::Sm,
                         move || editing.update(|e| *e = !*e),
                     )
-                    .accessibility_label(format!("Edit {key}")),
-                ),
+                    .accessibility_label(format!("Edit {key}"))
+                })),
         )
         .child(when(move || !description.is_empty(), {
             let description = setting.description.clone();
@@ -496,19 +570,35 @@ fn providers(store: Store, settings: &Settings) -> View {
             move || store.change_settings(SettingsChange::RemoveFailover { index }),
         ));
     }
-    view()
-        .gap_2()
-        .child(section_label("Providers"))
-        .child(muted(
-            "Pick a preset (openai, anthropic, openrouter, google, ollama, chatgpt…). Empty \
-             fields take the preset's own. Store its key under provider.api_key (or the \
-             failover's) above.",
-        ))
-        .child(
+    // A daemon before protocol 1.6 sends no list: the preset is typed.
+    let options: Vec<(String, String)> = settings
+        .providers
+        .iter()
+        .map(|p| (p.preset.clone(), p.name.clone()))
+        .collect();
+    let picker: View = if options.is_empty() {
+        view().child(
             ui::field("Preset", preset)
                 .label("Provider preset")
                 .w_full(),
         )
+    } else {
+        view().flex_row().child(ui::choice(
+            "Provider",
+            "Choose a provider",
+            options,
+            move || Some(preset.get()).filter(|p| !p.is_empty()),
+            move |next: Option<String>| preset.set(next.unwrap_or_default()),
+        ))
+    };
+    view()
+        .gap_2()
+        .child(section_label("Providers"))
+        .child(muted(
+            "Choose a provider. Empty fields take its own. Store its key under \
+             provider.api_key (or the failover's) on the Settings tab.",
+        ))
+        .child(picker)
         .child(
             ui::field("Base URL (optional)", base_url)
                 .label("Base URL")
@@ -573,6 +663,7 @@ fn bots(store: Store, bots: &[BotInfo]) -> View {
             "No bots were connected at runtime. Bots in config.toml are settings above.",
         ));
     }
+    let mut rows = Vec::new();
     for bot in bots.iter().cloned() {
         let id = bot.id;
         let who = if bot.allowed_user_ids.is_empty() {
@@ -580,34 +671,38 @@ fn bots(store: Store, bots: &[BotInfo]) -> View {
         } else {
             bot.allowed_user_ids.join(", ")
         };
-        section = section.child(
-            ui::surface()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap(px(2.0))
-                        .child(text(format!("{} bot {}", bot.platform, bot.id)))
-                        .child(faint(format!("Talks to {who}"))),
-                )
-                .child(ui::btn("Remove", Variant::Danger, Size::Sm, move || {
-                    store.change_settings(SettingsChange::RemoveBot { bot_id: id })
-                })),
-        );
+        let name = format!("{} bot {}", bot.platform, bot.id);
+        let asked = name.clone();
+        rows.push(vec![
+            view().child(text(name).number_of_lines(1)),
+            view().child(muted(who).number_of_lines(2)),
+            view().child(
+                ui::btn("Remove", Variant::Ghost, Size::Sm, move || {
+                    ui::confirm(
+                        format!("Remove {asked}?"),
+                        "It stops answering until it is connected again.",
+                        "Remove",
+                        move || store.change_settings(SettingsChange::RemoveBot { bot_id: id }),
+                    )
+                })
+                .accessibility_label(format!("Remove bot {id}")),
+            ),
+        ]);
     }
+    section = section.child(ui::data_table(
+        "Connected bots",
+        &["Bot", "Talks to", ""],
+        rows,
+    ));
     section
 }
 
 fn mcp_servers(store: Store, servers: &[McpServerInfo]) -> View {
-    let mut section = view().gap_2().child(section_label("MCP servers"));
+    let section = view().gap_2().child(section_label("MCP servers"));
     if servers.is_empty() {
         return section.child(muted("No MCP servers."));
     }
+    let mut rows = Vec::new();
     for server in servers.iter().cloned() {
         let mcp = move |name: String, action: McpAction| {
             move || {
@@ -647,41 +742,50 @@ fn mcp_servers(store: Store, servers: &[McpServerInfo]) -> View {
             ))
         };
         if !server.from_config {
-            actions = actions.child(ui::btn(
-                "Remove",
-                Variant::Danger,
-                Size::Sm,
-                mcp(name.clone(), McpAction::Remove),
-            ));
+            let remove = mcp(name.clone(), McpAction::Remove);
+            let asked = name.clone();
+            actions = actions.child(
+                ui::btn("Remove", Variant::Ghost, Size::Sm, move || {
+                    let remove = remove.clone();
+                    ui::confirm(
+                        format!("Remove {asked}?"),
+                        "Its tools go away. Adding it back needs its command again.",
+                        "Remove",
+                        remove,
+                    )
+                })
+                .accessibility_label(format!("Remove {name}")),
+            );
         }
-        section = section.child(
-            ui::surface()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .py_2()
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap(px(2.0))
-                        .child(text(server.name.clone()))
-                        .child(ui::code(server.command.clone()).number_of_lines(1))
-                        .child(faint(format!(
-                            "{} · {tools}{}",
-                            if server.enabled { "on" } else { "off" },
-                            if server.from_config {
-                                " · from config.toml"
-                            } else {
-                                ""
-                            }
-                        ))),
-                )
-                .child(actions),
-        );
+        rows.push(vec![
+            view()
+                .gap(px(2.0))
+                .child(text(server.name.clone()).number_of_lines(1))
+                .child(ui::code(server.command.clone()).number_of_lines(1)),
+            view().flex_row().items_center().gap_2().child(ui::status(
+                if server.enabled { "On" } else { "Off" },
+                if server.enabled {
+                    Tone::Success
+                } else {
+                    Tone::Neutral
+                },
+            ))
+            .child(faint(format!(
+                "{tools}{}",
+                if server.from_config {
+                    " · config.toml"
+                } else {
+                    ""
+                }
+            ))),
+            actions,
+        ]);
     }
-    section
+    section.child(ui::data_table(
+        "MCP servers",
+        &["Server", "State", ""],
+        rows,
+    ))
 }
 
 fn database(store: Store, settings: &Settings) -> View {
@@ -763,7 +867,7 @@ fn apply_section(store: Store) -> View {
                     apply(store, ApplyHow::Reload)
                 }))
                 .child(ui::btn("Restart", Variant::Outline, Size::Sm, move || {
-                    apply(store, ApplyHow::Restart)
+                    restart(store)
                 })),
         )
 }

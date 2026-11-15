@@ -112,6 +112,7 @@ fn body(store: Store, read: MemoryRead, query: &str) -> View {
 
 fn memory_row(store: Store, item: MemoryItem) -> View {
     let id = item.id.clone();
+    let forgotten = format!("Your agent stops remembering: {}", item.value);
     let meta = {
         let mut parts = vec![item.category.clone()];
         if !item.source.is_empty() {
@@ -146,7 +147,13 @@ fn memory_row(store: Store, item: MemoryItem) -> View {
         )
         .child(
             ui::btn("Forget", Variant::Ghost, Size::Sm, move || {
-                store.forget_memory(&id)
+                let id = id.clone();
+                ui::confirm(
+                    "Forget this?",
+                    forgotten.clone(),
+                    "Forget",
+                    move || store.forget_memory(&id),
+                )
             })
             .accessibility_label(format!("Forget: {}", item.value)),
         )

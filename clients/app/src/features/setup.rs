@@ -460,34 +460,11 @@ fn model_step(store: Store) -> View {
                                             model.set(suggested);
                                         }
                                         Some(untracked(move || {
-                                            let filter = model.get();
-                                            // A model picked shows the others; typing narrows.
-                                            let picked = found.models.contains(&filter);
-                                            let needle = if picked {
-                                                String::new()
-                                            } else {
-                                                filter.to_lowercase()
-                                            };
-                                            let mut matches = view().flex_row().flex_wrap().gap_2();
-                                            for name in found
+                                            let options: Vec<(String, String)> = found
                                                 .models
                                                 .iter()
-                                                .filter(|m| {
-                                                    needle.is_empty()
-                                                        || m.to_lowercase().contains(&needle)
-                                                })
-                                                .filter(|m| **m != filter)
-                                                .take(8)
-                                                .cloned()
-                                            {
-                                                let pick = name.clone();
-                                                matches = matches.child(btn(
-                                                    name,
-                                                    Variant::Ghost,
-                                                    Size::Sm,
-                                                    move || model.set(pick.clone()),
-                                                ));
-                                            }
+                                                .map(|m| (m.clone(), m.clone()))
+                                                .collect();
                                             view()
                                                 .gap_2()
                                                 .child(lead(format!(
@@ -496,9 +473,19 @@ fn model_step(store: Store) -> View {
                                                 )))
                                                 .child(labeled(
                                                     "Model",
-                                                    field("Type to find one", model),
+                                                    view().flex_row().child(ui::choice(
+                                                        "Model",
+                                                        "Choose a model",
+                                                        options,
+                                                        move || {
+                                                            Some(model.get())
+                                                                .filter(|m| !m.is_empty())
+                                                        },
+                                                        move |next: Option<String>| {
+                                                            model.set(next.unwrap_or_default())
+                                                        },
+                                                    )),
                                                 ))
-                                                .child(matches)
                                         }))
                                     }))
                                     .child(when(

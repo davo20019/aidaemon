@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MINOR: u16 = 6;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -488,6 +488,10 @@ pub struct Settings {
     /// Whether the database is encrypted (its key can be rotated).
     #[serde(default)]
     pub database_encrypted: bool,
+    /// The providers a failover entry can name (protocol 1.6), so the
+    /// client offers a list rather than a preset id typed by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderOption>,
 }
 
 /// The settings of one config table.

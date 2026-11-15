@@ -53,6 +53,17 @@
       "notices": [
         "The database moves to /data/aidaemon.db at the next restart."
       ],
+      "providers": [
+        {
+          "billing": "per_token",
+          "key_url": "https://platform.openai.com/api-keys",
+          "model": "gpt-x",
+          "name": "OpenAI",
+          "needs_base_url": false,
+          "needs_key": true,
+          "preset": "openai"
+        }
+      ],
       "reload_pending": true,
       "restart_pending": false
     },

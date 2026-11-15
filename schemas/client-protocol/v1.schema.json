@@ -3288,6 +3288,13 @@
           },
           "type": "array"
         },
+        "providers": {
+          "description": "The providers a failover entry can name (protocol 1.6), so the\nclient offers a list rather than a preset id typed by hand.",
+          "items": {
+            "$ref": "#/$defs/ProviderOption"
+          },
+          "type": "array"
+        },
         "reload_pending": {
           "default": false,
           "description": "Saved changes that take effect on a reload.",

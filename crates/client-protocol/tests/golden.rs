@@ -676,6 +676,15 @@ fn server_samples() -> Vec<ServerFrame> {
                 ],
                 database_path: "/home/synthetic/.aidaemon/aidaemon.db".into(),
                 database_encrypted: true,
+                providers: vec![ProviderOption {
+                    preset: "openai".into(),
+                    name: "OpenAI".into(),
+                    billing: Billing::PerToken,
+                    needs_key: true,
+                    key_url: "https://platform.openai.com/api-keys".into(),
+                    needs_base_url: false,
+                    model: "gpt-x".into(),
+                }],
             },
         }),
         ack(CommandResult::SettingsChanged {

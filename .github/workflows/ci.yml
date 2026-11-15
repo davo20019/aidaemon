@@ -272,6 +272,10 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install && rustc --version
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
       # SQLCipher links OpenSSL.
       - name: Install OpenSSL
         shell: pwsh
@@ -279,8 +283,13 @@ jobs:
           vcpkg install openssl:x64-windows-static-md
           "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # Every error a round can show, not just the first crate's.
+      - name: Check (all errors)
+        run: cargo check --all-targets --locked --keep-going
+
       # The daemon first: what a Windows download needs.
       - name: Build
+        if: always()
         run: cargo build --locked
 
       - name: Build the app
