@@ -8,6 +8,10 @@
 //! a paired device key that trades a signed challenge for a short-lived
 //! grant, kept in a [`keystore::KeyStore`]).
 //!
+//! [`client`] is the whole client without rendering: the reducer, the
+//! connection's state, the reads asked for and their answers, turns'
+//! activity, uploads and the other state a UI must not own.
+//!
 //! The terminal UI and the nsh app (`clients/app`, desktop, web and terminal)
 //! link it.
 //!
@@ -16,6 +20,7 @@
 //! device keys, and sign-in over any [`signin::Http`]. Feature `native`
 //! (on by default) adds the tokio link and reqwest.
 
+pub mod client;
 pub mod keystore;
 #[cfg(feature = "native")]
 pub mod link;
@@ -25,6 +30,7 @@ pub mod state;
 #[cfg(feature = "native")]
 mod tls;
 
+pub use client::{Client, Connection, Context, Effect, Read};
 pub use keystore::{FileKeyStore, KeyStore, StoredDevice};
 #[cfg(feature = "native")]
 pub use link::{Auth, LinkConfig};

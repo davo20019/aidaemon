@@ -46,8 +46,16 @@ its pairing link approves itself (use `/client/v1/next/#offer=…`).
   `aidaemon-client` (the name the retired TypeScript client used; keep it).
   Never store a key a script can read.
 - Model output renders as Markdown with HTML off (`html: false`).
-- The store (`src/store/`) is the only writer of app state; screens call
-  its methods.
+- Nothing but drawing lives in the app. Connection state, the reducer,
+  reads and their request ids, turns' activity, uploads, unread and
+  stopping, coding detection, platform naming and sign-in are
+  `aidaemon-client-core` (`client::Client`, `state`, `machine`, `signin`),
+  so another UI toolkit reuses them unchanged. The store (`src/store/`)
+  holds one `Client` in a signal (pages read it through memos, so a page
+  rebuilds only when its own read changes) plus screen-only state (page,
+  panes, selection, drafts, toasts, filters, this device's pins). It is
+  the only writer of app state; screens call its methods. A new daemon read
+  or command goes into `Client` first, with a unit test there.
 - New daemon data (goals, mandates, coding receipts, the dashboard's
   status/health/usage) arrives as typed gateway protocol additions first:
   `crates/client-protocol`, the schema export and its test, golden

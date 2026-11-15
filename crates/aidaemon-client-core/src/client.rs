@@ -1,0 +1,1767 @@
+//! The whole client, with no rendering: the reducer's [`State`], the
+//! connection as the owner should see it, the commands waiting for the
+//! link, and everything the client keeps between frames that is not a
+//! screen's own business: the reads it asked the daemon for and their
+//! answers (matched by request id), each turn's activity, which
+//! conversations wrote code, what is unread, what is stopping, files
+//! uploading with a draft, settings changes in flight.
+//!
+//! A UI holds one [`Client`], calls its methods for what the owner does,
+//! hands it the link's [`Update`]s with a [`Context`] (the few facts only
+//! the screen knows: what is selected, whether the owner is looking), sends
+//! what [`Client::take_outgoing`] returns, and acts on the [`Effect`]s it
+//! gets back. Nothing here knows how anything is drawn.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use aidaemon_client_protocol::{
+    Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
+    AutomationSummary, Command, CommandResult, ErrorCode, Event, LiveTurnState, MemoryItem, MidRun,
+    ProjectSummary, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange,
+    SettingsOutcome, SetupAction, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
+};
+
+use crate::machine::{DropKind, Update, request_id};
+use crate::state::{Line, State, ViewRequest};
+
+/// The connection to the daemon, as the owner should see it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Connection {
+    #[default]
+    Connecting,
+    Online,
+    /// This device has no key the daemon knows: pair it first.
+    NeedsPairing,
+    /// No daemon to sign in to yet (no local token, no paired one): run one
+    /// here, or connect to one elsewhere.
+    NoDaemon,
+    Offline {
+        kind: DropKind,
+        reason: String,
+        /// When the link tries again, in ms since the epoch.
+        retry_at_ms: u64,
+    },
+}
+
+/// Something read from the daemon, as last asked.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Read<T> {
+    #[default]
+    NotYet,
+    Loading,
+    Ready(T),
+    Failed(String),
+}
+
+impl<T> Read<T> {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Read::Ready(_))
+    }
+
+    pub fn ready(&self) -> Option<&T> {
+        match self {
+            Read::Ready(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// The System page's data, as last read, and when.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SystemRead {
+    #[default]
+    NotYet,
+    Loading,
+    Ready {
+        status: Box<SystemStatus>,
+        at_ms: u64,
+    },
+    Failed(String),
+}
+
+/// A search of every conversation, as last asked.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SearchRead {
+    #[default]
+    Idle,
+    Loading(String),
+    Ready {
+        query: String,
+        hits: Vec<SearchHit>,
+    },
+    Failed(String),
+}
+
+/// One thing a turn did, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    pub id: u64,
+    pub kind: ActivityKind,
+    pub title: String,
+    pub detail: String,
+    pub at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    Thinking,
+    Tool,
+    ToolDone,
+    Output,
+    Plan,
+    Note,
+}
+
+/// A turn's activity, kept after it ends so it can still be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnLog {
+    pub session_id: String,
+    /// When this client saw it start.
+    pub started_ms: u64,
+    pub items: Vec<Activity>,
+    pub done: bool,
+}
+
+/// Where a conversation came from: the app or a chat platform, and
+/// whether others are in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Source {
+    All,
+    App,
+    Telegram,
+    Slack,
+    Discord,
+    Chat,
+    /// Conversations with other people in them, on any platform.
+    Groups,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::All => "All",
+            Source::App => "App",
+            Source::Telegram => "Telegram",
+            Source::Slack => "Slack",
+            Source::Discord => "Discord",
+            Source::Chat => "Other chats",
+            Source::Groups => "Groups",
+        }
+    }
+}
+
+/// A chat bot the daemon has conversations through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bot {
+    /// Its sessions' `channel`: `telegram:coding_bot`.
+    pub channel: String,
+    /// "Telegram · coding_bot".
+    pub name: String,
+    /// How many conversations it has.
+    pub chats: usize,
+    /// The project its direct-message chats go to.
+    pub project: Option<String>,
+}
+
+/// A file attached to the message being written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftFile {
+    pub number: u64,
+    pub name: String,
+    pub state: DraftFileState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DraftFileState {
+    Uploading,
+    Ready(AttachmentRef),
+    Failed(String),
+}
+
+/// The largest file the gateway takes.
+pub const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Tools whose work can change files: the changes read again after one.
+const CHANGING_TOOLS: [&str; 4] = ["edit_file", "write_file", "terminal", "cli_agent"];
+/// Tools that write files themselves: the first in a turn shows the changes.
+const WRITING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
+
+/// What only the screen knows, handed in with each update.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Context {
+    /// The wall clock, ms since the epoch.
+    pub now_ms: u64,
+    /// The conversation on screen.
+    pub selected: Option<String>,
+    /// The owner is looking at the selected conversation now (its page is
+    /// up and the app is in front): its replies are not unread.
+    pub looking: bool,
+    /// The changes of the selected conversation are on screen: a tool
+    /// that can change files reads them again at once, else on next
+    /// showing.
+    pub changes_visible: bool,
+    /// The Settings page is up: a settings change reads them again.
+    pub settings_open: bool,
+}
+
+/// What the UI should do after an update or a command.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// Tell the owner, briefly.
+    Say(String),
+    /// A message sent from a new conversation started it: show it (the
+    /// new conversation's draft is spent).
+    Started(String),
+    /// The greeting's conversation the setup asked to open.
+    OpenGreeting(String),
+    /// `session` was just found to work on code: its details belong
+    /// beside it.
+    NowCoding(String),
+    /// Show the changes of `session` (if it is on screen).
+    OpenChanges(String),
+    /// A project was made or saved.
+    ProjectSaved(ProjectSummary),
+    /// The agent asked for a view move.
+    View(ViewRequest),
+}
+
+/// The client, as [`crate::client`] describes it.
+#[derive(Debug, Clone, Default)]
+pub struct Client {
+    pub state: State,
+    pub connection: Connection,
+    /// Commands waiting to go to the link, in order.
+    outgoing: Vec<(String, Command)>,
+    /// Sessions whose history was asked for.
+    fetched: BTreeSet<String>,
+    /// The request of a message that starts a new session.
+    starting: Option<String>,
+    turns: BTreeMap<String, TurnLog>,
+    next_activity: u64,
+
+    pub system: SystemRead,
+    system_request: Option<String>,
+    pub settings: Read<Box<Settings>>,
+    settings_request: Option<String>,
+    /// Settings changes sent and not yet answered.
+    settings_changes: BTreeSet<String>,
+    /// Why the last settings change was refused, until dismissed or the
+    /// next change.
+    pub settings_error: Option<String>,
+    /// Settings changes waiting for an approval, and whether another
+    /// device must give it.
+    pub settings_waiting: BTreeMap<String, bool>,
+    pub memories: Read<Vec<MemoryItem>>,
+    memories_request: Option<String>,
+    pub automations: Read<Vec<AutomationSummary>>,
+    automations_request: Option<String>,
+    /// The automation a change was sent for and not answered yet.
+    pub automation_busy: Option<String>,
+    pub search: SearchRead,
+    search_request: Option<String>,
+    /// The selected session's changes, and the session they are of.
+    pub changes: Read<SessionChanges>,
+    changes_of: Option<String>,
+    changes_request: Option<String>,
+    /// Something changed while a read was in flight: read again after it.
+    changes_again: bool,
+    /// The daemon's slash commands.
+    pub commands: Vec<SlashCommand>,
+    project_request: Option<String>,
+    pub project_error: Option<String>,
+    setup_request: Option<String>,
+    pub setup_error: Option<String>,
+    /// Open the next conversation the daemon starts (the greeting).
+    open_greeting: bool,
+    /// Files attached to the message being written.
+    pub draft_files: Vec<DraftFile>,
+    /// Uploads not yet answered: request id to the draft file's number.
+    uploads: BTreeMap<String, u64>,
+    next_upload: u64,
+    /// Conversations that got a reply the owner has not looked at.
+    pub unread: BTreeSet<String>,
+    /// Conversations asked to stop, until their turn ends.
+    stopping: BTreeSet<String>,
+    /// The latest turn that finished: its session and when.
+    pub finished: Option<(String, u64)>,
+    /// Conversations that wrote files or showed code changes.
+    coded: BTreeSet<String>,
+    /// Turns that already showed the changes, so the owner's own choice
+    /// sticks for the rest of a turn.
+    changes_shown: BTreeSet<String>,
+}
+
+impl Client {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // ----- The link ---------------------------------------------------------
+
+    /// Queue `command` for the link; its request id.
+    pub fn send(&mut self, command: Command) -> String {
+        let id = request_id();
+        self.outgoing.push((id.clone(), command));
+        id
+    }
+
+    /// The commands to send now, in order.
+    pub fn take_outgoing(&mut self) -> Vec<(String, Command)> {
+        std::mem::take(&mut self.outgoing)
+    }
+
+    /// Commands waiting for the link, oldest first.
+    pub fn outgoing(&self) -> &[(String, Command)] {
+        &self.outgoing
+    }
+
+    pub fn needs_pairing(&mut self) {
+        self.connection = Connection::NeedsPairing;
+    }
+
+    pub fn needs_daemon(&mut self) {
+        self.connection = Connection::NoDaemon;
+    }
+
+    pub fn is_online(&self) -> bool {
+        self.connection == Connection::Online
+    }
+
+    /// What the link reported.
+    pub fn update(&mut self, update: Update, cx: &Context) -> Vec<Effect> {
+        match update {
+            Update::Connecting => {
+                if !matches!(self.connection, Connection::Offline { .. }) {
+                    self.connection = Connection::Connecting;
+                }
+                Vec::new()
+            }
+            Update::Connected => {
+                self.connection = Connection::Online;
+                self.send(Command::ListSessions {
+                    cursor: None,
+                    limit: 200,
+                });
+                self.send(Command::ListCommands);
+                self.send(Command::ListProjects);
+                // Today's token use, for the sidebar.
+                self.refresh_system();
+                // A reconnect may have missed history: ask again on view.
+                self.fetched.clear();
+                if let Some(id) = &cx.selected {
+                    self.load_history(id);
+                    // Its changes too: whether it works on code, and what.
+                    self.changes_of = None;
+                    self.refresh_changes(cx.selected.as_deref());
+                }
+                Vec::new()
+            }
+            Update::Disconnected(disconnect) => {
+                // Changes in flight get no answer now.
+                self.settings_changes.clear();
+                let retry = u64::try_from(disconnect.retry_in.as_millis()).unwrap_or(0);
+                self.connection = Connection::Offline {
+                    kind: disconnect.kind,
+                    reason: disconnect.reason,
+                    retry_at_ms: cx.now_ms.saturating_add(retry),
+                };
+                Vec::new()
+            }
+            Update::Frame(frame) => self.frame(frame, cx),
+        }
+    }
+
+    fn frame(&mut self, frame: ServerFrame, cx: &Context) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if self.answer(&frame, cx, &mut effects) {
+            return effects;
+        }
+        self.state.apply(frame);
+        if let Some(request) = self.state.take_view_request() {
+            effects.push(Effect::View(request));
+        }
+        effects
+    }
+
+    /// What the client does with `frame` besides the reducer: answers to
+    /// its own requests, and the notes it keeps from events. `true` when
+    /// the frame was the answer to a request and the reducer has nothing
+    /// to learn from it.
+    fn answer(&mut self, frame: &ServerFrame, cx: &Context, out: &mut Vec<Effect>) -> bool {
+        let mine = |slot: &Option<String>, id: &str| slot.as_deref() == Some(id);
+        match frame {
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Uploaded { attachment },
+            } => {
+                if let Some(number) = self.uploads.remove(request_id)
+                    && let Some(file) = self.draft_files.iter_mut().find(|f| f.number == number)
+                {
+                    file.state = DraftFileState::Ready(attachment.clone());
+                }
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.uploads.contains_key(request_id) => {
+                let number = self.uploads.remove(request_id).unwrap_or(0);
+                if let Some(file) = self.draft_files.iter_mut().find(|f| f.number == number) {
+                    file.state = DraftFileState::Failed(error.message.clone());
+                }
+                out.push(Effect::Say(format!(
+                    "Could not attach the file: {}",
+                    error.message
+                )));
+                return true;
+            }
+            _ => {}
+        }
+        if let ServerFrame::Ack {
+            request_id,
+            result: CommandResult::MessageAccepted { session_id, .. },
+        } = frame
+            && mine(&self.starting, request_id)
+        {
+            self.starting = None;
+            self.fetched.insert(session_id.clone());
+            out.push(Effect::Started(session_id.clone()));
+        }
+        match frame {
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Setup { .. },
+            } if mine(&self.setup_request, request_id) => {
+                self.setup_request = None;
+                self.setup_error = None;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.setup_request, request_id) => {
+                self.setup_request = None;
+                self.setup_error = Some(error.message.clone());
+                return true;
+            }
+            // In setup mode the usual reads on connecting are refused.
+            ServerFrame::Error { error, .. }
+                if error.code == ErrorCode::Forbidden && self.in_setup_mode() =>
+            {
+                return true;
+            }
+            ServerFrame::Event {
+                event: Event::SessionCreated { session },
+                ..
+            } if self.open_greeting => {
+                self.open_greeting = false;
+                out.push(Effect::OpenGreeting(session.id.clone()));
+            }
+            // The chat step heard from the owner: read where it stands.
+            ServerFrame::Event {
+                event: Event::UserMessage { origin, .. },
+                ..
+            } if origin != "app"
+                && self
+                    .state
+                    .setup
+                    .as_ref()
+                    .is_some_and(|s| s.step == SetupStep::Channel) =>
+            {
+                self.send(Command::GetSetup);
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::System { system },
+            } if mine(&self.system_request, request_id) => {
+                self.system_request = None;
+                self.system = SystemRead::Ready {
+                    status: Box::new(system.clone()),
+                    at_ms: cx.now_ms,
+                };
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.system_request, request_id) => {
+                self.system_request = None;
+                self.system = SystemRead::Failed(error.message.clone());
+                return true;
+            }
+            // Only this client's own list or change is answered with it.
+            ServerFrame::Ack {
+                result:
+                    CommandResult::Automations {
+                        automations, note, ..
+                    },
+                ..
+            } => {
+                self.automations_request = None;
+                self.automation_busy = None;
+                self.automations = Read::Ready(automations.clone());
+                if let Some(note) = note {
+                    out.push(Effect::Say(note.clone()));
+                }
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.automations_request, request_id) => {
+                self.automations_request = None;
+                if self.automation_busy.take().is_some() {
+                    out.push(Effect::Say(error.message.clone()));
+                } else {
+                    self.automations = Read::Failed(error.message.clone());
+                }
+                return true;
+            }
+            ServerFrame::Ack {
+                result: CommandResult::Commands { commands },
+                ..
+            } => {
+                self.commands = commands.clone();
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::SearchResults { hits },
+            } if mine(&self.search_request, request_id) => {
+                self.search_request = None;
+                if let SearchRead::Loading(query) = &self.search {
+                    self.search = SearchRead::Ready {
+                        query: query.clone(),
+                        hits: hits.clone(),
+                    };
+                }
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.search_request, request_id) => {
+                self.search_request = None;
+                self.search = SearchRead::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Project { project },
+            } if mine(&self.project_request, request_id) => {
+                self.project_request = None;
+                self.project_error = None;
+                out.push(Effect::ProjectSaved(project.clone()));
+                // The reducer keeps the project too.
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.project_request, request_id) => {
+                self.project_request = None;
+                self.project_error = Some(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Changes { changes },
+            } if mine(&self.changes_request, request_id) => {
+                self.changes_request = None;
+                // Changes found: the conversation is a coding one, and one
+                // just found to be shows them.
+                if changes.repos.iter().any(|r| !r.files.is_empty())
+                    && let Some(session) = self.changes_of.clone()
+                    && !self.is_coding(&session)
+                {
+                    self.mark_coded(&session, out);
+                    out.push(Effect::OpenChanges(session));
+                }
+                self.changes = Read::Ready(changes.clone());
+                if std::mem::take(&mut self.changes_again) {
+                    self.refresh_changes(cx.selected.as_deref());
+                }
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.changes_request, request_id) => {
+                self.changes_request = None;
+                self.changes_again = false;
+                self.changes = Read::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Memories { memories },
+            } if mine(&self.memories_request, request_id) => {
+                self.memories_request = None;
+                self.memories = Read::Ready(memories.clone());
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.memories_request, request_id) => {
+                self.memories_request = None;
+                self.memories = Read::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                result: CommandResult::Forgotten { memory_id },
+                ..
+            } => {
+                if let Read::Ready(items) = &mut self.memories {
+                    items.retain(|item| item.id != *memory_id);
+                }
+                out.push(Effect::Say("Forgotten".into()));
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Settings { settings },
+            } if mine(&self.settings_request, request_id) => {
+                self.settings_request = None;
+                self.settings = Read::Ready(Box::new(settings.clone()));
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.settings_request, request_id) => {
+                self.settings_request = None;
+                self.settings = Read::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::SettingsChanged { outcome },
+            } => {
+                self.settings_changes.remove(request_id);
+                // `Done`: the daemon announces what it did to every
+                // client (`settings_updated`), which says it here too.
+                if let SettingsOutcome::AwaitingApproval {
+                    approval_id,
+                    other_device,
+                } = outcome
+                {
+                    self.settings_waiting
+                        .insert(approval_id.clone(), *other_device);
+                    out.push(Effect::Say(
+                        if *other_device {
+                            "Approve it on another device, or on the daemon's computer"
+                        } else {
+                            "Waiting for your approval"
+                        }
+                        .into(),
+                    ));
+                }
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.settings_changes.contains(request_id) => {
+                self.settings_changes.remove(request_id);
+                self.settings_error = Some(error.message.clone());
+                return true;
+            }
+            ServerFrame::Event {
+                event: Event::SettingsUpdated { message, .. },
+                ..
+            } => {
+                out.push(Effect::Say(message.clone()));
+                if self.settings.is_ready() || cx.settings_open {
+                    self.refresh_settings();
+                }
+                return true;
+            }
+            ServerFrame::Event {
+                event: Event::ApprovalResolved { approval_id, .. },
+                ..
+            } if self.settings_waiting.contains_key(approval_id) => {
+                self.settings_waiting.remove(approval_id);
+            }
+            ServerFrame::Event {
+                event, session_id, ..
+            } => {
+                self.note_activity(event, cx.now_ms);
+                self.note_code(event, cx, out);
+                self.note_reply(session_id.as_deref(), event, cx);
+            }
+            // After a reload or a dropped connection: what running turns
+            // have got to, so the turn's activity is not empty.
+            ServerFrame::Snapshot { state, .. }
+            | ServerFrame::Ack {
+                result: CommandResult::Snapshot { state, .. },
+                ..
+            } => self.note_live_turns(&state.live_turns, cx.now_ms),
+            _ => {}
+        }
+        false
+    }
+
+    /// A reply landed: unread unless the owner is looking at it; a stop
+    /// asked for is over once its turn ends.
+    fn note_reply(&mut self, session: Option<&str>, event: &Event, cx: &Context) {
+        let (session, done) = match event {
+            Event::AssistantMessage { session_id, .. } => (session_id.as_str(), false),
+            Event::TurnCompleted { .. } => match session {
+                Some(session) => (session, true),
+                None => return,
+            },
+            _ => return,
+        };
+        let looking = cx.looking && cx.selected.as_deref() == Some(session);
+        if !looking {
+            self.unread.insert(session.to_owned());
+        }
+        if done {
+            self.stopping.remove(session);
+            self.finished = Some((session.to_owned(), cx.now_ms));
+        }
+    }
+
+    // ----- Setup ------------------------------------------------------------
+
+    /// The daemon is in setup mode: only the model step is open.
+    pub fn in_setup_mode(&self) -> bool {
+        self.state
+            .setup
+            .as_ref()
+            .is_some_and(|s| matches!(s.step, SetupStep::Model | SetupStep::Starting))
+    }
+
+    pub fn setup_step(&mut self, action: SetupAction) {
+        if matches!(action, SetupAction::SkipChannel | SetupAction::Finish) {
+            self.open_greeting = true;
+        }
+        self.setup_error = None;
+        let id = self.send(Command::Setup { action });
+        self.setup_request = Some(id);
+    }
+
+    pub fn setup_busy(&self) -> bool {
+        self.setup_request.is_some()
+    }
+
+    // ----- Reads the pages ask for -----------------------------------------
+
+    pub fn refresh_system(&mut self) {
+        if self.system_request.is_some() {
+            return;
+        }
+        if !matches!(self.system, SystemRead::Ready { .. }) {
+            self.system = SystemRead::Loading;
+        }
+        self.system_request = Some(self.send(Command::GetSystem));
+    }
+
+    /// Tokens used on `today` (a UTC date, as usage days are), when the
+    /// System read has them.
+    pub fn tokens_on(&self, today: &str) -> Option<u64> {
+        let SystemRead::Ready { status, .. } = &self.system else {
+            return None;
+        };
+        Some(
+            status
+                .usage
+                .iter()
+                .filter(|d| d.day == today)
+                .map(|d| d.input_tokens + d.output_tokens)
+                .sum(),
+        )
+    }
+
+    pub fn refresh_automations(&mut self) {
+        if self.automations_request.is_some() {
+            return;
+        }
+        if !self.automations.is_ready() {
+            self.automations = Read::Loading;
+        }
+        self.automations_request = Some(self.send(Command::ListAutomations));
+    }
+
+    /// Pause, resume, cancel or run one automation now; the answer brings
+    /// the list as it is after, and a note of what happened.
+    pub fn change_automation(&mut self, id: &str, change: AutomationChange) {
+        if self.automations_request.is_some() {
+            return;
+        }
+        self.automation_busy = Some(id.to_owned());
+        self.automations_request = Some(self.send(Command::ChangeAutomation {
+            automation_id: id.to_owned(),
+            change,
+        }));
+    }
+
+    /// Rename, reschedule or re-instruct one automation; a `None` field
+    /// stays as it is. `false` when another change is still in flight.
+    pub fn edit_automation(
+        &mut self,
+        id: &str,
+        name: Option<String>,
+        when: Option<String>,
+        instructions: Option<String>,
+        notify: Option<AutomationNotify>,
+    ) -> bool {
+        if self.automations_request.is_some() {
+            return false;
+        }
+        self.automation_busy = Some(id.to_owned());
+        self.automations_request = Some(self.send(Command::EditAutomation {
+            automation_id: id.to_owned(),
+            name,
+            when,
+            instructions,
+            notify,
+        }));
+        true
+    }
+
+    pub fn refresh_memories(&mut self) {
+        if self.memories_request.is_some() {
+            return;
+        }
+        if !self.memories.is_ready() {
+            self.memories = Read::Loading;
+        }
+        self.memories_request = Some(self.send(Command::ListMemories));
+    }
+
+    pub fn forget_memory(&mut self, id: &str) {
+        self.send(Command::ForgetMemory {
+            memory_id: id.to_owned(),
+        });
+    }
+
+    pub fn refresh_settings(&mut self) {
+        if self.settings_request.is_some() {
+            return;
+        }
+        if !self.settings.is_ready() {
+            self.settings = Read::Loading;
+        }
+        self.settings_request = Some(self.send(Command::GetSettings));
+    }
+
+    /// Ask the daemon to make `change`; the answer arrives as a note, and
+    /// the settings read again when it lands.
+    pub fn change_settings(&mut self, change: SettingsChange) {
+        self.settings_error = None;
+        let id = self.send(Command::ChangeSettings { change });
+        self.settings_changes.insert(id);
+    }
+
+    /// A settings change was sent and has no answer yet.
+    pub fn settings_busy(&self) -> bool {
+        !self.settings_changes.is_empty()
+    }
+
+    /// Ask for messages matching `query`, in every conversation.
+    pub fn search_messages(&mut self, query: &str) {
+        let query = query.trim().to_owned();
+        if query.chars().count() < 2 {
+            self.search_request = None;
+            self.search = SearchRead::Idle;
+            return;
+        }
+        self.search = SearchRead::Loading(query.clone());
+        self.search_request = Some(self.send(Command::SearchMessages { query, limit: 30 }));
+    }
+
+    // ----- Changes ------------------------------------------------------------
+
+    /// Read `selected`'s changes again; one read at a time, and one more
+    /// after it when asked meanwhile.
+    pub fn refresh_changes(&mut self, selected: Option<&str>) {
+        let Some(session_id) = selected else {
+            self.changes_of = None;
+            self.changes = Read::NotYet;
+            return;
+        };
+        if self.changes_request.is_some() {
+            self.changes_again = true;
+            return;
+        }
+        if self.changes_of.as_deref() != Some(session_id) || !self.changes.is_ready() {
+            self.changes = Read::Loading;
+        }
+        self.changes_of = Some(session_id.to_owned());
+        self.changes_request = Some(self.send(Command::GetChanges {
+            session_id: session_id.to_owned(),
+        }));
+    }
+
+    /// Read `selected`'s changes unless those held are its own and current.
+    pub fn refresh_changes_if_stale(&mut self, selected: Option<&str>) {
+        if self.changes_of.as_deref() != selected {
+            self.refresh_changes(selected);
+        }
+    }
+
+    /// How many files `selected` has changed, once read.
+    pub fn changed_files(&self, selected: &str) -> Option<usize> {
+        if self.changes_of.as_deref() != Some(selected) {
+            return None;
+        }
+        self.changes
+            .ready()
+            .map(|changes| changes.repos.iter().map(|r| r.files.len()).sum())
+    }
+
+    /// Whether conversation `id` works on code: it is in a project with a
+    /// folder, or it wrote files or showed changes.
+    pub fn is_coding(&self, id: &str) -> bool {
+        self.coded.contains(id)
+            || self
+                .session_project(id)
+                .and_then(|p| self.state.projects.get(&p))
+                .is_some_and(|p| p.path.is_some())
+    }
+
+    fn mark_coded(&mut self, session: &str, out: &mut Vec<Effect>) {
+        if self.coded.insert(session.to_owned()) {
+            out.push(Effect::NowCoding(session.to_owned()));
+        }
+    }
+
+    /// A tool that can change files finished in the selected session: the
+    /// changes read again, and the turn's first file write shows them.
+    fn note_code(&mut self, event: &Event, cx: &Context, out: &mut Vec<Effect>) {
+        let (turn_id, name) = match event {
+            Event::TurnStatus {
+                turn_id,
+                status: TurnStatus::ToolCompleted { name, .. },
+            } => (turn_id, Some(name.as_str())),
+            Event::TurnCompleted { turn_id, .. } => (turn_id, None),
+            _ => return,
+        };
+        let session = self.turns.get(turn_id).map(|log| log.session_id.clone());
+        if session.is_none() || session != cx.selected {
+            return;
+        }
+        if let Some(name) = name {
+            if !CHANGING_TOOLS.contains(&name) {
+                return;
+            }
+            if WRITING_TOOLS.contains(&name) && self.changes_shown.insert(turn_id.clone()) {
+                if let Some(session) = &session {
+                    self.mark_coded(session, out);
+                    out.push(Effect::OpenChanges(session.clone()));
+                }
+                // Showing them reads them.
+                self.refresh_changes(cx.selected.as_deref());
+                return;
+            }
+        }
+        if cx.changes_visible {
+            self.refresh_changes(cx.selected.as_deref());
+        } else {
+            // Read on next showing.
+            self.changes_of = None;
+        }
+    }
+
+    // ----- Turns' activity ----------------------------------------------------
+
+    /// The latest turn of `session` this client saw.
+    pub fn latest_turn(&self, session: &str) -> Option<&TurnLog> {
+        self.turns
+            .values()
+            .filter(|log| log.session_id == session)
+            .max_by_key(|log| log.started_ms)
+    }
+
+    /// Activity for running turns this client did not see start: their
+    /// tools in order, then what they are doing now. Turns it already
+    /// follows keep their own record.
+    fn note_live_turns(&mut self, live: &[LiveTurnState], now: u64) {
+        for turn in live {
+            if self.turns.contains_key(&turn.turn_id) {
+                continue;
+            }
+            self.note_activity(
+                &Event::TurnStarted {
+                    turn_id: turn.turn_id.clone(),
+                    session_id: turn.session_id.clone(),
+                    origin: String::new(),
+                },
+                now,
+            );
+            let last = turn.tools.len().saturating_sub(1);
+            for (n, name) in turn.tools.iter().enumerate() {
+                // The current status names the last tool with its summary.
+                let summary = match &turn.status {
+                    Some(TurnStatus::ToolStarted { name: now, summary })
+                        if n == last && now == name =>
+                    {
+                        summary.clone()
+                    }
+                    _ => String::new(),
+                };
+                self.note_activity(
+                    &Event::TurnStatus {
+                        turn_id: turn.turn_id.clone(),
+                        status: TurnStatus::ToolStarted {
+                            name: name.clone(),
+                            summary,
+                        },
+                    },
+                    now,
+                );
+            }
+            if let Some(status) = &turn.status
+                && !matches!(status, TurnStatus::ToolStarted { .. })
+            {
+                self.note_activity(
+                    &Event::TurnStatus {
+                        turn_id: turn.turn_id.clone(),
+                        status: status.clone(),
+                    },
+                    now,
+                );
+            }
+        }
+    }
+
+    fn note_activity(&mut self, event: &Event, now: u64) {
+        let (turn_id, kind, title, detail) = match event {
+            Event::TurnStarted {
+                turn_id,
+                session_id,
+                ..
+            } => {
+                self.turns.insert(
+                    turn_id.clone(),
+                    TurnLog {
+                        session_id: session_id.clone(),
+                        started_ms: now,
+                        ..TurnLog::default()
+                    },
+                );
+                return;
+            }
+            Event::TurnCompleted { turn_id, .. } => {
+                if let Some(log) = self.turns.get_mut(turn_id) {
+                    log.done = true;
+                }
+                return;
+            }
+            Event::TurnStatus { turn_id, status } => {
+                let (kind, title, detail) = match status {
+                    TurnStatus::Thinking => {
+                        (ActivityKind::Thinking, "Thinking".into(), String::new())
+                    }
+                    TurnStatus::ToolStarted { name, summary } => {
+                        (ActivityKind::Tool, name.clone(), summary.clone())
+                    }
+                    TurnStatus::ToolProgress { name, chunk } => {
+                        (ActivityKind::Output, name.clone(), chunk.clone())
+                    }
+                    TurnStatus::ToolCompleted { name, summary } => {
+                        (ActivityKind::ToolDone, name.clone(), summary.clone())
+                    }
+                    TurnStatus::PlanStep {
+                        step,
+                        total,
+                        description,
+                        ..
+                    } => (
+                        ActivityKind::Plan,
+                        format!("Step {} of {total}", step + 1),
+                        description.clone(),
+                    ),
+                    TurnStatus::Checklist { text } => {
+                        (ActivityKind::Plan, "Plan".into(), text.clone())
+                    }
+                    TurnStatus::Note { text } => (ActivityKind::Note, "Note".into(), text.clone()),
+                    TurnStatus::Unknown => return,
+                };
+                (turn_id, kind, title, detail)
+            }
+            _ => return,
+        };
+        self.next_activity += 1;
+        let id = self.next_activity;
+        let Some(log) = self.turns.get_mut(turn_id) else {
+            return;
+        };
+        // Progress of one tool folds into its last output row.
+        if kind == ActivityKind::Output
+            && let Some(last) = log.items.last_mut()
+            && last.kind == ActivityKind::Output
+            && last.title == title
+        {
+            last.detail.push_str(&detail);
+            return;
+        }
+        log.items.push(Activity {
+            id,
+            kind,
+            title,
+            detail,
+            at_ms: now,
+        });
+    }
+
+    // ----- Projects and bots ------------------------------------------------
+
+    /// The owner's projects, by name.
+    pub fn projects(&self) -> Vec<ProjectSummary> {
+        let mut projects: Vec<ProjectSummary> = self.state.projects.values().cloned().collect();
+        projects.sort_by_key(|p| p.name.to_lowercase());
+        projects
+    }
+
+    /// The project a conversation is in.
+    pub fn session_project(&self, session: &str) -> Option<String> {
+        self.state
+            .sessions
+            .get(session)
+            .and_then(|v| v.summary.as_ref())
+            .and_then(|summary| summary.project_id.clone())
+    }
+
+    /// The project whose folder holds `folder` (the innermost).
+    pub fn project_of_folder(&self, folder: &str) -> Option<String> {
+        let here = folder.trim_end_matches('/');
+        self.state
+            .projects
+            .values()
+            .filter_map(|p| {
+                let path = p.path.as_deref()?.trim_end_matches('/');
+                (here == path || here.starts_with(&format!("{path}/")))
+                    .then_some((path.len(), p.id.clone()))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, id)| id)
+    }
+
+    /// Make a project (`project_id` `None`) or save one's name and folder
+    /// (an empty folder removes it). `false` when it has no name.
+    pub fn save_project(&mut self, project_id: Option<String>, name: &str, path: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            self.project_error = Some("Give the project a name".to_owned());
+            return false;
+        }
+        let path = path.trim();
+        let command = match project_id {
+            Some(project_id) => Command::UpdateProject {
+                project_id,
+                name: Some(name.to_owned()),
+                path: Some(path.to_owned()),
+            },
+            None => Command::CreateProject {
+                name: name.to_owned(),
+                path: (!path.is_empty()).then(|| path.to_owned()),
+            },
+        };
+        self.project_request = Some(self.send(command));
+        true
+    }
+
+    pub fn saving_project(&self) -> bool {
+        self.project_request.is_some()
+    }
+
+    /// Put a conversation in a project, or in none.
+    pub fn move_to_project(&mut self, session: &str, project: Option<String>) {
+        self.send(Command::SetSessionProject {
+            session_id: session.to_owned(),
+            project_id: project,
+        });
+    }
+
+    /// The chat bots with conversations here, by channel.
+    pub fn bots(&self) -> Vec<Bot> {
+        let projects = self.projects();
+        let mut bots: BTreeMap<String, usize> = BTreeMap::new();
+        for view in self.state.sessions.values() {
+            if let Some(summary) = &view.summary
+                && !matches!(
+                    platform_of(&summary.channel, &summary.id),
+                    Source::App | Source::Chat
+                )
+            {
+                *bots.entry(summary.channel.clone()).or_default() += 1;
+            }
+        }
+        bots.into_iter()
+            .map(|(channel, chats)| Bot {
+                name: channel_name(&channel, ""),
+                project: projects
+                    .iter()
+                    .find(|p| p.channels.contains(&channel))
+                    .map(|p| p.id.clone()),
+                channel,
+                chats,
+            })
+            .collect()
+    }
+
+    /// Send a bot's direct-message chats to `project` (`None`: to none).
+    pub fn set_bot_project(&mut self, channel: &str, project: Option<String>) {
+        self.send(Command::SetChannelProject {
+            channel: channel.to_owned(),
+            project_id: project,
+        });
+    }
+
+    // ----- Conversations ------------------------------------------------------
+
+    /// Conversations, the most recently active first; ones never active
+    /// keep the gateway's order after them.
+    pub fn session_ids(&self) -> Vec<String> {
+        let mut ids = self.state.order.clone();
+        ids.sort_by_key(|id| std::cmp::Reverse(self.last_activity(id)));
+        ids
+    }
+
+    /// When a conversation last had a message.
+    pub fn last_activity(&self, id: &str) -> Option<u64> {
+        let view = self.state.sessions.get(id)?;
+        let line = view.lines.iter().rev().find_map(|line| match line {
+            Line::User { at_ms, .. } | Line::Assistant { at_ms, .. } if *at_ms > 0 => Some(*at_ms),
+            _ => None,
+        });
+        let summary = view.summary.as_ref().and_then(|m| m.last_activity_ms);
+        line.max(summary)
+    }
+
+    /// A conversation's name: the daemon's title, else its first message,
+    /// else where it lives ("Slack conversation").
+    pub fn title(&self, id: &str) -> String {
+        let view = self.state.sessions.get(id);
+        if let Some(title) = view
+            .and_then(|v| v.summary.as_ref())
+            .and_then(|m| m.title.clone())
+        {
+            return title;
+        }
+        let first = view.and_then(|v| {
+            v.lines.iter().find_map(|line| match line {
+                Line::User { text, .. } => {
+                    Some(text.lines().next().unwrap_or_default().trim().to_owned())
+                }
+                _ => None,
+            })
+        });
+        match first.filter(|t| !t.is_empty()) {
+            Some(text) if text.chars().count() > 60 => {
+                format!("{}…", text.chars().take(60).collect::<String>().trim_end())
+            }
+            Some(text) => text,
+            None => format!("{} conversation", platform_name(id)),
+        }
+    }
+
+    pub fn channel(&self, id: &str) -> Option<String> {
+        self.state
+            .sessions
+            .get(id)
+            .and_then(|v| v.summary.as_ref())
+            .map(|summary| summary.channel.clone())
+    }
+
+    /// Other people are in conversation `id`.
+    pub fn is_group(&self, id: &str) -> bool {
+        self.state
+            .sessions
+            .get(id)
+            .and_then(|v| v.summary.as_ref())
+            .is_some_and(|summary| summary.group)
+    }
+
+    /// Where a conversation lives: platform, bot, and whether it is a group.
+    pub fn place(&self, id: &str) -> String {
+        let place = channel_name(&self.channel(id).unwrap_or_default(), id);
+        if self.is_group(id) {
+            format!("{place} · group")
+        } else {
+            place
+        }
+    }
+
+    /// Where conversation `id` came from.
+    pub fn source(&self, id: &str) -> Source {
+        platform_of(&self.channel(id).unwrap_or_default(), id)
+    }
+
+    /// The source filters worth offering: every source with a
+    /// conversation, and groups when there are any; none when all come
+    /// from one place.
+    pub fn sources(&self) -> Vec<Source> {
+        let ids = &self.state.order;
+        let mut found: BTreeSet<Source> = ids.iter().map(|id| self.source(id)).collect();
+        if found.len() < 2 {
+            return Vec::new();
+        }
+        if ids.iter().any(|id| self.is_group(id)) {
+            found.insert(Source::Groups);
+        }
+        std::iter::once(Source::All).chain(found).collect()
+    }
+
+    /// Whether conversation `id` passes the source filter `source`.
+    pub fn in_source(&self, id: &str, source: Source) -> bool {
+        match source {
+            Source::All => true,
+            Source::Groups => self.is_group(id),
+            source => self.source(id) == source,
+        }
+    }
+
+    /// Whether conversation `id` matches every word of `query` (its title,
+    /// place, id or any loaded message).
+    pub fn matches(&self, id: &str, query: &str) -> bool {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() {
+            return true;
+        }
+        let mut hay = format!("{} {} {id}", self.title(id), self.place(id)).to_lowercase();
+        if let Some(view) = self.state.sessions.get(id) {
+            for line in &view.lines {
+                if let Line::User { text, .. } | Line::Assistant { text, .. } = line {
+                    hay.push(' ');
+                    hay.push_str(&text.to_lowercase());
+                }
+            }
+        }
+        words.iter().all(|w| hay.contains(w.as_str()))
+    }
+
+    pub fn lines(&self, id: &str) -> &[Line] {
+        self.state
+            .sessions
+            .get(id)
+            .map(|v| v.lines.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// The last thing the owner said in `session`.
+    pub fn last_user_text(&self, session: &str) -> Option<String> {
+        self.lines(session)
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                Line::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// The last message in `session`, and whether the owner sent it.
+    pub fn last_message(&self, session: &str) -> Option<(bool, String)> {
+        self.lines(session)
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                Line::User { text, .. } => Some((true, text.clone())),
+                Line::Assistant { text, .. } => Some((false, text.clone())),
+                _ => None,
+            })
+    }
+
+    /// The last reply in `session`.
+    pub fn last_reply(&self, session: &str) -> Option<String> {
+        self.lines(session)
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                Line::Assistant { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    pub fn is_running(&self, id: &str) -> bool {
+        self.state
+            .sessions
+            .get(id)
+            .is_some_and(|v| v.live.is_some())
+            || self.state.tasks.values().any(|t| t.session_id == id)
+    }
+
+    /// Its last turn handed work to the background and the report is
+    /// still to come.
+    pub fn in_background(&self, id: &str) -> bool {
+        self.state.sessions.get(id).is_some_and(|v| v.background)
+    }
+
+    pub fn is_stopping(&self, id: &str) -> bool {
+        self.stopping.contains(id) && self.is_running(id)
+    }
+
+    /// Whether the last turn of `session` failed or was stopped.
+    pub fn can_retry(&self, session: &str) -> bool {
+        !self.is_running(session)
+            && matches!(
+                self.lines(session).last(),
+                Some(Line::Note { text }) if text == "Stopped." || text.starts_with("Failed:")
+            )
+    }
+
+    /// Conversations with an approval waiting.
+    pub fn needs_you(&self, id: &str) -> bool {
+        self.state.approvals.values().any(|a| a.session_id == id)
+    }
+
+    /// The approvals waiting, oldest first.
+    pub fn approvals(&self) -> Vec<Approval> {
+        let mut all: Vec<Approval> = self.state.approvals.values().cloned().collect();
+        all.sort_by_key(|a| a.requested_at_ms);
+        all
+    }
+
+    pub fn running(&self) -> Vec<TaskSummary> {
+        self.state.running().into_iter().cloned().collect()
+    }
+
+    /// Slash commands completing `draft`: it starts with `/` and has no
+    /// space yet. At most eight, in the daemon's order.
+    pub fn slash_matches(&self, draft: &str) -> Vec<SlashCommand> {
+        let Some(typed) = draft.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if typed.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let typed = typed.to_lowercase();
+        self.commands
+            .iter()
+            .filter(|c| c.name.starts_with(&typed) && c.name != typed)
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    /// Ask for `id`'s history the first time it is shown, when nothing of
+    /// it is held.
+    pub fn load_history(&mut self, id: &str) {
+        let first = self.fetched.insert(id.to_owned());
+        let empty = self
+            .state
+            .sessions
+            .get(id)
+            .is_none_or(|v| v.lines.is_empty());
+        if first && empty {
+            self.send(Command::GetHistory {
+                session_id: id.to_owned(),
+                before: None,
+                limit: 50,
+            });
+        }
+    }
+
+    /// The owner opened `id`: its replies are read.
+    pub fn seen(&mut self, id: &str) {
+        self.unread.remove(id);
+    }
+
+    // ----- Sending --------------------------------------------------------
+
+    /// Send `text` (with the draft's ready files) to `session`, or start a
+    /// conversation in `project`. A leading `/` runs a slash command in an
+    /// existing session. `Ok(true)` when it went (the draft is spent),
+    /// `Ok(false)` when there was nothing to send, and `Err` with what to
+    /// tell the owner when it cannot go yet.
+    pub fn submit(
+        &mut self,
+        session: Option<&str>,
+        text: &str,
+        mid_run: Option<MidRun>,
+        project: Option<String>,
+    ) -> Result<bool, String> {
+        let text = text.trim().to_owned();
+        if self
+            .draft_files
+            .iter()
+            .any(|f| matches!(f.state, DraftFileState::Uploading))
+        {
+            return Err("Wait for the files to finish attaching".into());
+        }
+        let attachments: Vec<AttachmentRef> = self
+            .draft_files
+            .iter()
+            .filter_map(|f| match &f.state {
+                DraftFileState::Ready(attachment) => Some(attachment.clone()),
+                _ => None,
+            })
+            .collect();
+        if text.is_empty() && attachments.is_empty() {
+            return Ok(false);
+        }
+        if !attachments.is_empty() {
+            self.draft_files.clear();
+        }
+        match (
+            session,
+            text.strip_prefix('/').filter(|_| attachments.is_empty()),
+        ) {
+            (Some(session), Some(slash)) => {
+                let (command, args) = slash.split_once(' ').unwrap_or((slash, ""));
+                self.send(Command::RunSlash {
+                    session_id: session.to_owned(),
+                    command: command.to_owned(),
+                    args: args.trim().to_owned(),
+                });
+            }
+            _ => {
+                let id = self.send(Command::SendMessage {
+                    session_id: session.map(str::to_owned),
+                    text,
+                    attachments,
+                    mid_run,
+                    project_id: session.is_none().then_some(project).flatten(),
+                });
+                if session.is_none() {
+                    // The draft is spent once the conversation exists.
+                    self.starting = Some(id);
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Say `text` in `session`, as if typed (a suggested prompt, Retry).
+    pub fn ask(&mut self, session: &str, text: String) {
+        self.send(Command::SendMessage {
+            session_id: Some(session.to_owned()),
+            text,
+            attachments: Vec::new(),
+            mid_run: None,
+            project_id: None,
+        });
+    }
+
+    /// Send the last message of `session` again.
+    pub fn retry(&mut self, session: &str) {
+        if let Some(text) = self.last_user_text(session) {
+            self.ask(session, text);
+        }
+    }
+
+    /// Attach a file to the message being written: it uploads now. `Err`
+    /// with what to tell the owner when it is too large.
+    pub fn attach_file(&mut self, name: String, mime: String, bytes: &[u8]) -> Result<(), String> {
+        use base64::Engine as _;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(format!(
+                "{name} is too large to attach (up to {} MB)",
+                MAX_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        self.next_upload += 1;
+        let number = self.next_upload;
+        self.draft_files.push(DraftFile {
+            number,
+            name: name.clone(),
+            state: DraftFileState::Uploading,
+        });
+        let id = self.send(Command::UploadFile {
+            name,
+            mime: (!mime.is_empty()).then_some(mime),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        self.uploads.insert(id, number);
+        Ok(())
+    }
+
+    pub fn remove_draft_file(&mut self, number: u64) {
+        self.uploads.retain(|_, n| *n != number);
+        self.draft_files.retain(|f| f.number != number);
+    }
+
+    pub fn stop(&mut self, session: &str) {
+        self.stopping.insert(session.to_owned());
+        self.send(Command::StopTurn {
+            session_id: session.to_owned(),
+        });
+    }
+
+    pub fn cancel(&mut self, task: &str) {
+        self.send(Command::CancelTask {
+            task_id: task.to_owned(),
+        });
+    }
+
+    pub fn resolve(&mut self, approval: &str, decision: ApprovalDecision) {
+        self.send(Command::ResolveApproval {
+            approval_id: approval.to_owned(),
+            decision,
+        });
+    }
+}
+
+/// Where a session came from: its `channel` (`telegram:coding_bot`,
+/// `app`), else what its id names.
+pub fn platform_of(channel: &str, id: &str) -> Source {
+    let platform = channel.split(':').next().unwrap_or_default();
+    match platform {
+        "app" => Source::App,
+        "telegram" => Source::Telegram,
+        "slack" => Source::Slack,
+        "discord" => Source::Discord,
+        _ => match platform_name(id) {
+            "App" => Source::App,
+            "Telegram" => Source::Telegram,
+            "Slack" => Source::Slack,
+            "Discord" => Source::Discord,
+            _ => Source::Chat,
+        },
+    }
+}
+
+/// A channel as people name it: "Telegram · coding_bot", "App".
+pub fn channel_name(channel: &str, id: &str) -> String {
+    let platform = match platform_of(channel, id) {
+        Source::App => "App",
+        Source::Telegram => "Telegram",
+        Source::Slack => "Slack",
+        Source::Discord => "Discord",
+        _ => platform_name(id),
+    };
+    match channel.split_once(':') {
+        Some((_, bot)) if !bot.is_empty() => format!("{platform} · {bot}"),
+        _ => platform.to_owned(),
+    }
+}
+
+/// The platform a session id names (`aidaemon:slack:…`, `app:…`).
+pub fn platform_name(id: &str) -> &'static str {
+    let lower = id.to_ascii_lowercase();
+    let has = |word: &str| {
+        lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == word)
+    };
+    if lower.starts_with("app:") {
+        "App"
+    } else if has("slack") {
+        "Slack"
+    } else if has("discord") {
+        "Discord"
+    } else if has("telegram") || lower.contains("_bot:") {
+        "Telegram"
+    } else {
+        "Chat"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(json: &str) -> Update {
+        Update::Frame(serde_json::from_str::<ServerFrame>(json).expect("a frame"))
+    }
+
+    fn cx(selected: Option<&str>) -> Context {
+        Context {
+            now_ms: 1_000,
+            selected: selected.map(str::to_owned),
+            ..Context::default()
+        }
+    }
+
+    #[test]
+    fn connecting_asks_for_the_lists_and_reads_answer_by_request_id() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        let sent: Vec<String> = client
+            .take_outgoing()
+            .into_iter()
+            .map(|(_, c)| {
+                serde_json::to_value(c).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "list_sessions",
+                "list_commands",
+                "list_projects",
+                "get_system"
+            ]
+        );
+        client.refresh_memories();
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        assert_eq!(client.memories, Read::Loading);
+        // Someone else's answer is not this read's.
+        client.update(
+            frame(
+                r#"{"type":"ack","request_id":"other","result":{"type":"memories","memories":[]}}"#,
+            ),
+            &cx(None),
+        );
+        assert_eq!(client.memories, Read::Loading);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"memories","memories":[]}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(client.memories, Read::Ready(Vec::new()));
+    }
+
+    #[test]
+    fn a_reply_elsewhere_is_unread_and_a_first_file_write_shows_the_changes() {
+        let mut client = Client::new();
+        let here = cx(Some("app:a"));
+        client.update(
+            frame(r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:b","event":{"type":"assistant_message","session_id":"app:b","text":"hi"}}"#),
+            &here,
+        );
+        assert!(client.unread.contains("app:b"));
+        client.update(
+            frame(r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:a","event":{"type":"turn_started","turn_id":"t1","session_id":"app:a","origin":"app"}}"#),
+            &here,
+        );
+        let effects = client.update(
+            frame(r#"{"type":"event","at_ms":3,"session_id":"app:a","event":{"type":"turn_status","turn_id":"t1","status":{"kind":"tool_completed","name":"write_file","summary":"a.rs"}}}"#),
+            &here,
+        );
+        assert_eq!(
+            effects,
+            [
+                Effect::NowCoding("app:a".into()),
+                Effect::OpenChanges("app:a".into())
+            ]
+        );
+        assert!(client.is_coding("app:a"));
+        assert_eq!(client.changes, Read::Loading);
+        let log = client.latest_turn("app:a").unwrap();
+        assert_eq!(log.items.len(), 1);
+        assert_eq!(log.items[0].kind, ActivityKind::ToolDone);
+    }
+
+    #[test]
+    fn places_name_the_platform_and_bot() {
+        assert_eq!(
+            channel_name("telegram:coding_bot", ""),
+            "Telegram · coding_bot"
+        );
+        assert_eq!(channel_name("", "app:x"), "App");
+        assert_eq!(platform_of("", "aidaemon:slack:T1"), Source::Slack);
+        assert_eq!(platform_name("synthetic_bot:7"), "Telegram");
+    }
+
+    #[test]
+    fn a_new_conversation_is_started_once_its_message_is_accepted() {
+        let mut client = Client::new();
+        assert_eq!(client.submit(None, "hello", None, None), Ok(false));
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:new"}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(effects, [Effect::Started("app:new".into())]);
+        assert_eq!(client.submit(None, "  ", None, None), Ok(false));
+    }
+}
