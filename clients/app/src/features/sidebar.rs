@@ -577,8 +577,8 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
     )
 }
 
-/// System, Memory and Settings: rows on a desktop; on a phone one row of
-/// three, so the conversations keep the screen.
+/// Automations, System, Memory and Settings: rows on a desktop; on a phone
+/// one row of four, so the conversations keep the screen.
 fn pages(store: Store) -> View {
     if ui::touch() {
         let tab = |glyph: Glyph,
@@ -607,6 +607,13 @@ fn pages(store: Store) -> View {
             .border_t_1()
             .border_color(colors::LINE)
             .child(tab(
+                Glyph::Clock,
+                "Automations",
+                "Automations: what runs on its own",
+                Page::Automations,
+                Store::open_automations,
+            ))
+            .child(tab(
                 Glyph::System,
                 "System",
                 "System: how the daemon is doing",
@@ -629,6 +636,17 @@ fn pages(store: Store) -> View {
             ));
     }
     view()
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::Automations,
+                    move || store.open_automations(),
+                )
+                .accessibility_label("Automations: what runs on its own")
+                .child(icon(Glyph::Clock).text_color(colors::MUTED))
+                .child(text("Automations").flex_1().text_size(px(ui::fit::body()))),
+            ),
+        )
         .child(
             view().px_2().pb_1().child(
                 row(

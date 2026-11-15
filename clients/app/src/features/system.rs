@@ -1,7 +1,7 @@
 //! The System page: how the daemon itself is doing. Version and models,
 //! what needs a look (failing jobs and checks, overloaded queues), token
-//! use, model call timings, scheduled goals, background jobs and health
-//! checks; and the chat bots, each with the project its direct messages
+//! use, model call timings, background jobs and health checks (what runs
+//! on the owner's behalf is the Automations page); and the chat bots, each with the project its direct messages
 //! go to. Read on open, every 30 seconds while open, and on Refresh.
 
 use aidaemon_client_protocol::{CheckStatus, GoalRunInfo, SystemStatus};
@@ -91,7 +91,6 @@ fn body(store: Store, read: SystemRead) -> View {
             .child(bots(store))
             .child(runs(store, &status))
             .child(usage(&status))
-            .child(schedules(&status))
             .child(jobs(&status))
             .child(checks(&status)),
     }
@@ -485,41 +484,6 @@ fn runs(store: Store, s: &SystemStatus) -> View {
         c = c.child(entry);
     }
     section("While you were away").child(c)
-}
-
-fn schedules(s: &SystemStatus) -> View {
-    if s.schedules.is_empty() {
-        return view();
-    }
-    let now = now_ms();
-    let mut c = card();
-    for sched in &s.schedules {
-        let when = match (sched.paused, sched.next_run_ms) {
-            (true, _) => "Paused".to_owned(),
-            (false, Some(next)) if next > now => {
-                format!("Next {} {}", time::day_label(next, now), time::clock(next))
-            }
-            (false, Some(_)) => "Due now".to_owned(),
-            (false, None) => "Not scheduled".to_owned(),
-        };
-        c = c.child(
-            view()
-                .gap(px(2.0))
-                .px_2()
-                .py_1()
-                .child(
-                    text(sched.description.clone())
-                        .number_of_lines(2)
-                        .text_size(px(ui::fit::body())),
-                )
-                .child(
-                    text(format!("{} · {when}", sched.schedule))
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT),
-                ),
-        );
-    }
-    section("Scheduled goals").child(c)
 }
 
 fn jobs(s: &SystemStatus) -> View {

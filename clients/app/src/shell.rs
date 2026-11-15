@@ -195,6 +195,11 @@ fn page(store: Store, in_setup: Memo<bool>) -> impl IntoElement {
                     crate::features::settings::page(store).key("settings")
                 }));
             }
+            if store.page() == crate::store::Page::Automations {
+                return Some(untracked(|| {
+                    crate::features::automations::page(store).key("automations")
+                }));
+            }
             if store.page() == crate::store::Page::System {
                 return Some(untracked(|| {
                     crate::features::system::page(store).key("system")
@@ -275,6 +280,13 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         CommandItem::new("system", "System: how the daemon is doing")
             .group("View")
             .shortcut("mod+,"),
+    );
+    items.push(
+        CommandItem::new(
+            "automations",
+            "Automations: what runs on its own (pause, resume, run now)",
+        )
+        .group("View"),
     );
     items.push(CommandItem::new("new-project", "New project").group("Projects"));
     if let Some(project) = store.current_project().and_then(|id| store.project(&id)) {
@@ -375,6 +387,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 }
                                 "system" => store.open_system(),
                                 "memory" => store.open_memory(),
+                                "automations" => store.open_automations(),
                                 "settings" => store.open_settings(),
                                 "activity" => store.cycle_activity_mode(),
                                 "copy-reply" => copy_reply(store),

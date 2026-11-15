@@ -371,3 +371,33 @@ fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
     assert!((w / h - 2.0).abs() < 0.01, "{w} x {h}");
     Ok(())
 }
+
+#[test]
+fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([Update::Connected]);
+    app.press("Automations: what runs on its own")?;
+    app.wait_for("Reading your automations…")?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday at 9:00 AM ET","status":"active"},{"id":"mandate-1","kind":"watching","name":"Status watch","what":"Watch the synthetic status page","how_often":"Every hour","status":"paused"}]}}"#,
+    )]);
+    app.wait_for("Inbox digest")?;
+    app.wait_for("Scheduled · Every weekday at 9:00 AM ET")?;
+    // A paused one resumes; only scheduled work runs now.
+    app.wait_for("Paused")?;
+    app.wait_for("Resume")?;
+    app.wait_for("Run now")?;
+    // Cancelling asks first.
+    app.press("Cancel >> nth=0")?;
+    app.wait_for("Cancel it for good?")?;
+    app.press("Keep it")?;
+    app.wait_for_gone("Cancel it for good?", std::time::Duration::from_secs(5))?;
+    // A change's answer brings the list back, and says what happened.
+    feed([frame(
+        r#"{"type":"ack","request_id":"r10","result":{"type":"automations","automations":[],"note":"Cancelled \"Inbox digest\" (scheduled). It won't run again.","changed":true}}"#,
+    )]);
+    app.wait_for("Nothing runs on its own yet")?;
+    Ok(())
+}

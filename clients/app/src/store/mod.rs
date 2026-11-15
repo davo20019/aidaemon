@@ -74,6 +74,18 @@ pub enum Page {
     Memory,
     /// The daemon's settings.
     Settings,
+    /// What runs on its own: scheduled work, watching, health checks.
+    Automations,
+}
+
+/// The Automations page's list, as last read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AutomationsRead {
+    #[default]
+    NotYet,
+    Loading,
+    Ready(Vec<aidaemon_client_protocol::AutomationSummary>),
+    Failed(String),
 }
 
 /// How much of each turn's tool use the transcript shows.
@@ -358,6 +370,11 @@ pub struct Store {
     coded: Signal<BTreeSet<String>>,
     /// The sidebar's source filter.
     source: Signal<Source>,
+    /// The Automations page: the list, the request in flight, and the
+    /// automation a change is pending for.
+    automations: Signal<AutomationsRead>,
+    automations_request: Stored<Option<String>>,
+    automation_busy: Signal<Option<String>>,
     /// Advanced when the keyboard should go back to the composer (a
     /// conversation picked, a pane closed).
     composer_focus: Signal<u64>,
@@ -446,6 +463,9 @@ impl Store {
             coded: signal(BTreeSet::new()),
             source: signal(Source::All),
             composer_focus: signal(0),
+            automations: signal(AutomationsRead::NotYet),
+            automations_request: stored(None),
+            automation_busy: signal(None),
             posting: signal(BTreeSet::new()),
             settings: signal(SettingsRead::NotYet),
             settings_request: stored(None),
@@ -854,6 +874,40 @@ impl Store {
                 self.system.set(SystemRead::Failed(error.message.clone()));
                 return;
             }
+            // Only this client's own list or change is answered with it.
+            ServerFrame::Ack {
+                result:
+                    CommandResult::Automations {
+                        automations, note, ..
+                    },
+                ..
+            } => {
+                self.automations_request.replace(None);
+                self.automation_busy.set(None);
+                self.automations
+                    .set(AutomationsRead::Ready(automations.clone()));
+                if let Some(note) = note {
+                    self.say(note.clone());
+                }
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .automations_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.automations_request.replace(None);
+                if self.automation_busy.get_untracked().is_some() {
+                    self.automation_busy.set(None);
+                    self.say(error.message.clone());
+                } else {
+                    self.automations
+                        .set(AutomationsRead::Failed(error.message.clone()));
+                }
+                return;
+            }
             ServerFrame::Ack {
                 result: CommandResult::Commands { commands },
                 ..
@@ -1144,6 +1198,50 @@ impl Store {
         self.close_panes();
         self.page.set(Page::System);
         self.refresh_system();
+    }
+
+    // ----- The Automations page -------------------------------------------
+
+    pub fn open_automations(&self) {
+        crate::ui::motion::next_layout();
+        self.close_panes();
+        self.page.set(Page::Automations);
+        self.refresh_automations();
+    }
+
+    /// Read the automations again (on open, Refresh, and the page's timer).
+    pub fn refresh_automations(&self) {
+        if self.automations_request.with(|r| r.is_some()) {
+            return;
+        }
+        if !matches!(self.automations.get_untracked(), AutomationsRead::Ready(_)) {
+            self.automations.set(AutomationsRead::Loading);
+        }
+        let id = self.send(Command::ListAutomations);
+        self.automations_request.replace(Some(id));
+    }
+
+    pub fn automations(&self) -> AutomationsRead {
+        self.automations.get()
+    }
+
+    /// The automation a change was sent for and not answered yet.
+    pub fn automation_busy(&self) -> Option<String> {
+        self.automation_busy.get()
+    }
+
+    /// Pause, resume, cancel or run one automation now; the answer brings
+    /// the list as it is after, and a note of what happened.
+    pub fn change_automation(&self, id: &str, change: aidaemon_client_protocol::AutomationChange) {
+        if self.automations_request.with(|r| r.is_some()) {
+            return;
+        }
+        self.automation_busy.set(Some(id.to_owned()));
+        let request = self.send(Command::ChangeAutomation {
+            automation_id: id.to_owned(),
+            change,
+        });
+        self.automations_request.replace(Some(request));
     }
 
     /// Read the daemon's status again (the page's Refresh, and its timer).

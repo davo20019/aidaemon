@@ -282,6 +282,8 @@ pub enum Glyph {
     Attach,
     /// A file (not a picture).
     File,
+    /// Automations: what runs on its own.
+    Clock,
 }
 
 impl Glyph {
@@ -313,6 +315,7 @@ impl Glyph {
             Self::Memory => "◎",
             Self::Attach => "⊕",
             Self::File => "▭",
+            Self::Clock => "◷",
         }
     }
 }
@@ -328,6 +331,7 @@ impl Glyph {
                 r#"<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>"#
             }
             Self::Close => r#"<path d="M18 6 6 18M6 6l12 12"/>"#,
+            Self::Clock => r#"<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>"#,
             Self::Search => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
             Self::Chat => {
                 r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>"#
