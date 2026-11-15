@@ -86,7 +86,7 @@ default = "claude-sonnet-4-20250514"
             panic!("a failover removal must ask");
         };
         assert!(
-            request.summary.starts_with("Remove failover provider [0]"),
+            request.summary.starts_with("Remove failover 1: "),
             "{}",
             request.summary
         );

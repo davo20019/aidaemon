@@ -221,6 +221,31 @@ impl ConfigManagerTool {
         )
     }
 
+    /// The owner's card for removing failover `index`: its place counted
+    /// from 1, its kind and model, as Settings shows them.
+    fn remove_failover_card(entries: &[toml::Value], index: usize) -> String {
+        let table = entries[index].as_table();
+        let field = |key: &str| {
+            table
+                .and_then(|t| t.get(key))
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let model = table
+            .and_then(|t| t.get("models"))
+            .and_then(toml::Value::as_table)
+            .and_then(|m| m.get("default").or_else(|| m.get("primary")))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        let mut card = format!("Remove failover {}: {}", index + 1, field("kind"));
+        if !model.is_empty() {
+            card.push_str(&format!(" ({model})"));
+        }
+        card.push_str(". It is no longer tried when the providers before it fail.");
+        card
+    }
+
     /// The summary of failover entry `index` of `entries`.
     fn failover_entry_summary(entries: &[toml::Value], index: usize) -> String {
         entries[index]
@@ -304,32 +329,7 @@ impl ConfigManagerTool {
                 if index >= entries.len() {
                     return Ok(None);
                 }
-                Ok(Some(format!(
-                    "Remove failover provider {}",
-                    Self::failover_entry_summary(entries, index)
-                )))
-            }
-            "move_failover_provider" => {
-                let (Some(index), Some(to)) = (args.failover_index, args.failover_to_index) else {
-                    return Ok(None);
-                };
-                let content = self.config.read().await?;
-                let doc: toml::Table = content.parse()?;
-                let provider_table = doc
-                    .get("provider")
-                    .and_then(toml::Value::as_table)
-                    .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
-                let Some(entries) = Self::get_failover_array(provider_table)? else {
-                    return Ok(None);
-                };
-                if index >= entries.len() || to >= entries.len() || index == to {
-                    return Ok(None);
-                }
-                Ok(Some(format!(
-                    "Move failover provider {} to position #{}",
-                    Self::failover_entry_summary(entries, index),
-                    to
-                )))
+                Ok(Some(Self::remove_failover_card(entries, index)))
             }
             _ => Ok(None),
         }
@@ -1340,7 +1340,8 @@ impl ConfigManagerTool {
         if index == to {
             return Ok(format!("Failover provider #{index} is already there."));
         }
-        Self::require_kernel_approval(args)?;
+        // No approval: the order only chooses among providers the owner
+        // already connected, and each keeps its own key.
 
         let mut order: Vec<usize> = (0..existing_tables.len()).filter(|&i| i != index).collect();
         order.insert(to, index);
@@ -2792,6 +2793,28 @@ default = "synthetic-c"
             ])
         );
         assert!(store.get("provider_fallback_moving_0_api_key").is_err());
+    }
+
+    #[tokio::test]
+    async fn moving_a_failover_asks_no_approval() {
+        let (_dir, path) = write_temp_config(THREE_KEYCHAIN_FAILOVERS);
+        let (tool, store) = tool_with_secrets(path.clone(), &THREE_KEYS);
+        let call = json!({
+            "action": "move_failover_provider",
+            "failover_index": 1,
+            "failover_to_index": 0,
+        });
+        assert!(matches!(
+            tool.owner_approval(&call).await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+        let mut args = test_args();
+        args.action = "move_failover_provider".to_string();
+        args.failover_index = Some(1);
+        args.failover_to_index = Some(0);
+        args.kernel_approved = false;
+        tool.move_failover_provider(&args).await.unwrap();
+        assert_eq!(failover_keys(&path, &store)[0].0, "synthetic-b");
     }
 
     #[tokio::test]
