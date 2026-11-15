@@ -1455,7 +1455,7 @@ fn self_healable_denied_reads(output: &str, home: &str, already_granted: &[Strin
 fn extract_absolute_paths(line: &str) -> Vec<String> {
     const BOUNDARY: [char; 6] = [' ', '\'', '"', ')', '(', '\t'];
     line.split(BOUNDARY)
-        .filter(|token| token.starts_with('/'))
+        .filter(|token| aidaemon_tools::BackendPath::is_absolute(token))
         .map(|token| token.trim_end_matches(['.', ',', ':', ';']).to_string())
         .filter(|token| token.len() > 1)
         .collect()
@@ -2395,7 +2395,7 @@ async fn add_python_runtime_support(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|path| path.starts_with('/'))
+        .filter(|path| aidaemon_tools::BackendPath::is_absolute(path))
     {
         let path = aidaemon_tools::BackendPath::new(path.to_string());
         if backend.metadata(&path).await.is_ok() {
@@ -2406,7 +2406,7 @@ async fn add_python_runtime_support(
     for prefix in ["base_prefix", "prefix"]
         .into_iter()
         .filter_map(|key| profile.get(key).and_then(Value::as_str))
-        .filter(|path| path.starts_with('/'))
+        .filter(|path| aidaemon_tools::BackendPath::is_absolute(path))
     {
         let prefix = aidaemon_tools::BackendPath::new(prefix.to_string());
         for dependency in [prefix.join("lib"), prefix.join("pyvenv.cfg")] {
@@ -2439,7 +2439,7 @@ async fn add_macos_developer_runtime_support(
 ) {
     let mut sdk_root = std::env::var("SDKROOT")
         .ok()
-        .filter(|path| path.starts_with('/'));
+        .filter(|path| aidaemon_tools::BackendPath::is_absolute(path));
     if sdk_root.is_none() {
         let xcrun = aidaemon_tools::BackendPath::new("/usr/bin/xcrun");
         if backend.metadata(&xcrun).await.is_ok()
@@ -2462,7 +2462,7 @@ async fn add_macos_developer_runtime_support(
                 .stdout_lossy()
                 .lines()
                 .map(str::trim)
-                .find(|path| path.starts_with('/'))
+                .find(|path| aidaemon_tools::BackendPath::is_absolute(path))
                 .map(str::to_string);
         }
     }
@@ -2622,7 +2622,7 @@ async fn native_sandbox_runtime_support(
                     .stdout_lossy()
                     .lines()
                     .map(str::trim)
-                    .find(|line| line.starts_with('/'))
+                    .find(|line| aidaemon_tools::BackendPath::is_absolute(line))
             {
                 let actual = aidaemon_tools::BackendPath::new(actual.to_string());
                 if let Some(bin_dir) = actual.parent() {
@@ -3236,7 +3236,10 @@ async fn resolve_access_path(
 ) -> anyhow::Result<aidaemon_tools::BackendPath> {
     let path = path.trim();
     anyhow::ensure!(!path.is_empty(), "execution access path cannot be empty");
-    let prepared = if path.starts_with('/') || path == "~" || path.starts_with("~/") {
+    let prepared = if aidaemon_tools::BackendPath::is_absolute(path)
+        || path == "~"
+        || path.starts_with("~/")
+    {
         path.to_string()
     } else if let Some(cwd) = cwd {
         cwd.join(path).to_string()
@@ -7596,9 +7599,11 @@ fn deletion_observation_candidates(
         if trimmed.is_empty() || trimmed.contains(['*', '?', '[']) {
             return;
         }
-        let absolute = if trimmed.starts_with('/') {
+        let absolute = if aidaemon_tools::BackendPath::is_absolute(trimmed) {
             trimmed.to_string()
-        } else if let Some(cwd) = working_dir.filter(|cwd| cwd.starts_with('/')) {
+        } else if let Some(cwd) =
+            working_dir.filter(|cwd| aidaemon_tools::BackendPath::is_absolute(cwd))
+        {
             format!("{}/{}", cwd.trim_end_matches('/'), trimmed)
         } else {
             return;
@@ -7850,11 +7855,14 @@ fn terminal_command_operands(arguments: &str) -> Vec<String> {
         .working_dir
         .as_deref()
         .map(str::trim)
-        .filter(|dir| dir.starts_with('/'));
+        .filter(|dir| aidaemon_tools::BackendPath::is_absolute(dir));
     aidaemon_tools::command_effects::literal_path_operands(text)
         .into_iter()
         .map(|operand| {
-            if operand.starts_with('/') || operand == "~" || operand.starts_with("~/") {
+            if aidaemon_tools::BackendPath::is_absolute(&operand)
+                || operand == "~"
+                || operand.starts_with("~/")
+            {
                 operand
             } else if let Some(cwd) = cwd {
                 aidaemon_tools::BackendPath::new(cwd)
@@ -7879,7 +7887,11 @@ fn terminal_access_manifest(arguments: &str) -> crate::tools::traits::ToolCallAc
     let resolve = |path: &str| {
         execution_cwd
             .as_deref()
-            .filter(|_| !path.starts_with('/') && path != "~" && !path.starts_with("~/"))
+            .filter(|_| {
+                !aidaemon_tools::BackendPath::is_absolute(path)
+                    && path != "~"
+                    && !path.starts_with("~/")
+            })
             .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
             .unwrap_or_else(|| path.to_string())
     };
@@ -8062,7 +8074,7 @@ fn terminal_call_effects_on(arguments: &str, local: bool) -> aidaemon_core::Call
                 .working_dir
                 .as_deref()
                 .map(str::trim)
-                .filter(|dir| dir.starts_with('/'));
+                .filter(|dir| aidaemon_tools::BackendPath::is_absolute(dir));
             // Never complete (see `shell_call_effects`): the keys are best
             // effort and bind the owner's declines.
             let mut effects = shell_call_effects(text, cwd);

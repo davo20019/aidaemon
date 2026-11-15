@@ -149,12 +149,14 @@ impl ProjectInstructionTracker {
             return Ok(None);
         }
 
-        let unresolved =
-            if raw_target.starts_with('/') || raw_target == "~" || raw_target.starts_with("~/") {
-                raw_target.to_string()
-            } else {
-                self.base_directory.join(raw_target).to_string()
-            };
+        let unresolved = if aidaemon_tools::BackendPath::is_absolute(raw_target)
+            || raw_target == "~"
+            || raw_target.starts_with("~/")
+        {
+            raw_target.to_string()
+        } else {
+            self.base_directory.join(raw_target).to_string()
+        };
         let resolved = backend.resolve_path(&unresolved).await?;
         let leaf = nearest_existing_directory_from_path(backend, resolved).await?;
 
@@ -174,7 +176,7 @@ fn path_is_within(root: &BackendPath, candidate: &BackendPath) -> bool {
     let root = root.as_str().trim_end_matches('/');
     let candidate = candidate.as_str().trim_end_matches('/');
     if root.is_empty() {
-        return candidate.starts_with('/');
+        return aidaemon_tools::BackendPath::is_absolute(candidate);
     }
     candidate == root
         || candidate

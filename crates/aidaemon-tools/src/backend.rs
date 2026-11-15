@@ -44,7 +44,21 @@ impl BackendPath {
     /// `~/…` (the backend's home). Anything else, `~user` included, is
     /// relative to a working directory, as [`normalize_lexically`] reads it.
     pub fn is_anchored(path: &str) -> bool {
-        path == "~" || path.starts_with("~/") || Path::new(path).is_absolute()
+        path == "~" || path.starts_with("~/") || Self::is_absolute(path)
+    }
+
+    /// Whether `path` is absolute as written, whatever the daemon's own
+    /// platform: `/…` (a POSIX backend's paths, and a rooted path on
+    /// Windows), a drive path (`C:\…`, `C:/…`) or a UNC path (`\\server\…`).
+    pub fn is_absolute(path: impl AsRef<str>) -> bool {
+        let path = path.as_ref();
+        let bytes = path.as_bytes();
+        path.starts_with('/')
+            || path.starts_with("\\\\")
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/'))
     }
 
     pub fn as_str(&self) -> &str {

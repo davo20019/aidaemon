@@ -144,7 +144,9 @@ pub(super) fn user_text_references_file(text: &str) -> bool {
         let token = raw_token
             .trim_matches(|c: char| c.is_ascii_punctuation() && c != '.' && c != '/' && c != '~')
             .to_ascii_lowercase();
-        if token.starts_with("~/") || (token.starts_with('/') && token.len() > 1) {
+        if token.starts_with("~/")
+            || (aidaemon_tools::BackendPath::is_absolute(&token) && token.len() > 1)
+        {
             return true;
         }
         if FILE_EXTENSIONS

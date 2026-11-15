@@ -400,7 +400,7 @@ pub fn extract_directory_paths(text: &str) -> Vec<String> {
         let clean = word.trim_end_matches(|c: char| {
             c == '.' || c == ',' || c == ':' || c == ';' || c == ')' || c == '\''
         });
-        if clean.starts_with('/')
+        if aidaemon_tools::BackendPath::is_absolute(clean)
             && clean.len() > 2
             && !clean.starts_with("//")
             // Must have at least 2 path components

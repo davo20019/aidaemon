@@ -630,7 +630,7 @@ impl PlanStore {
                     semantics
                         .target_hints
                         .iter()
-                        .any(|actual| actual.value == *expected)
+                        .any(|actual| same_target(&actual.value, expected))
                 });
 
             if effects_match && observation_matches && targets_match {
@@ -982,6 +982,19 @@ fn steps_from_json(json: &str) -> anyhow::Result<Vec<crate::plans::PlanStep>> {
     raw.into_iter()
         .map(|step| serde_json::from_value(step).map_err(anyhow::Error::from))
         .collect()
+}
+
+/// Whether a receipt's target is the step's expected one: the same text, or
+/// the same existing file however each was written (a Windows short name
+/// such as `RUNNER~1` against its long form, a link against its target).
+fn same_target(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match (dunce::canonicalize(actual), dunce::canonicalize(expected)) {
+        (Ok(actual), Ok(expected)) => actual == expected,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

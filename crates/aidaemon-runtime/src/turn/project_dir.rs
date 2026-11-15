@@ -54,7 +54,7 @@ pub fn extract_project_dir_hint_with_aliases(
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && (bytes[2] == b'\\' || bytes[2] == b'/');
-        let looks_path = token.starts_with('/')
+        let looks_path = aidaemon_tools::BackendPath::is_absolute(token)
             || token.starts_with("~/")
             || token.starts_with("./")
             || token.starts_with("../")

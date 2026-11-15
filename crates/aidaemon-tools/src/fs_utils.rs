@@ -51,7 +51,7 @@ pub fn resolve_project_dir(backend: &dyn ExecutionBackend, path: &str) -> anyhow
     // Only attempt fallback for simple names (not absolute, no path separators in
     // the original input). This prevents ~/projects/../../../etc/passwd tricks.
     let trimmed = path.trim();
-    if trimmed.starts_with('/')
+    if crate::BackendPath::is_absolute(trimmed)
         || trimmed.starts_with('~')
         || trimmed.contains('/')
         || trimmed.contains("..")

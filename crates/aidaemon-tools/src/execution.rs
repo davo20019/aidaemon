@@ -433,7 +433,7 @@ impl RemoteBackendCore {
             self.home.as_str().to_string()
         } else if let Some(rest) = path.strip_prefix("~/") {
             format!("{}/{}", self.home.as_str().trim_end_matches('/'), rest)
-        } else if path.starts_with('/') {
+        } else if crate::BackendPath::is_absolute(path) {
             path.to_string()
         } else {
             format!(

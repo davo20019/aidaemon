@@ -46,7 +46,7 @@ pub async fn attribute_declared_deliverables_backend(
 
     for raw in declared_write_paths {
         let raw = raw.trim();
-        if !raw.starts_with('/') {
+        if !crate::BackendPath::is_absolute(raw) {
             continue;
         }
         let candidate = PathBuf::from(raw);

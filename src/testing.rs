@@ -747,6 +747,16 @@ pub fn abs_path(unix: &str) -> String {
     }
 }
 
+/// A shell line that waits `seconds` and then prints `word`, in this
+/// platform's shell (`sh` here, Windows PowerShell there, which has no `&&`).
+pub fn sleep_then_echo(seconds: &str, word: &str) -> String {
+    if cfg!(windows) {
+        format!("Start-Sleep -Seconds {seconds}; Write-Output {word}")
+    } else {
+        format!("sleep {seconds} && echo {word}")
+    }
+}
+
 /// The attachment inbox of the agent [`setup_test_agent`] builds.
 #[cfg(not(windows))]
 pub const TEST_INBOX_DIR: &str = "/tmp/aidaemon-test-attachments";

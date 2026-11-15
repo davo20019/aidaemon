@@ -51,6 +51,7 @@ pub fn local_execution_search_path(home: &BackendPath) -> String {
     ] {
         push(home.join(relative).to_string());
     }
+    #[cfg(unix)]
     for directory in [
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",
@@ -122,23 +123,52 @@ pub const LOCAL_ENV_ALLOWLIST: &[&str] = &[
     "HOMEBREW_CELLAR",
     "HOMEBREW_REPOSITORY",
     "__CF_USER_TEXT_ENCODING",
+    // Windows: what PowerShell and Windows programs need to start and find
+    // things (names there match whatever their case).
     "SYSTEMROOT",
-    "SystemRoot",
+    "SYSTEMDRIVE",
     "COMSPEC",
     "PATHEXT",
     "WINDIR",
     "USERPROFILE",
+    "USERNAME",
+    "USERDOMAIN",
+    "HOMEDRIVE",
+    "HOMEPATH",
     "APPDATA",
     "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "PSMODULEPATH",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
     // Paths to the daemon's own config, env file and working directory
     // (never their contents), for an `aidaemon` command run from a shell.
     "AIDAEMON_RUNTIME_*",
 ];
 
 fn env_name_allowed(allowlist: &[String], name: &str) -> bool {
+    // Windows variable names have no case: `windir` is `WINDIR`.
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
     allowlist.iter().any(|entry| match entry.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => entry == name,
+        Some(prefix) => name
+            .get(..prefix.len())
+            .is_some_and(|start| same(start, prefix)),
+        None => same(entry, name),
     })
 }
 

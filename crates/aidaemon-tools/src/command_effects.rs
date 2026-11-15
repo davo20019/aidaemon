@@ -622,7 +622,11 @@ fn delete_targets(command: &str) -> Option<Vec<String>> {
         if named.is_empty() || named.iter().any(|target| unreadable(target)) {
             return None;
         }
-        if changes_directory && named.iter().any(|target| !target.starts_with('/')) {
+        if changes_directory
+            && named
+                .iter()
+                .any(|target| !crate::BackendPath::is_absolute(target))
+        {
             return None;
         }
         for target in named {
@@ -726,7 +730,8 @@ pub fn literal_path_operands(command: &str) -> Vec<String> {
     });
     let mut operands: Vec<String> = Vec::new();
     let mut add = |operand: &str| {
-        let anchored = operand.starts_with('/') || operand == "~" || operand.starts_with("~/");
+        let anchored =
+            crate::BackendPath::is_absolute(operand) || operand == "~" || operand.starts_with("~/");
         if literal(operand)
             && (anchored || !moves)
             && !operands.iter().any(|known| known == operand)
@@ -2284,10 +2289,12 @@ fn structural_absolute_path(raw: &str, cwd: Option<&str>) -> Option<String> {
     } else {
         raw.to_string()
     };
-    if expanded.starts_with('/') {
+    if crate::BackendPath::is_absolute(&expanded) {
         return Some(expanded);
     }
-    let cwd = cwd.map(str::trim).filter(|cwd| cwd.starts_with('/'))?;
+    let cwd = cwd
+        .map(str::trim)
+        .filter(|cwd| crate::BackendPath::is_absolute(cwd))?;
     Some(format!("{}/{expanded}", cwd.trim_end_matches('/')))
 }
 
@@ -2638,7 +2645,7 @@ fn analyze_shell(command: &str, cwd: Option<&str>) -> ShellAnalysis {
     }
     let mut here: Option<String> = cwd
         .map(str::trim)
-        .filter(|dir| dir.starts_with('/'))
+        .filter(|dir| crate::BackendPath::is_absolute(dir))
         .map(str::to_string);
     // Only text the shell executes yields keys: heredoc bodies, comments
     // and the inside of multi-line quoted strings are dropped first.

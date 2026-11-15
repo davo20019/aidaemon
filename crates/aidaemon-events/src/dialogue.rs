@@ -85,7 +85,8 @@ impl RequestVerificationTarget {
     pub fn from_legacy_exact(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
         let trimmed = value.trim();
-        let kind = if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+        let kind = if aidaemon_tools::BackendPath::is_absolute(trimmed) || trimmed.starts_with("~/")
+        {
             RequestVerificationTargetKind::Path
         } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             RequestVerificationTargetKind::Url

@@ -974,7 +974,7 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
     let step = |seconds: &str| {
         MockProvider::tool_call_response(
             "terminal",
-            &serde_json::json!({"command": format!("sleep {seconds} && echo synthetic-step")})
+            &serde_json::json!({"command": crate::testing::sleep_then_echo(seconds, "synthetic-step")})
                 .to_string(),
         )
     };
