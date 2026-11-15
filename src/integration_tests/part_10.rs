@@ -266,6 +266,7 @@ async fn test_orchestrator_executes_tool_calls_in_first_iteration() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         // After tool execution: final text response
         MockProvider::text_response("System is running macOS."),

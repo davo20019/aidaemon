@@ -1059,6 +1059,7 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         crate::traits::ProviderResponse {
             content: Some("Should not reach the first run.".to_string()),
@@ -1073,6 +1074,7 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         crate::traits::ProviderResponse {
             content: Some("Second scheduled run completed.".to_string()),
@@ -1087,6 +1089,7 @@ async fn test_scheduled_goal_run_budget_resets_between_runs() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
     ]);
 

@@ -726,6 +726,7 @@ async fn test_plain_text_retry_does_not_trip_execution_budget_before_tool_mode()
             }),
             thinking: None,
             response_note: Some("truncated".to_string()),
+            cut_off: false,
         },
         MockProvider::text_response(
             "Here is a tweet: Building a lot lately. What should I share next?",
@@ -778,6 +779,7 @@ async fn test_execution_budget_starts_after_tool_handoff_response() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response("I checked the system info successfully."),
     ]);
@@ -829,6 +831,7 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         ProviderResponse {
             content: None,
@@ -848,6 +851,7 @@ async fn test_observational_progress_extends_budget_so_productive_runs_complete(
             }),
             thinking: None,
             response_note: Some("oversized_observational_retry".to_string()),
+            cut_off: false,
         },
         MockProvider::text_response(
             "Here is the current system summary: macOS on arm64 with the expected hardware profile.",
@@ -959,6 +963,7 @@ async fn test_inferred_text_only_turn_does_not_override_model_tool_decision() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response(
             "Been heads-down building lately. What should I share a behind-the-scenes update about next?",
@@ -1074,6 +1079,7 @@ async fn test_text_answer_turn_allows_spawn_agent_delegation() {
             usage: None,
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response(
             "The main flaws are weak impact metrics and too many task-oriented bullets.",
@@ -1157,6 +1163,7 @@ async fn test_account_scoped_social_post_request_stays_in_execution_lane() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response("Posted."),
     ]);

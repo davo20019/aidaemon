@@ -62,6 +62,7 @@ async fn test_empty_llm_response_retried_then_fallback() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         ProviderResponse {
             content: Some(String::new()),
@@ -76,6 +77,7 @@ async fn test_empty_llm_response_retried_then_fallback() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
     ]);
     let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")

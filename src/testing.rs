@@ -261,6 +261,7 @@ impl MockProvider {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         }
     }
 
@@ -284,6 +285,7 @@ impl MockProvider {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         }
     }
 
@@ -384,6 +386,7 @@ impl MockProvider {
                 usage: None,
                 thinking: None,
                 response_note: None,
+                cut_off: false,
             });
         }
         // Silently intercept relationship-router and evaluator calls without
@@ -413,6 +416,7 @@ impl MockProvider {
                     usage: None,
                     thinking: None,
                     response_note: None,
+                    cut_off: false,
                 });
             }
         }

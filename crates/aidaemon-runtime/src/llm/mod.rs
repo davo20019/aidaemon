@@ -524,7 +524,7 @@ mod tests {
         );
         assert_eq!(
             target.models_for_failover(false),
-            vec!["claude-opus-5-5", "claude-haiku-5-5"]
+            vec!["claude-fable-5-2", "claude-haiku-5-5"]
         );
         assert_eq!(target.models_for_failover(true)[0], "claude-haiku-5-5");
     }

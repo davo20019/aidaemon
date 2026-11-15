@@ -435,6 +435,7 @@ mod tests {
             usage: None,
             thinking: Some("considered the listing".into()),
             response_note: Some("truncated".into()),
+            cut_off: false,
         });
         assert_eq!(
             response.reasoning.as_deref(),
@@ -473,6 +474,7 @@ mod tests {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         });
         assert_eq!(response.text, "hi");
         // Kept verbatim in the SDK's `_raw` form: the tool reports the bad

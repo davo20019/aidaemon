@@ -705,6 +705,7 @@ mod tests {
                 },
                 reasoning: Some("Thought.".into()),
                 note: Some("truncated".into()),
+                cut_off: false,
             },
             "gpt-6-sol",
         );

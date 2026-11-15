@@ -509,6 +509,7 @@ async fn test_empty_first_pass_response_not_intercepted() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response("Fallback response."),
     ]);
@@ -555,6 +556,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         // Iteration 2: still empty -> fallback.
         ProviderResponse {
@@ -570,6 +572,7 @@ async fn test_empty_execution_response_persists_fallback_message() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
     ]);
 
@@ -624,6 +627,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
                 "finish reason: SAFETY; candidate safety categories: HARM_CATEGORY_HATE_SPEECH"
                     .to_string(),
             ),
+            cut_off: false,
         },
         // Iteration 2: still empty, no note -> fallback surfaces the previous note.
         ProviderResponse {
@@ -639,6 +643,7 @@ async fn test_empty_execution_response_surfaces_provider_note() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
     ]);
 
@@ -691,6 +696,7 @@ async fn test_empty_execution_response_retry_recovers_with_text() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         // Iteration 2: recovery succeeds with text.
         MockProvider::text_response("Recovered response."),
@@ -755,6 +761,7 @@ async fn test_initial_routing_call_drops_hallucinated_tool_calls() {
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         // Iteration 2+: hallucinated tool calls force needs_tools=true, so executor
         // must use tool calls (text-only responses are now blocked).

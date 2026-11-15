@@ -272,6 +272,7 @@ async fn test_advisory_policy_filter_keeps_registered_tool_visible() {
             usage: None,
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response("Used the currently exposed tools instead."),
     ]);

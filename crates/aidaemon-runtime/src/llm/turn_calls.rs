@@ -444,6 +444,14 @@ pub async fn call_llm_with_recovery(
 
     match result {
         Ok(response) => {
+            if telemetry.fell_back {
+                info!(
+                    requested = model,
+                    answered_by = telemetry.final_model.as_str(),
+                    attempts = telemetry.attempts,
+                    "Answered by a fallback model"
+                );
+            }
             if telemetry.fell_back
                 && let Some(quota) = recovery.quota.lock().ok().and_then(|quota| quota.clone())
             {

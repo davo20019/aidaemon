@@ -1281,6 +1281,7 @@ async fn budget_blocked_same_tool_calls_do_not_trigger_false_consecutive_loop_st
             }),
             thinking: None,
             response_note: None,
+            cut_off: false,
         },
         MockProvider::text_response("Summarized project status."),
     ]);

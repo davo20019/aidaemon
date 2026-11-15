@@ -369,7 +369,7 @@ mod tests {
             ..ModelsConfig::default()
         };
         models.apply_defaults(&ProviderKind::Anthropic);
-        assert_eq!(models.smart, "claude-opus-5-5");
+        assert_eq!(models.smart, "claude-fable-5-2");
         assert_eq!(models.fast, "claude-haiku-5-5");
         assert!(!Router::new(models).is_uniform());
 
