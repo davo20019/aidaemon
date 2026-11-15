@@ -2681,6 +2681,20 @@ required_tool_choice_ignored_models = ["gemma-4-26b"]
         );
     }
 
+    #[test]
+    fn tool_result_chars_follow_a_known_window_up_to_the_ceiling() {
+        let config = ContextWindowConfig::default();
+        let cap = config.max_tool_result_chars;
+        let ceiling = cap * aidaemon_runtime::settings::MAX_TOOL_RESULT_SCALE;
+        // Known windows larger than the default raise the cap...
+        for model in ["claude-sonnet-5-5", "gpt-6-sol"] {
+            let chars = config.tool_result_chars_for(model);
+            assert!(chars > cap && chars < ceiling, "{model}: {chars}");
+        }
+        // ...up to the ceiling for a 1M-token window.
+        assert_eq!(config.tool_result_chars_for("gemini-3-pro"), ceiling);
+    }
+
     static ENV_EXPANSION_LOCK: LazyLock<std::sync::Mutex<()>> =
         LazyLock::new(|| std::sync::Mutex::new(()));
     static TERMINAL_WEB_APP_URL_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =

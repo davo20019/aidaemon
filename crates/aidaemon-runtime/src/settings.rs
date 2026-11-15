@@ -182,23 +182,31 @@ impl Default for ContextWindowConfig {
 impl ContextWindowConfig {
     /// Effective tool-result character cap for a specific model.
     ///
-    /// Resolution order: explicit `model_tool_result_chars` entry → cap
-    /// scaled by the model's `model_budgets` ratio against `default_budget`
-    /// (floored so tiny budgets stay usable) → global `max_tool_result_chars`.
+    /// Resolution order: explicit `model_tool_result_chars` entry → the
+    /// global `max_tool_result_chars` scaled by the model's context budget
+    /// ([`Self::context_budget_for`]: configured, known family window or
+    /// learned) against `default_budget`, floored so tiny budgets stay
+    /// usable and capped at [`MAX_TOOL_RESULT_SCALE`] times the global cap
+    /// so one result cannot crowd out the rest of a large window.
     pub fn tool_result_chars_for(&self, model: &str) -> usize {
         const MIN_TOOL_RESULT_CHARS: usize = 1_000;
         if let Some(&chars) = self.model_tool_result_chars.get(model) {
             return chars;
         }
-        if let Some(&budget) = self.model_budgets.get(model)
-            && let Some(scaled) = self
-                .max_tool_result_chars
-                .saturating_mul(budget)
-                .checked_div(self.default_budget)
+        let budget = self.context_budget_for(model);
+        match self
+            .max_tool_result_chars
+            .saturating_mul(budget)
+            .checked_div(self.default_budget)
         {
-            return scaled.max(MIN_TOOL_RESULT_CHARS);
+            Some(scaled) => scaled.clamp(
+                MIN_TOOL_RESULT_CHARS.min(self.max_tool_result_chars),
+                self.max_tool_result_chars
+                    .saturating_mul(MAX_TOOL_RESULT_SCALE)
+                    .max(MIN_TOOL_RESULT_CHARS),
+            ),
+            None => self.max_tool_result_chars,
         }
-        self.max_tool_result_chars
     }
 
     /// The model's total context budget: an explicit `model_budgets` entry,
@@ -253,6 +261,13 @@ impl ContextWindowConfig {
 /// estimate, and reasoning output shares the window on some APIs. GPT models
 /// use the window the ChatGPT/Codex backend serves (272k), not the larger
 /// public API one.
+/// How many times the global tool-result cap a large-window model may get.
+pub const MAX_TOOL_RESULT_SCALE: usize = 4;
+
+/// Context windows by model-name prefix; the first match wins, so specific
+/// prefixes come before their family's. Claude stays at 200K although the
+/// current models take 1M: the window also sets when history is summarized,
+/// and a 1M history would multiply every call's cost on an API key.
 const KNOWN_CONTEXT_WINDOWS: &[(&str, usize)] = &[
     ("gpt-6", 272_000),
     ("gpt-5", 272_000),
