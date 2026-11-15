@@ -400,39 +400,63 @@ fn snippet(text: &str, words: &[String]) -> String {
     out
 }
 
-#[async_trait]
-impl ClientHost for DaemonClientHost {
-    async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
-        let last: std::collections::HashMap<String, String> =
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT session_id, MAX(created_at) FROM events \
-                 WHERE event_type IN ('user_message', 'assistant_response') \
-                 GROUP BY session_id",
-            )
-            .fetch_all(&self.system.pool)
+/// Per conversation: when it last had a message (`last`), and what the
+/// owner said first and latest, the conversation list's names.
+struct SessionEnds {
+    last: std::collections::HashMap<String, String>,
+    first: std::collections::HashMap<String, String>,
+    latest: std::collections::HashMap<String, String>,
+}
+
+async fn session_ends(pool: &sqlx::SqlitePool) -> SessionEnds {
+    // Each reads one row per session: the per-session ends come from
+    // `idx_events_type_session`, then only those rows are opened.
+    let last: std::collections::HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT e.session_id, e.created_at FROM events e JOIN \
+             (SELECT MAX(id) AS id FROM events \
+              WHERE event_type IN ('user_message', 'assistant_response') \
+              GROUP BY session_id) m ON e.id = m.id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    // A name from what the owner said: an app conversation is about its
+    // first message; a chat (Telegram, Slack...) runs for months, so it
+    // goes by its latest one.
+    let said = |pick: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(format!(
+                "SELECT e.session_id, json_extract(e.data, '$.content') FROM events e JOIN \
+                 (SELECT {pick}(id) AS id FROM events WHERE event_type = 'user_message' \
+                  GROUP BY session_id) m ON e.id = m.id"
+            )))
+            .fetch_all(&pool)
             .await
             .unwrap_or_default()
             .into_iter()
-            .collect();
-        // A name from what the owner said: an app conversation is about its
-        // first message; a chat (Telegram, Slack...) runs for months, so it
-        // goes by its latest one.
-        let said = |pick: &'static str| {
-            let pool = self.system.pool.clone();
-            async move {
-                sqlx::query_as::<_, (String, Option<String>, i64)>(sqlx::AssertSqlSafe(format!(
-                    "SELECT session_id, json_extract(data, '$.content'), {pick}(id) FROM events \
-                     WHERE event_type = 'user_message' GROUP BY session_id"
-                )))
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|(id, text, _)| Some((id, text?)))
-                .collect::<std::collections::HashMap<String, String>>()
-            }
-        };
-        let (first, latest) = (said("MIN").await, said("MAX").await);
+            .filter_map(|(id, text)| Some((id, text?)))
+            .collect::<std::collections::HashMap<String, String>>()
+        }
+    };
+    let (first, latest) = (said("MIN").await, said("MAX").await);
+    SessionEnds {
+        last,
+        first,
+        latest,
+    }
+}
+
+#[async_trait]
+impl ClientHost for DaemonClientHost {
+    async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
+        let SessionEnds {
+            last,
+            first,
+            latest,
+        } = session_ends(&self.system.pool).await;
         // A chat is direct only when its messages said so; one not heard
         // from since this was recorded counts as shared.
         let shared: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
@@ -1010,7 +1034,52 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_words, snippet, tool_names};
+    use super::{outcome_words, session_ends, snippet, tool_names};
+
+    #[tokio::test]
+    async fn the_conversation_list_reads_each_session_s_first_and_latest_message() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        aidaemon_events::schema::migrate_events(&pool)
+            .await
+            .unwrap();
+        for (session, kind, text, at) in [
+            (
+                "app:1",
+                "user_message",
+                "Plan the trip",
+                "2026-01-01 10:00:00",
+            ),
+            (
+                "app:1",
+                "assistant_response",
+                "Here is a plan",
+                "2026-01-01 10:01:00",
+            ),
+            ("app:1", "user_message", "Add a day", "2026-01-01 10:02:00"),
+            (
+                "telegram:2",
+                "user_message",
+                "Fix the footer",
+                "2026-01-02 09:00:00",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO events (session_id, event_type, data, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(session)
+            .bind(kind)
+            .bind(serde_json::json!({ "content": text }).to_string())
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ends = session_ends(&pool).await;
+        assert_eq!(ends.first["app:1"], "Plan the trip");
+        assert_eq!(ends.latest["app:1"], "Add a day");
+        assert_eq!(ends.last["app:1"], "2026-01-01 10:02:00");
+        assert_eq!(ends.first["telegram:2"], "Fix the footer");
+    }
 
     #[test]
     fn a_status_code_outcome_reads_as_words() {

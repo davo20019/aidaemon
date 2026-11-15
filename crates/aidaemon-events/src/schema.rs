@@ -78,6 +78,15 @@ pub async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
 
+    // Each session's first and latest message by type, without reading
+    // the rows in between (the app's conversation list).
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_type_session
+         ON events(event_type, session_id, id)",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_events_task
          ON events(task_id) WHERE task_id IS NOT NULL",
