@@ -284,6 +284,16 @@ pub enum Glyph {
     File,
     /// Automations: what runs on its own.
     Clock,
+    /// The previous one (a diff's change).
+    Up,
+    /// The next one.
+    Down,
+    /// Side by side.
+    Columns,
+    /// Speak instead of typing.
+    Mic,
+    /// A folder.
+    Folder,
 }
 
 impl Glyph {
@@ -316,6 +326,11 @@ impl Glyph {
             Self::Attach => "⊕",
             Self::File => "▭",
             Self::Clock => "◷",
+            Self::Up => "↑",
+            Self::Down => "↓",
+            Self::Columns => "◫",
+            Self::Mic => "◉",
+            Self::Folder => "▸",
         }
     }
 }
@@ -384,6 +399,17 @@ impl Glyph {
             }
             Self::Attach => {
                 r#"<path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/>"#
+            }
+            Self::Up => r#"<path d="m18 15-6-6-6 6"/>"#,
+            Self::Down => r#"<path d="m6 9 6 6 6-6"/>"#,
+            Self::Columns => {
+                r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18"/>"#
+            }
+            Self::Mic => {
+                r#"<path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/>"#
+            }
+            Self::Folder => {
+                r#"<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#
             }
             Self::File => {
                 r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>"#

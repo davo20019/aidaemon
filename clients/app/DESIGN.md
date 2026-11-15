@@ -25,6 +25,8 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 `key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `secret_field` (masked), `picture` and `file_chip` (files with messages), `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Over `nsh_base`'s behaviour-only parts (`kit.rs`; keyboard, focus, roles and the terminal's rendering are nsh's): `toggle` (Switch: a setting that takes effect at once), `choice` (Select; searchable past 8 items; a sheet on phones), `sections` (Accordion, several open), `tab_bar` (Tabs), `data_table` (Table semantics, actions in the last column), `meter` (Progress), `confirm` (the platform's alert, before anything that cannot be undone), `with_menu` (ContextMenu: right click, long press, the menu key), `toasts` (ToastStack and ToastManager: one stack for the app; the terminal's status line), and `split` / `pane` / `pane_rest` (resizable panes).
 
+Over `nsh_base`'s larger views (`rich.rs`): `diff` (DiffView: one file's unified diff, line numbers, words changed, unchanged lines folded, highlighted by the file's name, side by side on request; only rows in view are made), `output` (Terminal: a program's output with its colours, scrolled back, following the end), `code_editor` (Editor: TOML and other code, growing to a cap), `day_bars` (plot: two stacked numbers per day, hover names the day), `file_tree` (Tree: files under folders, a folder of one folder joined), `suggest_field` (Combobox: free text with suggestions) and `with_preview` (HoverCard: more about a row while the pointer rests on it; never on touch or in a terminal).
+
 Features compose these and layout primitives only. A missing look becomes a variant here first.
 
 ## Motion (`src/ui/motion.rs`)
@@ -66,7 +68,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Conversation | Reading back while replies arrive | "Jump to latest" pill (bottom, centred) when the last row is out of view; follow-end only while at the end |
 | Conversation | Stop pressed | Stop becomes "Stopping…" (warning status) until the turn ends |
 | Sidebar | A reply lands elsewhere | Filled dot and full-strength title until opened; pinned (★) first; age at the right |
-| Steps | Work running | Elapsed time ticks each second; long tool output shows its last 8 lines with Show all / Copy |
+| Steps | Work running | Elapsed time ticks each second |
 | Sidebar | Projects | Needs you and Working stay first, from every project; then each project folds open or shut (chevron), with its folder (`~` for home, last parts when long) and a count; its "+" starts a conversation in it; New project (+ by the heading) opens a name and folder form under it, and a made project opens on a new conversation in it; conversations in no project follow as Conversations, with filters by where they came from (All, App, each chat platform, Groups) when they came from more than one place; a project's menu edits its name and folder; a conversation's menu moves it to a project or out of one; searching lists matches flat |
 | Conversation | In a project | The header's second line names the project and its folder; a new conversation offers a Project picker under the question, and starters that fit a project (Explain this project, What changed?, Fix something); the phone's + starts the next one in the same project |
 | Details | A conversation works on code (in a project with a folder, wrote a file, or has changes) | It gets the Changes tab and opens on it; on a wide window the details show beside it, and hide beside any other; a turn's first file write moves to Changes once per turn; on a phone the header's "Changes · N" opens them |
@@ -75,9 +77,15 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Conversation | A group chat | The composer is replaced by a note that the bot posts what is sent here for everyone, and "Post in this group"; once pressed, the composer shows for this conversation |
 | Automations | Open | Reads on open, every 30 s and on Refresh; Cancel turns into "Cancel it for good?" with Yes, cancel / Keep it; History swaps for Hide history and opens the runs under the card |
 | System | Chat bots | Each bot with its conversation count and a project picker: its direct messages work in that project's folder unless moved; group chats join a project only when moved there |
-| Changes | A tool that can change files finishes | The changes read again while the tab shows (else on its next showing); a press on a file opens its diff (+ success, − danger, @@ info, first 400 lines with Show all, Copy); All files goes back |
+| Changes | A tool that can change files finishes | The changes read again while the tab shows (else on its next showing); the files list as a tree under their folders; a press on a file fills the pane with its diff (`ui::diff`: line numbers, changed words, folded context that expands, highlighted by its name), with Previous/Next change, Side by side, Copy and All files |
 | System | Open | Reads on open and every 30 s; "Needs a look" (warning tint, alert role) leads when anything fails |
 | System | A reply finishes while the app is in the background | "Done: <conversation>" notification; pressing it opens the conversation |
+| Composer | Files dragged from the desktop | The border turns accent and says "Drop to attach"; dropped files attach as the paperclip's do (a folder or unreadable file says so) |
+| Composer | Microphone (where the platform recognizes speech) | Speech writes into the composer after what is there as it is heard; the button becomes Stop listening (accent); a refusal says what to allow |
+| Steps | A tool's output | Shown in a terminal (`ui::output`): colours kept, 8 rows or 24 with Show more, scrolled back for the rest, Copy |
+| Settings | A value is edited | A TOML code editor (highlighted, brackets closed); Another setting suggests the known keys as its key is typed |
+| System | Token use | Stacked bars per day (in grey, out teal), oldest at the left; the day under the pointer is named under the chart |
+| Sidebar | Pointer rests on a conversation (desktop, web) | A card after 600 ms: title, where it is and when it moved, its last message |
 | Conversation | A reply's turn used tools | One quiet disclosure line above the reply ("Used 4 tools: read_file ×2, … · 12s"); ▸ turns ▾ and lists every tool in order. The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
 | Conversation | Agent working, tools used | The working line adds "· N tools so far" |
 | Composer | Typing while the agent works | Send becomes "Add to the current work" (Enter); Queue (Mod+Enter) waits for its own turn; the hint names both and Esc |

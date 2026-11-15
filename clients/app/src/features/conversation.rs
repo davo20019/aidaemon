@@ -1064,6 +1064,7 @@ fn composer(store: Store, session: Option<String>) -> View {
         computed(move || session.as_deref().is_some_and(|id| store.is_running(id)))
     };
     let field = element_ref();
+    let dragging = signal(false);
     let touch = matches!(
         idiom(),
         nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
@@ -1129,6 +1130,36 @@ fn composer(store: Store, session: Option<String>) -> View {
                 .p(px(6.0))
                 .gap_1()
                 .focus_within(|s| s.border_color(colors::ACCENT))
+                // Files dragged from the desktop attach where they are let
+                // go; the border says so while they are over it.
+                .border_color(move || {
+                    if dragging.get() {
+                        colors::ACCENT
+                    } else {
+                        colors::BORDER
+                    }
+                })
+                .on_file_drag_enter(move |drag: &FileDragEvent| {
+                    if store.takes_files() && !drag.uris.is_empty() {
+                        dragging.set(true);
+                    }
+                })
+                .on_file_drag_leave(move || dragging.set(false))
+                .on_file_drop(move |drop: &FileDropEvent| {
+                    dragging.set(false);
+                    if store.takes_files() {
+                        attach_dropped(store, drop.uris.clone(), drop.mime_types.clone());
+                    }
+                })
+                .child(when(
+                    move || dragging.get(),
+                    || {
+                        text("Drop to attach")
+                            .px_1()
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::ACCENT)
+                    },
+                ))
                 .child(draft_files(store))
                 .child(
                     input()
@@ -1200,6 +1231,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 )
                             },
                         ))
+                        .child(dictation(store, terminal))
                         .child(
                             text(move || match (running.get(), touch) {
                                 (true, true) => {
@@ -1309,4 +1341,190 @@ fn slash_list(store: Store, matches: Memo<Vec<aidaemon_client_protocol::SlashCom
                     .child(when(move || index.get() == 0, || ui::kbd("Tab")))
             },
         ))
+}
+
+/// Attaches files dropped from the desktop: read off the engine's thread,
+/// each by its name, as the paperclip's are. Directories and files that
+/// cannot be read say so.
+#[cfg(not(target_arch = "wasm32"))]
+fn attach_dropped(store: Store, uris: Vec<String>, mimes: Vec<String>) {
+    spawn(async move {
+        let read = background(async move {
+            uris.iter()
+                .zip(mimes.iter().chain(std::iter::repeat(&String::new())))
+                .map(|(uri, mime)| {
+                    let path = file_path(uri);
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    let bytes = std::fs::metadata(&path)
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .and_then(|_| std::fs::read(&path).ok());
+                    (name, mime.clone(), bytes)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (name, mime, bytes) in read {
+            match bytes {
+                Some(bytes) => {
+                    let mime = if mime.is_empty() {
+                        "application/octet-stream".to_owned()
+                    } else {
+                        mime
+                    };
+                    store.attach_file(name, mime, &bytes)
+                }
+                None => store.say(format!(
+                    "{name} could not be attached (a folder, or unreadable)"
+                )),
+            }
+        }
+    });
+}
+
+/// The browser hands no paths: nothing to read.
+#[cfg(target_arch = "wasm32")]
+fn attach_dropped(_store: Store, _uris: Vec<String>, _mimes: Vec<String>) {}
+
+/// The local path of a `file:` URL, its `%XX` escapes decoded.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn file_path(uri: &str) -> String {
+    let rest = uri.strip_prefix("file://").unwrap_or(uri);
+    // `file://localhost/…` and `file:///…` both name a local path.
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    // Windows: `/C:/…` is `C:/…`.
+    let rest = match rest.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &rest[1..],
+        _ => rest,
+    };
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&rest[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The microphone: speaking writes into the composer, after what is
+/// already there, as the platform's recognizer hears it. Pressing it again
+/// stops listening (the last words are kept). Shown only where the
+/// platform recognizes speech.
+fn dictation(store: Store, terminal: bool) -> View {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nsh_core::element::SpeechRecognition;
+    use nsh_core::speech::{SpeechEvent, SpeechRequest};
+
+    let available = signal(false);
+    if !terminal {
+        spawn(async move { available.set(speech_available().await) });
+    }
+    let listening = signal(false);
+    let session: Stored<Option<Rc<RefCell<SpeechRecognition>>>> = stored(None);
+    // The session outlives the button pressed to start it (the button
+    // becomes Stop): it runs under the composer.
+    let owner = Owner::current();
+    let press = move || {
+        if listening.get_untracked() {
+            // The recognizer finishes what it heard, then the session ends.
+            session.with(|s| {
+                if let Some(s) = s {
+                    s.borrow().stop()
+                }
+            });
+            return;
+        }
+        let before = store.draft();
+        let lead = if before.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{} ", before.trim_end())
+        };
+        let running = Rc::new(RefCell::new(recognize_speech(SpeechRequest::default())));
+        session.replace(Some(running.clone()));
+        listening.set(true);
+        owner.run(|| {
+            spawn(async move {
+                loop {
+                    let event = std::future::poll_fn(|cx| running.borrow_mut().poll_next(cx)).await;
+                    match event {
+                        Some(SpeechEvent::Result { text, .. }) => {
+                            store.set_draft(format!("{lead}{text}"))
+                        }
+                        Some(SpeechEvent::End { error }) => {
+                            if let Some(note) = error.and_then(speech_note) {
+                                store.say(note);
+                            }
+                            break;
+                        }
+                        None => break,
+                        Some(_) => {}
+                    }
+                }
+                session.replace(None);
+                listening.set(false);
+            })
+        });
+    };
+    view().child(when(
+        move || available.get(),
+        move || {
+            view().child(dynamic(move || {
+                let on = listening.get();
+                Some(untracked(move || {
+                    if on {
+                        ui::icon_btn(Glyph::Stop, "Stop listening", Size::Md, press)
+                            .text_color(colors::ACCENT)
+                    } else {
+                        ui::icon_btn(Glyph::Mic, "Speak instead of typing", Size::Md, press)
+                    }
+                }))
+            }))
+        },
+    ))
+}
+
+/// What to tell the owner when listening failed; nothing when it only
+/// heard nothing.
+fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
+    use nsh_core::speech::SpeechError;
+    match error {
+        SpeechError::NoSpeech => None,
+        SpeechError::NotAllowed => Some(
+            "The microphone or speech recognition is not allowed for AIdaemon in the system's settings",
+        ),
+        SpeechError::AudioCapture => Some("No microphone could be used"),
+        SpeechError::LanguageNotSupported => Some("Speech in this language is not recognized here"),
+        _ => Some("Listening stopped: speech recognition failed"),
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::file_path;
+
+    #[test]
+    fn file_urls_become_paths() {
+        assert_eq!(file_path("file:///tmp/a%20b.png"), "/tmp/a b.png");
+        assert_eq!(file_path("file://localhost/tmp/x"), "/tmp/x");
+        assert_eq!(
+            file_path("file:///C:/Users/synthetic/n%C3%A9.txt"),
+            "C:/Users/synthetic/né.txt"
+        );
+        assert_eq!(file_path("file:///tmp/100%"), "/tmp/100%");
+    }
 }

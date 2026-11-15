@@ -174,70 +174,17 @@ fn timeline(store: Store) -> View {
                             .child(when(
                                 move || item.with(|a| !a.detail.is_empty()),
                                 move || {
-                                    let output = kind == ActivityKind::Output;
-                                    let all = signal(false);
-                                    let lines = move || item.with(|a| a.detail.lines().count());
-                                    // Long output shows its end (where errors are), with
-                                    // Show all and Copy.
-                                    let shown = move || {
-                                        let text = detail();
-                                        if !output || all.get() {
-                                            return text;
-                                        }
-                                        let lines: Vec<&str> = text.lines().collect();
-                                        let skip = lines.len().saturating_sub(8);
-                                        let tail = lines[skip..].join("\n");
-                                        if skip > 0 {
-                                            format!("… {skip} lines above\n{tail}")
-                                        } else {
-                                            tail
-                                        }
-                                    };
-                                    view()
-                                        .gap_1()
-                                        .when(output, |v| {
-                                            v.rounded(px(radius::SMALL))
-                                                .bg(colors::INSET)
-                                                .px_2()
-                                                .py_1()
-                                        })
-                                        .child(
-                                            text(shown)
-                                                .number_of_lines(if output { 0 } else { 3 })
+                                    if kind == ActivityKind::Output {
+                                        output(detail)
+                                    } else {
+                                        view().child(
+                                            text(detail)
+                                                .number_of_lines(3)
                                                 .selectable(true)
-                                                .when(output, |t| t.font_family(ui::theme::MONO))
                                                 .text_size(px(type_scale::XS))
                                                 .text_color(colors::MUTED),
                                         )
-                                        .child(when(
-                                            move || output && lines() > 8,
-                                            move || {
-                                                view()
-                                                    .flex_row()
-                                                    .gap_1()
-                                                    .child(dynamic(move || {
-                                                        let label = if all.get() {
-                                                            "Show less"
-                                                        } else {
-                                                            "Show all"
-                                                        };
-                                                        Some(untracked(move || {
-                                                            btn(
-                                                                label,
-                                                                Variant::Ghost,
-                                                                Size::Sm,
-                                                                move || all.update(|a| *a = !*a),
-                                                            )
-                                                        }))
-                                                    }))
-                                                    .child(btn(
-                                                        "Copy",
-                                                        Variant::Ghost,
-                                                        Size::Sm,
-                                                        move || set_clipboard(detail()),
-                                                    ))
-                                            },
-                                        ))
+                                    }
                                 },
                             )),
                     )
@@ -250,4 +197,48 @@ fn timeline(store: Store) -> View {
                 .text_size(px(type_scale::XS))
                 .text_color(colors::FAINT)
         }))
+}
+
+/// A step's output in a terminal: its last 8 lines, or 24 with Show all
+/// (the terminal scrolls back through the rest), with Copy.
+fn output(detail: impl Fn() -> String + Clone + 'static) -> View {
+    let all = signal(false);
+    let lines = {
+        let detail = detail.clone();
+        move || detail().lines().count()
+    };
+    let more = {
+        let lines = lines.clone();
+        move || lines() > 8
+    };
+    let rows = {
+        let lines = lines.clone();
+        move || (lines().max(1) as u32).min(if all.get() { 24 } else { 8 })
+    };
+    let copy = detail.clone();
+    view()
+        .gap_1()
+        .rounded(px(radius::SMALL))
+        .bg(colors::INSET)
+        .px_2()
+        .py_1()
+        .child(ui::output(detail, rows, "Step output"))
+        .child(
+            view()
+                .flex_row()
+                .gap_1()
+                .child(when(more, move || {
+                    view().child(dynamic(move || {
+                        let label = if all.get() { "Show less" } else { "Show more" };
+                        Some(untracked(move || {
+                            btn(label, Variant::Ghost, Size::Sm, move || {
+                                all.update(|a| *a = !*a)
+                            })
+                        }))
+                    }))
+                }))
+                .child(btn("Copy", Variant::Ghost, Size::Sm, move || {
+                    set_clipboard(copy())
+                })),
+        )
 }

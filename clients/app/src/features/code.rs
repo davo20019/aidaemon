@@ -11,9 +11,6 @@ use nsh_core::prelude::*;
 use crate::store::{ChangesRead, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, radius, section_label, type_scale};
 
-/// A file's diff shows this many lines until Show all.
-const DIFF_LINES: usize = 400;
-
 pub fn code(store: Store) -> View {
     // Read on opening, and whenever another conversation is selected.
     effect(move || {
@@ -26,14 +23,18 @@ pub fn code(store: Store) -> View {
         store.selected();
         open.set(None);
     });
-    view().flex_1().child(
-        scroll()
-            .flex_1()
-            .child(view().px_3().pt_2().pb_4().gap_2().child(dynamic(move || {
-                let read = store.changes();
-                Some(untracked(move || body(store, read, open)))
-            }))),
-    )
+    view().flex_1().child(dynamic(move || {
+        let shown = open.get();
+        Some(untracked(move || match shown {
+            Some((root, path)) => file_diff(store, root, path, open),
+            None => view().flex_1().child(scroll().flex_1().child(
+                view().px_3().pt_2().pb_4().gap_2().child(dynamic(move || {
+                    let read = store.changes();
+                    Some(untracked(move || body(store, read, open)))
+                })),
+            )),
+        }))
+    }))
 }
 
 fn body(store: Store, read: ChangesRead, open: Signal<Option<(String, String)>>) -> View {
@@ -155,7 +156,6 @@ fn repo_view(store: Store, repo: RepoChanges, open: Signal<Option<(String, Strin
     if let Some(branch) = &repo.branch {
         header = header.child(ui::badge(branch.clone(), Tone::Neutral));
     }
-    let patch = repo.patch.clone();
     let files = repo.files.clone();
     view()
         .gap_1()
@@ -174,14 +174,7 @@ fn repo_view(store: Store, repo: RepoChanges, open: Signal<Option<(String, Strin
                 )
             },
         ))
-        .child(dynamic(move || {
-            let shown = open.get().filter(|(r, _)| *r == root);
-            let (root, files, patch) = (root.clone(), files.clone(), patch.clone());
-            Some(untracked(move || match shown {
-                Some((_, path)) => file_diff(&path, &patch, open),
-                None => file_list(root, files, open),
-            }))
-        }))
+        .child(file_list(root, files, open))
 }
 
 fn file_list(root: String, files: Vec<FileChange>, open: Signal<Option<(String, String)>>) -> View {
@@ -189,74 +182,78 @@ fn file_list(root: String, files: Vec<FileChange>, open: Signal<Option<(String, 
     if files.iter().any(|f| f.by_session) {
         list = list.child(section_label("Changed files"));
     }
-    for file in files {
-        let target = (root.clone(), file.path.clone());
-        let (letter, tone) = status(file.status);
-        let mut row = ui::row(|| false, move || open.set(Some(target.clone())))
-            .accessibility_label(format!(
-                "{}, {}{}",
-                file.path,
-                status_word(file.status),
-                if file.by_session {
-                    ", written in this conversation"
-                } else {
-                    ""
-                }
-            ))
-            .child(
-                text(letter)
-                    .w(px(14.0))
-                    .font_family(ui::theme::MONO)
-                    .text_size(px(type_scale::XS))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tone.color()),
-            )
-            .child(
-                text(file.path.clone())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .number_of_lines(1)
-                    .font_family(ui::theme::MONO)
-                    .text_size(px(type_scale::XS))
-                    .text_color(if file.by_session {
-                        colors::TEXT
+    let rows = files
+        .into_iter()
+        .map(|file| {
+            let (letter, tone) = status(file.status);
+            ui::TreeFile {
+                label: format!(
+                    "{}, {}{}",
+                    file.path,
+                    status_word(file.status),
+                    if file.by_session {
+                        ", written in this conversation"
                     } else {
-                        colors::MUTED
-                    }),
-            );
-        if file.added > 0 || file.removed > 0 {
-            row = row.child(
-                text(format!("+{} −{}", file.added, file.removed))
-                    .font_family(ui::theme::MONO)
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-            );
-        }
-        if file.by_session {
-            row = row.child(ui::icon(Glyph::Dot).text_color(colors::ACCENT));
-        }
-        list = list.child(row);
-    }
-    list
+                        ""
+                    }
+                ),
+                stats: if file.added > 0 || file.removed > 0 {
+                    format!("+{} −{}", file.added, file.removed)
+                } else {
+                    String::new()
+                },
+                path: file.path,
+                letter,
+                tone,
+                marked: file.by_session,
+            }
+        })
+        .collect();
+    list.child(ui::file_tree("Changed files", rows, move |path| {
+        open.set(Some((root.clone(), path)))
+    }))
 }
 
-fn file_diff(path: &str, patch: &str, open: Signal<Option<(String, String)>>) -> View {
-    let lines = diff_of(patch, path);
-    let total = lines.len();
-    let all = signal(false);
-    let copy = lines.join("\n");
+/// One file's diff, filling the pane: back to the list, its path, the
+/// previous and next change, side by side or one over the other, Copy.
+/// It reads the file's section again whenever the changes are read again.
+fn file_diff(
+    store: Store,
+    root: String,
+    path: String,
+    open: Signal<Option<(String, String)>>,
+) -> View {
+    let split = signal(false);
+    let section = {
+        let (root, path) = (root.clone(), path.clone());
+        computed(move || match store.changes() {
+            ChangesRead::Ready(changes) => changes
+                .repos
+                .iter()
+                .find(|repo| repo.root == root)
+                .map(|repo| file_patch(&repo.patch, &path))
+                .unwrap_or_default(),
+            _ => String::new(),
+        })
+    };
+    let diff: ui::DiffRef = component_ref();
+    let label = path.clone();
     view()
+        .flex_1()
+        .min_h(px(0.0))
         .gap_1()
+        .pt_1()
         .child(
             view()
                 .flex_row()
                 .items_center()
                 .gap_1()
+                .px_2()
                 .child(ui::btn("All files", Variant::Ghost, Size::Sm, move || {
                     open.set(None)
                 }))
                 .child(
-                    text(path.to_string())
+                    text(path.clone())
                         .flex_1()
                         .min_w(px(0.0))
                         .number_of_lines(1)
@@ -264,94 +261,65 @@ fn file_diff(path: &str, patch: &str, open: Signal<Option<(String, String)>>) ->
                         .text_size(px(type_scale::XS))
                         .text_color(colors::MUTED),
                 )
+                .child(ui::icon_btn(
+                    Glyph::Up,
+                    "Previous change",
+                    Size::Sm,
+                    move || ui::diff_step(&diff, false),
+                ))
+                .child(ui::icon_btn(
+                    Glyph::Down,
+                    "Next change",
+                    Size::Sm,
+                    move || ui::diff_step(&diff, true),
+                ))
+                .child(ui::icon_btn(
+                    Glyph::Columns,
+                    "Side by side",
+                    Size::Sm,
+                    move || split.update(|s| *s = !*s),
+                ))
                 .child(ui::btn("Copy", Variant::Ghost, Size::Sm, move || {
-                    set_clipboard(copy.clone())
+                    set_clipboard(section.get_untracked())
                 })),
         )
         .child(dynamic(move || {
-            let every = all.get();
-            let lines = lines.clone();
+            let patch = section.get();
+            let label = label.clone();
             Some(untracked(move || {
-                let mut block = view().rounded(px(radius::SMALL)).bg(colors::INSET).py_1();
-                if lines.is_empty() {
-                    block = block.child(
+                if has_lines(&patch) {
+                    ui::diff(patch, label, move || split.get(), &diff)
+                } else {
+                    view().px_3().child(
                         text("No line changes to show (a binary file, a rename or a mode change).")
-                            .px_2()
                             .text_size(px(type_scale::XS))
                             .text_color(colors::FAINT),
-                    );
+                    )
                 }
-                let shown = if every { total } else { total.min(DIFF_LINES) };
-                for line in lines.into_iter().take(shown) {
-                    block = block.child(diff_line(line));
-                }
-                block
             }))
         }))
-        .child(when(
-            move || total > DIFF_LINES && !all.get(),
-            move || {
-                ui::btn(
-                    format!("Show all {total} lines"),
-                    Variant::Ghost,
-                    Size::Sm,
-                    move || all.set(true),
-                )
-            },
-        ))
 }
 
-fn diff_line(line: String) -> View {
-    let tone = if line.starts_with("@@") {
-        Some(Tone::Info)
-    } else if line.starts_with('+') {
-        Some(Tone::Success)
-    } else if line.starts_with('-') {
-        Some(Tone::Danger)
-    } else {
-        None
-    };
-    let row = view().px_2();
-    let row = match tone {
-        Some(Tone::Success) | Some(Tone::Danger) => row.bg(tone.unwrap().tint()),
-        _ => row,
-    };
-    row.child(
-        text(if line.is_empty() {
-            " ".to_string()
-        } else {
-            line
-        })
-        .selectable(true)
-        .font_family(ui::theme::MONO)
-        .text_size(px(type_scale::XS))
-        .text_color(tone.map_or(colors::MUTED, Tone::color)),
-    )
+/// Whether a file's section of a diff has any hunk.
+fn has_lines(section: &str) -> bool {
+    section.lines().any(|line| line.starts_with("@@"))
 }
 
-/// The hunk lines of `path`'s section of a unified diff, without its
-/// `diff --git`, `index`, `---` and `+++` header lines.
-pub fn diff_of(patch: &str, path: &str) -> Vec<String> {
-    let mut lines = Vec::new();
+/// `path`'s section of a unified diff: from its `diff --git` line to the
+/// next file's.
+pub fn file_patch(patch: &str, path: &str) -> String {
+    let mut out = String::new();
     let mut inside = false;
-    let mut in_hunks = false;
     for line in patch.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             inside = rest.ends_with(&format!(" b/{path}"));
-            in_hunks = false;
-            continue;
         }
-        if !inside {
-            continue;
-        }
-        if line.starts_with("@@") {
-            in_hunks = true;
-        }
-        if in_hunks || line.starts_with("Binary") {
-            lines.push(line.to_string());
+        if inside {
+            out.push_str(line);
+            out.push('\n');
         }
     }
-    lines
+    out
 }
 
 fn status(status: FileStatus) -> (&'static str, Tone) {
@@ -378,15 +346,19 @@ fn status_word(status: FileStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::diff_of;
+    use super::{file_patch, has_lines};
 
     #[test]
-    fn diff_of_keeps_one_files_hunks() {
+    fn file_patch_keeps_one_files_section() {
         let patch = "diff --git a/a.rs b/a.rs\nindex 1..2 100644\n--- a/a.rs\n+++ b/a.rs\n\
                      @@ -1 +1 @@\n-old\n+new\n\
                      diff --git a/b.md b/b.md\nnew file\n--- /dev/null\n+++ b/b.md\n@@ -0,0 +1 @@\n+note\n";
-        assert_eq!(diff_of(patch, "a.rs"), ["@@ -1 +1 @@", "-old", "+new"]);
-        assert_eq!(diff_of(patch, "b.md"), ["@@ -0,0 +1 @@", "+note"]);
-        assert!(diff_of(patch, "c.rs").is_empty());
+        assert_eq!(
+            file_patch(patch, "a.rs"),
+            "diff --git a/a.rs b/a.rs\nindex 1..2 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        );
+        assert!(file_patch(patch, "b.md").ends_with("@@ -0,0 +1 @@\n+note\n"));
+        assert!(file_patch(patch, "c.rs").is_empty());
+        assert!(!has_lines("diff --git a/x b/x\nBinary files differ\n"));
     }
 }

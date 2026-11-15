@@ -180,7 +180,51 @@ fn session_row(store: Store, id: String) -> View {
             store.move_to_project(&session, None)
         }));
     }
-    ui::with_menu(session_button(store, id), actions)
+    let preview = id.clone();
+    ui::with_menu(
+        ui::with_preview(session_button(store, id), move || {
+            session_preview(store, preview)
+        }),
+        actions,
+    )
+}
+
+/// More about a conversation than its row says: its title, where it is,
+/// when it last moved, and its last message.
+fn session_preview(store: Store, id: String) -> View {
+    let (title, place, when, last) = (id.clone(), id.clone(), id.clone(), id);
+    view()
+        .gap_1()
+        .child(
+            text(move || store.title(&title))
+                .number_of_lines(2)
+                .text_size(px(type_scale::SM))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors::TEXT),
+        )
+        .child(
+            text(move || {
+                let mut parts = vec![store.place(&place)];
+                if let Some(at) = store.last_activity(&when) {
+                    parts.push(ui::time::ago(at, crate::store::now_ms()));
+                }
+                parts.retain(|p| !p.is_empty());
+                parts.join(" · ")
+            })
+            .number_of_lines(1)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+        )
+        .child(
+            text(move || match store.last_message(&last) {
+                Some((true, text)) => format!("You: {}", text.trim()),
+                Some((false, text)) => text.trim().to_owned(),
+                None => "Open it to read it.".to_owned(),
+            })
+            .number_of_lines(4)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::MUTED),
+        )
 }
 
 /// The projects, each folded open or shut with its conversations, then

@@ -260,7 +260,14 @@ fn ready(
     page = page.child(ui::sections(open, groups));
     if !filtering {
         page = page
-            .child(other_setting(store))
+            .child(other_setting(
+                store,
+                settings
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.settings.iter().map(|s| s.key.clone()))
+                    .collect(),
+            ))
             .child(database(store, &settings))
             .child(apply_section(store))
             .child(
@@ -536,17 +543,18 @@ fn editor(store: Store, setting: Setting, editing: Signal<bool>) -> View {
                 "As TOML: text in quotes (\"gpt-x\"), numbers and true/false as they are, \
                  lists in brackets.",
             ))
-            .child(
-                ui::field("Value", draft)
-                    .label(format!("Value of {key}"))
-                    .w_full(),
-            );
+            .child(ui::code_editor(
+                draft,
+                "toml",
+                format!("Value of {key}"),
+                12,
+            ));
     }
     editor.child(actions)
 }
 
 /// Any setting by its key, for one the page does not list.
-fn other_setting(store: Store) -> View {
+fn other_setting(store: Store, keys: Vec<String>) -> View {
     let key = signal(String::new());
     let value = signal(String::new());
     view()
@@ -555,16 +563,13 @@ fn other_setting(store: Store) -> View {
         .child(muted(
             "Set any key the daemon reads, by its dotted path (a list entry as name[0]).",
         ))
-        .child(
-            ui::field("Key, like memory.retention_days", key)
-                .label("Setting key")
-                .w_full(),
-        )
-        .child(
-            ui::field("Value as TOML", value)
-                .label("Setting value")
-                .w_full(),
-        )
+        .child(ui::suggest_field(
+            "Setting key",
+            "Key, like memory.retention_days",
+            key,
+            keys,
+        ))
+        .child(ui::code_editor(value, "toml", "Setting value", 8))
         .child(
             view()
                 .flex_row()

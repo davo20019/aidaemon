@@ -3,12 +3,23 @@
 
 use aidaemon_client_core::Update;
 use aidaemon_client_protocol::ServerFrame;
-use nsh_app_aidaemon::{Offline, feed};
+use nsh_app_aidaemon::{Offline, feed, sent};
 use nsh_engine::{EngineConfig, Points, Root, Size};
 use nsh_testing::Headless;
 
 fn frame(json: &str) -> Update {
     Update::Frame(serde_json::from_str::<ServerFrame>(json).expect("a frame"))
+}
+
+/// The id of the last command of `kind` the app sent, once it has.
+fn wait_sent(kind: &str) -> Result<String, String> {
+    for _ in 0..100 {
+        if let Some(id) = sent(kind) {
+            return Ok(id);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!("no {kind} was sent"))
 }
 
 /// The feed is one per process: tests take turns.
@@ -21,6 +32,15 @@ fn start() -> Headless {
 fn start_at(width: f32, height: f32) -> Headless {
     let mut config = EngineConfig::new(Root::of::<Offline>());
     config.viewport = Size::new(Points(width), Points(height));
+    Headless::start(config).unwrap()
+}
+
+/// A desktop window, with a mouse to hover with.
+fn start_desktop() -> Headless {
+    let mut config = EngineConfig::new(Root::of::<Offline>());
+    config.viewport = Size::new(Points(1280.0), Points(820.0));
+    config.environment.os = nsh_core::platform::Os::MacOs;
+    config.environment.idiom = nsh_core::platform::Idiom::Desktop;
     Headless::start(config).unwrap()
 }
 
@@ -81,6 +101,10 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
         frame(
             r#"{"type":"event","at_ms":3,"session_id":"app:synthetic-1","event":{"type":"turn_status","turn_id":"t1","status":{"kind":"tool_started","name":"terminal","summary":"cargo test -q"}}}"#,
         ),
+        // The command's output, its colours a terminal's.
+        frame(
+            r#"{"type":"event","at_ms":3,"session_id":"app:synthetic-1","event":{"type":"turn_status","turn_id":"t1","status":{"kind":"tool_progress","name":"terminal","chunk":"running 3 tests\n\u001b[31mtest port_race ... FAILED\u001b[0m\n"}}}"#,
+        ),
         frame(
             r#"{"type":"event","at_ms":4,"session_id":"app:synthetic-1","event":{"type":"turn_delta","turn_id":"t1","text":"It races on the **shared** port."}}"#,
         ),
@@ -90,6 +114,7 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     ]);
     app.wait_for("Why does it fail on CI?")?;
     app.wait_for("terminal")?;
+    app.wait_for("test port_race ... FAILED")?;
     app.wait_for("git push origin fix-port")?;
     app.wait_for("Allow once")?;
     // The conversation waits on its owner: it leads the list.
@@ -147,6 +172,22 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
         r#"{"type":"event","at_ms":1,"event":{"type":"settings_updated","ok":true,"message":"Updated memory.retention_days = 30"}}"#,
     )]);
     app.wait_for("Updated memory.retention_days = 30")?;
+    // The settings arrive: a value edits as TOML in a code editor, and
+    // another key is typed with the known keys suggested.
+    let id = wait_sent("get_settings")?;
+    let result = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_stored", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
+    ))]);
+    app.press("Advanced")?;
+    app.wait_for("Another setting")?;
+    app.type_text("label:Setting key", "provider.mo")?;
+    app.wait_for("provider.models.default")?;
+    app.press("provider.models.default")?;
+    // A value opens in the code editor.
+    app.press("Model providers · 2 changed")?;
+    app.press("Edit >> nth=0")?;
+    app.wait_for("label:Value of provider.models.default")?;
     Ok(())
 }
 
@@ -260,6 +301,20 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     app.wait_for("This turn")?;
     app.press("Changes")?;
     app.wait_for("Reading changes…")?;
+    // The changes arrive; a file opens on its diff, which fills the pane.
+    let patch = r#"diff --git a/src/contact.rs b/src/contact.rs\n--- a/src/contact.rs\n+++ b/src/contact.rs\n@@ -1,2 +1,3 @@\n-fn send() {}\n+fn send() {\n+}\n fn main() {}\n"#;
+    let id = wait_sent("get_changes")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"changes","changes":{{"repos":[{{"root":"/home/synthetic/acme-site","branch":"main","files":[{{"path":"src/contact.rs","status":"modified","added":2,"removed":1,"by_session":true}}],"patch":"{patch}"}}]}}}}}}"#
+    ))]);
+    app.wait_for("acme-site")?;
+    app.press("src/contact.rs, modified, written in this conversation")?;
+    app.wait_for("All files")?;
+    app.wait_for("fn main() {}")?;
+    app.press("Side by side")?;
+    app.press("Next change")?;
+    app.press("All files")?;
+    app.wait_for("acme-site")?;
     Ok(())
 }
 
@@ -452,5 +507,66 @@ fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
         r#"{"type":"ack","request_id":"r10","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday and Saturday at 9:00 AM ET","status":"active","edit":{"when":"every weekday at 9am and saturdays","instructions":"Summarize the synthetic inbox"}}],"note":"Rescheduled \"Inbox digest\".","changed":true}}"#,
     )]);
     app.wait_for("Scheduled · Every weekday and Saturday at 9:00 AM ET")?;
+    Ok(())
+}
+
+#[test]
+fn resting_the_pointer_on_a_conversation_previews_it() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_desktop();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-6","channel":"app","title":"Weekend plan","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Weekend plan")?;
+    app.hover("Weekend plan >> nth=0")?;
+    app.wait_for("Open it to read it.")?;
+    Ok(())
+}
+
+/// A recognizer that hears one sentence and ends when stopped.
+struct Hears;
+
+struct Session(nsh_core::speech::SpeechSink);
+
+impl nsh_core::speech::SpeechControl for Session {
+    fn stop(&mut self) {
+        self.0.result("and add a test", true);
+        self.0.end(None);
+    }
+    fn abort(&mut self) {}
+}
+
+impl nsh_core::speech::SpeechBackend for Hears {
+    fn start(
+        &self,
+        _: nsh_core::speech::SpeechRequest,
+        events: nsh_core::speech::SpeechSink,
+    ) -> Box<dyn nsh_core::speech::SpeechControl> {
+        events.start();
+        events.result("and add", false);
+        Box::new(Session(events))
+    }
+}
+
+#[test]
+fn speaking_writes_into_the_composer() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut config = EngineConfig::new(Root::of::<Offline>());
+    config.viewport = Size::new(Points(1280.0), Points(820.0));
+    config.environment.os = nsh_core::platform::Os::MacOs;
+    config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+    config.speech = Some(std::sync::Arc::new(Hears));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("What should we work on?")?;
+    app.type_text("label:Message", "Fix the footer")?;
+    app.press("Speak instead of typing")?;
+    app.wait_for("Stop listening")?;
+    app.press("Stop listening")?;
+    app.wait_for("Speak instead of typing")?;
+    app.wait_for("Fix the footer and add a test")?;
     Ok(())
 }

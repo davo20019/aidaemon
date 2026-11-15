@@ -1599,6 +1599,17 @@ impl Store {
 
     /// Read the selected session's changes again; one read at a time, and
     /// one more after it when asked meanwhile.
+    /// The id of the last queued command of `kind` (its `type`): what a
+    /// test answers with an ack, as the daemon would.
+    pub fn queued_id(&self, kind: &str) -> Option<String> {
+        self.queued.with(|queued| {
+            queued.iter().rev().find_map(|(id, command)| {
+                let json = serde_json::to_value(command).ok()?;
+                (json.get("type")?.as_str()? == kind).then(|| id.clone())
+            })
+        })
+    }
+
     pub fn refresh_changes(&self) {
         let Some(session_id) = self.selected.get_untracked() else {
             self.changes_of.replace(None);
@@ -1834,6 +1845,18 @@ impl Store {
             .rev()
             .find_map(|line| match line {
                 Line::User { text, .. } => Some(text),
+                _ => None,
+            })
+    }
+
+    /// The last message in `session`, and whether the owner sent it.
+    pub fn last_message(&self, session: &str) -> Option<(bool, String)> {
+        self.lines(session)
+            .into_iter()
+            .rev()
+            .find_map(|line| match line {
+                Line::User { text, .. } => Some((true, text)),
+                Line::Assistant { text, .. } => Some((false, text)),
                 _ => None,
             })
     }

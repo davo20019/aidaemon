@@ -361,45 +361,60 @@ fn usage(s: &SystemStatus) -> View {
             )),
         }
     }
-    let most = days.iter().map(|d| d.1 + d.2).max().unwrap_or(1).max(1);
     let total: u64 = days.iter().map(|d| d.1 + d.2).sum();
-    let mut c = card();
+    // The chart reads oldest to newest; the list under it newest first.
+    let oldest_first: Vec<_> = days.iter().rev().cloned().collect();
+    let hovered = signal(None::<u32>);
+    let readout = {
+        let days = oldest_first.clone();
+        move || match hovered.get().and_then(|i| days.get(i as usize)) {
+            Some((day, input, output, requests)) => format!(
+                "{day}: {} in · {} out · {requests} calls",
+                tokens(*input),
+                tokens(*output)
+            ),
+            None => format!("{} tokens in all · in (grey) and out (teal)", tokens(total)),
+        }
+    };
+    let chart = ui::day_bars(
+        "Tokens per day, oldest first",
+        oldest_first.len(),
+        oldest_first.iter().map(|d| d.1 as f64).collect(),
+        oldest_first.iter().map(|d| d.2 as f64).collect(),
+        hovered,
+    );
+    let mut c = card().child(
+        view().px_2().pt_2().gap_1().child(chart).child(
+            text(readout)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        ),
+    );
     for (day, input, output, requests) in days {
-        let share = (input + output) as f32 / most as f32;
         c = c.child(
-            view()
-                .gap(px(4.0))
-                .px_2()
-                .py_1()
-                .child(
-                    view()
-                        .flex_row()
-                        .gap_2()
-                        .child(
-                            text(day.clone())
-                                .flex_1()
-                                .font_family(ui::theme::MONO)
-                                .text_size(px(type_scale::SM)),
-                        )
-                        .child(
-                            text(format!(
-                                "{} in · {} out · {requests} calls",
-                                tokens(input),
-                                tokens(output)
-                            ))
-                            .text_size(px(type_scale::SM))
-                            .text_color(colors::MUTED),
-                        ),
-                )
-                .child(ui::meter(format!("{day}: share of the busiest day"), share)),
+            view().px_2().py_1().child(
+                view()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        text(day.clone())
+                            .flex_1()
+                            .font_family(ui::theme::MONO)
+                            .text_size(px(type_scale::SM)),
+                    )
+                    .child(
+                        text(format!(
+                            "{} in · {} out · {requests} calls",
+                            tokens(input),
+                            tokens(output)
+                        ))
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::MUTED),
+                    ),
+            ),
         );
     }
-    section("Token use, last 7 days").child(c).child(
-        text(format!("{} tokens in all", tokens(total)))
-            .px_2()
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT),
-    )
+    section("Token use, last 7 days").child(c)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

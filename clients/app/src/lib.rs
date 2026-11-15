@@ -55,6 +55,21 @@ pub fn feed(updates: impl IntoIterator<Item = aidaemon_client_core::Update>) {
     }
 }
 
+/// The ids of commands an [`Offline`] root queued, newest last, with their
+/// `type`: tests answer them as the daemon would.
+static SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The id of the last command of `kind` (its `type`, as `get_changes`) an
+/// [`Offline`] root queued.
+pub fn sent(kind: &str) -> Option<String> {
+    SENT.lock()
+        .ok()?
+        .iter()
+        .rev()
+        .find(|(_, k)| k == kind)
+        .map(|(id, _)| id.clone())
+}
+
 /// The shell over a store fed by [`feed`] instead of a link: tests and
 /// previews drive it with gateway frames.
 #[component]
@@ -68,6 +83,14 @@ pub fn Offline() -> impl IntoElement {
             .unwrap_or_default();
         for update in updates {
             store.update(update);
+        }
+        for kind in ["get_changes", "get_settings"] {
+            if let Some(id) = store.queued_id(kind)
+                && let Ok(mut sent) = SENT.lock()
+                && !sent.iter().any(|(i, _)| *i == id)
+            {
+                sent.push((id, kind.to_owned()));
+            }
         }
     });
     view()
