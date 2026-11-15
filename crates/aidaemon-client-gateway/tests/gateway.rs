@@ -1488,6 +1488,14 @@ async fn no_view_action_can_resolve_an_approval() {
             .any(|a| a.id == approval_id),
         "the card is still waiting"
     );
+    // The turn waiting on it still runs: a client connecting now sees it.
+    assert!(
+        snapshot
+            .live_turns
+            .iter()
+            .any(|turn| turn.session_id == session_id),
+        "the waiting turn is live in the snapshot"
+    );
     let logged = f.gateway.bus().after(0, 500).await.unwrap();
     assert!(!logged.iter().any(|frame| matches!(
         frame,

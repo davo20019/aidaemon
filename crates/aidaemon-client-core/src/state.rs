@@ -173,6 +173,18 @@ impl State {
         for task in state.running_tasks {
             self.tasks.insert(task.id.clone(), task);
         }
+        // What running turns have got to: the working line comes back after
+        // a reload or a dropped connection, and later status events find
+        // their turn.
+        for turn in state.live_turns {
+            self.session(&turn.session_id).live = Some(LiveTurn {
+                turn_id: turn.turn_id,
+                streamed: turn.streamed,
+                status: turn.status.as_ref().map(status_text),
+                tools: turn.tools,
+                started_ms: turn.started_at_ms,
+            });
+        }
         self.last_seq = Some(seq);
     }
 
@@ -527,6 +539,48 @@ mod tests {
         assert_eq!(view.lines.len(), 2, "{:?}", view.lines);
         assert!(view.live.is_none());
         assert_eq!(state.last_seq, Some(3));
+    }
+
+    #[test]
+    fn a_snapshot_brings_back_what_a_running_turn_has_got_to() {
+        let mut state = State::default();
+        state.apply(ServerFrame::Snapshot {
+            seq: 4,
+            state: Snapshot {
+                live_turns: vec![aidaemon_client_protocol::LiveTurnState {
+                    session_id: "app:synthetic-1".into(),
+                    turn_id: "t1".into(),
+                    started_at_ms: 10,
+                    streamed: "Half a reply".into(),
+                    status: Some(TurnStatus::Thinking),
+                    tools: vec!["terminal".into()],
+                }],
+                ..Snapshot::default()
+            },
+        });
+        let live = state.sessions["app:synthetic-1"]
+            .live
+            .clone()
+            .expect("live");
+        assert_eq!(live.streamed, "Half a reply");
+        assert_eq!(live.tools, vec!["terminal".to_string()]);
+        assert!(live.status.is_some());
+        // A later status event finds its turn.
+        state.apply(event(
+            None,
+            Event::TurnStatus {
+                turn_id: "t1".into(),
+                status: TurnStatus::ToolStarted {
+                    name: "read_file".into(),
+                    summary: String::new(),
+                },
+            },
+        ));
+        let live = state.sessions["app:synthetic-1"]
+            .live
+            .clone()
+            .expect("live");
+        assert_eq!(live.tools.len(), 2);
     }
 
     #[test]

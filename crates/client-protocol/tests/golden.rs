@@ -74,6 +74,17 @@ fn snapshot() -> Snapshot {
         sessions: vec![session()],
         running_tasks: vec![task()],
         pending_approvals: vec![approval()],
+        live_turns: vec![LiveTurnState {
+            session_id: "app:synthetic-1".into(),
+            turn_id: "turn-7".into(),
+            started_at_ms: 1_700_000_000_000,
+            streamed: "Reading the synthetic notes".into(),
+            status: Some(TurnStatus::ToolStarted {
+                name: "terminal".into(),
+                summary: "cargo test -q".into(),
+            }),
+            tools: vec!["terminal".into()],
+        }],
     }
 }
 

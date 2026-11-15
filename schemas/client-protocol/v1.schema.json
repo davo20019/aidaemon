@@ -2399,6 +2399,47 @@
       ],
       "type": "object"
     },
+    "LiveTurnState": {
+      "description": "A running turn as far as it has got: the text streamed so far, what it\nis doing now and the tools it started, in order.",
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "streamed": {
+          "type": "string"
+        },
+        "tools": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "turn_id",
+        "started_at_ms"
+      ],
+      "type": "object"
+    },
     "McpAction": {
       "enum": [
         "enable",
@@ -3877,6 +3918,13 @@
     "Snapshot": {
       "description": "What a client needs when it cannot resume.",
       "properties": {
+        "live_turns": {
+          "description": "Turns running now, as far as each has got (protocol 1.7): a client\nthat (re)connects mid-turn shows what it is doing, not only that it\nruns.",
+          "items": {
+            "$ref": "#/$defs/LiveTurnState"
+          },
+          "type": "array"
+        },
         "pending_approvals": {
           "items": {
             "$ref": "#/$defs/Approval"

@@ -141,6 +141,9 @@ fn fit(frame: &ServerFrame, compact: bool) -> Option<ServerFrame> {
                 .into_iter()
                 .map(|a| a.compact())
                 .collect();
+            // As its streamed text and status events, a compact client
+            // goes without what running turns have got to.
+            state.live_turns.clear();
         }
         _ => {}
     }

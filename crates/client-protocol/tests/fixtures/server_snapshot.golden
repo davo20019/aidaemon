@@ -1,6 +1,22 @@
 {
   "seq": 42,
   "state": {
+    "live_turns": [
+      {
+        "session_id": "app:synthetic-1",
+        "started_at_ms": 1700000000000,
+        "status": {
+          "kind": "tool_started",
+          "name": "terminal",
+          "summary": "cargo test -q"
+        },
+        "streamed": "Reading the synthetic notes",
+        "tools": [
+          "terminal"
+        ],
+        "turn_id": "turn-7"
+      }
+    ],
     "pending_approvals": [
       {
         "card": {

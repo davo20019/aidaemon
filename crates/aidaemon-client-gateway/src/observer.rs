@@ -11,7 +11,9 @@ use aidaemon_channels::ports::AgentResponseEnvelope;
 use aidaemon_channels::turns::{
     Delivered, TurnEnd, TurnFinish, TurnObserver, TurnStart, TurnSurface,
 };
-use aidaemon_client_protocol::{Event, StepState, TaskState, TaskSummary, TurnState, TurnStatus};
+use aidaemon_client_protocol::{
+    Event, LiveTurnState, StepState, TaskState, TaskSummary, TurnState, TurnStatus,
+};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::ApprovalResponse;
 use aidaemon_tools::status::StatusUpdate;
@@ -56,10 +58,16 @@ pub struct GatewayObserver {
     pub(crate) active: Arc<Mutex<HashSet<String>>>,
     /// Turns running now, for their start time and description.
     pub(crate) running: Mutex<std::collections::HashMap<u64, (String, u64)>>,
+    /// Turns running now, as far as each has got: what a snapshot gives a
+    /// client that connects mid-turn.
+    pub(crate) live: LiveTurns,
     /// Each chat conversation as its own channel last saw it: what a reply
     /// from the app into that conversation runs under.
     pub(crate) contexts: Contexts,
 }
+
+/// Turns running now, by turn number.
+pub(crate) type LiveTurns = Arc<Mutex<std::collections::HashMap<u64, LiveTurnState>>>;
 
 /// Chat conversations' channel contexts, by session.
 pub(crate) type Contexts =
@@ -159,6 +167,17 @@ impl TurnObserver for GatewayObserver {
         if let Ok(mut running) = self.running.lock() {
             running.insert(turn.turn, (turn.description.to_string(), started));
         }
+        if let Ok(mut live) = self.live.lock() {
+            live.insert(
+                turn.turn,
+                LiveTurnState {
+                    session_id: turn.session_id.to_string(),
+                    turn_id: self.ids.turn(turn.turn),
+                    started_at_ms: started,
+                    ..LiveTurnState::default()
+                },
+            );
+        }
         let session = Some(turn.session_id.to_string());
         self.publisher.publish(
             session.clone(),
@@ -198,6 +217,11 @@ impl TurnObserver for GatewayObserver {
         let turn_id = self.ids.turn(turn);
         let session = Some(session_id.to_string());
         if let StatusUpdate::ReplyText(text) = update {
+            if let Ok(mut live) = self.live.lock()
+                && let Some(state) = live.get_mut(&turn)
+            {
+                state.streamed.push_str(text);
+            }
             self.publisher.publish(
                 session,
                 Event::TurnDelta {
@@ -218,6 +242,14 @@ impl TurnObserver for GatewayObserver {
             return;
         }
         if let Some(status) = status_of(update) {
+            if let Ok(mut live) = self.live.lock()
+                && let Some(state) = live.get_mut(&turn)
+            {
+                if let TurnStatus::ToolStarted { name, .. } = &status {
+                    state.tools.push(name.clone());
+                }
+                state.status = Some(status.clone());
+            }
             self.publisher
                 .publish(session, Event::TurnStatus { turn_id, status });
         }
@@ -230,6 +262,9 @@ impl TurnObserver for GatewayObserver {
             .ok()
             .and_then(|mut running| running.remove(&turn.turn))
             .unwrap_or_default();
+        if let Ok(mut live) = self.live.lock() {
+            live.remove(&turn.turn);
+        }
         let (state, task_state) = match turn.end {
             TurnEnd::Delivered if turn.handed_off => (TurnState::HandedOff, TaskState::Completed),
             TurnEnd::Delivered => (TurnState::Completed, TaskState::Completed),

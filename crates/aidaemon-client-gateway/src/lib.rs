@@ -267,6 +267,8 @@ pub struct ClientGateway {
     active: Arc<Mutex<HashSet<String>>>,
     /// Chat conversations' contexts, for replies from the app.
     contexts: observer::Contexts,
+    /// Turns running now, as far as each has got.
+    live: observer::LiveTurns,
     hub: Arc<ChannelHub>,
     pub(crate) config: ClientGatewayConfig,
     endpoints: aidaemon_core::EndpointSource,
@@ -314,11 +316,13 @@ impl ClientGateway {
 
         let active = Arc::new(Mutex::new(HashSet::new()));
         let contexts = observer::Contexts::default();
+        let live = observer::LiveTurns::default();
         deps.turns.watch.set(Arc::new(GatewayObserver {
             publisher: publisher.clone(),
             ids: ids.clone(),
             active: active.clone(),
             running: Mutex::default(),
+            live: live.clone(),
             contexts: contexts.clone(),
         }));
         deps.hub.set_approval_tap(approvals.clone());
@@ -348,6 +352,7 @@ impl ClientGateway {
             host: deps.host,
             active,
             contexts,
+            live,
             hub: deps.hub.clone(),
             config: deps.config,
             endpoints: deps.endpoints,
@@ -1190,8 +1195,20 @@ impl ClientGateway {
                 sessions,
                 running_tasks: self.running_tasks().await,
                 pending_approvals: self.approvals.pending(),
+                live_turns: self.live_turns(),
             },
         )
+    }
+
+    /// Turns running now, oldest first, as far as each has got.
+    fn live_turns(&self) -> Vec<aidaemon_client_protocol::LiveTurnState> {
+        let mut turns: Vec<_> = self
+            .live
+            .lock()
+            .map(|live| live.values().cloned().collect())
+            .unwrap_or_default();
+        turns.sort_by_key(|turn: &aidaemon_client_protocol::LiveTurnState| turn.started_at_ms);
+        turns
     }
 
     pub async fn glance(&self, compact: bool) -> Glance {

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 6;
+pub const PROTOCOL_MINOR: u16 = 7;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1468,6 +1468,26 @@ pub struct Snapshot {
     pub sessions: Vec<SessionSummary>,
     pub running_tasks: Vec<TaskSummary>,
     pub pending_approvals: Vec<Approval>,
+    /// Turns running now, as far as each has got (protocol 1.7): a client
+    /// that (re)connects mid-turn shows what it is doing, not only that it
+    /// runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_turns: Vec<LiveTurnState>,
+}
+
+/// A running turn as far as it has got: the text streamed so far, what it
+/// is doing now and the tools it started, in order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct LiveTurnState {
+    pub session_id: String,
+    pub turn_id: String,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub streamed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TurnStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 /// How the daemon itself is doing, for the app's System area.
