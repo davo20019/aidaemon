@@ -15,7 +15,8 @@ use tracing::{info, warn};
 use crate::host::TurnHost;
 use crate::prompt::core as core_prompt;
 use crate::prompt::rules::{
-    infer_assistant_name_from_prompt, render_environment_section, task_lead_rules,
+    infer_assistant_name_from_prompt, render_environment_section, render_workspace_section,
+    task_lead_rules,
 };
 use crate::turn::resume::ResumeCheckpoint;
 
@@ -46,6 +47,7 @@ pub async fn build_system_prompt_for_message(
     resume_checkpoint: Option<&ResumeCheckpoint>,
     preserve_conversation_context: bool,
     project_instruction_scope: Option<&str>,
+    workspace: Option<&str>,
 ) -> anyhow::Result<(
     String,
     String,
@@ -287,7 +289,15 @@ pub async fn build_system_prompt_for_message(
     let (mut fresh_tail, mut continuation_tail) = (fresh_tail, continuation_tail);
     if channel_ctx.visibility != ChannelVisibility::PublicExternal && !mandate_context {
         let backend = host.execution_backend();
-        let environment = render_environment_section(backend.kind(), backend.home_hint().as_str());
+        let mut environment =
+            render_environment_section(backend.kind(), backend.home_hint().as_str());
+        // The folder the work is bound to (a project's, a goal's, or one a
+        // parent handed over) is enforced by the kernel; the model is told
+        // it too, or it works wherever it remembers the project being.
+        if let Some(workspace) = workspace.map(str::trim).filter(|w| !w.is_empty()) {
+            environment.push_str("\n\n");
+            environment.push_str(&render_workspace_section(workspace));
+        }
         for tail in [&mut fresh_tail, &mut continuation_tail] {
             tail.push_str("\n\n");
             tail.push_str(&environment);

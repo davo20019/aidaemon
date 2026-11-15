@@ -384,6 +384,7 @@ async fn build_isolated_mandate_bootstrap(
         None,
         false,
         None,
+        None,
     )
     .await?;
     anyhow::ensure!(
@@ -1535,6 +1536,7 @@ pub async fn run_bootstrap(
         resume_checkpoint.as_ref(),
         preserve_conversation_context,
         project_instruction_scope,
+        turn_context.bound_workspace.as_deref(),
     )
     .await?;
     let prompt_ms = prompt_started.elapsed().as_millis() as u64;

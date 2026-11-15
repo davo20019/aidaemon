@@ -130,7 +130,8 @@ pub fn shell(store: Store) -> View {
                         .flex_1()
                         .child(ui::pane(
                             ui::Edge::Left,
-                            ui::size::SIDEBAR,
+                            // A terminal's cells are wide: titles need more of them.
+                            if terminal { 340.0 } else { ui::size::SIDEBAR },
                             200.0,
                             420.0,
                             move || store.sidebar_open() && roomy.get(),

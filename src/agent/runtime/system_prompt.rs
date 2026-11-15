@@ -285,9 +285,13 @@ mod tests {
                 None,
                 false,
                 None,
+                Some("/home/synthetic/acme-site"),
             )
             .await
             .expect("build new-task prompt");
+
+        // A bound turn is told its folder.
+        assert!(tail.contains("[Workspace]\nThis work happens in /home/synthetic/acme-site."));
 
         assert!(!tail.contains("STALE_OUTPUT_FORMAT"));
         assert!(!tail.contains("package_name=stale"));
@@ -449,6 +453,7 @@ mod tests {
                 None,
                 false,
                 project_dir.path().to_str(),
+                None,
             )
             .await
             .expect("build mandate prompt");
@@ -579,6 +584,7 @@ mod tests {
             None,
             false,
             project_dir.path().to_str(),
+            None,
         )
         .await
         .expect("build isolated mandate executor prompt");

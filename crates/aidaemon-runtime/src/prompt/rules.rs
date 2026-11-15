@@ -667,6 +667,17 @@ pub fn render_environment_section(kind: BackendKind, home: &str) -> String {
     )
 }
 
+/// The folder a turn's work is bound to: where it reads, edits and runs
+/// commands, and what relative paths mean. Writes outside it are refused.
+pub fn render_workspace_section(workspace: &str) -> String {
+    format!(
+        "[Workspace]\nThis work happens in {workspace}. Read, edit and run commands there; a \
+         relative path means a path inside it, and a command without a directory runs there. \
+         Files outside it can be read but not changed. When a request names files that \
+         also exist in another copy elsewhere, it means the ones in {workspace}."
+    )
+}
+
 /// What the host's command-line tools are, when they differ from the GNU
 /// tools models tend to assume.
 fn userland_note(os: &str) -> &'static str {
