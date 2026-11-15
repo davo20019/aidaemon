@@ -511,6 +511,9 @@ pub fn pane(
     resizable_panel()
         .size(px(size))
         .size_range(px(min)..px(max))
+        // A side pane keeps its width as the window changes; the page takes
+        // the difference.
+        .fixed(true)
         .visible(visible)
         .child(content)
 }

@@ -106,17 +106,24 @@ pub fn shell(store: Store) -> View {
                 )
                 .child(inspector(store)),
         )
-        // A roomy window: the panes beside the page, each as wide as the
-        // owner drags it.
-        .child(
-            view()
-                .flex_1()
-                .flex_row()
-                .style_when(
-                    move || store.is_compact() && (store.sidebar_open() || store.inspector_open()),
-                    |s| s.hidden(),
-                )
-                .child(
+        // A narrow window (a phone): the page alone, as wide as the screen.
+        // A roomy one: the panes beside the page, each as wide as the owner
+        // drags it. Only crossing between the two remakes the layout.
+        .child(dynamic(move || {
+            if store.is_compact() {
+                return Some(untracked(|| {
+                    view()
+                        .flex_1()
+                        .flex_row()
+                        .style_when(
+                            move || store.sidebar_open() || store.inspector_open(),
+                            |s| s.hidden(),
+                        )
+                        .child(page(store, in_setup))
+                }));
+            }
+            Some(untracked(|| {
+                view().flex_1().flex_row().child(
                     ui::split()
                         .flex_1()
                         .child(ui::pane(
@@ -131,11 +138,12 @@ pub fn shell(store: Store) -> View {
                             ui::size::INSPECTOR,
                             260.0,
                             520.0,
-                            move || store.inspector_open() && wide.get() && !store.is_compact(),
+                            move || store.inspector_open() && wide.get(),
                             inspector(store),
                         )),
-                ),
-        )
+                )
+            }))
+        }))
         .child(when(palette, move || palette_dialog(store, palette)))
         .child(ui::toasts(
             move || store.toast(),
