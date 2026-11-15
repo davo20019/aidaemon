@@ -204,6 +204,7 @@ impl ClientHost for Host {
                 how_often: "Every weekday at 9:00 AM ET".into(),
                 status: "active".into(),
                 next_run_ms: Some(now_ms() + 5 * 3_600_000),
+                recent_runs: Vec::new(),
             },
             AutomationSummary {
                 id: "mandate-status".into(),
@@ -213,6 +214,7 @@ impl ClientHost for Host {
                 how_often: "Every hour".into(),
                 status: "paused".into(),
                 next_run_ms: None,
+                recent_runs: Vec::new(),
             },
             AutomationSummary {
                 id: "probe-site".into(),
@@ -222,6 +224,7 @@ impl ClientHost for Host {
                 how_often: "Every 5 minutes".into(),
                 status: "failed".into(),
                 next_run_ms: Some(now_ms() + 300_000),
+                recent_runs: Vec::new(),
             },
         ])
     }
