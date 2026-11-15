@@ -97,11 +97,15 @@ impl QueuedMessage {
 
     /// Same sender and context, and the same placement: a message meant
     /// for the running work never runs merged into one the owner queued
-    /// for its own turn.
+    /// for its own turn. And none the owner queued for its own turn joins
+    /// another: each was sent as a request of its own (fragments of one
+    /// long message, which this merging is for, are not placed).
     fn can_coalesce_with(&self, other: &Self) -> bool {
         self.user_role == other.user_role
             && self.channel_ctx == other.channel_ctx
             && self.steerable == other.steerable
+            && !self.placed_for_later
+            && !other.placed_for_later
     }
 }
 
@@ -1450,6 +1454,22 @@ mod queue_edit_tests {
             .map(|(_, text, _, _)| text)
             .collect();
         assert_eq!(left, ["after this"]);
+    }
+
+    #[tokio::test]
+    async fn messages_queued_for_later_each_run_as_their_own_turn() {
+        let registry = TaskRegistry::new(10);
+        let session = "app:synthetic-separate-turns";
+        let ctx = ChannelContext::private("app");
+        for text in ["draft the invoice", "then plan the trip"] {
+            let later = QueuedMessage::new(text, UserRole::Owner, ctx.clone(), Vec::new())
+                .placed_for_later();
+            registry.queue_message(session, later, None).await;
+        }
+        let first = registry.pop_all_queued_messages(session).await.unwrap();
+        assert_eq!(first.text, "draft the invoice");
+        let second = registry.pop_all_queued_messages(session).await.unwrap();
+        assert_eq!(second.text, "then plan the trip");
     }
 
     #[tokio::test]
