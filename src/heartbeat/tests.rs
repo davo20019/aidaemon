@@ -2882,3 +2882,71 @@ async fn test_stale_pending_confirmation_cleanup() {
     let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
     assert!(schedules.is_empty());
 }
+
+/// A recurring run long past its time (the daemon was off) is skipped and
+/// said, not started late: a 9 AM digest never lands at night (research
+/// 2026-11-15: late catch-ups and silent misses are top complaints).
+#[tokio::test]
+async fn test_a_recurring_run_past_its_catch_up_window_is_skipped_and_said() {
+    let state = test_state_store().await;
+    let goal = Goal::new_continuous("Daily synthetic digest", "session-1", None, None);
+    state.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now();
+    let now_ts = now.to_rfc3339();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 9 * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("daily at 9am".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: (now - chrono::Duration::hours(5)).to_rfc3339(),
+        created_at: now_ts.clone(),
+        updated_at: now_ts,
+    };
+    state.create_goal_schedule(&schedule).await.unwrap();
+
+    let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+    let mut coordinator =
+        HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+    coordinator.tick().await.unwrap();
+
+    assert!(
+        state.get_tasks_for_goal(&goal.id).await.unwrap().is_empty(),
+        "a stale occurrence starts no work"
+    );
+    let moved = state
+        .get_schedules_for_goal(&goal.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let next = chrono::DateTime::parse_from_rfc3339(&moved.next_run_at).unwrap();
+    assert!(next > now, "the schedule moves to its next run");
+    let missed: Vec<_> = state
+        .get_pending_notifications(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.notification_type == "missed_run" && n.goal_id == goal.id)
+        .collect();
+    assert_eq!(missed.len(), 1);
+    assert!(
+        missed[0].message.starts_with("Missed the "),
+        "{}",
+        missed[0].message
+    );
+
+    // Said once: the next tick finds nothing due.
+    coordinator.tick().await.unwrap();
+    let again = state
+        .get_pending_notifications(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.notification_type == "missed_run")
+        .count();
+    assert_eq!(again, 1);
+}

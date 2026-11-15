@@ -319,6 +319,48 @@ impl GoalCycle {
             return Ok(());
         }
 
+        // A recurring run long past its time (the daemon was off) is not
+        // started late: it is skipped, the schedule moves to its next run,
+        // and the owner is told, so a morning digest never lands at night
+        // and a missed run is never silent. A one-shot still fires: a late
+        // reminder beats none.
+        if !schedule.is_one_shot
+            && let Ok(due) = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
+        {
+            let due = due.with_timezone(&chrono::Utc);
+            if let Some(window) = crate::schedule::catch_up_window(&schedule.cron_expr, due)
+                && now - due > window
+                && let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr)
+            {
+                schedule.next_run_at = next.to_rfc3339();
+                schedule.updated_at = now_ts.clone();
+                self.state.update_goal_schedule(&schedule).await?;
+                let msg = format!(
+                    "Missed the {} run of \"{}\": the daemon wasn't running then, and it is \
+                     too late to be useful now. Next run: {}.",
+                    crate::schedule::owner_time(&due.with_timezone(&chrono::Local)),
+                    self.presenter.goal_label(&goal.description),
+                    crate::schedule::owner_time(&next.with_timezone(&chrono::Local)),
+                );
+                let entry = crate::traits::NotificationEntry::new(
+                    &goal.id,
+                    &goal.session_id,
+                    "missed_run",
+                    &msg,
+                );
+                if let Err(error) = self.state.enqueue_notification(&entry).await {
+                    warn!(goal_id = %goal.id, %error, "Failed to enqueue missed-run notice");
+                }
+                info!(
+                    goal_id = %goal.id,
+                    schedule_id = %schedule.id,
+                    due = %due,
+                    "Skipped a scheduled run past its catch-up window"
+                );
+                return Ok(());
+            }
+        }
+
         // A continuous goal idle >30 days has likely stopped doing useful
         // work. We KEEP firing it (so it can recover on its own once it starts
         // succeeding again), but surface a one-time alert so a silently-dead

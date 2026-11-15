@@ -1090,6 +1090,37 @@ pub fn compute_next_run_local(cron_expr: &str) -> anyhow::Result<DateTime<Local>
         .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))
 }
 
+/// How late a recurring run may start and still be worth starting: half its
+/// period, between 5 minutes and 2 hours. A daily 9:00 AM digest the daemon
+/// was off for is not sent at 11 PM; an hourly check missed by a few
+/// minutes still runs, and a busy daemon's slow tick never skips one. `None` when the cron has no later occurrence.
+pub fn catch_up_window(cron_expr: &str, due: DateTime<Utc>) -> Option<chrono::Duration> {
+    let cron: Cron = cron_expr.parse().ok()?;
+    let due_local = due.with_timezone(&Local);
+    let after = cron.find_next_occurrence(&due_local, false).ok()?;
+    let period = after.with_timezone(&Utc) - due;
+    Some(
+        (period / 2)
+            .max(chrono::Duration::minutes(5))
+            .min(chrono::Duration::hours(2)),
+    )
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::{catch_up_window, compute_next_run};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn a_late_run_may_start_within_half_its_period_between_5_minutes_and_2_hours() {
+        let window = |cron: &str| catch_up_window(cron, compute_next_run(cron).unwrap());
+        assert_eq!(window("0 9 * * *"), Some(Duration::hours(2)));
+        assert_eq!(window("0 * * * *"), Some(Duration::minutes(30)));
+        assert_eq!(window("* * * * *"), Some(Duration::minutes(5)));
+        assert_eq!(catch_up_window("not a cron", Utc::now()), None);
+    }
+}
+
 /// Human-readable system timezone label used in schedule confirmations: the
 /// same short label every owner-facing time carries ([`owner_time`]).
 pub fn system_timezone_display() -> String {
