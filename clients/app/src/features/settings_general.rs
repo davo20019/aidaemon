@@ -220,7 +220,7 @@ pub fn general(store: Store, settings: &Settings) -> View {
 }
 
 /// How this device's composer behaves: kept on the device, not the daemon.
-fn this_device(store: Store) -> View {
+pub(super) fn this_device(store: Store) -> View {
     view().gap_2().child(section_label("On this device")).child(
         ui::surface()
             .p_3()

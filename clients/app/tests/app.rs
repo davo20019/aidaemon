@@ -172,6 +172,39 @@ fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
     Ok(())
 }
 
+/// A daemon's settings, as `get_settings` answers.
+const SETTINGS: &str = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "offered_models": ["gpt-x", "gpt-astra-synthetic"], "quick_model": "gpt-x", "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
+
+#[test]
+fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut config = EngineConfig::new(Root::of::<Offline>());
+    config.viewport = Size::new(Points(1280.0), Points(820.0));
+    config.environment.idiom = nsh_core::platform::Idiom::Terminal;
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("What should we work on?")?;
+    let before = sent("get_settings");
+    feed([Update::Connected]);
+    // From the keyboard: the command palette, then Settings.
+    app.press_key("mod+k")?;
+    app.wait_for("Settings: change how the daemon runs")?;
+    app.type_text("label:Commands", "settings")?;
+    app.press_key("Enter")?;
+    let id = wait_sent_new("get_settings", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
+    ))]);
+    // No tabs to reach: the models per job are the page.
+    app.wait_for("Hard work: synthetic-strong · Quick jobs: synthetic-quick")?;
+    app.wait_for("On this device")?;
+    if app.shows("Connections") || app.shows("Advanced") {
+        return Err("the terminal shows the settings tabs".into());
+    }
+    app.press("label:Change the models OpenAI uses")?;
+    app.wait_for("label:Hard work model")?;
+    Ok(())
+}
+
 #[test]
 fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
@@ -187,7 +220,7 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     // The settings arrive: a value edits as TOML in a code editor, and
     // another key is typed with the known keys suggested.
     let id = wait_sent("get_settings")?;
-    let result = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "offered_models": ["gpt-x", "gpt-astra-synthetic"], "quick_model": "gpt-x", "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
+    let result = SETTINGS;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
     ))]);

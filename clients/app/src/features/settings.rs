@@ -21,10 +21,18 @@ use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, t
 const TABS: [&str; 4] = ["General", "Models", "Connections", "Advanced"];
 /// The tab with every setting, the database and Reload or Restart.
 const ADVANCED: usize = 3;
+/// The terminal's one page: the models and this device, no tabs. The
+/// rest is the desktop and web app's.
+const TERMINAL: usize = usize::MAX;
+
+fn in_terminal() -> bool {
+    nsh_core::element::idiom() == nsh_core::platform::Idiom::Terminal
+}
 
 pub fn page(store: Store) -> View {
     let filter = signal(String::new());
-    let tab = signal(0_usize);
+    let terminal = in_terminal();
+    let tab = signal(if terminal { TERMINAL } else { 0_usize });
     // Open groups survive a refresh (a change landing rereads the page).
     let open = signal(Vec::<SharedString>::new());
     // The Providers tab's form, kept while the settings are read again.
@@ -57,7 +65,7 @@ pub fn page(store: Store) -> View {
                             ))
                         },
                     ))
-                    .child(ui::tab_bar(tab, &TABS))
+                    .children((!terminal).then(|| ui::tab_bar(tab, &TABS)))
                     .child(when(
                         move || tab.get() == ADVANCED,
                         move || {
@@ -214,6 +222,14 @@ fn ready(
     }
 
     match tab {
+        TERMINAL => {
+            return page
+                .child(providers(store, &settings, form))
+                .child(settings_general::this_device(store))
+                .child(faint(
+                    "Bots, MCP servers and every other setting are in the desktop and web app.",
+                ));
+        }
         0 => return page.child(settings_general::general(store, &settings)),
         1 => {
             return page
