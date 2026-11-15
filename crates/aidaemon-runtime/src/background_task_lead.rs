@@ -722,6 +722,63 @@ pub fn dispatch_closed_run(
         && (trigger_completed || !work_tasks.is_empty())
 }
 
+/// Why goal-run finalization found no live trigger to commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerFinalizationLoss {
+    /// The lead closed its own run (`complete_goal`/`fail_goal` call
+    /// `finish_goal_run`, which also ends the run's trigger task) and no
+    /// other attempt holds the trigger: nothing was lost.
+    ClosedByOwnLead,
+    /// Another attempt owns the trigger, or the run is still open without
+    /// this lease: a replacement lead (or lease recovery) took the run.
+    LeaseLost,
+}
+
+/// Classifies a trigger that finalization could not commit, from typed
+/// state: the trigger's status, its current live attempt and its run.
+pub fn classify_trigger_finalization_loss(
+    own_attempt_id: &str,
+    trigger_status: Option<&str>,
+    current_attempt_id: Option<&str>,
+    run_status: Option<&str>,
+) -> TriggerFinalizationLoss {
+    let trigger_terminal =
+        trigger_status.is_some_and(|status| !matches!(status, "pending" | "claimed" | "running"));
+    let run_terminal =
+        run_status.is_some_and(|status| matches!(status, "completed" | "failed" | "cancelled"));
+    let no_other_owner = current_attempt_id.is_none_or(|id| id == own_attempt_id);
+    if trigger_terminal && run_terminal && no_other_owner {
+        TriggerFinalizationLoss::ClosedByOwnLead
+    } else {
+        TriggerFinalizationLoss::LeaseLost
+    }
+}
+
+/// Reads the state [`classify_trigger_finalization_loss`] needs.
+pub async fn probe_trigger_finalization_loss<S>(
+    state: &S,
+    trigger_task_id: &str,
+    own_attempt_id: &str,
+) -> TriggerFinalizationLoss
+where
+    S: aidaemon_work::traits::TaskStore + aidaemon_work::traits::WorkCoordinationStore + ?Sized,
+{
+    let (Ok(trigger), Ok(current_attempt), Ok(run)) = (
+        state.get_task(trigger_task_id).await,
+        state.get_current_task_attempt(trigger_task_id).await,
+        state.get_goal_run_for_task(trigger_task_id).await,
+    ) else {
+        // Unreadable state is not proof the lead closed its own run.
+        return TriggerFinalizationLoss::LeaseLost;
+    };
+    classify_trigger_finalization_loss(
+        own_attempt_id,
+        trigger.as_ref().map(|task| task.status.as_str()),
+        current_attempt.as_ref().map(|attempt| attempt.id.as_str()),
+        run.as_ref().map(|run| run.status.as_str()),
+    )
+}
+
 pub fn task_lead_semantically_succeeded(
     task_lead_outcome: Option<TaskOutcome>,
     is_mandate_run: bool,
@@ -2332,10 +2389,26 @@ pub fn spawn_background_task_lead(
             let _ = keepalive_handle.await;
 
             if !trigger_finalization_authoritative {
-                warn!(
-                    goal_id = %goal_id,
-                    "Aborting goal-run finalization because the task-lead lease was lost"
-                );
+                let loss = match (
+                    dispatch_trigger_task_id.as_deref(),
+                    dispatch_attempt.as_ref(),
+                ) {
+                    (Some(trigger_task_id), Some(attempt)) => {
+                        probe_trigger_finalization_loss(&*state, trigger_task_id, &attempt.id).await
+                    }
+                    _ => TriggerFinalizationLoss::LeaseLost,
+                };
+                if loss == TriggerFinalizationLoss::ClosedByOwnLead {
+                    info!(
+                        goal_id = %goal_id,
+                        "Skipping goal-run finalization: the task lead already closed its run"
+                    );
+                } else {
+                    warn!(
+                        goal_id = %goal_id,
+                        "Aborting goal-run finalization because the task-lead lease was lost"
+                    );
+                }
                 return;
             }
 
@@ -3563,6 +3636,139 @@ mod tests {
         assert!(dispatch_closed_run(false, &[task("completed")]));
         assert!(!dispatch_closed_run(true, &[task("pending")]));
         assert!(!dispatch_closed_run(true, &[task("failed")]));
+    }
+
+    fn synthetic_trigger(goal_id: &str) -> aidaemon_work::traits::Task {
+        aidaemon_work::traits::Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal_id.to_string(),
+            description: "Scheduled check: synthetic recurrence".to_string(),
+            status: "pending".to_string(),
+            priority: "low".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 3,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    /// A lead that fails its own scheduled run (fail_goal -> finish_goal_run)
+    /// ends the trigger task under it. Finalization must see that as the
+    /// lead's own close, not as a lost lease; a replacement lead holding the
+    /// trigger is still a lost lease.
+    #[tokio::test]
+    async fn finalization_tells_a_self_closed_run_from_a_lost_lease() {
+        use aidaemon_work::traits::{GoalStore, TaskStore, WorkCoordinationStore};
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let store = aidaemon_work::sqlite::open_for_tests(database.path().to_str().unwrap()).await;
+        let goal = Goal::new_continuous("synthetic recurrence", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+
+        // The lead closes its own run.
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, None)
+            .await
+            .unwrap();
+        let trigger = synthetic_trigger(&goal.id);
+        store.create_task(&trigger).await.unwrap();
+        let attempt = store
+            .claim_task_with_lease(&trigger.id, "task-lead-a", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("claim succeeds");
+        assert!(
+            store
+                .finish_goal_run(&run.id, "failed", Some("synthetic failure"))
+                .await
+                .unwrap()
+        );
+        let closed = store.get_task(&trigger.id).await.unwrap().unwrap();
+        assert!(!matches!(closed.status.as_str(), "running" | "claimed"));
+        assert_eq!(
+            probe_trigger_finalization_loss(&store, &trigger.id, &attempt.id).await,
+            TriggerFinalizationLoss::ClosedByOwnLead
+        );
+
+        // A replacement lead owns the trigger of a still-open run.
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", None, None)
+            .await
+            .unwrap();
+        let trigger = synthetic_trigger(&goal.id);
+        store.create_task(&trigger).await.unwrap();
+        let stale = store
+            .claim_task_with_lease(&trigger.id, "task-lead-a", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("claim succeeds");
+        sqlx::query(
+            "UPDATE task_attempts SET lease_expires_at = datetime('now', '-1 second') WHERE id = ?",
+        )
+        .bind(&stale.id)
+        .execute(&store.pool())
+        .await
+        .unwrap();
+        store.recover_expired_task_attempts().await.unwrap();
+        let replacement = store
+            .claim_task_with_lease(&trigger.id, "task-lead-b", Some("profile-task-lead"), 180)
+            .await
+            .unwrap()
+            .expect("replacement claim succeeds");
+        assert_ne!(replacement.id, stale.id);
+        assert_eq!(
+            store
+                .get_goal_run_for_task(&trigger.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            run.id
+        );
+        assert_eq!(
+            probe_trigger_finalization_loss(&store, &trigger.id, &stale.id).await,
+            TriggerFinalizationLoss::LeaseLost
+        );
+    }
+
+    #[test]
+    fn trigger_finalization_loss_needs_a_terminal_run_and_no_other_owner() {
+        use TriggerFinalizationLoss::*;
+        let own = "attempt-a";
+        let classify = classify_trigger_finalization_loss;
+        assert_eq!(
+            classify(own, Some("cancelled"), Some(own), Some("failed")),
+            ClosedByOwnLead
+        );
+        assert_eq!(
+            classify(own, Some("completed"), None, Some("completed")),
+            ClosedByOwnLead
+        );
+        // Requeued for a replacement lead.
+        assert_eq!(
+            classify(own, Some("pending"), None, Some("running")),
+            LeaseLost
+        );
+        // A replacement lead holds the trigger.
+        assert_eq!(
+            classify(own, Some("running"), Some("attempt-b"), Some("running")),
+            LeaseLost
+        );
+        // Lease expiry blocked the run: not closed by the lead.
+        assert_eq!(
+            classify(own, Some("blocked"), None, Some("blocked")),
+            LeaseLost
+        );
+        assert_eq!(classify(own, None, None, None), LeaseLost);
     }
 
     #[test]
