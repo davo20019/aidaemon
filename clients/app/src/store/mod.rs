@@ -1380,8 +1380,12 @@ impl Store {
     }
 
     /// Choose the project the new conversation on screen starts in.
+    /// Where a new conversation works; then typing goes on in the
+    /// composer, not the picker that just closed (live 2026-11-15: in the
+    /// terminal, a project picked left no way to type the message).
     pub fn set_new_project(&self, project: Option<String>) {
         self.new_project.set(project);
+        self.focus_composer();
     }
 
     pub fn project_open(&self, id: &str) -> bool {
