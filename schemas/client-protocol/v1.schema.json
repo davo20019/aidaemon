@@ -1422,6 +1422,85 @@
         }
       ]
     },
+    "ConnectedProvider": {
+      "description": "A provider the daemon uses: the main one or a failover.",
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "credential": {
+          "$ref": "#/$defs/CredentialState"
+        },
+        "failover": {
+          "description": "`None`: the main provider; else failover `index` (from 0).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "key_setting": {
+          "description": "The setting its key is stored under (`provider.api_key`,\n`provider.fallbacks[0].api_key`); empty for a sign-in.",
+          "type": "string"
+        },
+        "models": {
+          "description": "Its default model first, then the others it uses.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "In plain words (\"Anthropic\", \"OpenAI-compatible · example.com\").",
+          "type": "string"
+        },
+        "preset": {
+          "description": "The catalog preset it matches; empty when none does.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "credential"
+      ],
+      "type": "object"
+    },
+    "CredentialState": {
+      "description": "How a connected provider is signed in.",
+      "oneOf": [
+        {
+          "const": "key_stored",
+          "description": "Its key is in the keychain.",
+          "type": "string"
+        },
+        {
+          "const": "key_in_file",
+          "description": "Its key is written in config.toml.",
+          "type": "string"
+        },
+        {
+          "const": "key_missing",
+          "description": "It needs a key and has none.",
+          "type": "string"
+        },
+        {
+          "const": "signed_in",
+          "description": "The ChatGPT subscription is signed in.",
+          "type": "string"
+        },
+        {
+          "const": "signed_out",
+          "description": "The ChatGPT subscription is not signed in.",
+          "type": "string"
+        },
+        {
+          "const": "not_needed",
+          "description": "It needs no key.",
+          "type": "string"
+        }
+      ]
+    },
     "DatabaseAction": {
       "oneOf": [
         {
@@ -3296,9 +3375,32 @@
           },
           "type": "array"
         },
+        "chatgpt_signed_in": {
+          "default": false,
+          "description": "A ChatGPT subscription sign-in is stored on the daemon's machine.",
+          "type": "boolean"
+        },
+        "checked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CheckedKey"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last key checked from Settings, with its account's models."
+        },
         "config_path": {
           "description": "The config file the settings live in.",
           "type": "string"
+        },
+        "connected": {
+          "description": "The providers the daemon uses, main first, then each failover in\nthe order it is tried (protocol 1.8).",
+          "items": {
+            "$ref": "#/$defs/ConnectedProvider"
+          },
+          "type": "array"
         },
         "database_encrypted": {
           "default": false,
@@ -3345,6 +3447,17 @@
           "default": false,
           "description": "Saved changes that take effect on a restart.",
           "type": "boolean"
+        },
+        "sign_in": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SignIn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A ChatGPT sign-in started from Settings, waiting for the owner."
         }
       },
       "required": [
@@ -3401,8 +3514,18 @@
           "type": "object"
         },
         {
-          "description": "Make a provider preset the primary provider.",
+          "description": "Make a provider preset the primary provider. `key` (protocol 1.8):\nits API key, stored in the main provider's keychain slot first.",
           "properties": {
+            "key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SecretText"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "const": "switch_provider",
               "type": "string"
@@ -3418,8 +3541,18 @@
           "type": "object"
         },
         {
-          "description": "Add a failover provider after the others.",
+          "description": "Add a failover provider after the others. `key` (protocol 1.8): its\nAPI key, stored in the new failover's keychain slot first.",
           "properties": {
+            "key": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SecretText"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "kind": {
               "const": "add_failover",
               "type": "string"
@@ -3431,6 +3564,74 @@
           "required": [
             "kind",
             "provider"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Check a provider's key (nothing is saved) and read the models its\naccount offers: the settings' `checked` (protocol 1.8).",
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/SecretText"
+            },
+            "kind": {
+              "const": "check_key",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "#/$defs/ProviderChoice"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Start a ChatGPT subscription sign-in: the settings' `sign_in`.\n`paste`: the browser is on another device (protocol 1.8).",
+          "properties": {
+            "kind": {
+              "const": "sign_in",
+              "type": "string"
+            },
+            "paste": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The address the sign-in's browser ended on (protocol 1.8).",
+          "properties": {
+            "kind": {
+              "const": "finish_sign_in",
+              "type": "string"
+            },
+            "redirect": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "redirect"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Drop a sign-in under way (protocol 1.8).",
+          "properties": {
+            "kind": {
+              "const": "cancel_sign_in",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
           ],
           "type": "object"
         },

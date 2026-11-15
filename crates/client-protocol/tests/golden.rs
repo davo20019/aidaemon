@@ -696,6 +696,33 @@ fn server_samples() -> Vec<ServerFrame> {
                     needs_base_url: false,
                     model: "gpt-x".into(),
                 }],
+                connected: vec![
+                    ConnectedProvider {
+                        failover: None,
+                        preset: "openai_chatgpt".into(),
+                        name: "OpenAI (ChatGPT subscription)".into(),
+                        base_url: String::new(),
+                        models: vec!["synthetic-model-1".into()],
+                        credential: CredentialState::SignedIn,
+                        key_setting: String::new(),
+                    },
+                    ConnectedProvider {
+                        failover: Some(0),
+                        preset: "openai".into(),
+                        name: "OpenAI".into(),
+                        base_url: "https://api.example.com/v1".into(),
+                        models: vec!["gpt-x".into()],
+                        credential: CredentialState::KeyStored,
+                        key_setting: "provider.fallbacks[0].api_key".into(),
+                    },
+                ],
+                chatgpt_signed_in: true,
+                sign_in: None,
+                checked: Some(CheckedKey {
+                    preset: "openai".into(),
+                    models: vec!["gpt-x".into(), "gpt-y".into()],
+                    suggested: Some("gpt-x".into()),
+                }),
             },
         }),
         ack(CommandResult::SettingsChanged {

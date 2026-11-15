@@ -12,7 +12,37 @@
           "platform": "telegram"
         }
       ],
+      "chatgpt_signed_in": true,
+      "checked": {
+        "models": [
+          "gpt-x",
+          "gpt-y"
+        ],
+        "preset": "openai",
+        "suggested": "gpt-x"
+      },
       "config_path": "/home/synthetic/.aidaemon/config.toml",
+      "connected": [
+        {
+          "credential": "signed_in",
+          "models": [
+            "synthetic-model-1"
+          ],
+          "name": "OpenAI (ChatGPT subscription)",
+          "preset": "openai_chatgpt"
+        },
+        {
+          "base_url": "https://api.example.com/v1",
+          "credential": "key_stored",
+          "failover": 0,
+          "key_setting": "provider.fallbacks[0].api_key",
+          "models": [
+            "gpt-x"
+          ],
+          "name": "OpenAI",
+          "preset": "openai"
+        }
+      ],
       "database_encrypted": true,
       "database_path": "/home/synthetic/.aidaemon/aidaemon.db",
       "groups": [

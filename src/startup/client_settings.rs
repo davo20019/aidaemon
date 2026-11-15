@@ -16,6 +16,7 @@ use aidaemon_client_protocol::{
 };
 use serde_json::{Value, json};
 
+use crate::startup::client_providers::{self, ProviderFlow};
 use crate::startup::settings_upkeep::{self, DbUpkeep, Trial};
 use crate::tools::ConfigManagerTool;
 use crate::traits::StateStore;
@@ -316,6 +317,8 @@ pub(crate) struct SettingsHost {
     /// Saved changes waiting for a reload, and for a restart.
     pub pending: Mutex<(bool, bool)>,
     pub trial: Option<Arc<Trial>>,
+    /// A ChatGPT sign-in or key check under way from the Providers tab.
+    pub flow: ProviderFlow,
 }
 
 impl SettingsHost {
@@ -337,6 +340,7 @@ impl SettingsHost {
             commands,
             pending: Mutex::new((false, false)),
             trial,
+            flow: ProviderFlow::default(),
         }
     }
 
@@ -485,7 +489,12 @@ impl SettingsHost {
             .unwrap_or("aidaemon.db")
             .to_string();
         let (reload_pending, restart_pending) = *self.pending();
+        let (sign_in, checked) = self.flow.shown().await;
         Ok(Settings {
+            connected: client_providers::connected(&current),
+            chatgpt_signed_in: client_providers::chatgpt_signed_in(),
+            sign_in,
+            checked,
             config_path: self.config_path.display().to_string(),
             groups,
             bots,
@@ -531,10 +540,10 @@ impl SettingsHost {
                     None => json!({"action": "unset", "key": key}),
                 }
             }
-            SettingsChange::SwitchProvider { provider } => {
+            SettingsChange::SwitchProvider { provider, .. } => {
                 provider_args("switch_provider", provider)
             }
-            SettingsChange::AddFailover { provider } => {
+            SettingsChange::AddFailover { provider, .. } => {
                 provider_args("add_failover_provider", provider)
             }
             SettingsChange::RemoveFailover { index } => {
@@ -569,6 +578,11 @@ impl SettingsHost {
             }
         }
         if let Some(call) = self.config_call(change)? {
+            // A provider change that stores a key asks even when the
+            // config tool cannot word it yet (the key is not stored).
+            if let Some((summary, _)) = self.key_change(change)? {
+                return Ok(ask(summary, false));
+            }
             if let crate::traits::OwnerApprovalNeed::Ask(request) =
                 self.tool.owner_approval(&call).await
             {
@@ -650,7 +664,12 @@ impl SettingsHost {
                 DatabaseAction::Cancel => SettingsGate::Free,
                 DatabaseAction::Unknown => return Err("Unknown database action".to_string()),
             },
-            SettingsChange::RemoveBot { .. } | SettingsChange::Apply { .. } => SettingsGate::Free,
+            SettingsChange::RemoveBot { .. }
+            | SettingsChange::Apply { .. }
+            | SettingsChange::CheckKey { .. }
+            | SettingsChange::SignIn { .. }
+            | SettingsChange::FinishSignIn { .. }
+            | SettingsChange::CancelSignIn => SettingsGate::Free,
             _ => return Err("This change is not known to this daemon".to_string()),
         })
     }
@@ -661,39 +680,196 @@ impl SettingsHost {
         approved: bool,
     ) -> Result<SettingsDone, String> {
         if let Some(call) = self.config_call(&change)? {
-            let key = match &change {
-                SettingsChange::Set { key, .. } => key.trim().to_string(),
-                _ => "provider".to_string(),
+            // Its key goes into the slot the provider reads first; the
+            // earlier one comes back if the change does not go through.
+            let stored_key = match self.key_change(&change)? {
+                Some((_, slot)) => Some(self.store_provider_key(&change, slot).await?),
+                None => None,
             };
-            let trial = on_trial(&key);
-            let trial_before = settings_upkeep::trial_active(&self.config_path);
-            if trial {
-                settings_upkeep::begin_trial(&self.config_path).map_err(|e| {
-                    format!("Could not keep the current config to roll back to: {e}")
-                })?;
+            let before = std::fs::read_to_string(&self.config_path).ok();
+            let mut done = self.config_change(&change, call, approved).await;
+            // `manage_config` explains some refusals in an answer that
+            // changed nothing: the key must not stay behind then either.
+            if stored_key.is_some()
+                && let Ok(answer) = &done
+                && std::fs::read_to_string(&self.config_path).ok() == before
+            {
+                done = Err(answer.message.clone());
             }
-            let applies = applies_of(&key);
-            let result = self.tool.run_owner_call(&call, approved).await;
-            let text = match result {
-                Ok(text) => text,
-                Err(reason) => {
-                    if trial && !trial_before {
-                        // Nothing changed: there is nothing to roll back.
-                        settings_upkeep::cancel_trial(&self.config_path);
-                    }
-                    return Err(first_paragraph(&reason));
-                }
-            };
-            self.note_saved(applies);
-            if matches!(change, SettingsChange::RestoreBackup) {
-                self.note_saved(Applies::Restart);
+            match (&done, stored_key) {
+                (Err(_), Some(earlier)) => earlier.put_back(),
+                (Ok(_), Some(_)) => self.flow.clear_checked().await,
+                _ => {}
             }
-            return Ok(SettingsDone {
-                message: first_paragraph(&text),
-                applies: Some(applies),
-            });
+            return done;
         }
+        self.other_change(change, approved).await
+    }
+
+    /// A provider change carrying a key: its approval card's words and the
+    /// keychain name the key goes under. `None`: it carries none.
+    fn key_change(&self, change: &SettingsChange) -> Result<Option<(String, String)>, String> {
+        let (provider, key, failover) = match change {
+            SettingsChange::SwitchProvider {
+                provider,
+                key: Some(key),
+            } => (provider, key, false),
+            SettingsChange::AddFailover {
+                provider,
+                key: Some(key),
+            } => (provider, key, true),
+            _ => return Ok(None),
+        };
+        if key.0.trim().is_empty() {
+            return Ok(None);
+        }
+        let entry = crate::setup::model::preset(&provider.preset).ok_or("Unknown provider")?;
+        if !entry.needs_api_key() {
+            return Err(format!("{} takes no API key", entry.display_name));
+        }
+        let current = self.current().map_err(|e| e.to_string())?;
+        let setting = if failover {
+            format!(
+                "provider.fallbacks[{}].api_key",
+                client_providers::failover_count(&current)
+            )
+        } else {
+            "provider.api_key".to_string()
+        };
+        let slot = crate::config::keychain_name_for(&setting)
+            .ok_or_else(|| format!("`{setting}` is not read from the keychain"))?;
+        let model = if provider.primary_model.trim().is_empty() {
+            entry.models.primary
+        } else {
+            provider.primary_model.trim()
+        };
+        let summary = if failover {
+            format!(
+                "Add {} ({model}) as a failover provider, with a new API key",
+                entry.display_name
+            )
+        } else {
+            format!(
+                "Make {} ({model}) the main provider, with a new API key",
+                entry.display_name
+            )
+        };
+        Ok(Some((summary, slot)))
+    }
+
+    /// Check `change`'s key with its provider, then store it under `slot`,
+    /// keeping what was there to put back.
+    async fn store_provider_key(
+        &self,
+        change: &SettingsChange,
+        slot: String,
+    ) -> Result<EarlierSecret, String> {
+        let (SettingsChange::SwitchProvider {
+            provider,
+            key: Some(key),
+        }
+        | SettingsChange::AddFailover {
+            provider,
+            key: Some(key),
+        }) = change
+        else {
+            return Err("This change carries no key".to_string());
+        };
+        let entry = crate::setup::model::preset(&provider.preset).ok_or("Unknown provider")?;
+        let base = if provider.base_url.trim().is_empty() {
+            entry.base_url
+        } else {
+            provider.base_url.trim()
+        };
+        if let Some(endpoint) = aidaemon_providers::key_check::KeyEndpoint::new(entry.kind, base) {
+            use aidaemon_providers::key_check::KeyCheck;
+            if let KeyCheck::Rejected(detail) =
+                aidaemon_providers::key_check::check_key(&endpoint, key.0.trim()).await
+            {
+                return Err(format!(
+                    "{} did not accept that key ({detail}); nothing was changed",
+                    entry.display_name
+                ));
+            }
+        }
+        use aidaemon_secrets::SecretStore as _;
+        let store = crate::config::secret_store();
+        let earlier = store.get(&slot).ok().map(|s| s.into_exposed());
+        crate::config::store_in_keychain(&slot, key.0.trim())
+            .map_err(|e| format!("Could not store the key: {e}"))?;
+        Ok(EarlierSecret { slot, earlier })
+    }
+
+    /// A change `manage_config` makes.
+    async fn config_change(
+        &self,
+        change: &SettingsChange,
+        call: Value,
+        approved: bool,
+    ) -> Result<SettingsDone, String> {
+        let key = match change {
+            SettingsChange::Set { key, .. } => key.trim().to_string(),
+            _ => "provider".to_string(),
+        };
+        let trial = on_trial(&key);
+        let trial_before = settings_upkeep::trial_active(&self.config_path);
+        if trial {
+            settings_upkeep::begin_trial(&self.config_path)
+                .map_err(|e| format!("Could not keep the current config to roll back to: {e}"))?;
+        }
+        let applies = applies_of(&key);
+        let result = self.tool.run_owner_call(&call, approved).await;
+        let text = match result {
+            Ok(text) => text,
+            Err(reason) => {
+                if trial && !trial_before {
+                    // Nothing changed: there is nothing to roll back.
+                    settings_upkeep::cancel_trial(&self.config_path);
+                }
+                return Err(first_paragraph(&reason));
+            }
+        };
+        self.note_saved(applies);
+        if matches!(change, SettingsChange::RestoreBackup) {
+            self.note_saved(Applies::Restart);
+        }
+        Ok(SettingsDone {
+            message: first_paragraph(&text),
+            applies: Some(applies),
+        })
+    }
+
+    /// A change that is not a config file edit.
+    async fn other_change(
+        &self,
+        change: SettingsChange,
+        approved: bool,
+    ) -> Result<SettingsDone, String> {
+        let now = |message: String| {
+            Ok(SettingsDone {
+                message,
+                applies: Some(Applies::Now),
+            })
+        };
         match change {
+            SettingsChange::CheckKey { provider, key } => {
+                now(self.flow.check_key(&provider, &key.0).await?)
+            }
+            SettingsChange::SignIn { paste } => {
+                let message = self
+                    .flow
+                    .sign_in(paste, |ok, message| {
+                        if let Some(gateway) = crate::startup::client_gateway::running() {
+                            gateway.settings_updated(ok, message);
+                        }
+                    })
+                    .await?;
+                now(message)
+            }
+            SettingsChange::FinishSignIn { redirect } => {
+                now(self.flow.finish_sign_in(&redirect).await?)
+            }
+            SettingsChange::CancelSignIn => now(self.flow.cancel_sign_in().await),
             SettingsChange::Secret { key, value } => {
                 let name = crate::config::keychain_name_for(&key)
                     .ok_or_else(|| format!("`{key}` is not read from the keychain"))?;
@@ -823,6 +999,27 @@ impl SettingsHost {
                 })
             }
             _ => Err("This change is not known to this daemon".to_string()),
+        }
+    }
+}
+
+/// What a keychain slot held before a provider key replaced it.
+struct EarlierSecret {
+    slot: String,
+    earlier: Option<String>,
+}
+
+impl EarlierSecret {
+    /// Put it back: the change it was made for did not go through.
+    fn put_back(self) {
+        use aidaemon_secrets::SecretStore as _;
+        let store = crate::config::secret_store();
+        let restored = match &self.earlier {
+            Some(value) => store.set(&self.slot, value),
+            None => store.delete(&self.slot),
+        };
+        if let Err(error) = restored {
+            tracing::warn!(slot = %self.slot, %error, "Could not put back a provider key");
         }
     }
 }

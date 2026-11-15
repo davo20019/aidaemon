@@ -734,6 +734,14 @@ impl ClientGateway {
         caller: &Caller,
     ) -> Result<CommandResult, ProtocolError> {
         let invalid = |message: String| ProtocolError::new(ErrorCode::Invalid, message);
+        // Only a client on the daemon's machine (the local token) can finish
+        // a sign-in on its loopback port; any other pastes the address.
+        let change = match change {
+            SettingsChange::SignIn { paste } => SettingsChange::SignIn {
+                paste: paste || !caller.principal.is_owner(),
+            },
+            other => other,
+        };
         match self.host.settings_gate(&change).await.map_err(invalid)? {
             SettingsGate::Free => {
                 let done = self
@@ -903,7 +911,9 @@ impl ClientGateway {
         self.publisher.publish(None, Event::SetupUpdated { setup });
     }
 
-    fn settings_updated(&self, ok: bool, message: String) {
+    /// Tell every client to read the settings again: `message` says what
+    /// changed (a sign-in that finished on its own, say).
+    pub fn settings_updated(&self, ok: bool, message: String) {
         self.publisher
             .publish(None, Event::SettingsUpdated { ok, message });
     }

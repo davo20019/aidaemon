@@ -82,6 +82,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Settings | A change is sent | The daemon's answer stays as a note at the top until dismissed; guarded changes say they wait for approval (or for another device) and a banner counts them |
 | Settings | Saved changes not yet in effect | Info banner with Reload, warning banner with Restart |
 | First run | No daemon to sign in to | "Where should your agent run?": Run it here (status while it starts) or a pairing link for one elsewhere |
+| Settings | Providers | "In use" lists the main provider and each failover in order, each with its models and a status dot for its key or ChatGPT sign-in; Add/Replace key opens a masked field under its row; Remove asks first. "Add a provider" opens a form for the provider picked: a key with Check key (then the account's models as a list), or Sign in with ChatGPT (a card with the page's link, and a paste field when the browser is on another device); Make it the main provider and Add as failover send the key with the change |
 | First run | Connect a model | Found models first with Use it; every provider says how it bills; a key form opens under its row; "Testing" while the test call runs; the daemon's refusal as a danger banner |
 | First run | Model connected | "Connected" with a working line until the daemon restarts with it |
 | First run | Chat step | Platform choices, then the token form; after connecting, "Waiting for your first message" until the bot has answered; Skip for now always |
@@ -96,7 +97,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
 - **Inbox** (the right pane): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
 - **Memory:** what the daemon remembers about the owner, newest first, filterable, each with Forget.
-- **Settings:** every setting of the daemon by config table (folded; filtering opens them), each with its value or "default (example: …)", "asks" when it needs approval, and when it takes effect; Edit in place as TOML, booleans as Turn on/off, secrets stored masked and never shown; any other key by path; providers and failover; runtime bots and MCP servers; moving the database and rotating its key; Reload and Restart.
+- **Settings:** every setting of the daemon by config table (folded; filtering opens them), each with its value or "default (example: …)", "asks" when it needs approval, and when it takes effect; Edit in place as TOML, booleans as Turn on/off, secrets stored masked and never shown; any other key by path; the providers in use with their keys or sign-in, and adding one as main or failover; runtime bots and MCP servers; moving the database and rotating its key; Reload and Restart.
 - **System:** daemon version, uptime and models; what needs a look; token use per day; model call times; scheduled goals; background jobs and queues; health checks.
 
 Times are shown in the owner's zone (`ui::time`): the browser's offset on the web, the system's elsewhere.

@@ -35,7 +35,7 @@ fn offered(entry: &CatalogEntry) -> bool {
         && entry.id != "anthropic_openrouter"
 }
 
-fn preset(id: &str) -> Option<&'static CatalogEntry> {
+pub(crate) fn preset(id: &str) -> Option<&'static CatalogEntry> {
     catalog::find(id)
 }
 
@@ -240,7 +240,7 @@ pub(crate) async fn test(candidate: &Candidate) -> Result<(), String> {
 
 /// Check `key` with `entry`'s provider (nothing is saved) and read the
 /// models its account offers.
-async fn check_key(
+pub(crate) async fn check_key(
     entry: &'static CatalogEntry,
     base_url: &str,
     key: &str,

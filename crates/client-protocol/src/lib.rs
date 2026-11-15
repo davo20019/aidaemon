@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 7;
+pub const PROTOCOL_MINOR: u16 = 8;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -492,6 +492,63 @@ pub struct Settings {
     /// client offers a list rather than a preset id typed by hand.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderOption>,
+    /// The providers the daemon uses, main first, then each failover in
+    /// the order it is tried (protocol 1.8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected: Vec<ConnectedProvider>,
+    /// A ChatGPT subscription sign-in is stored on the daemon's machine.
+    #[serde(default)]
+    pub chatgpt_signed_in: bool,
+    /// A ChatGPT sign-in started from Settings, waiting for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignIn>,
+    /// The last key checked from Settings, with its account's models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<CheckedKey>,
+}
+
+/// A provider the daemon uses: the main one or a failover.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ConnectedProvider {
+    /// `None`: the main provider; else failover `index` (from 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover: Option<u32>,
+    /// The catalog preset it matches; empty when none does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preset: String,
+    /// In plain words ("Anthropic", "OpenAI-compatible · example.com").
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub base_url: String,
+    /// Its default model first, then the others it uses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    pub credential: CredentialState,
+    /// The setting its key is stored under (`provider.api_key`,
+    /// `provider.fallbacks[0].api_key`); empty for a sign-in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_setting: String,
+}
+
+/// How a connected provider is signed in.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialState {
+    /// Its key is in the keychain.
+    KeyStored,
+    /// Its key is written in config.toml.
+    KeyInFile,
+    /// It needs a key and has none.
+    KeyMissing,
+    /// The ChatGPT subscription is signed in.
+    SignedIn,
+    /// The ChatGPT subscription is not signed in.
+    SignedOut,
+    /// It needs no key.
+    NotNeeded,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// The settings of one config table.
@@ -603,14 +660,38 @@ pub enum SettingsChange {
         key: String,
         value: SecretText,
     },
-    /// Make a provider preset the primary provider.
+    /// Make a provider preset the primary provider. `key` (protocol 1.8):
+    /// its API key, stored in the main provider's keychain slot first.
     SwitchProvider {
         provider: ProviderChoice,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<SecretText>,
     },
-    /// Add a failover provider after the others.
+    /// Add a failover provider after the others. `key` (protocol 1.8): its
+    /// API key, stored in the new failover's keychain slot first.
     AddFailover {
         provider: ProviderChoice,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<SecretText>,
     },
+    /// Check a provider's key (nothing is saved) and read the models its
+    /// account offers: the settings' `checked` (protocol 1.8).
+    CheckKey {
+        provider: ProviderChoice,
+        key: SecretText,
+    },
+    /// Start a ChatGPT subscription sign-in: the settings' `sign_in`.
+    /// `paste`: the browser is on another device (protocol 1.8).
+    SignIn {
+        #[serde(default)]
+        paste: bool,
+    },
+    /// The address the sign-in's browser ended on (protocol 1.8).
+    FinishSignIn {
+        redirect: String,
+    },
+    /// Drop a sign-in under way (protocol 1.8).
+    CancelSignIn,
     /// Remove failover provider `index` (from 0).
     RemoveFailover {
         index: u32,
