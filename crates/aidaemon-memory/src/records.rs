@@ -29,6 +29,25 @@ impl std::fmt::Display for FactPrivacy {
     }
 }
 
+/// Categories a background extractor (per-turn extraction, consolidation,
+/// task learning) may write flat facts into. Facts the owner stores
+/// explicitly keep any category; people go through structured personal
+/// memory, not this list.
+///
+/// `behavior` is deliberately absent: an extractor reads one session or one
+/// task, so it cannot observe recurrence, and asked for "recurring
+/// workflows" it filed every single request as a habit.
+pub const AUTOMATED_FACT_CATEGORIES: &[&str] =
+    &["user", "preference", "project", "technical", "relationship"];
+
+/// Whether a background extractor may write a flat fact in `category`.
+pub fn automated_fact_category_allowed(category: &str) -> bool {
+    let category = category.trim();
+    AUTOMATED_FACT_CATEGORIES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(category))
+}
+
 impl FactPrivacy {
     pub fn from_str_lossy(s: &str) -> Self {
         match s {

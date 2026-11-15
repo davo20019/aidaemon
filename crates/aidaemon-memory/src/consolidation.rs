@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 
 use crate::history::{ConsolidationCursors, ConversationSource, TurnRole};
 use crate::progressive::{identity_fact_lacks_user_evidence, worth_extracting};
-use crate::records::{ExtractedMemoryGraph, FactPrivacy, PersonalMemoryWrite};
+use crate::records::{
+    ExtractedMemoryGraph, FactPrivacy, PersonalMemoryWrite, automated_fact_category_allowed,
+};
 use crate::stores::FactStore;
 use crate::task_learning::{FACT_LIFETIME_INSTRUCTION, FactLifetime};
 
@@ -32,14 +34,13 @@ const CONSOLIDATION_PROMPT: &str = "You are a memory consolidation system. Given
             - project: Projects, tech stacks, goals\n\
             - technical: Environment details, installed tools\n\
             - relationship: Communication patterns with the AI\n\
-            - behavior: Observed tool-usage patterns and recurring workflows\n\
-            - people: Information about OTHER individuals mentioned or participating in conversation\n\n\
+            - people: Information about OTHER individuals mentioned or participating in conversation\n\
+            Use no other category.\n\n\
             ONLY learn from owner-authenticated user messages. NEVER extract or store facts from guest/public speakers, and NEVER treat another person's self-description as owner data. \
             A name mentioned in conversation belongs in \"people\" — it is NEVER the owner's \"name\" unless the owner explicitly states it as their own.\n\n\
-            For \"behavior\", look for:\n\
-            - Which tools the user prefers for specific tasks\n\
-            - Recurring workflows or action sequences\n\
-            - Types of tasks frequently delegated\n\n\
+            A request the owner makes is not a fact about them: you see one excerpt, so you cannot tell a habit from a one-off. \
+            Record a way of working only when the owner states it as a standing instruction (\"always tell me how long each task took\"), as a preference.\n\
+            If the owner later in the excerpt retracts or asks to forget something, do not extract it.\n\n\
             For \"people\", extract:\n\
             - Names and relationships mentioned (e.g., \"my wife Alice\", \"coworker Juan\")\n\
             - Personal details about others (birthdays, preferences, interests, jobs)\n\
@@ -280,6 +281,14 @@ async fn store_consolidated<S>(
             warn!(
                 key = fact.key,
                 "Skipping unstructured people fact; extractor must emit personal_memory"
+            );
+            continue;
+        }
+        if !automated_fact_category_allowed(&fact.category) {
+            debug!(
+                category = fact.category,
+                key = fact.key,
+                "Skipping consolidated fact outside the automated categories"
             );
             continue;
         }
@@ -631,6 +640,34 @@ mod tests {
         // The assistant's words and the too-short message never reach the model.
         let sent = &provider.requests()[0].messages[1].content;
         assert!(sent.contains("Lisbon") && !sent.contains("Pixel") && !sent.contains("user: ok"));
+    }
+
+    #[tokio::test]
+    async fn habits_inferred_from_one_excerpt_are_not_stored() {
+        let reply = r#"[{"category":"behavior","key":"delegates_parallel_installs","value":"Often delegates site installs to parallel agents"},
+            {"category":"workflow","key":"daily_review","value":"Reviews tasks every morning"},
+            {"category":"preference","key":"task_timing_report","value":"Wants each task's duration reported"}]"#;
+        let provider = Arc::new(ScriptedProvider::new([text(reply)]));
+        let (cursors, facts) = (Cursors::default(), Facts::default());
+        FactConsolidator::new(provider.clone(), "mock")
+            .consolidate(&owner_history(), &cursors, &facts, Utc::now())
+            .await
+            .unwrap();
+        let stored = facts.0.lock().unwrap();
+        let keys: Vec<&str> = stored.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(keys, ["task_timing_report"]);
+        let prompt = &provider.requests()[0].messages[0].content;
+        assert!(!prompt.contains("- behavior:"));
+    }
+
+    #[test]
+    fn automated_categories_are_a_closed_list() {
+        use crate::records::automated_fact_category_allowed;
+        assert!(automated_fact_category_allowed(" Project "));
+        assert!(automated_fact_category_allowed("preference"));
+        assert!(!automated_fact_category_allowed("behavior"));
+        assert!(!automated_fact_category_allowed("people"));
+        assert!(!automated_fact_category_allowed("meetings"));
     }
 
     #[tokio::test]

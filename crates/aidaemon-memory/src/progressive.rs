@@ -374,6 +374,14 @@ impl ProgressiveExtractor {
                 }
                 continue;
             }
+            if !crate::records::automated_fact_category_allowed(&fact.category) {
+                debug!(
+                    category = fact.category,
+                    key = fact.key,
+                    "Skipping progressive fact outside the automated categories"
+                );
+                continue;
+            }
             // Identity facts (user.name etc.) must be evidenced by the
             // user's own words: a name merely mentioned is not the user's.
             if identity_fact_lacks_user_evidence(

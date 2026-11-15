@@ -105,7 +105,7 @@ impl TaskLearner {
         {\n  \"facts\": [{\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"graph\": {\"entities\": [], \"relationships\": []}}],\n  \
         \"procedures\": [{\"name\": \"...\", \"trigger_pattern\": \"...\", \"steps\": [\"...\"]}],\n  \
         \"error_solutions\": [{\"error_pattern\": \"...\", \"solution_summary\": \"...\", \"domain\": \"...\"}]\n}\n\
-        Categories for facts: project, technical, preference, behavior. Graph entities use local_id, name, entity_type, aliases, confidence; relationships use source_id, target_id, relation, confidence. Only include graph data directly supported by the task evidence. Never infer entity types from category or key names.\n\
+        Categories for facts: project, technical, preference; use no other. What this one task did is not a fact about the user's habits: record a way of working only when the user stated it as a standing instruction, as a preference. Graph entities use local_id, name, entity_type, aliases, confidence; relationships use source_id, target_id, relation, confidence. Only include graph data directly supported by the task evidence. Never infer entity types from category or key names.\n\
         Only extract knowledge that would be useful for FUTURE tasks. If nothing worth remembering, return empty arrays.";
         let system_prompt = format!(
             "{system_prompt}\nFacts may carry a \"lifetime\" field. {}",
@@ -138,6 +138,14 @@ impl TaskLearner {
                 continue;
             }
             if fact.lifetime.is_transient() {
+                continue;
+            }
+            if !crate::records::automated_fact_category_allowed(&fact.category) {
+                debug!(
+                    category = fact.category,
+                    key = fact.key,
+                    "Skipping task-learning fact outside the automated categories"
+                );
                 continue;
             }
             if let Err(e) = store
