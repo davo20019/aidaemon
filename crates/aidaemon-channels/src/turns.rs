@@ -2241,3 +2241,23 @@ mod tests {
         ]
     }
 }
+
+#[cfg(test)]
+mod command_output_card_tests {
+    use super::status_text;
+    use aidaemon_tools::status::StatusUpdate;
+
+    /// A chat's card never carries what a command printed: only the owner's
+    /// own app reads the tail (it can hold a credential the redaction
+    /// missed, and a card can be in a group).
+    #[test]
+    fn a_card_never_shows_a_commands_output() {
+        let update = StatusUpdate::CommandOutput {
+            name: "terminal".into(),
+            lines: 3,
+            tail: Some("SYNTHETIC-OUTPUT-LINE".into()),
+        };
+        let shown = status_text(&update).unwrap_or_default();
+        assert!(!shown.contains("SYNTHETIC-OUTPUT-LINE"), "{shown}");
+    }
+}

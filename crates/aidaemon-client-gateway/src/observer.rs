@@ -209,6 +209,16 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
         StatusUpdate::PlanAbandoned { description, .. } => TurnStatus::Note {
             text: format!("Plan abandoned: {description}"),
         },
+        // What a command printed, redacted, for the owner's own app: the
+        // chats' cards read only its line count.
+        StatusUpdate::CommandOutput {
+            name,
+            tail: Some(tail),
+            ..
+        } => TurnStatus::ToolProgress {
+            name: name.clone(),
+            chunk: tail.clone(),
+        },
         StatusUpdate::StepHandedOff { kind } => TurnStatus::Note {
             text: aidaemon_core::card::Step::HandedOff(*kind).words(),
         },

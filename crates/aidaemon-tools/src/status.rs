@@ -114,7 +114,38 @@ pub enum StatusUpdate {
     /// count, so a long count or install visibly moves. Never the lines
     /// themselves: a command's output is its own data and can carry a
     /// credential (see [`aidaemon_core::card::Step::Output`]).
-    CommandOutput { name: String, lines: u64 },
+    CommandOutput {
+        name: String,
+        lines: u64,
+        /// Its latest lines, secrets redacted, for the owner's own app only
+        /// ([`command_output_tail`]); a chat's card reads `lines` and never
+        /// this. `None` where the owner's app is not the reader.
+        tail: Option<String>,
+    },
+}
+
+/// The last lines of a command's output for the owner's own app: at most
+/// 20 lines and 2,000 characters, secrets redacted.
+pub fn command_output_tail(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(stderr));
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    let tail: String = tail
+        .chars()
+        .rev()
+        .take(2_000)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let tail = crate::sanitize::redact_for_owner(&tail);
+    (!tail.trim().is_empty()).then_some(tail)
 }
 
 impl StatusUpdate {
@@ -169,5 +200,24 @@ mod tests {
             message: "[Authorize](https://auth.example.test/)".to_string(),
         };
         assert!(action.requires_immediate_delivery());
+    }
+}
+
+#[cfg(test)]
+mod command_output_tail_tests {
+    use super::command_output_tail;
+
+    #[test]
+    fn the_owner_sees_the_last_lines_with_secrets_redacted() {
+        let mut out = String::new();
+        for n in 1..=30 {
+            out.push_str(&format!("line {n}\n"));
+        }
+        out.push_str("token=sk-synthetic-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+        let tail = command_output_tail(out.as_bytes(), b"").unwrap();
+        assert!(!tail.contains("line 1\n"), "{tail}");
+        assert!(tail.contains("line 30"));
+        assert!(!tail.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "{tail}");
+        assert_eq!(command_output_tail(b"", b""), None);
     }
 }

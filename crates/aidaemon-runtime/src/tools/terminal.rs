@@ -5536,6 +5536,7 @@ impl TerminalTool {
                     let _ = tx.try_send(StatusUpdate::CommandOutput {
                         name: "terminal".to_string(),
                         lines,
+                        tail: None,
                     });
                     shown = lines;
                 }
@@ -5544,6 +5545,17 @@ impl TerminalTool {
 
         match tokio::time::timeout(foreground_wait, poll_finished).await {
             Ok(()) => {
+                // A command done before its first progress tick still shows
+                // what it printed in the owner's app (live 2026-11-15: a quick
+                // command showed no output under its step).
+                if let Some(tx) = status_tx.as_ref() {
+                    let (out, err) = (stdout_buf.lock().await, stderr_buf.lock().await);
+                    let _ = tx.try_send(StatusUpdate::CommandOutput {
+                        name: "terminal".to_string(),
+                        lines: printed_lines(&out, &err),
+                        tail: aidaemon_tools::status::command_output_tail(&out, &err),
+                    });
+                }
                 // Process finished within timeout — collect output.
                 let exit_code = reader_handle.await.ok().flatten();
                 let stdout_data = stdout_buf.lock().await;
@@ -5897,6 +5909,7 @@ impl TerminalTool {
                                         let _ = tx.try_send(StatusUpdate::CommandOutput {
                                             name: "terminal".to_string(),
                                             lines,
+                                            tail: None,
                                         });
                                         shown = lines;
                                     }

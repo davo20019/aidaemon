@@ -135,6 +135,7 @@ mod tests {
             .send(StatusUpdate::CommandOutput {
                 name: "terminal".into(),
                 lines,
+                tail: None,
             })
             .await
             .unwrap();
