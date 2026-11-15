@@ -548,6 +548,26 @@ async fn a_unit_no_item_links_is_covered_by_the_runs_edits() {
     assert!(!reply.contains("didn't start"), "{reply}");
 }
 
+/// Live 2026-11-15 (dloornext, RSS): a change request, a few reads, then a
+/// reply promising to look further ("I'll check both…") and no tool call.
+/// Nothing was changed: the run goes back once to do the work or ask.
+#[tokio::test]
+async fn a_promise_after_reads_on_a_change_request_goes_back_once() {
+    let session = "owner-units-promise";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::text_response("Two things need checking first. I'll check both."),
+        MockProvider::text_response("Asked to go on."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[
+        ("Add a feed for every language the site supports", true),
+    ])]);
+    let harness = unattempted_work_harness(provider).await;
+    let _reply = ask_owner_turn(&harness, session, "Add a feed for every language.").await;
+    assert!(held_for_unattempted_work(&harness, session).await);
+}
+
 // ==================== The request is the owner's words ====================
 //
 // Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing

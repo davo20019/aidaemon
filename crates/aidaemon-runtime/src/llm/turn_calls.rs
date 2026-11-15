@@ -40,6 +40,9 @@ pub struct LlmCallTelemetry {
     pub fell_back: bool,
     /// Total provider calls attempted (1 = succeeded on the first try).
     pub attempts: u32,
+    /// The plan's usage limit stopped the chosen model and another answered:
+    /// the owner-facing words for that limit.
+    pub answered_past_quota: Option<String>,
 }
 
 fn malformed_reason_label(
@@ -437,6 +440,12 @@ pub async fn call_llm_with_recovery(
 
     match result {
         Ok(response) => {
+            if telemetry.fell_back
+                && let Some(quota) = recovery.quota.lock().ok().and_then(|quota| quota.clone())
+            {
+                telemetry.answered_past_quota =
+                    Some(crate::chat_bridge::sdk_backed::to_daemon_error(quota).user_message());
+            }
             // The config works: stamp it as last known good.
             host.stamp_lastgood().await;
             Ok(crate::chat_bridge::sdk_backed::to_provider_response(

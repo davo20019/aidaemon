@@ -664,6 +664,18 @@ impl TurnEngine<'_> {
         };
         let iteration = scope.model_calls.load(Ordering::Relaxed) as usize;
         let work_unattempted = aggregate.declared_work_unattempted();
+        // What the closeout judged a stop on, so an early stop that went
+        // unheld can be traced (live 2026-11-15: a fallback model's cut-off
+        // "I'll check both…" on a change request ended the run).
+        tracing::info!(
+            task_id = scope.task_id,
+            owner_units = aggregate.owner_units.len(),
+            work_unattempted,
+            claimed = ?aggregate.executor_claimed_outcome,
+            mutating_operations = aggregate.operations.values().filter(|op| op.mutating).count(),
+            failed_without_success,
+            "Closeout judging a stop"
+        );
         let changes_permitted =
             !scope.contract.forbids_mutation && !scope.contract.forbids_tool_use;
         // The agent's own typed verdict: `partial`, `blocked` or

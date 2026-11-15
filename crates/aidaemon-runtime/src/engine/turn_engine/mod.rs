@@ -1302,6 +1302,7 @@ impl TurnEngine<'_> {
             unattempted_work_demanded: AtomicBool::new(false),
             partial_demanded: AtomicBool::new(false),
             not_attempted: std::sync::Mutex::new(Vec::new()),
+            answered_past_quota: std::sync::Mutex::new(None),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
             checklist_declared: AtomicBool::new(false),
@@ -1522,6 +1523,20 @@ impl TurnEngine<'_> {
                     if let Some(footer) = finished.footer() {
                         reply = format!("{}\n\n{footer}", reply.trim_end());
                     }
+                }
+                // The chosen model's plan ran out and another answered: the
+                // owner hears it, with the model that did (live 2026-11-15:
+                // a coding run quietly ran on a small fallback and stopped).
+                if let Some((limit, model)) = scope
+                    .answered_past_quota
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                {
+                    reply = format!(
+                        "{}\n\n⚠️ {limit} This answer came from {model}, a fallback model.",
+                        reply.trim_end()
+                    );
                 }
                 let not_done = abandoned
                     .not_done
