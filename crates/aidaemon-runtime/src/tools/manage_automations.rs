@@ -10,8 +10,8 @@
 //!
 //! List, show, edit (reschedule, rename, snooze), pause, resume and cancel
 //! are the owner's, in a private chat. Running scheduled work now, its run
-//! history and last failure, and its budget, instructions and workspace keep
-//! the checks they always had, because scheduled runs use some of them.
+//! history, and scheduled work's last failure, budget, instructions and
+//! workspace keep the checks they always had.
 //! Every change is judged by reading the stored state back, never by the
 //! wording of an answer.
 
@@ -33,7 +33,7 @@ use crate::tools::traits::{
 use crate::tools::traits::{ChannelVisibility, UserRole};
 use aidaemon_work::tools::manage_mandates::ManageMandatesTool;
 
-const TOOL_DESCRIPTION: &str = "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.";
+const TOOL_DESCRIPTION: &str = "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, history, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, last_failure, set_budget, update_instructions, bind_workspace. Watching history shows goal runs and decisions in words; health-check history shows stored status, latency and error. Create with schedule_task or set_reminder.";
 
 const ACTIONS: &[&str] = &[
     "list",
@@ -670,6 +670,84 @@ impl ManageAutomationsTool {
                 })
             })
             .collect())
+    }
+
+    async fn history(&self, automation: &Automation, limit: usize) -> anyhow::Result<String> {
+        let limit = limit.clamp(1, 50);
+        match automation.kind {
+            AutomationKind::Scheduled => self.runs.run_history(&automation.id, limit).await,
+            AutomationKind::Watching => {
+                let Some(mandate) = self.state.get_mandate(&automation.id).await? else {
+                    return Ok(format!("No history found for {}.", automation.title()));
+                };
+                let runs = self
+                    .state
+                    .get_goal_runs(&mandate.goal_id)
+                    .await?
+                    .into_iter()
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                if runs.is_empty() {
+                    return Ok(format!("No runs found yet for {}.", automation.title()));
+                }
+                let decisions = self.state.list_mandate_decisions(&mandate.id, 200).await?;
+                let mut out = format!(
+                    "**Watching History**\n\n- Automation: {}\n- Showing: {} run(s)",
+                    automation.title(),
+                    runs.len()
+                );
+                for run in runs {
+                    out.push_str(&format!("\n\n- {} · {}", run.started_at, run.status));
+                    if let Some(summary) = run.outcome_summary.as_deref() {
+                        let summary = automations::run_summary_words(summary);
+                        if !summary.is_empty() {
+                            out.push_str(&format!(" · {summary}"));
+                        }
+                    }
+                    if let Some(decision) = decisions
+                        .iter()
+                        .find(|decision| decision.goal_run_id == run.id)
+                    {
+                        let word = match decision.outcome {
+                            aidaemon_work::mandates::MandateDecisionOutcome::Act => "Act",
+                            aidaemon_work::mandates::MandateDecisionOutcome::Wait => "Wait",
+                            aidaemon_work::mandates::MandateDecisionOutcome::Ask => "Ask",
+                            aidaemon_work::mandates::MandateDecisionOutcome::Stop => "Stop",
+                        };
+                        out.push_str(&format!("\n  Decision: {word} — {}", decision.rationale));
+                    }
+                }
+                Ok(out)
+            }
+            AutomationKind::Probe => {
+                let Some(store) = &self.probes else {
+                    return Ok(format!("No history found for {}.", automation.title()));
+                };
+                let results = store.get_results(&automation.id, limit).await?;
+                if results.is_empty() {
+                    return Ok(format!("No checks found yet for {}.", automation.title()));
+                }
+                let mut out = format!(
+                    "**Health Check History**\n\n- Automation: {}\n- Showing: {} check(s)",
+                    automation.title(),
+                    results.len()
+                );
+                for result in results {
+                    let latency = result
+                        .latency_ms
+                        .map_or_else(|| "not recorded".to_string(), |ms| format!("{ms} ms"));
+                    let error = result.error_message.as_deref().unwrap_or("none");
+                    out.push_str(&format!(
+                        "\n\n- {} · status: {} · latency: {} · error: {}",
+                        result.checked_at,
+                        result.status.as_str(),
+                        latency,
+                        error
+                    ));
+                }
+                Ok(out)
+            }
+        }
     }
 
     /// Pause, resume, cancel or (scheduled work) run automation `id` now, as
@@ -1656,6 +1734,17 @@ impl ManageAutomationsTool {
                 },
             ),
             "pause" | "resume" | "cancel" => self.change_named(&args, action, facts, kind).await,
+            "history" => {
+                let automation = match self
+                    .select(given(&args.name), given(&args.id), session_id, kind)
+                    .await?
+                {
+                    Ok(automation) => automation,
+                    Err(answer) => return Ok(negative(answer)),
+                };
+                let output = self.history(&automation, args.limit.unwrap_or(10)).await?;
+                Ok(outcome(output, ToolOutcomeStatus::Succeeded))
+            }
             _ => {
                 if kind.is_some_and(|kind| kind != AutomationKind::Scheduled) {
                     return Ok(negative(format!(
@@ -1708,7 +1797,7 @@ impl Tool for ManageAutomationsTool {
                     "snooze_until": text("edit: move only the next run to this time."),
                     "new_name": text("edit: new name."),
                     "tell_me": { "type": "string", "enum": ["every_run", "changes", "problems"], "description": "edit, scheduled work: what its runs tell the user: every run, only changes, or only problems." },
-                    "limit": integer("history: runs to show."),
+                    "limit": integer("history: runs or health-check results to show."),
                     "budget_per_check": integer("Tokens per run."),
                     "budget_daily": integer("Tokens per day."),
                     "instructions": text("What later runs do."),

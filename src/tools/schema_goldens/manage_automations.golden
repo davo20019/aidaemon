@@ -1,8 +1,8 @@
 {
-  "description": "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.",
+  "description": "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, history, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, last_failure, set_budget, update_instructions, bind_workspace. Watching history shows goal runs and decisions in words; health-check history shows stored status, latency and error. Create with schedule_task or set_reminder.",
   "name": "manage_automations",
   "schema": {
-    "description": "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.",
+    "description": "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, history, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, last_failure, set_budget, update_instructions, bind_workspace. Watching history shows goal runs and decisions in words; health-check history shows stored status, latency and error. Create with schedule_task or set_reminder.",
     "name": "manage_automations",
     "parameters": {
       "additionalProperties": false,
@@ -66,7 +66,7 @@
           "type": "string"
         },
         "limit": {
-          "description": "history: runs to show.",
+          "description": "history: runs or health-check results to show.",
           "type": "integer"
         },
         "name": {

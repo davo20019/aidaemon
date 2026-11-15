@@ -736,6 +736,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_history_keeps_its_existing_output() {
+        let f = fixture().await;
+        f.scheduled_work("Repo check", "every day at 8am").await;
+        let goal_id = f.scheduled.lock().unwrap()["Repo check"].clone();
+        let run = f
+            .state
+            .start_goal_run(&goal_id, "manual", None, None)
+            .await
+            .unwrap();
+        f.state
+            .finish_goal_run(&run.id, "completed", Some("Synthetic repository is clean."))
+            .await
+            .unwrap();
+
+        let history = f
+            .call(json!({"action": "history", "name": "Repo check"}))
+            .await;
+        assert!(
+            history.starts_with("**Scheduled Run History**"),
+            "{history}"
+        );
+        assert!(
+            history.contains("- Goal: Summarize the synthetic inbox"),
+            "{history}"
+        );
+        assert!(
+            history.contains("Synthetic repository is clean."),
+            "{history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watching_history_uses_goal_runs_and_says_decisions_in_words() {
+        let f = fixture().await;
+        f.watching("Status watch").await;
+        let mandate = f
+            .state
+            .list_mandates(Some("owner-session"), false)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|mandate| mandate.has_name("Status watch"))
+            .unwrap();
+        let claimed = f
+            .state
+            .claim_due_mandates(1, "history-test", 300)
+            .await
+            .unwrap();
+        let leased = claimed
+            .into_iter()
+            .find(|item| item.id == mandate.id)
+            .unwrap();
+        let root_task = crate::traits::Task {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: mandate.goal_id.clone(),
+            description: "Review the synthetic status page".to_string(),
+            status: "pending".to_string(),
+            priority: "high".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: false,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            started_at: None,
+            completed_at: None,
+        };
+        let run = f
+            .state
+            .create_mandate_review_run(
+                &mandate.id,
+                leased.review_lease_token.as_deref().unwrap(),
+                &uuid::Uuid::new_v4().to_string(),
+                &root_task,
+            )
+            .await
+            .unwrap();
+        f.state
+            .claim_task_with_lease(&root_task.id, "history-task-lead", None, 300)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision = crate::traits::MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            crate::traits::MandateDecisionOutcome::Wait,
+            "The synthetic status page is healthy, so no intervention is needed.",
+            mandate.version,
+        );
+        f.state
+            .record_mandate_decision(&decision, None, None)
+            .await
+            .unwrap();
+        f.state
+            .finish_goal_run(&run.id, "completed", Some("mandate_non_action_satisfied"))
+            .await
+            .unwrap();
+
+        let history = f
+            .call(json!({"action": "history", "name": "Status watch", "kind": "watching"}))
+            .await;
+        assert!(history.starts_with("**Watching History**"), "{history}");
+        assert!(
+            history.contains("Decision: Wait — The synthetic status page is healthy, so no intervention is needed."),
+            "{history}"
+        );
+        assert!(
+            !history.contains("mandate_non_action_satisfied"),
+            "{history}"
+        );
+        assert!(!history.contains("goal_run_id"), "{history}");
+    }
+
+    #[tokio::test]
+    async fn health_check_history_shows_stored_status_latency_and_error() {
+        let f = fixture().await;
+        let store = Arc::new(
+            crate::health::HealthProbeStore::new(f._harness.state.pool())
+                .await
+                .unwrap(),
+        );
+        let tool =
+            ManageAutomationsTool::new(f.state.clone()).with_health_probes(Some(store.clone()));
+        let probe = crate::health::HealthProbe::new(
+            "Synthetic site".into(),
+            crate::health::ProbeType::Http,
+            "https://status.example.test/".into(),
+            "*/5 * * * *".into(),
+            "tool".into(),
+        );
+        store.upsert_probe(&probe).await.unwrap();
+        store
+            .insert_result(
+                &crate::health::ProbeResult::new(
+                    probe.id.clone(),
+                    crate::health::probes::ProbeStatus::Unhealthy,
+                )
+                .with_latency(425)
+                .with_error("Synthetic upstream timeout"),
+            )
+            .await
+            .unwrap();
+
+        let history = tool
+            .call_with(
+                &json!({"action": "history", "id": probe.id, "kind": "probe"}).to_string(),
+                owner(),
+            )
+            .await
+            .unwrap();
+        assert!(history.starts_with("**Health Check History**"), "{history}");
+        assert!(history.contains("status: unhealthy"), "{history}");
+        assert!(history.contains("latency: 425 ms"), "{history}");
+        assert!(
+            history.contains("error: Synthetic upstream timeout"),
+            "{history}"
+        );
+    }
+
+    #[tokio::test]
     async fn health_checks_are_listed_paused_and_cancelled_here() {
         let f = fixture().await;
         let store = Arc::new(
