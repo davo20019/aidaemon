@@ -33,7 +33,6 @@ const CONSOLIDATION_PROMPT: &str = "You are a memory consolidation system. Given
             - preference: Tool, workflow, and communication preferences\n\
             - project: Projects, tech stacks, goals\n\
             - technical: Environment details, installed tools\n\
-            - relationship: Communication patterns with the AI\n\
             - people: Information about OTHER individuals mentioned or participating in conversation\n\
             Use no other category.\n\n\
             ONLY learn from owner-authenticated user messages. NEVER extract or store facts from guest/public speakers, and NEVER treat another person's self-description as owner data. \
@@ -726,6 +725,7 @@ mod tests {
         assert!(automated_fact_category_allowed(" Project "));
         assert!(automated_fact_category_allowed("preference"));
         assert!(!automated_fact_category_allowed("behavior"));
+        assert!(!automated_fact_category_allowed("relationship"));
         assert!(!automated_fact_category_allowed("people"));
         assert!(!automated_fact_category_allowed("meetings"));
     }

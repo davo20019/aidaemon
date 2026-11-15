@@ -34,11 +34,11 @@ impl std::fmt::Display for FactPrivacy {
 /// explicitly keep any category; people go through structured personal
 /// memory, not this list.
 ///
-/// `behavior` is deliberately absent: an extractor reads one session or one
-/// task, so it cannot observe recurrence, and asked for "recurring
-/// workflows" it filed every single request as a habit.
-pub const AUTOMATED_FACT_CATEGORIES: &[&str] =
-    &["user", "preference", "project", "technical", "relationship"];
+/// `behavior` and `relationship` are deliberately absent: an extractor reads
+/// one session, so it cannot observe recurrence, and asked for "recurring
+/// workflows" or "communication patterns" it filed every single request as
+/// a habit. A stated way of working is a `preference`.
+pub const AUTOMATED_FACT_CATEGORIES: &[&str] = &["user", "preference", "project", "technical"];
 
 /// Whether a background extractor may write a flat fact in `category`.
 pub fn automated_fact_category_allowed(category: &str) -> bool {

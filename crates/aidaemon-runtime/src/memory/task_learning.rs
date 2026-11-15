@@ -1,8 +1,8 @@
 //! Knowledge extraction from completed tasks.
 //!
 //! After an executor completes a task, this module reads activity logs and uses
-//! an LLM to extract durable knowledge (facts, procedures, error solutions) that
-//! can benefit future tasks.
+//! an LLM to extract procedures and error solutions that can benefit future
+//! tasks. It learns no owner facts (see `aidaemon_memory::task_learning`).
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub use crate::turn::memory_writer::RunTaint;
 /// Extract durable knowledge from a completed task's activity log.
 ///
 /// Reads the task's activity records, builds a prompt asking the LLM to extract
-/// facts, procedures, and error solutions, then stores them in the state store.
+/// procedures and error solutions, then stores them in the memory store.
 /// A tainted run teaches nothing: content someone other than the owner wrote
 /// must not become durable memory, so no model call is made and nothing is
 /// stored.
@@ -38,16 +38,6 @@ pub async fn extract_task_knowledge(
         info!(task_id = %task.id, "Skipping task knowledge extraction: the run read untrusted content");
         return Ok(());
     }
-
-    // Derive channel provenance from the parent goal (tasks do not carry session_id).
-    let goal = state.get_goal(&task.goal_id).await.ok().flatten();
-    let derived_channel_id: Option<String> = goal
-        .as_ref()
-        .and_then(|g| aidaemon_events::session::derive_channel_id_from_session(&g.session_id));
-    // A recurring goal re-runs the same brief on every fire, so its "facts"
-    // are restatements of its own instructions and run state. Its procedures
-    // and error solutions still carry over; owner facts do not.
-    let learn_facts = goal.as_ref().is_none_or(|g| g.goal_type != "continuous");
 
     // Fetch activity log for this task
     let activities = state.get_task_activities(&task.id).await?;
@@ -116,8 +106,6 @@ pub async fn extract_task_knowledge(
                 description: &task.description,
                 result: task.result.as_deref(),
                 activity_log: &activity_log,
-                channel_id: derived_channel_id.as_deref(),
-                learn_facts,
             },
         )
         .await
@@ -248,7 +236,7 @@ mod tests {
         assert_eq!(failed_calls(&events, "task_learning").await, 0);
     }
 
-    /// An extraction that teaches one fact and one procedure.
+    /// An extraction offering one fact and one procedure.
     const TEACHES_SOMETHING: &str = r#"{
         "facts": [{"category": "project", "key": "acme_report_build", "value": "The Acme Corp report is built with make report"}],
         "procedures": [{"name": "build the Acme Corp report", "trigger_pattern": "build report", "steps": ["make report"]}],
@@ -291,5 +279,10 @@ mod tests {
         .await
         .unwrap();
         assert!(count_learned(&state).await > 0);
+        let (facts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM facts")
+            .fetch_one(&state.pool())
+            .await
+            .unwrap();
+        assert_eq!(facts, 0, "task learning stores no owner facts");
     }
 }
