@@ -367,6 +367,15 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("Can do: "))
         );
+        // What it spends is part of its details (its limits, today's use).
+        assert!(
+            digest
+                .details
+                .iter()
+                .any(|line| line.starts_with("Spend: ")),
+            "{:?}",
+            digest.details
+        );
         assert!(find(&entries, "Oven").edit.unwrap().instructions.is_none());
         assert!(find(&entries, "Status watch").edit.is_none());
 

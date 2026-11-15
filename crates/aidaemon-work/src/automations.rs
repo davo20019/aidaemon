@@ -113,6 +113,60 @@ pub fn quiet_run_note(context: Option<&str>, previous: Option<&str>) -> Option<S
     Some(format!("[SYSTEM: {since}]"))
 }
 
+/// What an automation spends, in the owner's words: today's tokens (when
+/// counted today) and its limits. `None` when it has neither.
+pub fn spend_line(
+    tokens_used_today: i64,
+    tokens_used_day: &str,
+    today: &str,
+    budget_per_check: Option<i64>,
+    budget_daily: Option<i64>,
+) -> Option<String> {
+    let used = if tokens_used_day == today {
+        tokens_used_today.max(0)
+    } else {
+        0
+    };
+    let tokens = |n: i64| match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 1_000 => format!("{}k", n / 1_000),
+        n => n.to_string(),
+    };
+    let mut parts = vec![format!("{} tokens today", tokens(used))];
+    if let Some(daily) = budget_daily.filter(|n| *n > 0) {
+        parts[0] = format!("{} of {} tokens today", tokens(used), tokens(daily));
+    }
+    if let Some(per) = budget_per_check.filter(|n| *n > 0) {
+        parts.push(format!("up to {} per run", tokens(per)));
+    }
+    (used > 0 || budget_daily.is_some() || budget_per_check.is_some())
+        .then(|| format!("Spend: {}", parts.join(", ")))
+}
+
+#[cfg(test)]
+mod spend_tests {
+    #[test]
+    fn spend_reads_as_todays_tokens_against_the_limits() {
+        assert_eq!(
+            super::spend_line(
+                12_400,
+                "2026-11-15",
+                "2026-11-15",
+                Some(50_000),
+                Some(200_000)
+            )
+            .as_deref(),
+            Some("Spend: 12k of 200k tokens today, up to 50k per run")
+        );
+        // Yesterday's count is not today's.
+        assert_eq!(
+            super::spend_line(12_400, "2026-11-14", "2026-11-15", None, Some(200_000)).as_deref(),
+            Some("Spend: 0 of 200k tokens today")
+        );
+        assert_eq!(super::spend_line(0, "", "2026-11-15", None, None), None);
+    }
+}
+
 /// The goal-context key naming the run whose task lead said it found
 /// nothing new (`manage_goal_tasks complete_goal` with `nothing_new`).
 pub const NOTHING_NEW_RUN_KEY: &str = "nothing_new_run";

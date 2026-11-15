@@ -422,6 +422,17 @@ impl ManageAutomationsTool {
             {
                 card.details.push(format!("Workspace: {workspace}"));
             }
+            // What it spends, so cost is never a surprise (research
+            // 2026-11-15: opaque credit costs were a top complaint).
+            if let Some(spend) = automations::spend_line(
+                goal.tokens_used_today,
+                &goal.tokens_used_day,
+                &Utc::now().date_naive().to_string(),
+                goal.budget_per_check,
+                goal.budget_daily,
+            ) {
+                card.details.push(spend);
+            }
             // Its runs kept failing and the recovery ledger paused its
             // schedules: on, but not running, which the owner must see.
             let held = goal.status == "active"
