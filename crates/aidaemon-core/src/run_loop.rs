@@ -38,6 +38,8 @@ use crate::tool::{SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo
 const CUT_OFF_REPLY: &str = "Your last reply was cut off at the output limit, so the owner \
      would get it unfinished. Send the complete answer again, shorter: keep what matters \
      and drop detail.";
+/// Ends a reply that stayed cut off after [`CUT_OFF_REPLY`].
+const CUT_OFF_NOTICE: &str = "\n\n(This reply was cut off at the model's output limit.)";
 
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
@@ -439,6 +441,11 @@ impl<'a> Driver<'a> {
                 ));
                 self.checkpoint().await?;
                 continue;
+            }
+            // Still cut off after that: say so, so the owner never takes a
+            // reply that stops mid-sentence for the whole answer.
+            if calls.is_empty() && response.cut_off {
+                response.text.push_str(CUT_OFF_NOTICE);
             }
 
             // 4a. No tool calls: the model thinks it is done. Ask stop hooks.

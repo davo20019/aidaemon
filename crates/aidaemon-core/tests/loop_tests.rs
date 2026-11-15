@@ -137,8 +137,12 @@ async fn a_final_reply_cut_off_at_the_output_limit_is_asked_for_again() {
     assert_eq!(reply.as_deref(), Some("Three parts."));
     assert_eq!(calls, 2);
 
+    // Still cut off after the one ask: the reply says so.
     let (reply, calls) = run(vec![cut("First cut"), cut("Second cut")]).await;
-    assert_eq!(reply.as_deref(), Some("Second cut"));
+    assert_eq!(
+        reply.as_deref(),
+        Some("Second cut\n\n(This reply was cut off at the model's output limit.)")
+    );
     assert_eq!(calls, 2);
 }
 
