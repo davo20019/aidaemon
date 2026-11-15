@@ -3408,9 +3408,13 @@ impl Drop for FollowupEnd {
     }
 }
 
+/// The longest a continuation may run while it keeps making progress: the
+/// task timeout. Its idle limit is the timeout it is given.
+const CONTINUATION_HARD_CAP: Duration = Duration::from_secs(30 * 60);
+
 async fn run_continuation_turn(
     agent: &dyn ConversationRuntime,
-    request: ConversationRequest,
+    mut request: ConversationRequest,
     timeout: Duration,
 ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
     let session_id = request.session_id.clone();
@@ -3424,14 +3428,45 @@ async fn run_continuation_turn(
             )
         })?;
     let clock = request.clock;
-    let mut envelope = tokio::time::timeout_at(deadline, agent.continue_conversation(request))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Background continuation for session {session_id} timed out after {}s",
-                timeout.as_secs()
-            )
-        })??;
+    // Bounded by inactivity, not by the clock: a continuation still making
+    // progress (model calls, tools) runs on, up to the task timeout; one
+    // that goes quiet for `timeout` is stopped (live 2026-11-15: a coding
+    // follow-up that fixed, rebuilt and re-ran its tests was cut off at
+    // ten minutes and its raw test output posted instead).
+    let unix_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+    let heartbeat = request
+        .heartbeat
+        .get_or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(unix_now())))
+        .clone();
+    heartbeat.store(unix_now(), Ordering::Relaxed);
+    let started = tokio::time::Instant::now();
+    let work = agent.continue_conversation(request);
+    tokio::pin!(work);
+    let mut envelope = loop {
+        tokio::select! {
+            result = &mut work => break result?,
+            _ = tokio::time::sleep(Duration::from_secs(2).min(timeout)) => {
+                let idle = unix_now().saturating_sub(heartbeat.load(Ordering::Relaxed));
+                if idle >= timeout.as_secs().max(1) {
+                    anyhow::bail!(
+                        "Background continuation for session {session_id} timed out after {}s without progress",
+                        timeout.as_secs()
+                    );
+                }
+                if started.elapsed() >= CONTINUATION_HARD_CAP {
+                    anyhow::bail!(
+                        "Background continuation for session {session_id} timed out after {}s",
+                        CONTINUATION_HARD_CAP.as_secs()
+                    );
+                }
+            }
+        }
+    };
     // The final answer to a request carries its total, measured from the
     // owner's message to now and rendered from the records, never the
     // model's estimate (live 2026-11-13: an answer said the total "wasn't
@@ -11621,6 +11656,59 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    /// Works for longer than the idle limit while beating its heartbeat.
+    struct BusyConversationRuntime;
+
+    #[async_trait::async_trait]
+    impl ConversationRuntime for BusyConversationRuntime {
+        async fn continue_conversation(
+            &self,
+            request: ConversationRequest,
+        ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                crate::turn::helpers::touch_heartbeat(&request.heartbeat);
+            }
+            AnsweringConversationRuntime
+                .continue_conversation(request)
+                .await
+        }
+
+        async fn record_continuation_delivery(
+            &self,
+            _session_id: &str,
+            _delivery: aidaemon_events::ResponseDeliveryData,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A follow-up still making progress is not cut off by the idle limit
+    /// (live 2026-11-15: a fix-and-retest follow-up was dropped at ten
+    /// minutes and its raw test output posted instead).
+    #[tokio::test]
+    async fn a_continuation_that_keeps_making_progress_runs_past_its_idle_limit() {
+        let request = ConversationRequest {
+            session_id: "app:synthetic-busy".to_string(),
+            user_text: "[Background command finished]".to_string(),
+            status_tx: None,
+            user_role: aidaemon_tools::semantics::UserRole::Owner,
+            channel_ctx: aidaemon_channels::context::ChannelContext::internal(),
+            heartbeat: None,
+            parent_task_id: None,
+            parent_tool_call_id: None,
+            parent_result_id: None,
+            clock: None,
+        };
+        let (result, _end) = run_background_continuation_with_timeout(
+            &BusyConversationRuntime,
+            request,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result.unwrap().text, "Drupal is installed.");
     }
 
     /// Watched follow-ups: a runtime that reports one step, then answers.
