@@ -539,7 +539,7 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
         let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         let run = sqlx::query(
             "SELECT gr.goal_id, gr.status AS prior_status, gr.trigger_type, gr.root_task_id,
-                    g.goal_type, g.session_id,
+                    g.goal_type, g.session_id, g.description, g.context AS goal_context,
                     EXISTS(SELECT 1 FROM goal_schedules s WHERE s.goal_id = gr.goal_id) AS has_schedule,
                     json_extract(t.context, '$.recovery_for_run') AS recovery_for_run
              FROM goal_runs gr
@@ -837,9 +837,18 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
                     .bind(notification_id)
                     .bind(&goal_id)
                     .bind(&session_id)
-                    .bind(format!(
-                        "Scheduled objective paused after {consecutive_failures} consecutive failed runs (budget {failure_budget}; typed cause {}). The parent objective remains active for explicit recovery.",
-                        failure_kind.as_str()
+                    .bind(paused_notice(
+                        &crate::automations::name_from_context(
+                            run.get::<Option<String>, _>("goal_context").as_deref(),
+                        )
+                        .unwrap_or_else(|| {
+                            aidaemon_tools::sanitize::short_goal_label(
+                                &run.get::<String, _>("description"),
+                            )
+                        }),
+                        consecutive_failures,
+                        failure_kind,
+                        summary,
                     ))
                     .bind(&now)
                     .execute(&mut *tx)
@@ -3556,5 +3565,65 @@ mod tests {
             "a recovery proven by receipts under the bound worker session must heal the objective"
         );
         assert_eq!(healthy.consecutive_failures, 0);
+    }
+}
+
+/// The owner's notice when a scheduled automation pauses itself after
+/// failing `failures` runs in a row: which one, why, and what to do.
+fn paused_notice(
+    name: &str,
+    failures: i64,
+    kind: crate::traits::ScheduledFailureKind,
+    latest: Option<&str>,
+) -> String {
+    use crate::traits::ScheduledFailureKind as Kind;
+    let why = latest
+        .map(|text| text.trim().trim_end_matches('.'))
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            match kind {
+                Kind::AuthorizationBlocked => "a step it needed was not allowed",
+                Kind::RetryableTool => "a tool kept failing",
+                Kind::PermanentTool => "a tool it needs failed",
+                Kind::TaskFailed => "the run could not finish its work",
+                Kind::OutcomeUnproven => "it could not show the work was done",
+            }
+            .to_string()
+        });
+    format!(
+        "Paused \"{name}\" after {failures} failed runs in a row, so it stops retrying. \
+         Latest problem: {why}. Fix the cause, then resume it in Automations, or ask me to look into it."
+    )
+}
+
+#[cfg(test)]
+mod paused_notice_tests {
+    use super::paused_notice;
+    use crate::traits::ScheduledFailureKind;
+
+    #[test]
+    fn the_pause_notice_names_the_automation_the_cause_and_what_to_do() {
+        let text = paused_notice(
+            "Daily report",
+            3,
+            ScheduledFailureKind::TaskFailed,
+            Some("The report file was missing."),
+        );
+        assert_eq!(
+            text,
+            "Paused \"Daily report\" after 3 failed runs in a row, so it stops retrying. \
+             Latest problem: The report file was missing. Fix the cause, then resume it in \
+             Automations, or ask me to look into it."
+        );
+        let text = paused_notice("Daily report", 3, ScheduledFailureKind::RetryableTool, None);
+        assert!(
+            text.contains("Latest problem: a tool kept failing."),
+            "{text}"
+        );
+        assert!(
+            !text.contains("objective") && !text.contains("budget"),
+            "{text}"
+        );
     }
 }

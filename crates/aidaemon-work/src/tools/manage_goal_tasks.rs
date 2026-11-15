@@ -1416,8 +1416,19 @@ impl ManageGoalTasksTool {
         // Surface a recurring goal that keeps failing, so it doesn't retry
         // forever in silence. Alert on every Nth consecutive failure (the streak
         // is cleared by a successful run in complete_goal).
+        // A scheduled run's failures are counted when its run closes, and
+        // that pauses the schedule with its own notice: a second alert saying
+        // it "will keep retrying" would contradict it.
         const REPEATED_FAILURE_ALERT_THRESHOLD: i32 = 3;
+        let scheduled_run = self
+            .state
+            .get_current_goal_run(&self.goal_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|run| run.trigger_type == "scheduled");
         if is_continuous
+            && !scheduled_run
             && goal.dispatch_failures >= REPEATED_FAILURE_ALERT_THRESHOLD
             && goal.dispatch_failures % REPEATED_FAILURE_ALERT_THRESHOLD == 0
         {

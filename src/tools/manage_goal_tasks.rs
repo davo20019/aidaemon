@@ -207,6 +207,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scheduled_runs_failures_leave_the_alert_to_the_pause() {
+        let (state, _finite) = setup_test_state().await;
+        let cg = Goal::new_continuous("Daily recurring goal", "test-session", None, None);
+        state.create_goal(&cg).await.unwrap();
+        let tool = ManageGoalTasksTool::new(cg.id.clone(), state.clone());
+        let body = json!({ "action": "fail_goal", "summary": "run failed" }).to_string();
+        for _ in 0..3 {
+            state
+                .start_goal_run(&cg.id, "scheduled", None, None)
+                .await
+                .unwrap();
+            tool.call(&body).await.unwrap();
+        }
+        let alerts = state
+            .get_pending_notifications(20)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.notification_type == "evergreen_alert" && n.goal_id == cg.id)
+            .count();
+        assert_eq!(alerts, 0, "a scheduled run never says it will keep retrying");
+    }
+
+    #[tokio::test]
     async fn complete_goal_keeps_continuous_active_and_clears_failures() {
         let (state, _finite) = setup_test_state().await;
         let cg = Goal::new_continuous("Daily recurring goal", "test-session", None, None);
