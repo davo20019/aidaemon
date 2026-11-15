@@ -712,7 +712,12 @@ impl SettingsHost {
                 None => None,
             };
             let before = std::fs::read_to_string(&self.config_path).ok();
+            let said = self.failover_words(&change);
             let mut done = self.config_change(&change, call, approved).await;
+            // A failover change is said with the names Settings shows.
+            if let (Ok(done), Some(said)) = (&mut done, said) {
+                done.message = said;
+            }
             // `manage_config` explains some refusals in an answer that
             // changed nothing: the key must not stay behind then either.
             if stored_key.is_some()
@@ -729,6 +734,26 @@ impl SettingsHost {
             return done;
         }
         self.other_change(change, approved).await
+    }
+
+    /// What a failover move or removal did, in the names Settings shows
+    /// ("OpenRouter is now Failover 2."); `None` for other changes, or
+    /// when the provider is not found.
+    fn failover_words(&self, change: &SettingsChange) -> Option<String> {
+        let (index, to) = match change {
+            SettingsChange::MoveFailover { index, to, .. } => (*index, Some(*to)),
+            SettingsChange::RemoveFailover { index, .. } => (*index, None),
+            _ => return None,
+        };
+        let current = self.current().ok()?;
+        let name = client_providers::connected(&current)
+            .into_iter()
+            .find(|p| p.failover == Some(index))?
+            .name;
+        Some(match to {
+            Some(to) => format!("{name} is now Failover {}.", to + 1),
+            None => format!("Removed {name}."),
+        })
     }
 
     /// The key a provider change stores: its approval card's words, the
@@ -1402,9 +1427,22 @@ api_key = "keychain"
         assert_eq!(host.gate(&stale).await.unwrap_err(), STALE_FAILOVERS);
         let remove = SettingsChange::RemoveFailover {
             index: 0,
-            expect: second,
+            expect: second.clone(),
         };
         assert_eq!(host.gate(&remove).await.unwrap_err(), STALE_FAILOVERS);
+        // Said with the names the page shows.
+        assert_eq!(
+            host.failover_words(&up).unwrap(),
+            format!("{second} is now Failover 1.")
+        );
+        assert_eq!(
+            host.failover_words(&SettingsChange::RemoveFailover {
+                index: 0,
+                expect: String::new(),
+            })
+            .unwrap(),
+            format!("Removed {first}.")
+        );
     }
 
     #[tokio::test]
