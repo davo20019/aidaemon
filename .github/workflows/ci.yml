@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [master]
 
+# A newer push to a pull request supersedes the runs before it; master keeps
+# every run so each landed commit gets its own result.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   CODEX_CLI_VERSION: "0.151.0"
