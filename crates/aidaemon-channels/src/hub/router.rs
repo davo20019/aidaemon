@@ -537,6 +537,9 @@ impl ChannelHub {
             );
             return true;
         };
+        // The chat the card shows in (a helper's is its parent's): a
+        // message sent there while it is open waits for its answer.
+        let _open = crate::owner_wait::ApprovalOpen::begin(&routed_session);
         let one_time_only = matches!(request.kind, ApprovalKind::CommandOnce);
         let ask = crate::approval_render::ApprovalAsk {
             command: &request.command,

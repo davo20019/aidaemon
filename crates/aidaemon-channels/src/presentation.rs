@@ -566,6 +566,12 @@ pub fn queued_message_notice(waits_for_own_turn: bool) -> String {
     }
 }
 
+/// The reply to a message that arrives while the running work waits on an
+/// approval: nothing reads it until the owner answers.
+pub fn after_approval_notice() -> String {
+    "📥 Got it – I'll read this once you answer the approval.".to_string()
+}
+
 /// What a queued message's notice says once its own turn starts.
 pub fn queued_message_starting(text: &str) -> String {
     format!("▶️ Now on: \"{}\"", word_preview(text, 50))

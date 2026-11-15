@@ -559,7 +559,9 @@ impl TurnRunner {
                 turn.channel_ctx.clone(),
                 turn.attachments.clone(),
             );
-            if !steerable {
+            if matches!(placement, Some(MidRunPlacement::Queue)) {
+                queued = queued.placed_for_later();
+            } else if !steerable {
                 queued = queued.not_steerable();
             }
             if let Some(timing) = turn.ingress_timing.clone() {
@@ -575,7 +577,9 @@ impl TurnRunner {
                     // Notify for the first few only: a long message pasted
                     // in parts can arrive as many.
                     if position <= 3 {
-                        let notice = if unread {
+                        let notice = if steerable && crate::owner_wait::approval_open(&session_id) {
+                            crate::presentation::after_approval_notice()
+                        } else if unread {
                             crate::mid_run::unread_message_notice(
                                 &self.running_work(&session_id).await,
                             )

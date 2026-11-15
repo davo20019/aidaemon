@@ -352,3 +352,62 @@ mod progress_tests {
         assert!(clock.idle() < STEP * 2, "{:?}", clock.idle());
     }
 }
+
+/// Conversations with an approval card open now, by session id: while one
+/// is, the running work cannot read anything new, so a message sent then
+/// waits for the answer. The hub counts each card from when it is shown
+/// until it is answered or dropped ([`ApprovalOpen`]).
+fn open_approvals() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+
+/// One approval card open for a session, until dropped.
+pub struct ApprovalOpen(String);
+
+impl ApprovalOpen {
+    pub fn begin(session_id: &str) -> Self {
+        if let Ok(mut open) = open_approvals().lock() {
+            *open.entry(session_id.to_owned()).or_default() += 1;
+        }
+        Self(session_id.to_owned())
+    }
+}
+
+impl Drop for ApprovalOpen {
+    fn drop(&mut self) {
+        if let Ok(mut open) = open_approvals().lock()
+            && let Some(n) = open.get_mut(&self.0)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                open.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Whether `session_id` has an approval card waiting for the owner.
+pub fn approval_open(session_id: &str) -> bool {
+    open_approvals()
+        .lock()
+        .is_ok_and(|open| open.get(session_id).is_some_and(|n| *n > 0))
+}
+
+#[cfg(test)]
+mod approval_open_tests {
+    use super::{ApprovalOpen, approval_open};
+
+    #[test]
+    fn a_card_is_open_until_dropped() {
+        let session = "telegram:synthetic-approval-open";
+        assert!(!approval_open(session));
+        let first = ApprovalOpen::begin(session);
+        let second = ApprovalOpen::begin(session);
+        drop(first);
+        assert!(approval_open(session));
+        drop(second);
+        assert!(!approval_open(session));
+    }
+}

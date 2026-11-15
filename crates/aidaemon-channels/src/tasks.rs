@@ -50,6 +50,9 @@ pub struct QueuedMessage {
     /// Whether the running turn may take it in mid-run. A message read as
     /// unrelated to the running work waits for its own turn.
     pub steerable: bool,
+    /// The owner sent it to wait for its own turn (an app's Queue): the
+    /// running work takes messages sent after it to be read now past it.
+    pub placed_for_later: bool,
 }
 
 impl QueuedMessage {
@@ -69,6 +72,7 @@ impl QueuedMessage {
             queued_at: Utc::now(),
             ingress_timing: None,
             steerable: true,
+            placed_for_later: false,
         }
     }
 
@@ -78,14 +82,26 @@ impl QueuedMessage {
         self
     }
 
+    /// The owner chose to send it after the running work (an app's Queue).
+    pub fn placed_for_later(mut self) -> Self {
+        self.steerable = false;
+        self.placed_for_later = true;
+        self
+    }
+
     pub fn with_ingress_timing(mut self, mut timing: crate::ports::InboundMessageTiming) -> Self {
         timing.mark_queued(self.queued_at);
         self.ingress_timing = Some(timing);
         self
     }
 
+    /// Same sender and context, and the same placement: a message meant
+    /// for the running work never runs merged into one the owner queued
+    /// for its own turn.
     fn can_coalesce_with(&self, other: &Self) -> bool {
-        self.user_role == other.user_role && self.channel_ctx == other.channel_ctx
+        self.user_role == other.user_role
+            && self.channel_ctx == other.channel_ctx
+            && self.steerable == other.steerable
     }
 }
 
@@ -544,15 +560,29 @@ impl TaskRegistry {
         let Some(queue) = queues.get_mut(session_id) else {
             return Vec::new();
         };
+        // From the front, while each comes from the turn's principal and
+        // context: a message meant for the running work is taken; one the
+        // owner placed to wait for its own turn keeps its place and does not
+        // hold back what they sent after it to be read now (live
+        // 2026-11-15: "also this", sent with Enter behind "after this" sent
+        // with Queue, ran merged into the queued turn). Anything else (another
+        // sender, files, a message read as unrelated) stops the take, so
+        // order and authorization hold.
         let mut taken = Vec::new();
-        while queue.front().is_some_and(|next| {
-            next.steerable
-                && next.user_role == user_role
-                && &next.channel_ctx == channel_ctx
-                && next.attachments.is_empty()
-        }) {
-            taken.extend(queue.pop_front());
+        let mut kept = VecDeque::with_capacity(queue.len());
+        let mut stopped = false;
+        for next in queue.drain(..) {
+            let same = next.user_role == user_role && &next.channel_ctx == channel_ctx;
+            if !stopped && same && next.steerable && next.attachments.is_empty() {
+                taken.push(next);
+            } else {
+                if !(same && next.placed_for_later) {
+                    stopped = true;
+                }
+                kept.push_back(next);
+            }
         }
+        *queue = kept;
         taken
     }
 
@@ -1375,5 +1405,31 @@ mod queue_edit_tests {
             .map(|(_, text, _)| text)
             .collect();
         assert_eq!(left, ["first, edited"]);
+    }
+
+    #[tokio::test]
+    async fn a_message_for_the_running_work_is_taken_past_one_queued_for_later() {
+        let registry = TaskRegistry::new(10);
+        let session = "app:synthetic-steer";
+        let ctx = ChannelContext::private("app");
+        let later = QueuedMessage::new("after this", UserRole::Owner, ctx.clone(), Vec::new())
+            .placed_for_later();
+        let now = QueuedMessage::new("also this", UserRole::Owner, ctx.clone(), Vec::new());
+        registry.queue_message(session, later, None).await;
+        registry.queue_message(session, now, None).await;
+        let taken = registry
+            .take_steering_messages(session, UserRole::Owner, &ctx)
+            .await;
+        assert_eq!(
+            taken.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["also this"]
+        );
+        let left: Vec<String> = registry
+            .queued_messages(session)
+            .await
+            .into_iter()
+            .map(|(_, text, _)| text)
+            .collect();
+        assert_eq!(left, ["after this"]);
     }
 }
