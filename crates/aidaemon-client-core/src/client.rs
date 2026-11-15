@@ -302,8 +302,8 @@ pub struct Client {
     /// Each conversation's messages waiting for its running work, as last
     /// read.
     pub queued: BTreeMap<String, Vec<QueuedMessage>>,
-    /// Messages sent to wait their turn, until accepted: the queue reads
-    /// again then.
+    /// Messages sent while the work runs (to be read now or after), until
+    /// accepted: the waiting list reads again then.
     queue_sends: BTreeSet<String>,
     /// The file undo in flight: its request and the file.
     revert_request: Option<(String, String)>,
@@ -1767,7 +1767,9 @@ impl Client {
                     }
                     Some(_) => (None, None),
                 };
-                let queueing = matches!(mid_run, Some(MidRun::Queue));
+                // Sent while the work runs, either way: it waits (to be read
+                // or for its own turn) and the list shows it.
+                let queueing = mid_run.is_some();
                 let id = self.send(Command::SendMessage {
                     session_id: session.map(str::to_owned),
                     text,
@@ -1777,7 +1779,6 @@ impl Client {
                     model,
                     effort,
                 });
-                // Sent to wait its turn: the queue shows it once accepted.
                 if queueing {
                     self.queue_sends.insert(id.clone());
                 }
@@ -2138,6 +2139,24 @@ mod tests {
         assert_eq!(effects, [Effect::Say("Undid the changes to a.rs".into())]);
         assert!(client.changes.is_ready());
         assert!(!client.reverting());
+    }
+
+    #[test]
+    fn a_message_for_the_running_work_reads_the_waiting_list_too() {
+        let mut client = Client::new();
+        let here = cx(Some("app:a"));
+        client
+            .submit(Some("app:a"), "read this now", Some(MidRun::Steer), None)
+            .unwrap();
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:a"}}}}"#
+            )),
+            &here,
+        );
+        let (_, list) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(list, Command::ListQueued { .. }));
     }
 
     #[test]
