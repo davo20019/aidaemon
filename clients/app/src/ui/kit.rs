@@ -552,23 +552,90 @@ pub fn split() -> nsh_base::ResizablePanelGroupElement {
         .handle_accessibility_label("Resize")
 }
 
-/// A pane of a [`split`]: `size` at first, between `min` and `max`, shown
-/// while `visible`.
+/// The edge a [`pane`] lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+}
+
+/// A pane of a [`split`] at `edge`: `size` wide at first, between `min` and
+/// `max` as the owner drags it, shown while `open`. Opening, it slides in
+/// from its edge: its width grows from none while what it holds keeps its
+/// full width and moves in with it, so nothing rewraps on the way; closing,
+/// it slides back out. With reduced motion it changes at once.
 pub fn pane(
+    edge: Edge,
     size: f32,
     min: f32,
     max: f32,
-    visible: impl Fn() -> bool + 'static,
+    open: impl Fn() -> bool + Copy + 'static,
     content: impl IntoElement,
 ) -> nsh_base::ResizablePanelElement {
+    // The width the owner chose (a drag changes it), and the width shown
+    // now: the same while still, between none and it while sliding.
+    let chosen = signal(size);
+    let shown = signal(if untracked(open) { size } else { 0.0 });
+    let sliding = stored(None::<Spawned<()>>);
+    effect(move || {
+        let opening = open();
+        let from = shown.get_untracked();
+        let to = if opening { chosen.get_untracked() } else { 0.0 };
+        if let Some(timer) = sliding.replace(None) {
+            timer.cancel();
+        }
+        if (from - to).abs() < 0.5
+            || reduce_motion()
+            || idiom() == nsh_core::platform::Idiom::Terminal
+        {
+            shown.set(to);
+            return;
+        }
+        let started = nsh_core::time::now();
+        let span = if opening { motion::ENTER } else { motion::BASE };
+        let timer = set_interval(std::time::Duration::from_millis(16), move || {
+            let t = (started.elapsed().as_secs_f32() * 1000.0 / span).min(1.0);
+            // Decelerating in, accelerating out.
+            let eased = if opening {
+                1.0 - (1.0 - t).powi(3)
+            } else {
+                t * t * t
+            };
+            shown.set(from + (to - from) * eased);
+            if t >= 1.0
+                && let Some(timer) = sliding.replace(None)
+            {
+                timer.cancel();
+            }
+        });
+        sliding.replace(Some(timer));
+    });
     resizable_panel()
-        .size(px(size))
-        .size_range(px(min)..px(max))
+        .visible(move || shown.get() > 0.5)
+        .size(move || Some(px(shown.get())))
+        .min_size(move || px(min.min(shown.get())))
+        .max_size(Some(px(max)))
         // A side pane keeps its width as the window changes; the page takes
         // the difference.
         .fixed(true)
-        .visible(visible)
-        .child(content)
+        .on_resize(move |width: &Points| {
+            // Only the owner's drag, not the slide, changes the choice.
+            if sliding.with(|s| s.is_none()) && open() {
+                chosen.set(width.0);
+                shown.set(width.0);
+            }
+        })
+        .overflow_hidden()
+        .child(
+            view()
+                .h_full()
+                .w(move || px(chosen.get()))
+                .translate_x(move || match edge {
+                    Edge::Left => px(shown.get() - chosen.get()),
+                    Edge::Right => px(0.0),
+                })
+                .child(content),
+        )
 }
 
 /// The pane of a [`split`] that takes the rest of the room.

@@ -122,6 +122,7 @@ pub fn shell(store: Store) -> View {
                     ui::split()
                         .flex_1()
                         .child(ui::pane(
+                            ui::Edge::Left,
                             ui::size::SIDEBAR,
                             200.0,
                             420.0,
@@ -130,6 +131,7 @@ pub fn shell(store: Store) -> View {
                         ))
                         .child(ui::pane_rest(page(store, in_setup)))
                         .child(ui::pane(
+                            ui::Edge::Right,
                             ui::size::INSPECTOR,
                             260.0,
                             520.0,
