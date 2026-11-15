@@ -94,13 +94,21 @@ impl EffectKey {
     /// path, normalized lexically: empty and `.` components dropped, `..`
     /// resolved, no trailing slash. `None` for a relative path or one that
     /// climbs above `/`. The filesystem is not consulted (symlinks are not
-    /// resolved).
+    /// resolved). A Windows path with a drive (`C:\Users\x`, `c:/Users/x`)
+    /// is absolute too, written `C:/Users/x`: `\` and `/` both separate its
+    /// components, and the drive letter is uppercase.
     pub fn path(class: EffectClass, raw: &str) -> Option<EffectKey> {
-        if !raw.starts_with('/') {
-            return None;
-        }
+        let (root, rest, separators): (String, &str, &[char]) = match raw.as_bytes() {
+            [b'/', ..] => (String::new(), raw, &['/']),
+            [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic() => (
+                format!("{}:", (*drive as char).to_ascii_uppercase()),
+                &raw[2..],
+                &['/', '\\'],
+            ),
+            _ => return None,
+        };
         let mut parts: Vec<&str> = Vec::new();
-        for part in raw.split('/') {
+        for part in rest.split(separators) {
             match part {
                 "" | "." => {}
                 ".." => {
@@ -111,7 +119,7 @@ impl EffectKey {
         }
         Some(EffectKey {
             class,
-            target: format!("/{}", parts.join("/")),
+            target: format!("{root}/{}", parts.join("/")),
         })
     }
 

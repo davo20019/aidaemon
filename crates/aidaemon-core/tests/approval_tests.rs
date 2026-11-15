@@ -645,6 +645,28 @@ fn path_constructor_normalizes() {
     assert_eq!(k.class, EffectClass::Write);
 }
 
+/// A Windows path with a drive is absolute: either separator, one form.
+#[test]
+fn drive_paths_normalize_to_one_form() {
+    let p = |raw: &str| EffectKey::path(EffectClass::Write, raw).map(|k| k.target);
+    assert_eq!(
+        p(r"C:\Users\alice\notes.txt"),
+        Some("C:/Users/alice/notes.txt".into())
+    );
+    assert_eq!(
+        p("c:/Users/alice/./x/../notes.txt"),
+        Some("C:/Users/alice/notes.txt".into())
+    );
+    assert_eq!(p(r"D:\"), Some("D:/".into()));
+    assert_eq!(p(r"C:\.."), None);
+    // Drive-relative and rooted-without-drive Windows forms are not absolute.
+    assert_eq!(p("C:notes.txt"), None);
+    assert_eq!(p(r"\tmp\x"), None);
+    let dir = EffectKey::path(EffectClass::Write, r"C:\Users\alice").unwrap();
+    let file = EffectKey::path(EffectClass::Write, "C:/Users/alice/notes.txt").unwrap();
+    assert!(dir.overlaps(&file));
+}
+
 #[test]
 fn relative_path_rejected() {
     assert_eq!(EffectKey::path(EffectClass::Write, "notes.txt"), None);

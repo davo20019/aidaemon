@@ -3410,7 +3410,10 @@ fn resolve_absolute(path: &str) -> Option<std::path::PathBuf> {
 
 fn is_absolute_or_home(path: &str) -> bool {
     let path = path.trim();
-    path.starts_with('~') || std::path::Path::new(path).is_absolute()
+    // `has_root`: on Windows `\etc\hosts` is on the current drive, not
+    // under the working directory (and, with no drive, never trusted).
+    let path_ref = std::path::Path::new(path);
+    path.starts_with('~') || path_ref.is_absolute() || path_ref.has_root()
 }
 
 /// Validated, canonical tool input. This is the boundary object shared by

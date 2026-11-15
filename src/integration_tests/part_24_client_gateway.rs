@@ -476,7 +476,12 @@ mod client_gateway {
     async fn http_json<T: serde::de::DeserializeOwned>(
         response: reqwest::Response,
     ) -> T {
-        assert!(response.status().is_success(), "{}", response.status());
+        assert!(
+            response.status().is_success(),
+            "{} from {}",
+            response.status(),
+            response.url()
+        );
         response.json().await.unwrap()
     }
 
