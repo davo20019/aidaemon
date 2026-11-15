@@ -183,6 +183,9 @@ fn extractor(provider: Arc<dyn Provider>, model: &str) -> ProgressiveExtractor {
 /// Extract durable facts from one exchange and write them: the model
 /// proposes, the store keeps what is new, and `provenance` (if any) binds
 /// them to their source and records the write.
+/// Stored facts nearest the user's message shown to per-turn extraction.
+const NEARBY_FACTS_SHOWN: usize = 12;
+
 pub async fn extract_progressive(
     provider: Arc<dyn Provider>,
     model: &str,
@@ -195,11 +198,23 @@ pub async fn extract_progressive(
     }
     let extractor = extractor(provider, model);
     let already_stored = owner_writes_during_run(store.as_ref(), run.run_started_at).await;
+    // What recall would show in this channel, never another scope's facts.
+    let nearby = store
+        .get_relevant_facts_for_channel(
+            &run.user_text,
+            NEARBY_FACTS_SHOWN,
+            run.channel_id.as_deref(),
+            run.visibility,
+            true,
+        )
+        .await
+        .unwrap_or_default();
     let exchange = Exchange {
         user_text: &run.user_text,
         assistant_reply: &run.reply,
         channel_id: run.channel_id.as_deref(),
         already_stored: &already_stored,
+        nearby: &nearby,
         stated_at: run.run_started_at,
     };
     let facts = match extractor.propose(&exchange).await {
