@@ -33,6 +33,10 @@ CREATE INDEX idx_events_session_id
 index idx_events_type on events
 CREATE INDEX idx_events_type ON events(event_type)
 
+index idx_events_type_session on events
+CREATE INDEX idx_events_type_session
+         ON events(event_type, session_id, id)
+
 index idx_events_task on events
 CREATE INDEX idx_events_task
          ON events(task_id) WHERE task_id IS NOT NULL
@@ -676,7 +680,7 @@ CREATE TABLE session_channels (
             session_id TEXT PRIMARY KEY,
             channel_name TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
+        , shared INTEGER)
 
 table dynamic_skills on dynamic_skills
 CREATE TABLE dynamic_skills (
@@ -930,11 +934,18 @@ CREATE TABLE work_projects (
             description TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
+        , path TEXT)
 
 table session_work_projects on session_work_projects
 CREATE TABLE session_work_projects (
             session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+
+table channel_work_projects on channel_work_projects
+CREATE TABLE channel_work_projects (
+            channel TEXT PRIMARY KEY,
             project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
@@ -1571,6 +1582,7 @@ rows goal_run_recovery_links = 0
 rows scheduled_recovery_paused_schedules = 0
 rows work_projects = 1
 rows session_work_projects = 0
+rows channel_work_projects = 0
 rows goal_runs = 0
 rows mandates = 0
 rows mandate_principal_sessions = 0
