@@ -39,6 +39,9 @@ pub trait TurnStores: Send + Sync {
     fn summaries(&self) -> &dyn aidaemon_events::stores::ConversationSummaryStore;
     /// Goals (a goal's bound workspace scopes its tasks' turns).
     fn goals(&self) -> &dyn aidaemon_work::stores::GoalStore;
+    /// Projects (a conversation placed in a project with a folder works
+    /// there).
+    fn projects(&self) -> &dyn aidaemon_work::stores::WorkCoordinationStore;
     /// The work stores beyond the conversation: tasks and their activity
     /// log, goals' schedules and runs, a scheduled run's persisted budget
     /// state, and the notices delivered to the owner.

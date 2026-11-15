@@ -40,6 +40,10 @@ impl TurnStores for Agent {
         &*self.state
     }
 
+    fn projects(&self) -> &dyn aidaemon_work::stores::WorkCoordinationStore {
+        &*self.state
+    }
+
     fn work(&self) -> &dyn aidaemon_work::scheduler::SchedulerStore {
         &*self.state
     }

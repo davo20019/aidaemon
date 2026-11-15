@@ -42,13 +42,29 @@ pub(crate) async fn session_changes(
     .bind(CALLS_READ)
     .fetch_all(pool)
     .await?;
-    let touched = touched_paths(calls.iter().filter_map(|(tool, data)| {
+    // The project's folder comes first: the conversation works there.
+    let folder: Option<String> = sqlx::query_scalar(
+        "SELECT p.path FROM session_work_projects s \
+         JOIN work_projects p ON p.id = s.project_id \
+         WHERE s.session_id = ? AND p.path IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let mut touched = touched_paths(calls.iter().filter_map(|(tool, data)| {
         let data: Value = serde_json::from_str(data).ok()?;
         let name = tool
             .clone()
             .or_else(|| data.get("name")?.as_str().map(str::to_string))?;
         Some((name, data.get("arguments").cloned().unwrap_or(Value::Null)))
     }));
+    if let Some(folder) = folder.map(PathBuf::from)
+        && !touched.seen.contains(&folder)
+    {
+        touched.seen.insert(0, folder);
+    }
     changes_for(touched).await
 }
 

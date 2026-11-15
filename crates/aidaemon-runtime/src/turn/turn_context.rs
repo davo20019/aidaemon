@@ -303,6 +303,26 @@ pub fn extract_recent_parent_messages(
     rows_rev
 }
 
+/// The folder of the project session `session_id` is placed in, when it
+/// has one that still exists on this computer.
+pub async fn session_project_folder(
+    projects: &dyn aidaemon_work::stores::WorkCoordinationStore,
+    session_id: &str,
+) -> Option<String> {
+    let project_id = projects.get_session_work_project(session_id).await.ok()?;
+    if project_id == aidaemon_work::traits::DEFAULT_PROJECT_ID {
+        return None;
+    }
+    projects
+        .list_work_projects()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|project| project.id == project_id)?
+        .path
+        .filter(|path| std::path::Path::new(path).is_dir())
+}
+
 /// The session history appends and turn-context assembly every turn runs,
 /// for any [`TurnHost`].
 #[async_trait::async_trait]
@@ -471,6 +491,18 @@ pub trait TurnHistory: TurnHost {
                 })
         } else {
             None
+        };
+        // * the folder of the project the owner placed this conversation in
+        //   (the app's projects), for a conversation's own turns; a goal's
+        //   binding and a parent's handed-over workspace come first.
+        let bound_goal_scope = match bound_goal_scope {
+            Some(scope) => Some(scope),
+            None if self.inherited_project_scope().is_none()
+                && self.role() != aidaemon_events::traits::AgentRole::Executor =>
+            {
+                session_project_folder(self.projects(), session_id).await
+            }
+            None => None,
         };
         use crate::turn::project_scope::WorkspaceBindingOrigin;
         let (bound_workspace, bound_workspace_origin) = match bound_goal_scope {

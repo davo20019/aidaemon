@@ -359,6 +359,61 @@ mod tests {
         (workspace, path)
     }
 
+    /// A conversation the owner placed in a project with a folder works in
+    /// that folder without naming it; out of the project it does not.
+    #[tokio::test]
+    async fn a_project_conversation_is_bound_to_the_projects_folder() {
+        use crate::testing::{MockProvider, setup_test_agent_root};
+        use crate::traits::store_prelude::*;
+
+        let harness = setup_test_agent_root(MockProvider::new())
+            .await
+            .expect("test harness");
+        let (_workspace, workspace_path) = synthetic_site_workspace();
+        let project = harness
+            .state
+            .create_work_project("Acme site", None)
+            .await
+            .unwrap();
+        harness
+            .state
+            .update_work_project(&project.id, None, Some(Some(&workspace_path)))
+            .await
+            .unwrap();
+        harness
+            .state
+            .set_session_work_project("app:project-chat", &project.id)
+            .await
+            .unwrap();
+        for request in [
+            "Add a contact page under src/content.",
+            "fix the typo on the about page",
+        ] {
+            let turn_context = harness
+                .agent
+                .build_turn_context_from_recent_history("app:project-chat", request)
+                .await;
+            assert_eq!(
+                turn_context.bound_workspace.as_deref(),
+                Some(workspace_path.as_str()),
+                "{request}"
+            );
+            assert_eq!(
+                turn_context.primary_project_scope.as_deref(),
+                Some(workspace_path.as_str()),
+                "{request}"
+            );
+        }
+        let elsewhere = harness
+            .agent
+            .build_turn_context_from_recent_history(
+                "app:other-chat",
+                "fix the typo on the about page",
+            )
+            .await;
+        assert_eq!(elsewhere.bound_workspace, None);
+    }
+
     #[tokio::test]
     async fn relative_paths_in_mission_text_anchor_to_the_bound_goal_workspace() {
         use crate::testing::{MockProvider, setup_test_agent_root};
