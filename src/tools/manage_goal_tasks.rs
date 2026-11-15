@@ -245,6 +245,41 @@ mod tests {
         );
     }
 
+    /// A run that found nothing new says so as a typed flag, kept with
+    /// that run: an automation set to tell only changes stays quiet for it.
+    #[tokio::test]
+    async fn complete_goal_records_a_run_that_found_nothing_new() {
+        let (state, _finite) = setup_test_state().await;
+        let cg = Goal::new_continuous("Watch the synthetic file", "test-session", None, None);
+        state.create_goal(&cg).await.unwrap();
+        let run = state
+            .start_goal_run(&cg.id, "manual", None, None)
+            .await
+            .unwrap();
+        let tool = ManageGoalTasksTool::new(cg.id.clone(), state.clone());
+        tool.call(
+            &json!({ "action": "create_task", "description": "read the file", "task_order": 1 })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let mut t = state.get_tasks_for_goal(&cg.id).await.unwrap()[0].clone();
+        t.status = "completed".to_string();
+        t.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        state.update_task(&t).await.unwrap();
+        tool.call(
+            &json!({ "action": "complete_goal", "summary": "unchanged", "nothing_new": true })
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        let g = state.get_goal(&cg.id).await.unwrap().unwrap();
+        assert!(aidaemon_work::automations::run_found_nothing_new(
+            g.context.as_deref(),
+            &run.id
+        ));
+    }
+
     #[tokio::test]
     async fn complete_goal_not_blocked_by_dead_interrupted_task() {
         // Regression: the daily-tweet goal 9a744834 accumulated watchdog-

@@ -3180,12 +3180,25 @@ pub fn spawn_background_task_lead(
 
             // The owner chose what a run tells them: a quiet run keeps its
             // record (the run's summary), and nothing is sent.
+            let latest_context = state
+                .get_goal(&goal_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|goal| goal.context);
+            let found_nothing_new = task_lead_found_nothing_new
+                || goal_run_id.as_deref().is_some_and(|run_id| {
+                    aidaemon_work::automations::run_found_nothing_new(
+                        latest_context.as_deref(),
+                        run_id,
+                    )
+                });
             if is_scheduled_run
                 && continuous_controller
                 && !aidaemon_work::automations::NotifyMode::from_context(
                     initial_goal.context.as_deref(),
                 )
-                .tells(notification_type, task_lead_found_nothing_new)
+                .tells(notification_type, found_nothing_new)
             {
                 info!(
                     goal_id = %goal_id,

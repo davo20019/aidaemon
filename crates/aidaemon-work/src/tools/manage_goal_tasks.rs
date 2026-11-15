@@ -209,6 +209,10 @@ pub use crate::goals::{is_terminal_task_status, tasks_satisfy_goal_completion};
 #[derive(Clone, Deserialize)]
 struct ManageGoalTasksArgs {
     action: String,
+    /// `complete_goal` for a scheduled run: it found nothing changed since
+    /// the automation's previous run.
+    #[serde(default)]
+    nothing_new: Option<bool>,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -315,6 +319,10 @@ impl Tool for ManageGoalTasksTool {
                     },
                     "summary": {
                         "type": "string"
+                    },
+                    "nothing_new": {
+                        "type": "boolean",
+                        "description": "complete_goal for a scheduled run: true when this run found nothing changed since the automation's previous run, so there is nothing new to tell the owner."
                     },
                     "agent_id": {
                         "type": "string"
@@ -1213,11 +1221,26 @@ impl ManageGoalTasksTool {
                 .await?
                 .map(|run| run.id),
         };
-        if let Some(run_id) = run_id {
+        if let Some(run_id) = run_id.as_deref() {
             let _ = self
                 .state
-                .finish_goal_run(&run_id, "completed", Some(summary))
+                .finish_goal_run(run_id, "completed", Some(summary))
                 .await?;
+        }
+        // "Nothing new" is this run's typed verdict, kept with the run it
+        // belongs to: an automation set to tell only changes stays quiet.
+        if is_continuous
+            && args.nothing_new == Some(true)
+            && let Some(run_id) = run_id.as_deref()
+        {
+            let mut context = goal
+                .context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            context[crate::automations::NOTHING_NEW_RUN_KEY] = Value::String(run_id.to_string());
+            goal.context = Some(context.to_string());
         }
         self.state.update_goal(&goal).await?;
         info!(goal_id = %self.goal_id, is_continuous, "Goal run completed");

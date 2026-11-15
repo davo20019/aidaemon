@@ -2985,7 +2985,7 @@ async fn test_a_quiet_automations_run_is_told_how_to_report_nothing_new() {
     assert!(
         tasks[0]
             .description
-            .contains("set track_requirements' outcome to nothing_new"),
+            .contains("complete_goal and nothing_new: true"),
         "{}",
         tasks[0].description
     );
@@ -3065,7 +3065,7 @@ async fn test_a_quiet_automations_run_now_is_told_how_to_report_nothing_new() {
     assert!(
         tasks[0]
             .description
-            .contains("set track_requirements' outcome to nothing_new"),
+            .contains("complete_goal and nothing_new: true"),
         "{}",
         tasks[0].description
     );

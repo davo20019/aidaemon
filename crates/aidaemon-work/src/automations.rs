@@ -83,6 +83,23 @@ pub enum NotifyMode {
     Problems,
 }
 
+/// The goal-context key naming the run whose task lead said it found
+/// nothing new (`manage_goal_tasks complete_goal` with `nothing_new`).
+pub const NOTHING_NEW_RUN_KEY: &str = "nothing_new_run";
+
+/// Whether goal `context` records run `run_id` as having found nothing new.
+pub fn run_found_nothing_new(context: Option<&str>, run_id: &str) -> bool {
+    context
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|context| {
+            context
+                .get(NOTHING_NEW_RUN_KEY)
+                .and_then(serde_json::Value::as_str)
+                .map(|recorded| recorded == run_id)
+        })
+        .unwrap_or(false)
+}
+
 impl NotifyMode {
     pub const KEY: &'static str = "notify";
 
@@ -131,8 +148,9 @@ impl NotifyMode {
     pub fn run_note(self) -> Option<&'static str> {
         match self {
             Self::Changes => Some(
-                " Report only what changed since this automation's previous run; when nothing \
-                 did, set track_requirements' outcome to nothing_new and answer in one line.",
+                " Report only what changed since this automation's previous run (its earlier \
+                 results are the goal context's task_results); when nothing did, finish with \
+                 manage_goal_tasks complete_goal and nothing_new: true, and answer in one line.",
             ),
             _ => None,
         }
@@ -165,6 +183,14 @@ mod notify_tests {
             NotifyMode::Changes
         );
         assert_eq!(NotifyMode::from_context(None), NotifyMode::EveryRun);
+    }
+
+    #[test]
+    fn nothing_new_is_known_for_the_run_that_said_it() {
+        let context = Some(r#"{"nothing_new_run":"run-2"}"#);
+        assert!(super::run_found_nothing_new(context, "run-2"));
+        assert!(!super::run_found_nothing_new(context, "run-3"));
+        assert!(!super::run_found_nothing_new(None, "run-2"));
     }
 }
 

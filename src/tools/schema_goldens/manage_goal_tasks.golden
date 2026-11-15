@@ -49,6 +49,10 @@
           "description": "Next action.",
           "type": "string"
         },
+        "nothing_new": {
+          "description": "complete_goal for a scheduled run: true when this run found nothing changed since the automation's previous run, so there is nothing new to tell the owner.",
+          "type": "boolean"
+        },
         "parallel_group": {
           "type": "string"
         },
