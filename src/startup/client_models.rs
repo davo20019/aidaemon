@@ -58,6 +58,79 @@ pub(crate) fn options(llm: &SharedLlmRuntime) -> ModelOptions {
     }
 }
 
+fn available_models(options: &ModelOptions) -> String {
+    let models: Vec<&str> = options
+        .providers
+        .iter()
+        .flat_map(|provider| provider.models.iter().map(|model| model.id.as_str()))
+        .collect();
+    if models.is_empty() {
+        "No models are available.".to_string()
+    } else {
+        format!("Available models: {}", models.join(", "))
+    }
+}
+
+/// Handle the app's per-conversation model commands. Other slash commands
+/// continue through the channel command dispatcher.
+pub(crate) async fn slash(
+    settings: &dyn SettingsStore,
+    llm: &SharedLlmRuntime,
+    session_id: &str,
+    command: &str,
+    args: &str,
+) -> Option<String> {
+    match command {
+        "model" => {
+            let requested = args.trim();
+            if requested.is_empty() {
+                let current = current(settings, llm, session_id).await;
+                return Some(match current.model {
+                    ModelChoice::Pinned { provider, model } => {
+                        format!("This conversation uses `{model}` ({provider}).")
+                    }
+                    _ => "This conversation uses automatic model routing.".to_string(),
+                });
+            }
+            let choices = options(llm);
+            let selected = choices.providers.iter().find_map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .any(|model| model.id == requested)
+                    .then(|| ModelChoice::Pinned {
+                        provider: provider.id.clone(),
+                        model: requested.to_string(),
+                    })
+            });
+            let Some(selected) = selected else {
+                return Some(format!(
+                    "Unknown model `{requested}`. {}",
+                    available_models(&choices)
+                ));
+            };
+            Some(
+                match set(settings, llm, session_id, Some(selected), None).await {
+                    Ok(model) => match model.model {
+                        ModelChoice::Pinned { provider, model } => {
+                            format!("This conversation now uses `{model}` ({provider}).")
+                        }
+                        _ => "This conversation uses automatic model routing.".to_string(),
+                    },
+                    Err(error) => error,
+                },
+            )
+        }
+        "auto" => Some(
+            match set(settings, llm, session_id, Some(ModelChoice::Auto), None).await {
+                Ok(_) => "This conversation now uses automatic model routing.".to_string(),
+                Err(error) => error,
+            },
+        ),
+        _ => None,
+    }
+}
+
 /// What `session_id` answers with now: a pin the runtime no longer has, or
 /// an effort its provider does not take, reads as automatic, as the turn
 /// treats it.
@@ -251,5 +324,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auto.model, ModelChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn slash_model_isolated_by_conversation_resolves_provider_and_auto_clears() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let settings = harness.state.as_ref();
+        let llm = runtime();
+
+        let selected = slash(
+            settings,
+            &llm,
+            "app:synthetic-one",
+            "model",
+            "synthetic-gemini",
+        )
+        .await
+        .unwrap();
+        assert!(selected.contains("failover-0"), "{selected}");
+        assert_eq!(
+            current(settings, &llm, "app:synthetic-one").await.model,
+            pin("failover-0", "synthetic-gemini").unwrap()
+        );
+        assert_eq!(
+            current(settings, &llm, "app:synthetic-two").await.model,
+            ModelChoice::Auto
+        );
+
+        let report = slash(settings, &llm, "app:synthetic-one", "model", "")
+            .await
+            .unwrap();
+        assert!(report.contains("synthetic-gemini"), "{report}");
+
+        let unknown = slash(
+            settings,
+            &llm,
+            "app:synthetic-one",
+            "model",
+            "synthetic-missing",
+        )
+        .await
+        .unwrap();
+        assert!(unknown.contains("Unknown model `synthetic-missing`"));
+        assert!(unknown.contains("synthetic-claude, synthetic-gemini"));
+        assert_eq!(
+            current(settings, &llm, "app:synthetic-one").await.model,
+            pin("failover-0", "synthetic-gemini").unwrap(),
+            "an unknown model must not change the existing pin"
+        );
+        assert_eq!(
+            slash(settings, &llm, "app:synthetic-one", "help", "").await,
+            None
+        );
+
+        let auto = slash(settings, &llm, "app:synthetic-one", "auto", "")
+            .await
+            .unwrap();
+        assert!(auto.contains("automatic model routing"));
+        assert_eq!(
+            current(settings, &llm, "app:synthetic-one").await.model,
+            ModelChoice::Auto
+        );
+        let report = slash(settings, &llm, "app:synthetic-one", "model", "")
+            .await
+            .unwrap();
+        assert!(report.contains("automatic model routing"), "{report}");
     }
 }

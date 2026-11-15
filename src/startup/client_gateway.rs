@@ -981,6 +981,12 @@ impl ClientHost for DaemonClientHost {
     }
 
     async fn slash(&self, session_id: &str, command: &str, args: &str) -> Option<String> {
+        if let Some(reply) =
+            super::client_models::slash(self.state.as_ref(), &self.llm, session_id, command, args)
+                .await
+        {
+            return Some(reply);
+        }
         self.commands
             .dispatch(
                 &format!("/{command}"),
