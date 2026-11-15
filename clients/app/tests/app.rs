@@ -422,3 +422,33 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     app.wait_for("Nothing runs on its own yet")?;
     Ok(())
 }
+
+/// Editing scheduled work in place: Save waits for a change, sends it, and
+/// the answer brings the list back as the daemon now has it.
+#[test]
+fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([Update::Connected]);
+    app.press("Automations: what runs on its own")?;
+    app.wait_for("Reading your automations…")?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday at 9:00 AM ET","status":"active","edit":{"when":"every weekday at 9am","instructions":"Summarize the synthetic inbox"}}]}}"#,
+    )]);
+    app.wait_for("Inbox digest")?;
+    app.press("Edit")?;
+    app.wait_for("Changes apply from its next run.")?;
+    app.type_text("label:When it runs", " and saturdays")?;
+    app.press("Save")?;
+    // The form closes; the answer brings the list as it is now.
+    app.wait_for_gone(
+        "Changes apply from its next run.",
+        std::time::Duration::from_secs(5),
+    )?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"r10","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday and Saturday at 9:00 AM ET","status":"active","edit":{"when":"every weekday at 9am and saturdays","instructions":"Summarize the synthetic inbox"}}],"note":"Rescheduled \"Inbox digest\".","changed":true}}"#,
+    )]);
+    app.wait_for("Scheduled · Every weekday and Saturday at 9:00 AM ET")?;
+    Ok(())
+}
