@@ -82,6 +82,23 @@ fn models_of(table: &toml::Table) -> Vec<String> {
     out
 }
 
+/// The models a provider table uses for the hardest work and for quick
+/// jobs, as the daemon fills them (a job left unnamed takes the catalog's
+/// model for that provider). Empty for an unknown kind.
+fn jobs_of(table: &toml::Table, kind: &str) -> (String, String) {
+    let Ok(kind) = toml::Value::String(kind.to_string()).try_into::<crate::config::ProviderKind>()
+    else {
+        return Default::default();
+    };
+    let mut models: crate::config::ModelsConfig = table
+        .get("models")
+        .cloned()
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or_default();
+    models.apply_defaults(&kind);
+    (models.smart, models.fast)
+}
+
 /// One provider table as the tab shows it. `failover`: its index, or
 /// `None` for the main provider. `stored`: whether a secret is stored under
 /// a keychain name; `signed_in`: whether ChatGPT is.
@@ -137,12 +154,15 @@ fn connected_of(
     } else {
         CredentialState::KeyMissing
     };
+    let (hard_model, quick_model) = jobs_of(table, &kind);
     ConnectedProvider {
         failover,
         preset: entry.map(|e| e.id.to_string()).unwrap_or_default(),
         name,
         base_url,
         models: models_of(table),
+        hard_model,
+        quick_model,
         credential,
         key_setting: if kind == CHATGPT_KIND {
             String::new()
@@ -359,6 +379,25 @@ mod tests {
 
     fn table(text: &str) -> toml::Table {
         text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_provider_with_only_a_key_shows_the_catalogs_models_by_job() {
+        let config = table(
+            r#"
+kind = "anthropic"
+[models]
+default = "claude-haiku-5-5"
+"#,
+        );
+        assert_eq!(
+            jobs_of(&config, "anthropic"),
+            (
+                "claude-opus-5-5".to_string(),
+                "claude-haiku-5-5".to_string()
+            )
+        );
+        assert_eq!(jobs_of(&config, "not-a-kind"), Default::default());
     }
 
     #[test]

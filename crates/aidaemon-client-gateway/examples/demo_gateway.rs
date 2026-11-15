@@ -574,6 +574,8 @@ impl ClientHost for Host {
                 } else {
                     choice.primary_model.clone()
                 }],
+                hard_model: String::new(),
+                quick_model: String::new(),
                 credential: if option.needs_key {
                     CredentialState::KeyStored
                 } else {
@@ -688,6 +690,8 @@ fn demo_settings() -> &'static std::sync::Mutex<Settings> {
                     name: name.into(),
                     base_url: String::new(),
                     models: models.iter().map(|m| m.to_string()).collect(),
+                    hard_model: models.first().map(|m| m.to_string()).unwrap_or_default(),
+                    quick_model: models.last().map(|m| m.to_string()).unwrap_or_default(),
                     credential,
                     key_setting: key.into(),
                 }

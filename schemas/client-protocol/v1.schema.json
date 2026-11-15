@@ -2291,6 +2291,10 @@
             "null"
           ]
         },
+        "hard_model": {
+          "description": "The model it uses for the hardest work, the owner's choice or the\ncatalog's when they named none (protocol 1.20). Empty when unknown.",
+          "type": "string"
+        },
         "key_setting": {
           "description": "The setting its key is stored under (`provider.api_key`,\n`provider.fallbacks[0].api_key`); empty for a sign-in.",
           "type": "string"
@@ -2308,6 +2312,10 @@
         },
         "preset": {
           "description": "The catalog preset it matches; empty when none does.",
+          "type": "string"
+        },
+        "quick_model": {
+          "description": "The model it uses for quick jobs, chosen the same way (protocol 1.20).",
           "type": "string"
         }
       },

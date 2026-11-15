@@ -25,11 +25,13 @@
       "connected": [
         {
           "credential": "signed_in",
+          "hard_model": "synthetic-model-1",
           "models": [
             "synthetic-model-1"
           ],
           "name": "OpenAI (ChatGPT subscription)",
-          "preset": "openai_chatgpt"
+          "preset": "openai_chatgpt",
+          "quick_model": "synthetic-model-2"
         },
         {
           "base_url": "https://api.example.com/v1",

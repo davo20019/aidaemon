@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 19;
+pub const PROTOCOL_MINOR: u16 = 20;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -974,6 +974,13 @@ pub struct ConnectedProvider {
     /// Its default model first, then the others it uses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// The model it uses for the hardest work, the owner's choice or the
+    /// catalog's when they named none (protocol 1.20). Empty when unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hard_model: String,
+    /// The model it uses for quick jobs, chosen the same way (protocol 1.20).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quick_model: String,
     pub credential: CredentialState,
     /// The setting its key is stored under (`provider.api_key`,
     /// `provider.fallbacks[0].api_key`); empty for a sign-in.
