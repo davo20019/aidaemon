@@ -154,7 +154,8 @@ impl ChildAgentRuntime for Agent {
         let Some(hub) = answer.hub.as_ref().and_then(std::sync::Weak::upgrade) else {
             return Ok(false);
         };
-        let envelope = crate::tools::terminal::run_background_continuation(
+        // The follow-up's end is told once its reply is delivered (drop).
+        let (continued, _followup_end) = crate::tools::terminal::run_background_continuation(
             self,
             ConversationRequest {
                 session_id: answer.chat.clone(),
@@ -169,7 +170,8 @@ impl ChildAgentRuntime for Agent {
                 clock: answer.clock,
             },
         )
-        .await?;
+        .await;
+        let envelope = continued?;
         let reply = aidaemon_tools::sanitize::sanitize_user_facing_reply(&envelope.text);
         if reply.trim().is_empty() {
             return Ok(false);

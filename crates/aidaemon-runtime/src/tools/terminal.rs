@@ -3294,10 +3294,16 @@ pub async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()>
 /// Run one background completion continuation under the shared serializer and
 /// a single wall-clock budget that includes waiting for the serializer. This is
 /// the authoritative boundary for terminal and delegated CLI completions.
+///
+/// The [`FollowupEnd`] tells watchers the turn ended when it is dropped:
+/// keep it until the answer is delivered.
 pub async fn run_background_continuation(
     agent: &dyn ConversationRuntime,
     request: ConversationRequest,
-) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+) -> (
+    anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope>,
+    FollowupEnd,
+) {
     run_background_continuation_with_timeout(agent, request, BACKGROUND_CONTINUATION_TIMEOUT).await
 }
 
@@ -3313,7 +3319,10 @@ async fn run_background_continuation_with_timeout(
     agent: &dyn ConversationRuntime,
     mut request: ConversationRequest,
     timeout: Duration,
-) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+) -> (
+    anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope>,
+    FollowupEnd,
+) {
     // The follow-up is a turn of the conversation like any other: whoever
     // watches turns (the app) sees it start, its progress and its end, not
     // only the message it ends with.
@@ -3339,31 +3348,64 @@ async fn run_background_continuation_with_timeout(
     };
     let session_id = request.session_id.clone();
     let result = run_continuation_turn(agent, request, timeout).await;
-    if let Some((observer, turn, forward)) = watched {
-        // The turn has ended and dropped its sender: let what it said reach
-        // the watcher before its end does.
-        let _ = tokio::time::timeout(Duration::from_secs(2), forward).await;
-        let error = result.as_ref().err().map(|error| error.to_string());
-        let end = match &result {
-            Ok(envelope) if envelope.text.trim().is_empty() => {
-                aidaemon_channels::turns::TurnEnd::Empty
-            }
-            Ok(_) => aidaemon_channels::turns::TurnEnd::Delivered,
-            Err(_) => aidaemon_channels::turns::TurnEnd::Failed,
-        };
-        observer.turn_finished(&aidaemon_channels::turns::TurnFinish {
-            session_id: &session_id,
-            turn,
-            platform: "background",
-            end,
-            // The answer goes out as the conversation's message, by the
-            // caller's delivery: the turn itself carries none.
-            reply: "",
-            handed_off: false,
-            error: error.as_deref(),
-        });
+    let Some((observer, turn, forward)) = watched else {
+        return (result, FollowupEnd(None));
+    };
+    // The turn has ended and dropped its sender: let what it said reach the
+    // watcher before its end does.
+    let _ = tokio::time::timeout(Duration::from_secs(2), forward).await;
+    let end = match &result {
+        Ok(envelope) if envelope.text.trim().is_empty() => aidaemon_channels::turns::TurnEnd::Empty,
+        Ok(_) => aidaemon_channels::turns::TurnEnd::Delivered,
+        Err(_) => aidaemon_channels::turns::TurnEnd::Failed,
+    };
+    let ended = FollowupEnded {
+        observer,
+        session_id,
+        turn,
+        end,
+        // A follow-up may start more background work (a fix's check): the
+        // conversation stays working until that reports.
+        handed_off: result.as_ref().is_ok_and(|envelope| {
+            envelope.disposition == aidaemon_events::AssistantResponseDisposition::BackgroundHandoff
+        }),
+        error: result.as_ref().err().map(|error| error.to_string()),
+    };
+    (result, FollowupEnd(Some(ended)))
+}
+
+/// A watched follow-up's end, told when this is dropped: after the caller
+/// delivered its answer, so the conversation reads "working in the
+/// background" from a hand-off on, never idle in between.
+pub struct FollowupEnd(Option<FollowupEnded>);
+
+struct FollowupEnded {
+    observer: Arc<dyn aidaemon_channels::turns::TurnObserver>,
+    session_id: String,
+    turn: u64,
+    end: aidaemon_channels::turns::TurnEnd,
+    handed_off: bool,
+    error: Option<String>,
+}
+
+impl Drop for FollowupEnd {
+    fn drop(&mut self) {
+        if let Some(ended) = self.0.take() {
+            ended
+                .observer
+                .turn_finished(&aidaemon_channels::turns::TurnFinish {
+                    session_id: &ended.session_id,
+                    turn: ended.turn,
+                    platform: "background",
+                    end: ended.end,
+                    // The answer went out as the conversation's message, by
+                    // the caller's delivery: the turn itself carries none.
+                    reply: "",
+                    handed_off: ended.handed_off,
+                    error: ended.error.as_deref(),
+                });
+        }
     }
-    result
 }
 
 async fn run_continuation_turn(
@@ -6359,7 +6401,7 @@ impl TerminalTool {
                                             command = %command_for_notify,
                                             "Re-engaging agent loop to process background command output"
                                         );
-                                        match run_background_continuation(
+                                        let (continued, _followup_end) = run_background_continuation(
                                             agent.as_ref(),
                                             ConversationRequest {
                                                 session_id: session_for_notify.clone(),
@@ -6383,8 +6425,8 @@ impl TerminalTool {
                                                 },
                                             },
                                         )
-                                        .await
-                                        {
+                                        .await;
+                                        match continued {
                                             Ok(envelope) => {
                                                 // Defense-in-depth: never leak scaffolding
                                                 // the re-engaged loop may echo.
@@ -11612,10 +11654,10 @@ mod tests {
             }
         }
         fn turn_finished(&self, turn: &aidaemon_channels::turns::TurnFinish<'_>) {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("finished {:?} reply={:?}", turn.end, turn.reply));
+            self.0.lock().unwrap().push(format!(
+                "finished {:?} reply={:?} handed_off={}",
+                turn.end, turn.reply, turn.handed_off
+            ));
         }
     }
 
@@ -11644,15 +11686,19 @@ mod tests {
             },
             Duration::from_secs(5),
         )
-        .await
-        .unwrap();
+        .await;
+        let (envelope, end) = (envelope.0.unwrap(), envelope.1);
         assert_eq!(envelope.text, "Drupal is installed.");
+        // Its end is told once its answer is delivered: when the caller
+        // drops what it was handed.
+        assert_eq!(recorded.0.lock().unwrap().len(), 2);
+        drop(end);
         assert_eq!(
             *recorded.0.lock().unwrap(),
             vec![
                 format!("started app:synthetic-follow-up: {FOLLOWUP_DESCRIPTION}"),
                 "thinking".to_string(),
-                "finished Delivered reply=\"\"".to_string(),
+                "finished Delivered reply=\"\" handed_off=false".to_string(),
             ]
         );
     }
@@ -11684,6 +11730,7 @@ mod tests {
                 Duration::from_secs(5),
             )
             .await
+            .0
             .unwrap()
             .text
         };
@@ -11738,6 +11785,7 @@ mod tests {
             Duration::from_millis(20),
         )
         .await
+        .0
         .expect_err("pending continuation must time out");
         assert!(error.to_string().contains("timed out"), "{error}");
     }

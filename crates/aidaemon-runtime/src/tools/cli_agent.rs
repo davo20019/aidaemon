@@ -3338,30 +3338,31 @@ impl CliAgentTool {
                             if let Some(run) = run.as_ref() {
                                 run.step(Step::Reporting).await;
                             }
-                            match crate::tools::terminal::run_background_continuation(
-                                agent.as_ref(),
-                                ConversationRequest {
-                                    session_id: notify_session_id.clone(),
-                                    user_text: followup,
-                                    status_tx: None,
-                                    user_role: aidaemon_tools::semantics::UserRole::Owner,
-                                    channel_ctx:
-                                        aidaemon_channels::context::ChannelContext::internal(),
-                                    heartbeat: None,
-                                    parent_task_id,
-                                    parent_tool_call_id: None,
-                                    parent_result_id: None,
-                                    clock: match group_answer.as_ref() {
-                                        Some(answer) => answer.clock,
-                                        None => ended
-                                            .as_ref()
-                                            .and_then(|(state, _)| state.as_ref())
-                                            .and_then(crate::run_state::RequestClock::of_run),
+                            let (continued, _followup_end) =
+                                crate::tools::terminal::run_background_continuation(
+                                    agent.as_ref(),
+                                    ConversationRequest {
+                                        session_id: notify_session_id.clone(),
+                                        user_text: followup,
+                                        status_tx: None,
+                                        user_role: aidaemon_tools::semantics::UserRole::Owner,
+                                        channel_ctx:
+                                            aidaemon_channels::context::ChannelContext::internal(),
+                                        heartbeat: None,
+                                        parent_task_id,
+                                        parent_tool_call_id: None,
+                                        parent_result_id: None,
+                                        clock: match group_answer.as_ref() {
+                                            Some(answer) => answer.clock,
+                                            None => ended
+                                                .as_ref()
+                                                .and_then(|(state, _)| state.as_ref())
+                                                .and_then(crate::run_state::RequestClock::of_run),
+                                        },
                                     },
-                                },
-                            )
-                            .await
-                            {
+                                )
+                                .await;
+                            match continued {
                                 Ok(envelope) if !envelope.text.trim().is_empty() => {
                                     let text = aidaemon_tools::sanitize::sanitize_user_facing_reply(
                                         &envelope.text,
