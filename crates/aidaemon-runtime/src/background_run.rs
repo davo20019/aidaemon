@@ -349,7 +349,11 @@ impl BackgroundRun {
             GroupTurn::Alone => RunsTurn::Alone,
             GroupTurn::Waiting => RunsTurn::Waiting,
             GroupTurn::Complete(ends) => RunsTurn::Answer(GroupAnswer {
-                followup: group_followup(&ends, max_report_chars),
+                followup: group_followup(
+                    &ends,
+                    max_report_chars,
+                    crate::helper_run::delivery::GroupWork::Checks,
+                ),
                 parent_task_id: self.task_id.clone(),
                 clock: crate::run_state::RequestClock::of_group(&ends),
                 messages: ends.into_iter().map(|end| end.message).collect(),
@@ -455,6 +459,30 @@ mod tests {
                 assert_eq!(answer.parent_task_id.as_deref(), Some("task-1"));
                 assert_eq!(answer.messages, vec!["count done", "Install done"]);
                 assert!(answer.followup.contains("installed"));
+                // Checks' results may call for a fix and a fresh check.
+                assert!(answer.followup.contains("fix it now and check again"));
+                assert!(!answer.followup.contains("Don't call tools to re-check"));
+            }
+            other => panic!("expected the group's answer, got {other:?}"),
+        }
+
+        // A long check keeps its end, where a test run's verdict is (live
+        // 2026-11-15: "its report was truncated, so I can't identify the
+        // failing test").
+        let a = BackgroundRun::start(home.clone(), start("tests-1", "tests")).await;
+        let b = BackgroundRun::start(home.clone(), start("lint-1", "lint")).await;
+        let (state, _) = a
+            .finish(RunEnd::Stopped(None), RunEvidence::default())
+            .await;
+        let long = format!(
+            "{}\ntest synthetic_card ... FAILED",
+            "compiling\n".repeat(400)
+        );
+        assert!(matches!(end(&a, state, &long), RunsTurn::Waiting));
+        let (state, _) = b.finish(RunEnd::Succeeded, RunEvidence::default()).await;
+        match end(&b, state, "clean") {
+            RunsTurn::Answer(answer) => {
+                assert!(answer.followup.contains("test synthetic_card ... FAILED"));
             }
             other => panic!("expected the group's answer, got {other:?}"),
         }

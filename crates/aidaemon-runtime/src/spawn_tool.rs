@@ -2562,7 +2562,11 @@ mod group_tests {
                 "WordPress is up at https://wp.ddev.site.",
             ),
         ];
-        let followup = group_followup(&ends, 8_000);
+        let followup = group_followup(
+            &ends,
+            8_000,
+            crate::helper_run::delivery::GroupWork::Helpers,
+        );
         let drupal = ends[0].state.times().unwrap();
         let wordpress = ends[1].state.times().unwrap();
         assert_eq!(wordpress.took(), chrono::Duration::seconds(235));
@@ -2663,7 +2667,11 @@ mod group_tests {
             run("d", "Install Drupal", Some(Vec::new())),
             run("c", "A shell loop", None),
         ];
-        let followup = group_followup(&ends, 8_000);
+        let followup = group_followup(
+            &ends,
+            8_000,
+            crate::helper_run::delivery::GroupWork::Helpers,
+        );
         assert!(
             followup.contains(
                 "Delivered to the owner by this run:\n- Sent to the owner: Screenshot of \

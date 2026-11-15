@@ -403,7 +403,7 @@ async fn answer_group(
             hub: route.hub.clone(),
             chat: chat.clone(),
             parent_task_id: route.parent_task_id.clone(),
-            followup: group_followup(&ends, route.max_response_chars),
+            followup: group_followup(&ends, route.max_response_chars, GroupWork::Helpers),
             clock: crate::run_state::RequestClock::of_group(&ends),
         })
         .await;
@@ -445,7 +445,23 @@ async fn answer_group(
 /// that said "Done 5m 54s after your request"). The card already shows each
 /// run's end and the group's total, so the answer is told not to list them
 /// again; a request that asked how long gets these lines as given.
-pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usize) -> String {
+/// What ran in the background for a request, which decides what its
+/// answer may do: helpers' work is done and only reported; a command's or a
+/// coding agent's result may call for a fix and a fresh check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupWork {
+    /// Sub-agents (`spawn_agent`): their reports are the answer's input.
+    Helpers,
+    /// Background commands and CLI agents: checks and changes whose result
+    /// the request may need acted on.
+    Checks,
+}
+
+pub fn group_followup(
+    ends: &[crate::run_state::GroupEnd],
+    max_report_chars: usize,
+    work: GroupWork,
+) -> String {
     let mut out = String::from(
         "[Background helpers finished]\n\
          Every helper this request started has ended. Their run records follow \
@@ -477,7 +493,21 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
             out.push_str(&lines);
             out.push('\n');
         }
-        let (report, _) = bounded_child_response(end.report.text.trim(), max_report_chars);
+        // A check's verdict is at its end (a test run's failures and
+        // summary): it keeps its head and its tail.
+        let kept;
+        let report = match work {
+            GroupWork::Helpers => {
+                bounded_child_response(end.report.text.trim(), max_report_chars).0
+            }
+            GroupWork::Checks => {
+                kept = crate::tools::terminal::keep_head_and_tail(
+                    end.report.text.trim(),
+                    max_report_chars,
+                );
+                kept.as_str()
+            }
+        };
         let report = if end.report.untrusted {
             aidaemon_tools::sanitize::wrap_untrusted_output("spawn_agent", report)
         } else {
@@ -509,8 +539,15 @@ pub fn group_followup(ends: &[crate::run_state::GroupEnd], max_report_chars: usi
          never work a time out yourself. When the answer's own time adds to these, the daemon \
          measures it and shows it under your answer as \"Answer sent … after your request\": \
          never say it wasn't measured, and don't state one of your own. A record's \
-         \"Next step\" is the daemon's offer: make it in your answer, as given. Don't call tools \
-         to re-check this work.",
+         \"Next step\" is the daemon's offer: make it in your answer, as given.",
     );
+    out.push_str(match work {
+        GroupWork::Helpers => " Don't call tools to re-check this work.",
+        GroupWork::Checks => {
+            " When the request asked you to fix what these found, fix it now and check \
+             again before you answer: a check run after you changed files is a new check. \
+             Don't run one again only to see a result shown here."
+        }
+    });
     out
 }
