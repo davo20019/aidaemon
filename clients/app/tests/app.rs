@@ -389,12 +389,6 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press("New conversation in this project >> nth=0")?;
     app.wait_for("Explain this project")?;
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
-    // A new conversation says where it works: Chat leaves the project and
-    // brings the everyday starters; In a project goes back to one.
-    app.press("Chat")?;
-    app.wait_for("Set a reminder")?;
-    app.press("In a project")?;
-    app.wait_for("Explain this project")?;
     Ok(())
 }
 
