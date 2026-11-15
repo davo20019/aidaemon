@@ -375,6 +375,9 @@ pub struct Store {
     automations: Signal<AutomationsRead>,
     automations_request: Stored<Option<String>>,
     automation_busy: Signal<Option<String>>,
+    /// The automation whose edit form is open: the page's timed refresh
+    /// waits, so what the owner is typing stays.
+    automation_editing: Signal<Option<String>>,
     /// Advanced when the keyboard should go back to the composer (a
     /// conversation picked, a pane closed).
     composer_focus: Signal<u64>,
@@ -466,6 +469,7 @@ impl Store {
             automations: signal(AutomationsRead::NotYet),
             automations_request: stored(None),
             automation_busy: signal(None),
+            automation_editing: signal(None),
             posting: signal(BTreeSet::new()),
             settings: signal(SettingsRead::NotYet),
             settings_request: stored(None),
@@ -1242,6 +1246,44 @@ impl Store {
             change,
         });
         self.automations_request.replace(Some(request));
+    }
+
+    /// Rename, reschedule or re-instruct one automation; a `None` field
+    /// stays as it is. The answer brings the list and what happened.
+    pub fn edit_automation(
+        &self,
+        id: &str,
+        name: Option<String>,
+        when: Option<String>,
+        instructions: Option<String>,
+    ) {
+        if self.automations_request.with(|r| r.is_some()) {
+            return;
+        }
+        self.automation_editing.set(None);
+        self.automation_busy.set(Some(id.to_owned()));
+        let request = self.send(Command::EditAutomation {
+            automation_id: id.to_owned(),
+            name,
+            when,
+            instructions,
+        });
+        self.automations_request.replace(Some(request));
+    }
+
+    pub fn automation_editing(&self) -> Option<String> {
+        self.automation_editing.get()
+    }
+
+    /// Open (`Some`) or close the edit form of one automation.
+    pub fn set_automation_editing(&self, id: Option<String>) {
+        self.automation_editing.set(id);
+    }
+
+    /// Change an automation by asking: a new conversation, started.
+    pub fn change_automation_in_chat(&self, title: &str) {
+        self.select(None);
+        self.set_draft(format!("Change my automation \"{title}\": "));
     }
 
     /// Read the daemon's status again (the page's Refresh, and its timer).

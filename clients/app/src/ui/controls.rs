@@ -487,6 +487,14 @@ pub fn field(placeholder: &'static str, value: Signal<String>) -> Input {
         .focus(|s| s.border_color(colors::ACCENT))
 }
 
+/// A field for a few lines of text (instructions, a note).
+pub fn area(placeholder: &'static str, value: Signal<String>) -> Input {
+    field(placeholder, value)
+        .multiline(true)
+        .h(px(size::CONTROL_MD * 3.0))
+        .py_2()
+}
+
 /// A one-line field for a secret: masked, never filled in by the platform.
 pub fn secret_field(placeholder: &'static str, value: Signal<String>) -> Input {
     field(placeholder, value).masked(true).auto_correct(false)

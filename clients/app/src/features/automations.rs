@@ -1,9 +1,11 @@
 //! The Automations page: everything that runs on its own (scheduled work
 //! and reminders, watching automations, health checks), next to run first,
-//! each with Pause or Resume, Run now (scheduled work) and Cancel (asked
-//! twice). New ones are made by asking the agent, so the page starts a
-//! conversation for that. Read on open, every 30 seconds while open, on
-//! Refresh, and after each change (its answer brings the list).
+//! each with Pause or Resume, Run now (scheduled work), Details (its card
+//! and recent runs), Edit (scheduled work: name, when, what it does) or
+//! Change in chat, and Cancel (asked twice). New ones are made by asking
+//! the agent, so the page starts a conversation for that. Read on open,
+//! every 30 seconds while open and no form is open, on Refresh, and after
+//! each change (its answer brings the list).
 
 use aidaemon_client_protocol::{
     AutomationChange, AutomationKind, AutomationRun, AutomationSummary, RunOutcome,
@@ -15,7 +17,9 @@ use crate::ui::{self, Glyph, Size, Tone, Variant, badge, colors, size, time, typ
 
 pub fn page(store: Store) -> View {
     set_interval(std::time::Duration::from_secs(30), move || {
-        store.refresh_automations()
+        if store.automation_editing().is_none() {
+            store.refresh_automations()
+        }
     });
     view()
         .flex_1()
@@ -326,6 +330,46 @@ fn card(store: Store, automation: AutomationSummary) -> View {
             .disabled(busy.clone()),
         );
     }
+    // Change it: here when it can be (scheduled work), else by asking.
+    let editing = {
+        let id = id.clone();
+        move || store.automation_editing().as_deref() == Some(id.as_str())
+    };
+    match automation.edit.clone() {
+        Some(_) => {
+            let id = id.clone();
+            actions = actions.child(
+                ui::btn("Edit", Variant::Ghost, Size::Sm, move || {
+                    store.set_automation_editing(Some(id.clone()))
+                })
+                .disabled(busy.clone()),
+            );
+        }
+        None => {
+            let title = automation
+                .name
+                .clone()
+                .unwrap_or_else(|| automation.what.clone());
+            actions = actions.child(ui::btn(
+                "Change in chat",
+                Variant::Ghost,
+                Size::Sm,
+                move || store.change_automation_in_chat(&title),
+            ));
+        }
+    }
+    actions = actions.child(
+        when(showing, move || {
+            ui::btn("Hide details", Variant::Ghost, Size::Sm, move || {
+                showing.set(false)
+            })
+        })
+        .otherwise(move || {
+            ui::btn("Details", Variant::Ghost, Size::Sm, move || {
+                showing.set(true)
+            })
+        }),
+    );
     let cancel = act(AutomationChange::Cancel);
     actions = actions.child(
         when(confirming, move || {
@@ -357,20 +401,104 @@ fn card(store: Store, automation: AutomationSummary) -> View {
         }),
     );
     let runs = automation.recent_runs.clone();
-    if !runs.is_empty() {
-        actions = actions.child(
-            when(showing, move || {
-                ui::btn("Hide history", Variant::Ghost, Size::Sm, move || {
-                    showing.set(false)
-                })
-            })
-            .otherwise(move || {
-                ui::btn("History", Variant::Ghost, Size::Sm, move || {
-                    showing.set(true)
-                })
-            }),
+    let lines = automation.details.clone();
+    let form = automation.edit.clone().map(|edit| {
+        let id = id.clone();
+        let name = automation.name.clone().unwrap_or_default();
+        move || edit_form(store, id.clone(), name.clone(), edit.clone())
+    });
+    let mut c = c
+        .child(actions)
+        .child(when(showing, move || details(lines.clone(), runs.clone())));
+    if let Some(form) = form {
+        c = c.child(when(editing, form));
+    }
+    c
+}
+
+/// All of it: what it may do, when it tells you, when it ends and the rest
+/// of its card, then its recent runs.
+fn details(lines: Vec<String>, runs: Vec<AutomationRun>) -> View {
+    let mut list = view().gap_1().pt_1();
+    for line in lines {
+        list = list.child(
+            text(line)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
         );
     }
-    c.child(actions)
-        .child(when(showing, move || history(runs.clone())))
+    if runs.is_empty() {
+        return list;
+    }
+    list.child(
+        text("Recent runs")
+            .pt_2()
+            .text_size(px(type_scale::XS))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(colors::MUTED),
+    )
+    .child(history(runs))
+}
+
+/// Change it in place: its name, when it runs (in words) and what its runs
+/// do (a reminder's message stays). Saved changes apply from its next run.
+fn edit_form(
+    store: Store,
+    id: String,
+    name: String,
+    edit: aidaemon_client_protocol::AutomationEdit,
+) -> View {
+    let new_name = signal(name.clone());
+    let new_when = signal(edit.when.clone());
+    let instructions = edit.instructions.clone();
+    let new_instructions = signal(instructions.clone().unwrap_or_default());
+    let changed = |now: String, was: &str| {
+        let now = now.trim().to_owned();
+        (!now.is_empty() && now != was.trim()).then_some(now)
+    };
+    let save = {
+        let (name, when, instructions) = (name.clone(), edit.when.clone(), instructions.clone());
+        move || {
+            store.edit_automation(
+                &id,
+                changed(new_name.get_untracked(), &name),
+                changed(new_when.get_untracked(), &when),
+                instructions
+                    .as_deref()
+                    .and_then(|was| changed(new_instructions.get_untracked(), was)),
+            )
+        }
+    };
+    let unchanged = {
+        let (name, when, instructions) = (name, edit.when, instructions.clone());
+        move || {
+            changed(new_name.get(), &name).is_none()
+                && changed(new_when.get(), &when).is_none()
+                && instructions
+                    .as_deref()
+                    .is_none_or(|was| changed(new_instructions.get(), was).is_none())
+        }
+    };
+    let mut form = view()
+        .gap_2()
+        .pt_2()
+        .child(ui::field("Name", new_name).label("Name"))
+        .child(ui::field("Every weekday at 9am", new_when).label("When it runs"));
+    if instructions.is_some() {
+        form = form.child(ui::area("What each run does", new_instructions).label("What it does"));
+    }
+    form.child(
+        text("Changes apply from its next run.")
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+    )
+    .child(
+        view()
+            .flex_row()
+            .gap_1()
+            .child(ui::btn("Save", Variant::Primary, Size::Sm, save).disabled(unchanged))
+            .child(ui::btn("Discard", Variant::Ghost, Size::Sm, move || {
+                store.set_automation_editing(None)
+            })),
+    )
 }
