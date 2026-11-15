@@ -393,7 +393,7 @@ default = "claude-haiku-5-5"
         assert_eq!(
             jobs_of(&config, "anthropic"),
             (
-                "claude-fable-5-2".to_string(),
+                "claude-opus-5-5".to_string(),
                 "claude-haiku-5-5".to_string()
             )
         );

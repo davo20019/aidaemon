@@ -187,7 +187,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         models: Models {
             primary: "claude-sonnet-5-5",
             fast: "claude-haiku-5-5",
-            smart: "claude-fable-5-2",
+            smart: "claude-opus-5-5",
         },
         credential: Credential::ApiKey {
             env: &["ANTHROPIC_API_KEY"],
