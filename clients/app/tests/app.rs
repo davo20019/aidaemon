@@ -285,3 +285,24 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
     Ok(())
 }
+
+#[test]
+fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-files","channel":"app","title":"Quarterly numbers","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Quarterly numbers")?;
+    app.press("Quarterly numbers")?;
+    feed([frame(
+        r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-files","event":{"type":"assistant_message","session_id":"app:synthetic-files","text":"Here is the report.","attachments":[{"id":"0123456789abcdef01234567","name":"synthetic-report.pdf","mime":"application/pdf","size_bytes":4,"url":"/client/v1/files/0123456789abcdef01234567/sig/synthetic-report.pdf"}]}}"#,
+    )]);
+    app.wait_for("Here is the report.")?;
+    app.wait_for("synthetic-report.pdf")?;
+    Ok(())
+}

@@ -9,10 +9,11 @@ use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, Command, CommandResult, ErrorCode, Event, Feature, MemoryItem,
-    MidRun, ProjectSummary, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange, SettingsOutcome,
-    SetupAction, SetupState, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
+    MidRun, ProjectSummary, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange,
+    SettingsOutcome, SetupAction, SetupState, SetupStep, SlashCommand, SystemStatus, TaskSummary,
+    TurnStatus,
 };
-use aidaemon_client_protocol::{Pane, ViewAction};
+use aidaemon_client_protocol::{AttachmentRef, Pane, ViewAction};
 use nsh_core::prelude::*;
 
 /// The connection to the daemon, as the owner should see it.
@@ -166,6 +167,24 @@ pub enum MemoryRead {
     Failed(String),
 }
 
+/// The largest file the gateway takes.
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+
+/// A file attached to the message being written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftFile {
+    pub number: u64,
+    pub name: String,
+    pub state: DraftFileState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DraftFileState {
+    Uploading,
+    Ready(AttachmentRef),
+    Failed(String),
+}
+
 /// The Settings page's data, as last read.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum SettingsRead {
@@ -257,6 +276,14 @@ pub struct Store {
     search_request: Stored<Option<String>>,
     memories: Signal<MemoryRead>,
     memories_request: Stored<Option<String>>,
+    /// Files attached to the message being written.
+    draft_files: Signal<Vec<DraftFile>>,
+    /// Uploads not yet answered: request id to the draft file's number.
+    uploads: Stored<BTreeMap<String, u64>>,
+    next_upload: Stored<u64>,
+    /// The gateway's HTTP origin, before a file's link; empty in the
+    /// browser, where links are on the page's own origin.
+    gateway_base: Stored<String>,
     /// The Code tab: the selected session's changes, and the session they
     /// are of.
     changes: Signal<ChangesRead>,
@@ -340,6 +367,10 @@ impl Store {
             search_request: stored(None),
             memories: signal(MemoryRead::NotYet),
             memories_request: stored(None),
+            draft_files: signal(Vec::new()),
+            uploads: stored(BTreeMap::new()),
+            next_upload: stored(1),
+            gateway_base: stored(String::new()),
             changes: signal(ChangesRead::NotYet),
             changes_of: stored(None),
             changes_request: stored(None),
@@ -625,6 +656,37 @@ impl Store {
     }
 
     fn frame(&self, frame: ServerFrame) {
+        match &frame {
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Uploaded { attachment },
+            } => {
+                if let Some(number) = self.uploads.with(|u| u.remove(request_id)) {
+                    let attachment = attachment.clone();
+                    self.draft_files.update(|files| {
+                        if let Some(file) = files.iter_mut().find(|f| f.number == number) {
+                            file.state = DraftFileState::Ready(attachment);
+                        }
+                    });
+                }
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.uploads.with(|u| u.contains_key(request_id)) => {
+                let number = self.uploads.with(|u| u.remove(request_id)).unwrap_or(0);
+                let reason = error.message.clone();
+                self.draft_files.update(|files| {
+                    if let Some(file) = files.iter_mut().find(|f| f.number == number) {
+                        file.state = DraftFileState::Failed(reason.clone());
+                    }
+                });
+                self.say(format!("Could not attach the file: {}", error.message));
+                return;
+            }
+            _ => {}
+        }
         if let ServerFrame::Ack {
             request_id,
             result: CommandResult::MessageAccepted { session_id, .. },
@@ -2093,10 +2155,31 @@ impl Store {
             .with_untracked(|d| d.get(key.as_deref().unwrap_or(NEW)).cloned())
             .unwrap_or_default();
         let text = text.trim().to_owned();
-        if text.is_empty() {
+        let files = self.draft_files.get_untracked();
+        if files
+            .iter()
+            .any(|f| matches!(f.state, DraftFileState::Uploading))
+        {
+            self.say("Wait for the files to finish attaching");
             return;
         }
-        match (&key, text.strip_prefix('/')) {
+        let attachments: Vec<AttachmentRef> = files
+            .into_iter()
+            .filter_map(|f| match f.state {
+                DraftFileState::Ready(attachment) => Some(attachment),
+                _ => None,
+            })
+            .collect();
+        if text.is_empty() && attachments.is_empty() {
+            return;
+        }
+        if !attachments.is_empty() {
+            self.draft_files.set(Vec::new());
+        }
+        match (
+            &key,
+            text.strip_prefix('/').filter(|_| attachments.is_empty()),
+        ) {
             (Some(session), Some(slash)) => {
                 let (command, args) = slash.split_once(' ').unwrap_or((slash, ""));
                 self.send(Command::RunSlash {
@@ -2109,7 +2192,7 @@ impl Store {
                 let id = self.send(Command::SendMessage {
                     session_id: key.clone(),
                     text,
-                    attachments: Vec::new(),
+                    attachments,
                     mid_run,
                     // A new conversation starts in the project it was opened in.
                     project_id: key
@@ -2127,6 +2210,78 @@ impl Store {
         self.drafts.update(|d| {
             d.remove(key.as_deref().unwrap_or(NEW));
         });
+    }
+
+    // ----- Files with messages -------------------------------------------
+
+    /// Where the gateway is, for files' links (native apps).
+    pub fn set_gateway_base(&self, base: String) {
+        self.gateway_base
+            .replace(base.trim_end_matches('/').to_owned());
+    }
+
+    /// Where to fetch `file`.
+    pub fn file_url(&self, file: &AttachmentRef) -> Option<String> {
+        let url = file.url.as_deref()?;
+        Some(format!("{}{url}", self.gateway_base.with(|b| b.clone())))
+    }
+
+    /// Files attached to the message being written.
+    pub fn draft_files(&self) -> Vec<DraftFile> {
+        self.draft_files.get()
+    }
+
+    /// Whether files can go with a message here: the app's own
+    /// conversations (or a new one).
+    pub fn takes_files(&self) -> bool {
+        self.selected.get().is_none_or(|id| id.starts_with("app:"))
+    }
+
+    /// Attach a file to the message being written: it uploads now.
+    pub fn attach_file(&self, name: String, mime: String, bytes: &[u8]) {
+        use base64::Engine as _;
+        if bytes.len() > MAX_FILE_BYTES {
+            self.say(format!(
+                "{name} is too large to attach (up to {} MB)",
+                MAX_FILE_BYTES / (1024 * 1024)
+            ));
+            return;
+        }
+        let number = self.next_upload.with(|n| {
+            *n += 1;
+            *n
+        });
+        self.draft_files.update(|files| {
+            files.push(DraftFile {
+                number,
+                name: name.clone(),
+                state: DraftFileState::Uploading,
+            })
+        });
+        let id = self.send(Command::UploadFile {
+            name,
+            mime: (!mime.is_empty()).then_some(mime),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        self.uploads.with(|u| u.insert(id, number));
+    }
+
+    /// Pick pictures to attach (scaled to fit 2048 px).
+    pub fn pick_pictures(&self) {
+        let store = *self;
+        spawn(async move {
+            let mut request = nsh_core::picker::PickRequest::new(true, 4);
+            request.max_dimension = Some(DevicePixels(2048));
+            for file in pick_images(request).await {
+                store.attach_file(file.name, file.mime, file.data.bytes());
+            }
+        });
+    }
+
+    pub fn remove_draft_file(&self, number: u64) {
+        self.uploads.with(|u| u.retain(|_, n| *n != number));
+        self.draft_files
+            .update(|files| files.retain(|f| f.number != number));
     }
 
     pub fn stop(&self, session: &str) {

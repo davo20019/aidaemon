@@ -3,12 +3,13 @@
 //! conversation is the same page with no session yet.
 
 use aidaemon_client_core::state::Line;
-use aidaemon_client_protocol::MidRun;
-use nsh_base::{MarkdownOptions, TextViewLinks, input, text_view};
+use aidaemon_client_protocol::{AttachmentRef, MidRun};
+use nsh_base::{MarkdownOptions, TextViewLinks, button, input, text_view};
+use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
 use super::approvals;
-use crate::store::{ActivityMode, Connection, Store};
+use crate::store::{ActivityMode, Connection, DraftFileState, Store};
 use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
@@ -16,8 +17,8 @@ use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type
 enum Row {
     /// A day break: "Today", "Yesterday", "Mar 3".
     Day(String),
-    User(String, u64),
-    Assistant(String, u64),
+    User(String, u64, Vec<AttachmentRef>),
+    Assistant(String, u64, Vec<AttachmentRef>),
     Note(String),
     /// The reply being written and what the agent is doing.
     Live,
@@ -58,8 +59,18 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             }
         }
         rows.push(match line {
-            Line::User { text, at_ms, .. } => Row::User(text, at_ms),
-            Line::Assistant { text, at_ms, .. } => Row::Assistant(text, at_ms),
+            Line::User {
+                text,
+                at_ms,
+                attachments,
+                ..
+            } => Row::User(text, at_ms, attachments),
+            Line::Assistant {
+                text,
+                at_ms,
+                attachments,
+                ..
+            } => Row::Assistant(text, at_ms, attachments),
             Line::Note { text } => Row::Note(text),
             Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
             Line::Activity { tools, secs } => Row::Activity(tools, secs),
@@ -387,8 +398,14 @@ const STARTERS: [(&str, &str); 3] = [
 
 /// The same, in a project: the agent already works in its folder.
 const PROJECT_STARTERS: [(&str, &str); 3] = [
-    ("Explain this project", "Explain how this project is laid out and how to run it."),
-    ("What changed?", "Summarize what changed here recently and what is unfinished."),
+    (
+        "Explain this project",
+        "Explain how this project is laid out and how to run it.",
+    ),
+    (
+        "What changed?",
+        "Summarize what changed here recently and what is unfinished.",
+    ),
     ("Fix something", "Fix "),
 ];
 
@@ -532,26 +549,45 @@ fn transcript_list(
                     let content = move || {
                         row.with(|r| match r {
                             Some(
-                                Row::User(t, _) | Row::Assistant(t, _) | Row::Note(t) | Row::Day(t),
+                                Row::User(t, ..)
+                                | Row::Assistant(t, ..)
+                                | Row::Note(t)
+                                | Row::Day(t),
                             ) => t.clone(),
                             _ => String::new(),
                         })
                     };
                     let at = move || {
                         row.with(|r| match r.as_ref() {
-                            Some(Row::User(_, at) | Row::Assistant(_, at)) => *at,
+                            Some(Row::User(_, at, _) | Row::Assistant(_, at, _)) => *at,
                             _ => 0,
+                        })
+                    };
+                    let attached = move || {
+                        row.with(|r| match r {
+                            Some(Row::User(_, _, files) | Row::Assistant(_, _, files)) => {
+                                files.clone()
+                            }
+                            _ => Vec::new(),
                         })
                     };
                     match kind {
                         0 => column
                             .items_end()
                             .gap_1()
-                            .child(user_bubble(content))
+                            .child(files(store, attached, true))
+                            .child(when(
+                                move || !content().trim().is_empty(),
+                                move || user_bubble(content),
+                            ))
                             .child(stamp(at)),
                         1 => column
                             .gap_1()
-                            .child(markdown(move || content().into(), || false))
+                            .child(when(
+                                move || !content().trim().is_empty(),
+                                move || markdown(move || content().into(), || false),
+                            ))
+                            .child(files(store, attached, false))
                             .child(reply_footer(store, content, at)),
                         2 => column.child(note(content)),
                         5 => column.child(day_break(content)),
@@ -737,6 +773,96 @@ fn day_break(label: impl Fn() -> String + 'static) -> View {
         .child(view().flex_1().h(px(1.0)).bg(colors::LINE))
 }
 
+/// The files sent with a message: pictures in place, other files as chips
+/// that open them. `mine`: the owner's (shown at the right).
+fn files(store: Store, attached: impl Fn() -> Vec<AttachmentRef> + 'static, mine: bool) -> View {
+    view().child(dynamic(move || {
+        let files = attached();
+        if files.is_empty() {
+            return None;
+        }
+        Some(untracked(move || {
+            let mut list = view().flex_row().flex_wrap().gap_2();
+            if mine {
+                list = list.justify_end();
+            }
+            for file in files {
+                let Some(url) = store.file_url(&file) else {
+                    list = list.child(ui::file_chip(file.name.clone(), "not available"));
+                    continue;
+                };
+                let open = url.clone();
+                if file.is_image() && idiom() != Idiom::Terminal {
+                    list = list.child(ui::picture(
+                        url,
+                        format!("Picture: {}", file.name),
+                        move || {
+                            open_file(open.clone());
+                        },
+                    ));
+                } else {
+                    list = list.child(
+                        button()
+                            .accessibility_label(format!("Open {}", file.name))
+                            .on_press(move || {
+                                open_file(open.clone());
+                            })
+                            .child(ui::file_chip(file.name.clone(), "")),
+                    );
+                }
+            }
+            list
+        }))
+    }))
+}
+
+/// The files attached to the message being written, each with a way to
+/// take it off.
+fn draft_files(store: Store) -> View {
+    view().child(dynamic(move || {
+        let files = store.draft_files();
+        if files.is_empty() {
+            return None;
+        }
+        Some(untracked(move || {
+            let mut list = view()
+                .flex_row()
+                .flex_wrap()
+                .gap_1()
+                .px(px(4.0))
+                .pt(px(2.0));
+            for file in files {
+                let number = file.number;
+                let status = match &file.state {
+                    DraftFileState::Uploading => "attaching…",
+                    DraftFileState::Ready(_) => "",
+                    DraftFileState::Failed(_) => "failed",
+                };
+                list = list.child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .child(ui::file_chip(file.name.clone(), status))
+                        .child(ui::icon_btn(
+                            Glyph::Close,
+                            "Remove the file",
+                            Size::Sm,
+                            move || store.remove_draft_file(number),
+                        )),
+                );
+            }
+            list
+        }))
+    }))
+}
+
+/// Open a message's file in the system's browser or viewer.
+fn open_file(url: String) {
+    spawn(async move {
+        let _ = open_url(url).await;
+    });
+}
+
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
     view()
         .max_w(percentage(0.8))
@@ -843,7 +969,14 @@ fn composer(store: Store, session: Option<String>) -> View {
     // rest of it (a phone's line is 24 pt).
     let height = signal(ui::fit::read_lh());
     let online = move || store.is_online();
-    let can_send = move || online() && !store.draft().trim().is_empty();
+    let can_send = move || {
+        online()
+            && (!store.draft().trim().is_empty()
+                || store
+                    .draft_files()
+                    .iter()
+                    .any(|f| matches!(f.state, DraftFileState::Ready(_))))
+    };
     let running = {
         let session = session.clone();
         computed(move || session.as_deref().is_some_and(|id| store.is_running(id)))
@@ -899,9 +1032,20 @@ fn composer(store: Store, session: Option<String>) -> View {
                 .p(px(6.0))
                 .gap_1()
                 .focus_within(|s| s.border_color(colors::ACCENT))
+                .child(draft_files(store))
                 .child(
                     input()
                         .element_ref(&field)
+                        // A pasted picture (a screenshot) is attached; its
+                        // text, if any, still goes in.
+                        .on_paste(move |paste: &PasteEvent| {
+                            if !store.takes_files() {
+                                return;
+                            }
+                            for file in &paste.files {
+                                store.attach_file(file.name.clone(), file.mime.clone(), &file.data);
+                            }
+                        })
                         .value(move || store.draft())
                         .on_change(move |text: &str| store.set_draft(text.to_owned()))
                         .multiline(true)
@@ -948,6 +1092,17 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .flex_row()
                         .items_center()
                         .gap_1()
+                        .child(when(
+                            move || !terminal && store.takes_files(),
+                            move || {
+                                ui::icon_btn(
+                                    Glyph::Attach,
+                                    "Attach pictures",
+                                    Size::Md,
+                                    move || store.pick_pictures(),
+                                )
+                            },
+                        ))
                         .child(
                             text(move || match (running.get(), touch) {
                                 (true, true) => {

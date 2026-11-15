@@ -28,6 +28,22 @@ fn gateway_url() -> String {
         .unwrap_or_else(|| DEFAULT_URL.to_owned())
 }
 
+/// The gateway's HTTP origin, from its socket URL (`ws://h:p/client/v1/ws`):
+/// where a message's files are fetched.
+fn http_base(socket: &str) -> String {
+    let http = if let Some(rest) = socket.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = socket.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        socket.to_owned()
+    };
+    match http.find("/client/v1") {
+        Some(at) => http[..at].to_owned(),
+        None => http.trim_end_matches('/').to_owned(),
+    }
+}
+
 /// The owner's local token: from `aidaemon app` / `aidaemon tui`
 /// (`AIDAEMON_CLIENT_TOKEN`), else the saved copy (`aidaemon client-token`).
 fn local_token() -> Option<String> {
@@ -72,6 +88,7 @@ pub fn start(store: Store) {
         store.needs_daemon();
         return;
     };
+    store.set_gateway_base(http_base(&url));
     let kind = if idiom() == Idiom::Terminal {
         ClientKind::Tui
     } else {

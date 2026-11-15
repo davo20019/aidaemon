@@ -23,7 +23,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 ## Components (`src/ui/controls.rs`, `src/ui/kit.rs`)
 
-`key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `secret_field` (masked), `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Over `nsh_base`'s behaviour-only parts (`kit.rs`; keyboard, focus, roles and the terminal's rendering are nsh's): `toggle` (Switch: a setting that takes effect at once), `choice` (Select; searchable past 8 items; a sheet on phones), `sections` (Accordion, several open), `tab_bar` (Tabs), `data_table` (Table semantics, actions in the last column), `meter` (Progress), `confirm` (the platform's alert, before anything that cannot be undone), `with_menu` (ContextMenu: right click, long press, the menu key), `toasts` (ToastStack and ToastManager: one stack for the app; the terminal's status line), and `split` / `pane` / `pane_rest` (resizable panes).
+`key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `secret_field` (masked), `picture` and `file_chip` (files with messages), `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Over `nsh_base`'s behaviour-only parts (`kit.rs`; keyboard, focus, roles and the terminal's rendering are nsh's): `toggle` (Switch: a setting that takes effect at once), `choice` (Select; searchable past 8 items; a sheet on phones), `sections` (Accordion, several open), `tab_bar` (Tabs), `data_table` (Table semantics, actions in the last column), `meter` (Progress), `confirm` (the platform's alert, before anything that cannot be undone), `with_menu` (ContextMenu: right click, long press, the menu key), `toasts` (ToastStack and ToastManager: one stack for the app; the terminal's status line), and `split` / `pane` / `pane_rest` (resizable panes).
 
 Features compose these and layout primitives only. A missing look becomes a variant here first.
 
@@ -100,6 +100,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 
 - **First run:** where the agent runs, then the daemon's own setup steps (a model, then an optional chat), then the greeting's conversation opens.
 
+- **Files:** the composer's paperclip picks pictures (scaled to fit 2048 px) and a pasted screenshot is attached; each shows as a chip ("attaching…", "failed") with a remove button until sent. Sent and received pictures show in place (up to 320 pt wide), other files as chips; pressing either opens it. Only the app's own conversations take files; the terminal shows chips, not pictures.
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
 - **Projects** (sidebar): a name and any folder on the daemon's computer (a site, a repository, designs, or none); a conversation in one works in its folder.
 - **Inbox** (the right pane's first tab): waiting approvals of other conversations, new replies, running work, and the current turn's steps.

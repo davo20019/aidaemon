@@ -206,11 +206,17 @@ fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
                 .flex_row()
                 .items_center()
                 .child(section_label("Projects").flex_1())
-                .child(ui::icon_btn(Glyph::Plus, "New project", ui::Size::Sm, move || {
-                    store.show_project_form(!store.project_form_open())
-                })),
+                .child(ui::icon_btn(
+                    Glyph::Plus,
+                    "New project",
+                    ui::Size::Sm,
+                    move || store.show_project_form(!store.project_form_open()),
+                )),
         )
-        .child(when(move || store.project_form_open(), move || project_form(store)))
+        .child(when(
+            move || store.project_form_open(),
+            move || project_form(store),
+        ))
         .child(when(
             move || all.with(Vec::is_empty) && !store.project_form_open(),
             || {
@@ -347,29 +353,31 @@ fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
                     },
                 )),
         )
-        .child(when(move || is_open.get(), move || {
-            let empty_id = empty_id.clone();
-            view()
-                .pl_3()
-                .gap(px(1.0))
-                .child(when(
-                    move || mine.with(Vec::is_empty),
-                    move || {
-                        let id = empty_id.clone();
-                        row(|| false, move || store.new_in_project(Some(id.clone())))
-                            .child(
+        .child(when(
+            move || is_open.get(),
+            move || {
+                let empty_id = empty_id.clone();
+                view()
+                    .pl_3()
+                    .gap(px(1.0))
+                    .child(when(
+                        move || mine.with(Vec::is_empty),
+                        move || {
+                            let id = empty_id.clone();
+                            row(|| false, move || store.new_in_project(Some(id.clone()))).child(
                                 text("No conversations yet. Start one")
                                     .text_size(px(type_scale::SM))
                                     .text_color(colors::FAINT),
                             )
-                    },
-                ))
-                .child(each(
-                    mine,
-                    |id: &String| id.clone(),
-                    move |id, _| session_row(store, id.get_untracked()),
-                ))
-        }))
+                        },
+                    ))
+                    .child(each(
+                        mine,
+                        |id: &String| id.clone(),
+                        move |id, _| session_row(store, id.get_untracked()),
+                    ))
+            },
+        ))
 }
 
 /// The New project form, under the Projects heading.
@@ -393,7 +401,12 @@ fn project_form(store: Store) -> View {
         )
         .child(when(
             move || store.project_error().is_some(),
-            move || ui::banner(move || store.project_error().unwrap_or_default(), Tone::Danger),
+            move || {
+                ui::banner(
+                    move || store.project_error().unwrap_or_default(),
+                    Tone::Danger,
+                )
+            },
         ))
         .child(
             view()
@@ -405,9 +418,12 @@ fn project_form(store: Store) -> View {
                     ui::Size::Sm,
                     move || store.create_project(&name.get_untracked(), &path.get_untracked()),
                 ))
-                .child(ui::btn("Cancel", ui::Variant::Ghost, ui::Size::Sm, move || {
-                    store.show_project_form(false)
-                })),
+                .child(ui::btn(
+                    "Cancel",
+                    ui::Variant::Ghost,
+                    ui::Size::Sm,
+                    move || store.show_project_form(false),
+                )),
         )
 }
 

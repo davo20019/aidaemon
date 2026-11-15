@@ -278,6 +278,10 @@ pub enum Glyph {
     System,
     Inbox,
     Memory,
+    /// Attach a file.
+    Attach,
+    /// A file (not a picture).
+    File,
 }
 
 impl Glyph {
@@ -307,6 +311,8 @@ impl Glyph {
             Self::System => "◫",
             Self::Inbox => "◆",
             Self::Memory => "◎",
+            Self::Attach => "⊕",
+            Self::File => "▭",
         }
     }
 }
@@ -371,6 +377,12 @@ impl Glyph {
             }
             Self::Memory => {
                 r#"<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>"#
+            }
+            Self::Attach => {
+                r#"<path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/>"#
+            }
+            Self::File => {
+                r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>"#
             }
         }
     }
@@ -579,6 +591,60 @@ pub fn row(
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
         .style_when(selected, |s| s.bg(colors::SELECTED))
         .on_press(on_press)
+}
+
+/// A picture sent with a message: fitted to 320 points wide (less on a
+/// narrow screen), rounded like a card, pressable to open it full size.
+pub fn picture(
+    src: String,
+    label: String,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    button()
+        .max_w(px(320.0))
+        .max_w(percentage(0.8))
+        .rounded(px(radius::SURFACE))
+        .overflow_hidden()
+        .border_1()
+        .border_color(colors::BORDER)
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .accessibility_label(label)
+        .on_press(on_press)
+        .child(image(src).w_full().max_h(px(360.0)))
+}
+
+/// A file sent with a message, or attached to one being written: its name
+/// as a small chip. `status` is a word after it ("attaching…").
+pub fn file_chip(name: impl Into<SharedString>, status: impl Into<SharedString>) -> View {
+    let status: SharedString = status.into();
+    let mut chip = view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .h(px(fit::row()))
+        .max_w(px(260.0))
+        .rounded(px(radius::CONTROL))
+        .border_1()
+        .border_color(colors::BORDER)
+        .bg(colors::SURFACE)
+        .child(icon(Glyph::File).text_color(colors::MUTED))
+        .child(
+            text(name.into())
+                .number_of_lines(1)
+                .flex_shrink(1.0)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::TEXT),
+        );
+    if !status.is_empty() {
+        chip = chip.child(
+            text(status)
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        );
+    }
+    chip
 }
 
 /// A framed surface: cards, dialogs' bodies, the composer.
