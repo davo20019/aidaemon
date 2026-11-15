@@ -99,6 +99,12 @@
             "text": "Draft the synthetic report"
           },
           {
+            "calls": [
+              {
+                "input": "building the report",
+                "name": "terminal"
+              }
+            ],
             "kind": "activity",
             "secs": 1,
             "tools": [
