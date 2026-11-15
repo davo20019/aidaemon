@@ -187,13 +187,25 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     // The settings arrive: a value edits as TOML in a code editor, and
     // another key is typed with the known keys suggested.
     let id = wait_sent("get_settings")?;
-    let result = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_stored", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
+    let result = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
     ))]);
     // What Enter does while the agent works is this device's choice.
     app.wait_for("On this device")?;
     app.wait_for("While the agent works, Enter >> nth=0")?;
+    // Providers name a model per job; a key in the file offers the keychain,
+    // and a failover never offers the provider already in use.
+    app.press("Models")?;
+    app.wait_for("Hard work: synthetic-strong · Quick jobs: synthetic-quick")?;
+    app.wait_for("Key in config.toml")?;
+    app.wait_for("Move to keychain")?;
+    app.press("Add a failover")?;
+    app.wait_for("Tried when the providers before it fail.")?;
+    app.wait_for("Every provider here is already in use.")?;
+    if app.shows("Billed per use") {
+        return Err("the failover list offers OpenAI again".into());
+    }
     app.press("Advanced")?;
     app.wait_for("Another setting")?;
     app.type_text("label:Setting key", "provider.mo")?;

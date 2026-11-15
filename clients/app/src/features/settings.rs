@@ -697,10 +697,7 @@ impl ProviderForm {
 fn credential_words(credential: CredentialState) -> (&'static str, Tone) {
     match credential {
         CredentialState::KeyStored => ("Key in the keychain", Tone::Success),
-        CredentialState::KeyInFile => (
-            "Key written in config.toml: replace it to keep it in the keychain",
-            Tone::Warning,
-        ),
+        CredentialState::KeyInFile => ("Key in config.toml", Tone::Warning),
         CredentialState::KeyMissing => ("No key: it cannot answer", Tone::Danger),
         CredentialState::SignedIn => ("Signed in to ChatGPT", Tone::Success),
         CredentialState::SignedOut => ("Not signed in: it cannot answer", Tone::Danger),
@@ -736,6 +733,12 @@ fn providers(store: Store, settings: &Settings, form: ProviderForm) -> View {
             .filter(|p| p.failover.is_some() && p.credential == CredentialState::KeyStored)
             .map(|p| p.preset.clone())
             .collect(),
+        connected: settings
+            .connected
+            .iter()
+            .filter(|p| !p.preset.is_empty())
+            .map(|p| p.preset.clone())
+            .collect(),
     };
     page.child(in_use(store, settings, form, known))
 }
@@ -769,7 +772,8 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
             .child(form_at(store, form, known, BELOW));
     }
     section = section.child(muted(
-        "The main provider answers. If it fails, the failovers are tried in order.",
+        "The main provider answers. If it can't, the next one takes over with the same kind \
+         of model (hard work stays on a strong model).",
     ));
     let mut list = ui::surface().gap_0();
     let count = settings.connected.len();
@@ -803,6 +807,21 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
         .child(form_at(store, form, known, BELOW))
 }
 
+/// Which model does which job: one key reaches every model of its
+/// provider, so the card names jobs, not a list to add to.
+fn models_by_job(provider: &ConnectedProvider) -> String {
+    let (hard, quick) = (provider.hard_model.as_str(), provider.quick_model.as_str());
+    match (hard.is_empty(), quick.is_empty()) {
+        (false, false) if hard == quick => format!("All work: {hard}"),
+        (false, false) => format!("Hard work: {hard} · Quick jobs: {quick}"),
+        (false, true) => format!("Hard work: {hard}"),
+        (true, false) => format!("Quick jobs: {quick}"),
+        // A daemon before protocol 1.20, or an address that decides.
+        (true, true) if provider.models.is_empty() => "The provider's own models".to_string(),
+        (true, true) => provider.models.join(", "),
+    }
+}
+
 fn connected_row(
     store: Store,
     provider: ConnectedProvider,
@@ -816,18 +835,15 @@ fn connected_row(
         Some(index) => format!("Failover {}", index + 1),
     };
     let (credential, tone) = credential_words(provider.credential);
-    let (model, others) = match provider.models.split_first() {
-        Some((first, rest)) => (first.clone(), rest.to_vec()),
-        None => ("The provider's own model".to_string(), Vec::new()),
-    };
+    let models_line = models_by_job(&provider);
     let mut actions = view().flex_row().flex_wrap().gap_2();
     if main {
         actions = actions.child(
-            ui::btn("Change", Variant::Outline, Size::Sm, move || {
+            ui::btn("Change models", Variant::Ghost, Size::Sm, move || {
                 form.open(Adding::Main, String::new(), at)
             })
             .disabled(move || store.settings_busy())
-            .accessibility_label("Change the main provider"),
+            .accessibility_label("Change the main provider or its models"),
         );
     } else if !provider.preset.is_empty() {
         let preset = provider.preset.clone();
@@ -851,9 +867,16 @@ fn connected_row(
     if !setting.is_empty() {
         let replacing = setting.clone();
         let missing = provider.credential == CredentialState::KeyMissing;
+        let in_file = provider.credential == CredentialState::KeyInFile;
         actions = actions.child(
             ui::btn(
-                if missing { "Add key" } else { "Replace key" },
+                if missing {
+                    "Add key"
+                } else if in_file {
+                    "Move to keychain"
+                } else {
+                    "Replace key"
+                },
                 if missing {
                     Variant::Primary
                 } else {
@@ -898,15 +921,10 @@ fn connected_row(
                 .with(|r| r.as_deref() == Some(setting.as_str()))
         }
     };
-    let mut models = view().gap_0p5().child(
-        text(model)
-            .number_of_lines(1)
-            .text_size(px(ui::fit::small()))
-            .text_color(colors::TEXT),
-    );
-    if !others.is_empty() {
-        models = models.child(faint(format!("Also {}", others.join(", "))).number_of_lines(2));
-    }
+    let models = text(models_line)
+        .number_of_lines(2)
+        .text_size(px(ui::fit::small()))
+        .text_color(colors::TEXT);
     view()
         .p_3()
         .gap_2()
@@ -1058,6 +1076,9 @@ struct Known {
     main_name: String,
     /// Presets a failover holds a stored key for: made main, they use it.
     keyed: Vec<String>,
+    /// Presets already in use: one key reaches all of a provider's models,
+    /// so a failover never adds the same provider again.
+    connected: Vec<String>,
 }
 
 /// Connect a provider as the main one or a failover: pick it, then sign
@@ -1069,6 +1090,7 @@ fn add_form(store: Store, adding: Adding, form: ProviderForm, known: Known) -> V
         checked,
         main_name,
         keyed,
+        connected,
     } = known;
     let (title, lead) = match adding {
         Adding::Main => (
@@ -1113,6 +1135,14 @@ fn add_form(store: Store, adding: Adding, form: ProviderForm, known: Known) -> V
             )
             .child(submit(store, adding, form, Rc::new(|| true)));
     }
+    // A custom endpoint differs by address, so it may appear twice.
+    let options: Vec<ProviderOption> = match adding {
+        Adding::Main => options,
+        Adding::Failover => options
+            .into_iter()
+            .filter(|o| o.needs_base_url || !connected.contains(&o.preset))
+            .collect(),
+    };
     card.child(dynamic(move || {
         let preset = form.preset.get();
         let options = options.clone();
@@ -1161,6 +1191,9 @@ fn add_form(store: Store, adding: Adding, form: ProviderForm, known: Known) -> V
 /// Every provider the daemon can connect, each saying how it bills and
 /// signs in.
 fn provider_list(options: Vec<ProviderOption>, form: ProviderForm, signed_in: bool) -> View {
+    if options.is_empty() {
+        return view().child(muted("Every provider here is already in use."));
+    }
     let mut list = view().gap_0p5();
     for option in options {
         let preset = option.preset.clone();
