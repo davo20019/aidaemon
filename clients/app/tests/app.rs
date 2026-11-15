@@ -187,7 +187,7 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     // The settings arrive: a value edits as TOML in a code editor, and
     // another key is typed with the known keys suggested.
     let id = wait_sent("get_settings")?;
-    let result = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
+    let result = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "quick_model": "gpt-x", "name": "OpenAI", "preset": "openai"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
     ))]);
@@ -200,6 +200,42 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     app.wait_for("Hard work: synthetic-strong · Quick jobs: synthetic-quick")?;
     app.wait_for("Key in config.toml")?;
     app.wait_for("Move to keychain")?;
+    // Each provider's models per job are the owner's to pick, failovers
+    // included; an emptied job goes back to the catalog's model.
+    app.press("label:Change the models OpenAI uses")?;
+    app.wait_for("label:Hard work model")?;
+    app.type_text("label:Hard work model", "gpt-strong-synthetic")?;
+    // The current model is shown; emptied, the catalog's returns.
+    app.clear("label:Quick jobs model")?;
+    app.press("Save models")?;
+    app.wait_for_gone("label:Hard work model", std::time::Duration::from_secs(5))?;
+    let mut changes = Vec::new();
+    for _ in 0..100 {
+        changes = nsh_app_aidaemon::settings_sent();
+        if changes.len() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for (id, _) in nsh_app_aidaemon::settings_sent_ids() {
+        feed([frame(&format!(
+            r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings_changed","outcome":{{"kind":"done","message":"Saved"}}}}}}"#
+        ))]);
+    }
+    let changes: Vec<serde_json::Value> = changes
+        .iter()
+        .filter_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .map(|c| c["change"].clone())
+        .collect();
+    let hard = serde_json::json!({"kind": "set", "key": "provider.fallbacks[0].models.smart", "value": "\"gpt-strong-synthetic\""});
+    let reset = serde_json::json!({"kind": "set", "key": "provider.fallbacks[0].models.fast"});
+    if !changes.contains(&hard) || !changes.contains(&reset) {
+        return Err(format!("the model changes sent: {changes:?}"));
+    }
+    feed([frame(
+        r#"{"type":"event","at_ms":2,"event":{"type":"settings_updated","ok":true,"message":"Updated provider.fallbacks[0].models.smart"}}"#,
+    )]);
+    app.wait_for("Updated provider.fallbacks[0].models.smart")?;
     app.press("Add a failover")?;
     app.wait_for("Tried when the providers before it fail.")?;
     app.wait_for("Every provider here is already in use.")?;

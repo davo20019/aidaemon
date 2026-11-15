@@ -58,6 +58,20 @@ pub fn feed(updates: impl IntoIterator<Item = aidaemon_client_core::Update>) {
 /// The ids of commands an [`Offline`] root queued, newest last, with their
 /// `type`: tests answer them as the daemon would.
 static SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+static SETTINGS_SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Every settings change an [`Offline`] root queued, as JSON, oldest first.
+pub fn settings_sent() -> Vec<String> {
+    settings_sent_ids()
+        .into_iter()
+        .map(|(_, json)| json)
+        .collect()
+}
+
+/// [`settings_sent`] with each change's request id.
+pub fn settings_sent_ids() -> Vec<(String, String)> {
+    SETTINGS_SENT.lock().map(|s| s.clone()).unwrap_or_default()
+}
 
 /// The id of the last command of `kind` (its `type`, as `get_changes`) an
 /// [`Offline`] root queued.
@@ -98,6 +112,13 @@ pub fn Offline() -> impl IntoElement {
                 && !sent.iter().any(|(i, _)| *i == id)
             {
                 sent.push((id, kind.to_owned()));
+            }
+        }
+        if let Ok(mut sent) = SETTINGS_SENT.lock() {
+            for (id, json) in store.queued_of("change_settings") {
+                if !sent.iter().any(|(i, _)| *i == id) {
+                    sent.push((id, json));
+                }
             }
         }
     });

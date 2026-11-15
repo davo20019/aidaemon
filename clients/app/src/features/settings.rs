@@ -612,6 +612,10 @@ struct ProviderForm {
     /// The connected provider whose key is being replaced, by its setting.
     replacing: Signal<Option<String>>,
     replacement: Signal<String>,
+    /// The connected row whose models per job are being chosen.
+    modeling: Signal<Option<usize>>,
+    hard: Signal<String>,
+    quick: Signal<String>,
     /// The form's change was sent: it closes once the daemon takes it.
     sent: Signal<bool>,
     /// Where the form opened: under connected row `n`, or (`BELOW`) under
@@ -636,6 +640,9 @@ impl ProviderForm {
             redirect: signal(String::new()),
             replacing: signal(None),
             replacement: signal(String::new()),
+            modeling: signal(None),
+            hard: signal(String::new()),
+            quick: signal(String::new()),
             sent: signal(false),
             at: signal(BELOW),
         }
@@ -784,6 +791,7 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
                 provider,
                 form,
                 settings.chatgpt_signed_in,
+                settings.checked.clone(),
                 at,
             ))
             .child(view().px_3().child(form_at(store, form, known.clone(), at)));
@@ -822,11 +830,134 @@ fn models_by_job(provider: &ConnectedProvider) -> String {
     }
 }
 
+/// A TOML string holding `id`.
+fn toml_string(id: &str) -> String {
+    format!("\"{}\"", id.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Pick the model a provider uses for hard work and for quick jobs: any
+/// id may be typed (the provider decides whether it works), with the
+/// models it is known to have suggested. Empty takes the catalog's.
+/// A model id typed in full, or one of `known` tapped in: the field
+/// shows what is chosen, and keeps any id typed.
+fn model_pick(job: &'static str, value: Signal<String>, known: &[String]) -> View {
+    let mut picks = view().flex_row().flex_wrap().gap_1();
+    for model in known.iter().take(8) {
+        let model = model.clone();
+        let label = format!("Use {model} for {}", job.to_lowercase());
+        picks = picks.child(
+            ui::btn(model.clone(), Variant::Ghost, Size::Sm, move || {
+                value.set(model.clone())
+            })
+            .accessibility_label(label),
+        );
+    }
+    ui::labeled(
+        job,
+        view()
+            .gap_1()
+            .child(
+                ui::field("Model id", value)
+                    .label(format!("{job} model"))
+                    .w_full(),
+            )
+            .child(picks),
+    )
+}
+
+fn job_models_editor(
+    store: Store,
+    provider: &ConnectedProvider,
+    form: ProviderForm,
+    checked: Option<aidaemon_client_protocol::CheckedKey>,
+    at: usize,
+) -> View {
+    let mut known: Vec<String> = Vec::new();
+    let account = checked
+        .filter(|c| c.preset == provider.preset && !provider.preset.is_empty())
+        .map(|c| c.models)
+        .unwrap_or_default();
+    for model in [provider.hard_model.clone(), provider.quick_model.clone()]
+        .into_iter()
+        .chain(provider.models.iter().cloned())
+        .chain(account)
+    {
+        if !model.is_empty() && !known.contains(&model) {
+            known.push(model);
+        }
+    }
+    let prefix = match provider.failover {
+        None => "provider.models".to_string(),
+        Some(index) => format!("provider.fallbacks[{index}].models"),
+    };
+    let current = (provider.hard_model.clone(), provider.quick_model.clone());
+    view().child(when(
+        move || form.modeling.get() == Some(at),
+        move || {
+            let (prefix, current) = (prefix.clone(), current.clone());
+            let save = {
+                let (prefix, current) = (prefix.clone(), current.clone());
+                move || {
+                    for (job, typed, was) in [
+                        ("smart", form.hard.get_untracked(), &current.0),
+                        ("fast", form.quick.get_untracked(), &current.1),
+                    ] {
+                        let typed = typed.trim();
+                        if typed == was.as_str() {
+                            continue;
+                        }
+                        store.change_settings(SettingsChange::Set {
+                            key: format!("{prefix}.{job}"),
+                            value: (!typed.is_empty()).then(|| toml_string(typed)),
+                        });
+                    }
+                    form.modeling.set(None);
+                }
+            };
+            let defaults = move || {
+                for job in ["smart", "fast"] {
+                    store.change_settings(SettingsChange::Set {
+                        key: format!("{prefix}.{job}"),
+                        value: None,
+                    });
+                }
+                form.modeling.set(None);
+            };
+            view()
+                .gap_2()
+                .child(model_pick("Hard work", form.hard, &known))
+                .child(model_pick("Quick jobs", form.quick, &known))
+                .child(faint(
+                    "Any model id this provider offers. Empty uses its usual one. \
+                     It takes effect on a reload.",
+                ))
+                .child(
+                    view()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            ui::btn("Save models", Variant::Primary, Size::Sm, save)
+                                .disabled(move || store.settings_busy()),
+                        )
+                        .child(
+                            ui::btn("Use defaults", Variant::Ghost, Size::Sm, defaults)
+                                .disabled(move || store.settings_busy()),
+                        )
+                        .child(ui::btn("Cancel", Variant::Ghost, Size::Sm, move || {
+                            form.modeling.set(None)
+                        })),
+                )
+        },
+    ))
+}
+
 fn connected_row(
     store: Store,
     provider: ConnectedProvider,
     form: ProviderForm,
     signed_in: bool,
+    checked: Option<aidaemon_client_protocol::CheckedKey>,
     at: usize,
 ) -> View {
     let main = provider.failover.is_none();
@@ -839,11 +970,11 @@ fn connected_row(
     let mut actions = view().flex_row().flex_wrap().gap_2();
     if main {
         actions = actions.child(
-            ui::btn("Change models", Variant::Ghost, Size::Sm, move || {
+            ui::btn("Change provider", Variant::Ghost, Size::Sm, move || {
                 form.open(Adding::Main, String::new(), at)
             })
             .disabled(move || store.settings_busy())
-            .accessibility_label("Change the main provider or its models"),
+            .accessibility_label("Change the main provider"),
         );
     } else if !provider.preset.is_empty() {
         let preset = provider.preset.clone();
@@ -863,6 +994,23 @@ fn connected_row(
             .disabled(move || store.settings_busy()),
         );
     }
+    {
+        let (hard, quick) = (provider.hard_model.clone(), provider.quick_model.clone());
+        actions = actions.child(
+            ui::btn("Change models", Variant::Ghost, Size::Sm, move || {
+                if form.modeling.get_untracked() == Some(at) {
+                    form.modeling.set(None);
+                    return;
+                }
+                form.hard.set(hard.clone());
+                form.quick.set(quick.clone());
+                form.modeling.set(Some(at));
+            })
+            .disabled(move || store.settings_busy())
+            .accessibility_label(format!("Change the models {} uses", provider.name)),
+        );
+    }
+    let job_models = job_models_editor(store, &provider, form, checked, at);
     let setting = provider.key_setting.clone();
     if !setting.is_empty() {
         let replacing = setting.clone();
@@ -950,6 +1098,7 @@ fn connected_row(
         .child(models)
         .child(ui::status(credential, tone))
         .child(actions)
+        .child(job_models)
         .child(when(editing, move || {
             let setting = setting.clone();
             let store_it = move || {

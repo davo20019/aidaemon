@@ -422,11 +422,20 @@ impl Store {
     /// The id of the last queued command of `kind` (its `type`): what a
     /// test answers with an ack, as the daemon would.
     pub fn queued_id(&self, kind: &str) -> Option<String> {
+        self.queued_of(kind).pop().map(|(id, _)| id)
+    }
+
+    /// Every queued command of `kind`, oldest first, with its JSON.
+    pub fn queued_of(&self, kind: &str) -> Vec<(String, String)> {
         self.client.with_untracked(|client| {
-            client.outgoing().iter().rev().find_map(|(id, command)| {
-                let json = serde_json::to_value(command).ok()?;
-                (json.get("type")?.as_str()? == kind).then(|| id.clone())
-            })
+            client
+                .outgoing()
+                .iter()
+                .filter_map(|(id, command)| {
+                    let json = serde_json::to_value(command).ok()?;
+                    (json.get("type")?.as_str()? == kind).then(|| (id.clone(), json.to_string()))
+                })
+                .collect()
         })
     }
 
