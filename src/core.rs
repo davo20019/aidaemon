@@ -606,8 +606,6 @@ pub async fn run_memory_export(
     config: AppConfig,
     directory: std::path::PathBuf,
 ) -> anyhow::Result<Vec<(String, usize)>> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-
     let key = config
         .state
         .encryption_key
@@ -635,17 +633,19 @@ pub async fn run_memory_export(
     .export_readable()
     .await?;
 
-    std::fs::DirBuilder::new()
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
         .create(&directory)
         .map_err(|error| anyhow::anyhow!("cannot create {}: {error}", directory.display()))?;
     let mut written = Vec::new();
     for file in files {
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(directory.join(file.name))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut output = options.open(directory.join(file.name))?;
         std::io::Write::write_all(&mut output, file.content.as_bytes())?;
         written.push((file.name.to_string(), file.entries));
     }
