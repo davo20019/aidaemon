@@ -185,25 +185,40 @@ fn card(store: Store, automation: AutomationSummary) -> View {
             move || store.change_automation(&id, change)
         }
     };
-    let mut actions = view().flex_row().flex_wrap().gap_1().pt_1();
-    actions = actions.child(
-        if paused {
-            ui::btn(
-                "Resume",
-                Variant::Secondary,
-                Size::Sm,
-                act(AutomationChange::Resume),
-            )
-        } else {
-            ui::btn(
-                "Pause",
-                Variant::Secondary,
-                Size::Sm,
-                act(AutomationChange::Pause),
-            )
-        }
-        .disabled(busy.clone()),
+    // Waiting on the owner (a question, a confirmation), it neither runs
+    // nor pauses: the answer is in the chat it asked in.
+    let waiting = matches!(
+        automation.status.as_str(),
+        "awaiting_input" | "pending_confirmation"
     );
+    if waiting {
+        c = c.child(
+            text("It is waiting for your answer in the chat where it asked.")
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        );
+    }
+    let mut actions = view().flex_row().flex_wrap().gap_1().pt_1();
+    if !waiting {
+        actions = actions.child(
+            if paused {
+                ui::btn(
+                    "Resume",
+                    Variant::Secondary,
+                    Size::Sm,
+                    act(AutomationChange::Resume),
+                )
+            } else {
+                ui::btn(
+                    "Pause",
+                    Variant::Secondary,
+                    Size::Sm,
+                    act(AutomationChange::Pause),
+                )
+            }
+            .disabled(busy.clone()),
+        );
+    }
     if automation.kind == AutomationKind::Scheduled {
         actions = actions.child(
             ui::btn(
