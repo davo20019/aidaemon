@@ -306,15 +306,23 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// When a quota resets, for the user: the UTC time and how long until then
-/// ("at 14:05 UTC (in 2h 10m)"), with the date when it is not today.
+/// When a quota resets, for the owner: the time in their zone and how long
+/// until then ("at 9:05 PM ET (in 2h 10m)"), with the date when it is not
+/// today.
 pub fn describe_reset(at: std::time::SystemTime, now: std::time::SystemTime) -> String {
-    let when = chrono::DateTime::<chrono::Utc>::from(at);
-    let today = chrono::DateTime::<chrono::Utc>::from(now).date_naive();
-    let clock = if when.date_naive() == today {
-        when.format("at %H:%M UTC").to_string()
+    use chrono::Local;
+    let when = chrono::DateTime::<Local>::from(at);
+    let today = chrono::DateTime::<Local>::from(now);
+    let label = aidaemon_work::schedule::owner_zone_label(when.offset().local_minus_utc());
+    let time = aidaemon_work::schedule::format_owner_time(
+        &when.fixed_offset(),
+        &today.fixed_offset(),
+        &label,
+    );
+    let clock = if when.date_naive() == today.date_naive() {
+        format!("at {time}")
     } else {
-        when.format("on %b %-d at %H:%M UTC").to_string()
+        format!("on {time}")
     };
     match at.duration_since(now) {
         Ok(left) => {
@@ -391,6 +399,15 @@ fn truncate_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quota_reset_is_told_in_the_owners_time() {
+        let now = std::time::SystemTime::now();
+        let at = now + std::time::Duration::from_secs(2 * 3600 + 10 * 60);
+        let text = describe_reset(at, now);
+        assert!(text.ends_with("(in 2h 10m)"), "{text}");
+        assert!(text.contains(" AM ") || text.contains(" PM "), "{text}");
+    }
 
     #[test]
     fn transient_server_error_message_mentions_retry() {
