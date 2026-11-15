@@ -116,12 +116,21 @@ impl Plan {
     }
 
     /// The card the owner confirms the work with: the five lines every
-    /// automation card has, then the next run and the name as details.
+    /// automation card has, then the upcoming runs and name as details.
     fn approval_request(&self) -> aidaemon_core::OwnerApprovalRequest {
         let spec = aidaemon_work::automations::ScheduleSpec {
             cron: self.cron.clone(),
             one_shot: self.is_one_shot,
             next: Some(aidaemon_work::schedule::owner_time(&self.next_local)),
+            following: if self.is_one_shot {
+                Vec::new()
+            } else {
+                aidaemon_work::schedule::following_runs(&self.cron, &self.next_local, 2)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(aidaemon_work::schedule::owner_time)
+                    .collect()
+            },
         };
         let mut card = aidaemon_work::automations::scheduled_card(
             &self.desc,
@@ -129,7 +138,6 @@ impl Plan {
             &[spec],
             &aidaemon_work::schedule::system_timezone_display(),
         );
-        card.details.push(format!("Next: {}", self.next_run));
         if let Some(name) = self.name.as_deref() {
             card.details.push(format!("Name: {name}"));
         }

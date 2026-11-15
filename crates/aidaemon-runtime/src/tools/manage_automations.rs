@@ -355,6 +355,7 @@ impl ManageAutomationsTool {
                     cron: schedule.cron_expr.clone(),
                     one_shot: schedule.is_one_shot,
                     next: aidaemon_work::schedule::owner_time_rfc3339(&schedule.next_run_at),
+                    following: Vec::new(),
                 })
                 .collect();
             let reminder = aidaemon_work::reminders::message_from_context(goal.context.as_deref());
@@ -1207,6 +1208,7 @@ impl ManageAutomationsTool {
                 cron,
                 one_shot,
                 next: Some(aidaemon_work::schedule::owner_time(&next)),
+                following: Vec::new(),
             };
             changed.push(format!(
                 "its schedule is now {}",

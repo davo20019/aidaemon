@@ -157,6 +157,8 @@ pub struct ScheduleSpec {
     pub one_shot: bool,
     /// The next run, already in the owner's format.
     pub next: Option<String>,
+    /// The two runs after `next`, for recurring schedules.
+    pub following: Vec<String>,
 }
 
 fn clock(minute: &str, hour: &str, zone: &str) -> Option<String> {
@@ -292,7 +294,18 @@ pub fn scheduled_card(
         } else {
             "Only when you stop it".to_string()
         },
-        details: Vec::new(),
+        details: schedules
+            .iter()
+            .flat_map(|schedule| {
+                schedule.next.iter().flat_map(|next| {
+                    std::iter::once(next)
+                        .chain(schedule.following.iter().filter(|_| !schedule.one_shot))
+                        .take(3)
+                        .enumerate()
+                        .map(|(index, run)| format!("Run {}: {run}", index + 1))
+                })
+            })
+            .collect(),
     }
 }
 
@@ -302,6 +315,7 @@ pub fn probe_card(kind: &str, target: &str, cron: &str, zone: &str) -> MandateCo
         cron: cron.to_string(),
         one_shot: false,
         next: None,
+        following: Vec::new(),
     };
     MandateConfirmationCard {
         what: format!("Checks {} ({kind})", target.trim()),
@@ -322,6 +336,7 @@ mod tests {
             cron: cron.to_string(),
             one_shot: false,
             next: Some("Thu, Nov 13, 8:00 AM ET".to_string()),
+            following: Vec::new(),
         }
     }
 
@@ -348,6 +363,7 @@ mod tests {
             cron: "0 9 13 11 *".to_string(),
             one_shot: true,
             next: Some("Thu, Nov 13, 9:00 AM ET".to_string()),
+            following: Vec::new(),
         };
         assert_eq!(cadence_words(&once, "ET"), "Once, Thu, Nov 13, 9:00 AM ET");
     }
@@ -368,6 +384,7 @@ mod tests {
                 "Can do: Anything you can do – it runs with your full access",
                 "Tells you when: a run finishes, or it hits a problem",
                 "Ends: Only when you stop it",
+                "Run 1: Thu, Nov 13, 8:00 AM ET",
             ]
         );
         assert_eq!(
@@ -382,6 +399,7 @@ mod tests {
                 cron: "5 14 12 11 *".to_string(),
                 one_shot: true,
                 next: Some("2:05 PM ET".to_string()),
+                following: Vec::new(),
             }],
             "ET",
         );
@@ -391,6 +409,39 @@ mod tests {
             "Only sends you this message – nothing else runs"
         );
         assert_eq!(reminder.ends, "After it runs once");
+    }
+
+    #[test]
+    fn scheduled_card_shows_two_following_runs_but_not_for_one_shot() {
+        let recurring = ScheduleSpec {
+            cron: "0 8 * * 1-5".to_string(),
+            one_shot: false,
+            next: Some("Mon, Nov 17, 8:00 AM ET".to_string()),
+            following: vec![
+                "Tue, Nov 18, 8:00 AM ET".to_string(),
+                "Wed, Nov 19, 8:00 AM ET".to_string(),
+            ],
+        };
+        let card = scheduled_card("Check status", None, &[recurring], "ET");
+        assert_eq!(
+            card.details,
+            vec![
+                "Run 1: Mon, Nov 17, 8:00 AM ET",
+                "Run 2: Tue, Nov 18, 8:00 AM ET",
+                "Run 3: Wed, Nov 19, 8:00 AM ET"
+            ]
+        );
+
+        let once = ScheduleSpec {
+            cron: "0 9 13 11 *".to_string(),
+            one_shot: true,
+            next: Some("Thu, Nov 13, 9:00 AM ET".to_string()),
+            following: Vec::new(),
+        };
+        assert_eq!(
+            scheduled_card("Run once", None, &[once], "ET").details,
+            vec!["Run 1: Thu, Nov 13, 9:00 AM ET"]
+        );
     }
 
     #[test]

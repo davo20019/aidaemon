@@ -1090,6 +1090,43 @@ pub fn compute_next_run_local(cron_expr: &str) -> anyhow::Result<DateTime<Local>
         .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))
 }
 
+/// Compute a fixed number of occurrences after an already-computed next run.
+pub fn following_runs(
+    cron_expr: &str,
+    next: &DateTime<Local>,
+    count: usize,
+) -> anyhow::Result<Vec<DateTime<Local>>> {
+    let cron: Cron = cron_expr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse cron '{}': {}", cron_expr, e))?;
+    let mut cursor = *next;
+    let mut runs = Vec::with_capacity(count);
+    for _ in 0..count {
+        cursor = cron
+            .find_next_occurrence(&cursor, false)
+            .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))?;
+        runs.push(cursor);
+    }
+    Ok(runs)
+}
+
+#[cfg(test)]
+mod following_runs_tests {
+    use chrono::{Local, TimeZone};
+
+    #[test]
+    fn weekday_runs_skip_the_weekend_and_do_not_repeat_next() {
+        let friday = Local
+            .with_ymd_and_hms(2026, 11, 20, 8, 0, 0)
+            .single()
+            .unwrap();
+        let runs = super::following_runs("0 8 * * 1-5", &friday, 2).unwrap();
+        assert_eq!(runs[0].date_naive().to_string(), "2026-11-23");
+        assert_eq!(runs[1].date_naive().to_string(), "2026-11-24");
+        assert!(runs.iter().all(|run| run.time() == friday.time()));
+    }
+}
+
 /// How late a recurring run may start and still be worth starting: half its
 /// period, between 5 minutes and 2 hours. A daily 9:00 AM digest the daemon
 /// was off for is not sent at 11 PM; an hourly check missed by a few
