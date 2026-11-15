@@ -635,17 +635,7 @@ impl ScheduledGoalRuns {
         let task = Task {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
-            // A run started now follows its automation's notify setting
-            // like a timed one (live 2026-11-15: a Run now in "only changes"
-            // mode reported unchanged contents).
-            description: format!(
-                "Manual scheduled run: {}{}",
-                goal.description,
-                crate::automations::NotifyMode::from_context(goal.context.as_deref())
-                    .run_note()
-                    .map(|note| format!(" [SYSTEM:{note}]"))
-                    .unwrap_or_default()
-            ),
+            description: format!("Manual scheduled run: {}", goal.description),
             status: "pending".to_string(),
             priority: if goal.goal_type == "continuous" {
                 "low".to_string()

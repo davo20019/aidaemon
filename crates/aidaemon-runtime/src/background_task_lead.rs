@@ -1211,7 +1211,11 @@ pub fn spawn_background_task_lead(
 
         let body = async move {
             let goal_id = goal.id.clone();
-            let mission = goal.description.clone();
+            let mission = if goal.goal_type == "continuous" {
+                aidaemon_work::automations::run_mission(&goal.description, goal.context.as_deref())
+            } else {
+                goal.description.clone()
+            };
             let initial_goal = goal.clone();
             let goal_run = state.get_current_goal_run(&goal_id).await.ok().flatten();
             let goal_run_id = goal_run.as_ref().map(|run| run.id.clone());

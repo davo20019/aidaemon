@@ -83,6 +83,17 @@ pub enum NotifyMode {
     Problems,
 }
 
+/// What a scheduled goal's task lead is asked to do: the goal, and, when its
+/// automation tells only changes, how to say a run found nothing new. Timed
+/// runs and Run now both start here (live 2026-11-15: a note on the run's
+/// task never reached its task lead, whose mission is the goal's).
+pub fn run_mission(description: &str, context: Option<&str>) -> String {
+    match NotifyMode::from_context(context).run_note() {
+        Some(note) => format!("{description}\n\n[SYSTEM:{note}]"),
+        None => description.to_string(),
+    }
+}
+
 /// The goal-context key naming the run whose task lead said it found
 /// nothing new (`manage_goal_tasks complete_goal` with `nothing_new`).
 pub const NOTHING_NEW_RUN_KEY: &str = "nothing_new_run";
@@ -183,6 +194,20 @@ mod notify_tests {
             NotifyMode::Changes
         );
         assert_eq!(NotifyMode::from_context(None), NotifyMode::EveryRun);
+    }
+
+    #[test]
+    fn a_quiet_automations_task_lead_is_told_how_to_say_nothing_new() {
+        let quiet = super::run_mission("Read the synthetic file", Some(r#"{"notify":"changes"}"#));
+        assert!(quiet.starts_with("Read the synthetic file"));
+        assert!(
+            quiet.contains("complete_goal and nothing_new: true"),
+            "{quiet}"
+        );
+        assert_eq!(
+            super::run_mission("Read the synthetic file", None),
+            "Read the synthetic file"
+        );
     }
 
     #[test]

@@ -730,11 +730,8 @@ impl GoalCycle {
                 )
             } else {
                 format!(
-                    "Scheduled check: {} [SYSTEM: already scheduled and firing now; do not reschedule.{}]",
-                    goal.description,
-                    crate::automations::NotifyMode::from_context(goal.context.as_deref())
-                        .run_note()
-                        .unwrap_or_default()
+                    "Scheduled check: {} [SYSTEM: already scheduled and firing now; do not reschedule.]",
+                    goal.description
                 )
             },
             status: "pending".to_string(),
