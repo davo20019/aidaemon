@@ -135,6 +135,32 @@ struct Automation {
     from_config: bool,
     /// What a client may change in place (scheduled work only).
     edit: Option<Editable>,
+    /// Human-only context for a scheduled automation held by recovery.
+    held_after_failures: Option<HeldAfterFailures>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldAfterFailures {
+    consecutive_failures: u16,
+    last_failure_reason: Option<String>,
+}
+
+fn held_after_failures(
+    recovery: &aidaemon_work::goals::ScheduledRecoveryState,
+    runs: &[aidaemon_work::goals::GoalRun],
+) -> Option<HeldAfterFailures> {
+    (recovery.disposition == aidaemon_work::goals::ScheduledRecoveryDisposition::Escalated).then(
+        || HeldAfterFailures {
+            consecutive_failures: recovery.consecutive_failures,
+            last_failure_reason: recovery.last_failed_run_id.as_deref().and_then(|run_id| {
+                runs.iter()
+                    .find(|run| run.id == run_id)
+                    .and_then(|run| run.outcome_summary.as_deref())
+                    .map(automations::run_summary_words)
+                    .filter(|summary| !summary.is_empty())
+            }),
+        },
+    )
 }
 
 /// A scheduled automation's changeable fields as they are now.
@@ -177,6 +203,15 @@ impl Automation {
             row.push_str(&format!(" · next {next}"));
         }
         row.push_str(&format!(" [ref {}]", self.short_id()));
+        if let Some(held) = &self.held_after_failures {
+            row.push_str(&format!(
+                " · {} consecutive failures",
+                held.consecutive_failures
+            ));
+            if let Some(reason) = &held.last_failure_reason {
+                row.push_str(&format!(" · last failure: {reason}"));
+            }
+        }
         row
     }
 
@@ -194,6 +229,15 @@ impl Automation {
         ));
         if let Some(next) = self.next_words() {
             text.push_str(&format!(" · next {next}"));
+        }
+        if let Some(held) = &self.held_after_failures {
+            text.push_str(&format!(
+                "\nConsecutive failures: {}",
+                held.consecutive_failures
+            ));
+            if let Some(reason) = &held.last_failure_reason {
+                text.push_str(&format!("\nLast failure: {reason}"));
+            }
         }
         text
     }
@@ -435,15 +479,22 @@ impl ManageAutomationsTool {
             }
             // Its runs kept failing and the recovery ledger paused its
             // schedules: on, but not running, which the owner must see.
-            let held = goal.status == "active"
-                && self
-                    .state
-                    .get_scheduled_recovery_state(&goal.id)
-                    .await?
-                    .is_some_and(|recovery| {
-                        recovery.disposition
-                            == aidaemon_work::goals::ScheduledRecoveryDisposition::Escalated
-                    });
+            let recovery = self.state.get_scheduled_recovery_state(&goal.id).await?;
+            let held_after_failures = if goal.status == "active" {
+                match recovery.as_ref() {
+                    Some(recovery)
+                        if recovery.disposition
+                            == aidaemon_work::goals::ScheduledRecoveryDisposition::Escalated =>
+                    {
+                        let runs = self.state.get_goal_runs(&goal.id).await?;
+                        held_after_failures(recovery, &runs)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let held = held_after_failures.is_some();
             found.push(Automation {
                 kind: AutomationKind::Scheduled,
                 name: automations::name_from_context(goal.context.as_deref()),
@@ -459,6 +510,7 @@ impl ManageAutomationsTool {
                 card,
                 from_config: false,
                 edit: Some(edit),
+                held_after_failures,
             });
         }
         Ok(found)
@@ -483,6 +535,7 @@ impl ManageAutomationsTool {
                 id: mandate.id,
                 from_config: false,
                 edit: None,
+                held_after_failures: None,
             })
             .collect())
     }
@@ -514,6 +567,7 @@ impl ManageAutomationsTool {
                 name: Some(probe.name),
                 from_config: probe.source == "config",
                 id: probe.id,
+                held_after_failures: None,
             })
             .collect())
     }
@@ -1729,5 +1783,112 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
             idempotent: false,
             high_impact_write: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aidaemon_work::goals::{GoalRun, ScheduledRecoveryDisposition, ScheduledRecoveryState};
+
+    fn recovery(last_failed_run_id: Option<&str>) -> ScheduledRecoveryState {
+        ScheduledRecoveryState {
+            goal_id: "goal-1".to_string(),
+            consecutive_failures: 4,
+            failure_budget: 3,
+            disposition: ScheduledRecoveryDisposition::Escalated,
+            latest_failure_kind: None,
+            last_failed_run_id: last_failed_run_id.map(str::to_string),
+            last_recovery_run_id: None,
+            recovery_attempts: 0,
+            last_recovery_attempt_at: None,
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn failed_run(id: &str, summary: &str) -> GoalRun {
+        let mut run = GoalRun::new("goal-1", "project-1", "scheduled");
+        run.id = id.to_string();
+        run.status = "failed".to_string();
+        run.outcome_summary = Some(summary.to_string());
+        run
+    }
+
+    fn held_automation(held: HeldAfterFailures) -> Automation {
+        Automation {
+            kind: AutomationKind::Scheduled,
+            id: "scheduled-goal-1".to_string(),
+            name: Some("Repo check".to_string()),
+            status: automations::HELD_AFTER_FAILURES.to_string(),
+            card: MandateConfirmationCard {
+                what: "Check the synthetic repository".to_string(),
+                how_often: "Every day".to_string(),
+                can_do: "Read only".to_string(),
+                tells_you_when: "a run fails".to_string(),
+                ends: "Only when you stop it".to_string(),
+                details: Vec::new(),
+            },
+            next: None,
+            from_config: false,
+            edit: None,
+            held_after_failures: Some(held),
+        }
+    }
+
+    #[test]
+    fn held_failure_uses_only_the_ledger_named_run_summary() {
+        let runs = vec![
+            failed_run("newer-run", "A different failure."),
+            failed_run("ledger-run", "The synthetic token expired."),
+        ];
+
+        let held = held_after_failures(&recovery(Some("ledger-run")), &runs).unwrap();
+        assert_eq!(held.consecutive_failures, 4);
+        assert_eq!(
+            held.last_failure_reason.as_deref(),
+            Some("The synthetic token expired.")
+        );
+
+        let held = held_after_failures(&recovery(Some("missing-run")), &runs).unwrap();
+        assert_eq!(held.last_failure_reason, None);
+    }
+
+    #[test]
+    fn held_failure_omits_blank_run_summary_but_keeps_count() {
+        let runs = vec![failed_run("ledger-run", "   ")];
+
+        let held = held_after_failures(&recovery(Some("ledger-run")), &runs).unwrap();
+        assert_eq!(held.consecutive_failures, 4);
+        assert_eq!(held.last_failure_reason, None);
+
+        let automation = held_automation(held);
+        let shown = automation.render_card();
+        assert!(shown.contains("Consecutive failures: 4"), "{shown}");
+        assert!(!shown.contains("Last failure:"), "{shown}");
+    }
+
+    #[test]
+    fn held_failure_count_and_reason_render_in_list_and_show() {
+        let automation = held_automation(HeldAfterFailures {
+            consecutive_failures: 4,
+            last_failure_reason: Some("The synthetic token expired.".to_string()),
+        });
+
+        let list = ManageAutomationsTool::render_list(
+            std::slice::from_ref(&automation),
+            Some(AutomationKind::Scheduled),
+        );
+        assert!(list.contains("4 consecutive failures"), "{list}");
+        assert!(
+            list.contains("last failure: The synthetic token expired."),
+            "{list}"
+        );
+
+        let shown = automation.render_card();
+        assert!(shown.contains("Consecutive failures: 4"), "{shown}");
+        assert!(
+            shown.contains("Last failure: The synthetic token expired."),
+            "{shown}"
+        );
     }
 }
