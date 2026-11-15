@@ -316,6 +316,7 @@ pub async fn compile_owner_units(
          Separate results are separate units, even when one sentence asks for them together. \
          A rule for how the work is done (follow the project's guide, use this branch, don't push, keep the tests passing) is not a unit: \
          it qualifies the units it applies to. Checking or committing the work is a unit only when the owner asks for that result itself. \
+         A check the owner wants passing (tests, typecheck, lint) is never asks_change: it is a look at the work, and a passing run of it is its result. \
          asks_change is true when the owner wants the world to be different afterwards: something made, installed, set up, changed or removed, \
          a result that does not exist until the work is done. It is false when the owner wants only to know or see something: to look, check, find, measure, report or be shown. \
          Judge what the owner wants done, not what may already exist: asking for something to be made is new work even if something like it exists, \

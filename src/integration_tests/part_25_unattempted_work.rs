@@ -509,6 +509,45 @@ async fn finished_edits_for_the_owners_units_are_never_reported_unstarted() {
     assert_eq!(reply, "Reading time is added and tested.");
 }
 
+/// Live 2026-11-15 (dloornext, again): one checklist item linked one of
+/// the owner's units; the others, linked by none, were done by the run's
+/// own edits and must not read "didn't start".
+#[tokio::test]
+async fn a_unit_no_item_links_is_covered_by_the_runs_edits() {
+    let session = "owner-units-partly-linked";
+    let items = |status: &str| {
+        json!({"items": [
+            {"text": "Add the synthetic helper and show it under each title", "status": status, "mutation_effects": ["local_workspace_write"]},
+            {"text": "Add a node test for the synthetic helper", "status": status, "mutation_effects": ["local_workspace_write"], "owner_units": [1]}
+        ]})
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &items("in_progress").to_string()),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"/tmp/synthetic-site/app/lib/helper.ts"}"#),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"/tmp/synthetic-site/tests/helper.test.mjs"}"#),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &{
+                let mut done = items("completed");
+                done["outcome"] = json!("done");
+                done.to_string()
+            },
+        ),
+        MockProvider::text_response("The helper and its test are added."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[
+        ("Add an estimated reading time under each post's title", true),
+        ("Add a node test for the helper", true),
+    ])]);
+    let edit: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticEdit);
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![edit], None)
+        .await
+        .unwrap();
+    let reply = ask_owner_turn(&harness, session, "Add a reading time with a test.").await;
+    assert!(!reply.contains("didn't start"), "{reply}");
+}
+
 // ==================== The request is the owner's words ====================
 //
 // Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing

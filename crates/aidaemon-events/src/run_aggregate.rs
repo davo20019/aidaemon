@@ -1411,29 +1411,47 @@ impl RunAggregate {
                 ))
                 .is_some_and(|obligation| obligation.class == RunObligationClass::Achieve)
         };
+        let attempts: usize = self
+            .operations
+            .values()
+            .filter(|operation| {
+                operation.mutating
+                    || operation.policy_denied
+                    || operation.owner_declined
+                    || (operation.is_background_in_flight()
+                        && (operation.checklist_items.is_empty()
+                            || operation
+                                .checklist_items
+                                .iter()
+                                .any(|item| item_changes(*item))))
+            })
+            .map(RunOperation::attempts)
+            .sum();
         if self.checklist_owner_units.is_empty() {
-            let attempts: usize = self
-                .operations
-                .values()
-                .filter(|operation| {
-                    operation.mutating
-                        || operation.policy_denied
-                        || operation.owner_declined
-                        || (operation.is_background_in_flight()
-                            && (operation.checklist_items.is_empty()
-                                || operation
-                                    .checklist_items
-                                    .iter()
-                                    .any(|item| item_changes(*item))))
-                })
-                .map(RunOperation::attempts)
-                .sum();
             return change_units.into_iter().skip(attempts).collect();
         }
+        // A unit no checklist item links is judged as when nothing links:
+        // by the run's own attempts to change things (live 2026-11-15: one
+        // item linked one of four units, and the other three read "didn't
+        // start" after thirteen edits).
+        let linked = |unit: &usize| {
+            self.checklist_owner_units
+                .values()
+                .any(|units| units.contains(unit))
+        };
+        let unlinked_uncovered: BTreeSet<usize> = change_units
+            .iter()
+            .copied()
+            .filter(|unit| !linked(unit))
+            .skip(attempts)
+            .collect();
         let unattempted = self.unattempted_checklist_items_of(&self.unattempted_checklist_work());
         change_units
             .into_iter()
             .filter(|unit| {
+                if !linked(unit) {
+                    return unlinked_uncovered.contains(unit);
+                }
                 !self
                     .checklist_owner_units
                     .iter()
