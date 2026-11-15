@@ -66,7 +66,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "clear",
         "Start fresh conversation (history kept for memory/audit)",
     ),
-    ("wipe", "Permanently delete this conversation"),
+    (
+        "wipe",
+        "Permanently delete this conversation (send twice to confirm)",
+    ),
     ("cost", "Show token usage statistics"),
     ("context", "Show conversation context coverage"),
     ("help", "Show available commands"),

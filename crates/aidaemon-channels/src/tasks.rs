@@ -187,6 +187,20 @@ pub struct TaskRegistry {
     /// background commands (by their agent key), drawn from the same counter
     /// as turn numbers so one `/cancel <n>` names either.
     work_numbers: std::sync::Mutex<HashMap<String, Vec<(String, u64)>>>,
+    /// When each chat last asked for `/wipe`, awaiting its confirmation.
+    wipe_requests: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+}
+
+/// How long a `/wipe` waits for the second `/wipe` that confirms it.
+pub const WIPE_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a `/wipe` in a chat amounts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeRequest {
+    /// The first: nothing is erased until it is confirmed.
+    Requested,
+    /// A second `/wipe` within [`WIPE_CONFIRM_WINDOW`] of the first.
+    Confirmed,
 }
 
 impl TaskRegistry {
@@ -202,6 +216,24 @@ impl TaskRegistry {
             queues: RwLock::new(HashMap::new()),
             recently_seen: RwLock::new(HashMap::new()),
             work_numbers: std::sync::Mutex::new(HashMap::new()),
+            wipe_requests: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record a `/wipe` in `session_id` at `now`. The second one within
+    /// [`WIPE_CONFIRM_WINDOW`] confirms (and consumes) the first; a later
+    /// one starts over. A confirmation belongs to its own chat only.
+    pub fn request_wipe(&self, session_id: &str, now: std::time::Instant) -> WipeRequest {
+        let mut requests = self
+            .wipe_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        requests.retain(|_, at| now.saturating_duration_since(*at) <= WIPE_CONFIRM_WINDOW);
+        if requests.remove(session_id).is_some() {
+            WipeRequest::Confirmed
+        } else {
+            requests.insert(session_id.to_string(), now);
+            WipeRequest::Requested
         }
     }
 
@@ -778,6 +810,41 @@ impl TaskRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wipe_needs_a_second_request_in_the_same_chat_within_the_window() {
+        let registry = TaskRegistry::new(10);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            registry.request_wipe("chat-a", start),
+            WipeRequest::Requested
+        );
+        // Another chat's /wipe confirms nothing here.
+        assert_eq!(
+            registry.request_wipe("chat-b", start),
+            WipeRequest::Requested
+        );
+        let soon = start + std::time::Duration::from_secs(30);
+        assert_eq!(
+            registry.request_wipe("chat-a", soon),
+            WipeRequest::Confirmed
+        );
+        // Consumed: the next one asks again.
+        assert_eq!(
+            registry.request_wipe("chat-a", soon),
+            WipeRequest::Requested
+        );
+        // Too late: the old request expired, this one asks again.
+        let late = soon + WIPE_CONFIRM_WINDOW + std::time::Duration::from_secs(1);
+        assert_eq!(
+            registry.request_wipe("chat-a", late),
+            WipeRequest::Requested
+        );
+        assert_eq!(
+            registry.request_wipe("chat-b", late),
+            WipeRequest::Requested
+        );
+    }
 
     #[tokio::test]
     async fn a_long_turn_with_a_live_heartbeat_is_not_reaped() {

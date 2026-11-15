@@ -152,7 +152,7 @@ pub fn shared_commands() -> Vec<CommandDef> {
         },
         CommandDef {
             name: "wipe",
-            description: "Permanently delete this conversation",
+            description: "Permanently delete this conversation (send twice to confirm)",
             usage: None,
             category: CommandCategory::Core,
         },
@@ -901,6 +901,21 @@ impl SharedCommands {
     }
 
     async fn handle_wipe(&self, session_id: &str) -> String {
+        // Irreversible, and one tap away from /clear in the command menu:
+        // the first /wipe only asks.
+        if self
+            .task_registry
+            .request_wipe(session_id, std::time::Instant::now())
+            == crate::tasks::WipeRequest::Requested
+        {
+            return format!(
+                "Nothing was erased. /wipe permanently deletes this conversation from the \
+                 database: its messages, search index, summaries and episodes. Facts already \
+                 saved to memory are kept. To start fresh and keep the history, use /clear \
+                 instead. To erase it, send /wipe again within {} minutes.",
+                crate::tasks::WIPE_CONFIRM_WINDOW.as_secs() / 60
+            );
+        }
         let stopped_work =
             crate::stop::stop_background_work(&self.task_registry, self.agent.as_ref(), session_id)
                 .await;
