@@ -486,6 +486,68 @@ fn untracked_patch(path: &Path, shown: &str) -> String {
 }
 
 /// Run git in `dir`; its stdout when it succeeds.
+/// Undo the uncommitted changes to `path` in repository `root`, one the
+/// session worked in: a changed or deleted file goes back to its last
+/// commit, a new one is removed. The changes after. `Err`: nothing was
+/// touched, and why, in plain words.
+pub(crate) async fn revert_file(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    root: &str,
+    path: &str,
+) -> Result<SessionChanges, String> {
+    let changes = session_changes(pool, session_id)
+        .await
+        .map_err(|e| format!("Could not read the changes: {e}"))?;
+    let repo = changes
+        .repos
+        .iter()
+        .find(|r| r.root == root)
+        .ok_or("That repository is not one this conversation worked in")?;
+    let file = repo
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .ok_or("That file has no uncommitted changes")?;
+    // Only a path inside the repository, as git listed it.
+    if Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("That path is outside the repository".to_string());
+    }
+    let dir = Path::new(root);
+    let done = match file.status {
+        FileStatus::Untracked => std::fs::remove_file(dir.join(path)).is_ok(),
+        FileStatus::Added => git(dir, &["rm", "-f", "-q", "--", path]).await.is_some(),
+        FileStatus::Renamed => {
+            return Err(
+                "A rename is undone from a terminal (git restore on both paths)".to_string(),
+            );
+        }
+        FileStatus::Modified | FileStatus::Deleted | FileStatus::Unknown => git(
+            dir,
+            &[
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                path,
+            ],
+        )
+        .await
+        .is_some(),
+    };
+    if !done {
+        return Err(format!("Could not undo the changes to {path}"));
+    }
+    session_changes(pool, session_id)
+        .await
+        .map_err(|e| format!("Undone, but the changes could not be read again: {e}"))
+}
+
 async fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = tokio::process::Command::new("git");
     command

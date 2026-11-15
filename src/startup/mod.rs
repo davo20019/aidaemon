@@ -3,6 +3,7 @@ pub(crate) mod client_changes;
 pub mod client_gateway;
 pub(crate) mod client_projects;
 pub(crate) mod client_providers;
+pub(crate) mod client_sessions;
 pub(crate) mod client_settings;
 pub mod db_security;
 pub mod db_upkeep;

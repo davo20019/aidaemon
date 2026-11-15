@@ -819,6 +819,18 @@ impl Client {
         true
     }
 
+    /// Runs that finished after `seen_ms` (when the owner last looked at
+    /// the automations) with something to read: a report, or a failure.
+    /// A quiet run with nothing to say is not news.
+    pub fn automation_news(&self, seen_ms: u64) -> usize {
+        self.automations.ready().map_or(0, |all| {
+            all.iter()
+                .flat_map(|a| a.recent_runs.iter())
+                .filter(|run| run_is_news(run, seen_ms))
+                .count()
+        })
+    }
+
     pub fn refresh_memories(&mut self) {
         if self.memories_request.is_some() {
             return;
@@ -1594,6 +1606,18 @@ impl Client {
     }
 }
 
+/// Whether `run` finished after `seen_ms` with something to read.
+pub fn run_is_news(run: &aidaemon_client_protocol::AutomationRun, seen_ms: u64) -> bool {
+    use aidaemon_client_protocol::RunOutcome;
+    let ended = run.finished_ms.unwrap_or(run.started_ms);
+    ended > seen_ms
+        && match run.outcome {
+            RunOutcome::Failed | RunOutcome::Blocked => true,
+            RunOutcome::Done => run.summary.as_deref().is_some_and(|s| !s.trim().is_empty()),
+            RunOutcome::Running | RunOutcome::Cancelled | RunOutcome::Unknown => false,
+        }
+}
+
 /// Where a session came from: its `channel` (`telegram:coding_bot`,
 /// `app`), else what its id names.
 pub fn platform_of(channel: &str, id: &str) -> Source {
@@ -1737,6 +1761,24 @@ mod tests {
         let log = client.latest_turn("app:a").unwrap();
         assert_eq!(log.items.len(), 1);
         assert_eq!(log.items[0].kind, ActivityKind::ToolDone);
+    }
+
+    #[test]
+    fn only_runs_with_something_to_read_after_the_last_look_are_news() {
+        use aidaemon_client_protocol::{AutomationRun, RunOutcome};
+        let run = |finished: u64, outcome, summary: Option<&str>| AutomationRun {
+            started_ms: finished - 10,
+            finished_ms: Some(finished),
+            outcome,
+            summary: summary.map(str::to_owned),
+        };
+        assert!(run_is_news(
+            &run(200, RunOutcome::Done, Some("2 open PRs.")),
+            100
+        ));
+        assert!(run_is_news(&run(200, RunOutcome::Failed, None), 100));
+        assert!(!run_is_news(&run(200, RunOutcome::Done, None), 100));
+        assert!(!run_is_news(&run(90, RunOutcome::Failed, None), 100));
     }
 
     #[test]
