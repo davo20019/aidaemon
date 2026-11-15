@@ -1385,7 +1385,6 @@ impl Store {
     /// wide one.
     pub fn open_sidebar(&self) {
         if self.compact.get_untracked() {
-            crate::ui::motion::next_layout();
             self.inspector.set(false);
             self.sidebar.set(true);
         } else {
@@ -1395,7 +1394,6 @@ impl Store {
 
     pub fn open_inspector(&self) {
         if self.compact.get_untracked() {
-            crate::ui::motion::next_layout();
             self.sidebar.set(false);
             self.inspector.set(true);
         } else {
@@ -1405,10 +1403,7 @@ impl Store {
 
     /// Back to the conversation (a narrow window's panes).
     pub fn close_panes(&self) {
-        if self.compact.get_untracked()
-            && (self.sidebar.get_untracked() || self.inspector.get_untracked())
-        {
-            crate::ui::motion::next_layout();
+        if self.compact.get_untracked() {
             self.sidebar.set(false);
             self.inspector.set(false);
         }

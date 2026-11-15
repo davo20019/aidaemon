@@ -10,8 +10,8 @@ use nsh_base::{
     Anchor, SelectEntry, SelectItem, SelectValue, ToastManager, ToastMotion, ToastOptions,
     ToastStackState, accordion, accordion_header, accordion_item, accordion_panel,
     accordion_trigger, alert_dialog, context_menu, h_resizable, menu_item, progress,
-    resizable_panel, select, switch, tab, table, table_body, table_cell, table_head, table_header,
-    table_row, tabs, toast, toast_stack,
+    resizable_panel, select, sheet, switch, tab, table, table_body, table_cell, table_head,
+    table_header, table_row, tabs, toast, toast_stack,
 };
 use nsh_core::prelude::*;
 use nsh_core::time::now;
@@ -514,6 +514,35 @@ pub fn toasts(
                     },
                 )),
         )
+}
+
+/// A pane at an edge of a narrow window: it slides in from `side` over the
+/// page, which dims behind it, and back out (in place when the owner asked
+/// for less motion). A press on the dimmed page, Escape or the back button
+/// close it (`close`). Its content's own heading names it.
+pub fn drawer(
+    side: Placement,
+    open: impl Fn() -> bool + 'static,
+    close: impl Fn() + 'static,
+    content: impl IntoElement,
+) -> nsh_base::SheetElement {
+    sheet()
+        .side(side)
+        .open(move || Some(open()))
+        .on_open_change(move |event: &nsh_base::SheetEvent| {
+            if let nsh_base::SheetEvent::OpenChange(false, _) = event {
+                close();
+            }
+        })
+        .popup_style(|s| {
+            s.h_full()
+                .w(percentage(0.86))
+                .max_w(px(380.0))
+                .bg(colors::SIDEBAR)
+                .shadow_lg()
+        })
+        .backdrop_style(|s| s.bg(colors::SCRIM))
+        .child(content)
 }
 
 /// Side-by-side panes the owner resizes by dragging the line between them.

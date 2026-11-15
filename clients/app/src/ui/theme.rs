@@ -25,6 +25,8 @@ const fn tone(light: Rgba, dark: Rgba) -> AdaptiveColor {
 pub mod colors {
     use super::{AdaptiveColor, rgb, rgb_a, tone};
 
+    /// What dims the page behind a drawer or a sheet.
+    pub const SCRIM: AdaptiveColor = tone(rgb_a(0x000000, 0.32), rgb_a(0x000000, 0.55));
     /// No colour: a fill that is not there.
     pub const TRANSPARENT: AdaptiveColor = tone(rgb_a(0x000000, 0.0), rgb_a(0x000000, 0.0));
 

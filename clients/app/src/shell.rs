@@ -88,14 +88,25 @@ pub fn shell(store: Store) -> View {
         .flex_row()
         // A narrow window shows one thing at a time: a pane, full-screen,
         // or the conversation.
-        // Made when opened (not shown from hidden), so it fades in.
+        // A narrow window's panes are drawers over the page: each slides in
+        // from its own edge over a dimmed page, and back out.
         .child(when(
-            move || store.is_compact() && store.sidebar_open(),
-            move || view().flex_1().child(sidebar(store)),
-        ))
-        .child(when(
-            move || store.is_compact() && store.inspector_open(),
-            move || view().flex_1().child(inspector(store)),
+            move || store.is_compact(),
+            move || {
+                view()
+                    .child(ui::drawer(
+                        Placement::Left,
+                        move || store.sidebar_open(),
+                        move || store.close_panes(),
+                        sidebar(store),
+                    ))
+                    .child(ui::drawer(
+                        Placement::Right,
+                        move || store.inspector_open(),
+                        move || store.close_panes(),
+                        inspector(store),
+                    ))
+            },
         ))
         // A narrow window (a phone): the page alone, as wide as the screen.
         // A roomy one: the panes beside the page, each as wide as the owner
@@ -103,14 +114,7 @@ pub fn shell(store: Store) -> View {
         .child(dynamic(move || {
             if store.is_compact() {
                 return Some(untracked(|| {
-                    view()
-                        .flex_1()
-                        .flex_row()
-                        .style_when(
-                            move || store.sidebar_open() || store.inspector_open(),
-                            |s| s.hidden(),
-                        )
-                        .child(page(store, in_setup))
+                    view().flex_1().flex_row().child(page(store, in_setup))
                 }));
             }
             Some(untracked(|| {
@@ -156,9 +160,6 @@ fn page(store: Store, in_setup: Memo<bool>) -> impl IntoElement {
         .flex_row()
         .min_w(px(0.0))
         .child(dynamic(move || {
-            if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
-                return None;
-            }
             if store.connection() == Connection::NoDaemon {
                 return Some(untracked(|| {
                     crate::features::setup::where_page(store).key("where")
