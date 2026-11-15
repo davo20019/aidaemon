@@ -1762,6 +1762,19 @@ impl Client {
         if text.is_empty() && attachments.is_empty() {
             return Ok(false);
         }
+        // A command runs in an open conversation. In a new one, sending it
+        // would hand the agent a request to act on instead.
+        if session.is_none()
+            && attachments.is_empty()
+            && let Some(name) = text
+                .strip_prefix('/')
+                .and_then(|rest| rest.split_whitespace().next())
+            && self.commands.iter().any(|c| c.name == name.to_lowercase())
+        {
+            return Err(format!(
+                "/{name} runs inside a conversation: open one, or start this one with a message first"
+            ));
+        }
         if !attachments.is_empty() {
             self.draft_files.clear();
         }
@@ -2257,6 +2270,34 @@ mod tests {
         );
         assert_eq!(effects, [Effect::Started("app:new".into())]);
         assert_eq!(client.submit(None, "  ", None, None), Ok(false));
+    }
+
+    #[test]
+    fn a_command_typed_in_a_new_conversation_is_not_sent_as_a_message() {
+        let mut client = Client::new();
+        client.commands = vec![SlashCommand {
+            name: "model".into(),
+            description: "Show or switch AI model".into(),
+        }];
+        let refused = client.submit(None, "/model synthetic-claude", None, None);
+        assert!(
+            refused
+                .unwrap_err()
+                .starts_with("/model runs inside a conversation")
+        );
+        assert!(
+            client.take_outgoing().is_empty(),
+            "nothing went to the agent"
+        );
+        // A path is not a command: it is sent as the message it is.
+        assert_eq!(
+            client.submit(None, "/etc/hosts looks wrong", None, None),
+            Ok(false)
+        );
+        assert!(matches!(
+            client.take_outgoing().pop(),
+            Some((_, Command::SendMessage { .. }))
+        ));
     }
 
     fn models_ready(client: &mut Client) {
