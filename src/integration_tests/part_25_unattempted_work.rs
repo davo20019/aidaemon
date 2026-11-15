@@ -330,6 +330,40 @@ async fn an_item_still_untaken_after_the_pass_ends_not_attempted() {
     );
 }
 
+/// A step that comes after the job (commit once the tests pass) is not yet
+/// due at the handoff: past the pass the turn hands off to the job, whose
+/// continuation carries it, and the reply does not say it wasn't started
+/// (live 2026-11-15: "I didn't start these parts: Commit on this branch").
+#[tokio::test]
+async fn a_step_after_the_job_is_left_to_its_continuation() {
+    let session = "unattempted-step-after-job";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": [
+                {"text": "Run the synthetic test suite", "status": "background", "mutation_effects": ["local_workspace_write"]},
+                {"text": "Commit the synthetic change on this branch", "status": "pending", "mutation_effects": ["local_workspace_write"]}
+            ]})
+            .to_string(),
+        ),
+        MockProvider::tool_call_response("launch_drupal", "{}"),
+        MockProvider::tool_call_response("launch_drupal", r#"{"again":true}"#),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = launch_harness(provider).await;
+    let reply = ask_owner_turn(
+        &harness,
+        session,
+        "Run the synthetic tests and commit the change once they pass.",
+    )
+    .await;
+
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(!reply.contains("didn't start"), "{reply}");
+    assert!(reply.starts_with("Started in the background"), "{reply}");
+}
+
 // ==================== The request is the owner's words ====================
 //
 // Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing

@@ -96,7 +96,7 @@ impl TurnEngine<'_> {
         if decision == sdk::StopDecision::Accept
             && scope.open_background_jobs.load(Ordering::Relaxed) > 0
         {
-            match self.sdk_judge_unattempted_work(scope, None).await {
+            match self.sdk_judge_unattempted_work(scope, None, false).await {
                 Some(held @ sdk::StopDecision::Continue { .. }) => {
                     let _ = check.reply.send(held);
                     return;
@@ -589,10 +589,17 @@ impl TurnEngine<'_> {
     /// its receipt not yet in the ledger, and the items it names). `None`:
     /// nothing to hold. `Continue`: the one pass to launch it or ask.
     /// `AcceptUnmet`: the pass was spent, and the items end "not attempted".
+    ///
+    /// `continuation_follows`: the job reports back, and its continuation
+    /// carries the request's remaining steps from its result. Past the
+    /// pass, nothing is then recorded "not attempted": a step that comes
+    /// after the job (commit once the tests pass) is not yet due (live
+    /// 2026-11-15: a handoff's reply said "I didn't start: Commit").
     pub async fn sdk_judge_unattempted_work(
         &self,
         scope: &TurnScope<'_>,
         launch: Option<(&str, &[usize], usize)>,
+        continuation_follows: bool,
     ) -> Option<sdk::StopDecision> {
         let aggregate = self
             .events()
@@ -620,6 +627,7 @@ impl TurnEngine<'_> {
                         .await,
                 )
             }
+            UnattemptedWorkVerdict::StopUnmet if continuation_follows => None,
             UnattemptedWorkVerdict::StopUnmet => Some(sdk::StopDecision::AcceptUnmet {
                 unmet: record_not_attempted(scope, &aggregate),
             }),

@@ -1012,8 +1012,8 @@ impl TurnEngine<'_> {
                     // two installs declared, one helper launched, and the
                     // second was never started).
                     let mut held: Option<String> = None;
-                    // Past the one pass, the items end "not attempted" (the
-                    // judgement records them) and the handoff goes ahead.
+                    // Past the one pass the handoff goes ahead; the items end
+                    // "not attempted" only when no continuation follows.
                     if hands_off {
                         let judged = self
                             .sdk_judge_unattempted_work(
@@ -1023,6 +1023,7 @@ impl TurnEngine<'_> {
                                     &outcome.metadata.checklist_items,
                                     outcome.metadata.launched_runs,
                                 )),
+                                reports_back,
                             )
                             .await;
                         if let Some(sdk::StopDecision::Continue { message }) = judged {
