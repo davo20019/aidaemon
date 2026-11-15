@@ -1793,6 +1793,9 @@ pub fn spawn_background_task_lead(
                 );
             }
             let task_lead_outcome = task_lead_run.as_ref().ok().map(|run| run.outcome);
+            let task_lead_found_nothing_new = task_lead_run.as_ref().ok().is_some_and(|run| {
+                run.claim == Some(aidaemon_events::ExecutorClaimedOutcome::NothingNew)
+            });
             let result = task_lead_run.map(|run| run.response);
 
             // Keep the task-lead textual response, but defer relay until we know
@@ -3175,6 +3178,25 @@ pub fn spawn_background_task_lead(
                 }
             };
 
+            // The owner chose what a run tells them: a quiet run keeps its
+            // record (the run's summary), and nothing is sent.
+            if is_scheduled_run
+                && continuous_controller
+                && !aidaemon_work::automations::NotifyMode::from_context(
+                    initial_goal.context.as_deref(),
+                )
+                .tells(notification_type, task_lead_found_nothing_new)
+            {
+                info!(
+                    goal_id = %goal_id,
+                    notification_type,
+                    "Scheduled run kept quiet, as its automation's notify setting asks"
+                );
+                if let Some(ref registry) = goal_token_registry {
+                    registry.remove(&goal_id).await;
+                }
+                return;
+            }
             let msg = if is_scheduled_run {
                 aidaemon_channels::presentation::present_scheduled_run_notification(
                     notification_type,

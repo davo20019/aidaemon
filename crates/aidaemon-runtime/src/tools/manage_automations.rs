@@ -33,7 +33,7 @@ use crate::tools::traits::{
 use crate::tools::traits::{ChannelVisibility, UserRole};
 use aidaemon_work::tools::manage_mandates::ManageMandatesTool;
 
-const TOOL_DESCRIPTION: &str = "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.";
+const TOOL_DESCRIPTION: &str = "The user's automations: scheduled (an instruction or reminder at set times), watching (mandates) and health checks. List, show, edit (when, new_name, snooze_until, tell_me), pause, resume or cancel one by name; for scheduled work also run_now, history, last_failure, set_budget, update_instructions, bind_workspace. Create with schedule_task or set_reminder.";
 
 const ACTIONS: &[&str] = &[
     "list",
@@ -104,6 +104,7 @@ struct Args {
     when: Option<String>,
     snooze_until: Option<String>,
     new_name: Option<String>,
+    tell_me: Option<String>,
     limit: Option<usize>,
     budget_per_check: Option<i64>,
     budget_daily: Option<i64>,
@@ -143,6 +144,8 @@ pub struct Editable {
     pub when: String,
     /// What its runs do; `None` for a reminder.
     pub instructions: Option<String>,
+    /// What its runs tell the owner; `None` for a reminder (it always does).
+    pub notify: Option<automations::NotifyMode>,
 }
 
 impl Automation {
@@ -370,6 +373,9 @@ impl ManageAutomationsTool {
                             .map(|schedule| schedule.cron_expr.clone())
                             .unwrap_or_default()
                     }),
+                notify: reminder
+                    .is_none()
+                    .then(|| automations::NotifyMode::from_context(goal.context.as_deref())),
                 instructions: match reminder {
                     Some(_) => None,
                     None => Some(
@@ -393,6 +399,16 @@ impl ManageAutomationsTool {
                 .clone()
                 .unwrap_or_else(|| goal.description.clone());
             let mut card = automations::scheduled_card(&what, reminder.as_deref(), &specs, &zone);
+            match edit.notify {
+                Some(automations::NotifyMode::Changes) => {
+                    card.tells_you_when =
+                        "only when a run finds something new, or hits a problem".to_string();
+                }
+                Some(automations::NotifyMode::Problems) => {
+                    card.tells_you_when = "only when a run fails or needs you".to_string();
+                }
+                _ => {}
+            }
             if let Some(workspace) = goal
                 .context
                 .as_deref()
@@ -650,6 +666,7 @@ impl ManageAutomationsTool {
         name: Option<&str>,
         when: Option<&str>,
         instructions: Option<&str>,
+        notify: Option<automations::NotifyMode>,
     ) -> anyhow::Result<(bool, String)> {
         let Some(automation) = self
             .all("", Some(AutomationKind::Scheduled))
@@ -685,10 +702,14 @@ impl ManageAutomationsTool {
             channel_visibility: Some(ChannelVisibility::Private),
             ..ToolCallContext::default()
         };
+        let notify = notify.filter(|mode| editable.as_ref().and_then(|e| e.notify) != Some(*mode));
         let mut said = Vec::new();
         let mut changed = false;
-        if name.is_some() || when.is_some() {
+        if name.is_some() || when.is_some() || notify.is_some() {
             let mut call = json!({ "action": "edit", "id": automation.id, "kind": "scheduled" });
+            if let Some(mode) = notify {
+                call["tell_me"] = json!(mode.as_str());
+            }
             if let Some(name) = name {
                 call["new_name"] = json!(name);
             }
@@ -1070,9 +1091,20 @@ impl ManageAutomationsTool {
         let when = given(&args.when);
         let snooze = given(&args.snooze_until);
         let new_name = given(&args.new_name);
-        if when.is_none() && snooze.is_none() && new_name.is_none() {
+        let tell_me = match given(&args.tell_me) {
+            None => None,
+            Some(raw) => match automations::NotifyMode::parse(raw) {
+                Some(mode) => Some(mode),
+                None => {
+                    return Ok(negative(
+                        "`tell_me` is every_run, changes or problems.".to_string(),
+                    ));
+                }
+            },
+        };
+        if when.is_none() && snooze.is_none() && new_name.is_none() && tell_me.is_none() {
             return Ok(negative(
-                "Say what to change: `when` (a new time), `new_name`, or `snooze_until`."
+                "Say what to change: `when` (a new time), `new_name`, `snooze_until` or `tell_me`."
                     .to_string(),
             ));
         }
@@ -1169,8 +1201,28 @@ impl ManageAutomationsTool {
             }
         };
 
+        if tell_me.is_some()
+            && aidaemon_work::reminders::message_from_context(goal.context.as_deref()).is_some()
+        {
+            return Ok(negative(format!(
+                "{title} is a reminder: it always tells you; there is nothing to quiet."
+            )));
+        }
         let now = Utc::now().to_rfc3339();
         let mut changed = Vec::new();
+        if let Some(mode) = tell_me {
+            let mut context = goal
+                .context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({}));
+            context[automations::NotifyMode::KEY] = json!(mode.as_str());
+            goal.context = Some(context.to_string());
+            goal.updated_at = now.clone();
+            self.state.update_goal(&goal).await?;
+            changed.push(format!("it now tells you {}", mode.words()));
+        }
         if let Some(new_name) = new_name {
             goal.context = Some(automations::context_with_name(
                 goal.context.as_deref(),
@@ -1493,6 +1545,7 @@ impl Tool for ManageAutomationsTool {
                     "when": text("edit: new schedule."),
                     "snooze_until": text("edit: move only the next run to this time."),
                     "new_name": text("edit: new name."),
+                    "tell_me": { "type": "string", "enum": ["every_run", "changes", "problems"], "description": "edit, scheduled work: what its runs tell the user: every run, only changes, or only problems." },
                     "limit": integer("history: runs to show."),
                     "budget_per_check": integer("Tokens per run."),
                     "budget_daily": integer("Tokens per day."),

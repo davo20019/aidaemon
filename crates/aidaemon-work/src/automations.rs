@@ -69,6 +69,105 @@ pub fn context_with_name(context: Option<&str>, name: &str) -> String {
 }
 
 /// A goal's lifecycle status as the owner reads it.
+/// What a scheduled automation tells the owner after a run: the owner's
+/// choice, stored as `notify` in its goal context. Quiet runs still leave
+/// their record, so silence stays provable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NotifyMode {
+    /// Every run's result (the default).
+    #[default]
+    EveryRun,
+    /// Only a run that found something new, or a problem.
+    Changes,
+    /// Only a run that failed or needs the owner.
+    Problems,
+}
+
+impl NotifyMode {
+    pub const KEY: &'static str = "notify";
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "every_run" => Some(Self::EveryRun),
+            "changes" => Some(Self::Changes),
+            "problems" => Some(Self::Problems),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EveryRun => "every_run",
+            Self::Changes => "changes",
+            Self::Problems => "problems",
+        }
+    }
+
+    /// The mode a goal's context holds; every run when it holds none.
+    pub fn from_context(context: Option<&str>) -> Self {
+        context
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|context| {
+                context
+                    .get(Self::KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(Self::parse)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether a run that ended as `notification_type` (`completed`,
+    /// `failed`...) with the run's own verdict `claim` is told.
+    pub fn tells(self, notification_type: &str, nothing_new: bool) -> bool {
+        let done = notification_type == "completed";
+        match self {
+            Self::EveryRun => true,
+            Self::Changes => !(done && nothing_new),
+            Self::Problems => !done,
+        }
+    }
+
+    /// What a run of an automation in this mode is told to do about it.
+    pub fn run_note(self) -> Option<&'static str> {
+        match self {
+            Self::Changes => Some(
+                " Report only what changed since this automation's previous run; when nothing \
+                 did, set track_requirements' outcome to nothing_new and answer in one line.",
+            ),
+            _ => None,
+        }
+    }
+
+    /// How the owner reads it.
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::EveryRun => "every run",
+            Self::Changes => "only when something changes",
+            Self::Problems => "only about problems",
+        }
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::NotifyMode;
+
+    #[test]
+    fn each_mode_tells_what_the_owner_chose() {
+        assert!(NotifyMode::EveryRun.tells("completed", true));
+        assert!(!NotifyMode::Changes.tells("completed", true));
+        assert!(NotifyMode::Changes.tells("completed", false));
+        assert!(NotifyMode::Changes.tells("failed", true));
+        assert!(!NotifyMode::Problems.tells("completed", false));
+        assert!(NotifyMode::Problems.tells("failed", false));
+        assert_eq!(
+            NotifyMode::from_context(Some(r#"{"notify":"changes"}"#)),
+            NotifyMode::Changes
+        );
+        assert_eq!(NotifyMode::from_context(None), NotifyMode::EveryRun);
+    }
+}
+
 /// A run's summary in the owner's words. Watching automations record a
 /// typed reason (`mandate_act_satisfied`, `mandate_review_failed:<reason>`);
 /// a summary that already reads as words is kept.

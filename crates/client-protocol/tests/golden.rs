@@ -368,6 +368,7 @@ fn client_samples() -> Vec<ClientFrame> {
                 name: None,
                 when: Some("every weekday at 8am".into()),
                 instructions: Some("Summarize the synthetic inbox; skip newsletters".into()),
+                notify: None,
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -902,6 +903,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 edit: Some(AutomationEdit {
                     when: "every weekday at 9am".into(),
                     instructions: Some("Summarize the synthetic inbox".into()),
+                    notify: Some(AutomationNotify::Changes),
                 }),
             }],
             note: Some("Paused \"Inbox digest\" (scheduled). It won't run until you resume it.".into()),

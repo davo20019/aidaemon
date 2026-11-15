@@ -688,6 +688,7 @@ mod child_runtime_tests {
                 trust: SourceTrust::Trusted,
                 end: self.end.lock().unwrap().clone(),
                 evidence: self.evidence.lock().unwrap().clone(),
+                claim: None,
             })
         }
         fn helper_runs(&self) -> Arc<aidaemon_runtime::run_state::RunStates> {

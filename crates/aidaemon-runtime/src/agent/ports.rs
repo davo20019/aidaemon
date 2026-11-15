@@ -70,6 +70,7 @@ impl ChildAgentRuntime for Agent {
             trust: result.trust,
             end: result.end,
             evidence: result.evidence,
+            claim: result.claim,
         })
     }
 

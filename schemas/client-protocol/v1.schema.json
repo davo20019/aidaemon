@@ -378,6 +378,17 @@
             "null"
           ]
         },
+        "notify": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutomationNotify"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What its runs tell the owner; absent for a reminder, which always\ndoes."
+        },
         "when": {
           "description": "When it runs, in the words it was set with (\"every weekday at 9am\").",
           "type": "string"
@@ -403,6 +414,26 @@
         {
           "const": "probe",
           "description": "Checks a service, port, command or file on a schedule.",
+          "type": "string"
+        }
+      ]
+    },
+    "AutomationNotify": {
+      "description": "What a scheduled automation's runs tell the owner (protocol 1.15).",
+      "oneOf": [
+        {
+          "const": "every_run",
+          "description": "Every run's result.",
+          "type": "string"
+        },
+        {
+          "const": "changes",
+          "description": "Only a run that found something new, or a problem.",
+          "type": "string"
+        },
+        {
+          "const": "problems",
+          "description": "Only a run that failed or needs the owner.",
           "type": "string"
         }
       ]
@@ -1531,6 +1562,17 @@
                 "string",
                 "null"
               ]
+            },
+            "notify": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AutomationNotify"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "What its runs tell the owner (protocol 1.15)."
             },
             "type": {
               "const": "edit_automation",

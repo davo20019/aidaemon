@@ -186,6 +186,7 @@ pub trait ClientHost: Send + Sync {
         _name: Option<&str>,
         _when: Option<&str>,
         _instructions: Option<&str>,
+        _notify: Option<aidaemon_client_protocol::AutomationNotify>,
     ) -> Result<(bool, String), String> {
         Err("This daemon has no automations".to_string())
     }
@@ -903,6 +904,7 @@ impl ClientGateway {
                 name,
                 when,
                 instructions,
+                notify,
             } => {
                 let (changed, note) = self
                     .host
@@ -911,6 +913,7 @@ impl ClientGateway {
                         name.as_deref(),
                         when.as_deref(),
                         instructions.as_deref(),
+                        notify,
                     )
                     .await
                     .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;

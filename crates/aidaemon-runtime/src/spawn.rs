@@ -73,6 +73,9 @@ pub struct SpawnChildResult {
     pub end: crate::run_state::RunEnd,
     /// Its typed steps no receipt confirmed.
     pub evidence: crate::run_state::RunEvidence,
+    /// Its own verdict on the work (`track_requirements`' outcome), when it
+    /// gave one.
+    pub claim: Option<aidaemon_events::ExecutorClaimedOutcome>,
 }
 
 /// How a child's run ended, the one place that decides it, from typed facts
@@ -1251,6 +1254,9 @@ pub struct ChildAgentRun {
     pub end: crate::run_state::RunEnd,
     /// Its typed steps no receipt confirmed.
     pub evidence: crate::run_state::RunEvidence,
+    /// Its own verdict on the work (`track_requirements`' outcome), when it
+    /// gave one.
+    pub claim: Option<aidaemon_events::ExecutorClaimedOutcome>,
 }
 
 /// How long a child may go without progress (no model or tool call running

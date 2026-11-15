@@ -431,7 +431,7 @@ impl Tool for TrackRequirementsTool {
                     },
                     "outcome": {
                         "type": "string",
-                        "description": "Your verdict on the whole request, set on your last call before the final answer. needs_owner: the work waits on the owner's choice, and your final answer is that question.",
+                        "description": "Your verdict on the whole request, set on your last call before the final answer. needs_owner: the work waits on the owner's choice, and your final answer is that question. nothing_new: a scheduled run found nothing changed since its previous run, so there is nothing new to tell the owner.",
                         "enum": aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES
                     },
                     "short_of": {

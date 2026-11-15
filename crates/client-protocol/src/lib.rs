@@ -371,6 +371,9 @@ pub enum Command {
         when: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<String>,
+        /// What its runs tell the owner (protocol 1.15).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<AutomationNotify>,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -622,6 +625,25 @@ pub struct AutomationEdit {
     /// What its runs do; absent for a reminder, whose message is fixed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// What its runs tell the owner; absent for a reminder, which always
+    /// does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<AutomationNotify>,
+}
+
+/// What a scheduled automation's runs tell the owner (protocol 1.15).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationNotify {
+    /// Every run's result.
+    EveryRun,
+    /// Only a run that found something new, or a problem.
+    Changes,
+    /// Only a run that failed or needs the owner.
+    Problems,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// One run of an automation (protocol 1.14).

@@ -211,6 +211,7 @@ impl ClientHost for Host {
                     instructions: Some(
                         "Summarize the synthetic inbox and send the highlights".into(),
                     ),
+                    notify: Some(aidaemon_client_protocol::AutomationNotify::EveryRun),
                 }),
             },
             AutomationSummary {

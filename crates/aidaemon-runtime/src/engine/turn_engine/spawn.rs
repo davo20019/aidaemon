@@ -2157,6 +2157,7 @@ impl TurnEngine<'_> {
             unlanded_write,
         );
         // How the run ended, decided once from typed facts.
+        let mut claim = None;
         let (run_end, evidence) = match child_end_record.as_ref() {
             Ok(Some(end)) if result.is_ok() && !unlanded_write => {
                 let aggregate = self
@@ -2164,6 +2165,9 @@ impl TurnEngine<'_> {
                     .task_run_aggregate(&child_session_for_events, &end.task_id)
                     .await
                     .ok();
+                claim = aggregate
+                    .as_ref()
+                    .and_then(|aggregate| aggregate.executor_claimed_outcome);
                 crate::spawn::run_phase(
                     child_outcome,
                     Some(end),
@@ -2309,6 +2313,7 @@ impl TurnEngine<'_> {
             trust,
             end: run_end,
             evidence,
+            claim,
         })
     }
 }

@@ -598,6 +598,17 @@ impl ClientHost for DaemonClientHost {
                     .map(|edit| aidaemon_client_protocol::AutomationEdit {
                         when: edit.when,
                         instructions: edit.instructions,
+                        notify: edit.notify.map(|mode| match mode {
+                            aidaemon_work::automations::NotifyMode::EveryRun => {
+                                aidaemon_client_protocol::AutomationNotify::EveryRun
+                            }
+                            aidaemon_work::automations::NotifyMode::Changes => {
+                                aidaemon_client_protocol::AutomationNotify::Changes
+                            }
+                            aidaemon_work::automations::NotifyMode::Problems => {
+                                aidaemon_client_protocol::AutomationNotify::Problems
+                            }
+                        }),
                     }),
             })
             .collect())
@@ -628,9 +639,19 @@ impl ClientHost for DaemonClientHost {
         name: Option<&str>,
         when: Option<&str>,
         instructions: Option<&str>,
+        notify: Option<aidaemon_client_protocol::AutomationNotify>,
     ) -> Result<(bool, String), String> {
+        use aidaemon_client_protocol::AutomationNotify as Notify;
+        use aidaemon_work::automations::NotifyMode;
+        let notify = match notify {
+            None => None,
+            Some(Notify::EveryRun) => Some(NotifyMode::EveryRun),
+            Some(Notify::Changes) => Some(NotifyMode::Changes),
+            Some(Notify::Problems) => Some(NotifyMode::Problems),
+            Some(Notify::Unknown) => return Err("This app asked for an unknown setting".into()),
+        };
         self.automation_tool()
-            .owner_edit(id, name, when, instructions)
+            .owner_edit(id, name, when, instructions, notify)
             .await
             .map_err(|e| e.to_string())
     }

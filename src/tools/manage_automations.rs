@@ -377,6 +377,7 @@ mod tests {
                 Some("Morning digest"),
                 Some("every weekday at 8am"),
                 Some("Summarize the synthetic inbox; skip newsletters"),
+                None,
             )
             .await
             .unwrap();
@@ -388,33 +389,67 @@ mod tests {
             after.how_often
         );
         assert_eq!(
-            after.edit.unwrap().instructions.as_deref(),
+            after.edit.as_ref().unwrap().instructions.as_deref(),
             Some("Summarize the synthetic inbox; skip newsletters")
         );
         assert_eq!(
             after.what,
             "Summarize the synthetic inbox; skip newsletters"
         );
+        // Quiet unless something changes: the card says so.
+        assert_eq!(
+            after.edit.as_ref().and_then(|e| e.notify),
+            Some(automations::NotifyMode::EveryRun)
+        );
+        let (changed, said) = f
+            .tool
+            .owner_edit(
+                &after.id,
+                None,
+                None,
+                None,
+                Some(automations::NotifyMode::Changes),
+            )
+            .await
+            .unwrap();
+        assert!(changed, "{said}");
+        let quiet = find(&f.tool.entries().await.unwrap(), "Morning digest");
+        assert_eq!(
+            quiet.edit.as_ref().and_then(|e| e.notify),
+            Some(automations::NotifyMode::Changes)
+        );
+        assert!(
+            quiet.details.iter().any(|line| line
+                == "Tells you when: only when a run finds something new, or hits a problem"),
+            "{:?}",
+            quiet.details
+        );
 
         // Unchanged fields change nothing; a reminder's message is fixed;
         // a watching automation is changed by asking.
         let (changed, said) = f
             .tool
-            .owner_edit(&after.id, Some("Morning digest"), None, None)
+            .owner_edit(&after.id, Some("Morning digest"), None, None, None)
             .await
             .unwrap();
         assert!(!changed && said == "Nothing changed.", "{said}");
         let oven = find(&f.tool.entries().await.unwrap(), "Oven");
         let (changed, _) = f
             .tool
-            .owner_edit(&oven.id, None, None, Some("Check the synthetic stove"))
+            .owner_edit(
+                &oven.id,
+                None,
+                None,
+                Some("Check the synthetic stove"),
+                None,
+            )
             .await
             .unwrap();
         assert!(!changed);
         let watch = find(&f.tool.entries().await.unwrap(), "Status watch");
         let (changed, said) = f
             .tool
-            .owner_edit(&watch.id, Some("Renamed"), None, None)
+            .owner_edit(&watch.id, Some("Renamed"), None, None, None)
             .await
             .unwrap();
         assert!(!changed && said.contains("ask in a conversation"), "{said}");

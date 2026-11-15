@@ -1058,6 +1058,10 @@ pub enum ExecutorClaimedOutcome {
     /// replace or duplicate them). Nothing is done in the owner's name until
     /// they answer.
     NeedsOwner,
+    /// Done, and nothing has changed since the previous run of this
+    /// scheduled work: there is nothing new to tell the owner. Judged as
+    /// done; an automation set to report only changes stays quiet.
+    NothingNew,
 }
 
 impl ExecutorClaimedOutcome {
@@ -1067,6 +1071,7 @@ impl ExecutorClaimedOutcome {
             "partial" => Some(Self::Partial),
             "blocked" => Some(Self::Blocked),
             "needs_owner" => Some(Self::NeedsOwner),
+            "nothing_new" => Some(Self::NothingNew),
             _ => None,
         }
     }
@@ -1077,10 +1082,12 @@ impl ExecutorClaimedOutcome {
             Self::Partial => "partial",
             Self::Blocked => "blocked",
             Self::NeedsOwner => "needs_owner",
+            Self::NothingNew => "nothing_new",
         }
     }
 
-    pub const PROTOCOL_NAMES: [&'static str; 4] = ["done", "partial", "blocked", "needs_owner"];
+    pub const PROTOCOL_NAMES: [&'static str; 5] =
+        ["done", "partial", "blocked", "needs_owner", "nothing_new"];
 
     /// The unmet requirement a run ending on this verdict records, in words
     /// the owner reads.
@@ -1093,7 +1100,7 @@ impl ExecutorClaimedOutcome {
 
     /// Whether the agent says the request is not fully done.
     pub const fn unfinished(self) -> bool {
-        !matches!(self, Self::Done)
+        !matches!(self, Self::Done | Self::NothingNew)
     }
 }
 

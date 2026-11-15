@@ -9,6 +9,7 @@
         ],
         "edit": {
           "instructions": "Summarize the synthetic inbox",
+          "notify": "changes",
           "when": "every weekday at 9am"
         },
         "how_often": "Every weekday at 9:00 AM ET",
