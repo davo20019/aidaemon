@@ -13,7 +13,8 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 ## Tokens (`src/ui/theme.rs`)
 
 - **Surfaces:** `BACKGROUND` (the window), `SIDEBAR` (side panes, one step away), `SURFACE` (cards, popups, the composer), `INSET` (code and tool output inside a surface). Washes: `HOVER` is weaker than `SELECTED`.
-- **Text:** `TEXT`, `MUTED` (secondary), `FAINT` (metadata, hints). Never smaller than 11 pt.
+- **Text:** `TEXT`, `MUTED` (secondary), `FAINT` (metadata, hints; at least 4.5:1 on the background in both themes). Never smaller than 11 pt.
+- **Icons:** `ui::icon(Glyph)`: Lucide line art (ISC) drawn in the text colour in a window and a browser; the plain symbol in a terminal.
 - **One accent:** `ACCENT` (teal) means the agent: running work, the focus ring, the caret, links. `PRIMARY` is the one main action's fill (ink on paper, paper on graphite).
 - **Status** (`Tone`): success, warning, danger, info, neutral, accent. Each has a colour and a soft tint, and always comes with a word or glyph, never colour alone.
 - **Radii:** surfaces 12, controls 7, small parts 4. Nested shapes are concentric.

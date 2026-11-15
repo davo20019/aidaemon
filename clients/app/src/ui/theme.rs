@@ -46,7 +46,7 @@ pub mod colors {
     /// Secondary text.
     pub const MUTED: AdaptiveColor = tone(rgb(0x5d6168), rgb(0x9196a0));
     /// Quiet text: timestamps, counts, hints.
-    pub const FAINT: AdaptiveColor = tone(rgb(0x92969d), rgb(0x60646d));
+    pub const FAINT: AdaptiveColor = tone(rgb(0x6b6f76), rgb(0x80858f));
     /// The agent's colour: running work, links, the focus ring, the caret.
     pub const ACCENT: AdaptiveColor = tone(rgb(0x0b7a6e), rgb(0x45d2bf));
     /// The main action's fill.

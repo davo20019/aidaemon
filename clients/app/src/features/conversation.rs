@@ -734,7 +734,9 @@ fn live(store: Store, session: String) -> View {
 }
 
 fn composer(store: Store, session: Option<String>) -> View {
-    let height = signal(22.0_f32);
+    // At least one line: shorter, the browser shows a scroll bar for the
+    // rest of it (a phone's line is 24 pt).
+    let height = signal(ui::fit::read_lh());
     let online = move || store.is_online();
     let can_send = move || online() && !store.draft().trim().is_empty();
     let running = {
@@ -811,7 +813,8 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 store.submit();
                             }
                         })
-                        .auto_focus(true)
+                        // A phone would raise its keyboard over the page.
+                        .auto_focus(!touch)
                         .placeholder(move || match store.connection() {
                             Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
                             Connection::Connecting
@@ -825,7 +828,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .caret_color(|| color(colors::ACCENT))
                         .selection_color(|| color(colors::ACCENT))
                         .on_content_size_change(move |size: &nsh_core::geometry::Size<Points>| {
-                            height.set(size.height.0.clamp(22.0, 180.0));
+                            height.set(size.height.0.clamp(ui::fit::read_lh(), 180.0));
                         })
                         .h(move || px(height.get() + 16.0))
                         .px(px(8.0))
