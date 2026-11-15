@@ -58,6 +58,15 @@ pub(crate) fn options(llm: &SharedLlmRuntime) -> ModelOptions {
     }
 }
 
+/// The name the picker shows for provider `id` (the id when unknown).
+fn provider_name<'a>(options: &'a ModelOptions, id: &'a str) -> &'a str {
+    options
+        .providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .map_or(id, |provider| provider.name.as_str())
+}
+
 fn available_models(options: &ModelOptions) -> String {
     let models: Vec<&str> = options
         .providers
@@ -87,6 +96,7 @@ pub(crate) async fn slash(
                 let current = current(settings, llm, session_id).await;
                 return Some(match current.model {
                     ModelChoice::Pinned { provider, model } => {
+                        let provider = provider_name(&options(llm), &provider).to_owned();
                         format!("This conversation uses `{model}` ({provider}).")
                     }
                     _ => "This conversation uses automatic model routing.".to_string(),
@@ -113,6 +123,7 @@ pub(crate) async fn slash(
                 match set(settings, llm, session_id, Some(selected), None).await {
                     Ok(model) => match model.model {
                         ModelChoice::Pinned { provider, model } => {
+                            let provider = provider_name(&choices, &provider);
                             format!("This conversation now uses `{model}` ({provider}).")
                         }
                         _ => "This conversation uses automatic model routing.".to_string(),
@@ -343,7 +354,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(selected.contains("failover-0"), "{selected}");
+        assert!(selected.contains("Google Gemini"), "{selected}");
         assert_eq!(
             current(settings, &llm, "app:synthetic-one").await.model,
             pin("failover-0", "synthetic-gemini").unwrap()

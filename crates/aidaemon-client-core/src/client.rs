@@ -259,6 +259,9 @@ pub struct Client {
     pub session_models: BTreeMap<String, Read<SessionModel>>,
     /// Reads and changes of a conversation's model: request id to session.
     session_model_requests: BTreeMap<String, String>,
+    /// `/model` and `/auto` sent in a conversation: request id to session,
+    /// so its model is read again once the command has run.
+    model_commands: BTreeMap<String, String>,
     /// The model and effort the next new conversation starts with.
     pub new_model: (ModelChoice, Effort),
     /// The model a new conversation's first message carried, until the
@@ -472,6 +475,13 @@ impl Client {
             out.push(Effect::Started(session_id.clone()));
         }
         match frame {
+            // `/model` or `/auto` changed the conversation's model: read it
+            // again, and let the reply show as usual.
+            ServerFrame::Ack { request_id, .. } if self.model_commands.contains_key(request_id) => {
+                let session = self.model_commands.remove(request_id).unwrap_or_default();
+                self.session_models.remove(&session);
+                self.load_session_model(&session);
+            }
             ServerFrame::Ack {
                 request_id,
                 result: CommandResult::Setup { .. },
@@ -1784,11 +1794,14 @@ impl Client {
         ) {
             (Some(session), Some(slash)) => {
                 let (command, args) = slash.split_once(' ').unwrap_or((slash, ""));
-                self.send(Command::RunSlash {
+                let id = self.send(Command::RunSlash {
                     session_id: session.to_owned(),
                     command: command.to_owned(),
                     args: args.trim().to_owned(),
                 });
+                if matches!(command.to_lowercase().as_str(), "model" | "auto") {
+                    self.model_commands.insert(id, session.to_owned());
+                }
             }
             _ => {
                 // A new conversation starts on the model picked for it; an
@@ -2298,6 +2311,29 @@ mod tests {
             client.take_outgoing().pop(),
             Some((_, Command::SendMessage { .. }))
         ));
+    }
+
+    #[test]
+    fn a_conversations_model_is_read_again_after_model_or_auto() {
+        let mut client = Client::new();
+        client
+            .submit(Some("app:a"), "/model synthetic-gemini", None, None)
+            .unwrap();
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(command, Command::RunSlash { .. }), "{command:?}");
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"reply","text":"This conversation now uses synthetic-gemini."}}}}"#
+            )),
+            &cx(None),
+        );
+        let (_, reread) = client.take_outgoing().pop().unwrap();
+        assert_eq!(
+            reread,
+            Command::GetSessionModel {
+                session_id: "app:a".into()
+            }
+        );
     }
 
     fn models_ready(client: &mut Client) {
