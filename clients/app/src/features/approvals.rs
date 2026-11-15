@@ -26,6 +26,20 @@ fn decision(d: ApprovalDecision) -> (&'static str, Variant) {
     }
 }
 
+/// How far an answer reaches.
+fn scope(d: ApprovalDecision) -> &'static str {
+    match d {
+        ApprovalDecision::ApproveOnce => "Allow once: just this step",
+        ApprovalDecision::ApproveSession => {
+            "Allow this session: this kind of step, for the rest of this conversation"
+        }
+        ApprovalDecision::ApproveAlways => {
+            "Always allow: this kind of step from now on, without asking"
+        }
+        ApprovalDecision::Deny => "Deny: skip just this step",
+    }
+}
+
 fn impact(impact: &Impact) -> Option<String> {
     match impact {
         Impact::Deletes { targets } if targets.is_empty() => Some("Deletes files".into()),
@@ -178,14 +192,17 @@ pub fn card(store: Store, approval: Approval) -> View {
             let buttons = approval.options.iter().map(|d| {
                 let (label, variant) = decision(*d);
                 let (id, d) = (id.clone(), *d);
-                btn(label, variant, Size::Sm, move || store.resolve(&id, d))
+                // What an answer covers, in words and for screen readers.
+                let button = btn(label, variant, Size::Sm, move || store.resolve(&id, d))
+                    .accessibility_label(scope(d));
+                (d, button)
             });
             if ui::touch() {
                 // A phone stacks the answers full width, the main one
                 // first: three side by side would wrap at a thumb's size.
                 view()
                     .gap_2()
-                    .children(buttons.map(|b| b.w_full()))
+                    .children(buttons.map(|(_, b)| b.w_full()))
                     .child(meta)
             } else {
                 view()
@@ -193,7 +210,8 @@ pub fn card(store: Store, approval: Approval) -> View {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
-                    .children(buttons)
+                    // Pointing at an answer says how far it reaches.
+                    .children(buttons.map(|(d, b)| ui::with_hint(scope(d), b)))
                     .child(view().flex_1())
                     .child(meta)
             }

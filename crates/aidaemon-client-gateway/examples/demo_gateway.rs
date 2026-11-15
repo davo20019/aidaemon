@@ -73,7 +73,9 @@ impl AgentIngress for Agent {
                 .await?;
             match response_rx.await {
                 Ok(ApprovalResponse::Deny) => "Not published.".to_string(),
-                Ok(response) => format!("Published ({response:?})."),
+                Ok(ApprovalResponse::AllowOnce) => "Published the synthetic report.".to_string(),
+                Ok(_) => "Published the synthetic report. Publishing reports is allowed from now on."
+                    .to_string(),
                 Err(_) => "No answer.".to_string(),
             }
         } else if text.contains("waiting") {
