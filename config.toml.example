@@ -597,11 +597,19 @@ timeout_seconds = 20
 # its confidence is self-reported, so decisions that need an honest
 # confidence stay in shadow) or "gemini" (Google's Decisions API,
 # calibrated confidence; input is sent to Google, and its free tier may use
-# it to improve Google's products).
+# it to improve Google's products) or "typesafe" (TypeSafe's System One API,
+# answered by its Jev model, calibrated confidence; input is sent to
+# TypeSafe; early access, so you need a TypeSafe API key; see
+# https://docs.typesafe.ai).
 # [decisions]
 # backend = "gemini"
 # # Empty: the key of the first google_genai provider in [provider].
+# # For "typesafe" a key is required and only this key is used; "keychain"
+# # reads decisions_api_key from the OS credential store (both backends).
 # api_key = ""
+# # Empty: gemini-decision-1 for "gemini", jev-latest for "typesafe" (pin a
+# # versioned id such as "jev-1.14.0" to keep confidence thresholds stable).
+# model = ""
 # [decisions.mode]   # off | shadow (record, never act) | on
 # turn_digest = "shadow"
 # resume = "shadow"

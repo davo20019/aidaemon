@@ -101,6 +101,7 @@ fn the_scan_sees_the_gateway() {
 /// and telemetry.
 const RAW_DECIDER: &[&str] = &[
     "GeminiDecider",
+    "TypesafeDecider",
     "ProviderDecider",
     "dyn Decider",
     "impl Decider",

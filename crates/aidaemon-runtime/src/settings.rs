@@ -21,12 +21,16 @@ pub struct DecisionsConfig {
     pub backend: DecisionBackendKind,
     /// For `backend = "provider"`: the model to ask; empty means the
     /// configured cheap (fast-tier) model. For `backend = "gemini"`: the
-    /// decision model; empty means `gemini-decision-1`.
+    /// decision model; empty means `gemini-decision-1`. For
+    /// `backend = "typesafe"`: the Jev model id or alias; empty means
+    /// `jev-latest`.
     #[serde(default)]
     pub model: String,
     /// For `backend = "gemini"`: the API key, or `"keychain"` to read
     /// `decisions_api_key` from the OS credential store. Empty means the key
-    /// of the first `google_genai` provider in `[provider]`, if any.
+    /// of the first `google_genai` provider in `[provider]`, if any. For
+    /// `backend = "typesafe"`: the TypeSafe API key, or `"keychain"` as
+    /// above; empty turns the layer off.
     #[serde(default)]
     pub api_key: String,
     /// Per decision: `off`, `shadow` (ask and record, never act) or `on`.
@@ -63,6 +67,8 @@ pub enum DecisionBackendKind {
     Provider,
     /// Google's Decisions API (calibrated confidence).
     Gemini,
+    /// TypeSafe's System One API, answered by Jev (calibrated confidence).
+    Typesafe,
 }
 
 /// Whether a decision runs, and whether it may act.
@@ -885,4 +891,32 @@ pub enum IterationLimitConfig {
     /// Legacy hard limit behavior (backward compatibility).
     /// Agent will be forced to stop at `cap` iterations.
     Hard { initial: usize, cap: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decisions_backend_typesafe_parses() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            decisions: DecisionsConfig,
+        }
+        let parsed: Wrapper = toml::from_str(
+            r#"
+            [decisions]
+            backend = "typesafe"
+            model = "jev-1.14.0"
+            api_key = "keychain"
+            [decisions.mode]
+            turn_digest = "on"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.decisions.backend, DecisionBackendKind::Typesafe);
+        assert_eq!(parsed.decisions.model, "jev-1.14.0");
+        assert_eq!(parsed.decisions.api_key, "keychain");
+        assert_eq!(parsed.decisions.mode.turn_digest, DecisionMode::On);
+    }
 }

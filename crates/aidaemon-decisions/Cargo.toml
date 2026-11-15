@@ -20,6 +20,8 @@ publish = false
 [features]
 # `GeminiDecider`: Google's Decisions API (`gemini-decision-1`).
 gemini = ["dep:reqwest"]
+# `TypesafeDecider`: TypeSafe's System One API (Jev).
+typesafe = ["dep:reqwest"]
 # `ScriptedDecider` and the conformance kit, for testing deciders and callers.
 testing = []
 
@@ -33,5 +35,5 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
-aidaemon-decisions = { path = ".", features = ["testing", "gemini"] }
+aidaemon-decisions = { path = ".", features = ["testing", "gemini", "typesafe"] }
 tokio = { version = "1", features = ["full"] }

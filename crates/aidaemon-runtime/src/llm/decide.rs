@@ -23,7 +23,8 @@ enum Backend {
     /// A chat model through the side-call door; `model` empty means the
     /// configured cheap model at the time of the call.
     Provider { model: String },
-    /// A backend that needs no provider (Gemini, a scripted one in tests).
+    /// A backend that needs no provider (Gemini, TypeSafe, a scripted one
+    /// in tests).
     Decider(Arc<dyn Decider>),
 }
 
@@ -64,6 +65,22 @@ impl DecisionLayer {
                     return None;
                 };
                 let mut decider = aidaemon_decisions::GeminiDecider::new(key);
+                if !config.model.trim().is_empty() {
+                    decider = decider.with_model(config.model.trim());
+                }
+                Backend::Decider(Arc::new(decider))
+            }
+            DecisionBackendKind::Typesafe => {
+                // Only `[decisions] api_key`: a provider's key is never sent
+                // to TypeSafe.
+                let key = config.api_key.trim();
+                if key.is_empty() {
+                    tracing::warn!(
+                        "decisions backend is typesafe but no api_key is set; decision layer off"
+                    );
+                    return None;
+                }
+                let mut decider = aidaemon_decisions::TypesafeDecider::new(key);
                 if !config.model.trim().is_empty() {
                     decider = decider.with_model(config.model.trim());
                 }
@@ -649,5 +666,25 @@ mod tests {
         };
         assert!(DecisionLayer::from_config(&config).is_none());
         assert!(DecisionLayer::from_config(&Default::default()).is_none());
+    }
+
+    #[test]
+    fn a_typesafe_backend_uses_only_its_own_key() {
+        let config = crate::settings::DecisionsConfig {
+            backend: crate::settings::DecisionBackendKind::Typesafe,
+            ..Default::default()
+        };
+        // The Gemini provider's key is never used for TypeSafe.
+        assert!(DecisionLayer::from_config_with_key(&config, Some("synthetic-key")).is_none());
+        let config = crate::settings::DecisionsConfig {
+            api_key: "synthetic-typesafe-key".to_string(),
+            model: "jev-1.14.0".to_string(),
+            ..config
+        };
+        let layer = DecisionLayer::from_config_with_key(&config, None).expect("built");
+        match &layer.backend {
+            Backend::Decider(decider) => assert_eq!(decider.name(), "typesafe:jev-1.14.0"),
+            Backend::Provider { .. } => panic!("expected a decider"),
+        }
     }
 }

@@ -11,6 +11,8 @@
 //!   through a JSON schema. Its confidence is [`ConfidenceSource::SelfReported`].
 //! - `GeminiDecider` (feature `gemini`) calls Google's Decisions API. Its
 //!   confidence is [`ConfidenceSource::Calibrated`].
+//! - `TypesafeDecider` (feature `typesafe`) calls TypeSafe's System One API
+//!   (Jev). Its confidence is [`ConfidenceSource::Calibrated`].
 //! - `ScriptedDecider` (feature `testing`) returns fixed answers.
 //!
 //! A caller decides which confidence sources it trusts: a model that states
@@ -28,6 +30,14 @@ pub use provider::ProviderDecider;
 mod gemini;
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiDecider;
+
+#[cfg(feature = "typesafe")]
+mod typesafe;
+#[cfg(feature = "typesafe")]
+pub use typesafe::TypesafeDecider;
+
+#[cfg(all(test, any(feature = "gemini", feature = "typesafe")))]
+mod test_http;
 
 #[cfg(feature = "testing")]
 pub mod testing;

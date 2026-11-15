@@ -114,7 +114,7 @@ aidaemon-core = { version = "=0.20.0", path = "crates/aidaemon-core" }
 # The kernel's run journal and checkpoints, on the daemon's own pool.
 aidaemon-store-sqlite = { version = "=0.20.0", path = "crates/aidaemon-store-sqlite", features = ["client-events"] }
 aidaemon-policies = { version = "=0.20.0", path = "crates/aidaemon-policies" }
-aidaemon-decisions = { version = "=0.20.0", path = "crates/aidaemon-decisions", features = ["gemini"] }
+aidaemon-decisions = { version = "=0.20.0", path = "crates/aidaemon-decisions", features = ["gemini", "typesafe"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 # Tool semantics (call descriptions, receipts metadata) live in the SDK.
 aidaemon-tools = { version = "=0.20.0", path = "crates/aidaemon-tools", features = ["checkpoints", "oauth"] }
@@ -195,7 +195,7 @@ aidaemon-eval = { path = "crates/aidaemon-eval" }
 aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }
 aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
 aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
-aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "testing"] }
+aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "typesafe", "testing"] }
 aidaemon-runtime = { path = "crates/aidaemon-runtime", features = ["testing"] }
 aidaemon-memory = { path = "crates/aidaemon-memory", features = ["fastembed"] }
 tempfile = "3"

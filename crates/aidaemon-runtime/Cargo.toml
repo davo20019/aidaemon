@@ -34,7 +34,7 @@ aidaemon-agents = { version = "0.20.0", path = "../aidaemon-agents" }
 aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
 aidaemon-client-gateway = { version = "0.20.0", path = "../aidaemon-client-gateway" }
 aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
-aidaemon-decisions = { version = "0.20.0", path = "../aidaemon-decisions", features = ["gemini"] }
+aidaemon-decisions = { version = "0.20.0", path = "../aidaemon-decisions", features = ["gemini", "typesafe"] }
 aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
 aidaemon-exposure = { version = "0.20.0", path = "../aidaemon-exposure" }
 aidaemon-mcp = { version = "0.20.0", path = "../aidaemon-mcp", features = ["registry"] }
@@ -82,7 +82,7 @@ xcap = { version = "0.9", optional = true }
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
-aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini"] }
+aidaemon-decisions = { path = "../aidaemon-decisions", features = ["testing", "gemini", "typesafe"] }
 aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
