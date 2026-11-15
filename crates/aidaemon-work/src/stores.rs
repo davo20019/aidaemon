@@ -685,6 +685,23 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(crate::traits::DEFAULT_PROJECT_ID.to_string())
     }
 
+    /// Rename a project or change its folder (`Some(None)` clears it).
+    /// `None` when there is no such project.
+    async fn update_work_project(
+        &self,
+        _id: &str,
+        _name: Option<&str>,
+        _path: Option<Option<&str>>,
+    ) -> anyhow::Result<Option<crate::traits::WorkProject>> {
+        anyhow::bail!("work projects are not supported by this store")
+    }
+
+    /// Every session placed in a project other than the default one, with
+    /// its project id.
+    async fn session_work_projects(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+
     async fn set_session_work_project(
         &self,
         _session_id: &str,

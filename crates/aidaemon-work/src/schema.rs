@@ -888,6 +888,11 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
+    // A project's folder (any folder: a repository, a site, designs);
+    // conversations in the project work there.
+    let _ = sqlx::query("ALTER TABLE work_projects ADD COLUMN path TEXT")
+        .execute(pool)
+        .await;
     sqlx::query(
         "INSERT OR IGNORE INTO work_projects (id, name, description)
          VALUES ('default', 'Default', 'Default Aidaemon work project')",

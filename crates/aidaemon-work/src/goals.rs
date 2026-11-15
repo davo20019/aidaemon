@@ -481,6 +481,9 @@ pub struct WorkProject {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    /// The folder the project's conversations work in, as an absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

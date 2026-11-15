@@ -180,6 +180,7 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
+            path: None,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -199,7 +200,7 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
 
     async fn list_work_projects(&self) -> anyhow::Result<Vec<WorkProject>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, created_at, updated_at
+            "SELECT id, name, description, path, created_at, updated_at
              FROM work_projects ORDER BY name COLLATE NOCASE",
         )
         .fetch_all(self.work_pool())
@@ -210,10 +211,58 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
                 id: row.get("id"),
                 name: row.get("name"),
                 description: row.get("description"),
+                path: row.get("path"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
             })
             .collect())
+    }
+
+    async fn update_work_project(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        path: Option<Option<&str>>,
+    ) -> anyhow::Result<Option<WorkProject>> {
+        let name = name.map(str::trim);
+        if let Some(name) = name {
+            anyhow::ensure!(!name.is_empty(), "project name cannot be empty");
+            anyhow::ensure!(name.chars().count() <= 80, "project name is too long");
+        }
+        let path = path.map(|p| p.map(str::trim).filter(|p| !p.is_empty()));
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = sqlx::query(
+            "UPDATE work_projects
+             SET name = COALESCE(?, name),
+                 path = CASE WHEN ? THEN ? ELSE path END,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(name)
+        .bind(path.is_some())
+        .bind(path.flatten())
+        .bind(&now)
+        .bind(id)
+        .execute(self.work_pool())
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .list_work_projects()
+            .await?
+            .into_iter()
+            .find(|project| project.id == id))
+    }
+
+    async fn session_work_projects(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT session_id, project_id FROM session_work_projects WHERE project_id != ?",
+        )
+        .bind(DEFAULT_PROJECT_ID)
+        .fetch_all(self.work_pool())
+        .await?)
     }
 
     async fn get_session_work_project(&self, session_id: &str) -> anyhow::Result<String> {
@@ -2147,6 +2196,58 @@ mod tests {
             next_step: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_project_keeps_its_folder_and_lists_the_sessions_placed_in_it() {
+        let (store, _db) = test_store().await;
+        let project = store.create_work_project("Acme site", None).await.unwrap();
+        assert_eq!(project.path, None);
+        let moved = store
+            .update_work_project(&project.id, None, Some(Some("/home/synthetic/acme-site")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.path.as_deref(), Some("/home/synthetic/acme-site"));
+        assert_eq!(moved.name, "Acme site");
+        let renamed = store
+            .update_work_project(&project.id, Some("Acme Corp site"), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (renamed.name.as_str(), renamed.path.as_deref()),
+            ("Acme Corp site", Some("/home/synthetic/acme-site"))
+        );
+        let cleared = store
+            .update_work_project(&project.id, None, Some(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.path, None);
+        assert!(
+            store
+                .update_work_project("project-missing", Some("x"), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .set_session_work_project("app:a", &project.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_session_work_project("app:b", DEFAULT_PROJECT_ID)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.session_work_projects().await.unwrap(),
+            vec![("app:a".to_string(), project.id.clone())]
+        );
     }
 
     #[tokio::test]
