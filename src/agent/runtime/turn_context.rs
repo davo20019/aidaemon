@@ -342,9 +342,15 @@ mod tests {
                 "Create the post in /tmp/synthetic-alice/projects/acme-daemon/src/content/posts.",
             )
             .await;
+        // On Windows the path is on the current drive.
+        let posts =
+            std::path::absolute("/tmp/synthetic-alice/projects/acme-daemon/src/content/posts")
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
         assert_eq!(
             unbound.primary_project_scope.as_deref(),
-            Some("/tmp/synthetic-alice/projects/acme-daemon/src/content/posts"),
+            Some(posts.as_str())
         );
     }
 
@@ -470,7 +476,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             path_targets,
-            vec![format!("{workspace_path}/src/content/posts")],
+            vec![
+                std::path::Path::new(&workspace_path)
+                    .join("src")
+                    .join("content")
+                    .join("posts")
+                    .to_string_lossy()
+                    .into_owned()
+            ],
             "verification target anchored to the bound workspace, not the daemon cwd"
         );
     }

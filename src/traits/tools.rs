@@ -87,21 +87,23 @@ mod tests {
 
     #[test]
     fn trust_roots_contains_only_descendants() {
-        let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
+        let p = crate::testing::abs_path;
+        let roots = vec![p("/tmp/aidaemon-test/ws")];
         let roots = TrustRoots::new(&roots);
-        assert!(roots.contains("/tmp/aidaemon-test/ws"));
-        assert!(roots.contains("/tmp/aidaemon-test/ws/a.txt"));
-        assert!(!roots.contains("/tmp/aidaemon-test/ws2/a.txt"));
-        assert!(!roots.contains("/tmp/aidaemon-test/ws/../x"));
+        assert!(roots.contains(&p("/tmp/aidaemon-test/ws")));
+        assert!(roots.contains(&p("/tmp/aidaemon-test/ws/a.txt")));
+        assert!(!roots.contains(&p("/tmp/aidaemon-test/ws2/a.txt")));
+        assert!(!roots.contains(&p("/tmp/aidaemon-test/ws/../x")));
         assert!(!roots.contains("src/lib.rs"), "relative with no cwd");
-        let list = vec!["/tmp/aidaemon-test/ws".to_string()];
-        let anchored = TrustRoots::new(&list).with_cwd(Some("/tmp/aidaemon-test/ws"));
+        let list = vec![p("/tmp/aidaemon-test/ws")];
+        let cwd = p("/tmp/aidaemon-test/ws");
+        let anchored = TrustRoots::new(&list).with_cwd(Some(&cwd));
         assert!(anchored.contains("src/lib.rs"));
         assert!(anchored.contains("./src/../Cargo.toml"));
         assert!(!anchored.contains("../other/a.txt"));
         assert!(!anchored.contains("/etc/hosts"));
         assert!(!roots.contains("a.txt"));
-        assert!(!TrustRoots::new(&[]).contains("/tmp/aidaemon-test/ws/a.txt"));
+        assert!(!TrustRoots::new(&[]).contains(&p("/tmp/aidaemon-test/ws/a.txt")));
     }
 
     /// A symlink inside a root that points outside it does not carry the

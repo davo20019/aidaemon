@@ -738,17 +738,21 @@ pub async fn fake_mcp_registry_with_read_only(
 }
 
 /// An absolute fixture path from a Unix-style one: on Windows a path needs a
-/// drive to be absolute, so `/tmp/x` becomes `C:/tmp/x` there.
+/// drive to be absolute, so `/tmp/x` becomes `C:\tmp\x` there.
 pub fn abs_path(unix: &str) -> String {
     if cfg!(windows) {
-        format!("C:{unix}")
+        format!("C:{}", unix.replace('/', "\\"))
     } else {
         unix.to_string()
     }
 }
 
 /// The attachment inbox of the agent [`setup_test_agent`] builds.
+#[cfg(not(windows))]
 pub const TEST_INBOX_DIR: &str = "/tmp/aidaemon-test-attachments";
+/// The attachment inbox of the agent [`setup_test_agent`] builds.
+#[cfg(windows)]
+pub const TEST_INBOX_DIR: &str = r"C:\tmp\aidaemon-test-attachments";
 
 pub async fn setup_test_agent(provider: MockProvider) -> anyhow::Result<TestHarness> {
     setup_test_agent_internal(provider, vec![], None, true, true, false, None).await

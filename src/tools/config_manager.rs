@@ -278,19 +278,17 @@ fallback = ["old-a", "old-b"]
 
     #[test]
     fn changes_declare_the_config_path_and_reads_declare_nothing() {
+        let config = crate::testing::abs_path("/tmp/aidaemon-synthetic/config.toml");
         let tool = ConfigManagerTool::new(
-            crate::config::config_file(PathBuf::from("/tmp/aidaemon-synthetic/config.toml")),
+            crate::config::config_file(PathBuf::from(&config)),
             Arc::new(aidaemon_secrets::MemorySecretStore::new()),
         );
         let effects = tool.effects_for(r#"{"action":"set","key":"provider.kind","value":"x"}"#);
         assert_eq!(
             effects.keys,
             vec![
-                aidaemon_core::EffectKey::path(
-                    aidaemon_core::EffectClass::Configuration,
-                    "/tmp/aidaemon-synthetic/config.toml"
-                )
-                .unwrap()
+                aidaemon_core::EffectKey::path(aidaemon_core::EffectClass::Configuration, &config)
+                    .unwrap()
             ]
         );
         assert!(!effects.complete);

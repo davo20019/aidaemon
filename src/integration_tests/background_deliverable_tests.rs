@@ -163,7 +163,7 @@ async fn empty_stdout_background_command_delivers_result_file() {
         std::env::temp_dir().join(format!("bgd_probe_results_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&result_path);
     let script = format!(
-        "import time\noutput_path = \"{}\"\ntime.sleep(2)\nwith open(output_path, \"w\") as f:\n    f.write(\"latency: 42ms\\n\")\n",
+        "import time\noutput_path = r\"{}\"\ntime.sleep(2)\nwith open(output_path, \"w\") as f:\n    f.write(\"latency: 42ms\\n\")\n",
         result_path.display()
     );
     std::fs::write(&script_path, script).unwrap();
@@ -319,7 +319,7 @@ async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
     std::fs::write(
         &script_path,
         format!(
-            "import pathlib, time\ntime.sleep(2)\npathlib.Path('{}').write_text('a')\npathlib.Path('{}').write_text('b')\n",
+            "import pathlib, time\ntime.sleep(2)\npathlib.Path(r'{}').write_text('a')\npathlib.Path(r'{}').write_text('b')\n",
             a_path.display(),
             b_path.display()
         ),
@@ -381,7 +381,7 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     let result_path =
         std::env::temp_dir().join(format!("bgd_retry_results_{}.txt", std::process::id()));
     let script = format!(
-        "import time\noutput_path = \"{}\"\ntime.sleep(2)\nopen(output_path, 'w').write('retry ok\\n')\n",
+        "import time\noutput_path = r\"{}\"\ntime.sleep(2)\nopen(output_path, 'w').write('retry ok\\n')\n",
         result_path.display()
     );
     std::fs::write(&script_path, script).unwrap();
@@ -446,7 +446,7 @@ async fn nonzero_background_command_with_file_reports_failure_without_autosend()
     std::fs::write(
         &script_path,
         format!(
-            "import pathlib, sys, time\ntime.sleep(2)\npathlib.Path('{}').write_text('partial')\nsys.exit(7)\n",
+            "import pathlib, sys, time\ntime.sleep(2)\npathlib.Path(r'{}').write_text('partial')\nsys.exit(7)\n",
             result_path.display()
         ),
     )
@@ -508,7 +508,7 @@ async fn reaped_script_declared_missing_output_reports_honest_failure() {
     std::fs::write(
         &script_path,
         format!(
-            "import time\noutput_path = '{}'\ntime.sleep(30)\n# intended output path is declared but never written\n",
+            "import time\noutput_path = r'{}'\ntime.sleep(30)\n# intended output path is declared but never written\n",
             missing_path.display()
         ),
     )

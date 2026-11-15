@@ -132,6 +132,11 @@ pub enum Journal {
     /// an already-unlinked temp file until every pooled connection closes,
     /// which across thousands of tests fills the disk.
     Delete,
+    /// Rollback journal kept in memory, and no flush to disk. For throwaway
+    /// test databases: a journal file created, flushed and deleted on every
+    /// commit makes each migration slow where file operations are (Windows,
+    /// with its file scanning, took 30 s per store).
+    Memory,
 }
 
 impl Journal {
@@ -139,6 +144,7 @@ impl Journal {
         match self {
             Journal::Wal => "wal",
             Journal::Delete => "delete",
+            Journal::Memory => "memory",
         }
     }
 
@@ -146,6 +152,15 @@ impl Journal {
         match self {
             Journal::Wal => "PRAGMA journal_mode = WAL",
             Journal::Delete => "PRAGMA journal_mode = DELETE",
+            Journal::Memory => "PRAGMA journal_mode = MEMORY",
+        }
+    }
+
+    /// How often SQLite flushes to disk with this journal.
+    fn synchronous(self) -> SqliteSynchronous {
+        match self {
+            Journal::Wal | Journal::Delete => SqliteSynchronous::Normal,
+            Journal::Memory => SqliteSynchronous::Off,
         }
     }
 }
@@ -175,7 +190,7 @@ impl StoreOptions {
     };
     /// A throwaway database a test opens and drops.
     pub const SCRATCH: Self = Self {
-        journal: Journal::Delete,
+        journal: Journal::Memory,
         cache_mib: DEFAULT_CACHE_MIB,
     };
 
@@ -194,7 +209,8 @@ impl StoreOptions {
 }
 
 impl SqliteStateStore {
-    /// A throwaway store for tests: rollback journal ([`StoreOptions::SCRATCH`]).
+    /// A throwaway store for tests: rollback journal in memory
+    /// ([`StoreOptions::SCRATCH`]).
     pub async fn for_tests<E>(
         db_path: &str,
         cap: usize,
@@ -244,7 +260,8 @@ impl SqliteStateStore {
             // synchronous=NORMAL is the recommended pairing with WAL: durable across
             // app crashes, only loses the very last transaction on an OS/power crash,
             // and avoids an fsync on every commit (the dominant write cost under FULL).
-            .synchronous(SqliteSynchronous::Normal)
+            // (A scratch database skips the flushes: see `Journal::Memory`.)
+            .synchronous(options.journal.synchronous())
             // Each connection's share of the configured total page cache.
             .pragma("cache_size", options.per_connection_cache_pragma())
             // Memory-mapped reads (256 MiB) cut syscall overhead on read-heavy paths.
