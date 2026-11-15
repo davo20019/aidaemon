@@ -102,7 +102,7 @@ async fn goal_run_writes_confined_reads_free() {
 #[tokio::test]
 async fn guest_grants_unchanged() {
     let dir = authority_test_dir();
-    let root = std::fs::canonicalize(&dir).unwrap();
+    let root = dunce::canonicalize(&dir).unwrap();
     std::fs::write(root.join("package.json"), r#"{"name":"synthetic-project"}"#).unwrap();
     let grant = crate::types::WorkspaceGrant {
         platform: "telegram".to_string(),

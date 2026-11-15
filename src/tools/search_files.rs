@@ -41,7 +41,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("safe.txt"), "COLLAB_NEEDLE").unwrap();
         std::fs::write(root.path().join(".env.local"), "COLLAB_NEEDLE=secret").unwrap();
-        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let canonical_root = dunce::canonicalize(root.path()).unwrap();
         let args = serde_json::json!({
             "pattern": "COLLAB_NEEDLE",
             "path": canonical_root,

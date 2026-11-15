@@ -1364,7 +1364,7 @@ fn self_healable_denied_reads(output: &str, home: &str, already_granted: &[Strin
             // Canonicalize so a `..`-laden nomination cannot resolve elsewhere,
             // and require the resolved path to still carry the allowlisted
             // basename and be an existing regular file.
-            let Ok(canonical) = std::fs::canonicalize(&path) else {
+            let Ok(canonical) = dunce::canonicalize(&path) else {
                 continue;
             };
             if canonical.file_name().and_then(|name| name.to_str()) != Some(basename) {
@@ -2037,7 +2037,7 @@ fn macos_manifest_sandbox_policy(
         // — never the directory as a whole — so a script can use normal shell
         // syntax without reopening ambient temporary write authority.
         let mut temp_dirs = vec![std::env::temp_dir()];
-        if let Ok(canonical) = std::fs::canonicalize(&temp_dirs[0])
+        if let Ok(canonical) = dunce::canonicalize(&temp_dirs[0])
             && !temp_dirs.iter().any(|path| path == &canonical)
         {
             temp_dirs.push(canonical);
@@ -12870,7 +12870,7 @@ mod tests {
         // An allowlisted NON-secret config the tool may need at startup.
         let nodever = home.join(".node-version");
         std::fs::write(&nodever, "22.13.0\n").unwrap();
-        let nodever_canon = std::fs::canonicalize(&nodever)
+        let nodever_canon = dunce::canonicalize(&nodever)
             .unwrap()
             .to_string_lossy()
             .to_string();

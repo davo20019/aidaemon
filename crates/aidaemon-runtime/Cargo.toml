@@ -30,6 +30,7 @@ computer_use = []
 computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
 
 [dependencies]
+dunce = "1.0"
 aidaemon-agents = { version = "0.20.0", path = "../aidaemon-agents" }
 aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels" }
 aidaemon-client-gateway = { version = "0.20.0", path = "../aidaemon-client-gateway" }

@@ -354,10 +354,10 @@ impl CheckpointManager {
         let store_root = checkpoint_store_path(&config)?;
         validate_store_path(&store_root)?;
         fs::create_dir_all(&store_root)?;
-        let store_root = store_root.canonicalize()?;
+        let store_root = dunce::canonicalize(&store_root)?;
 
         let workspace = PathBuf::from(backend.workspace_root().as_str());
-        if let Ok(workspace) = workspace.canonicalize() {
+        if let Ok(workspace) = dunce::canonicalize(&workspace) {
             anyhow::ensure!(
                 !store_root.starts_with(&workspace),
                 "checkpoint storage must be outside the execution workspace ({})",
@@ -1070,7 +1070,7 @@ impl CheckpointManager {
                 )
             }
         };
-        let root = root.canonicalize()?;
+        let root = dunce::canonicalize(&root)?;
         validate_checkpoint_root(&root, &self.store_root)?;
         Ok(root)
     }
@@ -1527,7 +1527,7 @@ fn validate_store_path(path: &Path) -> anyhow::Result<()> {
         path != Path::new("/"),
         "refusing to use the filesystem root as checkpoint storage"
     );
-    if let Some(home) = dirs::home_dir().and_then(|path| path.canonicalize().ok()) {
+    if let Some(home) = dirs::home_dir().and_then(|path| dunce::canonicalize(&path).ok()) {
         let broad = [
             home.clone(),
             home.join("Desktop"),
@@ -1552,7 +1552,7 @@ fn discover_git() -> anyhow::Result<PathBuf> {
                 .find(|candidate| candidate.is_file())
         })
         .ok_or_else(|| anyhow::anyhow!("Git is required for filesystem checkpoints"))?;
-    path.canonicalize().or(Ok(path))
+    dunce::canonicalize(&path).or(Ok(path))
 }
 
 fn isolated_git_command(git: &Path, empty_config: &Path, repo: Option<&Path>) -> Command {
@@ -1688,7 +1688,7 @@ fn validate_checkpoint_root(root: &Path, store_root: &Path) -> anyhow::Result<()
         !store_root.starts_with(root),
         "checkpoint store cannot be inside the protected workspace"
     );
-    if let Some(home) = dirs::home_dir().and_then(|path| path.canonicalize().ok()) {
+    if let Some(home) = dirs::home_dir().and_then(|path| dunce::canonicalize(&path).ok()) {
         let broad = [
             home.clone(),
             home.join("Desktop"),
@@ -2536,7 +2536,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(PathBuf::from(root), project.canonicalize().unwrap());
+        assert_eq!(PathBuf::from(root), dunce::canonicalize(&project).unwrap());
     }
 
     #[tokio::test]

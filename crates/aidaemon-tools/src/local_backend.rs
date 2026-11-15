@@ -152,7 +152,7 @@ impl LocalBackend {
     pub fn current_unrestricted() -> Self {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let canonical_workspace_root =
-            std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+            dunce::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
         let workspace_root =
             BackendPath::new(canonical_workspace_root.to_string_lossy().into_owned());
         let home = dirs::home_dir().unwrap_or_else(|| canonical_workspace_root.clone());
@@ -190,7 +190,9 @@ impl LocalBackend {
             .transpose()?
             .unwrap_or(cwd);
         tokio::fs::create_dir_all(&workspace).await?;
-        let canonical_workspace_root = tokio::fs::canonicalize(&workspace).await?;
+        let canonical_workspace_root = tokio::fs::canonicalize(&workspace)
+            .await
+            .map(|p| dunce::simplified(&p).to_path_buf())?;
         let workspace_root =
             BackendPath::new(canonical_workspace_root.to_string_lossy().into_owned());
         let home = dirs::home_dir().unwrap_or_else(|| canonical_workspace_root.clone());
@@ -276,7 +278,9 @@ impl ExecutionBackend for LocalBackend {
     async fn canonicalize(&self, path: &BackendPath) -> anyhow::Result<BackendPath> {
         let host = self.host_path(path);
         self.ensure_allowed(&host).await?;
-        let canonical = tokio::fs::canonicalize(host).await?;
+        let canonical = tokio::fs::canonicalize(host)
+            .await
+            .map(|p| dunce::simplified(&p).to_path_buf())?;
         self.ensure_allowed(&canonical).await?;
         Ok(BackendPath::new(canonical.to_string_lossy().into_owned()))
     }

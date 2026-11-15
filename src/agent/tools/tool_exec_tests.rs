@@ -64,7 +64,7 @@ mod scoped_workspace_tests {
             workspace_id: "T_TEST".to_string(),
             channel_id: "C_PRIVATE".to_string(),
             user_id: "U_GUEST".to_string(),
-            project_root: std::fs::canonicalize(root)
+            project_root: dunce::canonicalize(root)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
@@ -107,8 +107,8 @@ mod scoped_workspace_tests {
         .await
         .unwrap();
         assert_eq!(
-            std::fs::canonicalize(inside["path"].as_str().unwrap()).unwrap(),
-            std::fs::canonicalize(root.path().join("index.html")).unwrap()
+            dunce::canonicalize(inside["path"].as_str().unwrap()).unwrap(),
+            dunce::canonicalize(root.path().join("index.html")).unwrap()
         );
 
         let traversal = scoped_workspace_arguments(
@@ -158,8 +158,8 @@ mod scoped_workspace_tests {
         assert!(aliased.get("file_path").is_none());
         assert!(aliased.get("filename").is_none());
         assert_eq!(
-            std::fs::canonicalize(aliased["path"].as_str().unwrap()).unwrap(),
-            std::fs::canonicalize(root.path().join("index.html")).unwrap()
+            dunce::canonicalize(aliased["path"].as_str().unwrap()).unwrap(),
+            dunce::canonicalize(root.path().join("index.html")).unwrap()
         );
     }
 

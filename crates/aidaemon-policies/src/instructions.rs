@@ -98,7 +98,7 @@ impl ProjectInstructions {
         working_dir: impl AsRef<Path>,
     ) -> io::Result<Self> {
         let leaf = nearest_existing_directory(working_dir.as_ref())?;
-        let root = root.as_ref().canonicalize()?;
+        let root = dunce::canonicalize(root.as_ref())?;
         Ok(Self::load(working_dir.as_ref(), root, leaf))
     }
 
@@ -308,7 +308,7 @@ impl Hook for NestedInstructions {
 fn nearest_existing_directory(scope: &Path) -> io::Result<PathBuf> {
     let mut candidate = scope.to_path_buf();
     loop {
-        if let Ok(canonical) = candidate.canonicalize() {
+        if let Ok(canonical) = dunce::canonicalize(&candidate) {
             return if canonical.is_dir() {
                 Ok(canonical)
             } else {
@@ -362,7 +362,7 @@ fn read_instruction_source(root: &Path, directory: &Path) -> Option<InstructionS
         }
         // A symlink may point elsewhere inside the project (AGENTS.md ->
         // CLAUDE.md) but never outside it.
-        let canonical = match path.canonicalize() {
+        let canonical = match dunce::canonicalize(&path) {
             Ok(canonical) if canonical.starts_with(root) => canonical,
             Ok(target) => {
                 tracing::warn!(

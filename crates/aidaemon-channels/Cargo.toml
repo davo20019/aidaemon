@@ -31,6 +31,7 @@ http = ["dep:reqwest"]
 checkpoints = ["aidaemon-tools/checkpoints"]
 
 [dependencies]
+dunce = "1.0"
 aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
 aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
 aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }

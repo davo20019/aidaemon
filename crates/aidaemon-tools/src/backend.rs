@@ -548,7 +548,7 @@ impl LexicalPaths {
     /// run (a one-shot CLI command) where no execution backend exists.
     pub fn daemon_host() -> Self {
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let canonical = std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+        let canonical = dunce::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
         let home = dirs::home_dir().unwrap_or_else(|| canonical.clone());
         Self {
             kind: BackendKind::Local,

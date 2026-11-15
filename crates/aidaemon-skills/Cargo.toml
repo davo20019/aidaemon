@@ -18,6 +18,7 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]
+dunce = "1.0"
 aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
 aidaemon-memory = { version = "0.20.0", path = "../aidaemon-memory" }
 aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }

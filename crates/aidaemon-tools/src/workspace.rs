@@ -41,7 +41,7 @@ pub struct Workspace {
 impl Workspace {
     /// Open an existing directory as a workspace. The root is canonicalized.
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
-        let root = std::fs::canonicalize(root.as_ref())?;
+        let root = dunce::canonicalize(root.as_ref())?;
         if !root.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -180,7 +180,7 @@ mod tests {
     fn follows_links_before_dot_dot_and_broken_links_to_their_target() {
         let (_d, ws) = ws();
         let other = tempfile::tempdir().unwrap();
-        let other = std::fs::canonicalize(other.path()).unwrap();
+        let other = dunce::canonicalize(other.path()).unwrap();
         std::fs::create_dir(other.join("sub")).unwrap();
         std::os::unix::fs::symlink(other.join("sub"), ws.root().join("link")).unwrap();
         assert!(ws.resolve("link/../escape.txt").is_err());

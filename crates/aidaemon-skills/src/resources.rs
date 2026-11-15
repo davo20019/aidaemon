@@ -66,7 +66,7 @@ impl ResourceResolver for FileSystemResolver {
         let full_path = base.join(resource_path);
 
         // Security: canonicalize and verify path stays within skill directory
-        let canonical_base = base.canonicalize()?;
+        let canonical_base = dunce::canonicalize(base)?;
         let canonical_path = full_path
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("Cannot resolve resource '{}': {}", resource_path, e))?;

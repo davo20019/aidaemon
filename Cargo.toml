@@ -76,6 +76,7 @@ path = "src/bin/computer_use_probe.rs"
 required-features = ["computer_use-macos"]
 
 [dependencies]
+dunce = "1.0"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "query", "form", "blocking", "gzip", "deflate", "brotli", "stream"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }

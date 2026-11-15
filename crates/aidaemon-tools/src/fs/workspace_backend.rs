@@ -87,7 +87,9 @@ impl ExecutionBackend for WorkspaceBackend {
     }
 
     async fn canonicalize(&self, path: &BackendPath) -> anyhow::Result<BackendPath> {
-        let resolved = tokio::fs::canonicalize(self.confine(path)?).await?;
+        let resolved = tokio::fs::canonicalize(self.confine(path)?)
+            .await
+            .map(|p| dunce::simplified(&p).to_path_buf())?;
         Ok(BackendPath::new(resolved.display().to_string()))
     }
 

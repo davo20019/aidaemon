@@ -125,7 +125,7 @@ pub fn log_configured_trust_roots(configured: &[String], workspace: String) {
 /// broad as its target.
 fn is_narrow_root_resolved(root: &str) -> bool {
     is_narrow_root(root)
-        && std::fs::canonicalize(root)
+        && dunce::canonicalize(root)
             .map(|resolved| is_narrow_root(&resolved.to_string_lossy()))
             .unwrap_or(true)
 }
@@ -147,7 +147,7 @@ fn is_narrow_root(dir: &str) -> bool {
         .iter()
         .map(std::path::PathBuf::from)
         .collect();
-    shared.extend(std::fs::canonicalize(&temp).ok());
+    shared.extend(dunce::canonicalize(&temp).ok());
     shared.push(temp);
     !shared.iter().any(|root| root.as_path() == dir)
 }

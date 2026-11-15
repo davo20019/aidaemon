@@ -176,7 +176,7 @@ pub fn normalize_scope_path(raw: &str) -> std::path::PathBuf {
         // The longest existing prefix, resolved physically.
         for end in (1..=components.len()).rev() {
             let prefix: PathBuf = components[..end].iter().collect();
-            if let Ok(real) = std::fs::canonicalize(&prefix) {
+            if let Ok(real) = dunce::canonicalize(&prefix) {
                 resolved = real;
                 start = end;
                 break;

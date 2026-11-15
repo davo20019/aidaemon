@@ -262,10 +262,16 @@ jobs:
   # build, which tests fail) without blocking a merge. Make it required once
   # it passes.
   windows:
-    name: Windows (not yet supported)
+    name: Windows (not yet supported, tests ${{ matrix.partition }}/3)
     runs-on: windows-latest
     timeout-minutes: 90
     continue-on-error: true
+    # The tests take over an hour on one Windows runner: three runners each
+    # take a third. The first also checks and builds everything.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
 
@@ -285,15 +291,16 @@ jobs:
 
       # Every error a round can show, not just the first crate's.
       - name: Check (all errors)
+        if: matrix.partition == 1
         run: cargo check --all-targets --locked --keep-going
 
       # The daemon first: what a Windows download needs.
       - name: Build
-        if: always()
+        if: always() && matrix.partition == 1
         run: cargo build --locked
 
       - name: Build the app
-        if: always()
+        if: always() && matrix.partition == 1
         run: cargo build --locked --manifest-path clients/app/Cargo.toml
 
       - name: Install cargo-nextest
@@ -304,7 +311,8 @@ jobs:
       # One process per test with a time limit (.config/nextest.toml), so
       # a hang fails alone and every result is reported.
       - name: Test
-        run: cargo nextest run --lib --locked --profile windows-ci
+        if: always()
+        run: cargo nextest run --lib --locked --profile windows-ci --partition hash:${{ matrix.partition }}/3
 
   test:
     name: Test (${{ matrix.os }})

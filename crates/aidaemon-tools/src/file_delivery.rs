@@ -172,11 +172,11 @@ pub fn is_path_allowed(canonical: &Path, inbox_dir: &Path, outbox_dirs: &[PathBu
 /// path. Roots are canonicalized so macOS `/tmp` → `/private/tmp` matches.
 pub fn is_recoverable_source(canonical: &Path) -> bool {
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(t) = std::env::temp_dir().canonicalize() {
+    if let Ok(t) = dunce::canonicalize(std::env::temp_dir()) {
         roots.push(t);
     }
     for p in ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"] {
-        if let Ok(c) = Path::new(p).canonicalize() {
+        if let Ok(c) = dunce::canonicalize(Path::new(p)) {
             roots.push(c);
         }
     }
@@ -195,7 +195,7 @@ pub fn recover_into_inbox(src: &Path, inbox_dir: &Path) -> std::io::Result<PathB
         .unwrap_or_else(|| std::ffi::OsStr::new("file"));
     let dest = inbox_dir.join(filename);
     std::fs::copy(src, &dest)?;
-    dest.canonicalize()
+    dunce::canonicalize(&dest)
 }
 
 #[cfg(test)]
@@ -219,7 +219,7 @@ mod tests {
         assert!(
             ready
                 .canonical_path
-                .starts_with(inbox.canonicalize().unwrap())
+                .starts_with(dunce::canonicalize(&inbox).unwrap())
         );
         let _ = std::fs::remove_file(&src);
     }

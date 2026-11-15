@@ -619,7 +619,7 @@ async fn policies_compose_in_one_agent_run() {
         "Never touch generated files.",
     )
     .unwrap();
-    let root = repo.path().canonicalize().unwrap();
+    let root = dunce::canonicalize(repo.path()).unwrap();
     let root_str = root.to_str().unwrap().to_string();
 
     let provider = Arc::new(ScriptedProvider::new([

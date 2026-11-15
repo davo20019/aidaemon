@@ -1781,11 +1781,16 @@ fn contest_facts(
 pub async fn canonical_path(backend: &SharedExecutionBackend, raw: &str) -> anyhow::Result<String> {
     let resolved = backend.resolve_path(raw).await?;
     let path = std::path::PathBuf::from(resolved.as_str());
-    if let Ok(real) = tokio::fs::canonicalize(&path).await {
+    if let Ok(real) = tokio::fs::canonicalize(&path)
+        .await
+        .map(|p| dunce::simplified(&p).to_path_buf())
+    {
         return Ok(real.to_string_lossy().into_owned());
     }
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
-        && let Ok(real) = tokio::fs::canonicalize(parent).await
+        && let Ok(real) = tokio::fs::canonicalize(parent)
+            .await
+            .map(|p| dunce::simplified(&p).to_path_buf())
     {
         return Ok(real.join(name).to_string_lossy().into_owned());
     }

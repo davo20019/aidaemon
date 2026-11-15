@@ -975,7 +975,10 @@ mod tests {
         let mut message = rx.recv().await.expect("media enqueued");
         match &message.kind {
             MediaKind::Document { file_path, .. } => {
-                assert_eq!(Path::new(file_path), artifact.canonicalize().unwrap());
+                assert_eq!(
+                    Path::new(file_path),
+                    dunce::canonicalize(&artifact).unwrap()
+                );
             }
             _ => panic!("expected document"),
         }
@@ -1062,7 +1065,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let in_temp = tmp.path().join("out.txt");
         std::fs::write(&in_temp, b"x").expect("write");
-        let in_temp = in_temp.canonicalize().expect("canon");
+        let in_temp = dunce::canonicalize(&in_temp).expect("canon");
         assert!(is_recoverable_source(&in_temp));
 
         // ...but arbitrary paths outside temp are NOT (no arbitrary exfiltration).

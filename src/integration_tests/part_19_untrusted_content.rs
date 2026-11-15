@@ -439,7 +439,7 @@ async fn tool_results_by_name(provider: &crate::testing::MockProvider) -> Vec<(S
 async fn guest_message_cannot_write_or_run_even_via_a_child() {
     use aidaemon_core::Authority;
     let dir = authority_test_dir();
-    let root = std::fs::canonicalize(&dir).unwrap();
+    let root = dunce::canonicalize(&dir).unwrap();
 
     // (a) No grant: write_file, terminal and spawn_agent are all refused.
     let written = root.join("guest-write.txt");

@@ -3202,7 +3202,7 @@ pub fn declared_named_files<T: ToolSemantics + ?Sized>(tool: &T, arguments: &str
 /// resolves on disk (when it does), anything else (a resource id) as given.
 fn produced_key(target: &str) -> String {
     let expanded = shellexpand::tilde(target.trim()).into_owned();
-    std::fs::canonicalize(&expanded)
+    dunce::canonicalize(&expanded)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or(expanded)
 }
@@ -3396,7 +3396,7 @@ fn resolve_absolute(path: &str) -> Option<std::path::PathBuf> {
             Component::Normal(part) => {
                 resolved.push(part);
                 if existing {
-                    match std::fs::canonicalize(&resolved) {
+                    match dunce::canonicalize(&resolved) {
                         Ok(canonical) => resolved = canonical,
                         Err(_) => existing = false,
                     }

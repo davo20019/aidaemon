@@ -56,7 +56,7 @@ struct Fixture {
 
 fn workspace() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let root = dunce::canonicalize(dir.path()).unwrap();
     Fixture { _dir: dir, root }
 }
 

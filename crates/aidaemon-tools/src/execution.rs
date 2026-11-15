@@ -983,7 +983,9 @@ impl DockerBackend {
                 None => std::env::current_dir()?,
             };
             tokio::fs::create_dir_all(&host_workspace).await?;
-            let host_workspace = tokio::fs::canonicalize(host_workspace).await?;
+            let host_workspace = tokio::fs::canonicalize(host_workspace)
+                .await
+                .map(|p| dunce::simplified(&p).to_path_buf())?;
             let workspace = workspace_override.unwrap_or(&config.workspace_root);
             let mut args = vec![
                 "create".to_string(),

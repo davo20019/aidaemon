@@ -78,7 +78,7 @@ impl ScheduledGoalRuns {
         if !expanded.is_absolute() {
             return Ok("workspace_path must be absolute (or start with ~/).".to_string());
         }
-        let canonical = match std::fs::canonicalize(&expanded) {
+        let canonical = match dunce::canonicalize(&expanded) {
             Ok(path) => path,
             Err(error) => {
                 return Ok(format!(

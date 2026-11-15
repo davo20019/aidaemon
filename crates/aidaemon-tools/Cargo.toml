@@ -29,6 +29,7 @@ docker = []
 oauth = ["dep:aidaemon-secrets", "reqwest/json", "reqwest/form"]
 
 [dependencies]
+dunce = "1.0"
 aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
 aidaemon-policies = { version = "0.20.0", path = "../aidaemon-policies" }
 aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false, optional = true }

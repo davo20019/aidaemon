@@ -33,7 +33,7 @@ const AUTO_SEND_BLOCKED_PATTERNS: &[&str] = &[
 /// Only returns paths that exist on disk and aren't security-sensitive.
 pub fn extract_file_paths_from_text(text: &str) -> Vec<String> {
     // Unix paths, and Windows ones (`C:\Users\...`, `C:/Users/...`).
-    let re = regex::Regex::new(r"((?:[A-Za-z]:[\\/]|/)[\w./\\-]+\.\w{1,10})").unwrap();
+    let re = regex::Regex::new(r"((?:[A-Za-z]:[\\/]|/)[\w./\\~-]+\.\w{1,10})").unwrap();
     let mut paths = Vec::new();
     for cap in re.captures_iter(text) {
         let path_str = &cap[1];

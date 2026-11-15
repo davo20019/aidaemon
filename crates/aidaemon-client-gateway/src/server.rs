@@ -426,8 +426,12 @@ pub(crate) async fn serve_app_file(
     let file = root.join(&relative);
     // Symlinks must stay inside the directory too.
     let (Ok(root), Ok(real)) = (
-        tokio::fs::canonicalize(root).await,
-        tokio::fs::canonicalize(&file).await,
+        tokio::fs::canonicalize(root)
+            .await
+            .map(|p| dunce::simplified(&p).to_path_buf()),
+        tokio::fs::canonicalize(&file)
+            .await
+            .map(|p| dunce::simplified(&p).to_path_buf()),
     ) else {
         return StatusCode::NOT_FOUND.into_response();
     };

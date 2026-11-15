@@ -77,7 +77,7 @@ pub fn grant_own_spill_reads(
         return;
     };
     // macOS temp paths have a `/private` canonical twin; grant both spellings.
-    let canonical = std::fs::canonicalize(&dir)
+    let canonical = dunce::canonicalize(&dir)
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
     for path in std::iter::once(dir).chain(canonical) {

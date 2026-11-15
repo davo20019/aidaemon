@@ -280,7 +280,7 @@ pub fn default_deny_read() -> Vec<PathBuf> {
 /// is not hidden from itself; a path the caller names is always kept.
 fn deny_list(defaults: &[PathBuf], cmd: &SandboxCommand) -> Vec<PathBuf> {
     let root =
-        std::fs::canonicalize(&cmd.workspace_root).unwrap_or_else(|_| cmd.workspace_root.clone());
+        dunce::canonicalize(&cmd.workspace_root).unwrap_or_else(|_| cmd.workspace_root.clone());
     let mut out: Vec<PathBuf> = existing_canonical(defaults)
         .into_iter()
         .filter(|path| !root.starts_with(path))
@@ -591,7 +591,7 @@ impl Default for SeatbeltSandbox {
 fn existing_canonical(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths
         .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter_map(|p| dunce::canonicalize(p).ok())
         .collect()
 }
 
@@ -738,8 +738,8 @@ impl DockerSandbox {
             "-w".into(),
             workdir.display().to_string(),
         ]);
-        let root = std::fs::canonicalize(&cmd.workspace_root)
-            .unwrap_or_else(|_| cmd.workspace_root.clone());
+        let root =
+            dunce::canonicalize(&cmd.workspace_root).unwrap_or_else(|_| cmd.workspace_root.clone());
         for path in existing_canonical(&cmd.deny_read) {
             let Ok(rel) = path.strip_prefix(&root) else {
                 continue; // not mounted at all
@@ -1036,7 +1036,7 @@ mod tests {
     #[test]
     fn bubblewrap_args_hide_denied_paths_after_the_workspace() {
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         std::fs::create_dir(root.join("secrets")).unwrap();
         std::fs::write(root.join("token"), "t").unwrap();
         let mut s = SandboxCommand::new("true", &root);
@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn seatbelt_profile_denies_reads_of_denied_paths() {
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         let mut s = SandboxCommand::new("true", &root);
         s.deny_read = vec![root.clone(), root.join("missing")];
         let profile = SeatbeltSandbox::new().profile(&s);
@@ -1078,7 +1078,7 @@ mod tests {
     #[test]
     fn home_secrets_are_denied_by_default_after_the_workspace() {
         let home = tempfile::tempdir().unwrap();
-        let home = std::fs::canonicalize(home.path()).unwrap();
+        let home = dunce::canonicalize(home.path()).unwrap();
         std::fs::create_dir_all(home.join(".aws")).unwrap();
         std::fs::write(home.join(".netrc"), "machine x").unwrap();
         let ws = home.join("project");
@@ -1219,7 +1219,7 @@ mod tests {
         std::fs::write(home.path().join(".aws/credentials"), "synthetic-secret").unwrap();
         let backend = SeatbeltSandbox::new().default_deny_read(home_secret_paths(home.path()));
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         let cat = format!("cat {}/.aws/credentials", home.path().display());
         let mut s = SandboxCommand::new(cat.clone(), &root);
         s.env = vec![("PATH".into(), "/usr/bin:/bin".into())];
@@ -1240,7 +1240,7 @@ mod tests {
             return;
         }
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         let secrets = tempfile::tempdir().unwrap();
         std::fs::write(secrets.path().join("key"), "synthetic-secret").unwrap();
         let mut s = SandboxCommand::new(format!("cat {}/key", secrets.path().display()), &root);
@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn docker_args_cover_denied_paths_inside_the_workspace() {
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         std::fs::create_dir(root.join("private")).unwrap();
         std::fs::write(root.join("token"), "t").unwrap();
         let mut s = SandboxCommand::new("true", &root);
@@ -1306,7 +1306,7 @@ mod tests {
             return;
         }
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         let outside = tempfile::tempdir_in(std::env::var("HOME").unwrap_or("/".into()))
             .or_else(|_| tempfile::tempdir())
             .unwrap();
@@ -1331,7 +1331,7 @@ mod tests {
             return;
         }
         let ws = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(ws.path()).unwrap();
+        let root = dunce::canonicalize(ws.path()).unwrap();
         let outside = tempfile::tempdir().unwrap();
         let mut s = SandboxCommand::new(
             format!(

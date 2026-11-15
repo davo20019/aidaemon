@@ -2312,7 +2312,7 @@ fn resolved_on_disk(class: EffectClass, lexical: EffectKey) -> EffectKey {
         _ => (path, None),
     };
     for ancestor in base.ancestors() {
-        let Ok(mut real) = std::fs::canonicalize(ancestor) else {
+        let Ok(mut real) = dunce::canonicalize(ancestor) else {
             continue;
         };
         if let Ok(rest) = base.strip_prefix(ancestor)
@@ -2354,7 +2354,7 @@ pub fn shell_path_effects(
     let base = loop {
         let prefix = format!("/{}", components[..existing].join("/"));
         if std::fs::symlink_metadata(&prefix).is_ok() {
-            break std::fs::canonicalize(&prefix).ok()?;
+            break dunce::canonicalize(&prefix).ok()?;
         }
         existing -= 1;
     };
@@ -4711,7 +4711,7 @@ mod tests {
     fn canonical(path: &str) -> String {
         let path = std::path::Path::new(path);
         for ancestor in path.ancestors() {
-            if let Ok(real) = std::fs::canonicalize(ancestor) {
+            if let Ok(real) = dunce::canonicalize(ancestor) {
                 let rest = path.strip_prefix(ancestor).unwrap();
                 return real
                     .join(rest)
@@ -4758,7 +4758,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(not(unix))]
         return;
-        let real_canonical = std::fs::canonicalize(&real).unwrap();
+        let real_canonical = dunce::canonicalize(&real).unwrap();
         // An existing path through a symlink is the symlink's target.
         let existing = path_effect(EffectClass::Write, link.to_str().unwrap(), None).unwrap();
         assert_eq!(existing.target, real_canonical.to_string_lossy());
@@ -4783,7 +4783,7 @@ mod tests {
         let removed = path_effect(EffectClass::Delete, link.to_str().unwrap(), None).unwrap();
         assert_eq!(
             removed.target,
-            std::fs::canonicalize(dir.path())
+            dunce::canonicalize(dir.path())
                 .unwrap()
                 .join("link")
                 .to_string_lossy()
@@ -5419,7 +5419,7 @@ mod tests {
     #[test]
     fn shell_paths_resolve_through_symlinks_physically() {
         let dir = tempfile::tempdir().unwrap();
-        let w = std::fs::canonicalize(dir.path()).unwrap();
+        let w = dunce::canonicalize(dir.path()).unwrap();
         let w = w.to_str().unwrap();
         std::fs::create_dir_all(format!("{w}/a/real")).unwrap();
         std::os::unix::fs::symlink(format!("{w}/a/real"), format!("{w}/link")).unwrap();

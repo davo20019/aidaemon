@@ -115,7 +115,7 @@ impl PathClassifier {
 pub fn same_file(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
-            (a.canonicalize(), b.canonicalize()),
+            (dunce::canonicalize(a), dunce::canonicalize(b)),
             (Ok(x), Ok(y)) if x == y
         )
 }

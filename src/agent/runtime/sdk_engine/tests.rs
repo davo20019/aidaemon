@@ -2063,7 +2063,7 @@ async fn same_tool_limit_still_limits_distinct_terminal_commands() {
 async fn tools_declare_their_source_class() {
     use crate::traits::{ToolSemantics as _, TrustRoots};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
-    let roots = vec!["/tmp/aidaemon-test/ws".to_string()];
+    let roots = vec![crate::testing::abs_path("/tmp/aidaemon-test/ws")];
     let roots = TrustRoots::new(&roots);
     let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
     let http = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
@@ -2087,15 +2087,27 @@ async fn tools_declare_their_source_class() {
     assert_eq!(mcp.output_trust("{}", &roots), Untrusted);
     let read = crate::tools::ReadFileTool::new(crate::execution::active_execution_backend());
     assert_eq!(
-        read.output_trust(r#"{"path":"/tmp/aidaemon-test/other/x"}"#, &roots),
+        read.output_trust(
+            &serde_json::json!({"path": crate::testing::abs_path("/tmp/aidaemon-test/other/x")})
+                .to_string(),
+            &roots
+        ),
         Untrusted
     );
     assert_eq!(
-        read.output_trust(r#"{"path":"/tmp/aidaemon-test/ws/x"}"#, &roots),
+        read.output_trust(
+            &serde_json::json!({"path": crate::testing::abs_path("/tmp/aidaemon-test/ws/x")})
+                .to_string(),
+            &roots
+        ),
         Trusted
     );
     assert_eq!(
-        read.output_trust(r#"{"file_path":"/tmp/aidaemon-test/ws/x"}"#, &roots),
+        read.output_trust(
+            &serde_json::json!({"file_path": crate::testing::abs_path("/tmp/aidaemon-test/ws/x")})
+                .to_string(),
+            &roots
+        ),
         Trusted
     );
     assert_eq!(
@@ -2118,7 +2130,8 @@ async fn tools_declare_their_source_class() {
 fn relative_reads_under_the_working_directory_are_trusted() {
     use crate::traits::{ToolSemantics as _, TrustRoots};
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
-    let cwd = "/tmp/aidaemon-test/ws";
+    let cwd = crate::testing::abs_path("/tmp/aidaemon-test/ws");
+    let cwd = cwd.as_str();
     let roots = cwd_roots(cwd);
     assert_eq!(
         roots,
@@ -2161,7 +2174,7 @@ fn broad_working_directories_are_not_trusted_roots() {
         "/var/tmp".to_string(),
         std::env::temp_dir().to_string_lossy().into_owned(),
     ];
-    if let Ok(canonical) = std::fs::canonicalize(std::env::temp_dir()) {
+    if let Ok(canonical) = dunce::canonicalize(std::env::temp_dir()) {
         broad.push(canonical.to_string_lossy().into_owned());
     }
     if let Some(home) = dirs::home_dir() {
@@ -2177,7 +2190,8 @@ fn broad_working_directories_are_not_trusted_roots() {
         );
     }
     for cwd in ["/tmp/aidaemon-test/ws", "/var/tmp/aidaemon-test/ws"] {
-        assert_eq!(cwd_roots(cwd), vec![cwd.to_string()]);
+        let cwd = crate::testing::abs_path(cwd);
+        assert_eq!(cwd_roots(&cwd), vec![cwd.clone()]);
     }
 }
 
@@ -2315,34 +2329,32 @@ fn broad_grants_are_not_trusted_roots() {
 #[test]
 fn a_child_never_gains_trusted_roots_its_parent_lacked() {
     use aidaemon_core::SourceTrust::{Trusted, Untrusted};
-    let parent = vec!["/tmp/aidaemon-test/ws".to_string()];
+    let p = crate::testing::abs_path;
+    let parent = vec![p("/tmp/aidaemon-test/ws")];
     let roots = super::turn_trust_roots(super::TrustRootSources {
-        cwd: Some("/tmp/aidaemon-test/ws"),
-        bound_workspace: Some("/tmp/aidaemon-test/named/docs"),
+        cwd: Some(&*p("/tmp/aidaemon-test/ws")),
+        bound_workspace: Some(&*p("/tmp/aidaemon-test/named/docs")),
         parent_roots: Some(&parent),
         ..Default::default()
     });
     assert_eq!(roots, parent);
-    let named = std::path::Path::new("/tmp/aidaemon-test/named/docs/x.md");
+    let named = &std::path::PathBuf::from(p("/tmp/aidaemon-test/named/docs/x.md"));
     assert_eq!(read_trust(&roots, named), Untrusted);
     let roots = super::turn_trust_roots(super::TrustRootSources {
-        bound_workspace: Some("/tmp/aidaemon-test/ws/sub"),
+        bound_workspace: Some(&*p("/tmp/aidaemon-test/ws/sub")),
         parent_roots: Some(&parent),
         ..Default::default()
     });
     assert_eq!(
         roots,
-        vec![
-            "/tmp/aidaemon-test/ws".to_string(),
-            "/tmp/aidaemon-test/ws/sub".to_string()
-        ]
+        vec![p("/tmp/aidaemon-test/ws"), p("/tmp/aidaemon-test/ws/sub")]
     );
-    let inside = std::path::Path::new("/tmp/aidaemon-test/ws/sub/x.md");
+    let inside = &std::path::PathBuf::from(p("/tmp/aidaemon-test/ws/sub/x.md"));
     assert_eq!(read_trust(&roots, inside), Trusted);
     // A parent that trusted nothing hands down nothing.
     assert!(
         super::turn_trust_roots(super::TrustRootSources {
-            cwd: Some("/tmp/aidaemon-test/ws"),
+            cwd: Some(&*p("/tmp/aidaemon-test/ws")),
             parent_roots: Some(&[]),
             ..Default::default()
         })
@@ -4638,7 +4650,8 @@ async fn a_new_message_never_gets_the_card_of_a_run_that_was_cut_off() {
 #[tokio::test]
 async fn canonical_hook_anchors_a_call_before_it_is_judged() {
     use sdk::Hook;
-    let base = std::path::Path::new("/tmp/aidaemon-test").join(uuid::Uuid::new_v4().to_string());
+    let base = std::path::PathBuf::from(crate::testing::abs_path("/tmp/aidaemon-test"))
+        .join(uuid::Uuid::new_v4().to_string());
     let project = base.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let project_dir = project.to_string_lossy().to_string();

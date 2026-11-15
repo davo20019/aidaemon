@@ -51,24 +51,18 @@ mod tests {
 
     #[test]
     fn resolve_authority_owner_bound_workspace_confines_writes_not_reads() {
+        let ws = crate::testing::abs_path("/tmp/aidaemon-test/ws");
         let resolved = resolve_authority(&AuthorityFacts {
-            bound_workspace: Some("/tmp/aidaemon-test/ws"),
+            bound_workspace: Some(&ws),
             ..facts(UserRole::Owner)
         });
         assert_eq!(resolved.authority, Authority::full());
         assert_eq!(resolved.owner_level, Some(OwnerLevel::Full));
         let access = resolved.task_access.expect("bound workspace manifest");
-        assert_eq!(
-            access.execution_cwd.as_deref(),
-            Some("/tmp/aidaemon-test/ws")
-        );
+        assert_eq!(access.execution_cwd.as_deref(), Some(ws.as_str()));
         assert_eq!(
             access.write_targets,
-            [ToolTargetHint::new(
-                ToolTargetHintKind::ProjectScope,
-                "/tmp/aidaemon-test/ws".to_string()
-            )
-            .unwrap()]
+            [ToolTargetHint::new(ToolTargetHintKind::ProjectScope, ws.clone()).unwrap()]
         );
         // Reads anywhere: the scope check admits them; writes outside do not.
         let call = |reads: &[&str], writes: &[&str]| ToolCallAccessManifest {
@@ -92,11 +86,26 @@ mod tests {
                 &crate::tools::DaemonPaths::default(),
             )
         };
-        assert!(check(&call(&["/tmp/aidaemon-test/elsewhere/notes.txt"], &[])).is_none());
-        assert!(check(&call(&[], &["/tmp/aidaemon-test/ws/a.txt"])).is_none());
+        assert!(
+            check(&call(
+                &[crate::testing::abs_path("/tmp/aidaemon-test/elsewhere/notes.txt").as_str()],
+                &[]
+            ))
+            .is_none()
+        );
+        assert!(
+            check(&call(
+                &[],
+                &[crate::testing::abs_path("/tmp/aidaemon-test/ws/a.txt").as_str()]
+            ))
+            .is_none()
+        );
         assert!(check(&call(&[], &["a.txt"])).is_none());
         assert!(matches!(
-            check(&call(&[], &["/tmp/aidaemon-test/outside.txt"])),
+            check(&call(
+                &[],
+                &[crate::testing::abs_path("/tmp/aidaemon-test/outside.txt").as_str()]
+            )),
             Some(crate::agent::tool_execution::ScopeCheck::Rejected(_))
         ));
     }

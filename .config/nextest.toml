@@ -5,8 +5,11 @@
 [profile.windows-ci]
 # Report every failure, not just the first.
 fail-fast = false
-# A test still running after 60 s is reported as slow; after 120 s it is
+# A test still running after 20 s is reported as slow; after 120 s it is
 # stopped and fails.
-slow-timeout = { period = "60s", terminate-after = 2 }
-failure-output = "final"
-status-level = "fail"
+slow-timeout = { period = "20s", terminate-after = 6 }
+# Each failure's output as it happens, so a cancelled run still shows why.
+failure-output = "immediate"
+# Slow tests too: on Windows some take 30 s where they take under one
+# elsewhere.
+status-level = "slow"

@@ -80,7 +80,7 @@ mod coordination_tests {
     }
 
     fn real(path: &std::path::Path) -> String {
-        std::fs::canonicalize(path)
+        dunce::canonicalize(path)
             .unwrap()
             .to_string_lossy()
             .into_owned()

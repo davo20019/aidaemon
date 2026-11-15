@@ -59,7 +59,7 @@ impl ReportBlockerTool {
         let Some(target) = args.target.as_deref().map(str::trim) else {
             return false;
         };
-        let Ok(canonical_target) = std::fs::canonicalize(target) else {
+        let Ok(canonical_target) = dunce::canonicalize(target) else {
             return false;
         };
         let Ok(Some(task)) = self.state.get_task(&self.task_id).await else {
@@ -79,7 +79,7 @@ impl ReportBlockerTool {
                         | crate::tools::traits::ToolTargetHintKind::ProjectScope
                 )
             })
-            .filter_map(|allowed| std::fs::canonicalize(&allowed.value).ok())
+            .filter_map(|allowed| dunce::canonicalize(&allowed.value).ok())
             .any(|allowed| canonical_target == allowed || canonical_target.starts_with(allowed));
         if !target_is_allowed {
             return false;

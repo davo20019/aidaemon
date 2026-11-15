@@ -222,7 +222,7 @@ impl crate::traits::ToolSemantics for RecordingTerminal {
 #[tokio::test]
 async fn test_sdk_call_without_directory_is_anchored_to_the_project_dir() {
     let project = tempfile::TempDir::new().unwrap();
-    let project_dir = project.path().canonicalize().unwrap();
+    let project_dir = dunce::canonicalize(project.path()).unwrap();
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = MockProvider::with_responses(vec![
         MockProvider::tool_call_response("terminal", r#"{"command":"ls"}"#),
@@ -250,7 +250,7 @@ async fn test_sdk_call_without_directory_is_anchored_to_the_project_dir() {
         .first()
         .and_then(|args| args.get("working_dir"))
         .and_then(serde_json::Value::as_str)
-        .map(|dir| std::path::Path::new(dir).canonicalize().unwrap());
+        .map(|dir| dunce::canonicalize(std::path::Path::new(dir)).unwrap());
     assert_eq!(
         working_dir.as_deref(),
         Some(project_dir.as_path()),
