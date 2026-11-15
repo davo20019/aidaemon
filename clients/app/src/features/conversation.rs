@@ -858,11 +858,11 @@ fn draft_files(store: Store) -> View {
     }))
 }
 
-/// Open a message's file in the system's browser or viewer.
+/// Open a message's file in the system's browser or viewer. Called right in
+/// the press: a browser opens a new tab only for the tap itself, so the
+/// request is not put off to a task (whether it opened is not awaited).
 fn open_file(url: String) {
-    spawn(async move {
-        let _ = open_url(url).await;
-    });
+    let _ = open_url(url);
 }
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {

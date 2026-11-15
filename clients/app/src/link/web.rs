@@ -155,6 +155,9 @@ pub async fn unpair() {
 }
 
 pub fn start(store: Store) {
+    // Files' links are on this page's own origin; opening one needs it
+    // whole.
+    store.set_gateway_base(origin());
     spawn(async move {
         let mut device = paired_device(store).await;
         let mut machine = LinkMachine::new(
