@@ -813,6 +813,13 @@ impl Store {
                 self.note_activity(event);
                 self.note_reply(session_id.as_deref(), event);
             }
+            // After a reload or a dropped connection: what running turns
+            // have got to, so the inspector's "This turn" is not empty.
+            ServerFrame::Snapshot { state, .. }
+            | ServerFrame::Ack {
+                result: CommandResult::Snapshot { state, .. },
+                ..
+            } => self.note_live_turns(&state.live_turns),
             _ => {}
         }
         let mut request = None;
@@ -1406,6 +1413,49 @@ impl Store {
         if self.compact.get_untracked() {
             self.sidebar.set(false);
             self.inspector.set(false);
+        }
+    }
+
+    /// Activity for running turns this client did not see start: their
+    /// tools in order, then what they are doing now. Turns it already
+    /// follows keep their own record.
+    fn note_live_turns(&self, live: &[aidaemon_client_protocol::LiveTurnState]) {
+        for turn in live {
+            if self.turns.with_untracked(|t| t.contains_key(&turn.turn_id)) {
+                continue;
+            }
+            self.note_activity(&Event::TurnStarted {
+                turn_id: turn.turn_id.clone(),
+                session_id: turn.session_id.clone(),
+                origin: String::new(),
+            });
+            let last = turn.tools.len().saturating_sub(1);
+            for (n, name) in turn.tools.iter().enumerate() {
+                // The current status names the last tool with its summary.
+                let summary = match &turn.status {
+                    Some(TurnStatus::ToolStarted { name: now, summary })
+                        if n == last && now == name =>
+                    {
+                        summary.clone()
+                    }
+                    _ => String::new(),
+                };
+                self.note_activity(&Event::TurnStatus {
+                    turn_id: turn.turn_id.clone(),
+                    status: TurnStatus::ToolStarted {
+                        name: name.clone(),
+                        summary,
+                    },
+                });
+            }
+            if let Some(status) = &turn.status
+                && !matches!(status, TurnStatus::ToolStarted { .. })
+            {
+                self.note_activity(&Event::TurnStatus {
+                    turn_id: turn.turn_id.clone(),
+                    status: status.clone(),
+                });
+            }
         }
     }
 

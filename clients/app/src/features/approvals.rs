@@ -21,7 +21,7 @@ fn decision(d: ApprovalDecision) -> (&'static str, Variant) {
     match d {
         ApprovalDecision::ApproveOnce => ("Allow once", Variant::Primary),
         ApprovalDecision::ApproveSession => ("Allow this session", Variant::Outline),
-        ApprovalDecision::ApproveAlways => ("Always allow", Variant::Ghost),
+        ApprovalDecision::ApproveAlways => ("Always allow", Variant::Outline),
         ApprovalDecision::Deny => ("Deny", Variant::Danger),
     }
 }
@@ -162,33 +162,42 @@ pub fn card(store: Store, approval: Approval) -> View {
                         .text_color(colors::MUTED),
                 )
         }))
-        .child(
-            view()
-                .flex_row()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .children(approval.options.iter().map(|d| {
-                    let (label, variant) = decision(*d);
-                    let (id, d) = (id.clone(), *d);
-                    btn(label, variant, Size::Sm, move || store.resolve(&id, d))
-                }))
-                .child(view().flex_1())
-                .child(
-                    text(
-                        [
-                            asked_by.map(|who| format!("asked by {who}")),
-                            expires(approval.expires_at_ms),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                    )
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                ),
-        )
+        .child({
+            let meta = text(
+                [
+                    asked_by.map(|who| format!("asked by {who}")),
+                    expires(approval.expires_at_ms),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · "),
+            )
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT);
+            let buttons = approval.options.iter().map(|d| {
+                let (label, variant) = decision(*d);
+                let (id, d) = (id.clone(), *d);
+                btn(label, variant, Size::Sm, move || store.resolve(&id, d))
+            });
+            if ui::touch() {
+                // A phone stacks the answers full width, the main one
+                // first: three side by side would wrap at a thumb's size.
+                view()
+                    .gap_2()
+                    .children(buttons.map(|b| b.w_full()))
+                    .child(meta)
+            } else {
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .children(buttons)
+                    .child(view().flex_1())
+                    .child(meta)
+            }
+        })
 }
 
 fn detail_text(value: String) -> View {

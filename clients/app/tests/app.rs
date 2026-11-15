@@ -205,3 +205,22 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
     app.wait_for("What can you do on this computer?")?;
     Ok(())
 }
+
+#[test]
+fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-3","channel":"app","title":"Count the files","writable":true}],"running_tasks":[{"id":"b:app:synthetic-3#1","session_id":"app:synthetic-3","number":1,"description":"Count the files","state":"running","started_at_ms":1}],"pending_approvals":[],"live_turns":[{"session_id":"app:synthetic-3","turn_id":"t9","started_at_ms":1,"status":{"kind":"tool_started","name":"terminal","summary":"find . -name '*.rs'"},"tools":["read_file","terminal"]}]}}"#,
+        ),
+    ]);
+    app.wait_for("Count the files")?;
+    app.press("Count the files >> nth=0")?;
+    // The working line and the inspector both say what it is doing.
+    app.wait_for("text:terminal: find . -name '*.rs'...  ·  2 tools so far")?;
+    app.wait_for("read_file")?;
+    Ok(())
+}
