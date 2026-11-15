@@ -365,6 +365,14 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN shared INTEGER")
         .execute(pool)
         .await;
+    // The owner's own name for the conversation (from an app), over the
+    // one taken from what was said; and whether they archived it.
+    let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN title TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN archived INTEGER")
+        .execute(pool)
+        .await;
 
     // Non-destructive `/clear` boundary: hides events at or before
     // `cleared_after_id` from CONTEXT retrieval without deleting them, so the

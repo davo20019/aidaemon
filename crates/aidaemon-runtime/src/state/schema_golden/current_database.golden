@@ -680,7 +680,7 @@ CREATE TABLE session_channels (
             session_id TEXT PRIMARY KEY,
             channel_name TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        , shared INTEGER)
+        , shared INTEGER, title TEXT, archived INTEGER)
 
 table dynamic_skills on dynamic_skills
 CREATE TABLE dynamic_skills (

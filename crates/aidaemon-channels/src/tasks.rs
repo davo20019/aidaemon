@@ -30,6 +30,8 @@ const MAX_RUNNING_TASK_AGE_SECS: i64 = 3600;
 /// A queued message waiting to be processed.
 #[derive(Clone, Debug)]
 pub struct QueuedMessage {
+    /// Its id while it waits: what an app names to edit or remove it.
+    pub id: u64,
     pub text: String,
     /// Authorization is captured when the message arrives. Channel workers
     /// must never reuse the role of the message that happened to start the
@@ -57,7 +59,9 @@ impl QueuedMessage {
         channel_ctx: ChannelContext,
         attachments: Vec<MessageAttachment>,
     ) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             text: text.into(),
             user_role,
             channel_ctx,
@@ -566,6 +570,46 @@ impl TaskRegistry {
         for message in messages.into_iter().rev() {
             queue.push_front(message);
         }
+    }
+
+    /// The messages waiting in `session_id`'s queue, oldest first: id,
+    /// text and when each was queued.
+    pub async fn queued_messages(&self, session_id: &str) -> Vec<(u64, String, DateTime<Utc>)> {
+        self.queues
+            .read()
+            .await
+            .get(session_id)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .map(|m| (m.id, m.text.clone(), m.queued_at))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Change the text of queued message `id` (`Some`), or take it out of
+    /// the queue (`None`). `false` when it is no longer waiting (it ran).
+    pub async fn edit_queued_message(
+        &self,
+        session_id: &str,
+        id: u64,
+        text: Option<String>,
+    ) -> bool {
+        let mut queues = self.queues.write().await;
+        let Some(queue) = queues.get_mut(session_id) else {
+            return false;
+        };
+        let Some(at) = queue.iter().position(|m| m.id == id) else {
+            return false;
+        };
+        match text {
+            Some(text) => queue[at].text = text,
+            None => {
+                queue.remove(at);
+            }
+        }
+        true
     }
 
     /// Atomically check for a running task and queue the message behind it.
@@ -1300,5 +1344,36 @@ mod tests {
                 .is_none()
         );
         assert!(!registry.has_running_task(session).await);
+    }
+}
+
+#[cfg(test)]
+mod queue_edit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_messages_list_edit_and_remove_by_id() {
+        let registry = TaskRegistry::new(10);
+        let session = "app:synthetic-q";
+        let ctx = ChannelContext::private("app");
+        let first = QueuedMessage::new("first", UserRole::Owner, ctx.clone(), Vec::new());
+        let second = QueuedMessage::new("second", UserRole::Owner, ctx, Vec::new());
+        let (a, b) = (first.id, second.id);
+        registry.queue_message(session, first, None).await;
+        registry.queue_message(session, second, None).await;
+        assert!(
+            registry
+                .edit_queued_message(session, a, Some("first, edited".into()))
+                .await
+        );
+        assert!(registry.edit_queued_message(session, b, None).await);
+        assert!(!registry.edit_queued_message(session, b, None).await);
+        let left: Vec<String> = registry
+            .queued_messages(session)
+            .await
+            .into_iter()
+            .map(|(_, text, _)| text)
+            .collect();
+        assert_eq!(left, ["first, edited"]);
     }
 }
