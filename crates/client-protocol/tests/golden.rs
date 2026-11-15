@@ -122,6 +122,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListCommands => "list_commands",
         Command::ListMemories => "list_memories",
         Command::ForgetMemory { .. } => "forget_memory",
+        Command::UploadFile { .. } => "upload_file",
         Command::GetSettings => "get_settings",
         Command::ChangeSettings { .. } => "change_settings",
         Command::GetSetup => "get_setup",
@@ -161,6 +162,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Commands { .. } => "commands",
         CommandResult::Memories { .. } => "memories",
         CommandResult::Forgotten { .. } => "forgotten",
+        CommandResult::Uploaded { .. } => "uploaded",
         CommandResult::Settings { .. } => "settings",
         CommandResult::SettingsChanged { .. } => "settings_changed",
         CommandResult::Setup { .. } => "setup",
@@ -198,6 +200,7 @@ fn client_samples() -> Vec<ClientFrame> {
                 session_id: None,
                 text: "Post the synthetic report for Alice Rivera".into(),
                 attachments: vec![AttachmentRef {
+                    url: None,
                     id: "up-1".into(),
                     name: "report.pdf".into(),
                     mime: Some("application/pdf".into()),
@@ -271,6 +274,14 @@ fn client_samples() -> Vec<ClientFrame> {
             "5d0c2b1e-0010",
             Command::ForgetMemory {
                 memory_id: "41".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0013",
+            Command::UploadFile {
+                name: "receipt.png".into(),
+                mime: Some("image/png".into()),
+                data: "iVBORw0KGgo=".into(),
             },
         ),
         command("5d0c2b1e-0011", Command::GetSettings),
@@ -420,6 +431,7 @@ fn server_samples() -> Vec<ServerFrame> {
         event(
             Some(4),
             Event::AssistantMessage {
+                attachments: Vec::new(),
                 session_id: "app:6c1f".into(),
                 text: "Got it, I'll start on that as soon as this finishes.".into(),
                 suggestions: Vec::new(),
@@ -556,6 +568,7 @@ fn server_samples() -> Vec<ServerFrame> {
             session_id: "app:6c1f".into(),
             messages: vec![
                 HistoryMessage {
+                    attachments: Vec::new(),
                     id: "m-119".into(),
                     role: "user".into(),
                     text: "Post the synthetic report for Alice Rivera".into(),
@@ -563,6 +576,7 @@ fn server_samples() -> Vec<ServerFrame> {
                     tools: Vec::new(),
                 },
                 HistoryMessage {
+                    attachments: Vec::new(),
                     id: "m-120".into(),
                     role: "assistant".into(),
                     text: "Posted it.".into(),
@@ -686,6 +700,15 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Forgotten {
             memory_id: "41".into(),
+        }),
+        ack(CommandResult::Uploaded {
+            attachment: AttachmentRef {
+                id: "f-3c9a".into(),
+                name: "receipt.png".into(),
+                mime: Some("image/png".into()),
+                size_bytes: Some(8),
+                url: Some("/client/v1/files/f-3c9a/5b1e/receipt.png".into()),
+            },
         }),
         ack(CommandResult::Settings {
             settings: Settings {

@@ -28,6 +28,9 @@ use crate::{Caller, ClientGateway};
 
 /// The largest frame or request body accepted.
 const MAX_BODY: usize = 256 * 1024;
+/// The largest command a signed-in client may send: an `upload_file`
+/// carries its file as base64.
+const MAX_COMMAND: usize = crate::files::MAX_UPLOAD_BYTES / 3 * 4 + 64 * 1024;
 /// How long a socket may take to say hello.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
 /// A socket that says nothing for this long (clients ping every 25 s) is
@@ -42,7 +45,11 @@ const MAX_WAIT: Duration = Duration::from_secs(25);
 pub fn router(gateway: Arc<ClientGateway>) -> Router {
     Router::new()
         .route("/client/v1/ws", get(websocket))
-        .route("/client/v1/commands", post(http_command))
+        .route(
+            "/client/v1/commands",
+            post(http_command).layer(axum::extract::DefaultBodyLimit::max(MAX_COMMAND)),
+        )
+        .route("/client/v1/files/{id}/{signature}/{name}", get(file))
         .route("/client/v1/events", get(http_events))
         .route("/client/v1/pairing/offers", post(create_offer))
         .route("/client/v1/pairing/offers/{offer_id}", get(offer_status))
@@ -63,6 +70,63 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/next/{*path}", get(app_file))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(gateway)
+}
+
+/// A message's file, at the link the gateway signed: pictures in place,
+/// anything else as a download, never run as a page.
+async fn file(
+    State(gateway): State<Arc<ClientGateway>>,
+    Path((id, signature, _name)): Path<(String, String, String)>,
+) -> Response {
+    let Some(record) = gateway
+        .files
+        .as_ref()
+        .and_then(|files| files.signed(&id, &signature))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(bytes) = tokio::fs::read(&record.path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let inline = crate::files::FileStore::inline(&record.mime);
+    let content_type = if inline {
+        record.mime.clone()
+    } else {
+        "application/octet-stream".to_string()
+    };
+    let name: String = record
+        .name
+        .chars()
+        .filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\' || *c == ' ')
+        .collect();
+    let disposition = format!(
+        "{}; filename=\"{}\"",
+        if inline { "inline" } else { "attachment" },
+        if name.is_empty() { "file" } else { &name }
+    );
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    for (key, value) in [
+        (axum::http::header::CONTENT_TYPE, content_type),
+        (axum::http::header::CONTENT_DISPOSITION, disposition),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable".to_string(),
+        ),
+        (
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            "nosniff".to_string(),
+        ),
+        (
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; sandbox".to_string(),
+        ),
+    ] {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            headers.insert(key, value);
+        }
+    }
+    response
 }
 
 /// Listen on the configured loopback address until the process ends.
@@ -645,7 +709,7 @@ async fn websocket(
         None => None,
     };
     upgrade
-        .max_message_size(MAX_BODY)
+        .max_message_size(MAX_COMMAND)
         .on_upgrade(move |socket| async move {
             if let Err(error) = run_socket(gateway, socket, by_header).await {
                 debug!(%error, "Client socket closed");

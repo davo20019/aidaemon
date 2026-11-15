@@ -60,6 +60,8 @@ pub struct ChannelHub {
     /// Sees every approval card and may answer it from elsewhere; set late,
     /// once the Client Gateway starts.
     approval_tap: std::sync::RwLock<Option<Arc<dyn ApprovalTap>>>,
+    /// Sees the media delivered to bots; set once the Client Gateway starts.
+    media_tap: std::sync::RwLock<Option<Arc<dyn super::MediaTap>>>,
 }
 
 /// How many kept cards per session the hub remembers.
@@ -109,6 +111,26 @@ impl ChannelHub {
             checklist_surfaces: RwLock::new(HashMap::new()),
             checklist_history: RwLock::new(HashMap::new()),
             approval_tap: std::sync::RwLock::new(None),
+            media_tap: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Tell `tap` about every picture and document delivered to a bot.
+    pub fn set_media_tap(&self, tap: Arc<dyn super::MediaTap>) {
+        *self
+            .media_tap
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tap);
+    }
+
+    fn media_delivered(&self, channel: &str, session_id: &str, media: &MediaMessage) {
+        let tap = self
+            .media_tap
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(tap) = tap {
+            tap.delivered(channel, session_id, media);
         }
     }
 
@@ -765,6 +787,7 @@ impl ChannelHub {
                         delivery_result = Err(e.to_string());
                         warn!("Failed to send media via {}: {}", channel.name(), e);
                     } else {
+                        self.media_delivered(&channel.name(), &routed_session, &msg);
                         self.record_media_delivery_note(&routed_session, &msg).await;
                     }
                 } else {
@@ -915,6 +938,7 @@ impl ChannelHub {
                     self.release_media_delivery(&routed_session, media).await;
                     return Err(e);
                 }
+                self.media_delivered(&channel.name(), &routed_session, media);
                 self.record_media_delivery_note(&routed_session, media)
                     .await;
                 Ok(())
@@ -963,6 +987,7 @@ impl ChannelHub {
             self.release_media_delivery(&routed_session, media).await;
             return Err(e);
         }
+        self.media_delivered(&channel.name(), &routed_session, media);
         self.record_media_delivery_note(&routed_session, media)
             .await;
         Ok(())

@@ -298,7 +298,7 @@
       ]
     },
     "AttachmentRef": {
-      "description": "A file a client uploaded before sending its message.",
+      "description": "A file with a message: one a client uploaded before sending it, or one\nthe daemon sent (a picture, a document).",
       "properties": {
         "id": {
           "type": "string"
@@ -317,6 +317,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "Where to fetch it, on the gateway's own origin\n(`/client/v1/files/...`). It needs no token: the path itself is the\npermission, so treat it like the file (protocol 1.11).",
+          "type": [
+            "string",
             "null"
           ]
         }
@@ -390,7 +397,7 @@
         },
         {
           "const": "attachments",
-          "description": "Files with messages, through upload slots.",
+          "description": "Files with messages: `upload_file` before `send_message`, and the\nfiles of messages and replies, each with a `url` (protocol 1.11).",
           "type": "string"
         },
         {
@@ -1034,6 +1041,33 @@
           "type": "object"
         },
         {
+          "description": "Upload a file to send with a message (capability `attachments`,\nprotocol 1.11): its bytes as standard base64. The reply's attachment\ngoes in `send_message`'s `attachments`.",
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "mime": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "upload_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Forget one remembered fact, by its `id` from `list_memories`.",
           "properties": {
             "memory_id": {
@@ -1478,6 +1512,23 @@
           "required": [
             "type",
             "memory_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`upload_file`: the file is kept; send it with `send_message`.",
+          "properties": {
+            "attachment": {
+              "$ref": "#/$defs/AttachmentRef"
+            },
+            "type": {
+              "const": "uploaded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attachment"
           ],
           "type": "object"
         },
@@ -1936,6 +1987,13 @@
         {
           "description": "A message from the daemon outside a turn's reply: a queued-message\nnotice, an answer about running work, a background job's report.",
           "properties": {
+            "attachments": {
+              "description": "Files sent with it: a picture the agent made or took, a document\n(protocol 1.11).",
+              "items": {
+                "$ref": "#/$defs/AttachmentRef"
+              },
+              "type": "array"
+            },
             "session_id": {
               "type": "string"
             },
@@ -2562,6 +2620,13 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "attachments": {
+          "description": "Files sent with it (protocol 1.11).",
+          "items": {
+            "$ref": "#/$defs/AttachmentRef"
+          },
+          "type": "array"
         },
         "id": {
           "type": "string"

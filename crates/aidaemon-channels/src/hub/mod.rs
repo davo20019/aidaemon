@@ -87,6 +87,13 @@ pub enum TapClosed {
 /// (shown on the bot's card, "from the app").
 pub type TapAnswer = tokio::sync::oneshot::Receiver<(ApprovalResponse, String)>;
 
+/// Sees the media the hub delivers to a bot (a picture, a document), so the
+/// owner's apps show it too.
+pub trait MediaTap: Send + Sync {
+    /// `media` reached `session_id` on channel `channel`.
+    fn delivered(&self, channel: &str, session_id: &str, media: &MediaMessage);
+}
+
 /// Sees every approval card the hub routes and may answer it from
 /// elsewhere (the Client Gateway). The first answer wins: the bot's card is
 /// closed when the tap answers, and the tap is told when the bot does.

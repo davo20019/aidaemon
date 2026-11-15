@@ -64,6 +64,69 @@ pub struct GatewayObserver {
     /// Each chat conversation as its own channel last saw it: what a reply
     /// from the app into that conversation runs under.
     pub(crate) contexts: Contexts,
+    /// Where a message's files are shown from; `None`: not shown.
+    pub(crate) files: Option<Arc<crate::files::FileStore>>,
+}
+
+/// Files as clients reach them.
+pub(crate) fn shown_files(
+    files: Option<&crate::files::FileStore>,
+    attachments: &[aidaemon_tools::semantics::MessageAttachment],
+) -> Vec<aidaemon_client_protocol::AttachmentRef> {
+    files.map(|f| f.show(attachments)).unwrap_or_default()
+}
+
+/// A picture or document the agent sent, as clients reach it.
+fn media_file(
+    files: &crate::files::FileStore,
+    media: &MediaMessage,
+) -> Option<aidaemon_client_protocol::AttachmentRef> {
+    let saved = match &media.kind {
+        MediaKind::Photo { data } => files.save("picture.png", None, data),
+        MediaKind::Document {
+            file_path,
+            filename,
+        } => {
+            let path = std::path::Path::new(file_path);
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let mime = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| aidaemon_tools::sniff_image_mime(&bytes).map(str::to_string))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            files.register(path, filename, &mime, size)
+        }
+    };
+    saved
+        .map_err(|e| tracing::warn!(error = %e, "Could not keep a file the agent sent"))
+        .ok()
+}
+
+/// Shows clients the pictures and documents the agent sends to a chat
+/// (Telegram, Slack...): the app's own sessions get theirs through
+/// [`AppChannel`].
+pub(crate) struct MediaToClients {
+    pub(crate) publisher: Publisher,
+    pub(crate) files: Arc<crate::files::FileStore>,
+}
+
+impl aidaemon_channels::hub::MediaTap for MediaToClients {
+    fn delivered(&self, channel: &str, session_id: &str, media: &MediaMessage) {
+        if channel == APP_CHANNEL {
+            return;
+        }
+        let Some(file) = media_file(&self.files, media) else {
+            return;
+        };
+        self.publisher.publish(
+            Some(session_id.to_string()),
+            Event::AssistantMessage {
+                session_id: session_id.to_string(),
+                text: media.caption.trim().to_string(),
+                attachments: vec![file],
+                suggestions: Vec::new(),
+            },
+        );
+    }
 }
 
 /// Turns running now, by turn number.
@@ -183,8 +246,14 @@ impl TurnObserver for GatewayObserver {
             session.clone(),
             Event::UserMessage {
                 session_id: turn.session_id.to_string(),
-                text: turn.text.to_string(),
-                attachments: Vec::new(),
+                // What the sender typed: the files' notes for the agent
+                // come as the files themselves.
+                text: if turn.attachments.is_empty() {
+                    turn.text.to_string()
+                } else {
+                    aidaemon_channels::attachments::user_authored_text(turn.text)
+                },
+                attachments: shown_files(self.files.as_deref(), turn.attachments),
                 origin: turn.platform.to_string(),
             },
         );
@@ -319,6 +388,7 @@ impl TurnSurface for AppSurface {
         self.publisher.publish(
             Some(self.session_id.clone()),
             Event::AssistantMessage {
+                attachments: Vec::new(),
                 session_id: self.session_id.clone(),
                 text: text.to_string(),
                 suggestions: Vec::new(),
@@ -369,6 +439,7 @@ impl TurnSurface for ChatReplySurface {
         self.publisher.publish(
             Some(self.session_id.clone()),
             Event::AssistantMessage {
+                attachments: Vec::new(),
                 session_id: self.session_id.clone(),
                 text: text.to_string(),
                 suggestions: Vec::new(),
@@ -412,6 +483,7 @@ impl TurnSurface for ChatReplySurface {
 /// asking here only waits.
 pub struct AppChannel {
     pub(crate) publisher: Publisher,
+    pub(crate) files: Option<Arc<crate::files::FileStore>>,
 }
 
 impl AppChannel {
@@ -419,6 +491,7 @@ impl AppChannel {
         self.publisher.publish(
             Some(session_id.to_string()),
             Event::AssistantMessage {
+                attachments: Vec::new(),
                 session_id: session_id.to_string(),
                 text,
                 suggestions: Vec::new(),
@@ -437,7 +510,7 @@ impl HubChannel for AppChannel {
         ChannelCapabilities {
             markdown: true,
             inline_buttons: true,
-            media: false,
+            media: self.files.is_some(),
             max_message_len: 64 * 1024,
         }
     }
@@ -448,6 +521,20 @@ impl HubChannel for AppChannel {
     }
 
     async fn send_media(&self, session_id: &str, media: &MediaMessage) -> anyhow::Result<()> {
+        if let Some(files) = &self.files {
+            let file = media_file(files, media)
+                .ok_or_else(|| anyhow::anyhow!("could not keep the file for the app"))?;
+            self.publisher.publish(
+                Some(session_id.to_string()),
+                Event::AssistantMessage {
+                    session_id: session_id.to_string(),
+                    text: media.caption.trim().to_string(),
+                    attachments: vec![file],
+                    suggestions: Vec::new(),
+                },
+            );
+            return Ok(());
+        }
         let name = match &media.kind {
             MediaKind::Photo { .. } => "a picture".to_string(),
             MediaKind::Document { filename, .. } => format!("`{filename}`"),

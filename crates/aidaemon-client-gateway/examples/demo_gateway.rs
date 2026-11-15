@@ -195,6 +195,7 @@ impl ClientHost for Host {
             .iter()
             .enumerate()
             .map(|(n, (role, text))| HistoryMessage {
+                attachments: Vec::new(),
                 id: format!("{session_id}-m{n}"),
                 role: role.to_string(),
                 text: text.to_string(),
@@ -676,6 +677,7 @@ async fn main() -> anyhow::Result<()> {
     let token_copy = dir.path().join("client-token");
     std::fs::write(&token_copy, &token)?;
     let gateway = ClientGateway::start(GatewayDeps {
+        files: None,
         turns: TurnDeps {
             agent,
             session_map,

@@ -28,6 +28,7 @@ mod bus;
 pub mod client_feature;
 pub mod client_view;
 mod config;
+pub mod files;
 mod observer;
 pub mod pairing;
 mod server;
@@ -268,6 +269,9 @@ pub struct GatewayDeps {
     /// one the agent's cards use). `None`: pairings are confirmed only
     /// through the owner's decision call.
     pub approvals: Option<mpsc::Sender<aidaemon_channels::hub::ApprovalRequest>>,
+    /// Files with messages (uploads, and pictures and documents the agent
+    /// sends). `None`: the gateway takes no attachments.
+    pub files: Option<Arc<files::FileStore>>,
 }
 
 /// Who sent a command.
@@ -318,6 +322,7 @@ pub struct ClientGateway {
     pub(crate) views: Arc<ViewTargets>,
     /// Requests being handled now, so a retry waits for the first answer.
     in_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) files: Option<Arc<files::FileStore>>,
 }
 
 impl ClientGateway {
@@ -365,11 +370,19 @@ impl ClientGateway {
             running: Mutex::default(),
             live: live.clone(),
             contexts: contexts.clone(),
+            files: deps.files.clone(),
         }));
         deps.hub.set_approval_tap(approvals.clone());
+        if let Some(files) = deps.files.clone() {
+            deps.hub.set_media_tap(Arc::new(observer::MediaToClients {
+                publisher: publisher.clone(),
+                files,
+            }));
+        }
         deps.hub
             .register_channel(Arc::new(AppChannel {
                 publisher: publisher.clone(),
+                files: deps.files.clone(),
             }) as Arc<dyn HubChannel>)
             .await;
 
@@ -400,6 +413,7 @@ impl ClientGateway {
             token_file: deps.token_file,
             views: Arc::default(),
             in_flight: Mutex::default(),
+            files: deps.files,
         });
         let upkeep = Arc::downgrade(&gateway);
         tokio::spawn(async move {
@@ -585,6 +599,7 @@ impl ClientGateway {
             | Command::UpdateProject { .. }
             | Command::SetSessionProject { .. } => Some(Scope::Chat),
             Command::ForgetMemory { .. }
+            | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
             Command::Unknown => None,
@@ -615,7 +630,7 @@ impl ClientGateway {
                     request_id,
                     session_id,
                     text,
-                    attachments.is_empty(),
+                    attachments,
                     caller.view_connection,
                     placement,
                     project_id,
@@ -721,6 +736,7 @@ impl ClientGateway {
                 })?;
                 Ok(CommandResult::Memories { memories })
             }
+            Command::UploadFile { name, mime, data } => self.upload(name, mime, data),
             Command::ForgetMemory { memory_id } => match self.host.forget(&memory_id).await {
                 Ok(true) => Ok(CommandResult::Forgotten { memory_id }),
                 Ok(false) => Err(ProtocolError::new(ErrorCode::NotFound, "No such memory")),
@@ -992,6 +1008,7 @@ impl ClientGateway {
         self.publisher.publish(
             Some(session_id.clone()),
             Event::AssistantMessage {
+                attachments: Vec::new(),
                 session_id: session_id.clone(),
                 text: text.to_string(),
                 suggestions,
@@ -1024,6 +1041,81 @@ impl ClientGateway {
 
     /// Tell every client to read the settings again: `message` says what
     /// changed (a sign-in that finished on its own, say).
+    /// `upload_file`: keep the file for a message to send.
+    fn upload(
+        &self,
+        name: String,
+        mime: Option<String>,
+        data: String,
+    ) -> Result<CommandResult, ProtocolError> {
+        use base64::Engine as _;
+        let Some(files) = &self.files else {
+            return Err(ProtocolError::new(
+                ErrorCode::Invalid,
+                "This gateway does not take files",
+            ));
+        };
+        let too_big = || {
+            ProtocolError::new(
+                ErrorCode::Invalid,
+                format!(
+                    "The file is too large: up to {} MB",
+                    files::MAX_UPLOAD_BYTES / (1024 * 1024)
+                ),
+            )
+        };
+        if data.len() / 4 * 3 > files::MAX_UPLOAD_BYTES + 3 {
+            return Err(too_big());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|_| ProtocolError::new(ErrorCode::Invalid, "The file is not base64"))?;
+        if bytes.is_empty() {
+            return Err(ProtocolError::new(ErrorCode::Invalid, "The file is empty"));
+        }
+        if bytes.len() > files::MAX_UPLOAD_BYTES {
+            return Err(too_big());
+        }
+        let attachment = files.save(&name, mime.as_deref(), &bytes).map_err(|e| {
+            warn!(error = %e, "Saving an uploaded file failed");
+            ProtocolError::new(ErrorCode::Internal, "Could not keep the file")
+        })?;
+        Ok(CommandResult::Uploaded { attachment })
+    }
+
+    /// The uploaded files a message names, as the agent takes them.
+    fn message_files(
+        &self,
+        attachments: &[aidaemon_client_protocol::AttachmentRef],
+    ) -> Result<Vec<aidaemon_tools::semantics::MessageAttachment>, ProtocolError> {
+        if attachments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(files) = &self.files else {
+            return Err(ProtocolError::new(
+                ErrorCode::Invalid,
+                "This gateway does not take files",
+            ));
+        };
+        attachments
+            .iter()
+            .map(|attachment| {
+                let record = files.get(&attachment.id).ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::NotFound,
+                        format!("No uploaded file {}: upload it again", attachment.id),
+                    )
+                })?;
+                Ok(aidaemon_channels::attachments::message_attachment(
+                    record.path,
+                    record.name,
+                    record.mime,
+                    record.size_bytes,
+                ))
+            })
+            .collect()
+    }
+
     pub fn settings_updated(&self, ok: bool, message: String) {
         self.publisher
             .publish(None, Event::SettingsUpdated { ok, message });
@@ -1138,18 +1230,13 @@ impl ClientGateway {
         request_id: &str,
         session_id: Option<String>,
         text: String,
-        no_attachments: bool,
+        attachments: Vec<aidaemon_client_protocol::AttachmentRef>,
         view_connection: Option<u64>,
         placement: Option<MidRunPlacement>,
         project_id: Option<String>,
     ) -> Result<CommandResult, ProtocolError> {
-        if !no_attachments {
-            return Err(ProtocolError::new(
-                ErrorCode::Invalid,
-                "This gateway does not take attachments yet",
-            ));
-        }
-        if text.trim().is_empty() {
+        let files = self.message_files(&attachments)?;
+        if text.trim().is_empty() && files.is_empty() {
             return Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 "The message is empty",
@@ -1162,6 +1249,13 @@ impl ClientGateway {
             ),
             Some(session_id) if session_id.starts_with(APP_SESSION_PREFIX) => (session_id, false),
             Some(session_id) => {
+                if !files.is_empty() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Invalid,
+                        "Files go only to the app's own conversations for now; send them \
+                         in a new conversation",
+                    ));
+                }
                 return self
                     .reply_in_chat(request_id, session_id, text, placement)
                     .await;
@@ -1193,7 +1287,14 @@ impl ClientGateway {
                     session: SessionSummary {
                         id: session_id.clone(),
                         channel: APP_CHANNEL.to_string(),
-                        title: Some(aidaemon_channels::presentation::word_preview(&text, 60)),
+                        title: Some(if text.trim().is_empty() {
+                            files
+                                .first()
+                                .map(|f| f.filename.clone())
+                                .unwrap_or_default()
+                        } else {
+                            aidaemon_channels::presentation::word_preview(&text, 60)
+                        }),
                         last_activity_ms: Some(bus::now_ms()),
                         writable: true,
                         project_id,
@@ -1203,10 +1304,15 @@ impl ClientGateway {
         }
         let mut channel_ctx = aidaemon_channels::context::ChannelContext::private(APP_CHANNEL);
         channel_ctx.channel_id = Some(session_id.clone());
+        let text = if files.is_empty() {
+            text
+        } else {
+            aidaemon_channels::attachments::build_inbound_text(&text, &files)
+        };
         let turn = Turn {
             session_id: session_id.clone(),
             text,
-            attachments: Vec::new(),
+            attachments: files,
             user_role: UserRole::Owner,
             channel_ctx,
             dedup_key: Some(request_id.to_string()),

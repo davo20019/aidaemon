@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 10;
+pub const PROTOCOL_MINOR: u16 = 11;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -189,7 +189,8 @@ pub enum Capability {
     Deltas,
     /// `goal_updated` events.
     Goals,
-    /// Files with messages, through upload slots.
+    /// Files with messages: `upload_file` before `send_message`, and the
+    /// files of messages and replies, each with a `url` (protocol 1.11).
     Attachments,
     /// Push notifications through a relay.
     Push,
@@ -286,6 +287,15 @@ pub enum Command {
     ListCommands,
     /// What the daemon remembers about the owner (protocol 1.3).
     ListMemories,
+    /// Upload a file to send with a message (capability `attachments`,
+    /// protocol 1.11): its bytes as standard base64. The reply's attachment
+    /// goes in `send_message`'s `attachments`.
+    UploadFile {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+        data: String,
+    },
     /// Forget one remembered fact, by its `id` from `list_memories`.
     ForgetMemory { memory_id: String },
     /// The daemon's settings: every value its config file holds (secrets
@@ -352,7 +362,8 @@ fn default_limit() -> u32 {
     50
 }
 
-/// A file a client uploaded before sending its message.
+/// A file with a message: one a client uploaded before sending it, or one
+/// the daemon sent (a picture, a document).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct AttachmentRef {
     pub id: String,
@@ -361,6 +372,18 @@ pub struct AttachmentRef {
     pub mime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    /// Where to fetch it, on the gateway's own origin
+    /// (`/client/v1/files/...`). It needs no token: the path itself is the
+    /// permission, so treat it like the file (protocol 1.11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl AttachmentRef {
+    /// Whether it is a picture a client can show.
+    pub fn is_image(&self) -> bool {
+        self.mime.as_deref().is_some_and(|m| m.starts_with("image/"))
+    }
 }
 
 /// The answer to a command.
@@ -426,6 +449,10 @@ pub enum CommandResult {
     /// `forget_memory`: the fact is no longer recalled.
     Forgotten {
         memory_id: String,
+    },
+    /// `upload_file`: the file is kept; send it with `send_message`.
+    Uploaded {
+        attachment: AttachmentRef,
     },
     /// `get_settings`.
     Settings {
@@ -1146,6 +1173,10 @@ pub enum Event {
     AssistantMessage {
         session_id: String,
         text: String,
+        /// Files sent with it: a picture the agent made or took, a document
+        /// (protocol 1.11).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentRef>,
         /// Things the owner might ask next, shown as prompts to press
         /// (protocol 1.5).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1625,6 +1656,9 @@ pub struct HistoryMessage {
     /// For a reply: the tools its turn used, in order (protocol 1.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// Files sent with it (protocol 1.11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
 }
 
 /// One entry of a session's running-work list: a turn, a helper (sub-agent)
@@ -2195,6 +2229,7 @@ mod tests {
         );
         assert!(
             Event::AssistantMessage {
+                attachments: Vec::new(),
                 session_id: "s".into(),
                 text: "x".into(),
                 suggestions: Vec::new(),

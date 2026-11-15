@@ -88,6 +88,7 @@ mod client_gateway {
         };
         let gateway =
             aidaemon_client_gateway::ClientGateway::start(aidaemon_client_gateway::GatewayDeps {
+                files: None,
                 turns: turns.clone(),
                 hub: hub.clone(),
                 host: Arc::new(NoHost),

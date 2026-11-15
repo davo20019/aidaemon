@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use aidaemon_client_protocol::{
-    Approval, CommandResult, Event, Feature, HistoryMessage, ProjectSummary, ServerFrame,
-    SessionSummary, SetupState, Snapshot, TaskState, TaskSummary, TurnState, TurnStatus,
-    ViewAction,
+    Approval, AttachmentRef, CommandResult, Event, Feature, HistoryMessage, ProjectSummary,
+    ServerFrame, SessionSummary, SetupState, Snapshot, TaskState, TaskSummary, TurnState,
+    TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -22,11 +22,16 @@ pub enum Line {
         /// When it was said (ms since the epoch); 0 when unknown.
         #[serde(default, skip_serializing_if = "is_zero")]
         at_ms: u64,
+        /// Files sent with it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentRef>,
     },
     Assistant {
         text: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         at_ms: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<AttachmentRef>,
     },
     /// A note from the client itself (a stopped turn, an error).
     Note { text: String },
@@ -261,6 +266,7 @@ impl State {
                     text: m.text,
                     origin: String::new(),
                     at_ms: m.at_ms,
+                    attachments: m.attachments,
                 }),
                 _ => {
                     if !m.tools.is_empty() {
@@ -272,6 +278,7 @@ impl State {
                     lines.push(Line::Assistant {
                         text: m.text,
                         at_ms: m.at_ms,
+                        attachments: m.attachments,
                     });
                 }
             }
@@ -298,7 +305,7 @@ impl State {
                 session_id,
                 text,
                 origin,
-                ..
+                attachments,
             } => {
                 self.touch(&session_id);
                 let view = self.session(&session_id);
@@ -307,15 +314,21 @@ impl State {
                     text,
                     origin,
                     at_ms,
+                    attachments,
                 });
             }
             Event::AssistantMessage {
                 session_id,
                 text,
                 suggestions,
+                attachments,
             } => {
                 let view = self.session(&session_id);
-                view.lines.push(Line::Assistant { text, at_ms });
+                view.lines.push(Line::Assistant {
+                    text,
+                    at_ms,
+                    attachments,
+                });
                 view.suggestions = suggestions;
             }
             Event::SetupUpdated { setup } => self.set_setup(setup),
@@ -368,7 +381,7 @@ impl State {
                 text,
                 state,
                 error,
-                ..
+                attachments,
             } => {
                 let Some(view) = self.sessions.values_mut().find(|view| {
                     view.live
@@ -379,9 +392,11 @@ impl State {
                     if let Some(session_id) = session_id
                         && !text.is_empty()
                     {
-                        self.session(&session_id)
-                            .lines
-                            .push(Line::Assistant { text, at_ms });
+                        self.session(&session_id).lines.push(Line::Assistant {
+                            text,
+                            at_ms,
+                            attachments,
+                        });
                     }
                     return;
                 };
@@ -398,8 +413,12 @@ impl State {
                         secs,
                     });
                 }
-                if !text.is_empty() {
-                    view.lines.push(Line::Assistant { text, at_ms });
+                if !text.is_empty() || !attachments.is_empty() {
+                    view.lines.push(Line::Assistant {
+                        text,
+                        at_ms,
+                        attachments,
+                    });
                 }
                 match state {
                     TurnState::Cancelled => view.lines.push(Line::Note {

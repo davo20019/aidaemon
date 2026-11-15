@@ -1,0 +1,14 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "attachment": {
+      "id": "f-3c9a",
+      "mime": "image/png",
+      "name": "receipt.png",
+      "size_bytes": 8,
+      "url": "/client/v1/files/f-3c9a/5b1e/receipt.png"
+    },
+    "type": "uploaded"
+  },
+  "type": "ack"
+}

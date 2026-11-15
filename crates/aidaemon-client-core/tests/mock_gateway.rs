@@ -101,6 +101,7 @@ async fn the_link_resumes_and_resends_unanswered_commands() {
             .send(text(&event(
                 seq,
                 Event::AssistantMessage {
+                    attachments: Vec::new(),
                     session_id: "app:s1".into(),
                     text: format!("note {seq}"),
                     suggestions: Vec::new(),

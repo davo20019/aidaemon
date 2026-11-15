@@ -31,6 +31,8 @@ struct ScriptedAgent {
     approvals: mpsc::Sender<ApprovalRequest>,
     risk: RiskLevel,
     turns: AtomicUsize,
+    /// The files the last message came with.
+    files: std::sync::Mutex<Vec<aidaemon_tools::semantics::MessageAttachment>>,
 }
 
 #[async_trait]
@@ -40,6 +42,7 @@ impl AgentIngress for ScriptedAgent {
         request: InboundMessageRequest,
     ) -> anyhow::Result<AgentResponseEnvelope> {
         self.turns.fetch_add(1, Ordering::SeqCst);
+        *self.files.lock().unwrap() = request.attachments.clone();
         if let Some(status) = request.status_tx.as_ref() {
             let _ = status
                 .send(StatusUpdate::ToolStart {
@@ -143,6 +146,7 @@ impl ClientHost for Host {
     async fn history(&self, _: &str, _: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         Ok((1..=5)
             .map(|n| HistoryMessage {
+                attachments: Vec::new(),
                 id: format!("m{n}"),
                 role: "user".into(),
                 text: format!("message {n}"),
@@ -250,6 +254,7 @@ async fn fixture(risk: RiskLevel) -> Fixture {
         approvals: approvals_tx,
         risk,
         turns: AtomicUsize::new(0),
+        files: std::sync::Mutex::default(),
     });
     let session_map = aidaemon_channels::hub::SessionMap::default();
     let hub = Arc::new(ChannelHub::new(Vec::new(), session_map.clone()));
@@ -265,7 +270,15 @@ async fn fixture(risk: RiskLevel) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("client-token.sha256");
     let token = aidaemon_client_gateway::token::mint(&token_file).unwrap();
+    let files = Arc::new(
+        aidaemon_client_gateway::files::FileStore::open(
+            dir.path().join("client-files"),
+            dir.path().join("inbox"),
+        )
+        .unwrap(),
+    );
     let gateway = ClientGateway::start(GatewayDeps {
+        files: Some(files),
         turns: deps.clone(),
         hub: hub.clone(),
         host: Arc::new(Host),
@@ -1604,4 +1617,167 @@ async fn no_view_action_can_resolve_an_approval() {
         matches!(result, CommandResult::ApprovalResolved { .. }),
         "{result:?}"
     );
+}
+
+#[tokio::test]
+async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
+    use base64::Engine as _;
+    let f = fixture(RiskLevel::Medium).await;
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDRsynthetic";
+    let ack = f
+        .post(
+            &[],
+            &command(
+                "up-1",
+                Command::UploadFile {
+                    name: "receipt.png".into(),
+                    mime: None,
+                    data: base64::engine::general_purpose::STANDARD.encode(png),
+                },
+            ),
+        )
+        .await;
+    let ServerFrame::Ack {
+        result: CommandResult::Uploaded { attachment },
+        ..
+    } = ack
+    else {
+        panic!("{ack:?}");
+    };
+    assert_eq!(attachment.mime.as_deref(), Some("image/png"));
+    let url = attachment.url.clone().unwrap();
+
+    // Served at its link with no token, as a picture; a wrong link is not.
+    let fetched = reqwest::get(format!("http://{}{url}", f.url))
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), 200);
+    assert_eq!(fetched.headers()["content-type"], "image/png");
+    assert!(
+        fetched.headers()["content-disposition"]
+            .to_str()
+            .unwrap()
+            .starts_with("inline")
+    );
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), png);
+    let forged = url.replacen(&attachment.id, &"0".repeat(24), 1);
+    assert_eq!(
+        reqwest::get(format!("http://{}{forged}", f.url))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+
+    // A message with only the picture.
+    let ack = f
+        .post(
+            &[],
+            &command(
+                "r-files",
+                Command::SendMessage {
+                    session_id: None,
+                    text: String::new(),
+                    attachments: vec![attachment.clone()],
+                    mid_run: None,
+                    project_id: None,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            ack,
+            ServerFrame::Ack {
+                result: CommandResult::MessageAccepted { .. },
+                ..
+            }
+        ),
+        "{ack:?}"
+    );
+    let mut since = 0;
+    let events = f
+        .poll_until(&[], &mut since, |e| {
+            matches!(e, Event::TurnCompleted { .. })
+        })
+        .await;
+    let shown = events
+        .iter()
+        .find_map(|e| match e {
+            Event::UserMessage {
+                text, attachments, ..
+            } => Some((text.clone(), attachments.clone())),
+            _ => None,
+        })
+        .unwrap();
+    // Clients see the picture, not the note the agent read about it.
+    assert_eq!(shown.0, "");
+    assert_eq!(shown.1, vec![attachment]);
+    let got = f.agent.files.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].mime_type, "image/png");
+    assert_eq!(std::fs::read(&got[0].local_path).unwrap(), png);
+
+    // An unknown file is refused, and nothing is sent.
+    let ack = f
+        .post(
+            &[],
+            &command(
+                "r-missing",
+                Command::SendMessage {
+                    session_id: None,
+                    text: "and this".into(),
+                    attachments: vec![AttachmentRef {
+                        id: "0".repeat(24),
+                        name: "gone.png".into(),
+                        mime: None,
+                        size_bytes: None,
+                        url: None,
+                    }],
+                    mid_run: None,
+                    project_id: None,
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(ack, ServerFrame::Error { .. }), "{ack:?}");
+}
+
+#[tokio::test]
+async fn a_picture_the_agent_sends_reaches_clients() {
+    let f = fixture(RiskLevel::Medium).await;
+    let session = "app:synthetic-media";
+    aidaemon_channels::turns::TurnRunner::new(f.deps.clone())
+        .register_session(session, aidaemon_client_gateway::APP_CHANNEL)
+        .await;
+    f.hub
+        .send_media(
+            session,
+            &MediaMessage {
+                session_id: session.into(),
+                caption: "The chart".into(),
+                kind: aidaemon_channels::hub::MediaKind::Photo {
+                    data: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDRchart".to_vec(),
+                },
+                result_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut since = 0;
+    let events = f
+        .poll_until(
+            &[],
+            &mut since,
+            |e| matches!(e, Event::AssistantMessage { attachments, .. } if !attachments.is_empty()),
+        )
+        .await;
+    let Some(Event::AssistantMessage {
+        text, attachments, ..
+    }) = events.last()
+    else {
+        panic!()
+    };
+    assert_eq!(text, "The chart");
+    assert!(attachments[0].is_image());
 }

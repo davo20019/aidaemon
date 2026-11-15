@@ -82,6 +82,8 @@ pub(crate) struct DaemonClientHost {
     pub settings: crate::startup::client_settings::SettingsHost,
     /// First-run setup's chat step and greeting.
     pub setup: crate::setup::channel::ChannelSetup,
+    /// Where the files of messages are shown from.
+    pub files: Option<Arc<aidaemon_client_gateway::files::FileStore>>,
 }
 
 impl DaemonClientHost {
@@ -567,15 +569,28 @@ impl ClientHost for DaemonClientHost {
                 pending.extend(tool_names(json));
                 continue;
             }
-            let Some(text) = m.content.filter(|text| !text.trim().is_empty()) else {
-                continue;
+            // A message's files come as themselves, not as the notes the
+            // agent read about them.
+            let attachments = match &self.files {
+                Some(files) if !m.attachments.is_empty() => files.show(&m.attachments),
+                _ => Vec::new(),
             };
+            let text = m.content.unwrap_or_default();
+            let text = if m.attachments.is_empty() {
+                text
+            } else {
+                aidaemon_channels::attachments::user_authored_text(&text)
+            };
+            if text.trim().is_empty() && attachments.is_empty() {
+                continue;
+            }
             let tools = if m.role == "assistant" {
                 std::mem::take(&mut pending)
             } else {
                 Vec::new()
             };
             out.push(HistoryMessage {
+                attachments,
                 id: m.id,
                 role: m.role,
                 text,
@@ -793,7 +808,22 @@ pub async fn start(
     let log = aidaemon_store_sqlite::SqliteClientEventLog::open(pool)
         .await
         .map_err(|error| anyhow::anyhow!("client event log: {error}"))?;
+    // Files of messages: kept beside the gateway's token; uploads go to the
+    // inbox, where the agent reads any file a chat sent.
+    let files = aidaemon_client_gateway::token::token_file(&config.client_gateway)
+        .parent()
+        .map(|dir| dir.join("client-files"))
+        .and_then(|dir| {
+            aidaemon_client_gateway::files::FileStore::open(
+                dir,
+                shellexpand::tilde(&config.files.inbox_dir).to_string(),
+            )
+            .map_err(|e| tracing::warn!(error = %e, "Client files are off: their folder failed"))
+            .ok()
+        })
+        .map(Arc::new);
     let gateway = ClientGateway::start(GatewayDeps {
+        files: files.clone(),
         turns: aidaemon_channels::turns::TurnDeps {
             agent: deps.agent.clone(),
             session_map: deps.session_map.clone(),
@@ -811,6 +841,7 @@ pub async fn start(
                 system.mcp.take(),
                 Some(deps.command_context()),
             ),
+            files,
             setup: crate::setup::channel::ChannelSetup {
                 config_path: commands.config_path.clone(),
                 state: deps.state.clone(),
