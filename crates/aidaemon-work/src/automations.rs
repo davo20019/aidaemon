@@ -516,11 +516,19 @@ pub fn scheduled_card(
             .iter()
             .flat_map(|schedule| {
                 schedule.next.iter().flat_map(|next| {
-                    std::iter::once(next)
+                    let runs: Vec<&String> = std::iter::once(next)
                         .chain(schedule.following.iter().filter(|_| !schedule.one_shot))
                         .take(3)
-                        .enumerate()
-                        .map(|(index, run)| format!("Run {}: {run}", index + 1))
+                        .collect();
+                    // One upcoming run is "Next"; a few are numbered.
+                    let single = runs.len() == 1;
+                    runs.into_iter().enumerate().map(move |(index, run)| {
+                        if single {
+                            format!("Next: {run}")
+                        } else {
+                            format!("Run {}: {run}", index + 1)
+                        }
+                    })
                 })
             })
             .collect(),
@@ -602,7 +610,7 @@ mod tests {
                 "Can do: Anything you can do – it runs with your full access",
                 "Tells you when: a run finishes, or it hits a problem",
                 "Ends: Only when you stop it",
-                "Run 1: Thu, Nov 13, 8:00 AM ET",
+                "Next: Thu, Nov 13, 8:00 AM ET",
             ]
         );
         assert_eq!(
@@ -658,7 +666,7 @@ mod tests {
         };
         assert_eq!(
             scheduled_card("Run once", None, &[once], "ET").details,
-            vec!["Run 1: Thu, Nov 13, 9:00 AM ET"]
+            vec!["Next: Thu, Nov 13, 9:00 AM ET"]
         );
     }
 
