@@ -381,8 +381,18 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
     feed([frame(
-        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday at 9:00 AM ET","status":"active"},{"id":"mandate-1","kind":"watching","name":"Status watch","what":"Watch the synthetic status page","how_often":"Every hour","status":"paused"}]}}"#,
+        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday at 9:00 AM ET","status":"active"},{"id":"mandate-1","kind":"watching","name":"Status watch","what":"Watch the synthetic status page","how_often":"Every hour","status":"paused","recent_runs":[{"started_ms":1767002400000,"finished_ms":1767002460000,"outcome":"done","summary":"No change on the synthetic status page."}]},{"id":"goal-2","kind":"scheduled","name":"Repo check","what":"Check the synthetic repo","how_often":"Every day at 8:00 AM ET","status":"held_after_failures","recent_runs":[{"started_ms":1767002400000,"outcome":"failed","summary":"The synthetic token expired."},{"started_ms":1766916000000,"outcome":"done","summary":"2 open PRs."}]}]}}"#,
     )]);
+    // What each one did, not only what it will do.
+    app.wait_for("It hasn't run yet.")?;
+    app.wait_for(r"text:/^Last run .* · Failed: The synthetic token expired\.$/")?;
+    // Paused after its runs kept failing: the way back is a good run.
+    app.wait_for("Paused after failures")?;
+    app.wait_for("Try again")?;
+    app.press("History >> nth=1")?;
+    app.wait_for("2 open PRs.")?;
+    app.press("Hide history")?;
+    app.wait_for_gone("2 open PRs.", std::time::Duration::from_secs(5))?;
     app.wait_for("Inbox digest")?;
     app.wait_for("Scheduled · Every weekday at 9:00 AM ET")?;
     // A paused one resumes; only scheduled work runs now.

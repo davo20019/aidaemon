@@ -5,7 +5,9 @@
 //! conversation for that. Read on open, every 30 seconds while open, on
 //! Refresh, and after each change (its answer brings the list).
 
-use aidaemon_client_protocol::{AutomationChange, AutomationKind, AutomationSummary};
+use aidaemon_client_protocol::{
+    AutomationChange, AutomationKind, AutomationRun, AutomationSummary, RunOutcome,
+};
 use nsh_core::prelude::*;
 
 use crate::store::{AutomationsRead, Store, now_ms};
@@ -126,10 +128,79 @@ fn state_badge(status: &str) -> Option<(&'static str, Tone)> {
         "active" => None,
         "paused" => Some(("Paused", Tone::Neutral)),
         "failed" | "stalled" => Some(("Failed", Tone::Danger)),
+        "held_after_failures" => Some(("Paused after failures", Tone::Danger)),
         "awaiting_input" => Some(("Waiting for you", Tone::Warning)),
         "pending_confirmation" => Some(("Not confirmed yet", Tone::Warning)),
         _ => Some(("Off", Tone::Neutral)),
     }
+}
+
+fn outcome_word(outcome: RunOutcome) -> (&'static str, Tone) {
+    match outcome {
+        RunOutcome::Running => ("Running", Tone::Info),
+        RunOutcome::Done => ("Done", Tone::Success),
+        RunOutcome::Failed => ("Failed", Tone::Danger),
+        RunOutcome::Blocked => ("Blocked", Tone::Warning),
+        RunOutcome::Cancelled => ("Cancelled", Tone::Neutral),
+        RunOutcome::Unknown => ("Ended", Tone::Neutral),
+    }
+}
+
+/// "Mon 9:02 AM".
+fn ran_at(at_ms: u64) -> String {
+    format!(
+        "{} {}",
+        time::day_label(at_ms, now_ms()),
+        time::clock(at_ms)
+    )
+}
+
+/// Its latest run in one line: when, how it ended, what it said.
+fn last_run(run: &AutomationRun) -> Text {
+    let (word, _) = outcome_word(run.outcome);
+    let mut line = format!("Last run {} · {word}", ran_at(run.started_ms));
+    if let Some(summary) = run.summary.as_deref() {
+        line.push_str(": ");
+        line.push_str(summary);
+    }
+    text(line)
+        .number_of_lines(2)
+        .text_size(px(type_scale::SM))
+        .text_color(if run.outcome == RunOutcome::Failed {
+            colors::DANGER
+        } else {
+            colors::TEXT
+        })
+}
+
+/// Its recent runs, newest first: each run's end and what it said.
+fn history(runs: Vec<AutomationRun>) -> View {
+    let mut list = view().gap_2().pt_1();
+    for run in runs {
+        let (word, tone) = outcome_word(run.outcome);
+        let mut row = view().gap(px(2.0)).child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(ui::status(word, tone))
+                .child(
+                    text(ran_at(run.started_ms))
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::MUTED),
+                ),
+        );
+        if let Some(summary) = run.summary {
+            row = row.child(
+                text(summary)
+                    .number_of_lines(4)
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::MUTED),
+            );
+        }
+        list = list.child(row);
+    }
+    list
 }
 
 fn card(store: Store, automation: AutomationSummary) -> View {
@@ -178,6 +249,18 @@ fn card(store: Store, automation: AutomationSummary) -> View {
                 .text_color(colors::MUTED),
         );
     }
+    // What it did, not only what it will do.
+    match automation.recent_runs.first() {
+        Some(run) => c = c.child(last_run(run)),
+        None => {
+            c = c.child(
+                text("It hasn't run yet.")
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+            )
+        }
+    }
+    let showing = signal(false);
     let act = {
         let id = id.clone();
         move |change: AutomationChange| {
@@ -198,12 +281,25 @@ fn card(store: Store, automation: AutomationSummary) -> View {
                 .text_color(colors::FAINT),
         );
     }
+    // Paused after failures: its next good run turns it back on.
+    let held = automation.status == "held_after_failures";
+    let failed = matches!(automation.status.as_str(), "failed" | "stalled");
     let mut actions = view().flex_row().flex_wrap().gap_1().pt_1();
-    if !waiting {
+    if held {
+        actions = actions.child(
+            ui::btn(
+                "Try again",
+                Variant::Secondary,
+                Size::Sm,
+                act(AutomationChange::RunNow),
+            )
+            .disabled(busy.clone()),
+        );
+    } else if !waiting {
         actions = actions.child(
             if paused {
                 ui::btn(
-                    "Resume",
+                    if failed { "Try again" } else { "Resume" },
                     Variant::Secondary,
                     Size::Sm,
                     act(AutomationChange::Resume),
@@ -219,7 +315,7 @@ fn card(store: Store, automation: AutomationSummary) -> View {
             .disabled(busy.clone()),
         );
     }
-    if automation.kind == AutomationKind::Scheduled {
+    if automation.kind == AutomationKind::Scheduled && !held {
         actions = actions.child(
             ui::btn(
                 "Run now",
@@ -260,5 +356,21 @@ fn card(store: Store, automation: AutomationSummary) -> View {
             })
         }),
     );
+    let runs = automation.recent_runs.clone();
+    if !runs.is_empty() {
+        actions = actions.child(
+            when(showing, move || {
+                ui::btn("Hide history", Variant::Ghost, Size::Sm, move || {
+                    showing.set(false)
+                })
+            })
+            .otherwise(move || {
+                ui::btn("History", Variant::Ghost, Size::Sm, move || {
+                    showing.set(true)
+                })
+            }),
+        );
+    }
     c.child(actions)
+        .child(when(showing, move || history(runs.clone())))
 }
