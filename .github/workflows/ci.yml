@@ -296,8 +296,15 @@ jobs:
         if: always()
         run: cargo build --locked --manifest-path clients/app/Cargo.toml
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # One process per test with a time limit (.config/nextest.toml), so
+      # a hang fails alone and every result is reported.
       - name: Test
-        run: cargo test --lib --locked
+        run: cargo nextest run --lib --locked --profile windows-ci
 
   test:
     name: Test (${{ matrix.os }})
