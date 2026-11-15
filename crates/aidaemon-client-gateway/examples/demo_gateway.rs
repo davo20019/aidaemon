@@ -576,6 +576,7 @@ impl ClientHost for Host {
                 }],
                 hard_model: String::new(),
                 quick_model: String::new(),
+                offered_models: Vec::new(),
                 credential: if option.needs_key {
                     CredentialState::KeyStored
                 } else {
@@ -692,6 +693,7 @@ fn demo_settings() -> &'static std::sync::Mutex<Settings> {
                     models: models.iter().map(|m| m.to_string()).collect(),
                     hard_model: models.first().map(|m| m.to_string()).unwrap_or_default(),
                     quick_model: models.last().map(|m| m.to_string()).unwrap_or_default(),
+                    offered_models: models.iter().map(|m| m.to_string()).collect(),
                     credential,
                     key_setting: key.into(),
                 }

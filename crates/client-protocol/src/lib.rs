@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 20;
+pub const PROTOCOL_MINOR: u16 = 21;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -981,6 +981,12 @@ pub struct ConnectedProvider {
     /// The model it uses for quick jobs, chosen the same way (protocol 1.20).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quick_model: String,
+    /// The models its provider offers, from the daemon's catalog, for the
+    /// client to offer as choices besides `models` (protocol 1.21). Empty
+    /// when the catalog cannot know them (an OpenAI-compatible server,
+    /// whose models depend on its address) or the daemon is older.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_models: Vec<String>,
     pub credential: CredentialState,
     /// The setting its key is stored under (`provider.api_key`,
     /// `provider.fallbacks[0].api_key`); empty for a sign-in.

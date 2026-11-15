@@ -99,6 +99,17 @@ fn jobs_of(table: &toml::Table, kind: &str) -> (String, String) {
     (models.smart, models.fast)
 }
 
+/// The models a provider's catalog entry offers; none when no entry
+/// matches or its models depend on the address.
+fn offered_of(entry: Option<&CatalogEntry>) -> Vec<String> {
+    entry
+        .map(|entry| entry.offered.models())
+        .unwrap_or_default()
+        .iter()
+        .map(|model| model.to_string())
+        .collect()
+}
+
 /// One provider table as the tab shows it. `failover`: its index, or
 /// `None` for the main provider. `stored`: whether a secret is stored under
 /// a keychain name; `signed_in`: whether ChatGPT is.
@@ -163,6 +174,7 @@ fn connected_of(
         models: models_of(table),
         hard_model,
         quick_model,
+        offered_models: offered_of(entry),
         credential,
         key_setting: if kind == CHATGPT_KIND {
             String::new()
@@ -456,6 +468,62 @@ api_key = "keychain"
         assert!(all[3].name.ends_with("llm.example.com"), "{}", all[3].name);
         assert_eq!(all[3].credential, CredentialState::KeyMissing);
         assert_eq!(failover_count(&config), 3);
+    }
+
+    #[test]
+    fn each_provider_offers_its_catalog_models_and_servers_offer_none() {
+        let config = table(
+            r#"
+[provider]
+kind = "anthropic"
+api_key = "keychain"
+
+[[provider.fallbacks]]
+kind = "openai_chatgpt"
+
+[[provider.fallbacks]]
+kind = "openai_compatible"
+base_url = "https://api.deepseek.com"
+
+[[provider.fallbacks]]
+kind = "openai_compatible"
+base_url = "https://llm.example.com/v1"
+
+[[provider.fallbacks]]
+kind = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+
+[[provider.fallbacks]]
+kind = "not-a-kind"
+"#,
+        );
+        let all = connected_with(&config, &|_| false, true);
+        assert_eq!(
+            all[0].offered_models,
+            [
+                "claude-fable-5-2",
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-haiku-5-5"
+            ]
+        );
+        assert_eq!(all[1].preset, "openai_chatgpt");
+        assert_eq!(
+            all[1].offered_models,
+            aidaemon_providers::CHATGPT_KNOWN_MODELS
+        );
+        assert!(all[1].offered_models.iter().any(|m| m == "gpt-6-astra"));
+        assert_eq!(all[2].preset, "deepseek");
+        assert_eq!(
+            all[2].offered_models,
+            ["deepseek-chat", "deepseek-reasoner"]
+        );
+        // Servers whose models depend on the address, and an unknown kind.
+        assert_eq!(all[3].preset, "custom_openai_compatible");
+        assert!(all[3].offered_models.is_empty());
+        assert_eq!(all[4].preset, "ollama");
+        assert!(all[4].offered_models.is_empty());
+        assert!(all[5].offered_models.is_empty());
     }
 
     #[test]

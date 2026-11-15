@@ -57,6 +57,27 @@ pub struct Models {
     pub smart: &'static str,
 }
 
+/// The models a provider offers, for a settings screen to offer as
+/// choices before (or without) asking the provider for its listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferedModels {
+    /// These models, the catalog's own first.
+    Listed(&'static [&'static str]),
+    /// Whatever the server at the owner's address serves: the catalog
+    /// cannot know them.
+    ByAddress,
+}
+
+impl OfferedModels {
+    /// The models, empty for [`OfferedModels::ByAddress`].
+    pub fn models(self) -> &'static [&'static str] {
+        match self {
+            OfferedModels::Listed(models) => models,
+            OfferedModels::ByAddress => &[],
+        }
+    }
+}
+
 /// One provider.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CatalogEntry {
@@ -69,6 +90,8 @@ pub struct CatalogEntry {
     /// Empty: the provider's own default.
     pub base_url: &'static str,
     pub models: Models,
+    /// The models it offers to pick from.
+    pub offered: OfferedModels,
     pub credential: Credential,
     pub billing: Billing,
     /// The owner must name the address.
@@ -173,6 +196,7 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "gpt-6-luna",
             smart: "gpt-6-sol",
         },
+        offered: OfferedModels::Listed(crate::CHATGPT_KNOWN_MODELS),
         credential: Credential::ChatGptSignIn,
         billing: Billing::Plan,
         custom_base_url: false,
@@ -189,6 +213,12 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "claude-haiku-5-5",
             smart: "claude-opus-5-5",
         },
+        offered: OfferedModels::Listed(&[
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ]),
         credential: Credential::ApiKey {
             env: &["ANTHROPIC_API_KEY"],
             key_url: "https://console.anthropic.com/settings/keys",
@@ -204,6 +234,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::OpenaiCompatible,
         base_url: "https://api.openai.com/v1",
         models: same("gpt-5"),
+        offered: OfferedModels::Listed(&["gpt-5"]),
         credential: Credential::ApiKey {
             env: &["OPENAI_API_KEY"],
             key_url: "https://platform.openai.com/api-keys",
@@ -223,6 +254,11 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "gemini-3.5-flash-lite",
             smart: "gemini-4-argon",
         },
+        offered: OfferedModels::Listed(&[
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-3.5-flash-lite",
+        ]),
         credential: Credential::ApiKey {
             env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
             key_url: "https://aistudio.google.com/apikey",
@@ -238,6 +274,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::OpenaiCompatible,
         base_url: "https://openrouter.ai/api/v1",
         models: same("moonshotai/kimi-k2.5"),
+        offered: OfferedModels::Listed(&["moonshotai/kimi-k2.5"]),
         credential: Credential::ApiKey {
             env: &["OPENROUTER_API_KEY"],
             key_url: "https://openrouter.ai/keys",
@@ -253,6 +290,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::XaiNative,
         base_url: "https://api.x.ai/v1",
         models: same("grok-4"),
+        offered: OfferedModels::Listed(&["grok-4"]),
         credential: Credential::ApiKey {
             env: &["XAI_API_KEY"],
             key_url: "https://console.x.ai",
@@ -272,6 +310,7 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "deepseek-chat",
             smart: "deepseek-reasoner",
         },
+        offered: OfferedModels::Listed(&["deepseek-chat", "deepseek-reasoner"]),
         credential: Credential::ApiKey {
             env: &["DEEPSEEK_API_KEY"],
             key_url: "https://platform.deepseek.com/api_keys",
@@ -291,6 +330,7 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "kimi-k2.5",
             smart: "kimi-k2-thinking",
         },
+        offered: OfferedModels::Listed(&["kimi-k2.5", "kimi-k2-thinking"]),
         credential: Credential::ApiKey {
             env: &["MOONSHOT_API_KEY"],
             key_url: "https://platform.moonshot.ai/",
@@ -310,6 +350,7 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "MiniMax-M2.5-highspeed",
             smart: "MiniMax-M2.5",
         },
+        offered: OfferedModels::Listed(&["MiniMax-M2.5", "MiniMax-M2.5-highspeed"]),
         credential: Credential::ApiKey {
             env: &["MINIMAX_API_KEY"],
             key_url: "https://platform.minimax.io/user-center/basic-information",
@@ -325,6 +366,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::OpenaiCompatible,
         base_url: "",
         models: same(""),
+        offered: OfferedModels::ByAddress,
         credential: Credential::ApiKey {
             env: &[],
             key_url: "",
@@ -340,6 +382,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::OpenaiCompatible,
         base_url: "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/compat",
         models: same(""),
+        offered: OfferedModels::ByAddress,
         credential: Credential::ApiKey {
             env: &[],
             key_url: "https://dash.cloudflare.com/",
@@ -359,6 +402,11 @@ pub const CATALOG: &[CatalogEntry] = &[
             fast: "anthropic/claude-haiku-4",
             smart: "anthropic/claude-opus-4",
         },
+        offered: OfferedModels::Listed(&[
+            "anthropic/claude-sonnet-4",
+            "anthropic/claude-opus-4",
+            "anthropic/claude-haiku-4",
+        ]),
         credential: Credential::ApiKey {
             env: &[],
             key_url: "https://openrouter.ai/keys",
@@ -374,6 +422,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::OpenaiCompatible,
         base_url: "http://localhost:11434/v1",
         models: same(""),
+        offered: OfferedModels::ByAddress,
         credential: Credential::None,
         billing: Billing::Local,
         custom_base_url: false,
@@ -629,6 +678,41 @@ mod tests {
         assert_eq!(ids.len(), CATALOG.len());
         assert_eq!(find("Claude").map(|e| e.id), Some("anthropic_native"));
         assert_eq!(find("chat gpt").map(|e| e.id), Some("openai_chatgpt"));
+    }
+
+    #[test]
+    fn each_hosted_entry_offers_its_own_models_and_servers_offer_none() {
+        for entry in CATALOG {
+            let offered = entry.offered.models();
+            if entry.models.primary.is_empty() {
+                // Its models depend on the address the owner names.
+                assert_eq!(entry.offered, OfferedModels::ByAddress, "{}", entry.id);
+                continue;
+            }
+            for model in [entry.models.primary, entry.models.fast, entry.models.smart] {
+                assert!(offered.contains(&model), "{} lacks {model}", entry.id);
+            }
+            let mut unique = offered.to_vec();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), offered.len(), "{} repeats a model", entry.id);
+        }
+        assert_eq!(
+            find("anthropic").unwrap().offered.models(),
+            [
+                "claude-fable-5-2",
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-haiku-5-5"
+            ]
+        );
+        assert_eq!(
+            find("chatgpt").unwrap().offered.models(),
+            crate::CHATGPT_KNOWN_MODELS
+        );
+        for id in ["custom_openai_compatible", "cloudflare_gateway", "ollama"] {
+            assert!(find(id).unwrap().offered.models().is_empty(), "{id}");
+        }
     }
 
     #[test]

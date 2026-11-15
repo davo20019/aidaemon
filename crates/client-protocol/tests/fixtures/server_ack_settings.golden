@@ -30,6 +30,11 @@
             "synthetic-model-1"
           ],
           "name": "OpenAI (ChatGPT subscription)",
+          "offered_models": [
+            "synthetic-model-1",
+            "synthetic-model-2",
+            "synthetic-model-3"
+          ],
           "preset": "openai_chatgpt",
           "quick_model": "synthetic-model-2"
         },

@@ -2310,6 +2310,13 @@
           "description": "In plain words (\"Anthropic\", \"OpenAI-compatible · example.com\").",
           "type": "string"
         },
+        "offered_models": {
+          "description": "The models its provider offers, from the daemon's catalog, for the\nclient to offer as choices besides `models` (protocol 1.21). Empty\nwhen the catalog cannot know them (an OpenAI-compatible server,\nwhose models depend on its address) or the daemon is older.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "preset": {
           "description": "The catalog preset it matches; empty when none does.",
           "type": "string"
