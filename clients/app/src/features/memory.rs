@@ -113,6 +113,7 @@ fn body(store: Store, read: MemoryRead, query: &str) -> View {
 fn memory_row(store: Store, item: MemoryItem) -> View {
     let id = item.id.clone();
     let forgotten = format!("Your agent stops remembering: {}", item.value);
+    let label = readable_key(&item.key);
     let meta = {
         let mut parts = vec![item.category.clone()];
         if !item.source.is_empty() {
@@ -121,30 +122,35 @@ fn memory_row(store: Store, item: MemoryItem) -> View {
         parts.push(format!("updated {}", time::ago(item.updated_ms, now_ms())));
         parts.join(" · ")
     };
+    let mut body = view().flex_1().min_w(px(0.0)).gap(px(2.0));
+    if !label.is_empty() {
+        body = body.child(
+            text(label)
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::MUTED),
+        );
+    }
+    let body = body
+        .child(
+            text(item.value.clone())
+                .selectable(true)
+                .text_size(px(ui::fit::body()))
+                .text_color(colors::TEXT),
+        )
+        .child(
+            text(meta)
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        );
     ui::surface()
         .flex_row()
         .items_center()
         .gap_3()
         .px_3()
         .py_2()
-        .child(
-            view()
-                .flex_1()
-                .min_w(px(0.0))
-                .gap(px(2.0))
-                .child(
-                    text(item.value.clone())
-                        .selectable(true)
-                        .text_size(px(ui::fit::body()))
-                        .text_color(colors::TEXT),
-                )
-                .child(
-                    text(meta)
-                        .number_of_lines(1)
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT),
-                ),
-        )
+        .child(body)
         .child(
             ui::btn("Forget", Variant::Ghost, Size::Sm, move || {
                 let id = id.clone();
@@ -154,4 +160,16 @@ fn memory_row(store: Store, item: MemoryItem) -> View {
             })
             .accessibility_label(format!("Forget: {}", item.value)),
         )
+}
+
+/// A fact's key as words, so a bare value such as `ddev` says what it is
+/// ("Local dev tool"). The model sees the key; the owner should too.
+fn readable_key(key: &str) -> String {
+    let words = key.replace(['_', '-'], " ");
+    let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
