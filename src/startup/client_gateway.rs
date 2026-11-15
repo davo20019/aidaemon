@@ -462,6 +462,13 @@ impl ClientHost for DaemonClientHost {
         Some(self.system.status().await)
     }
 
+    async fn changes(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<aidaemon_client_protocol::SessionChanges> {
+        super::client_changes::session_changes(&self.system.pool, session_id).await
+    }
+
     async fn settings(&self) -> anyhow::Result<Option<aidaemon_client_protocol::Settings>> {
         self.settings.settings().await.map(Some)
     }
