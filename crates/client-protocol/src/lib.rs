@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 15;
+pub const PROTOCOL_MINOR: u16 = 16;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -235,6 +235,15 @@ pub enum Command {
         /// when continuing one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<String>,
+        /// The model the conversation answers with from this message on
+        /// (protocol 1.16); absent: as it was. Only the app's own
+        /// conversations take one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelChoice>,
+        /// How hard it thinks from this message on (protocol 1.16);
+        /// absent: as it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
     },
     /// Stop everything the session has running (`/cancel all`).
     StopTurn { session_id: String },
@@ -375,9 +384,90 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notify: Option<AutomationNotify>,
     },
+    /// The providers and models a conversation can be set to answer with
+    /// (protocol 1.16). Answers with `models`.
+    ListModels,
+    /// The model and effort a conversation answers with (protocol 1.16).
+    /// Answers with `session_model`.
+    GetSessionModel { session_id: String },
+    /// Set the model and effort an app conversation answers with from its
+    /// next turn (protocol 1.16); a field left out stays as it is. Answers
+    /// with `session_model`.
+    SetSessionModel {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelChoice>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+/// The model a conversation answers with (protocol 1.16).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ModelChoice {
+    /// The daemon picks, turn by turn, as it does for every chat.
+    #[default]
+    Auto,
+    /// This model of this provider (ids from `list_models`), every turn.
+    Pinned { provider: String, model: String },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// How hard the model thinks before it answers (protocol 1.16).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    /// The model's own setting, raised by the daemon when it needs more.
+    #[default]
+    Auto,
+    Low,
+    Medium,
+    High,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// What a conversation can be set to answer with (protocol 1.16).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ModelOptions {
+    /// The connected providers, the main one first, each listing only the
+    /// models no earlier provider lists.
+    pub providers: Vec<ModelProvider>,
+}
+
+/// A connected provider, as a model picker lists it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ModelProvider {
+    /// What a `pinned` choice names it by.
+    pub id: String,
+    /// In plain words ("Anthropic", "ChatGPT").
+    pub name: String,
+    pub billing: Billing,
+    pub models: Vec<ModelOption>,
+}
+
+/// A model a conversation can be set to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ModelOption {
+    pub id: String,
+    /// The efforts it takes besides `auto`; empty: it takes none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<Effort>,
+}
+
+/// The model and effort a conversation answers with (protocol 1.16).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SessionModel {
+    pub session_id: String,
+    pub model: ModelChoice,
+    pub effort: Effort,
 }
 
 /// Where a message sent while its session works goes.
@@ -530,6 +620,14 @@ pub enum CommandResult {
     /// `create_project` and `update_project`: the project as it is now.
     Project {
         project: ProjectSummary,
+    },
+    /// `list_models` (protocol 1.16).
+    Models {
+        options: ModelOptions,
+    },
+    /// `get_session_model` and `set_session_model` (protocol 1.16).
+    SessionModel {
+        session_model: SessionModel,
     },
     #[serde(other)]
     #[schemars(skip)]

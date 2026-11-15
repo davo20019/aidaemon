@@ -380,8 +380,11 @@ pub async fn call_llm_with_recovery(
 ) -> anyhow::Result<aidaemon_events::provider::ProviderResponse> {
     use aidaemon_core::{Failover, FailoverStep};
 
+    // A model a conversation pinned may belong to a failover provider: its
+    // first attempt goes there, and the usual chain follows.
+    let first = owner_of(&host.llm_runtime().snapshot(), model, provider.clone());
     let mut steps = vec![
-        FailoverStep::from_arc(provider.clone())
+        FailoverStep::from_arc(first)
             .model(model)
             .deadline(first_attempt_deadline)
             .attempts(MAX_STEP_ATTEMPTS),
@@ -517,16 +520,80 @@ impl aidaemon_core::FailoverPolicy for RecoveryHandle {
 }
 
 pub async fn model_override_active(host: &dyn TurnHost, session_id: &str) -> bool {
-    match tokio::time::timeout(Duration::from_secs(2), host.model_override_lock().read()).await {
-        Ok(guard) => *guard,
-        Err(_) => {
+    let global =
+        match tokio::time::timeout(Duration::from_secs(2), host.model_override_lock().read()).await
+        {
+            Ok(guard) => *guard,
+            Err(_) => {
+                warn!(
+                    session_id,
+                    "Timed out acquiring model_override lock; treating the model as pinned"
+                );
+                true
+            }
+        };
+    global
+        || session_pinned_model(host, &host.llm_runtime().snapshot(), session_id)
+            .await
+            .is_some()
+}
+
+/// The model a client pinned for this conversation, when the runtime still
+/// has it. Only the root agent's turns follow it: sub-agents and
+/// specialists keep their own choice.
+pub async fn session_pinned_model(
+    host: &dyn TurnHost,
+    snapshot: &crate::llm::LlmRuntimeSnapshot,
+    session_id: &str,
+) -> Option<String> {
+    if host.depth() != 0 {
+        return None;
+    }
+    let pin = crate::session_model::get(host.settings(), session_id)
+        .await
+        .pinned?;
+    match crate::session_model::resolve(snapshot, &pin) {
+        Some(_) => Some(pin.model),
+        None => {
             warn!(
                 session_id,
-                "Timed out acquiring model_override lock; treating the model as pinned"
+                provider = %pin.provider,
+                model = %pin.model,
+                "The conversation's pinned model is no longer configured; choosing automatically"
             );
-            true
+            None
         }
     }
+}
+
+/// The effort a client set for this conversation, when the provider that
+/// owns `model` takes it. Root agent turns only, as for the model.
+pub async fn session_effort(host: &dyn TurnHost, session_id: &str, model: &str) -> Option<String> {
+    if host.depth() != 0 {
+        return None;
+    }
+    let effort = crate::session_model::get(host.settings(), session_id)
+        .await
+        .effort?;
+    let snapshot = host.llm_runtime().snapshot();
+    let kind = crate::session_model::pickable(&snapshot)
+        .into_iter()
+        .find(|provider| provider.models.iter().any(|known| known == model))
+        .map_or(snapshot.provider_kind(), |provider| provider.kind);
+    crate::session_model::effort_valid(kind, &effort).then_some(effort)
+}
+
+/// The provider a request for `model` goes to: the first provider of the
+/// runtime that lists it, else `fallback` (the main provider).
+fn owner_of(
+    snapshot: &crate::llm::LlmRuntimeSnapshot,
+    model: &str,
+    fallback: crate::llm::ModelBackend,
+) -> crate::llm::ModelBackend {
+    crate::session_model::pickable(snapshot)
+        .into_iter()
+        .find(|provider| provider.models.iter().any(|known| known == model))
+        .map_or(fallback, |provider| provider.backend)
 }
 
 pub async fn select_turn_model(
@@ -562,6 +629,9 @@ pub async fn select_turn_model(
     };
     if is_override {
         return (own_model().await, false);
+    }
+    if let Some(model) = session_pinned_model(host, snapshot, session_id).await {
+        return (model, false);
     }
     let autonomous = host
         .turn_runtime()

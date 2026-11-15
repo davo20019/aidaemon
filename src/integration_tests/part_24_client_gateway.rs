@@ -255,6 +255,8 @@ mod client_gateway {
                 attachments: Vec::new(),
                 mid_run: None,
                 project_id: None,
+                model: None,
+                effort: None,
             },
         )
         .await;

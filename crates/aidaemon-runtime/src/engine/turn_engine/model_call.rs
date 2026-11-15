@@ -265,6 +265,13 @@ impl TurnEngine<'_> {
         self.observe_sent(scope.run_id, &messages);
         let mut options = to_chat_options(request);
         options.cache_key = Some(scope.session_id.to_string());
+        // The effort a client set for the conversation, unless a hook
+        // already chose one for this call.
+        if options.reasoning_effort_override.is_none() {
+            options.reasoning_effort_override =
+                crate::llm::turn_calls::session_effort(self.host, scope.session_id, &request.model)
+                    .await;
+        }
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
         // `Some(interactive_slot)` to keep its KV cache warm; sub-agents carry
         // `None` and use the provider's background slot.

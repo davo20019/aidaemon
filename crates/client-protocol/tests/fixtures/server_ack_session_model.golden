@@ -1,0 +1,16 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "session_model": {
+      "effort": "high",
+      "model": {
+        "mode": "pinned",
+        "model": "synthetic-model-large",
+        "provider": "main"
+      },
+      "session_id": "app:6c1f"
+    },
+    "type": "session_model"
+  },
+  "type": "ack"
+}

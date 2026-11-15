@@ -72,6 +72,7 @@ pub mod mid_run;
 pub mod policy;
 pub mod prompt;
 pub mod run_state;
+pub mod session_model;
 pub mod settings;
 pub mod spawn;
 pub mod spawn_tool;

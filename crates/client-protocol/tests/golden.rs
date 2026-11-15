@@ -138,6 +138,9 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListAutomations => "list_automations",
         Command::ChangeAutomation { .. } => "change_automation",
         Command::EditAutomation { .. } => "edit_automation",
+        Command::ListModels => "list_models",
+        Command::GetSessionModel { .. } => "get_session_model",
+        Command::SetSessionModel { .. } => "set_session_model",
         Command::Unknown => "unknown",
     }
 }
@@ -176,6 +179,8 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Projects { .. } => "projects",
         CommandResult::Automations { .. } => "automations",
         CommandResult::Project { .. } => "project",
+        CommandResult::Models { .. } => "models",
+        CommandResult::SessionModel { .. } => "session_model",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -217,6 +222,11 @@ fn client_samples() -> Vec<ClientFrame> {
                 }],
                 mid_run: Some(MidRun::Queue),
                 project_id: Some("project-acme".into()),
+                model: Some(ModelChoice::Pinned {
+                    provider: "main".into(),
+                    model: "synthetic-model-large".into(),
+                }),
+                effort: Some(Effort::High),
             },
         ),
         command(
@@ -369,6 +379,21 @@ fn client_samples() -> Vec<ClientFrame> {
                 when: Some("every weekday at 8am".into()),
                 instructions: Some("Summarize the synthetic inbox; skip newsletters".into()),
                 notify: None,
+            },
+        ),
+        command("5d0c2b1e-001e", Command::ListModels),
+        command(
+            "5d0c2b1e-001f",
+            Command::GetSessionModel {
+                session_id: "app:6c1f".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0020",
+            Command::SetSessionModel {
+                session_id: "app:6c1f".into(),
+                model: Some(ModelChoice::Auto),
+                effort: Some(Effort::Low),
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -913,6 +938,40 @@ fn server_samples() -> Vec<ServerFrame> {
             projects: vec![project()],
         }),
         ack(CommandResult::Project { project: project() }),
+        ack(CommandResult::Models {
+            options: ModelOptions {
+                providers: vec![
+                    ModelProvider {
+                        id: "main".into(),
+                        name: "ChatGPT".into(),
+                        billing: Billing::Plan,
+                        models: vec![ModelOption {
+                            id: "synthetic-model-large".into(),
+                            efforts: vec![Effort::Low, Effort::Medium, Effort::High],
+                        }],
+                    },
+                    ModelProvider {
+                        id: "failover-0".into(),
+                        name: "Google Gemini".into(),
+                        billing: Billing::PerToken,
+                        models: vec![ModelOption {
+                            id: "synthetic-model-flash".into(),
+                            efforts: vec![],
+                        }],
+                    },
+                ],
+            },
+        }),
+        ack(CommandResult::SessionModel {
+            session_model: SessionModel {
+                session_id: "app:6c1f".into(),
+                model: ModelChoice::Pinned {
+                    provider: "main".into(),
+                    model: "synthetic-model-large".into(),
+                },
+                effort: Effort::High,
+            },
+        }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {
             request_id: Some("5d0c2b1e-0003".into()),

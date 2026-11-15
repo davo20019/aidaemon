@@ -1004,6 +1004,17 @@
               },
               "type": "array"
             },
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "How hard it thinks from this message on (protocol 1.16);\nabsent: as it was."
+            },
             "mid_run": {
               "anyOf": [
                 {
@@ -1014,6 +1025,17 @@
                 }
               ],
               "description": "What to do with it when the session is already working\n(protocol 1.3). `None`: the agent reads it and decides."
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ModelChoice"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The model the conversation answers with from this message on\n(protocol 1.16); absent: as it was. Only the app's own\nconversations take one."
             },
             "project_id": {
               "description": "The project a new session starts in (protocol 1.10); ignored\nwhen continuing one.",
@@ -1591,6 +1613,73 @@
             "automation_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "The providers and models a conversation can be set to answer with\n(protocol 1.16). Answers with `models`.",
+          "properties": {
+            "type": {
+              "const": "list_models",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The model and effort a conversation answers with (protocol 1.16).\nAnswers with `session_model`.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "get_session_model",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Set the model and effort an app conversation answers with from its\nnext turn (protocol 1.16); a field left out stays as it is. Answers\nwith `session_model`.",
+          "properties": {
+            "effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Effort"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ModelChoice"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "set_session_model",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2008,6 +2097,40 @@
             "project"
           ],
           "type": "object"
+        },
+        {
+          "description": "`list_models` (protocol 1.16).",
+          "properties": {
+            "options": {
+              "$ref": "#/$defs/ModelOptions"
+            },
+            "type": {
+              "const": "models",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`get_session_model` and `set_session_model` (protocol 1.16).",
+          "properties": {
+            "session_model": {
+              "$ref": "#/$defs/SessionModel"
+            },
+            "type": {
+              "const": "session_model",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_model"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2191,6 +2314,24 @@
         "created_at_ms"
       ],
       "type": "object"
+    },
+    "Effort": {
+      "description": "How hard the model thinks before it answers (protocol 1.16).",
+      "oneOf": [
+        {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "The model's own setting, raised by the daemon when it needs more.",
+          "type": "string"
+        }
+      ]
     },
     "Enrollment": {
       "description": "Where a pairing stands (`GET /client/v1/enrollments/{offer_id}`, and\nthe owner's `GET /client/v1/pairing/offers/{offer_id}`).",
@@ -3326,6 +3467,109 @@
       ],
       "type": "object"
     },
+    "ModelChoice": {
+      "description": "The model a conversation answers with (protocol 1.16).",
+      "oneOf": [
+        {
+          "description": "The daemon picks, turn by turn, as it does for every chat.",
+          "properties": {
+            "mode": {
+              "const": "auto",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "This model of this provider (ids from `list_models`), every turn.",
+          "properties": {
+            "mode": {
+              "const": "pinned",
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "provider",
+            "model"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ModelOption": {
+      "description": "A model a conversation can be set to.",
+      "properties": {
+        "efforts": {
+          "description": "The efforts it takes besides `auto`; empty: it takes none.",
+          "items": {
+            "$ref": "#/$defs/Effort"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "ModelOptions": {
+      "description": "What a conversation can be set to answer with (protocol 1.16).",
+      "properties": {
+        "providers": {
+          "description": "The connected providers, the main one first, each listing only the\nmodels no earlier provider lists.",
+          "items": {
+            "$ref": "#/$defs/ModelProvider"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "providers"
+      ],
+      "type": "object"
+    },
+    "ModelProvider": {
+      "description": "A connected provider, as a model picker lists it.",
+      "properties": {
+        "billing": {
+          "$ref": "#/$defs/Billing"
+        },
+        "id": {
+          "description": "What a `pinned` choice names it by.",
+          "type": "string"
+        },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ModelOption"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "In plain words (\"Anthropic\", \"ChatGPT\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "billing",
+        "models"
+      ],
+      "type": "object"
+    },
     "OfferRequest": {
       "description": "The owner's offer to pair a device (owner only:\n`POST /client/v1/pairing/offers`).",
       "properties": {
@@ -4001,6 +4245,26 @@
           "type": "array"
         }
       },
+      "type": "object"
+    },
+    "SessionModel": {
+      "description": "The model and effort a conversation answers with (protocol 1.16).",
+      "properties": {
+        "effort": {
+          "$ref": "#/$defs/Effort"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelChoice"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "model",
+        "effort"
+      ],
       "type": "object"
     },
     "SessionRequest": {

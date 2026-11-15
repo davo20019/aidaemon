@@ -141,6 +141,34 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no projects".to_string())
     }
 
+    /// The providers and models a conversation can be set to answer with
+    /// (protocol 1.16).
+    async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
+        Ok(Default::default())
+    }
+
+    /// The model and effort conversation `session_id` answers with.
+    async fn session_model(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<aidaemon_client_protocol::SessionModel> {
+        Ok(aidaemon_client_protocol::SessionModel {
+            session_id: session_id.to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Set what conversation `session_id` answers with from its next turn;
+    /// a `None` stays as it is. `Err`: nothing changed, and why.
+    async fn set_session_model(
+        &self,
+        _session_id: &str,
+        _model: Option<aidaemon_client_protocol::ModelChoice>,
+        _effort: Option<aidaemon_client_protocol::Effort>,
+    ) -> Result<aidaemon_client_protocol::SessionModel, String> {
+        Err("This daemon cannot change a conversation's model".to_string())
+    }
+
     /// Put session `session_id` in project `project_id` (`None`: in no
     /// project). `Err`: it stayed where it was, and why.
     async fn set_session_project(
@@ -635,7 +663,10 @@ impl ClientGateway {
             | Command::GetSetup
             | Command::GetChanges { .. }
             | Command::ListProjects
-            | Command::ListAutomations => Some(Scope::Observe),
+            | Command::ListAutomations
+            | Command::ListModels
+            | Command::GetSessionModel { .. } => Some(Scope::Observe),
+            Command::SetSessionModel { .. } => Some(Scope::Chat),
             Command::CreateProject { .. }
             | Command::UpdateProject { .. }
             | Command::SetSessionProject { .. }
@@ -664,6 +695,8 @@ impl ClientGateway {
                 attachments,
                 mid_run,
                 project_id,
+                model,
+                effort,
             } => {
                 let placement = match mid_run {
                     Some(MidRun::Steer) => Some(MidRunPlacement::Steer),
@@ -678,8 +711,38 @@ impl ClientGateway {
                     caller.view_connection,
                     placement,
                     project_id,
+                    (model, effort),
                 )
                 .await
+            }
+            Command::ListModels => Ok(CommandResult::Models {
+                options: self.host.model_options().await.map_err(internal)?,
+            }),
+            Command::GetSessionModel { session_id } => Ok(CommandResult::SessionModel {
+                session_model: self
+                    .host
+                    .session_model(&session_id)
+                    .await
+                    .map_err(internal)?,
+            }),
+            Command::SetSessionModel {
+                session_id,
+                model,
+                effort,
+            } => {
+                if !session_id.starts_with(APP_SESSION_PREFIX) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Invalid,
+                        "Only the app's own conversations can be set to a model",
+                    ));
+                }
+                Ok(CommandResult::SessionModel {
+                    session_model: self
+                        .host
+                        .set_session_model(&session_id, model, effort)
+                        .await
+                        .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?,
+                })
             }
             Command::StopTurn { session_id } => {
                 let report = stop::stop(
@@ -1371,6 +1434,10 @@ impl ClientGateway {
         view_connection: Option<u64>,
         placement: Option<MidRunPlacement>,
         project_id: Option<String>,
+        (model, effort): (
+            Option<aidaemon_client_protocol::ModelChoice>,
+            Option<aidaemon_client_protocol::Effort>,
+        ),
     ) -> Result<CommandResult, ProtocolError> {
         let files = self.message_files(&attachments)?;
         if text.trim().is_empty() && files.is_empty() {
@@ -1385,6 +1452,12 @@ impl ClientGateway {
                 true,
             ),
             Some(session_id) if session_id.starts_with(APP_SESSION_PREFIX) => (session_id, false),
+            Some(_) if model.is_some() || effort.is_some() => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Invalid,
+                    "Only the app's own conversations can be set to a model",
+                ));
+            }
             Some(session_id) => {
                 if !files.is_empty() {
                     return Err(ProtocolError::new(
@@ -1398,6 +1471,14 @@ impl ClientGateway {
                     .await;
             }
         };
+        // The model and effort this message sets apply from its own turn,
+        // so they are stored before it starts.
+        if model.is_some() || effort.is_some() {
+            self.host
+                .set_session_model(&session_id, model, effort)
+                .await
+                .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+        }
         self.runner.register_session(&session_id, APP_CHANNEL).await;
         // A new conversation started inside a project is placed there
         // before its first turn, so that turn already works in its folder.

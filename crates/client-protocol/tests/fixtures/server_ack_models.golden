@@ -1,0 +1,36 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "options": {
+      "providers": [
+        {
+          "billing": "plan",
+          "id": "main",
+          "models": [
+            {
+              "efforts": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "id": "synthetic-model-large"
+            }
+          ],
+          "name": "ChatGPT"
+        },
+        {
+          "billing": "per_token",
+          "id": "failover-0",
+          "models": [
+            {
+              "id": "synthetic-model-flash"
+            }
+          ],
+          "name": "Google Gemini"
+        }
+      ]
+    },
+    "type": "models"
+  },
+  "type": "ack"
+}

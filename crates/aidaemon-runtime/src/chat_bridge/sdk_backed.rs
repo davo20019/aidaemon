@@ -119,9 +119,11 @@ pub fn to_sdk_request(
     tools: &[Value],
     options: &ChatOptions,
 ) -> sdk::ModelRequest {
+    let mut messages = to_sdk_messages(messages);
+    drop_other_models_reasoning(&mut messages, model);
     sdk::ModelRequest {
         model: model.to_string(),
-        messages: to_sdk_messages(messages),
+        messages,
         tools: tools.iter().filter_map(to_sdk_tool).collect(),
         tool_choice: match &options.tool_choice {
             ToolChoiceMode::Auto => sdk::ToolChoice::Auto,
@@ -269,6 +271,45 @@ fn to_sdk_call(call: &Value) -> Option<sdk::ToolCall> {
     Some(sdk_call)
 }
 
+/// The key a tool call's provider data carries the model that produced it
+/// under. Adapters read only their own keys, so it rides along unseen.
+pub const PRODUCED_BY_KEY: &str = "_produced_by";
+
+/// Reasoning a provider hands back for replay (encrypted reasoning items,
+/// thinking blocks, thought signatures) is only valid for the model that
+/// produced it. When a conversation moves to another model it is dropped,
+/// and the tool calls and text it came with stay.
+pub fn drop_other_models_reasoning(messages: &mut [sdk::Message], model: &str) {
+    for call in messages
+        .iter_mut()
+        .flat_map(|message| message.tool_calls.iter_mut())
+    {
+        let produced_by = call
+            .provider_data
+            .as_ref()
+            .and_then(|data| data.get(PRODUCED_BY_KEY))
+            .and_then(Value::as_str);
+        if produced_by.is_some_and(|produced_by| produced_by != model) {
+            call.provider_data = None;
+        }
+    }
+}
+
+/// `data` stamped with the model that produced it (an object only: other
+/// shapes are left as they are).
+fn stamped(data: Option<Value>, model: &str) -> Option<Value> {
+    match data {
+        Some(Value::Object(mut map)) => {
+            map.insert(
+                PRODUCED_BY_KEY.to_string(),
+                Value::String(model.to_string()),
+            );
+            Some(Value::Object(map))
+        }
+        other => other,
+    }
+}
+
 pub fn to_provider_response(response: sdk::ModelResponse, model: &str) -> ProviderResponse {
     let usage = response.usage;
     ProviderResponse {
@@ -285,7 +326,7 @@ pub fn to_provider_response(response: sdk::ModelResponse, model: &str) -> Provid
                 },
                 id: call.id,
                 name: call.name,
-                extra_content: call.provider_data,
+                extra_content: stamped(call.provider_data, model),
             })
             .collect(),
         usage: Some(TokenUsage {
@@ -668,7 +709,7 @@ mod tests {
         assert_eq!(response.content.as_deref(), Some("Listing."));
         assert_eq!(
             response.tool_calls[0].extra_content,
-            Some(json!({"thought_signature": "sig-synthetic"}))
+            Some(json!({"thought_signature": "sig-synthetic", PRODUCED_BY_KEY: "gpt-6-sol"}))
         );
         assert_eq!(response.tool_calls[1].arguments, "{not json");
         let usage = response.usage.unwrap();
@@ -676,6 +717,35 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(response.thinking.as_deref(), Some("Thought."));
         assert_eq!(response.response_note.as_deref(), Some("truncated"));
+    }
+
+    /// A conversation moved to another model sends its tool calls without
+    /// the reasoning the earlier model produced; the same model, and data
+    /// stored before stamping, keep it.
+    #[test]
+    fn reasoning_replays_only_to_the_model_that_produced_it() {
+        let call = |id: &str, data: Value| {
+            json!({
+                "id": id, "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+                "extra_content": data,
+            })
+        };
+        let messages = vec![json!({"role": "assistant", "content": "", "tool_calls": [
+            call("c1", json!({"chatgpt_reasoning_items": ["sealed"], PRODUCED_BY_KEY: "model-a"})),
+            call("c2", json!({"thought_signature": "sig", PRODUCED_BY_KEY: "model-b"})),
+            call("c3", json!({"thought_signature": "older"})),
+        ]})];
+        let request = to_sdk_request("model-b", &messages, &[], &ChatOptions::default());
+        let calls = &request.messages[0].tool_calls;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].provider_data, None);
+        assert_eq!(calls[0].name, "terminal");
+        assert!(calls[1].provider_data.is_some());
+        assert_eq!(
+            calls[2].provider_data,
+            Some(json!({"thought_signature": "older"}))
+        );
     }
 
     /// SDK errors land on the recovery routes the daemon's own backends

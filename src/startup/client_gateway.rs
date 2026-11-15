@@ -84,6 +84,8 @@ pub(crate) struct DaemonClientHost {
     pub setup: crate::setup::channel::ChannelSetup,
     /// Where the files of messages are shown from.
     pub files: Option<Arc<aidaemon_client_gateway::files::FileStore>>,
+    /// The live providers and models, for a conversation's model picker.
+    pub llm: aidaemon_runtime::llm::SharedLlmRuntime,
 }
 
 impl DaemonClientHost {
@@ -108,6 +110,8 @@ impl DaemonClientHost {
 /// What the app's System area reads: the daemon's models, token use, model
 /// call timings, schedules, background jobs, queues and health checks.
 pub(crate) struct SystemSources {
+    /// The live providers and models.
+    pub llm: aidaemon_runtime::llm::SharedLlmRuntime,
     pub started_at: std::time::Instant,
     pub models: aidaemon_providers::routing::ModelsConfig,
     pub pool: sqlx::SqlitePool,
@@ -530,6 +534,26 @@ impl ClientHost for DaemonClientHost {
         path: Option<&str>,
     ) -> Result<aidaemon_client_protocol::ProjectSummary, String> {
         super::client_projects::update(self.state.as_ref(), id, name, path).await
+    }
+
+    async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
+        Ok(super::client_models::options(&self.llm))
+    }
+
+    async fn session_model(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<aidaemon_client_protocol::SessionModel> {
+        Ok(super::client_models::current(self.state.as_ref(), &self.llm, session_id).await)
+    }
+
+    async fn set_session_model(
+        &self,
+        session_id: &str,
+        model: Option<aidaemon_client_protocol::ModelChoice>,
+        effort: Option<aidaemon_client_protocol::Effort>,
+    ) -> Result<aidaemon_client_protocol::SessionModel, String> {
+        super::client_models::set(self.state.as_ref(), &self.llm, session_id, model, effort).await
     }
 
     async fn set_session_project(
@@ -993,6 +1017,7 @@ pub async fn start(
         },
         hub,
         host: Arc::new(DaemonClientHost {
+            llm: system.llm.clone(),
             state: deps.state.clone(),
             settings: crate::startup::client_settings::SettingsHost::new(
                 commands.config_path.clone(),

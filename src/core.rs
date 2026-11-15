@@ -431,6 +431,7 @@ pub async fn run(
         approval_tx.clone(),
         gateway_endpoints.client.clone(),
         crate::startup::client_gateway::SystemSources {
+            llm: llm_runtime.clone(),
             started_at: std::time::Instant::now(),
             models: config.provider.models.clone(),
             pool: pool.clone(),

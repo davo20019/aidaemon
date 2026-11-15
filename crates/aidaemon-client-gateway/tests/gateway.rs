@@ -376,6 +376,8 @@ fn send(text: &str) -> Command {
         attachments: Vec::new(),
         mid_run: None,
         project_id: None,
+        model: None,
+        effort: None,
     }
 }
 
@@ -592,6 +594,8 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
                     attachments: Vec::new(),
                     mid_run: None,
                     project_id: None,
+                    model: None,
+                    effort: None,
                 },
             ),
         )
@@ -1533,6 +1537,8 @@ async fn a_view_action_reaches_only_the_capable_sender() {
                     attachments: Vec::new(),
                     mid_run: None,
                     project_id: None,
+                    model: None,
+                    effort: None,
                 },
             ),
         )
@@ -1711,6 +1717,8 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     attachments: vec![attachment.clone()],
                     mid_run: None,
                     project_id: None,
+                    model: None,
+                    effort: None,
                 },
             ),
         )
@@ -1768,6 +1776,8 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     }],
                     mid_run: None,
                     project_id: None,
+                    model: None,
+                    effort: None,
                 },
             ),
         )
@@ -1812,4 +1822,70 @@ async fn a_picture_the_agent_sends_reaches_clients() {
     };
     assert_eq!(text, "The chart");
     assert!(attachments[0].is_image());
+}
+
+/// A conversation of another chat keeps that chat's model: setting one
+/// there, alone or with a message, is refused; reading one answers
+/// automatic.
+#[tokio::test]
+async fn only_app_conversations_take_a_model() {
+    let f = fixture(RiskLevel::Medium).await;
+    let pin = || ModelChoice::Pinned {
+        provider: "main".into(),
+        model: "synthetic-model-large".into(),
+    };
+    let refused = f
+        .post(
+            &[],
+            &command(
+                "m-1",
+                Command::SetSessionModel {
+                    session_id: "telegram:synthetic-user-1".into(),
+                    model: Some(pin()),
+                    effort: None,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Invalid),
+        "{refused:?}"
+    );
+    let refused = f
+        .post(
+            &[],
+            &command(
+                "m-2",
+                Command::SendMessage {
+                    session_id: Some("telegram:synthetic-user-1".into()),
+                    text: "hello".into(),
+                    attachments: Vec::new(),
+                    mid_run: None,
+                    project_id: None,
+                    model: None,
+                    effort: Some(Effort::High),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Invalid),
+        "{refused:?}"
+    );
+    let read = f
+        .post(
+            &[],
+            &command(
+                "m-3",
+                Command::GetSessionModel {
+                    session_id: "app:synthetic".into(),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&read, ServerFrame::Ack { result: CommandResult::SessionModel { session_model }, .. }
+            if session_model.model == ModelChoice::Auto && session_model.effort == Effort::Auto),
+        "{read:?}"
+    );
 }
