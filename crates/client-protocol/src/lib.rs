@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 13;
+pub const PROTOCOL_MINOR: u16 = 14;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -586,6 +586,38 @@ pub struct AutomationSummary {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_run_ms: Option<u64>,
+    /// Its latest runs, newest first (a few): what it did, not only what
+    /// it will do (protocol 1.14).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_runs: Vec<AutomationRun>,
+}
+
+/// One run of an automation (protocol 1.14).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AutomationRun {
+    pub started_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_ms: Option<u64>,
+    pub outcome: RunOutcome,
+    /// What it found or did, or why it stopped, in a line or two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// How a run ended, or that it has not yet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    /// Waiting to start, or running now.
+    Running,
+    Done,
+    Failed,
+    /// It stopped on something it needs (an answer, access, a fix).
+    Blocked,
+    Cancelled,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

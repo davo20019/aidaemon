@@ -292,6 +292,50 @@ mod tests {
         assert!(!changed && said == "That automation is gone.", "{said}");
     }
 
+    /// A client sees what each automation did: its latest runs, newest
+    /// first, with what they said; and one whose runs kept failing reads as
+    /// paused after failures, not as on with no next run (research
+    /// 2026-11-15: silent failure is what owners complain about most).
+    #[tokio::test]
+    async fn a_client_sees_recent_runs_and_an_automation_held_after_failures() {
+        let f = fixture().await;
+        f.scheduled_work("Repo check", "every day at 8am").await;
+        let goal_id = f.scheduled.lock().unwrap()["Repo check"].clone();
+        let entries = f.tool.entries().await.unwrap();
+        assert!(entries[0].runs.is_empty());
+        assert_eq!(entries[0].status, "active");
+        for attempt in 1..=3 {
+            let run = f
+                .state
+                .start_goal_run(&goal_id, "manual", None, None)
+                .await
+                .unwrap();
+            assert!(
+                f.state
+                    .finish_goal_run(
+                        &run.id,
+                        "failed",
+                        Some(&format!("The synthetic token expired ({attempt}).")),
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let entry = f.tool.entries().await.unwrap().remove(0);
+        assert_eq!(entry.status, automations::HELD_AFTER_FAILURES);
+        assert!(entry.next.is_none(), "a held automation has no next run");
+        assert_eq!(entry.runs.len(), 3);
+        assert_eq!(entry.runs[0].status, "failed");
+        assert_eq!(
+            entry.runs[0].summary.as_deref(),
+            Some("The synthetic token expired (3).")
+        );
+        assert_eq!(
+            automations::state_words(&entry.status),
+            "Paused after repeated failures"
+        );
+    }
+
     #[tokio::test]
     async fn pause_and_resume_by_name_round_trip_for_each_kind() {
         let f = fixture().await;

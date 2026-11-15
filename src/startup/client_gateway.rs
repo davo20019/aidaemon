@@ -551,8 +551,11 @@ impl ClientHost for DaemonClientHost {
     async fn automations(
         &self,
     ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {
-        use aidaemon_client_protocol::{AutomationKind as Kind, AutomationSummary};
+        use aidaemon_client_protocol::{
+            AutomationKind as Kind, AutomationRun, AutomationSummary, RunOutcome,
+        };
         use aidaemon_work::automations::AutomationKind;
+        let ms = |at: chrono::DateTime<chrono::Utc>| u64::try_from(at.timestamp_millis()).ok();
         Ok(self
             .automation_tool()
             .entries()
@@ -569,9 +572,26 @@ impl ClientHost for DaemonClientHost {
                 what: entry.what,
                 how_often: entry.how_often,
                 status: entry.status,
-                next_run_ms: entry
-                    .next
-                    .and_then(|at| u64::try_from(at.timestamp_millis()).ok()),
+                next_run_ms: entry.next.and_then(ms),
+                recent_runs: entry
+                    .runs
+                    .into_iter()
+                    .filter_map(|run| {
+                        Some(AutomationRun {
+                            started_ms: ms(run.started)?,
+                            finished_ms: run.finished.and_then(ms),
+                            outcome: match run.status.as_str() {
+                                "pending" | "running" => RunOutcome::Running,
+                                "completed" => RunOutcome::Done,
+                                "failed" => RunOutcome::Failed,
+                                "blocked" => RunOutcome::Blocked,
+                                "cancelled" => RunOutcome::Cancelled,
+                                _ => RunOutcome::Unknown,
+                            },
+                            summary: run.summary,
+                        })
+                    })
+                    .collect(),
             })
             .collect())
     }

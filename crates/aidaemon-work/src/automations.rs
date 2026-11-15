@@ -69,6 +69,10 @@ pub fn context_with_name(context: Option<&str>, name: &str) -> String {
 }
 
 /// A goal's lifecycle status as the owner reads it.
+/// A scheduled automation whose runs kept failing: the recovery ledger
+/// paused its schedules, and its next good run (Run now) turns them back on.
+pub const HELD_AFTER_FAILURES: &str = "held_after_failures";
+
 pub fn state_words(status: &str) -> &'static str {
     match status {
         "active" => "On",
@@ -76,6 +80,7 @@ pub fn state_words(status: &str) -> &'static str {
         "pending_confirmation" | "pending" => "Waiting for your approval",
         "awaiting_input" => "Waiting for your answer",
         "failed" => "Stopped after a problem",
+        HELD_AFTER_FAILURES => "Paused after repeated failures",
         "completed" => "Done",
         "cancelled" | "abandoned" => "Cancelled",
         _ => "Unknown",

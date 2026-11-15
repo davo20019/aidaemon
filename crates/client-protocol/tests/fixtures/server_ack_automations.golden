@@ -7,6 +7,20 @@
         "id": "goal-7f3e",
         "kind": "scheduled",
         "name": "Inbox digest",
+        "recent_runs": [
+          {
+            "finished_ms": 1767002460000,
+            "outcome": "failed",
+            "started_ms": 1767002400000,
+            "summary": "The synthetic mail account refused the sign-in."
+          },
+          {
+            "finished_ms": 1766916042000,
+            "outcome": "done",
+            "started_ms": 1766916000000,
+            "summary": "3 new messages, 1 needs a reply."
+          }
+        ],
         "status": "paused",
         "what": "Summarize the synthetic inbox"
       }

@@ -387,6 +387,39 @@
         }
       ]
     },
+    "AutomationRun": {
+      "description": "One run of an automation (protocol 1.14).",
+      "properties": {
+        "finished_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/RunOutcome"
+        },
+        "started_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "summary": {
+          "description": "What it found or did, or why it stopped, in a line or two.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "started_ms",
+        "outcome"
+      ],
+      "type": "object"
+    },
     "AutomationSummary": {
       "description": "Something that runs on its own (protocol 1.13).",
       "properties": {
@@ -414,6 +447,13 @@
             "integer",
             "null"
           ]
+        },
+        "recent_runs": {
+          "description": "Its latest runs, newest first (a few): what it did, not only what\nit will do (protocol 1.14).",
+          "items": {
+            "$ref": "#/$defs/AutomationRun"
+          },
+          "type": "array"
         },
         "status": {
           "description": "`active`, `paused`, `failed`, `awaiting_input`, `pending_confirmation`...",
@@ -3530,6 +3570,29 @@
         "critical"
       ],
       "type": "string"
+    },
+    "RunOutcome": {
+      "description": "How a run ended, or that it has not yet.",
+      "oneOf": [
+        {
+          "enum": [
+            "done",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "Waiting to start, or running now.",
+          "type": "string"
+        },
+        {
+          "const": "blocked",
+          "description": "It stopped on something it needs (an answer, access, a fix).",
+          "type": "string"
+        }
+      ]
     },
     "ScheduleInfo": {
       "properties": {

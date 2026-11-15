@@ -267,6 +267,27 @@ pub struct AutomationEntry {
     /// `active`, `paused`, `failed`, `awaiting_input`...
     pub status: String,
     pub next: Option<DateTime<Utc>>,
+    /// Its latest runs, newest first.
+    pub runs: Vec<RunEntry>,
+}
+
+/// One run of an automation, as its records left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEntry {
+    pub started: DateTime<Utc>,
+    pub finished: Option<DateTime<Utc>>,
+    /// `pending`, `running`, `completed`, `failed`, `blocked`, `cancelled`.
+    pub status: String,
+    pub summary: Option<String>,
+}
+
+/// How many runs a client is shown per automation.
+pub const RECENT_RUNS: usize = 5;
+
+fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// What the owner can do to an automation from a client.
@@ -336,13 +357,28 @@ impl ManageAutomationsTool {
             {
                 card.details.push(format!("Workspace: {workspace}"));
             }
+            // Its runs kept failing and the recovery ledger paused its
+            // schedules: on, but not running, which the owner must see.
+            let held = goal.status == "active"
+                && self
+                    .state
+                    .get_scheduled_recovery_state(&goal.id)
+                    .await?
+                    .is_some_and(|recovery| {
+                        recovery.disposition
+                            == aidaemon_work::goals::ScheduledRecoveryDisposition::Escalated
+                    });
             found.push(Automation {
                 kind: AutomationKind::Scheduled,
                 name: automations::name_from_context(goal.context.as_deref()),
-                next: (goal.status == "active")
+                next: (goal.status == "active" && !held)
                     .then(|| runs.iter().min().copied())
                     .flatten(),
-                status: goal.status,
+                status: if held {
+                    automations::HELD_AFTER_FAILURES.to_string()
+                } else {
+                    goal.status
+                },
                 id: goal.id,
                 card,
                 from_config: false,
@@ -411,9 +447,14 @@ impl ManageAutomationsTool {
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => left.id.cmp(&right.id),
         });
-        Ok(all
-            .into_iter()
-            .map(|automation| AutomationEntry {
+        let mut entries = Vec::with_capacity(all.len());
+        for automation in all {
+            // A run's records are no reason to hide the automation.
+            let runs = self
+                .recent_runs(automation.kind, &automation.id)
+                .await
+                .unwrap_or_default();
+            entries.push(AutomationEntry {
                 kind: automation.kind,
                 id: automation.id,
                 name: automation.name,
@@ -421,6 +462,64 @@ impl ManageAutomationsTool {
                 how_often: automation.card.how_often,
                 status: automation.status,
                 next: automation.next,
+                runs,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// The latest runs of automation `id`, newest first: a scheduled goal's
+    /// and a watching automation's goal runs, a health check's results.
+    async fn recent_runs(&self, kind: AutomationKind, id: &str) -> anyhow::Result<Vec<RunEntry>> {
+        let goal_id = match kind {
+            AutomationKind::Scheduled => id.to_string(),
+            AutomationKind::Watching => match self.state.get_mandate(id).await? {
+                Some(mandate) => mandate.goal_id,
+                None => return Ok(Vec::new()),
+            },
+            AutomationKind::Probe => {
+                let Some(store) = &self.probes else {
+                    return Ok(Vec::new());
+                };
+                return Ok(store
+                    .get_results(id, RECENT_RUNS)
+                    .await?
+                    .into_iter()
+                    .map(|result| {
+                        let healthy = matches!(
+                            result.status,
+                            aidaemon_work::health::probes::ProbeStatus::Healthy
+                        );
+                        RunEntry {
+                            started: result.checked_at,
+                            finished: Some(result.checked_at),
+                            status: if healthy { "completed" } else { "failed" }.to_string(),
+                            summary: if healthy {
+                                result.latency_ms.map(|ms| format!("Healthy in {ms} ms"))
+                            } else {
+                                Some(result.error_message.unwrap_or_else(|| {
+                                    format!("Check result: {}", result.status.as_str())
+                                }))
+                            },
+                        }
+                    })
+                    .collect());
+            }
+        };
+        let mut runs = self.state.get_goal_runs(&goal_id).await?;
+        runs.truncate(RECENT_RUNS);
+        Ok(runs
+            .into_iter()
+            .filter_map(|run| {
+                Some(RunEntry {
+                    started: parse_time(&run.started_at)?,
+                    finished: run.completed_at.as_deref().and_then(parse_time),
+                    status: run.status,
+                    summary: run
+                        .outcome_summary
+                        .map(|summary| summary.trim().to_string())
+                        .filter(|summary| !summary.is_empty()),
+                })
             })
             .collect())
     }

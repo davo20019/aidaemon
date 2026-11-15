@@ -871,6 +871,20 @@ fn server_samples() -> Vec<ServerFrame> {
                 how_often: "Every weekday at 9:00 AM ET".into(),
                 status: "paused".into(),
                 next_run_ms: None,
+                recent_runs: vec![
+                    AutomationRun {
+                        started_ms: 1_767_002_400_000,
+                        finished_ms: Some(1_767_002_460_000),
+                        outcome: RunOutcome::Failed,
+                        summary: Some("The synthetic mail account refused the sign-in.".into()),
+                    },
+                    AutomationRun {
+                        started_ms: 1_766_916_000_000,
+                        finished_ms: Some(1_766_916_042_000),
+                        outcome: RunOutcome::Done,
+                        summary: Some("3 new messages, 1 needs a reply.".into()),
+                    },
+                ],
             }],
             note: Some("Paused \"Inbox digest\" (scheduled). It won't run until you resume it.".into()),
             changed: true,
