@@ -416,10 +416,17 @@ impl GoalCycle {
                         .await
                         .ok()
                         .flatten()
-                        // An automatic recovery occurrence is a valid current
-                        // cycle of a scheduled objective: its root task must be
-                        // dispatched, never retired as a stale child.
-                        .filter(|run| matches!(run.trigger_type.as_str(), "scheduled" | "recovery"))
+                        // An automatic recovery occurrence, and a run the owner
+                        // started now (Run now, Try again), are valid current
+                        // cycles of a scheduled objective: their root task must
+                        // be dispatched, never retired as a stale child (live
+                        // 2026-11-15: every Run now was retired and failed).
+                        .filter(|run| {
+                            matches!(
+                                run.trigger_type.as_str(),
+                                "scheduled" | "recovery" | "manual"
+                            )
+                        })
                         // Legacy/repair-created open runs can contain old child
                         // rows without an execution root. They are not a valid
                         // current scheduled cycle and must keep using the stale

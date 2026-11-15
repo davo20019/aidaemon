@@ -2990,3 +2990,45 @@ async fn test_a_quiet_automations_run_is_told_how_to_report_nothing_new() {
         tasks[0].description
     );
 }
+
+/// A run the owner starts now (Run now, Try again) is the goal's current
+/// cycle: the next tick dispatches its root task, never retires it as a
+/// stale child of a closed run (live 2026-11-15: every Run now was retired,
+/// then reconciled as failed).
+#[tokio::test]
+async fn test_a_run_started_now_is_not_retired_as_stale() {
+    let state = test_state_store().await;
+    let goal = Goal::new_continuous("Read the synthetic status file", "session-1", None, None);
+    state.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now();
+    let now_ts = now.to_rfc3339();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: (now + chrono::Duration::minutes(50)).to_rfc3339(),
+        created_at: now_ts.clone(),
+        updated_at: now_ts,
+    };
+    state.create_goal_schedule(&schedule).await.unwrap();
+    let queued = aidaemon_work::tools::scheduled_goal_runs::ScheduledGoalRuns::new(state.clone())
+        .run_now(&goal.id, None)
+        .await
+        .unwrap();
+    assert!(queued.contains("Queued manual run"), "{queued}");
+
+    let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+    let mut coordinator =
+        HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+    coordinator.tick().await.unwrap();
+
+    let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_ne!(tasks[0].status, "cancelled", "{:?}", tasks[0].error);
+}
