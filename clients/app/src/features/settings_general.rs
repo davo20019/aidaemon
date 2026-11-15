@@ -408,7 +408,7 @@ pub fn decisions(store: Store, settings: &Settings) -> View {
             }
             let placeholder = match chosen.as_str() {
                 "gemini" => "gemini-decision-1",
-                "typesafe" => "jev",
+                "typesafe" => "jev-latest",
                 _ => "Your fast model",
             };
             let saved = model_now.clone();
@@ -464,7 +464,7 @@ pub fn decisions(store: Store, settings: &Settings) -> View {
                 );
                 let url = match chosen.as_str() {
                     "gemini" => "https://aistudio.google.com/apikey",
-                    _ => "https://docs.typesafe.ai/",
+                    _ => "https://console.typesafe.ai/",
                 };
                 keys = keys.child(ui::btn("Get a key", Variant::Ghost, Size::Sm, move || {
                     drop(open_url(url));
