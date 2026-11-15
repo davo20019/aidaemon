@@ -257,10 +257,17 @@ fn card(store: Store, automation: AutomationSummary) -> View {
     match automation.recent_runs.first() {
         Some(run) => c = c.child(last_run(run)),
         None => {
+            // A failing check keeps no runs here: its badge says it failed,
+            // so "hasn't run" would contradict it.
+            let failing = matches!(automation.status.as_str(), "failed" | "stalled");
             c = c.child(
-                text("It hasn't run yet.")
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
+                text(if failing {
+                    "It is failing. Its runs are not recorded here; Details has what is known."
+                } else {
+                    "It hasn't run yet."
+                })
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
             )
         }
     }
@@ -488,10 +495,19 @@ fn edit_form(
     let mut form = view()
         .gap_2()
         .pt_2()
-        .child(ui::field("Name", new_name).label("Name"))
-        .child(ui::field("Every weekday at 9am", new_when).label("When it runs"));
+        .child(ui::labeled(
+            "Name",
+            ui::field("Name", new_name).label("Name"),
+        ))
+        .child(ui::labeled(
+            "When it runs",
+            ui::field("Every weekday at 9am", new_when).label("When it runs"),
+        ));
     if instructions.is_some() {
-        form = form.child(ui::area("What each run does", new_instructions).label("What it does"));
+        form = form.child(ui::labeled(
+            "What each run does",
+            ui::area("What each run does", new_instructions).label("What it does"),
+        ));
     }
     // Quiet unless it matters: what its runs tell you (a reminder always
     // does). A quiet run is still in its history.
@@ -503,25 +519,28 @@ fn edit_form(
             Notify::Problems => "problems",
             Notify::Unknown => "",
         };
-        form = form.child(ui::choice(
+        form = form.child(ui::labeled(
             "Tell me",
-            "Every run",
-            vec![
-                ("every_run".to_owned(), "Every run".to_owned()),
-                (
-                    "changes".to_owned(),
-                    "Only when something changes".to_owned(),
-                ),
-                ("problems".to_owned(), "Only about problems".to_owned()),
-            ],
-            move || new_notify.get().map(|mode| key(mode).to_owned()),
-            move |chosen| {
-                new_notify.set(match chosen.as_deref() {
-                    Some("changes") => Some(Notify::Changes),
-                    Some("problems") => Some(Notify::Problems),
-                    _ => Some(Notify::EveryRun),
-                })
-            },
+            ui::choice(
+                "Tell me",
+                "Every run",
+                vec![
+                    ("every_run".to_owned(), "Every run".to_owned()),
+                    (
+                        "changes".to_owned(),
+                        "Only when something changes".to_owned(),
+                    ),
+                    ("problems".to_owned(), "Only about problems".to_owned()),
+                ],
+                move || new_notify.get().map(|mode| key(mode).to_owned()),
+                move |chosen| {
+                    new_notify.set(match chosen.as_deref() {
+                        Some("changes") => Some(Notify::Changes),
+                        Some("problems") => Some(Notify::Problems),
+                        _ => Some(Notify::EveryRun),
+                    })
+                },
+            ),
         ));
     }
     form.child(

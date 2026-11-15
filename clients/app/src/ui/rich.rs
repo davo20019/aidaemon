@@ -472,9 +472,9 @@ pub fn suggest_field(
                 }
             })
             .input_class(if super::touch() {
-                "h-12 px-3 text-base rounded-md border border-border bg-card focus:border-ring"
+                "flex-1 w-full h-12 px-3 text-base rounded-md border border-border bg-card focus:border-ring"
             } else {
-                "h-8 px-3 text-sm rounded-md border border-border bg-card focus:border-ring"
+                "flex-1 w-full h-8 px-3 text-sm rounded-md border border-border bg-card focus:border-ring"
             })
             .popup_style(|s| {
                 s.bg(colors::SURFACE)

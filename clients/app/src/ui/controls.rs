@@ -97,6 +97,8 @@ fn frame(variant: Variant, size: Size, scale: f32) -> nsh_base::ButtonElement {
                 .outline_offset(px(2.0))
                 .outline_color(colors::ACCENT)
         })
+        // A terminal draws no outline: the focused control is a band.
+        .focus(focus_band)
         .active(move |s| s.scale(scale))
         .disabled_style(|s| s.opacity(0.45));
     let base = match fill(variant) {
@@ -510,7 +512,7 @@ pub fn field(placeholder: &'static str, value: Signal<String>) -> Input {
         .border_color(colors::BORDER)
         .transition_colors()
         .duration(motion::FAST)
-        .focus(|s| s.border_color(colors::ACCENT))
+        .focus(|s| focus_band(s.border_color(colors::ACCENT)))
 }
 
 /// A field for a few lines of text (instructions, a note).
@@ -629,6 +631,7 @@ pub fn chip(
         .duration(motion::FAST)
         .hover(|s| s.bg(colors::HOVER))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .focus(focus_band)
         .style_when(selected, |s| {
             s.bg(Tone::Accent.tint()).border_color(colors::ACCENT)
         })
@@ -665,6 +668,7 @@ pub fn row(
         .hover(|s| s.bg(colors::HOVER))
         .active(|s| s.bg(colors::SELECTED))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .focus(focus_band)
         .style_when(selected, |s| s.bg(colors::SELECTED))
         .on_press(on_press)
 }
@@ -705,6 +709,7 @@ pub fn picture(
                 .border_color(colors::BORDER)
                 .bg(colors::SURFACE)
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                .focus(focus_band)
                 .accessibility_label(label)
                 .on_press(on_press)
                 .child(image(src).w_full().h_full().object_fit(fit)),
@@ -820,6 +825,7 @@ pub fn disclosure(
         .duration(motion::FAST)
         .hover(|s| s.bg(colors::HOVER).border_color(colors::BORDER))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .focus(focus_band)
         .child(
             icon(Glyph::Chevron)
                 .text_color(colors::FAINT)
@@ -886,4 +892,30 @@ pub fn key_line(keys: impl Fn() -> String + 'static) -> View {
                 .text_size(px(type_scale::XS))
                 .text_color(colors::MUTED),
         )
+}
+
+/// How a focused control shows in a terminal, which draws no outline or
+/// border: a band of the selection wash behind it. Elsewhere nothing more
+/// (the focus ring does it).
+pub fn focus_band(s: nsh_core::element::StyleRefinement) -> nsh_core::element::StyleRefinement {
+    if idiom() == nsh_core::platform::Idiom::Terminal {
+        s.bg(colors::SELECTED)
+    } else {
+        s
+    }
+}
+
+/// `control` under a visible caption: a form's field says what it is in
+/// every idiom (a placeholder goes once something is typed, and an
+/// accessibility label is not drawn).
+pub fn labeled(caption: &'static str, control: impl IntoElement) -> View {
+    view()
+        .gap(px(4.0))
+        .child(
+            text(caption)
+                .text_size(px(type_scale::XS))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors::MUTED),
+        )
+        .child(control)
 }

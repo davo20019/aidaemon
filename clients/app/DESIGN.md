@@ -88,7 +88,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Sidebar | Pointer rests on a conversation (desktop, web) | A card after 600 ms: title, where it is and when it moved, its last message |
 | Conversation | A reply's turn used tools | One quiet disclosure line above the reply ("Used 4 tools: read_file ×2, … · 12s"); ▸ turns ▾ and lists every tool in order. The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
 | Conversation | Agent working, tools used | The working line adds "· N tools so far" |
-| Composer | Typing while the agent works | Send becomes "Add to the current work" (Enter); Queue (Mod+Enter) waits for its own turn; the hint names both and Esc |
+| Composer | Typing while the agent works | Send (Enter) tells the running work now; Queue (Mod+Enter) sends after it; the hint says "Enter tells it now · ⌘↩ sends after · Esc stops" |
 | Composer | Draft starts with `/` | The daemon's matching commands above the composer; Tab or a press completes the first |
 | Composer | Up on an empty composer | The last message sent here comes back to edit |
 | Conversation | Last turn failed or was stopped | Retry under it sends the same message again |

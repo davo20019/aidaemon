@@ -288,16 +288,6 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         )
         .group("View"),
     );
-    items.push(CommandItem::new("new-project", "New project").group("Projects"));
-    if let Some(project) = store.current_project().and_then(|id| store.project(&id)) {
-        items.push(
-            CommandItem::new(
-                "edit-project",
-                format!("Edit {}: name or folder", project.name),
-            )
-            .group("Projects"),
-        );
-    }
     items.push(CommandItem::new("memory", "Memory: what the daemon remembers").group("View"));
     items.push(CommandItem::new("settings", "Settings: change how the daemon runs").group("View"));
     items.push(
@@ -310,6 +300,16 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         )
         .group("View"),
     );
+    items.push(CommandItem::new("new-project", "New project").group("Projects"));
+    if let Some(project) = store.current_project().and_then(|id| store.project(&id)) {
+        items.push(
+            CommandItem::new(
+                "edit-project",
+                format!("Edit {}: name or folder", project.name),
+            )
+            .group("Projects"),
+        );
+    }
     items.push(
         CommandItem::new("copy-reply", "Copy the last reply")
             .group("Conversation")
@@ -368,6 +368,8 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                         .placeholder("Search conversations and commands…")
                         .accessibility_label("Commands")
                         .auto_focus(true)
+                        // Escape clears the search, then closes the palette.
+                        .on_cancel(move || open.set(false))
                         .on_select(move |id: &SharedString| {
                             open.set(false);
                             match id.as_ref() {

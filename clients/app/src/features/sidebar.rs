@@ -162,7 +162,11 @@ fn session_row(store: Store, id: String) -> View {
         ui::MenuAction::new(if pinned { "Unpin" } else { "Pin" }, move || {
             store.toggle_pin(&pin)
         }),
-        ui::MenuAction::new("Stop its work", move || store.stop(&stop)),
+        {
+            let working = stop.clone();
+            ui::MenuAction::new("Stop its work", move || store.stop(&stop))
+                .shown_when(move || store.is_working(&working))
+        },
     ];
     for project in untracked(|| store.projects()) {
         if current.as_deref() == Some(project.id.as_str()) {
@@ -639,7 +643,8 @@ fn pages(store: Store) -> View {
                 .child(icon(glyph).text_color(colors::MUTED))
                 .child(
                     text(label)
-                        .text_size(px(type_scale::SM))
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::XS))
                         .text_color(colors::MUTED),
                 )
         };
@@ -652,7 +657,7 @@ fn pages(store: Store) -> View {
             .border_color(colors::LINE)
             .child(tab(
                 Glyph::Clock,
-                "Automations",
+                "Automate",
                 "Automations: what runs on its own",
                 Page::Automations,
                 Store::open_automations,

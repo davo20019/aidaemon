@@ -308,12 +308,21 @@ fn attention(s: &SystemStatus) -> View {
         return view().child(status("Everything is running normally", Tone::Success));
     }
     let mut list = view().gap_1();
+    // One row each, marked, so two problems never read as one sentence.
     for problem in problems {
         list = list.child(
-            text(problem)
-                .selectable(true)
-                .text_size(px(ui::fit::small()))
-                .text_color(colors::TEXT),
+            view()
+                .flex_row()
+                .gap_2()
+                .child(ui::icon(ui::Glyph::Warning).text_color(Tone::Warning.color()))
+                .child(
+                    text(format!("{}.", problem.trim_end_matches('.')))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .selectable(true)
+                        .text_size(px(ui::fit::small()))
+                        .text_color(colors::TEXT),
+                ),
         );
     }
     section("Needs a look").child(

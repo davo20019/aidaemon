@@ -1235,15 +1235,15 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .child(
                             text(move || match (running.get(), touch) {
                                 (true, true) => {
-                                    "Working · Add joins the work, Queue waits".to_owned()
+                                    "Working · Send tells it now · Queue sends after".to_owned()
                                 }
                                 (true, false) if terminal => format!(
-                                    "Working · Enter adds to it · {} queues · Esc or {} stops",
+                                    "Working · Enter tells it now · {} sends after · Esc or {} stops",
                                     key_label("mod+enter"),
                                     key_label("mod+c")
                                 ),
                                 (true, false) => format!(
-                                    "Working · Enter adds to it · {} queues · Esc stops",
+                                    "Working · Enter tells it now · {} sends after · Esc stops",
                                     key_label("mod+enter")
                                 ),
                                 (false, true) => chat_note.clone().unwrap_or_default(),
@@ -1272,7 +1272,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                     store.submit_placed(Some(MidRun::Queue))
                                 })
                                 .disabled(move || !can_send())
-                                .accessibility_label("Queue: send after the current work")
+                                .accessibility_label("Queue: send after the running work")
                             },
                         ))
                         .child(
@@ -1292,7 +1292,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                             .disabled(move || !can_send())
                             .accessibility_label(move || {
                                 Some(SharedString::from(if running.get() {
-                                    "Add to the current work"
+                                    "Send now: the running work reads it"
                                 } else {
                                     "Send"
                                 }))

@@ -125,6 +125,7 @@ pub fn choice(
                 .duration(motion::FAST)
                 .hover(|s| s.border_color(colors::FAINT))
                 .focus_visible(|s| s.border_color(colors::ACCENT))
+                .focus(super::controls::focus_band)
                 .child(
                     text(move || {
                         chosen()
@@ -207,6 +208,7 @@ pub fn sections(open: Signal<Vec<SharedString>>, items: Vec<(String, String, Vie
                             .duration(motion::FAST)
                             .hover(|s| s.bg(colors::HOVER))
                             .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                            .focus(super::controls::focus_band)
                             .child(
                                 text(move || {
                                     if open.with(|o| o.contains(&expanded)) {
@@ -262,6 +264,7 @@ pub fn tab_bar(selected: Signal<usize>, labels: &[&'static str]) -> View {
                 .duration(motion::FAST)
                 .hover(|s| s.bg(colors::HOVER))
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                .focus(super::controls::focus_band)
                 .on_press(move || selected.set(index))
                 .child(
                     text(label)
@@ -393,6 +396,8 @@ pub fn confirm(
 pub struct MenuAction {
     pub label: SharedString,
     pub run: Box<dyn Fn()>,
+    /// Shown only while this holds (an action that only makes sense now).
+    pub shown: Option<std::rc::Rc<dyn Fn() -> bool>>,
 }
 
 impl MenuAction {
@@ -400,7 +405,14 @@ impl MenuAction {
         Self {
             label: label.into(),
             run: Box::new(run),
+            shown: None,
         }
+    }
+
+    /// Show it only while `shown` holds.
+    pub fn shown_when(mut self, shown: impl Fn() -> bool + 'static) -> Self {
+        self.shown = Some(std::rc::Rc::new(shown));
+        self
     }
 }
 
@@ -425,8 +437,10 @@ pub fn with_menu(trigger: impl IntoElement, actions: Vec<MenuAction>) -> View {
         .popup_ending_class("opacity-0 scale-95");
     for action in actions {
         let run = action.run;
+        let shown = action.shown.clone();
         menu = menu.child(
             menu_item()
+                .style_when(move || shown.as_ref().is_some_and(|f| !f()), |s| s.hidden())
                 .accessibility_label(action.label.clone())
                 .px_2()
                 .py(px(5.0))
