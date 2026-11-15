@@ -842,7 +842,7 @@ fn toml_string(id: &str) -> String {
 /// shows what is chosen, and keeps any id typed.
 fn model_pick(job: &'static str, value: Signal<String>, known: &[String]) -> View {
     let mut picks = view().flex_row().flex_wrap().gap_1();
-    for model in known.iter().take(8) {
+    for model in known.iter().take(12) {
         let model = model.clone();
         let label = format!("Use {model} for {}", job.to_lowercase());
         picks = picks.child(
@@ -880,6 +880,7 @@ fn job_models_editor(
     for model in [provider.hard_model.clone(), provider.quick_model.clone()]
         .into_iter()
         .chain(provider.models.iter().cloned())
+        .chain(provider.offered_models.iter().cloned())
         .chain(account)
     {
         if !model.is_empty() && !known.contains(&model) {
