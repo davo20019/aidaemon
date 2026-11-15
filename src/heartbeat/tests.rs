@@ -2992,3 +2992,42 @@ async fn test_a_run_started_now_is_not_retired_as_stale() {
     assert_eq!(tasks.len(), 1);
     assert_ne!(tasks[0].status, "cancelled", "{:?}", tasks[0].error);
 }
+
+/// Run now after a run that was cut short (its task blocked) closes that
+/// run as failed and starts a new one, never errors (live 2026-11-15: a
+/// restart blocked a run, and every Run now then failed with "cannot
+/// complete while 1 task obligation(s) remain unresolved").
+#[tokio::test]
+async fn test_run_now_after_a_blocked_run_starts_a_new_one() {
+    let state = test_state_store().await;
+    let goal = Goal::new_continuous("Read the synthetic status file", "session-1", None, None);
+    state.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    state.create_goal_schedule(&schedule).await.unwrap();
+    let runs = aidaemon_work::tools::scheduled_goal_runs::ScheduledGoalRuns::new(state.clone());
+    runs.run_now(&goal.id, None).await.unwrap();
+    let mut task = state.get_tasks_for_goal(&goal.id).await.unwrap().remove(0);
+    task.status = "blocked".to_string();
+    task.blocker = Some("The daemon restarted mid-run".to_string());
+    state.update_task(&task).await.unwrap();
+    let first = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+
+    let again = runs.run_now(&goal.id, None).await.unwrap();
+    assert!(again.contains("Queued manual run"), "{again}");
+    let current = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
+    assert_ne!(current.id, first.id);
+}

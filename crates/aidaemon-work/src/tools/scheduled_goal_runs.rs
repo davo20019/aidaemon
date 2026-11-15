@@ -681,15 +681,14 @@ impl ScheduledGoalRuns {
         if let Some(open_run) = self.state.get_current_goal_run(&goal.id).await? {
             let run_tasks = self.state.get_tasks_for_goal_run(&open_run.id).await?;
             if !run_tasks.is_empty() {
-                let status = if run_tasks.iter().any(|existing| {
-                    matches!(
-                        existing.status.as_str(),
-                        "failed" | "interrupted" | "cancelled"
-                    )
-                }) {
-                    "failed"
-                } else {
+                // Completed only when every task did, by the store's own rule;
+                // anything else (failed, blocked, cut off by a restart) closes
+                // it as failed, so Run now always starts (live 2026-11-15: a
+                // run blocked by a restart made every Run now error).
+                let status = if run_tasks.iter().all(Task::satisfies_run_completion) {
                     "completed"
+                } else {
+                    "failed"
                 };
                 self.state
                     .finish_goal_run(
