@@ -70,6 +70,12 @@ pub enum SystemDirective {
     DeclaredWorkUnattempted {
         items: Vec<String>,
     },
+    /// The agent called the request `partial` while nothing typed stood in
+    /// its way (no failure, refusal, missing resource or running job) and
+    /// declared items were still open: it goes on once.
+    PartialWithoutObstacle {
+        open_items: usize,
+    },
     /// A ledger demand ended unmet and the model's reply answered the
     /// demand. One tool-less rewrite addressed to the user, judged by the
     /// run's state (`ReplyDefect::AnswersUnmetDemand`), never by wording.
@@ -265,6 +271,13 @@ impl SystemDirective {
             ),
             Self::FinalAnswerRejectedInternalMarkers => "[SYSTEM] Your previous answer was rejected: it consisted of internal tool-envelope markers instead of an answer. Do NOT quote tool output wrappers, [SYSTEM] lines, or bracketed markers. In plain language, state your final answer to the user's request now — what you found or did, and any honest limitation (e.g. the requested item was not found).".to_string(),
             Self::FinalAnswerWasFilePaste => "[SYSTEM] Your previous answer pasted raw tool output (file contents, a line-numbered page, a list of file paths, or a JSON dump) instead of answering. Do NOT paste raw tool output. Using ONLY the items relevant to the user's request, answer in plain language now — name the specific matches by filename (or say clearly that none matched). If the user asked for a file, deliver it with send_file rather than listing paths. If the data is too large to scan, say which filter you would need.".to_string(),
+            Self::PartialWithoutObstacle { open_items } => format!(
+                "[SYSTEM] Internal check, not shown to the user: you set the outcome to partial, but nothing recorded stands in the way: \
+                 no tool failed, nothing was refused, no resource ran out, and {open_items} of your checklist items are still open. \
+                 Carry on with them now with the available tools. \
+                 If something does stop you, pass track_requirements once more with outcome blocked, and say in your reply exactly what stops you. \
+                 Your next reply without tool calls is sent to the user; do not mention this check."
+            ),
             Self::DeclaredWorkUnattempted { items } => format!(
                 "[SYSTEM] Internal check, not shown to the user: the owner asked for work that nothing has taken on yet: {}. \
                  Each thing the owner asked for is done in its own right: work started on another part, or a job left running for it, does not do this one. \

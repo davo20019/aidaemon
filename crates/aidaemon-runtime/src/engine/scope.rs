@@ -54,6 +54,9 @@ pub struct TurnScope<'a> {
     /// The run was sent back once because declared work was never
     /// attempted (`RunAggregate::unattempted_declared_work`).
     pub unattempted_work_demanded: AtomicBool,
+    /// The run was sent back once after a `partial` verdict with nothing in
+    /// its way ([`crate::turn::system_directives::SystemDirective::PartialWithoutObstacle`]).
+    pub partial_demanded: AtomicBool,
     /// Declared items the run ended without attempting, after its one pass
     /// (index, the step in the model's own words): their typed reason, "not
     /// attempted", reaches the card and the reply.

@@ -676,6 +676,42 @@ impl TurnEngine<'_> {
                     .sdk_demand_unattempted_work(scope, &aggregate, iteration)
                     .await;
             }
+            // `partial` with nothing typed in its way and declared items
+            // still open: it goes on once, or says what stops it (live
+            // 2026-11-15: a coding run stopped mid-change after two edits,
+            // "the edit handler is currently incomplete").
+            // Its own list says what is still open.
+            let open_items = scope.open_checklist_items.load(Ordering::Relaxed) as usize;
+            if claim == aidaemon_events::ExecutorClaimedOutcome::Partial
+                && open_items > 0
+                && changes_permitted
+                && !failed_without_success
+                && aggregate.executor_short_of.is_none()
+                && !aggregate.terminal_policy_denial()
+                && !aggregate.has_background_in_flight()
+                && !scope.partial_demanded.swap(true, Ordering::Relaxed)
+            {
+                self.emit_decision_point(
+                    scope.emitter,
+                    scope.task_id,
+                    iteration,
+                    aidaemon_events::payloads::DecisionType::PostExecutionValidation,
+                    "Partial verdict with nothing in the way: one more pass".to_string(),
+                    serde_json::json!({
+                        "condition": "partial_without_obstacle",
+                        "open_items": open_items,
+                        "engine": "sdk",
+                    }),
+                )
+                .await;
+                return sdk::StopDecision::Continue {
+                    message:
+                        crate::turn::system_directives::SystemDirective::PartialWithoutObstacle {
+                            open_items,
+                        }
+                        .render(),
+                };
+            }
             scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
             self.emit_decision_point(
                 scope.emitter,

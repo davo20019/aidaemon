@@ -364,6 +364,62 @@ async fn a_step_after_the_job_is_left_to_its_continuation() {
     assert!(reply.starts_with("Started in the background"), "{reply}");
 }
 
+/// `partial` with nothing in its way and its items still open goes on
+/// once: no failure, refusal or missing resource was recorded (live
+/// 2026-11-15: a coding run stopped mid-change after two edits).
+#[tokio::test]
+async fn a_partial_verdict_with_nothing_in_the_way_goes_on_once() {
+    let session = "partial-without-obstacle";
+    let items = |status: &str| {
+        json!([
+            {"text": "Add the synthetic edit handler", "status": status, "mutation_effects": ["local_workspace_write"]},
+            {"text": "Test the synthetic edit handler", "status": status, "mutation_effects": ["local_workspace_write"]}
+        ])
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": items("in_progress")}).to_string(),
+        ),
+        MockProvider::tool_call_response("apply_synthetic_edit", "{}"),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": items("in_progress"), "outcome": "partial"}).to_string(),
+        ),
+        MockProvider::text_response("I started the change, but it is incomplete."),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": items("done"), "outcome": "done"}).to_string(),
+        ),
+        MockProvider::text_response("The edit handler is added and tested."),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let edit: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::testing::MockTool::new("apply_synthetic_edit", "Edits the synthetic repo", "edited")
+            .with_metadata(crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                checklist_items: vec![0, 1],
+                ..crate::traits::ToolCallMetadata::default()
+            }),
+    );
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![edit], None)
+        .await
+        .unwrap();
+    let reply = ask_owner_turn(&harness, session, "Add the synthetic edit handler with tests.").await;
+
+    assert_eq!(reply, "The edit handler is added and tested.");
+    let sent_back = harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::DecisionPoint], 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::DecisionPointData>().ok())
+        .any(|point| point.metadata["condition"] == "partial_without_obstacle");
+    assert!(sent_back);
+}
+
 // ==================== The request is the owner's words ====================
 //
 // Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing

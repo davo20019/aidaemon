@@ -1300,6 +1300,7 @@ impl TurnEngine<'_> {
             verification_demanded: AtomicBool::new(false),
             recovery_demanded: AtomicBool::new(false),
             unattempted_work_demanded: AtomicBool::new(false),
+            partial_demanded: AtomicBool::new(false),
             not_attempted: std::sync::Mutex::new(Vec::new()),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
