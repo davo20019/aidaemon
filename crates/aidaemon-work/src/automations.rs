@@ -87,11 +87,20 @@ pub enum NotifyMode {
 /// automation tells only changes, how to say a run found nothing new. Timed
 /// runs and Run now both start here (live 2026-11-15: a note on the run's
 /// task never reached its task lead, whose mission is the goal's).
-pub fn run_mission(description: &str, context: Option<&str>) -> String {
-    match NotifyMode::from_context(context).run_note() {
-        Some(note) => format!("{description}\n\n[SYSTEM:{note}]"),
-        None => description.to_string(),
+pub fn run_mission(description: &str, context: Option<&str>, previous: Option<&str>) -> String {
+    if NotifyMode::from_context(context) != NotifyMode::Changes {
+        return description.to_string();
     }
+    let since = match previous.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(previous) => format!(
+            "The previous run reported: \"{}\". Report only what changed since then; when \
+             nothing did, finish with manage_goal_tasks complete_goal and nothing_new: true, \
+             and answer in one line.",
+            previous.chars().take(1500).collect::<String>()
+        ),
+        None => "This is its first run: report what you find.".to_string(),
+    };
+    format!("{description}\n\n[SYSTEM: {since}]")
 }
 
 /// The goal-context key naming the run whose task lead said it found
@@ -155,18 +164,6 @@ impl NotifyMode {
         }
     }
 
-    /// What a run of an automation in this mode is told to do about it.
-    pub fn run_note(self) -> Option<&'static str> {
-        match self {
-            Self::Changes => Some(
-                " Report only what changed since this automation's previous run (its earlier \
-                 results are the goal context's task_results); when nothing did, finish with \
-                 manage_goal_tasks complete_goal and nothing_new: true, and answer in one line.",
-            ),
-            _ => None,
-        }
-    }
-
     /// How the owner reads it.
     pub const fn words(self) -> &'static str {
         match self {
@@ -198,14 +195,21 @@ mod notify_tests {
 
     #[test]
     fn a_quiet_automations_task_lead_is_told_how_to_say_nothing_new() {
-        let quiet = super::run_mission("Read the synthetic file", Some(r#"{"notify":"changes"}"#));
+        let changes = Some(r#"{"notify":"changes"}"#);
+        let quiet = super::run_mission("Read the synthetic file", changes, Some("v1"));
         assert!(quiet.starts_with("Read the synthetic file"));
+        assert!(
+            quiet.contains("The previous run reported: \"v1\""),
+            "{quiet}"
+        );
         assert!(
             quiet.contains("complete_goal and nothing_new: true"),
             "{quiet}"
         );
+        let first = super::run_mission("Read the synthetic file", changes, None);
+        assert!(first.contains("first run"), "{first}");
         assert_eq!(
-            super::run_mission("Read the synthetic file", None),
+            super::run_mission("Read the synthetic file", None, Some("v1")),
             "Read the synthetic file"
         );
     }

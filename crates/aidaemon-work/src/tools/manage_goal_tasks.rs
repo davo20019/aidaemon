@@ -1243,7 +1243,12 @@ impl ManageGoalTasksTool {
             goal.context = Some(context.to_string());
         }
         self.state.update_goal(&goal).await?;
-        info!(goal_id = %self.goal_id, is_continuous, "Goal run completed");
+        info!(
+            goal_id = %self.goal_id,
+            is_continuous,
+            nothing_new = args.nothing_new.unwrap_or(false),
+            "Goal run completed"
+        );
 
         let mut response = if is_continuous {
             format!(

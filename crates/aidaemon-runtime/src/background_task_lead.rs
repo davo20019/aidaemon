@@ -1211,14 +1211,32 @@ pub fn spawn_background_task_lead(
 
         let body = async move {
             let goal_id = goal.id.clone();
+            let goal_run = state.get_current_goal_run(&goal_id).await.ok().flatten();
+            let goal_run_id = goal_run.as_ref().map(|run| run.id.clone());
+            // What the last finished run reported: a quiet automation's run
+            // compares itself with it.
+            let previous_result = if goal.goal_type == "continuous" {
+                state
+                    .get_goal_runs(&goal_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|run| Some(&run.id) != goal_run_id.as_ref())
+                    .find(|run| run.status == "completed")
+                    .and_then(|run| run.outcome_summary)
+            } else {
+                None
+            };
             let mission = if goal.goal_type == "continuous" {
-                aidaemon_work::automations::run_mission(&goal.description, goal.context.as_deref())
+                aidaemon_work::automations::run_mission(
+                    &goal.description,
+                    goal.context.as_deref(),
+                    previous_result.as_deref(),
+                )
             } else {
                 goal.description.clone()
             };
             let initial_goal = goal.clone();
-            let goal_run = state.get_current_goal_run(&goal_id).await.ok().flatten();
-            let goal_run_id = goal_run.as_ref().map(|run| run.id.clone());
             let is_mandate_run = goal_run
                 .as_ref()
                 .is_some_and(|run| run.trigger_type == "mandate");
@@ -3197,6 +3215,12 @@ pub fn spawn_background_task_lead(
                         run_id,
                     )
                 });
+            info!(
+                goal_id = %goal_id,
+                notification_type,
+                found_nothing_new,
+                "Scheduled run notify decision"
+            );
             if is_scheduled_run
                 && continuous_controller
                 && !aidaemon_work::automations::NotifyMode::from_context(
