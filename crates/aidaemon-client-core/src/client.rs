@@ -16,9 +16,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
-    AutomationSummary, Command, CommandResult, ErrorCode, Event, LiveTurnState, MemoryItem, MidRun,
-    ProjectSummary, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange,
-    SettingsOutcome, SetupAction, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
+    AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
+    MidRun, ModelChoice, ModelOptions, ProjectSummary, SearchHit, ServerFrame, SessionChanges,
+    SessionModel, Settings, SettingsChange, SettingsOutcome, SetupAction, SetupStep, SlashCommand,
+    SystemStatus, TaskSummary, TurnStatus,
 };
 
 use crate::machine::{DropKind, Update, request_id};
@@ -248,6 +249,18 @@ pub struct Client {
     /// Why the last settings change was refused, until dismissed or the
     /// next change.
     pub settings_error: Option<String>,
+    /// The providers and models a conversation can answer with.
+    pub models: Read<ModelOptions>,
+    models_request: Option<String>,
+    /// What each app conversation answers with, as last read or set.
+    pub session_models: BTreeMap<String, Read<SessionModel>>,
+    /// Reads and changes of a conversation's model: request id to session.
+    session_model_requests: BTreeMap<String, String>,
+    /// The model and effort the next new conversation starts with.
+    pub new_model: (ModelChoice, Effort),
+    /// The model a new conversation's first message carried, until the
+    /// daemon names the conversation.
+    starting_model: Option<(ModelChoice, Effort)>,
     /// Settings changes waiting for an approval, and whether another
     /// device must give it.
     pub settings_waiting: BTreeMap<String, bool>,
@@ -425,6 +438,16 @@ impl Client {
         {
             self.starting = None;
             self.fetched.insert(session_id.clone());
+            if let Some((model, effort)) = self.starting_model.take() {
+                self.session_models.insert(
+                    session_id.clone(),
+                    Read::Ready(SessionModel {
+                        session_id: session_id.clone(),
+                        model,
+                        effort,
+                    }),
+                );
+            }
             out.push(Effect::Started(session_id.clone()));
         }
         match frame {
@@ -486,6 +509,48 @@ impl Client {
             } if mine(&self.system_request, request_id) => {
                 self.system_request = None;
                 self.system = SystemRead::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Models { options },
+            } if mine(&self.models_request, request_id) => {
+                self.models_request = None;
+                self.models = Read::Ready(options.clone());
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.models_request, request_id) => {
+                self.models_request = None;
+                self.models = Read::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::SessionModel { session_model },
+            } if self.session_model_requests.contains_key(request_id) => {
+                self.session_model_requests.remove(request_id);
+                self.session_models.insert(
+                    session_model.session_id.clone(),
+                    Read::Ready(session_model.clone()),
+                );
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.session_model_requests.contains_key(request_id) => {
+                let session = self
+                    .session_model_requests
+                    .remove(request_id)
+                    .unwrap_or_default();
+                // A refused change leaves the conversation as the daemon
+                // has it: read that again.
+                out.push(Effect::Say(error.message.clone()));
+                self.session_models.remove(&session);
+                self.load_session_model(&session);
                 return true;
             }
             // Only this client's own list or change is answered with it.
@@ -1119,6 +1184,117 @@ impl Client {
 
     // ----- Projects and bots ------------------------------------------------
 
+    // ----- A conversation's model ------------------------------------------
+
+    /// Read the providers and models a conversation can answer with.
+    pub fn refresh_models(&mut self) {
+        if self.models_request.is_some() {
+            return;
+        }
+        if !self.models.is_ready() {
+            self.models = Read::Loading;
+        }
+        self.models_request = Some(self.send(Command::ListModels));
+    }
+
+    /// Whether `session` (`None`: a new conversation) can be set to a
+    /// model: only the app's own conversations can.
+    pub fn can_pick_model(&self, session: Option<&str>) -> bool {
+        session.is_none_or(|id| id.starts_with("app:"))
+    }
+
+    /// Read what `session` answers with, once.
+    pub fn load_session_model(&mut self, session: &str) {
+        if !self.can_pick_model(Some(session)) || self.session_models.contains_key(session) {
+            return;
+        }
+        self.session_models
+            .insert(session.to_owned(), Read::Loading);
+        let id = self.send(Command::GetSessionModel {
+            session_id: session.to_owned(),
+        });
+        self.session_model_requests.insert(id, session.to_owned());
+    }
+
+    /// The model and effort `session` (`None`: a new conversation) answers
+    /// with, as far as this client knows.
+    pub fn model_of(&self, session: Option<&str>) -> (ModelChoice, Effort) {
+        match session {
+            None => self.new_model.clone(),
+            Some(id) => self
+                .session_models
+                .get(id)
+                .and_then(Read::ready)
+                .map(|m| (m.model.clone(), m.effort))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The efforts `model` takes besides automatic: a pinned model's own;
+    /// automatic, those of the main provider's first model.
+    pub fn efforts_of(&self, model: &ModelChoice) -> Vec<Effort> {
+        let Some(options) = self.models.ready() else {
+            return Vec::new();
+        };
+        match model {
+            ModelChoice::Pinned { provider, model } => options
+                .providers
+                .iter()
+                .find(|p| p.id == *provider)
+                .and_then(|p| p.models.iter().find(|m| m.id == *model))
+                .map(|m| m.efforts.clone())
+                .unwrap_or_default(),
+            _ => options
+                .providers
+                .first()
+                .and_then(|p| p.models.first())
+                .map(|m| m.efforts.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Set what `session` (`None`: the next new conversation) answers
+    /// with; a `None` stays as it is. An effort the new model does not take
+    /// goes back to automatic.
+    pub fn set_session_model(
+        &mut self,
+        session: Option<&str>,
+        model: Option<ModelChoice>,
+        effort: Option<Effort>,
+    ) {
+        if !self.can_pick_model(session) {
+            return;
+        }
+        let (mut next_model, mut next_effort) = self.model_of(session);
+        if let Some(model) = model.clone() {
+            next_model = model;
+        }
+        if let Some(effort) = effort {
+            next_effort = effort;
+        }
+        if next_effort != Effort::Auto && !self.efforts_of(&next_model).contains(&next_effort) {
+            next_effort = Effort::Auto;
+        }
+        let Some(session) = session else {
+            self.new_model = (next_model, next_effort);
+            return;
+        };
+        self.session_models.insert(
+            session.to_owned(),
+            Read::Ready(SessionModel {
+                session_id: session.to_owned(),
+                model: next_model,
+                effort: next_effort,
+            }),
+        );
+        let id = self.send(Command::SetSessionModel {
+            session_id: session.to_owned(),
+            model,
+            effort: Some(next_effort),
+        });
+        self.session_model_requests.insert(id, session.to_owned());
+    }
+
     /// The owner's projects, by name.
     pub fn projects(&self) -> Vec<ProjectSummary> {
         let mut projects: Vec<ProjectSummary> = self.state.projects.values().cloned().collect();
@@ -1519,12 +1695,27 @@ impl Client {
                 });
             }
             _ => {
+                // A new conversation starts on the model picked for it; an
+                // existing one already answers with its own.
+                let (model, effort) = match session {
+                    None => {
+                        let pick = std::mem::take(&mut self.new_model);
+                        self.starting_model = Some(pick.clone());
+                        (
+                            Some(pick.0).filter(|m| *m != ModelChoice::Auto),
+                            Some(pick.1).filter(|e| *e != Effort::Auto),
+                        )
+                    }
+                    Some(_) => (None, None),
+                };
                 let id = self.send(Command::SendMessage {
                     session_id: session.map(str::to_owned),
                     text,
                     attachments,
                     mid_run,
                     project_id: session.is_none().then_some(project).flatten(),
+                    model,
+                    effort,
                 });
                 if session.is_none() {
                     // The draft is spent once the conversation exists.
@@ -1544,6 +1735,8 @@ impl Client {
             attachments: Vec::new(),
             mid_run: None,
             project_id: None,
+            model: None,
+            effort: None,
         });
     }
 
@@ -1805,5 +1998,97 @@ mod tests {
         );
         assert_eq!(effects, [Effect::Started("app:new".into())]);
         assert_eq!(client.submit(None, "  ", None, None), Ok(false));
+    }
+
+    fn models_ready(client: &mut Client) {
+        client.refresh_models();
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        assert_eq!(command, Command::ListModels);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"models","options":{{"providers":[
+                    {{"id":"main","name":"Anthropic","billing":"per_token","models":[{{"id":"synthetic-claude","efforts":["low","medium","high"]}}]}},
+                    {{"id":"failover-0","name":"Google Gemini","billing":"per_token","models":[{{"id":"synthetic-gemini"}}]}}
+                ]}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(client.models.is_ready());
+    }
+
+    fn gemini() -> ModelChoice {
+        ModelChoice::Pinned {
+            provider: "failover-0".into(),
+            model: "synthetic-gemini".into(),
+        }
+    }
+
+    #[test]
+    fn a_new_conversation_starts_on_its_pick_and_keeps_it() {
+        let mut client = Client::new();
+        models_ready(&mut client);
+        client.set_session_model(None, None, Some(Effort::High));
+        assert_eq!(client.model_of(None), (ModelChoice::Auto, Effort::High));
+        // Gemini takes no effort: picking it drops the effort.
+        client.set_session_model(None, Some(gemini()), None);
+        assert_eq!(client.model_of(None), (gemini(), Effort::Auto));
+        assert!(client.take_outgoing().is_empty(), "nothing sent yet");
+
+        client.submit(None, "hello", None, None).unwrap();
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        let Command::SendMessage { model, effort, .. } = command else {
+            panic!("{command:?}");
+        };
+        assert_eq!(model, Some(gemini()));
+        assert_eq!(effort, None);
+        assert_eq!(client.model_of(None), (ModelChoice::Auto, Effort::Auto));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:new","new_session":true}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(client.model_of(Some("app:new")), (gemini(), Effort::Auto));
+    }
+
+    #[test]
+    fn a_conversations_pick_is_sent_and_a_refusal_reads_it_again() {
+        let mut client = Client::new();
+        models_ready(&mut client);
+        assert!(!client.can_pick_model(Some("telegram:synthetic-user-1")));
+        client.set_session_model(Some("telegram:synthetic-user-1"), Some(gemini()), None);
+        assert!(client.take_outgoing().is_empty());
+
+        client.set_session_model(Some("app:a"), Some(gemini()), None);
+        assert_eq!(client.model_of(Some("app:a")).0, gemini());
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        assert!(
+            matches!(command, Command::SetSessionModel { .. }),
+            "{command:?}"
+        );
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{id}","error":{{"code":"invalid","message":"synthetic-gemini is not a model this daemon is set up with","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(matches!(&effects[..], [Effect::Say(_)]), "{effects:?}");
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        assert_eq!(
+            command,
+            Command::GetSessionModel {
+                session_id: "app:a".into()
+            }
+        );
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"session_model","session_model":{{"session_id":"app:a","model":{{"mode":"auto"}},"effort":"auto"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(
+            client.model_of(Some("app:a")),
+            (ModelChoice::Auto, Effort::Auto)
+        );
     }
 }
