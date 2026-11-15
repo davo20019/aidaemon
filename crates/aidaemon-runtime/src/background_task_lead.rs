@@ -778,6 +778,39 @@ pub fn clear_partial_success_context(goal: &mut aidaemon_work::traits::Goal) {
 
 /// A task lead that handed its work to the background finishes `Partial`:
 /// its run is still going, so its card must not call it complete.
+/// Whether a finished scheduled run stays quiet: its automation tells only
+/// changes or only problems, and this run (`run_id`) is one it keeps to
+/// itself. Its record stays in its history either way.
+async fn run_kept_quiet(
+    state: &Arc<dyn SchedulerStore>,
+    goal_id: &str,
+    owner_context: Option<&str>,
+    run_id: Option<&str>,
+    notification_type: &str,
+    claimed_nothing_new: bool,
+) -> bool {
+    let mode = aidaemon_work::automations::NotifyMode::from_context(owner_context);
+    if mode == aidaemon_work::automations::NotifyMode::EveryRun {
+        return false;
+    }
+    let latest = state
+        .get_goal(goal_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|goal| goal.context);
+    let nothing_new = claimed_nothing_new
+        || run_id.is_some_and(|run_id| {
+            aidaemon_work::automations::run_found_nothing_new(latest.as_deref(), run_id)
+        });
+    let quiet = !mode.tells(notification_type, nothing_new);
+    info!(
+        goal_id,
+        notification_type, nothing_new, quiet, "Scheduled run notify decision"
+    );
+    quiet
+}
+
 pub fn scheduled_run_progress(
     task_lead_outcome: Option<TaskOutcome>,
 ) -> aidaemon_channels::presentation::ScheduledRunProgress {
@@ -2720,6 +2753,26 @@ pub fn spawn_background_task_lead(
                     )
                     && !final_run_tasks.iter().any(is_terminal_recovery_task);
 
+                let quiet = match terminal_notification.as_ref() {
+                    Some((notification_type, _)) => {
+                        run_kept_quiet(
+                            &state,
+                            &goal_id,
+                            initial_goal.context.as_deref(),
+                            goal_run_id.as_deref(),
+                            notification_type,
+                            task_lead_found_nothing_new,
+                        )
+                        .await
+                    }
+                    None => false,
+                };
+                if quiet {
+                    if let Some(ref registry) = goal_token_registry {
+                        registry.remove(&goal_id).await;
+                    }
+                    return;
+                }
                 if !defer_to_autonomous_recovery {
                     if let Some((notification_type, msg)) = terminal_notification {
                         let msg =
@@ -3202,37 +3255,18 @@ pub fn spawn_background_task_lead(
 
             // The owner chose what a run tells them: a quiet run keeps its
             // record (the run's summary), and nothing is sent.
-            let latest_context = state
-                .get_goal(&goal_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|goal| goal.context);
-            let found_nothing_new = task_lead_found_nothing_new
-                || goal_run_id.as_deref().is_some_and(|run_id| {
-                    aidaemon_work::automations::run_found_nothing_new(
-                        latest_context.as_deref(),
-                        run_id,
-                    )
-                });
-            info!(
-                goal_id = %goal_id,
-                notification_type,
-                found_nothing_new,
-                "Scheduled run notify decision"
-            );
             if is_scheduled_run
                 && continuous_controller
-                && !aidaemon_work::automations::NotifyMode::from_context(
+                && run_kept_quiet(
+                    &state,
+                    &goal_id,
                     initial_goal.context.as_deref(),
-                )
-                .tells(notification_type, found_nothing_new)
-            {
-                info!(
-                    goal_id = %goal_id,
+                    goal_run_id.as_deref(),
                     notification_type,
-                    "Scheduled run kept quiet, as its automation's notify setting asks"
-                );
+                    task_lead_found_nothing_new,
+                )
+                .await
+            {
                 if let Some(ref registry) = goal_token_registry {
                     registry.remove(&goal_id).await;
                 }
