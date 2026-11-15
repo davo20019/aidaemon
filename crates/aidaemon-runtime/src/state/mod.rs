@@ -63,6 +63,12 @@ impl aidaemon_work::sqlite::WorkDatabase for SqliteStateStore {
 }
 
 /// Set restrictive file permissions (0600) on the database and WAL files.
+/// Windows keeps a user's files private through their profile's ACLs.
+#[cfg(not(unix))]
+fn set_db_file_permissions(_db_path: &str) {}
+
+/// Set restrictive file permissions (0600) on the database and WAL files.
+#[cfg(unix)]
 fn set_db_file_permissions(db_path: &str) {
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::Permissions::from_mode(0o600);

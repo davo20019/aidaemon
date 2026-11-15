@@ -1197,6 +1197,7 @@ async fn test_audio_ineligible_model_sends_text_stub_only() {
 }
 
 /// When native audio is skipped, Whisper STT fallback appends transcription text.
+#[cfg(unix)] // a fake executable script
 #[tokio::test]
 async fn test_stt_fallback_appends_transcription_when_native_audio_skipped() {
     use std::io::Write;

@@ -988,6 +988,7 @@ primary = "gpt-4o"
     }
 
     /// The export runs beside a live daemon: it must not need the write lock.
+    #[cfg(unix)] // file modes
     #[tokio::test]
     async fn memory_export_works_while_the_database_is_being_written() {
         use std::os::unix::fs::PermissionsExt;

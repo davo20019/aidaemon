@@ -279,14 +279,16 @@ jobs:
           vcpkg install openssl:x64-windows-static-md
           "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # The daemon first: what a Windows download needs.
       - name: Build
-        run: cargo build --all-targets --locked
+        run: cargo build --locked
+
+      - name: Build the app
+        if: always()
+        run: cargo build --locked --manifest-path clients/app/Cargo.toml
 
       - name: Test
         run: cargo test --lib --locked
-
-      - name: Build the app
-        run: cargo build --locked --manifest-path clients/app/Cargo.toml
 
   test:
     name: Test (${{ matrix.os }})
