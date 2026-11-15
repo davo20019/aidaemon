@@ -83,7 +83,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
 pub fn page(store: Store, session: Option<String>) -> View {
     let body = match &session {
         Some(id) => transcript(store, id.clone()).into_element(),
-        None => welcome().into_element(),
+        None => welcome(store).into_element(),
     };
     view()
         .test_id("conversation")
@@ -349,11 +349,133 @@ fn header(store: Store, session: Option<String>) -> View {
         ))
 }
 
-fn welcome() -> View {
-    ui::empty(
-        "What should we work on?",
-        "Ask anything, start a coding task, or hand off work to run in the background. Approvals and live progress show up here as the agent works.",
-    )
+/// What a new conversation can start from: a tap puts it in the composer
+/// to finish or send as it is.
+const STARTERS: [&str; 4] = [
+    "What can you do on this computer?",
+    "Start a coding task in ",
+    "Remind me tomorrow to ",
+    "Look up ",
+];
+
+/// A new conversation: a greeting, things to start from, and the latest
+/// conversations to go back to. On a phone it sits low, by the thumb and
+/// the composer; in a window it is centred.
+fn welcome(store: Store) -> View {
+    let hour =
+        ((crate::store::now_ms() as i64 + ui::time::local_offset_ms()) / 3_600_000).rem_euclid(24);
+    let greeting = match hour {
+        5..=11 => "Good morning",
+        12..=17 => "Good afternoon",
+        _ => "Good evening",
+    };
+    let mut starters = view().w_full().gap_2();
+    for prompt in STARTERS {
+        starters = starters.child(
+            ui::row(|| false, move || store.set_draft(prompt.to_owned()))
+                .accessibility_label(format!("Start with: {}", prompt.trim_end()))
+                .px_3()
+                .border_1()
+                .border_color(colors::LINE)
+                .rounded(px(ui::radius::CONTROL))
+                .child(
+                    text(if prompt.ends_with(' ') {
+                        format!("{}…", prompt.trim_end())
+                    } else {
+                        prompt.to_owned()
+                    })
+                    .flex_1()
+                    .number_of_lines(1)
+                    .text_size(px(ui::fit::body()))
+                    .text_color(colors::TEXT),
+                ),
+        );
+    }
+    // The three latest, as they load and change.
+    let recent = computed(move || store.session_ids().into_iter().take(3).collect::<Vec<_>>());
+    let latest = dynamic(move || {
+        let recent = recent.get();
+        (!recent.is_empty()).then(|| untracked(move || latest_rows(store, recent)))
+    });
+    view()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .style_when(ui::touch(), |s| s.justify_end())
+        .px_4()
+        .py_4()
+        .child(
+            view()
+                .w_full()
+                .max_w(px(560.0))
+                .gap_5()
+                .child(
+                    view()
+                        .gap_1()
+                        .child(
+                            text(greeting)
+                                .text_size(px(type_scale::SM))
+                                .text_color(colors::MUTED),
+                        )
+                        .child(
+                            text("What should we work on?")
+                                .role(AccessibilityRole::Header)
+                                .text_size(px(type_scale::TITLE + 3.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(colors::TEXT),
+                        )
+                        .child(
+                            text("Ask anything, start a coding task, or hand off work to run in the background.")
+                                .text_size(px(ui::fit::small()))
+                                .text_color(colors::MUTED),
+                        ),
+                )
+                .child(starters)
+                .child(latest),
+        )
+}
+
+/// The latest conversations, to go back to.
+fn latest_rows(store: Store, recent: Vec<String>) -> View {
+    let mut latest = view()
+        .w_full()
+        .gap(px(2.0))
+        .child(ui::section_label("Pick up where you left off"));
+    for id in recent {
+        let (open, title, place) = (id.clone(), store.title(&id), store.place(&id));
+        let age = store
+            .last_activity(&id)
+            .map(|at| ui::time::ago(at, crate::store::now_ms()))
+            .unwrap_or_default();
+        latest = latest.child(
+            ui::row(|| false, move || store.select(Some(open.clone())))
+                .accessibility_label(format!("{title}, {place}"))
+                .child(ui::icon(Glyph::Chat).text_color(colors::FAINT))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(title)
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::body()))
+                                .text_color(colors::TEXT),
+                        )
+                        .child(
+                            text(place)
+                                .number_of_lines(1)
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                        ),
+                )
+                .child(
+                    text(age)
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::FAINT),
+                ),
+        );
+    }
+    latest
 }
 
 /// The transcript, and a "Jump to latest" pill while the owner reads back.

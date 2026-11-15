@@ -68,7 +68,7 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
         ),
     ]);
     app.wait_for("Fix the flaky test")?;
-    app.press("Fix the flaky test")?;
+    app.press("Fix the flaky test >> nth=0")?;
     feed([
         frame(
             r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-1","event":{"type":"user_message","session_id":"app:synthetic-1","text":"Why does it fail on CI?","origin":"app"}}"#,
