@@ -33,10 +33,7 @@ pub fn next_unfold() {
 }
 
 fn fade() -> nsh_core::element::LayoutTransition {
-    nsh_core::element::LayoutTransition::new(
-        nsh_core::element::LayoutCurve::EaseInEaseOut,
-        BASE,
-    )
+    nsh_core::element::LayoutTransition::new(nsh_core::element::LayoutCurve::EaseInEaseOut, BASE)
 }
 
 /// A terminal has only cells: it changes at once.
