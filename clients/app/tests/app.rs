@@ -570,3 +570,28 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
     app.wait_for("Fix the footer and add a test")?;
     Ok(())
 }
+
+#[test]
+fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-7","channel":"app","title":"Draft the invoice","writable":true},{"id":"app:synthetic-8","channel":"app","title":"Plan the trip","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Plan the trip")?;
+    app.press("Plan the trip >> nth=0")?;
+    feed([
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-7","event":{"type":"turn_started","turn_id":"t7","session_id":"app:synthetic-7","origin":"app"}}"#,
+        ),
+        frame(
+            r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:synthetic-7","event":{"type":"turn_completed","turn_id":"t7","text":"The invoice is drafted.","state":"completed"}}"#,
+        ),
+    ]);
+    app.wait_for("Done: Draft the invoice")?;
+    Ok(())
+}

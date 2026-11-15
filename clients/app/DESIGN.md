@@ -79,6 +79,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | System | Chat bots | Each bot with its conversation count and a project picker: its direct messages work in that project's folder unless moved; group chats join a project only when moved there |
 | Changes | A tool that can change files finishes | The changes read again while the tab shows (else on its next showing); the files list as a tree under their folders; a press on a file fills the pane with its diff (`ui::diff`: line numbers, changed words, folded context that expands, highlighted by its name), with Previous/Next change, Side by side, Copy and All files |
 | System | Open | Reads on open and every 30 s; "Needs a look" (warning tint, alert role) leads when anything fails |
+| All | A reply finishes, or an approval arrives, in another conversation while the app is in front | Toast: "Done: <conversation>" or "Needs you in <conversation>: <what>" |
 | System | A reply finishes while the app is in the background | "Done: <conversation>" notification; pressing it opens the conversation |
 | Composer | Files dragged from the desktop | The border turns accent and says "Drop to attach"; dropped files attach as the paperclip's do (a folder or unreadable file says so) |
 | Composer | Microphone (where the platform recognizes speech) | Speech writes into the composer after what is there as it is heard; the button becomes Stop listening (accent); a refusal says what to allow |

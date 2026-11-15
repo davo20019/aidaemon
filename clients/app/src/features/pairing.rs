@@ -43,6 +43,11 @@ pub fn pairing(store: Store) -> View {
             }
         });
     };
+    // A link that carries its code pairs at once: opening it is the ask,
+    // and the owner still confirms in the chat it came from.
+    if from_link && code.with_untracked(|c| !c.trim().is_empty()) {
+        submit();
+    }
     view().flex_1().items_center().justify_center().p_6().child(
         ui::surface()
             .w(px(420.0))

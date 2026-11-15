@@ -770,9 +770,16 @@ fn search_hits(store: Store) -> View {
                     .text_size(px(type_scale::SM))
                     .text_color(colors::MUTED),
             ),
+            // Conversations already listed above match: "nothing" here
+            // would read as if the search found nothing at all.
+            SearchRead::Ready { hits, .. }
+                if hits.is_empty() && !store.visible_ids().is_empty() =>
+            {
+                view()
+            }
             SearchRead::Ready { hits, .. } => {
                 let mut list = view().gap(px(1.0)).child(section_label(if hits.is_empty() {
-                    "In messages: nothing"
+                    "Nothing matches, in titles or messages"
                 } else {
                     "In messages"
                 }));

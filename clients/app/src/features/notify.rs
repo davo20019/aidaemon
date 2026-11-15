@@ -1,4 +1,5 @@
-//! Telling the owner an approval is waiting while they look elsewhere: a
+//! Telling the owner an approval is waiting, or a reply finished, while
+//! they look elsewhere: a note in the app when it is in front, else a
 //! system notification per new approval (closed once it is answered
 //! anywhere), and the waiting count on the app's icon. Pressing a
 //! notification brings that approval into view.
@@ -31,7 +32,18 @@ pub fn approvals(store: Store) {
                 .filter(|a| !seen.with(|s| s.contains(&a.id)))
                 .collect();
             seen.with(|s| *s = ids);
-            if new.is_empty() || lifecycle() == Lifecycle::Active {
+            if new.is_empty() {
+                return;
+            }
+            // In front, but elsewhere: a note in the app, not the system's.
+            if lifecycle() == Lifecycle::Active {
+                if let Some(approval) = new.iter().find(|a| !on_screen(store, &a.session_id)) {
+                    store.say(format!(
+                        "Needs you in {}: {}",
+                        store.title(&approval.session_id),
+                        approval.summary
+                    ));
+                }
                 return;
             }
             let first_ask = !asked.replace(true);
@@ -84,6 +96,10 @@ pub fn replies(store: Store) {
         };
         untracked(|| {
             if lifecycle() == Lifecycle::Active {
+                // In front, but looking at something else: say so here.
+                if !on_screen(store, &session) {
+                    store.say(format!("Done: {}", store.title(&session)));
+                }
                 return;
             }
             let title = store.title(&session);
@@ -100,4 +116,9 @@ pub fn replies(store: Store) {
             });
         });
     });
+}
+
+/// Whether `session`'s conversation is what the owner is looking at.
+fn on_screen(store: Store, session: &str) -> bool {
+    store.page() == crate::store::Page::Conversation && store.selected().as_deref() == Some(session)
 }
