@@ -117,9 +117,9 @@ pub enum FailoverAction {
 
 /// Decides what follows a failed attempt. The default ([`DefaultFailover`])
 /// retries what [`ProviderError::is_retryable`] allows on the same step,
-/// then moves on; it moves on at once from authentication, billing,
-/// not-found and other errors, and stops on an invalid request, a context
-/// overflow (the caller must shrink it) and a wrongly shaped reply.
+/// then moves on; it moves on at once from every other error (another
+/// provider may accept what this one refused) and stops only on a context
+/// overflow (the caller must shrink the request).
 /// A request with [`crate::RequestOptions::single_attempt`] stops at its
 /// first error whatever the policy says, unless it also sets
 /// [`crate::RequestOptions::fallback_when_unspent`] and the error proves
@@ -175,9 +175,7 @@ impl FailoverPolicy for DefaultFailover {
                 };
                 FailoverAction::Retry(delay.min(MAX_BACKOFF))
             }
-            ProviderError::InvalidRequest(_)
-            | ProviderError::ContextOverflow { .. }
-            | ProviderError::Malformed { parse: false, .. } => FailoverAction::Stop,
+            ProviderError::ContextOverflow { .. } => FailoverAction::Stop,
             _ => FailoverAction::Next,
         }
     }
@@ -509,18 +507,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_invalid_request_stops_the_chain() {
+    async fn a_request_one_provider_refuses_goes_to_the_next() {
         let chain = Failover::new(vec![
             FailoverStep::new(ScriptedProvider::with_results(vec![Err(
                 ProviderError::InvalidRequest("bad schema".into()),
             )])),
-            FailoverStep::new(ScriptedProvider::new(vec![text("never")])),
+            FailoverStep::new(ScriptedProvider::new(vec![text("next provider")])),
         ]);
         let events = collect(&chain).await;
-        assert_eq!(
-            events,
-            vec![Err(ProviderError::InvalidRequest("bad schema".into()))]
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "next provider")
         );
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_stops_the_chain() {
+        let overflow = ProviderError::ContextOverflow {
+            message: "too long".into(),
+            limit: None,
+        };
+        let chain = Failover::new(vec![
+            FailoverStep::new(ScriptedProvider::with_results(vec![Err(overflow.clone())])),
+            FailoverStep::new(ScriptedProvider::new(vec![text("never")])),
+        ]);
+        assert_eq!(collect(&chain).await, vec![Err(overflow)]);
     }
 
     #[tokio::test]

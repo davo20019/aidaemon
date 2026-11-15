@@ -198,7 +198,9 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
             aidaemon_tools::backoff::exponential_backoff(base, attempt.saturating_sub(1), max)
         };
         match daemon_error.recovery_route(false) {
-            ProviderRecoveryRoute::Fail => Stop,
+            // Unclassified: this model can't be trusted to answer; another
+            // provider may.
+            ProviderRecoveryRoute::Fail => Next,
             // A 402 that says what it can afford: retry once with that cap,
             // then remember the failure and move on.
             ProviderRecoveryRoute::RetryReducedBudgetThenFallback => {
@@ -246,7 +248,7 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                             request: Box::new(defaults),
                         }
                     }
-                    None => Stop,
+                    None => Next,
                 }
             }
             ProviderRecoveryRoute::RetryRateLimitThenFallback => {
@@ -298,8 +300,8 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                     Duration::MAX,
                 ))
             }
-            // A wrongly shaped reply is likely deterministic: one quick
-            // retry, then give up without other models.
+            // A wrongly shaped reply is likely deterministic for this
+            // model: one quick retry, then the next model.
             ProviderRecoveryRoute::RetryMalformedThenFail => {
                 record_llm_payload_invalid_metric(
                     self.provider_label,
@@ -307,7 +309,7 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                     malformed_reason_label(daemon_error.malformed_reason),
                 );
                 if attempt > MAX_MALFORMED_PAYLOAD_RETRIES {
-                    return Stop;
+                    return Next;
                 }
                 Retry(Duration::from_secs(MALFORMED_PAYLOAD_RETRY_DELAY_SECS))
             }
@@ -357,15 +359,20 @@ async fn fallback_models(host: &dyn TurnHost, model: &str, router: Option<&Route
 ///   then the next model (a server error on media first retries without
 ///   it);
 /// - BadRequest: retry once without media, then once with default
-///   options, then fail;
+///   options, then the next model;
 /// - Billing: retry once with the affordable cap, then cache the failure
 ///   and move on (cached models are skipped for ten minutes);
-/// - NotFound: next model; malformed shape: one retry, then fail;
+/// - NotFound or an unclassified error: next model; malformed shape: one
+///   retry, then the next model;
 /// - Auth or a used-up quota: the next provider (each backend's
 ///   `QuotaGuard` fails the account's other models without a request,
 ///   and keeps failing them until the quota resets); when every model
 ///   fails, the quota and its reset are what is reported;
-/// - a context overflow (recorded for the caller): fail.
+/// - a context overflow (recorded for the caller, who shrinks the request
+///   and calls again): stop.
+///
+/// Every other failure moves on: a call ends only when every configured
+/// provider's models have been tried.
 ///
 /// `pin_model` (an active computer-use task) keeps the call on `model`.
 #[allow(clippy::too_many_arguments)]
