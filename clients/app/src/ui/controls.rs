@@ -670,7 +670,10 @@ pub fn disclosure(
                 .text_size(px(type_scale::SM))
                 .text_color(colors::MUTED),
         )
-        .on_press(move || open.update(|o| *o = !*o))
+        .on_press(move || {
+            motion::next_unfold();
+            open.update(|o| *o = !*o)
+        })
 }
 
 /// A short identifier in monospace.

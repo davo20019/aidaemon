@@ -859,6 +859,7 @@ impl Store {
     }
 
     pub fn open_system(&self) {
+        crate::ui::motion::next_layout();
         self.close_panes();
         self.page.set(Page::System);
         self.refresh_system();
@@ -900,6 +901,7 @@ impl Store {
     // ----- The Memory page ---------------------------------------------------
 
     pub fn open_memory(&self) {
+        crate::ui::motion::next_layout();
         self.close_panes();
         self.page.set(Page::Memory);
         self.refresh_memories();
@@ -929,6 +931,7 @@ impl Store {
     // ----- The Settings page -------------------------------------------------
 
     pub fn open_settings(&self) {
+        crate::ui::motion::next_layout();
         self.close_panes();
         self.page.set(Page::Settings);
         self.refresh_settings();
@@ -1344,6 +1347,8 @@ impl Store {
         self.inspector.get()
     }
 
+    /// A wide window's panes change at once: the resizable group keeps the
+    /// widths it measures, and an animated close would leave it at none.
     pub fn toggle_sidebar(&self) {
         self.sidebar.update(|s| *s = !*s);
     }
@@ -1380,6 +1385,7 @@ impl Store {
     /// wide one.
     pub fn open_sidebar(&self) {
         if self.compact.get_untracked() {
+            crate::ui::motion::next_layout();
             self.inspector.set(false);
             self.sidebar.set(true);
         } else {
@@ -1389,6 +1395,7 @@ impl Store {
 
     pub fn open_inspector(&self) {
         if self.compact.get_untracked() {
+            crate::ui::motion::next_layout();
             self.sidebar.set(false);
             self.inspector.set(true);
         } else {
@@ -1398,7 +1405,10 @@ impl Store {
 
     /// Back to the conversation (a narrow window's panes).
     pub fn close_panes(&self) {
-        if self.compact.get_untracked() {
+        if self.compact.get_untracked()
+            && (self.sidebar.get_untracked() || self.inspector.get_untracked())
+        {
+            crate::ui::motion::next_layout();
             self.sidebar.set(false);
             self.inspector.set(false);
         }
@@ -1659,6 +1669,7 @@ impl Store {
     // ----- What the owner does --------------------------------------------
 
     pub fn select(&self, id: Option<String>) {
+        crate::ui::motion::next_layout();
         self.close_panes();
         self.page.set(Page::Conversation);
         if let Some(id) = &id {

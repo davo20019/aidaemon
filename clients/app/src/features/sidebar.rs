@@ -144,8 +144,17 @@ pub fn sidebar(store: Store) -> View {
             ),
         )
         .child(pages(store))
-        .child(ui::separator())
-        .child(connection(store))
+        // On a phone the line shows only when something is wrong: connected
+        // is the normal state, not news worth a row.
+        .child(
+            view()
+                .style_when(
+                    move || ui::touch() && store.connection() == Connection::Online,
+                    |s| s.hidden(),
+                )
+                .child(ui::separator())
+                .child(connection(store)),
+        )
 }
 
 /// A conversation's row, with its menu on a right click or a long press:

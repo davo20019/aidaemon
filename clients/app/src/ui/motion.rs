@@ -14,3 +14,35 @@ pub const ENTER: f32 = 260.0;
 pub const PRESS_SCALE: f32 = 0.97;
 /// The scale a pressed icon button settles to.
 pub const PRESS_SCALE_ICON: f32 = 0.94;
+
+/// Fades the next state change: a pane opening or closing, a page
+/// replacing another. What comes fades in, what goes fades out; nothing
+/// grows (a view shown from hidden would grow out of a corner).
+pub fn next_layout() {
+    animate(nsh_core::element::LayoutAnimation {
+        create: Some(fade()),
+        update: None,
+        delete: Some(fade()),
+    });
+}
+
+/// Animates a section unfolding: its content fades in and what is below it
+/// moves down to make room (and back up when it folds).
+pub fn next_unfold() {
+    animate(nsh_core::element::LayoutAnimation::all(fade()));
+}
+
+fn fade() -> nsh_core::element::LayoutTransition {
+    nsh_core::element::LayoutTransition::new(
+        nsh_core::element::LayoutCurve::EaseInEaseOut,
+        BASE,
+    )
+}
+
+/// A terminal has only cells: it changes at once.
+fn animate(animation: nsh_core::element::LayoutAnimation) {
+    if nsh_core::element::idiom() == nsh_core::platform::Idiom::Terminal {
+        return;
+    }
+    nsh_core::prelude::animate_layout(animation);
+}

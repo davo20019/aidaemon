@@ -219,7 +219,12 @@ pub fn sections(open: Signal<Vec<SharedString>>, items: Vec<(String, String, Vie
                             ),
                     ),
                 )
-                .child(accordion_panel().accessibility_label(title).child(content)),
+                .child(
+                    accordion_panel()
+                        .reveal(true)
+                        .accessibility_label(title)
+                        .child(content),
+                ),
         );
     }
     view().child(list)
@@ -392,15 +397,22 @@ impl MenuAction {
 /// `trigger` with a menu on a secondary press (right click, a long press,
 /// the context-menu key).
 pub fn with_menu(trigger: impl IntoElement, actions: Vec<MenuAction>) -> View {
-    let mut menu = context_menu().trigger(trigger).popup_style(|s| {
-        s.bg(colors::SURFACE)
-            .border_1()
-            .border_color(colors::BORDER)
-            .rounded(px(radius::CONTROL))
-            .shadow_lg()
-            .p_1()
-            .min_w(px(180.0))
-    });
+    let mut menu = context_menu()
+        .trigger(trigger)
+        .popup_style(|s| {
+            s.bg(colors::SURFACE)
+                .border_1()
+                .border_color(colors::BORDER)
+                .rounded(px(radius::CONTROL))
+                .shadow_lg()
+                .p_1()
+                .min_w(px(180.0))
+                .transition_all()
+                .duration(motion::BASE)
+        })
+        // It grows from where it was asked for, and fades as it goes.
+        .popup_starting_class("opacity-0 scale-95")
+        .popup_ending_class("opacity-0 scale-95");
     for action in actions {
         let run = action.run;
         menu = menu.child(

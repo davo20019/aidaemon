@@ -88,24 +88,15 @@ pub fn shell(store: Store) -> View {
         .flex_row()
         // A narrow window shows one thing at a time: a pane, full-screen,
         // or the conversation.
-        .child(
-            view()
-                .flex_1()
-                .style_when(
-                    move || !(store.is_compact() && store.sidebar_open()),
-                    |s| s.hidden(),
-                )
-                .child(sidebar(store)),
-        )
-        .child(
-            view()
-                .flex_1()
-                .style_when(
-                    move || !(store.is_compact() && store.inspector_open()),
-                    |s| s.hidden(),
-                )
-                .child(inspector(store)),
-        )
+        // Made when opened (not shown from hidden), so it fades in.
+        .child(when(
+            move || store.is_compact() && store.sidebar_open(),
+            move || view().flex_1().child(sidebar(store)),
+        ))
+        .child(when(
+            move || store.is_compact() && store.inspector_open(),
+            move || view().flex_1().child(inspector(store)),
+        ))
         // A narrow window (a phone): the page alone, as wide as the screen.
         // A roomy one: the panes beside the page, each as wide as the owner
         // drags it. Only crossing between the two remakes the layout.
