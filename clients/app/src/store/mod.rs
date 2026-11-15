@@ -9,7 +9,7 @@ use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, Command, CommandResult, ErrorCode, Event, Feature, MemoryItem,
-    MidRun, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange, SettingsOutcome,
+    MidRun, ProjectSummary, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange, SettingsOutcome,
     SetupAction, SetupState, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
@@ -264,6 +264,14 @@ pub struct Store {
     changes_request: Stored<Option<String>>,
     /// Something changed while a read was in flight: read again after it.
     changes_again: Stored<bool>,
+    /// The project a new conversation starts in (`None`: no project).
+    new_project: Signal<Option<String>>,
+    /// Projects shown open in the sidebar.
+    open_projects: Signal<BTreeSet<String>>,
+    /// The New project form: shown, the request in flight, why it failed.
+    project_form: Signal<bool>,
+    project_request: Stored<Option<String>>,
+    project_error: Signal<Option<String>>,
     /// The inspector's open tab (an index of [`INSPECTOR_TABS`]).
     inspector_tab: Signal<usize>,
     /// Turns that already opened the Code tab, so the owner's own choice
@@ -336,6 +344,11 @@ impl Store {
             changes_of: stored(None),
             changes_request: stored(None),
             changes_again: stored(false),
+            new_project: signal(None),
+            open_projects: signal(BTreeSet::new()),
+            project_form: signal(false),
+            project_request: stored(None),
+            project_error: signal(None),
             inspector_tab: signal(0),
             code_opened: stored(BTreeSet::new()),
             settings: signal(SettingsRead::NotYet),
@@ -498,7 +511,7 @@ impl Store {
         for line in self.lines(&id) {
             let (who, text, at) = match line {
                 Line::User { text, at_ms, .. } => ("You", text, at_ms),
-                Line::Assistant { text, at_ms } => ("AIdaemon", text, at_ms),
+                Line::Assistant { text, at_ms, .. } => ("AIdaemon", text, at_ms),
                 Line::Note { text } => ("Note", text, 0),
                 Line::Activity { tools, .. } => {
                     out.push_str(&format!("\n_Used: {}_\n", tools.join(", ")));
@@ -587,6 +600,7 @@ impl Store {
                     limit: 200,
                 });
                 self.send(Command::ListCommands);
+                self.send(Command::ListProjects);
                 // Today's token use, for the sidebar.
                 self.refresh_system();
                 // A reconnect may have missed history: ask again on view.
@@ -723,6 +737,35 @@ impl Store {
                         hits: hits.clone(),
                     });
                 }
+                return;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Project { project },
+            } if self
+                .project_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.project_request.replace(None);
+                self.project_form.set(false);
+                self.project_error.set(None);
+                let id = project.id.clone();
+                self.open_projects.update(|open| {
+                    open.insert(id.clone());
+                });
+                self.say(format!("Project {} created", project.name));
+                // A new project opens on a new conversation in it.
+                self.new_in_project(Some(id));
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .project_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.project_request.replace(None);
+                self.project_error.set(Some(error.message.clone()));
                 return;
             }
             ServerFrame::Ack {
@@ -1012,6 +1055,111 @@ impl Store {
         });
     }
 
+    // ----- Projects -----------------------------------------------------------
+
+    /// The owner's projects, by name.
+    pub fn projects(&self) -> Vec<ProjectSummary> {
+        let mut projects: Vec<ProjectSummary> =
+            self.state.with(|s| s.projects.values().cloned().collect());
+        projects.sort_by_key(|p| p.name.to_lowercase());
+        projects
+    }
+
+    pub fn project(&self, id: &str) -> Option<ProjectSummary> {
+        self.state.with(|s| s.projects.get(id).cloned())
+    }
+
+    /// The project a conversation is in.
+    pub fn session_project(&self, session: &str) -> Option<String> {
+        self.state.with(|s| {
+            s.sessions
+                .get(session)
+                .and_then(|v| v.summary.as_ref())
+                .and_then(|summary| summary.project_id.clone())
+        })
+    }
+
+    /// The project of what is on screen: the selected conversation's, or
+    /// the one a new conversation will start in.
+    pub fn current_project(&self) -> Option<String> {
+        match self.selected.get() {
+            Some(id) => self.session_project(&id),
+            None => self.new_project.get(),
+        }
+    }
+
+    /// Start a new conversation in `project` (`None`: in no project).
+    pub fn new_in_project(&self, project: Option<String>) {
+        self.select(None);
+        self.new_project.set(project);
+    }
+
+    /// Choose the project the new conversation on screen starts in.
+    pub fn set_new_project(&self, project: Option<String>) {
+        self.new_project.set(project);
+    }
+
+    pub fn project_open(&self, id: &str) -> bool {
+        self.open_projects.with(|open| open.contains(id))
+    }
+
+    pub fn toggle_project(&self, id: &str) {
+        crate::ui::motion::next_unfold();
+        let id = id.to_owned();
+        self.open_projects.update(|open| {
+            if !open.remove(&id) {
+                open.insert(id);
+            }
+        });
+    }
+
+    pub fn project_form_open(&self) -> bool {
+        self.project_form.get()
+    }
+
+    pub fn show_project_form(&self, show: bool) {
+        crate::ui::motion::next_unfold();
+        self.project_form.set(show);
+        self.project_error.set(None);
+    }
+
+    pub fn project_error(&self) -> Option<String> {
+        self.project_error.get()
+    }
+
+    pub fn creating_project(&self) -> bool {
+        self.project_request.with(|r| r.is_some())
+    }
+
+    /// Make a project; it opens on a new conversation once made.
+    pub fn create_project(&self, name: &str, path: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.project_error
+                .set(Some("Give the project a name".to_owned()));
+            return;
+        }
+        let path = path.trim();
+        let id = self.send(Command::CreateProject {
+            name: name.to_owned(),
+            path: (!path.is_empty()).then(|| path.to_owned()),
+        });
+        self.project_request.replace(Some(id));
+    }
+
+    /// Put a conversation in a project, or in none.
+    pub fn move_to_project(&self, session: &str, project: Option<String>) {
+        if let Some(id) = &project {
+            self.open_projects.update(|open| {
+                open.insert(id.clone());
+            });
+        }
+        self.send(Command::SetSessionProject {
+            session_id: session.to_owned(),
+            project_id: project,
+        });
+    }
+
     // ----- The inspector's Code tab ------------------------------------------
 
     /// The inspector's open tab, for its tab bar.
@@ -1259,6 +1407,7 @@ impl Store {
                 text,
                 attachments: Vec::new(),
                 mid_run: None,
+                project_id: None,
             });
         }
     }
@@ -1270,6 +1419,7 @@ impl Store {
             text,
             attachments: Vec::new(),
             mid_run: None,
+            project_id: None,
         });
     }
 
@@ -1900,6 +2050,9 @@ impl Store {
             self.inspected.set(None);
         }
         let _ = nsh_core::storage::Storage::set_item(OPEN_KEY, id.clone().unwrap_or_default());
+        // A plain new conversation starts in no project; `new_in_project`
+        // places it after this.
+        self.new_project.set(None);
         self.selected.set(id);
     }
 
@@ -1958,6 +2111,11 @@ impl Store {
                     text,
                     attachments: Vec::new(),
                     mid_run,
+                    // A new conversation starts in the project it was opened in.
+                    project_id: key
+                        .is_none()
+                        .then(|| self.new_project.get_untracked())
+                        .flatten(),
                 });
                 if key.is_none() {
                     self.starting.replace(Some(id));

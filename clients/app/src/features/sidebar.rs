@@ -1,5 +1,6 @@
-//! The sidebar: a new conversation, the conversations with what each is
-//! doing, and the connection.
+//! The sidebar: a new conversation, the conversations that need the owner
+//! or are working (from every project), then each project with its
+//! conversations, the conversations in no project, and the connection.
 
 use nsh_core::prelude::*;
 
@@ -113,23 +114,14 @@ pub fn sidebar(store: Store) -> View {
                     .gap(px(1.0))
                     .child(group(store, "Needs you", needs))
                     .child(group(store, "Working", working))
-                    .child(when(
-                        move || !rest.with(Vec::is_empty),
-                        move || {
-                            section_label(move || {
-                                if needs.with(Vec::is_empty) && working.with(Vec::is_empty) {
-                                    "Conversations"
-                                } else {
-                                    "Others"
-                                }
-                            })
-                        },
-                    ))
-                    .child(each(
-                        rest,
-                        |id: &String| id.clone(),
-                        move |id, _| session_row(store, id.get_untracked()),
-                    ))
+                    // Searching lists every match flat; otherwise by project.
+                    .child(
+                        when(
+                            move || store.filter().trim().is_empty(),
+                            move || projects(store, rest),
+                        )
+                        .otherwise(move || group(store, "Conversations", rest)),
+                    )
                     .child(search_hits(store))
                     .child(when(
                         move || ids.with(Vec::is_empty) && !store.filter().trim().is_empty(),
@@ -158,20 +150,281 @@ pub fn sidebar(store: Store) -> View {
 }
 
 /// A conversation's row, with its menu on a right click or a long press:
-/// open it, pin or unpin it, stop its work.
+/// open it, pin or unpin it, stop its work, move it to a project.
 fn session_row(store: Store, id: String) -> View {
     let (open, pin, stop) = (id.clone(), id.clone(), id.clone());
     let pinned = untracked(|| store.is_pinned(&id));
-    ui::with_menu(
-        session_button(store, id),
-        vec![
-            ui::MenuAction::new("Open", move || store.select(Some(open.clone()))),
-            ui::MenuAction::new(if pinned { "Unpin" } else { "Pin" }, move || {
-                store.toggle_pin(&pin)
-            }),
-            ui::MenuAction::new("Stop its work", move || store.stop(&stop)),
-        ],
-    )
+    let current = untracked(|| store.session_project(&id));
+    let mut actions = vec![
+        ui::MenuAction::new("Open", move || store.select(Some(open.clone()))),
+        ui::MenuAction::new(if pinned { "Unpin" } else { "Pin" }, move || {
+            store.toggle_pin(&pin)
+        }),
+        ui::MenuAction::new("Stop its work", move || store.stop(&stop)),
+    ];
+    for project in untracked(|| store.projects()) {
+        if current.as_deref() == Some(project.id.as_str()) {
+            continue;
+        }
+        let (session, target) = (id.clone(), project.id.clone());
+        actions.push(ui::MenuAction::new(
+            format!("Move to {}", project.name),
+            move || store.move_to_project(&session, Some(target.clone())),
+        ));
+    }
+    if current.is_some() {
+        let session = id.clone();
+        actions.push(ui::MenuAction::new("Take out of its project", move || {
+            store.move_to_project(&session, None)
+        }));
+    }
+    ui::with_menu(session_button(store, id), actions)
+}
+
+/// The projects, each folded open or shut with its conversations, then
+/// the conversations in no project. `rest`: the conversations not already
+/// listed above (needing the owner, or working).
+fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
+    let all = computed(move || store.projects());
+    let unplaced = computed(move || {
+        let known: Vec<String> = all.with(|all| all.iter().map(|p| p.id.clone()).collect());
+        rest.with(|ids| {
+            ids.iter()
+                .filter(|id| {
+                    store
+                        .session_project(id)
+                        .is_none_or(|project| !known.contains(&project))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    view()
+        .gap(px(1.0))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .child(section_label("Projects").flex_1())
+                .child(ui::icon_btn(Glyph::Plus, "New project", ui::Size::Sm, move || {
+                    store.show_project_form(!store.project_form_open())
+                })),
+        )
+        .child(when(move || store.project_form_open(), move || project_form(store)))
+        .child(when(
+            move || all.with(Vec::is_empty) && !store.project_form_open(),
+            || {
+                text("Group conversations by folder: a site, a repository, designs.")
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT)
+            },
+        ))
+        .child(each(
+            all,
+            |p| p.id.clone(),
+            move |project, _| {
+                let id = project.with_untracked(|p| p.id.clone());
+                project_group(store, id, rest)
+            },
+        ))
+        .child(when(
+            move || !unplaced.with(Vec::is_empty),
+            move || {
+                section_label(move || {
+                    if all.with(Vec::is_empty) {
+                        "Conversations"
+                    } else {
+                        "Other conversations"
+                    }
+                })
+            },
+        ))
+        .child(each(
+            unplaced,
+            |id: &String| id.clone(),
+            move |id, _| session_row(store, id.get_untracked()),
+        ))
+}
+
+/// One project: its row (fold, name, folder, New conversation) and, open,
+/// its conversations.
+fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
+    let mine = {
+        let id = id.clone();
+        computed(move || {
+            rest.with(|ids| {
+                ids.iter()
+                    .filter(|s| store.session_project(s).as_deref() == Some(id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        })
+    };
+    let (toggle, open, new, name, folder, label, empty_id) = (
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+        id.clone(),
+    );
+    let is_open = computed(move || store.project_open(&open));
+    view()
+        .gap(px(1.0))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .child(
+                    row(
+                        move || {
+                            store.selected().is_none()
+                                && store.current_project().as_deref() == Some(new.as_str())
+                        },
+                        move || store.toggle_project(&toggle),
+                    )
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .accessibility_label(move || {
+                        let project = store.project(&label);
+                        Some(SharedString::from(format!(
+                            "Project {}, {} conversations",
+                            project.map(|p| p.name).unwrap_or_default(),
+                            mine.with(Vec::len)
+                        )))
+                    })
+                    .child(
+                        icon(Glyph::Chevron)
+                            .text_color(colors::FAINT)
+                            .rotate(move || deg(if is_open.get() { 90.0 } else { 0.0 }))
+                            .transition_transform()
+                            .duration(ui::motion::FAST),
+                    )
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                text(move || {
+                                    store.project(&name).map(|p| p.name).unwrap_or_default()
+                                })
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::body()))
+                                .font_weight(FontWeight::MEDIUM),
+                            )
+                            .child(
+                                text(move || {
+                                    store
+                                        .project(&folder)
+                                        .and_then(|p| p.path)
+                                        .map(|path| short_path(&path))
+                                        .unwrap_or_else(|| "No folder".to_owned())
+                                })
+                                .number_of_lines(1)
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                            ),
+                    )
+                    .child(
+                        text(move || match mine.with(Vec::len) {
+                            0 => String::new(),
+                            n => n.to_string(),
+                        })
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::FAINT),
+                    ),
+                )
+                .child(ui::icon_btn(
+                    Glyph::Plus,
+                    "New conversation in this project",
+                    ui::Size::Sm,
+                    {
+                        let id = id.clone();
+                        move || store.new_in_project(Some(id.clone()))
+                    },
+                )),
+        )
+        .child(when(move || is_open.get(), move || {
+            let empty_id = empty_id.clone();
+            view()
+                .pl_3()
+                .gap(px(1.0))
+                .child(when(
+                    move || mine.with(Vec::is_empty),
+                    move || {
+                        let id = empty_id.clone();
+                        row(|| false, move || store.new_in_project(Some(id.clone())))
+                            .child(
+                                text("No conversations yet. Start one")
+                                    .text_size(px(type_scale::SM))
+                                    .text_color(colors::FAINT),
+                            )
+                    },
+                ))
+                .child(each(
+                    mine,
+                    |id: &String| id.clone(),
+                    move |id, _| session_row(store, id.get_untracked()),
+                ))
+        }))
+}
+
+/// The New project form, under the Projects heading.
+fn project_form(store: Store) -> View {
+    let name = signal(String::new());
+    let path = signal(String::new());
+    view()
+        .px_2()
+        .py_2()
+        .gap_2()
+        .child(ui::field("Name", name).label("Project name").w_full())
+        .child(
+            ui::field("Folder, e.g. ~/projects/acme-site", path)
+                .label("Project folder on the daemon's computer")
+                .w_full(),
+        )
+        .child(
+            text("Any folder: a site, a repository, designs. Leave it empty for none.")
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        )
+        .child(when(
+            move || store.project_error().is_some(),
+            move || ui::banner(move || store.project_error().unwrap_or_default(), Tone::Danger),
+        ))
+        .child(
+            view()
+                .flex_row()
+                .gap_2()
+                .child(ui::btn(
+                    "Create project",
+                    ui::Variant::Primary,
+                    ui::Size::Sm,
+                    move || store.create_project(&name.get_untracked(), &path.get_untracked()),
+                ))
+                .child(ui::btn("Cancel", ui::Variant::Ghost, ui::Size::Sm, move || {
+                    store.show_project_form(false)
+                })),
+        )
+}
+
+/// A folder for a row: the home folder as `~`, and only its last parts
+/// when long.
+pub fn short_path(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shown = match path.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => path.to_owned(),
+    };
+    let parts: Vec<&str> = shown.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() > 3 {
+        format!("…/{}", parts[parts.len() - 2..].join("/"))
+    } else {
+        shown
+    }
 }
 
 fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {

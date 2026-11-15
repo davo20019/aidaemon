@@ -59,7 +59,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
         }
         rows.push(match line {
             Line::User { text, at_ms, .. } => Row::User(text, at_ms),
-            Line::Assistant { text, at_ms } => Row::Assistant(text, at_ms),
+            Line::Assistant { text, at_ms, .. } => Row::Assistant(text, at_ms),
             Line::Note { text } => Row::Note(text),
             Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
             Line::Activity { tools, secs } => Row::Activity(tools, secs),
@@ -273,16 +273,43 @@ fn header(store: Store, session: Option<String>) -> View {
             },
         ))
         .child(
-            text(move || match &title {
-                Some(id) => store.title(id),
-                None => "New conversation".into(),
-            })
-            .flex_1()
-            .px_2()
-            .role(AccessibilityRole::Header)
-            .number_of_lines(1)
-            .text_size(px(ui::fit::body()))
-            .font_weight(FontWeight::SEMIBOLD),
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .px_2()
+                .child(
+                    text(move || match &title {
+                        Some(id) => store.title(id),
+                        None => "New conversation".into(),
+                    })
+                    .role(AccessibilityRole::Header)
+                    .number_of_lines(1)
+                    .text_size(px(ui::fit::body()))
+                    .font_weight(FontWeight::SEMIBOLD),
+                )
+                // The project it works in, under its title.
+                .child(when(
+                    move || store.current_project().is_some(),
+                    move || {
+                        text(move || {
+                            store
+                                .current_project()
+                                .and_then(|id| store.project(&id))
+                                .map(|p| match p.path {
+                                    Some(path) => format!(
+                                        "{} · {}",
+                                        p.name,
+                                        super::sidebar::short_path(&path)
+                                    ),
+                                    None => p.name,
+                                })
+                                .unwrap_or_default()
+                        })
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::FAINT)
+                    },
+                )),
         )
         .child(when(
             {
@@ -331,8 +358,9 @@ fn header(store: Store, session: Option<String>) -> View {
         .child(when(
             move || store.is_compact(),
             move || {
+                // A new conversation in the same project.
                 ui::icon_btn(Glyph::Plus, "New conversation", Size::Md, move || {
-                    store.select(None)
+                    store.new_in_project(store.current_project())
                 })
             },
         ))
@@ -340,8 +368,8 @@ fn header(store: Store, session: Option<String>) -> View {
             move || store.is_compact() || !store.inspector_open(),
             move || {
                 ui::icon_btn_count(
-                    Glyph::Approval,
-                    "Activity",
+                    Glyph::Inspector,
+                    "Inbox and code",
                     move || waiting.get(),
                     move || store.open_inspector(),
                 )
@@ -357,18 +385,53 @@ const STARTERS: [(&str, &str); 3] = [
     ("Set a reminder", "Remind me "),
 ];
 
+/// The same, in a project: the agent already works in its folder.
+const PROJECT_STARTERS: [(&str, &str); 3] = [
+    ("Explain this project", "Explain how this project is laid out and how to run it."),
+    ("What changed?", "Summarize what changed here recently and what is unfinished."),
+    ("Fix something", "Fix "),
+];
+
 /// A new conversation: one question, and a few quiet ways to start just
 /// above the composer. The sidebar already lists past conversations.
 fn welcome(store: Store) -> View {
-    let mut chips = view().flex_row().flex_wrap().justify_center().gap_2();
-    for (label, words) in STARTERS {
-        chips = chips.child(
-            ui::btn(label, Variant::Outline, ui::Size::Sm, move || {
-                store.set_draft(words.to_owned())
-            })
-            .accessibility_label(format!("Start with: {}", words.trim_end())),
-        );
-    }
+    let chips = view().child(dynamic(move || {
+        let in_project = store.current_project().is_some();
+        Some(untracked(move || {
+            let mut chips = view().flex_row().flex_wrap().justify_center().gap_2();
+            for (label, words) in if in_project {
+                PROJECT_STARTERS
+            } else {
+                STARTERS
+            } {
+                chips = chips.child(
+                    ui::btn(label, Variant::Outline, ui::Size::Sm, move || {
+                        store.set_draft(words.to_owned())
+                    })
+                    .accessibility_label(format!("Start with: {}", words.trim_end())),
+                );
+            }
+            chips
+        }))
+    }));
+    // Where it will work: a project (its folder) or none.
+    let picker = view().items_center().gap_1().child(dynamic(move || {
+        let projects = store.projects();
+        Some(untracked(move || {
+            if projects.is_empty() {
+                return view();
+            }
+            let mut items = vec![(String::new(), "No project".to_owned())];
+            items.extend(projects.into_iter().map(|p| (p.id, p.name)));
+            view().child(ui::choice(
+                "Project",
+                "No project",
+                items,
+                move || store.current_project(),
+                move |chosen| store.set_new_project(chosen.filter(|id| !id.is_empty())),
+            ))
+        }))
+    }));
     view()
         .flex_1()
         .items_center()
@@ -383,6 +446,8 @@ fn welcome(store: Store) -> View {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors::TEXT),
         )
+        .child(view().h(px(8.0)))
+        .child(picker)
         // On a phone the chips sit by the composer, under the thumb; in a
         // window they stay under the question.
         .child(

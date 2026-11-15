@@ -67,6 +67,8 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Conversation | Stop pressed | Stop becomes "Stopping…" (warning status) until the turn ends |
 | Sidebar | A reply lands elsewhere | Filled dot and full-strength title until opened; pinned (★) first; age at the right |
 | Inbox | Work running | Elapsed time ticks each second; long tool output shows its last 8 lines with Show all / Copy |
+| Sidebar | Projects | Needs you and Working stay first, from every project; then each project folds open or shut (chevron), with its folder (`~` for home, last parts when long) and a count; its "+" starts a conversation in it; New project (+ by the heading) opens a name and folder form under it, and a made project opens on a new conversation in it; conversations in no project follow as Other conversations; a conversation's menu moves it to a project or out of one; searching lists matches flat |
+| Conversation | In a project | The header's second line names the project and its folder; a new conversation offers a Project picker under the question, and starters that fit a project (Explain this project, What changed?, Fix something); the phone's + starts the next one in the same project |
 | Inspector | A turn's first file write (edit_file, write_file) in the open conversation | The inspector moves to its Code tab once per turn; the owner's own choice of tab then sticks |
 | Code | A tool that can change files finishes | The changes read again while the tab shows (else on its next showing); a press on a file opens its diff (+ success, − danger, @@ info, first 400 lines with Show all, Copy); All files goes back |
 | System | Open | Reads on open and every 30 s; "Needs a look" (warning tint, alert role) leads when anything fails |
@@ -99,6 +101,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 - **First run:** where the agent runs, then the daemon's own setup steps (a model, then an optional chat), then the greeting's conversation opens.
 
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
+- **Projects** (sidebar): a name and any folder on the daemon's computer (a site, a repository, designs, or none); a conversation in one works in its folder.
 - **Inbox** (the right pane's first tab): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
 - **Code** (the right pane's second tab): the uncommitted changes in each git repository the open conversation worked in: name, branch, files changed with +/−; files this conversation wrote first, marked with an accent dot; each file's diff on press. Changes by the owner or other sessions in the same tree show too, unmarked.
 - **Memory:** what the daemon remembers about the owner, newest first, filterable, each with Forget.

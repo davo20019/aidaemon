@@ -256,3 +256,32 @@ fn the_code_tab_reads_changes_and_a_file_write_opens_it() -> Result<(), String> 
     app.wait_for("Reading changes…")?;
     Ok(())
 }
+
+#[test]
+fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"projects","projects":[{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"},{"id":"project-notes","name":"Design notes"}]}}"#,
+        ),
+        frame(
+            r#"{"type":"ack","request_id":"r1","result":{"type":"sessions","sessions":[{"id":"app:synthetic-3","channel":"app","title":"Contact form copy","writable":true,"project_id":"project-acme"},{"id":"app:synthetic-4","channel":"app","title":"Grocery list","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Acme site")?;
+    app.wait_for("Design notes")?;
+    // A conversation in no project is listed on its own.
+    app.wait_for("Other conversations")?;
+    app.wait_for("Grocery list")?;
+    // A project opens on its conversations.
+    app.press("Project Acme site, 1 conversations")?;
+    app.wait_for("Contact form copy")?;
+    // Its "+" starts a conversation there: the header names the project.
+    app.press("New conversation in this project >> nth=0")?;
+    app.wait_for("Explain this project")?;
+    app.wait_for("Acme site · /home/synthetic/acme-site")?;
+    Ok(())
+}
