@@ -163,6 +163,11 @@ pub struct TurnScope<'a> {
     pub goal_budget_extensions: std::sync::atomic::AtomicU32,
     /// The one ask to check a file more than one member changed was made.
     pub combined_verification_demands: std::sync::atomic::AtomicU32,
+    /// Source files this run changed in a repository since its last
+    /// command (`StopDemand::CodeChangeUnchecked`).
+    pub unchecked_code: std::sync::Mutex<Vec<String>>,
+    /// The one ask to check changed code was made.
+    pub code_check_demands: std::sync::atomic::AtomicU32,
     /// Mandate decision correction turns used.
     pub mandate_commit_retries: std::sync::atomic::AtomicU32,
     /// Verify-before-claim demands for an unverified GUI coordinate click.
@@ -241,4 +246,37 @@ pub struct AfterHelper {
     pub did_work: bool,
     /// How many helpers the run has waited on so far, this one included.
     pub helpers: usize,
+}
+
+/// Whether a file a run wrote is code its project can build or test: not
+/// prose (documentation, notes, plain text), and inside a git repository.
+pub fn is_checkable_code(path: &std::path::Path) -> bool {
+    const PROSE: [&str; 7] = ["md", "markdown", "mdx", "txt", "rst", "adoc", "org"];
+    let prose = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| PROSE.iter().any(|p| ext.eq_ignore_ascii_case(p)));
+    !prose
+        && path
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.join(".git").exists())
+}
+
+#[cfg(test)]
+mod checkable_code_tests {
+    use super::is_checkable_code;
+
+    #[test]
+    fn code_in_a_repository_counts_and_prose_or_loose_files_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("acme-site");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        assert!(is_checkable_code(&repo.join("src/contact.rs")));
+        assert!(is_checkable_code(&repo.join("web/contact.module")));
+        assert!(!is_checkable_code(&repo.join("README.md")));
+        assert!(!is_checkable_code(&repo.join("notes/Plan.TXT")));
+        assert!(!is_checkable_code(&tmp.path().join("loose.rs")));
+    }
 }

@@ -143,6 +143,9 @@ impl TurnEngine<'_> {
             decision = self.sdk_combined_verification_check(scope).await;
         }
         if decision == sdk::StopDecision::Accept {
+            decision = self.sdk_code_check(scope).await;
+        }
+        if decision == sdk::StopDecision::Accept {
             decision = self.sdk_reply_check(scope, &check.final_text).await;
         }
         let _ = check.reply.send(decision);
@@ -311,6 +314,46 @@ impl TurnEngine<'_> {
                 "More than one agent changed these files: {}. Read them or run a check on the \
                  combined result before you report.",
                 shared.join(", ")
+            ),
+        }
+    }
+
+    /// Code this run changed is built or tested once before it reports: a
+    /// command run after the last change closes it. Bounded, and never
+    /// asked of a run that cannot run a command; a run that says why it
+    /// could not check stops after the one ask.
+    pub async fn sdk_code_check(&self, scope: &TurnScope<'_>) -> sdk::StopDecision {
+        use crate::turn::closeout::{StopDemand, StopDemandVerdict};
+        let unchecked = scope
+            .unchecked_code
+            .lock()
+            .map(|files| files.clone())
+            .unwrap_or_default();
+        if unchecked.is_empty() {
+            return sdk::StopDecision::Accept;
+        }
+        let demand = StopDemand::CodeChangeUnchecked;
+        let used = scope.code_check_demands.load(Ordering::Relaxed);
+        if self.sdk_stop_demand_verdict(scope, demand, used).await != StopDemandVerdict::Demand {
+            return sdk::StopDecision::Accept;
+        }
+        scope.code_check_demands.fetch_add(1, Ordering::Relaxed);
+        const SHOWN: usize = 8;
+        let mut files = unchecked
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if unchecked.len() > SHOWN {
+            files.push_str(&format!(" and {} more", unchecked.len() - SHOWN));
+        }
+        sdk::StopDecision::Continue {
+            message: format!(
+                "You changed code ({files}) and ran no command since. Before you report, run \
+                 the narrowest check that covers the change (the project's build, type-check \
+                 or the relevant tests) and report its result. If no check can run here, say \
+                 so and why in your reply."
             ),
         }
     }

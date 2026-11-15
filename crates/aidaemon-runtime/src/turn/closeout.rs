@@ -197,6 +197,9 @@ pub enum StopDemand {
     /// More than one member of the request's tree changed a file and the
     /// top-level agent has not looked since; a read or command closes it.
     CombinedVerification,
+    /// The run changed source files in a repository and ran no command
+    /// since; a command (a build, type-check or test) closes it.
+    CodeChangeUnchecked,
 }
 
 /// The exact call that satisfies `StopDemand::MandateDecisionCommit`.
@@ -211,13 +214,17 @@ impl StopDemand {
             Self::GuiClickVerification => "gui_coordinate_click_unverified",
             Self::ReplyRepair => "final_reply_defect",
             Self::CombinedVerification => "combined_changes_unverified",
+            Self::CodeChangeUnchecked => "code_change_unchecked",
         }
     }
 
     /// How many times one run may ask for this demand.
     pub fn budget(self) -> u32 {
         match self {
-            Self::MandateDecisionCommit | Self::ReplyRepair | Self::CombinedVerification => 1,
+            Self::MandateDecisionCommit
+            | Self::ReplyRepair
+            | Self::CombinedVerification
+            | Self::CodeChangeUnchecked => 1,
             Self::GuiClickVerification => 3,
         }
     }
@@ -269,6 +276,16 @@ pub fn stop_demand_verdict(
         StopDemand::GuiClickVerification => !authority.forbids_tool_use,
         StopDemand::ReplyRepair => true,
         StopDemand::CombinedVerification => !authority.forbids_tool_use,
+        // Only a tool that runs a shell command line can build or test, and
+        // only when this run may call it.
+        StopDemand::CodeChangeUnchecked => {
+            !authority.forbids_tool_use
+                && visible_tools.iter().any(|tool| {
+                    let known = known(tool);
+                    known.is_some_and(|known| known.facts.shell_command_line)
+                        && authority.admits_tool(tool, known)
+                })
+        }
     };
     if !reachable {
         StopDemandVerdict::Unreachable
@@ -419,6 +436,48 @@ mod stop_demand_tests {
         };
         assert_eq!(
             stop_demand_verdict(demand, 0, &forbidden, &[], none, never),
+            StopDemandVerdict::Unreachable
+        );
+    }
+
+    #[test]
+    fn an_unchecked_code_change_is_asked_once_and_only_of_a_run_that_can_run_a_command() {
+        let open = authority(&[], &[]);
+        let never = |_: &str, _: &str| false;
+        let shell = |tool: &str| {
+            (tool == "shell_tool").then(|| KnownTool {
+                read_only: false,
+                facts: ToolDispatchFacts {
+                    shell_command_line: true,
+                    ..ToolDispatchFacts::default()
+                },
+            })
+        };
+        let demand = StopDemand::CodeChangeUnchecked;
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &open, &["file_tool", "shell_tool"], shell, never),
+            StopDemandVerdict::Demand
+        );
+        assert_eq!(
+            stop_demand_verdict(demand, 1, &open, &["shell_tool"], shell, never),
+            StopDemandVerdict::Exhausted
+        );
+        // No tool that runs commands: asking would only buy a refusal.
+        assert_eq!(
+            stop_demand_verdict(demand, 0, &open, &["file_tool"], shell, never),
+            StopDemandVerdict::Unreachable
+        );
+        let narrowed_to = vec!["file_tool".to_string()];
+        let narrowed = authority(&narrowed_to, &[]);
+        assert_eq!(
+            stop_demand_verdict(
+                demand,
+                0,
+                &narrowed,
+                &["file_tool", "shell_tool"],
+                shell,
+                never
+            ),
             StopDemandVerdict::Unreachable
         );
     }

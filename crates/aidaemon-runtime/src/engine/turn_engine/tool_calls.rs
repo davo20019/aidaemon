@@ -105,6 +105,81 @@ pub fn canonicalize_dispatched_call(
 }
 
 impl TurnEngine<'_> {
+    /// Keep `StopDemand::CodeChangeUnchecked`'s record: a file tool that
+    /// changed source code in a repository adds the file; any command that
+    /// ran afterwards (a build, type-check or test) clears the list. Typed
+    /// from the tool's own facts and the call's target paths, never from
+    /// tool names or text.
+    fn note_code_check(
+        &self,
+        scope: &TurnScope<'_>,
+        request: &crate::engine::calls::KernelCall,
+        facts: &aidaemon_tools::semantics::ToolDispatchFacts,
+        arguments: &str,
+        metadata: Option<&aidaemon_tools::semantics::ToolCallMetadata>,
+        failed: bool,
+    ) {
+        use aidaemon_tools::semantics::{FileGuard, ToolTargetHintKind};
+        if facts.shell_command_line {
+            // It ran (a refused call never gets here with metadata), even if
+            // the check it ran failed: the run has seen the result.
+            if metadata.is_some()
+                && let Ok(mut unchecked) = scope.unchecked_code.lock()
+            {
+                unchecked.clear();
+            }
+            return;
+        }
+        if failed || facts.file_guard != FileGuard::Writes {
+            return;
+        }
+        let writes = self.turn_tool(scope, &request.name).is_some_and(|tool| {
+            !tool
+                .call_annotations_in(
+                    arguments,
+                    &aidaemon_tools::semantics::TrustRoots::new(&scope.trust_roots),
+                )
+                .read_only
+        });
+        if !writes {
+            return;
+        }
+        let mut paths: Vec<String> = metadata
+            .map(|metadata| {
+                metadata
+                    .semantics
+                    .target_hints
+                    .iter()
+                    .filter(|hint| hint.kind == ToolTargetHintKind::Path)
+                    .map(|hint| hint.value.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            paths.extend(
+                ["path", "file_path", "file", "filename"]
+                    .iter()
+                    .find_map(|key| request.arguments.get(*key)?.as_str())
+                    .map(str::to_string),
+            );
+        }
+        let cwd = std::path::Path::new(&scope.cwd);
+        let code: Vec<String> = paths
+            .into_iter()
+            .filter(|path| crate::engine::scope::is_checkable_code(&cwd.join(path)))
+            .collect();
+        if code.is_empty() {
+            return;
+        }
+        if let Ok(mut unchecked) = scope.unchecked_code.lock() {
+            for path in code {
+                if !unchecked.contains(&path) {
+                    unchecked.push(path);
+                }
+            }
+        }
+    }
+
     /// The tool this turn runs under `name`: a daemon tool, else an
     /// MCP-registry tool bridged for the turn.
     pub fn turn_tool<'s>(
@@ -1130,6 +1205,7 @@ impl TurnEngine<'_> {
                 after.did_work = true;
             }
         }
+        self.note_code_check(scope, request, &facts, arguments, metadata.as_ref(), failed);
         // Budget progress counts distinct successful operations: repeating
         // an identical call is not new evidence.
         if !failed {

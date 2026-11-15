@@ -1248,6 +1248,8 @@ impl TurnEngine<'_> {
             absorbed_steering: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
             combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
+            unchecked_code: std::sync::Mutex::new(Vec::new()),
+            code_check_demands: std::sync::atomic::AtomicU32::new(0),
             mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
             gui_verify_demands: std::sync::atomic::AtomicU32::new(0),
             unreported_jobs_wait_spent: AtomicBool::new(false),

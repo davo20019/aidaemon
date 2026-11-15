@@ -5556,3 +5556,94 @@ async fn a_delivery_receipt_credits_the_step_that_declared_it() {
         "the delivery proves the step: {failures:#?}"
     );
 }
+
+/// Code the run changed in a repository is built or tested once before it
+/// reports: a run that writes a source file and stops is sent back once to
+/// run a check; a run that ran a command after its change, or only wrote
+/// prose, is not.
+#[tokio::test]
+async fn a_code_change_is_checked_once_before_the_run_reports() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::MockProvider;
+    let demand = "ran no command since";
+    for (file, ran_check, asked) in [
+        ("src/contact.rs", false, true),
+        ("src/contact.rs", true, false),
+        ("NOTES.md", false, false),
+    ] {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let path = repo.path().join(file);
+        let mut script = vec![MockProvider::tool_call_response(
+            "write_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "content": "fn send() {}\n"})
+                .to_string(),
+        )];
+        if ran_check {
+            script.push(MockProvider::tool_call_response(
+                "terminal",
+                &serde_json::json!({
+                    "command": "ls src",
+                    "working_dir": repo.path().to_string_lossy(),
+                })
+                .to_string(),
+            ));
+        }
+        script.push(MockProvider::text_response("Added the contact form."));
+        script.push(MockProvider::text_response(
+            "No build runs here; the change is untested.",
+        ));
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) =
+            tokio::sync::mpsc::channel::<crate::tools::terminal::ApprovalRequest>(1);
+        let terminal = crate::tools::TerminalTool::new(
+            crate::execution::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::tools::ApprovalBroker::new(approval_tx),
+            30,
+            8000,
+            crate::tools::command_risk::PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        let policy = crate::config::PolicyConfig {
+            trust_tier: "autonomous".to_string(),
+            ..Default::default()
+        };
+        let harness = crate::testing::setup_test_agent_with_policy(
+            MockProvider::with_responses(script),
+            policy,
+            vec![
+                std::sync::Arc::new(crate::tools::WriteFileTool::new(
+                    crate::execution::active_execution_backend(),
+                )),
+                std::sync::Arc::new(terminal),
+            ],
+        )
+        .await
+        .unwrap();
+        harness
+            .agent
+            .handle_inbound_message(owner_request(&format!(
+                "Write {} with a send function.",
+                path.display()
+            )))
+            .await
+            .unwrap();
+        assert!(path.exists(), "{file}: the write did not run");
+        let calls = harness.provider.call_log.lock().await;
+        let asks = calls
+            .iter()
+            .filter(|call| {
+                call.messages
+                    .last()
+                    .is_some_and(|message| message.to_string().contains(demand))
+            })
+            .count();
+        assert_eq!(asks, usize::from(asked), "{file}, ran a check: {ran_check}");
+    }
+}
