@@ -108,7 +108,7 @@ fn body(store: Store, read: AutomationsRead) -> View {
                 column = column.child(card(store, automation));
             }
             column.child(
-                text("To make one or change when it runs, ask in a conversation.")
+                text("To make a new one, ask in a conversation.")
                     .px_2()
                     .text_size(px(type_scale::XS))
                     .text_color(colors::FAINT),
