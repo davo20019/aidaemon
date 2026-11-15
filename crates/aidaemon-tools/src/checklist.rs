@@ -333,7 +333,11 @@ impl Tool for Checklist {
                  item, mark it deferred with a reason: the run can then end, but it is \
                  reported as not fully done. If another item replaces one, mark the old one \
                  superseded with superseded_by set to the new item's number. Items that are \
-                 not done cannot be removed from the list."
+                 not done cannot be removed from the list. Each item is a piece of work \
+                 with a result you can check. Rules the whole task must keep (follow the \
+                 project's instructions, don't commit, keep the tests passing) are not items: \
+                 keep them while doing the items, and check them as part of the item they \
+                 apply to."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -344,7 +348,7 @@ impl Tool for Checklist {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "text": {"type": "string", "description": "What must be true when this item is done."},
+                                "text": {"type": "string", "description": "What must be true when this item is done: a result, not a rule to follow throughout."},
                                 "status": {"type": "string", "enum": ["pending", "in_progress", "done", "deferred", "superseded"]},
                                 "reason": {"type": "string", "description": "Required for deferred: why it is not being done."},
                                 "superseded_by": {"type": "integer", "minimum": 1, "description": "Required for superseded: the number (1-based) of the item in this list that replaces it."}
