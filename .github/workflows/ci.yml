@@ -262,16 +262,12 @@ jobs:
   # build, which tests fail) without blocking a merge. Make it required once
   # it passes.
   windows:
-    name: Windows (not yet supported, tests ${{ matrix.partition }}/3)
+    name: Windows build (not yet supported)
     runs-on: windows-latest
     timeout-minutes: 90
     continue-on-error: true
-    # The tests take over an hour on one Windows runner: three runners each
-    # take a third. The first also checks and builds everything.
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
+    # Builds everything once, and the test binaries into a nextest archive
+    # the three test runners below share, so they compile nothing.
     steps:
       - uses: actions/checkout@v5
 
@@ -291,16 +287,15 @@ jobs:
 
       # Every error a round can show, not just the first crate's.
       - name: Check (all errors)
-        if: matrix.partition == 1
         run: cargo check --all-targets --locked --keep-going
 
       # The daemon first: what a Windows download needs.
       - name: Build
-        if: always() && matrix.partition == 1
+        if: always()
         run: cargo build --locked
 
       - name: Build the app
-        if: always() && matrix.partition == 1
+        if: always()
         run: cargo build --locked --manifest-path clients/app/Cargo.toml
 
       - name: Install cargo-nextest
@@ -308,11 +303,45 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # One process per test with a time limit (.config/nextest.toml), so
-      # a hang fails alone and every result is reported.
+      - name: Archive the tests
+        run: cargo nextest archive --lib --locked --archive-file windows-tests.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-tests
+          path: windows-tests.tar.zst
+          retention-days: 1
+
+  windows-test:
+    name: Windows tests ${{ matrix.partition }}/3 (not yet supported)
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    # A third of the archived tests each, one process per test with a time
+    # limit (.config/nextest.toml), so a hang fails alone.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    steps:
+      # The tests read fixtures from the source tree.
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-tests
+
       - name: Test
-        if: always()
-        run: cargo nextest run --lib --locked --profile windows-ci --partition hash:${{ matrix.partition }}/3
+        run: cargo nextest run --archive-file windows-tests.tar.zst --workspace-remap . --profile windows-ci --partition hash:${{ matrix.partition }}/3
 
   test:
     name: Test (${{ matrix.os }})
