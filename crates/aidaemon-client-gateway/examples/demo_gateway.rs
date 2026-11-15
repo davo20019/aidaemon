@@ -20,9 +20,9 @@ use aidaemon_channels::ports::{
 use aidaemon_channels::turns::{TurnDeps, TurnWatch};
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
 use aidaemon_client_protocol::{
-    Billing, CheckedKey, ConnectedProvider, CredentialState, HistoryMessage, MemoryItem,
-    ProviderChoice, ProviderOption, SearchHit, SessionSummary, Settings, SettingsChange, SignIn,
-    SlashCommand, ViewAction,
+    Billing, CheckedKey, ConnectedProvider, CredentialState, FileChange, FileStatus,
+    HistoryMessage, MemoryItem, ProviderChoice, ProviderOption, RepoChanges, SearchHit,
+    SessionChanges, SessionSummary, Settings, SettingsChange, SignIn, SlashCommand, ViewAction,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -205,6 +205,41 @@ impl ClientHost for Host {
                 },
             })
             .collect())
+    }
+    async fn changes(&self, session_id: &str) -> anyhow::Result<SessionChanges> {
+        if session_id != "app:plan" {
+            return Ok(SessionChanges::default());
+        }
+        let file = |path: &str, status, added, removed, by_session| FileChange {
+            path: path.into(),
+            status,
+            added,
+            removed,
+            by_session,
+        };
+        Ok(SessionChanges {
+            repos: vec![RepoChanges {
+                root: "/home/synthetic/acme-site".into(),
+                branch: Some("feature/contact-form".into()),
+                files: vec![
+                    file("src/contact.rs", FileStatus::Modified, 4, 1, true),
+                    file("templates/contact.html", FileStatus::Untracked, 3, 0, true),
+                    file("README.md", FileStatus::Modified, 1, 1, false),
+                ],
+                patch: "diff --git a/src/contact.rs b/src/contact.rs\n\
+                        --- a/src/contact.rs\n+++ b/src/contact.rs\n\
+                        @@ -1,3 +1,6 @@\n-fn send() {}\n+fn send(form: &Form) -> Result<()> {\n\
+                        +    form.validate()?;\n+    mailer::deliver(form)\n+}\n\
+                         \n fn main() {}\n\
+                        diff --git a/templates/contact.html b/templates/contact.html\n\
+                        new file\n--- /dev/null\n+++ b/templates/contact.html\n\
+                        @@ -0,0 +1,3 @@\n+<form method=\"post\">\n+  <input name=\"email\">\n+</form>\n\
+                        diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n\
+                        @@ -1 +1 @@\n-# Acme site\n+# Acme Corp site\n"
+                    .into(),
+                truncated: false,
+            }],
+        })
     }
     async fn slash(&self, _: &str, command: &str, _: &str) -> Option<String> {
         match command {
