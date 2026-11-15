@@ -1302,8 +1302,7 @@ impl BrowserTool {
             .ok_or_else(|| "Missing required parameter: source_path".to_string())?;
         let source = aidaemon_tools::fs_utils::validate_path(&*self.execution_backend, raw_source)
             .map_err(|e| format!("Invalid source_path: {e}"))?;
-        let source = source
-            .canonicalize()
+        let source = dunce::canonicalize(&source)
             .map_err(|e| format!("Could not resolve HTML source: {e}"))?;
         if !source.is_file() {
             return Err("source_path must identify a regular HTML file".to_string());

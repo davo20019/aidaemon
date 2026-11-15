@@ -331,9 +331,7 @@ async fn test_advisory_policy_filter_keeps_registered_tool_visible() {
 #[tokio::test]
 async fn test_executor_spawn_persists_structured_handoff_and_result_on_task() {
     let workspace = tempfile::tempdir().expect("synthetic executor workspace");
-    let workspace_root = workspace
-        .path()
-        .canonicalize()
+    let workspace_root = dunce::canonicalize(workspace.path())
         .expect("canonical workspace");
     let workspace_path = workspace_root.to_string_lossy().to_string();
     let file_path = workspace_root.join("src/main.rs");

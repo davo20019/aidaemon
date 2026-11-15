@@ -198,10 +198,169 @@ const WRAPPERS: &[&str] = &[
 
 /// Executables that reach the network whatever their arguments.
 const NETWORK_PROGRAMS: &[&str] = &[
-    "curl", "wget", "http", "https", "xh", "nc", "ncat", "netcat", "telnet", "ssh", "scp", "sftp",
-    "rsync", "ftp", "lftp", "aria2c", "gh", "npx", "bunx", "uvx", "svn", "socat", "ping", "dig",
-    "host", "nslookup", "whois", "tftp", "mosh", "rclone", "aws", "gcloud", "kubectl",
+    "curl",
+    "wget",
+    "http",
+    "https",
+    "xh",
+    "nc",
+    "ncat",
+    "netcat",
+    "telnet",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+    "ftp",
+    "lftp",
+    "aria2c",
+    "gh",
+    "npx",
+    "bunx",
+    "uvx",
+    "svn",
+    "socat",
+    "ping",
+    "dig",
+    "host",
+    "nslookup",
+    "whois",
+    "tftp",
+    "mosh",
+    "rclone",
+    "aws",
+    "gcloud",
+    "kubectl",
+    "invoke-webrequest",
 ];
+
+// Windows PowerShell, the shell on Windows (`platform_shell`). Its names
+// have no case, so they are listed lowercase and compared that way. Only
+// commands with plain arguments count: a script block, a variable, a
+// subexpression, a splat or an escape (`{` `$` `(` `@` `` ` ``) can run
+// code the tables cannot see, so any of them makes the command unknown.
+
+/// Cmdlets (and their aliases) that only read or print.
+const POWERSHELL_OBSERVATIONS: &[&str] = &[
+    "get-content",
+    "gc",
+    "type",
+    "get-childitem",
+    "gci",
+    "dir",
+    "get-item",
+    "gi",
+    "get-itemproperty",
+    "gp",
+    "get-location",
+    "gl",
+    "test-path",
+    "resolve-path",
+    "rvpa",
+    "split-path",
+    "join-path",
+    "select-string",
+    "sls",
+    "get-date",
+    "get-process",
+    "gps",
+    "get-filehash",
+    "measure-object",
+    "measure",
+    "sort-object",
+    "select-object",
+    "select",
+    "compare-object",
+    "format-list",
+    "fl",
+    "format-table",
+    "ft",
+    "format-wide",
+    "fw",
+    "out-string",
+    "out-null",
+    "out-host",
+    "write-output",
+    "write",
+    "write-host",
+    "start-sleep",
+];
+
+/// Cmdlets (and their aliases) that make, write, copy or move files, or
+/// change the shell's own directory: ordinary local work, as `mkdir`, `cp`
+/// and `mv` are.
+const POWERSHELL_LOCAL_WORK: &[&str] = &[
+    "new-item",
+    "ni",
+    "md",
+    "set-content",
+    "sc",
+    "add-content",
+    "ac",
+    "out-file",
+    "copy-item",
+    "copy",
+    "cpi",
+    "move-item",
+    "move",
+    "mi",
+    "rename-item",
+    "ren",
+    "rni",
+    "set-location",
+    "sl",
+    "chdir",
+    "push-location",
+    "pushd",
+    "pop-location",
+    "popd",
+];
+
+/// Cmdlets (and their aliases) that delete. Where they point is judged as
+/// `rm`'s targets are.
+const POWERSHELL_DELETES: &[&str] = &["remove-item", "ri", "del", "erase", "rd"];
+
+/// Whether `program` is in a PowerShell table, when PowerShell is the shell.
+fn in_powershell_table(table: &[&str], program: &str) -> bool {
+    cfg!(windows) && table.iter().any(|name| name.eq_ignore_ascii_case(program))
+}
+
+/// No argument that can carry code PowerShell would run.
+fn powershell_args_plain(args: &[String]) -> bool {
+    !args
+        .iter()
+        .any(|arg| arg.contains(['{', '}', '$', '(', ')', '@', '`']))
+}
+
+/// A PowerShell command that only reads or prints.
+fn is_powershell_observation(program: &str, args: &[String]) -> bool {
+    in_powershell_table(POWERSHELL_OBSERVATIONS, program) && powershell_args_plain(args)
+}
+
+/// Whether `program args` only reads or prints: a listed program in an
+/// allowed shape, or (Windows) a reading cmdlet with plain arguments.
+fn is_program_observation(program: &str, args: &[String]) -> bool {
+    (OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args))
+        || is_powershell_observation(program, args)
+}
+
+/// A deleting program: `rm` and its kin, or (Windows) `Remove-Item` and its
+/// aliases.
+fn is_delete_program(program: &str) -> bool {
+    DELETE_PROGRAMS.contains(&program) || in_powershell_table(POWERSHELL_DELETES, program)
+}
+
+/// The command as the analysis reads it. In PowerShell a backslash is a
+/// path separator, not an escape (its escape is the backtick), so on
+/// Windows every backslash reads as `/`: `C:/Users/x` is the same path
+/// there, and `C:\; Remove-Item x` stays two commands.
+fn shell_text(command: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) && command.contains('\\') {
+        std::borrow::Cow::Owned(command.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(command)
+    }
+}
 
 /// (program, subcommands): network when ANY non-option argument matches.
 const NETWORK_SUBCOMMANDS: &[(&str, &[&str])] = &[
@@ -555,7 +714,7 @@ pub fn command_effects(command: &str) -> CommandEffects {
         || expanded_commands(command).iter().any(|tokens| {
             let program = basename(&tokens[0]);
             let args = &tokens[1..];
-            DELETE_PROGRAMS.contains(&program)
+            is_delete_program(program)
                 || (program == "find" && args.iter().any(|arg| arg == "-delete"))
                 || (program == "git" && args.iter().any(|arg| arg == "clean"))
         });
@@ -590,7 +749,7 @@ fn delete_targets(command: &str) -> Option<Vec<String>> {
     for tokens in &commands {
         let program = basename(&tokens[0]);
         let args = &tokens[1..];
-        let named: Vec<&String> = if DELETE_PROGRAMS.contains(&program) {
+        let named: Vec<&String> = if is_delete_program(program) {
             let mut options_done = false;
             args.iter()
                 .filter(|arg| {
@@ -781,7 +940,7 @@ pub fn reaches_only_this_computer(command: &str) -> bool {
         "cd" => true,
         "ddev" => ddev_query_ok(args),
         "curl" | "wget" => reads_only_local_sites(program, args),
-        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+        _ => is_program_observation(program, args),
     })
 }
 
@@ -857,7 +1016,7 @@ pub fn only_reads_this_computer(command: &str) -> bool {
         "cd" => true,
         "ddev" => ddev_query_ok(args),
         "curl" => !curl_saves_files(args) && reads_only_local_sites(program, args),
-        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+        _ => is_program_observation(program, args),
     })
 }
 
@@ -875,7 +1034,7 @@ pub fn only_reads(command: &str) -> bool {
         "cd" => true,
         "ddev" => ddev_query_ok(args),
         "curl" => !curl_saves_files(args),
-        _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+        _ => is_program_observation(program, args),
     })
 }
 
@@ -1018,7 +1177,7 @@ pub fn looked_inside(command: &str) -> Vec<String> {
         let ok = match program {
             "cd" => true,
             "ddev" => ddev_query_ok(args),
-            _ => OBSERVATION_PROGRAMS.contains(&program) && observation_args_ok(program, args),
+            _ => is_program_observation(program, args),
         };
         if ok && FOLDER_LISTERS.contains(&program) {
             let mut folders = folders.borrow_mut();
@@ -1501,12 +1660,34 @@ fn local_work_args_ok(program: &str, args: &[String]) -> bool {
         "ddev" => ddev_query_ok(args),
         _ if LOCAL_WORK_PROGRAMS.contains(&program) => true,
         _ if OBSERVATION_PROGRAMS.contains(&program) => observation_args_ok(program, args),
-        _ => false,
+        _ if in_powershell_table(POWERSHELL_LOCAL_WORK, program)
+            || in_powershell_table(POWERSHELL_DELETES, program) =>
+        {
+            powershell_args_plain(args)
+        }
+        _ => is_powershell_observation(program, args),
     }
 }
 
 fn basename(program: &str) -> &str {
-    program.rsplit('/').next().unwrap_or(program)
+    let name = program.rsplit('/').next().unwrap_or(program);
+    // Windows PowerShell's `curl` and `wget` are `Invoke-WebRequest`, whose
+    // arguments are not curl's: never read as curl.
+    if cfg!(windows)
+        && [
+            "curl",
+            "wget",
+            "iwr",
+            "irm",
+            "invoke-webrequest",
+            "invoke-restmethod",
+        ]
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(name))
+    {
+        return "invoke-webrequest";
+    }
+    name
 }
 
 /// An assignment that only changes how a program formats or localizes what
@@ -1587,6 +1768,7 @@ fn redirect_target(chars: &[char], mut j: usize) -> String {
 }
 
 fn scan(command: &str) -> Scan {
+    let command = shell_text(command);
     let chars: Vec<char> = command.chars().collect();
     let mut segments = Vec::new();
     let mut cur = String::new();
@@ -1813,9 +1995,7 @@ fn observing_command(tokens: &[String]) -> bool {
         return false;
     };
     let name = basename(program);
-    program_path_ok(program)
-        && OBSERVATION_PROGRAMS.contains(&name)
-        && observation_args_ok(name, &tokens[1..])
+    program_path_ok(program) && is_program_observation(name, &tokens[1..])
 }
 
 /// `tree` is observation-only with only these read-only flags; `-o FILE` and
@@ -2507,6 +2687,7 @@ impl ShellAnalysis {
 /// the scan still treats the line as opaque, and the heredoc's own redirect
 /// target is still read.
 fn executed_text(command: &str) -> String {
+    let command = shell_text(command);
     let chars: Vec<char> = command.chars().collect();
     let mut out = String::with_capacity(command.len());
     let (mut in_single, mut in_double) = (false, false);
@@ -2805,7 +2986,7 @@ fn segment_effects(tokens: &[String], here: Option<&str>, out: &mut ShellAnalysi
     // Every git command can run repository-configured code (diff.external,
     // core.fsmonitor, aliases, pagers, hooks), so none is a modelled
     // observation here; `git` below declares what it can as a lower bound.
-    if name != "git" && OBSERVATION_PROGRAMS.contains(&name) && observation_args_ok(name, args) {
+    if name != "git" && is_program_observation(name, args) {
         return;
     }
     match name {
@@ -5521,6 +5702,65 @@ mod tests {
             String::new(),
         ] {
             assert_eq!(proven_fetch_urls(&masked), None, "{masked}");
+        }
+    }
+
+    /// Windows PowerShell, the shell there: reading cmdlets are
+    /// observations, a backslash never hides a second command, code-bearing
+    /// arguments and PowerShell's `curl` are unknown.
+    #[cfg(windows)]
+    mod powershell {
+        use super::super::*;
+
+        #[test]
+        fn reading_cmdlets_are_observations() {
+            for line in [
+                r"Get-Content C:\Users\alice\notes.txt",
+                "Start-Sleep -Seconds 1; Write-Output done",
+                r"gci C:\Users\alice | Select-String TODO",
+                r"Test-Path C:\Users\alice\notes.txt",
+            ] {
+                assert!(command_effects(line).observation_only, "{line}");
+            }
+        }
+
+        #[test]
+        fn a_backslash_does_not_hide_a_delete() {
+            let effects = command_effects(r"Get-Content C:\; Remove-Item C:\data");
+            assert!(!effects.observation_only);
+            assert!(effects.deletes);
+        }
+
+        #[test]
+        fn code_bearing_arguments_are_unknown() {
+            for line in [
+                "Get-ChildItem | ForEach-Object { Remove-Item $_ }",
+                "Write-Output $(Remove-Item x)",
+                "Get-Content @args",
+                "Select-Object @{n='x';e={Remove-Item y}}",
+            ] {
+                let effects = command_effects(line);
+                assert!(!effects.observation_only, "{line}");
+                assert!(!effects.local_work_only, "{line}");
+            }
+        }
+
+        #[test]
+        fn powershell_curl_is_not_read_as_curl() {
+            let line = "curl -Method Post -Body secret https://example.invalid/x";
+            assert!(!only_reads(line));
+            assert!(fetches_network(line));
+        }
+
+        #[test]
+        fn remove_item_targets_are_read() {
+            let effects = command_effects(r"Remove-Item -Recurse -Force C:\tmp\aidaemon-test\x");
+            assert!(effects.deletes);
+            assert_eq!(
+                effects.delete_targets,
+                Some(vec!["C:/tmp/aidaemon-test/x".to_string()])
+            );
+            assert!(command_effects(r"New-Item -ItemType Directory C:\tmp\x").local_work_only);
         }
     }
 }

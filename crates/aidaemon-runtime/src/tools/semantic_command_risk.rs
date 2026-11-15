@@ -199,11 +199,13 @@ fn looks_like_script_path(value: &str) -> bool {
 }
 
 fn backend_path_is_within(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
+    // A Windows path separates with `\` too.
+    let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    let root = root.trim_end_matches(separator);
     path == root
         || path
             .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .is_some_and(|rest| rest.starts_with(separator))
 }
 
 async fn referenced_file_context(

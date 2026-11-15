@@ -130,8 +130,7 @@ pub fn resolve_terminal_lite_cwd_from_base(base: &Path, raw: &str) -> anyhow::Re
         let p = PathBuf::from(raw);
         if p.is_absolute() { p } else { base.join(p) }
     };
-    let canonical = resolved
-        .canonicalize()
+    let canonical = dunce::canonicalize(&resolved)
         .map_err(|e| anyhow::anyhow!("invalid working dir '{}': {}", resolved.display(), e))?;
     if !canonical.is_dir() {
         anyhow::bail!("'{}' is not a directory", canonical.display());

@@ -173,15 +173,17 @@ impl ProjectInstructionTracker {
 }
 
 fn path_is_within(root: &BackendPath, candidate: &BackendPath) -> bool {
-    let root = root.as_str().trim_end_matches('/');
-    let candidate = candidate.as_str().trim_end_matches('/');
+    // A Windows path separates with `\` too.
+    let separator = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    let root = root.as_str().trim_end_matches(separator);
+    let candidate = candidate.as_str().trim_end_matches(separator);
     if root.is_empty() {
         return aidaemon_tools::BackendPath::is_absolute(candidate);
     }
     candidate == root
         || candidate
             .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+            .is_some_and(|suffix| suffix.starts_with(separator))
 }
 
 async fn nearest_existing_directory(

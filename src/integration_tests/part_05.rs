@@ -1570,13 +1570,13 @@ async fn test_full_stack_executor_declared_checklist_is_demanded_until_receipts_
     })
     .to_string();
     let mkdir_args = serde_json::json!({
-        "command": format!("mkdir -p '{dir}'"),
+        "command": crate::testing::make_dir_command(&dir),
         "working_dir": cwd,
         "write_paths": [dir],
     })
     .to_string();
     let write_args = serde_json::json!({
-        "command": format!("printf SYNTHETIC_NOTE > '{file}'"),
+        "command": crate::testing::write_text_command(&file, "SYNTHETIC_NOTE"),
         "working_dir": cwd,
         "write_paths": [file],
     })

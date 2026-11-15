@@ -67,8 +67,7 @@ impl ResourceResolver for FileSystemResolver {
 
         // Security: canonicalize and verify path stays within skill directory
         let canonical_base = dunce::canonicalize(base)?;
-        let canonical_path = full_path
-            .canonicalize()
+        let canonical_path = dunce::canonicalize(&full_path)
             .map_err(|e| anyhow::anyhow!("Cannot resolve resource '{}': {}", resource_path, e))?;
         if !canonical_path.starts_with(&canonical_base) {
             anyhow::bail!("Resource path traversal blocked");

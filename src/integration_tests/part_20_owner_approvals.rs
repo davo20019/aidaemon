@@ -1032,7 +1032,12 @@ fn no_assessor(allowed: &[&str]) -> TerminalSetup {
 // observations (`printf`, `echo`, `ls`) run confined without a card.
 #[tokio::test]
 async fn terminal_unknown_command_interrupts_for_owner() {
-    let command = "awk 'BEGIN{print \"synthetic-unknown-ok\"}'";
+    // A program the tables do not know, in this platform's shell.
+    let command = if cfg!(windows) {
+        "[Console]::WriteLine('synthetic-unknown-ok')"
+    } else {
+        "awk 'BEGIN{print \"synthetic-unknown-ok\"}'"
+    };
     let (harness, approver, _pool) = terminal_harness(
         vec![terminal_run(command), MockProvider::text_response("Done.")],
         vec![Some(crate::types::ApprovalResponse::AllowOnce)],

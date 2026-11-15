@@ -49,8 +49,7 @@ pub fn prepare_delivery(
     }
 
     // 4. Canonicalize to resolve symlinks and prevent traversal
-    let mut canonical = path
-        .canonicalize()
+    let mut canonical = dunce::canonicalize(&path)
         .map_err(|_| DeliveryError::FileNotFound(requested_path.to_string()))?;
 
     // 5. Block sensitive files BEFORE any recovery

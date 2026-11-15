@@ -757,6 +757,26 @@ pub fn sleep_then_echo(seconds: &str, word: &str) -> String {
     }
 }
 
+/// A shell line that writes `text` (no newline) to `path`, in this
+/// platform's shell.
+pub fn write_text_command(path: &str, text: &str) -> String {
+    if cfg!(windows) {
+        format!("Set-Content -NoNewline -Path '{path}' -Value {text}")
+    } else {
+        format!("printf {text} > '{path}'")
+    }
+}
+
+/// A shell line that makes the directory `dir` and its parents, in this
+/// platform's shell.
+pub fn make_dir_command(dir: &str) -> String {
+    if cfg!(windows) {
+        format!("New-Item -ItemType Directory -Force -Path '{dir}' | Out-Null")
+    } else {
+        format!("mkdir -p '{dir}'")
+    }
+}
+
 /// The attachment inbox of the agent [`setup_test_agent`] builds.
 #[cfg(not(windows))]
 pub const TEST_INBOX_DIR: &str = "/tmp/aidaemon-test-attachments";

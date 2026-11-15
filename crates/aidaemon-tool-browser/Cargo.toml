@@ -40,6 +40,7 @@ chromium = [
 ]
 
 [dependencies]
+dunce = "1.0"
 aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", optional = true }
 aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", optional = true }
 aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }

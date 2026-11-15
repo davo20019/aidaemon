@@ -701,13 +701,13 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
         MockProvider::tool_call_response("track_requirements", &checklist_args),
         MockProvider::tool_call_response(
             "terminal",
-            &terminal(format!("mkdir -p '{dir}'"), "write_paths", &dir),
+            &terminal(crate::testing::make_dir_command(&dir), "write_paths", &dir),
         ),
         MockProvider::text_response(early),
         MockProvider::tool_call_response(
             "terminal",
             &terminal(
-                format!("printf SYNTHETIC_NOTE > '{file}'"),
+                crate::testing::write_text_command(&file, "SYNTHETIC_NOTE"),
                 "write_paths",
                 &file,
             ),
@@ -5261,7 +5261,7 @@ async fn a_later_receipt_that_proves_a_ticked_step_redraws_the_card() {
     };
     let write = |path: &str| {
         serde_json::json!({
-            "command": format!("printf SYNTHETIC > '{path}'"),
+            "command": crate::testing::write_text_command(path, "SYNTHETIC"),
             "working_dir": cwd,
             "write_paths": [path]
         })

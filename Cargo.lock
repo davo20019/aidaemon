@@ -754,6 +754,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chromiumoxide",
+ "dunce",
  "futures",
  "hex",
  "reqwest 0.13.5",
