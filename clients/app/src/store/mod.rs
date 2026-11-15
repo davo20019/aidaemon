@@ -1363,6 +1363,11 @@ impl Store {
         self.composer_focus.get()
     }
 
+    /// Give the keyboard back to the composer (a palette command ran).
+    pub fn refocus_composer(&self) {
+        self.focus_composer();
+    }
+
     fn focus_composer(&self) {
         self.composer_focus.update(|n| *n += 1);
     }

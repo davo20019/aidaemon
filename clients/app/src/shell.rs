@@ -38,7 +38,7 @@ pub fn shell(store: Store) -> View {
     on_key("mod+k", move |_| palette.update(|open| *open = !*open));
     on_key("mod+n", move |_| store.select(None));
     on_key("mod+b", move |_| store.open_sidebar());
-    on_key("mod+i", move |_| store.open_inspector());
+    on_key(steps_key(), move |_| store.open_inspector());
     // The changes of the conversation on screen.
     on_key("mod+d", move |_| store.show_changes());
     on_key("mod+g", move |_| store.take_suggestion());
@@ -252,7 +252,7 @@ pub fn key_line(store: Store) -> View {
         if store.coding_on_screen() {
             keys.push((key_label("mod+d"), "changes"));
         } else {
-            keys.push((key_label("mod+i"), "steps"));
+            keys.push((key_label(steps_key()), "steps"));
         }
         if let Some(id) = store.selected()
             && store.is_running(&id)
@@ -280,7 +280,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .shortcut("mod+b"),
         CommandItem::new("inspector", "Show or hide the steps")
             .group("View")
-            .shortcut("mod+i"),
+            .shortcut(steps_key()),
         CommandItem::new("changes", "Show the changes of this conversation")
             .group("View")
             .shortcut("mod+d"),
@@ -369,6 +369,11 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                         .on_cancel(move || open.set(false))
                         .on_select(move |id: &SharedString| {
                             open.set(false);
+                            // Typing goes back to the composer, except
+                            // where the command opens a form to type in.
+                            if !matches!(id.as_ref(), "new-project" | "edit-project") {
+                                store.refocus_composer();
+                            }
                             match id.as_ref() {
                                 "new" => store.select(None),
                                 "sidebar" => store.open_sidebar(),
@@ -452,3 +457,13 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
 const SYSTEM_KEY: Option<&str> = Some("mod+,");
 #[cfg(target_arch = "wasm32")]
 const SYSTEM_KEY: Option<&str> = None;
+
+/// The details pane's key. A terminal sends Ctrl+I as Tab, so there it is
+/// Ctrl+O.
+fn steps_key() -> &'static str {
+    if idiom() == nsh_core::platform::Idiom::Terminal {
+        "mod+o"
+    } else {
+        "mod+i"
+    }
+}

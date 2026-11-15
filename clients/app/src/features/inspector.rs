@@ -177,13 +177,7 @@ fn timeline(store: Store) -> View {
                                     if kind == ActivityKind::Output {
                                         output(detail)
                                     } else {
-                                        view().child(
-                                            text(detail)
-                                                .number_of_lines(3)
-                                                .selectable(true)
-                                                .text_size(px(type_scale::XS))
-                                                .text_color(colors::MUTED),
-                                        )
+                                        step_detail(detail)
                                     }
                                 },
                             )),
@@ -241,4 +235,36 @@ fn output(detail: impl Fn() -> String + Clone + 'static) -> View {
                     set_clipboard(copy())
                 })),
         )
+}
+
+/// A step's detail: three lines, and More (a button, so the keyboard
+/// reaches it too) for the rest when there is more.
+fn step_detail(detail: impl Fn() -> String + Clone + 'static) -> View {
+    let all = signal(false);
+    let long = {
+        let detail = detail.clone();
+        move || {
+            let text = detail();
+            text.lines().count() > 3 || text.chars().count() > 240
+        }
+    };
+    view()
+        .gap_1()
+        .child(
+            text(detail)
+                .number_of_lines(move || if all.get() { 0_u32 } else { 3_u32 })
+                .selectable(true)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::MUTED),
+        )
+        .child(when(long, move || {
+            view().flex_row().child(dynamic(move || {
+                let label = if all.get() { "Less" } else { "More" };
+                Some(untracked(move || {
+                    btn(label, Variant::Ghost, Size::Sm, move || {
+                        all.update(|a| *a = !*a)
+                    })
+                }))
+            }))
+        }))
 }

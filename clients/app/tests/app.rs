@@ -734,6 +734,8 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
             r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-11","channel":"app","title":"Run the build","writable":true}]}}"#,
         ),
     ]);
+    // A terminal sends Ctrl+I as Tab: the steps' key there is O.
+    app.wait_for(r"text:/O steps/")?;
     // The terminal starts on the conversation; the list is a key away.
     app.press("label:Conversations")?;
     app.wait_for("Run the build")?;
