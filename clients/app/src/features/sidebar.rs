@@ -63,6 +63,13 @@ pub fn sidebar(store: Store) -> View {
                         .text_size(px(ui::fit::body()))
                         .font_weight(FontWeight::SEMIBOLD),
                 )
+                // On a phone, New conversation is a button here: the list
+                // keeps the room a full row would take.
+                .child(when(ui::touch(), move || {
+                    ui::icon_btn(Glyph::Plus, "New conversation", ui::Size::Md, move || {
+                        store.select(None)
+                    })
+                }))
                 .child(
                     when(
                         move || store.is_compact(),
@@ -75,7 +82,7 @@ pub fn sidebar(store: Store) -> View {
                     .otherwise(|| ui::kbd(key_label("mod+k"))),
                 ),
         )
-        .child(
+        .child(when(!ui::touch(), move || {
             view().px_2().child(
                 row(
                     move || store.selected().is_none(),
@@ -89,8 +96,8 @@ pub fn sidebar(store: Store) -> View {
                         .text_size(px(type_scale::BASE)),
                 )
                 .child(ui::kbd(key_label("mod+n"))),
-            ),
-        )
+            )
+        }))
         .child(
             view().px_2().pt_2().child(
                 ui::field("Search conversations", query)
@@ -136,50 +143,7 @@ pub fn sidebar(store: Store) -> View {
                     )),
             ),
         )
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::System,
-                    move || store.open_system(),
-                )
-                .accessibility_label("System: how the daemon is doing")
-                .child(icon(Glyph::System).text_color(colors::MUTED))
-                .child(text("System").flex_1().text_size(px(ui::fit::body())))
-                .child(
-                    text(move || {
-                        store
-                            .today_tokens()
-                            .filter(|n| *n > 0)
-                            .map(|n| format!("{} today", ui::time::compact_count(n)))
-                            .unwrap_or_default()
-                    })
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                ),
-            ),
-        )
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::Memory,
-                    move || store.open_memory(),
-                )
-                .accessibility_label("Memory: what the daemon remembers")
-                .child(icon(Glyph::Memory).text_color(colors::MUTED))
-                .child(text("Memory").flex_1().text_size(px(ui::fit::body()))),
-            ),
-        )
-        .child(
-            view().px_2().pb_1().child(
-                row(
-                    move || store.page() == Page::Settings,
-                    move || store.open_settings(),
-                )
-                .accessibility_label("Settings: change how the daemon runs")
-                .child(icon(Glyph::Settings).text_color(colors::MUTED))
-                .child(text("Settings").flex_1().text_size(px(ui::fit::body()))),
-            ),
-        )
+        .child(pages(store))
         .child(ui::separator())
         .child(connection(store))
 }
@@ -282,6 +246,104 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
                     .text_color(colors::FAINT),
             ),
     )
+}
+
+/// System, Memory and Settings: rows on a desktop; on a phone one row of
+/// three, so the conversations keep the screen.
+fn pages(store: Store) -> View {
+    if ui::touch() {
+        let tab = |glyph: Glyph,
+                   label: &'static str,
+                   name: &'static str,
+                   page: Page,
+                   open: fn(&Store)| {
+            ui::row(move || store.page() == page, move || open(&store))
+                .flex_1()
+                .flex_col()
+                .justify_center()
+                .gap(px(2.0))
+                .accessibility_label(name)
+                .child(icon(glyph).text_color(colors::MUTED))
+                .child(
+                    text(label)
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::MUTED),
+                )
+        };
+        return view()
+            .flex_row()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_t_1()
+            .border_color(colors::LINE)
+            .child(tab(
+                Glyph::System,
+                "System",
+                "System: how the daemon is doing",
+                Page::System,
+                Store::open_system,
+            ))
+            .child(tab(
+                Glyph::Memory,
+                "Memory",
+                "Memory: what the daemon remembers",
+                Page::Memory,
+                Store::open_memory,
+            ))
+            .child(tab(
+                Glyph::Settings,
+                "Settings",
+                "Settings: change how the daemon runs",
+                Page::Settings,
+                Store::open_settings,
+            ));
+    }
+    view()
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::System,
+                    move || store.open_system(),
+                )
+                .accessibility_label("System: how the daemon is doing")
+                .child(icon(Glyph::System).text_color(colors::MUTED))
+                .child(text("System").flex_1().text_size(px(ui::fit::body())))
+                .child(
+                    text(move || {
+                        store
+                            .today_tokens()
+                            .filter(|n| *n > 0)
+                            .map(|n| format!("{} today", ui::time::compact_count(n)))
+                            .unwrap_or_default()
+                    })
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                ),
+            ),
+        )
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::Memory,
+                    move || store.open_memory(),
+                )
+                .accessibility_label("Memory: what the daemon remembers")
+                .child(icon(Glyph::Memory).text_color(colors::MUTED))
+                .child(text("Memory").flex_1().text_size(px(ui::fit::body()))),
+            ),
+        )
+        .child(
+            view().px_2().pb_1().child(
+                row(
+                    move || store.page() == Page::Settings,
+                    move || store.open_settings(),
+                )
+                .accessibility_label("Settings: change how the daemon runs")
+                .child(icon(Glyph::Settings).text_color(colors::MUTED))
+                .child(text("Settings").flex_1().text_size(px(ui::fit::body()))),
+            ),
+        )
 }
 
 /// A titled group of conversations, shown only when it has any.
