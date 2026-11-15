@@ -10,7 +10,7 @@ use aidaemon_providers::routing::ProviderKind;
 use aidaemon_tools::services::SettingsStore;
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{LlmRuntimeSnapshot, ModelBackend};
+use crate::llm::LlmRuntimeSnapshot;
 
 /// The provider id of the runtime's main provider.
 pub const MAIN_PROVIDER: &str = "main";
@@ -104,7 +104,6 @@ pub fn provider_name(kind: ProviderKind) -> &'static str {
 pub struct PickableProvider {
     pub id: String,
     pub kind: ProviderKind,
-    pub backend: ModelBackend,
     /// Its configured models, each listed under the first provider that
     /// has it (the one a request for it goes to).
     pub models: Vec<String>,
@@ -120,14 +119,12 @@ pub fn pickable(snapshot: &LlmRuntimeSnapshot) -> Vec<PickableProvider> {
     let mut out = vec![PickableProvider {
         id: MAIN_PROVIDER.to_string(),
         kind: snapshot.provider_kind(),
-        backend: snapshot.provider(),
         models: main_models,
     }];
     for (index, target) in snapshot.failover_targets().into_iter().enumerate() {
         out.push(PickableProvider {
             id: format!("failover-{index}"),
             kind: target.provider_kind(),
-            backend: target.provider(),
             models: target.all_models_ordered(),
         });
     }

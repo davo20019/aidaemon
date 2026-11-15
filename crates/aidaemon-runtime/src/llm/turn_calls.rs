@@ -590,10 +590,22 @@ fn owner_of(
     model: &str,
     fallback: crate::llm::ModelBackend,
 ) -> crate::llm::ModelBackend {
-    crate::session_model::pickable(snapshot)
+    if crate::session_model::pickable(snapshot)
+        .first()
+        .is_some_and(|main| main.models.iter().any(|known| known == model))
+    {
+        return fallback;
+    }
+    snapshot
+        .failover_targets()
         .into_iter()
-        .find(|provider| provider.models.iter().any(|known| known == model))
-        .map_or(fallback, |provider| provider.backend)
+        .find(|target| {
+            target
+                .all_models_ordered()
+                .iter()
+                .any(|known| known == model)
+        })
+        .map_or(fallback, |target| target.provider())
 }
 
 pub async fn select_turn_model(
