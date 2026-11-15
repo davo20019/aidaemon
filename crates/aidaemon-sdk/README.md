@@ -14,7 +14,7 @@ async fn forecast(city: String) -> String {
 }
 
 let agent = preset("weather")
-    .provider_from_env() // ANTHROPIC_API_KEY or OPENAI_API_KEY
+    .provider_from_env() // ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, ...
     .instructions("Answer in one sentence.")
     .tool(Forecast)
     .build()

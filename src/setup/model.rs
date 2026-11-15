@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aidaemon_client_protocol::{
-    Billing, ChannelOption, FoundModel, ProviderChoice, ProviderOption, SetupAction, SetupState,
-    SetupStep, SignIn,
+    Billing, ChannelOption, CheckedKey, FoundModel, ProviderChoice, ProviderOption, SetupAction,
+    SetupState, SetupStep, SignIn,
 };
 use aidaemon_secrets::SecretStore;
 use serde_json::json;
@@ -20,77 +20,45 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ProviderConfig;
 use crate::tools::ConfigManagerTool;
 
-/// The presets offered, in order: the subscription sign-in first (it bills
-/// a plan the owner already has), then API-key providers. Local models are
-/// not offered.
-const OFFERED: &[&str] = &[
-    "openai_chatgpt",
-    "openai",
-    "anthropic_native",
-    "google_ai_studio",
-    "openrouter",
-    "xai",
-    "deepseek",
-    "moonshot",
-    "minimax",
-    "custom_openai_compatible",
-];
-
-/// Where to get each preset's key.
-fn key_url(preset: &str) -> &'static str {
-    match preset {
-        "openai" => "https://platform.openai.com/api-keys",
-        "anthropic_native" => "https://console.anthropic.com/settings/keys",
-        "google_ai_studio" => "https://aistudio.google.com/apikey",
-        "openrouter" => "https://openrouter.ai/keys",
-        "xai" => "https://console.x.ai",
-        "deepseek" => "https://platform.deepseek.com/api_keys",
-        "moonshot" => "https://platform.moonshot.ai/",
-        "minimax" => "https://platform.minimax.io/user-center/basic-information",
-        _ => "",
-    }
-}
-
-/// Provider keys a machine may already hold in its environment.
-const ENV_KEYS: &[(&str, &str)] = &[
-    ("OPENAI_API_KEY", "openai"),
-    ("ANTHROPIC_API_KEY", "anthropic_native"),
-    ("GEMINI_API_KEY", "google_ai_studio"),
-    ("GOOGLE_API_KEY", "google_ai_studio"),
-    ("OPENROUTER_API_KEY", "openrouter"),
-    ("XAI_API_KEY", "xai"),
-    ("DEEPSEEK_API_KEY", "deepseek"),
-];
+use aidaemon_providers::catalog::{self, CatalogEntry};
 
 const CHATGPT: &str = "openai_chatgpt";
 
-fn preset(id: &str) -> Option<aidaemon_runtime::tools::config_manager::PresetInfo> {
-    aidaemon_runtime::tools::config_manager::provider_presets()
-        .into_iter()
-        .find(|p| p.id == id)
+/// What setup offers from the SDK's provider catalog: the hosted
+/// providers (the subscription sign-in first, as the catalog orders them),
+/// without the advanced routes (a Cloudflare gateway, Anthropic through
+/// OpenRouter) a Settings change still reaches. Local models are not
+/// offered.
+fn offered(entry: &CatalogEntry) -> bool {
+    entry.billing != catalog::Billing::Local
+        && !entry.gateway_token
+        && entry.id != "anthropic_openrouter"
 }
 
-fn billing(preset: &str) -> Billing {
-    if preset == CHATGPT {
-        Billing::Plan
-    } else {
-        Billing::PerToken
+fn preset(id: &str) -> Option<&'static CatalogEntry> {
+    catalog::find(id)
+}
+
+fn billing(entry: &CatalogEntry) -> Billing {
+    match entry.billing {
+        catalog::Billing::Plan => Billing::Plan,
+        _ => Billing::PerToken,
     }
 }
 
 /// Every provider offered.
 pub(crate) fn options() -> Vec<ProviderOption> {
-    OFFERED
+    catalog::CATALOG
         .iter()
-        .filter_map(|id| preset(id))
-        .map(|p| ProviderOption {
-            preset: p.id.to_string(),
-            name: p.display_name.to_string(),
-            billing: billing(p.id),
-            needs_key: p.needs_api_key,
-            key_url: key_url(p.id).to_string(),
-            needs_base_url: p.requires_custom_base_url,
-            model: p.primary.to_string(),
+        .filter(|entry| offered(entry))
+        .map(|entry| ProviderOption {
+            preset: entry.id.to_string(),
+            name: entry.display_name.to_string(),
+            billing: billing(entry),
+            needs_key: entry.needs_api_key(),
+            key_url: entry.key_url().to_string(),
+            needs_base_url: entry.custom_base_url,
+            model: entry.models.primary.to_string(),
         })
         .collect()
 }
@@ -136,7 +104,7 @@ impl Candidate {
             .unwrap_or_else(|| self.choice.preset.clone());
         let model = if self.choice.primary_model.is_empty() {
             preset(&self.choice.preset)
-                .map(|p| p.primary.to_string())
+                .map(|p| p.models.primary.to_string())
                 .unwrap_or_default()
         } else {
             self.choice.primary_model.clone()
@@ -167,7 +135,7 @@ db_path = "aidaemon.db"
 fn switch_call(choice: &ProviderChoice) -> serde_json::Value {
     // A custom endpoint's preset names placeholder models: the one the
     // owner named does every job unless they name others.
-    let custom = preset(&choice.preset).is_some_and(|p| p.requires_custom_base_url);
+    let custom = preset(&choice.preset).is_some_and(|p| p.custom_base_url);
     let or_primary = |model: &str| {
         if model.is_empty() && custom {
             choice.primary_model.clone()
@@ -256,10 +224,48 @@ async fn provider_of(candidate: &Candidate) -> Result<ProviderConfig, String> {
         .map_err(|e| format!("The provider settings do not read back: {e}"))
 }
 
-/// Try `candidate` with one test call.
+/// Try `candidate` with one test call: the provider built from the
+/// config it would write, the way the daemon will build it, asked by the
+/// SDK's connection test. Nothing else exists yet in setup mode (no stores,
+/// no side-call gateway), and nothing is saved until it answers.
 pub(crate) async fn test(candidate: &Candidate) -> Result<(), String> {
-    let provider = provider_of(candidate).await?;
-    crate::providers::connection_test::try_connection(&provider).await
+    let config = provider_of(candidate).await?;
+    let (provider, _) = crate::providers::factory::build_provider(&config)
+        .map_err(|error| format!("Could not set up the provider: {error}"))?;
+    let model = crate::router::Router::new(config.models.clone())
+        .default_model()
+        .to_string();
+    aidaemon_providers::catalog::try_connection(provider.as_ref(), &model).await
+}
+
+/// Check `key` with `entry`'s provider (nothing is saved) and read the
+/// models its account offers.
+async fn check_key(
+    entry: &'static CatalogEntry,
+    base_url: &str,
+    key: &str,
+) -> Result<CheckedKey, String> {
+    let base = if base_url.trim().is_empty() {
+        entry.base_url
+    } else {
+        base_url.trim()
+    };
+    if let Some(endpoint) = aidaemon_providers::key_check::KeyEndpoint::new(entry.kind, base) {
+        use aidaemon_providers::key_check::KeyCheck;
+        if let KeyCheck::Rejected(detail) =
+            aidaemon_providers::key_check::check_key(&endpoint, key).await
+        {
+            return Err(format!("The provider did not accept that key ({detail})"));
+        }
+    }
+    let models = catalog::list_models(entry.kind, base, key)
+        .await
+        .map_err(|why| format!("The key works, but its models could not be listed: {why}"))?;
+    Ok(CheckedKey {
+        preset: entry.id.to_string(),
+        suggested: catalog::preselect(&models, entry.models.primary),
+        models,
+    })
 }
 
 /// Write the config for `candidate` (its key into the secret store first),
@@ -332,6 +338,8 @@ struct Inner {
     /// The sign-in waiting for a pasted address.
     pasted: Option<aidaemon_providers::chatgpt_login::LoginAttempt>,
     sign_in: Option<SignIn>,
+    /// A key checked, with its account's models.
+    checked: Option<CheckedKey>,
     model: Option<String>,
     notices: Vec<String>,
     /// Set up from another device.
@@ -373,6 +381,7 @@ impl ModelSetup {
             providers: options(),
             model: inner.model.clone(),
             sign_in: inner.sign_in.clone(),
+            checked: inner.checked.clone(),
             channels: channels(),
             channel: None,
             notices: inner.notices.clone(),
@@ -395,26 +404,44 @@ impl ModelSetup {
                 "ChatGPT sign-in on this computer".into(),
             ));
         }
-        for (var, preset) in ENV_KEYS {
-            let Some(key) = std::env::var(var)
-                .ok()
-                .map(|k| k.trim().to_string())
-                .filter(|k| !k.is_empty())
-            else {
-                continue;
-            };
-            if candidates.iter().any(|(c, _)| c.choice.preset == *preset) {
+        // Keys in the environment, each with a model its account offers.
+        let mut unusable: Vec<FoundModel> = Vec::new();
+        for found in catalog::keys_in_env() {
+            if !offered(found.entry) {
                 continue;
             }
+            let source = format!("{} in this computer's environment", found.var);
+            let model = match catalog::list_models(
+                found.entry.kind,
+                found.entry.base_url,
+                &found.key,
+            )
+            .await
+            {
+                Ok(models) => catalog::preselect(&models, found.entry.models.primary),
+                Err(_) => None,
+            };
+            let Some(model) = model else {
+                unusable.push(FoundModel {
+                    preset: found.entry.id.to_string(),
+                    name: found.entry.display_name.to_string(),
+                    source,
+                    billing: billing(found.entry),
+                    works: false,
+                    detail: "connect it below to pick one of its models".into(),
+                });
+                continue;
+            };
             candidates.push((
                 Candidate {
                     choice: ProviderChoice {
-                        preset: (*preset).into(),
+                        preset: found.entry.id.into(),
+                        primary_model: model,
                         ..ProviderChoice::default()
                     },
-                    key: Some(key),
+                    key: Some(found.key),
                 },
-                format!("{var} in this computer's environment"),
+                source,
             ));
         }
         let tests = candidates
@@ -432,7 +459,9 @@ impl ModelSetup {
                         preset: candidate.choice.preset.clone(),
                         name: candidate.name(),
                         source,
-                        billing: billing(&candidate.choice.preset),
+                        billing: preset(&candidate.choice.preset)
+                            .map(billing)
+                            .unwrap_or(Billing::PerToken),
                         works: result.is_ok(),
                         detail: result.err().unwrap_or_default(),
                     },
@@ -440,7 +469,18 @@ impl ModelSetup {
                 )
             })
             .collect();
-        self.inner.lock().await.found = found;
+        let mut inner = self.inner.lock().await;
+        inner.found = found;
+        inner.found.extend(unusable.into_iter().map(|f| {
+            (
+                f,
+                Candidate {
+                    choice: ProviderChoice::default(),
+                    key: None,
+                },
+            )
+        }));
+        drop(inner);
         self.changed();
     }
 
@@ -575,14 +615,23 @@ impl ModelSetup {
                 self.connect(found.1, true).await
             }
             SetupAction::SignIn { paste } => self.sign_in(paste || !local).await,
+            SetupAction::CheckKey { provider, key } => {
+                let entry = preset(&provider.preset).ok_or("Unknown provider")?;
+                let checked = check_key(entry, &provider.base_url, key.0.trim()).await?;
+                self.inner.lock().await.checked = Some(checked);
+                Ok(())
+            }
             SetupAction::FinishSignIn { redirect } => self.finish_sign_in(&redirect).await,
             SetupAction::ConnectModel { provider, key } => {
                 let preset = preset(&provider.preset).ok_or("Unknown provider")?;
                 let key = key
                     .map(|k| k.0.trim().to_string())
                     .filter(|k| !k.is_empty());
-                if preset.needs_api_key && key.is_none() {
+                if preset.needs_api_key() && key.is_none() {
                     return Err(format!("{} needs an API key", preset.display_name));
+                }
+                if provider.primary_model.trim().is_empty() && preset.models.primary.is_empty() {
+                    return Err("Pick a model".into());
                 }
                 if preset.id == CHATGPT {
                     return Err("Sign in to ChatGPT instead of entering a key".into());
@@ -678,7 +727,14 @@ mod tests {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
-        let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(complete));
+        async fn models() -> axum::Json<serde_json::Value> {
+            axum::Json(json!({"object": "list", "data": [
+                {"id": "synthetic-other"}, {"id": "synthetic-model"}
+            ]}))
+        }
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(complete))
+            .route("/v1/models", axum::routing::get(models));
         tokio::spawn(async move { axum::serve(listener, app).await });
         base
     }
@@ -700,6 +756,29 @@ mod tests {
             },
             key: Some(aidaemon_client_protocol::SecretText(key.into())),
         };
+
+        // A key is checked and the account's models read before choosing.
+        setup
+            .act(
+                SetupAction::CheckKey {
+                    provider: ProviderChoice {
+                        preset: "custom_openai_compatible".into(),
+                        base_url: base_url.clone(),
+                        ..ProviderChoice::default()
+                    },
+                    key: aidaemon_client_protocol::SecretText("sk-synthetic-good".into()),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let checked = Host(setup.clone()).state(true).await.checked.unwrap();
+        assert_eq!(checked.models, ["synthetic-other", "synthetic-model"]);
+        assert_eq!(
+            checked.suggested, None,
+            "a custom endpoint has no usual model"
+        );
+        assert!(!config_path.exists());
 
         let refused = setup
             .act(connect("sk-synthetic-bad"), true)

@@ -583,6 +583,33 @@
         }
       ]
     },
+    "CheckedKey": {
+      "description": "A key its provider accepted, with what the account offers.",
+      "properties": {
+        "models": {
+          "description": "The account's models, as the provider lists them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "preset": {
+          "type": "string"
+        },
+        "suggested": {
+          "description": "The one to preselect, when the account has the provider's usual\nstarting model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "preset",
+        "models"
+      ],
+      "type": "object"
+    },
     "ClientFrame": {
       "description": "A frame from a client to the daemon.",
       "oneOf": [
@@ -2671,7 +2698,7 @@
           "type": "string"
         },
         "model": {
-          "description": "The model it starts with.",
+          "description": "The model it usually starts with (the account's list decides).",
           "type": "string"
         },
         "name": {
@@ -2694,8 +2721,7 @@
         "preset",
         "name",
         "billing",
-        "needs_key",
-        "model"
+        "needs_key"
       ],
       "type": "object"
     },
@@ -3591,7 +3617,28 @@
           "type": "object"
         },
         {
-          "description": "Connect a provider with an API key (`None` for one that needs none);\nit is tested before anything is saved.",
+          "description": "Check a provider's key (nothing is saved) and read the models its\naccount offers: the answer's `checked`.",
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/SecretText"
+            },
+            "kind": {
+              "const": "check_key",
+              "type": "string"
+            },
+            "provider": {
+              "$ref": "#/$defs/ProviderChoice"
+            }
+          },
+          "required": [
+            "kind",
+            "provider",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Connect a provider with an API key (`None` for one that needs none)\nand a model; it is tested before anything is saved.",
           "properties": {
             "key": {
               "anyOf": [
@@ -3696,6 +3743,17 @@
             "$ref": "#/$defs/ChannelOption"
           },
           "type": "array"
+        },
+        "checked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CheckedKey"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A key the provider accepted, and the models its account offers."
         },
         "found": {
           "description": "Models already on this machine (a sign-in, a key in the\nenvironment), each tried once.",

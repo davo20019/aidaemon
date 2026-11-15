@@ -55,6 +55,7 @@
 //! ```
 
 mod anthropic;
+pub mod catalog;
 mod chatgpt;
 #[cfg(feature = "chatgpt-login")]
 pub mod chatgpt_login;

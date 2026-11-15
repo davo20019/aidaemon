@@ -732,6 +732,9 @@ pub struct SetupState {
     /// A subscription sign-in under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in: Option<SignIn>,
+    /// A key the provider accepted, and the models its account offers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<CheckedKey>,
     /// The chats this daemon can be reached on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channels: Vec<ChannelOption>,
@@ -810,8 +813,21 @@ pub struct ProviderOption {
     /// The owner names the address (a custom endpoint).
     #[serde(default)]
     pub needs_base_url: bool,
-    /// The model it starts with.
+    /// The model it usually starts with (the account's list decides).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
+}
+
+/// A key its provider accepted, with what the account offers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct CheckedKey {
+    pub preset: String,
+    /// The account's models, as the provider lists them.
+    pub models: Vec<String>,
+    /// The one to preselect, when the account has the provider's usual
+    /// starting model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested: Option<String>,
 }
 
 /// A subscription sign-in waiting for the owner.
@@ -866,8 +882,14 @@ pub enum SetupAction {
     },
     /// The address the sign-in's browser ended on.
     FinishSignIn { redirect: String },
-    /// Connect a provider with an API key (`None` for one that needs none);
-    /// it is tested before anything is saved.
+    /// Check a provider's key (nothing is saved) and read the models its
+    /// account offers: the answer's `checked`.
+    CheckKey {
+        provider: ProviderChoice,
+        key: SecretText,
+    },
+    /// Connect a provider with an API key (`None` for one that needs none)
+    /// and a model; it is tested before anything is saved.
     ConnectModel {
         provider: ProviderChoice,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -66,212 +66,27 @@ struct ProviderPreset {
     requires_custom_base_url: bool,
 }
 
-const PROVIDER_PRESETS: &[ProviderPreset] = &[
-    ProviderPreset {
-        id: "google_ai_studio",
-        aliases: &["google", "googleaistudio", "gemini"],
-        display_name: "Google AI Studio",
-        kind: "google_genai",
-        base_url: "",
-        primary: "gemini-3-flash-preview",
-        fast: "gemini-2.5-flash-lite",
-        smart: "gemini-3-pro-preview",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "openai",
-        aliases: &[],
-        display_name: "OpenAI",
-        kind: "openai_compatible",
-        base_url: "https://api.openai.com/v1",
-        primary: "gpt-4o",
-        fast: "gpt-4o-mini",
-        smart: "gpt-4o",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "xai",
-        aliases: &["x.ai", "grok"],
-        display_name: "xAI (Grok)",
-        kind: "xai_native",
-        base_url: "https://api.x.ai/v1",
-        primary: "grok-4",
-        fast: "grok-4",
-        smart: "grok-4",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "anthropic_native",
-        aliases: &["anthropic"],
-        display_name: "Anthropic (Native)",
-        kind: "anthropic",
-        base_url: "https://api.anthropic.com/v1",
-        primary: "claude-sonnet-4-20250514",
-        fast: "claude-haiku-4-20250414",
-        smart: "claude-opus-4-20250414",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "anthropic_openrouter",
-        aliases: &["anthropicopenrouter"],
-        display_name: "Anthropic (via OpenRouter)",
-        kind: "openai_compatible",
-        base_url: "https://openrouter.ai/api/v1",
-        primary: "anthropic/claude-sonnet-4",
-        fast: "anthropic/claude-haiku-4",
-        smart: "anthropic/claude-opus-4",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "openrouter",
-        aliases: &[],
-        display_name: "OpenRouter",
-        kind: "openai_compatible",
-        base_url: "https://openrouter.ai/api/v1",
-        primary: "openai/gpt-4o",
-        fast: "openai/gpt-4o-mini",
-        smart: "anthropic/claude-sonnet-4",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "deepseek",
-        aliases: &[],
-        display_name: "DeepSeek",
-        kind: "openai_compatible",
-        base_url: "https://api.deepseek.com",
-        primary: "deepseek-chat",
-        fast: "deepseek-chat",
-        smart: "deepseek-reasoner",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "moonshot",
-        aliases: &["moonshotai", "kimi", "kimik2", "kimik25"],
-        display_name: "Moonshot AI (Kimi)",
-        kind: "openai_compatible",
-        base_url: "https://api.moonshot.ai/v1",
-        primary: "kimi-k2.5",
-        fast: "kimi-k2.5",
-        smart: "kimi-k2-thinking",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "minimax",
-        aliases: &[],
-        display_name: "MiniMax",
-        kind: "openai_compatible",
-        base_url: "https://api.minimax.io/v1",
-        primary: "MiniMax-M2.5",
-        fast: "MiniMax-M2.5-highspeed",
-        smart: "MiniMax-M2.5",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "cloudflare_gateway",
-        aliases: &["cloudflare", "cloudflareaigateway", "aigateway"],
-        display_name: "Cloudflare AI Gateway",
-        kind: "openai_compatible",
-        base_url: "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY_ID>/compat",
-        primary: "gpt-4o-mini",
-        fast: "gpt-4o-mini",
-        smart: "gpt-4o",
-        needs_api_key: true,
-        supports_gateway_token: true,
-        requires_custom_base_url: true,
-    },
-    ProviderPreset {
-        id: "ollama",
-        aliases: &["ollamalocal"],
-        display_name: "Ollama (Local)",
-        kind: "openai_compatible",
-        base_url: "http://localhost:11434/v1",
-        primary: "llama3.1",
-        fast: "llama3.1",
-        smart: "llama3.1",
-        needs_api_key: false,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "openai_chatgpt",
-        aliases: &[
-            "chatgpt",
-            "chatgptsubscription",
-            "codex",
-            "openaisubscription",
-        ],
-        display_name: "OpenAI (ChatGPT subscription)",
-        kind: "openai_chatgpt",
-        base_url: "",
-        primary: "gpt-5.6-terra",
-        fast: "gpt-5.6-luna",
-        smart: "gpt-5.6-sol",
-        // Credentials come from the ChatGPT OAuth store, not an API key.
-        needs_api_key: false,
-        supports_gateway_token: false,
-        requires_custom_base_url: false,
-    },
-    ProviderPreset {
-        id: "custom_openai_compatible",
-        aliases: &["custom", "openaicompatible"],
-        display_name: "Custom (OpenAI Compatible)",
-        kind: "openai_compatible",
-        base_url: "",
-        primary: "model-name",
-        fast: "model-name",
-        smart: "model-name",
-        needs_api_key: true,
-        supports_gateway_token: false,
-        requires_custom_base_url: true,
-    },
-];
-
-/// A provider preset, as a setup screen offers it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PresetInfo {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    /// The `provider.kind` it writes.
-    pub kind: &'static str,
-    pub base_url: &'static str,
-    pub primary: &'static str,
-    pub needs_api_key: bool,
-    pub requires_custom_base_url: bool,
-}
-
-/// Every provider preset `switch_provider` takes, in its own order.
-pub fn provider_presets() -> Vec<PresetInfo> {
-    PROVIDER_PRESETS
-        .iter()
-        .map(|p| PresetInfo {
-            id: p.id,
-            display_name: p.display_name,
-            kind: p.kind,
-            base_url: p.base_url,
-            primary: p.primary,
-            needs_api_key: p.needs_api_key,
-            requires_custom_base_url: p.requires_custom_base_url,
-        })
-        .collect()
-}
+/// `switch_provider`'s presets: the SDK's provider catalog, the one
+/// table setup, `manage_config` and the SDK preset all read.
+static PROVIDER_PRESETS: std::sync::LazyLock<Vec<ProviderPreset>> =
+    std::sync::LazyLock::new(|| {
+        aidaemon_providers::catalog::CATALOG
+            .iter()
+            .map(|entry| ProviderPreset {
+                id: entry.id,
+                aliases: entry.aliases,
+                display_name: entry.display_name,
+                kind: entry.kind_name(),
+                base_url: entry.base_url,
+                primary: entry.models.primary,
+                fast: entry.models.fast,
+                smart: entry.models.smart,
+                needs_api_key: entry.needs_api_key(),
+                supports_gateway_token: entry.gateway_token,
+                requires_custom_base_url: entry.custom_base_url,
+            })
+            .collect()
+    });
 
 #[derive(Clone)]
 struct ResolvedProviderSelection {
@@ -682,7 +497,7 @@ impl ConfigManagerTool {
             "".to_string(),
         ];
 
-        for preset in PROVIDER_PRESETS {
+        for preset in PROVIDER_PRESETS.iter() {
             let key_req = if preset.needs_api_key {
                 "api_key required"
             } else {
@@ -829,6 +644,24 @@ impl ConfigManagerTool {
             preset.smart.to_string()
         } else {
             args.smart_model.trim().to_string()
+        };
+
+        if primary_model.is_empty() {
+            return Err(format!(
+                "{} has no model to start with: name one with `primary_model`.",
+                preset.display_name
+            ));
+        }
+        // With no model of their own, the other jobs use the one named.
+        let fast_model = if fast_model.is_empty() {
+            primary_model.clone()
+        } else {
+            fast_model
+        };
+        let smart_model = if smart_model.is_empty() {
+            primary_model.clone()
+        } else {
+            smart_model
         };
 
         let gateway_token_stored =
@@ -2644,7 +2477,7 @@ default = "primary-model"
         assert_eq!(fallbacks[0]["api_key"].as_str(), Some("keychain"));
         assert_eq!(
             fallbacks[0]["models"]["default"].as_str(),
-            Some("claude-sonnet-4-20250514")
+            Some("claude-sonnet-5-5")
         );
     }
 

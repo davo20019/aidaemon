@@ -12,10 +12,19 @@ stability promise.
 
 ## [Unreleased]
 
+### Changed
+- `aidaemon-sdk`: `provider_from_env` takes the first catalog provider whose key is set (still `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY` with `OPENAI_BASE_URL`, then `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, ...), so a key other than the first two no longer fails with `NoProvider`.
+- `aidaemon-providers`: `tokio` is a plain dependency (it was only with `chatgpt-login`).
+
+
 ### Removed
 - `aidaemon-client-gateway`: the built-in TypeScript web client (`clients/web` and the gateway's `web/` assets, `/client/v1/app/{module}`). The app's web build (`clients/app`) replaces it at `/client/v1/next/`; `/client/v1/app` redirects there when `app_dir` is set and otherwise serves a self-contained page saying the web app is not installed and how to get it.
 
 ### Added
+- `aidaemon-providers`: `catalog`, every provider as one table (`CATALOG`, `CatalogEntry`: kind, address, starting models, credential with its environment variables and where to make a key, billing). `find` by id or alias, `keys_in_env`, `CatalogEntry::provider` (a provider from a key), `list_models` (the account's own models from the provider's listing; the ChatGPT subscription's known models), `preselect`, and `try_connection` (one call with no tools and a single attempt, before an application saves a connection). The daemon's `manage_config` presets and first-run setup read it.
+- `aidaemon-providers`: `chatgpt_login::ChatGptCredentialManager::start_login` / `finish_on_loopback` / `finish_with_redirect`, the sign-in in two steps for an app that shows the address instead of a terminal.
+- `aidaemon-client-protocol` 1.5: first-run setup (`get_setup`, `setup` with `SetupAction`, `SetupState`, the `setup_updated` event and `welcome.setup`), `assistant_message.suggestions` and the `feature_requested` event. `aidaemon-client-gateway`: `ClientHost::setup` / `setup_step`, the `setup` module (a gateway with no agent behind it whose printed code pairs the first device as the owner device) and `client_feature::FeatureRequestTool`. `aidaemon-client-core`: `State::setup`, `State::feature_requests`, `SessionView::suggestions`.
+- `aidaemon-secrets`: with no usable keychain, `KeychainSecretStore` keeps a secret in its env file instead of failing, and reads it from there; `fallback_notice` says so.
 - `aidaemon-client-protocol` 1.2: command `get_system` and result `system` (`SystemStatus`: version, uptime, models, token use per day and model, model call timings, scheduled goals, background jobs, queues and health checks). `aidaemon-client-gateway`: `ClientHost::system` (default `None`, answered `not_found`).
 - `aidaemon-client-protocol` 1.1: capability `view_actions` and the ephemeral `view_action` event (`ViewAction`: open a session, show an approval or a task, focus a `Pane`, new session, show devices; unknown kinds read as `Unknown`). `aidaemon-client-gateway`: `views::ViewTargets` sends a view action to the one socket that declared the capability and sent the session's message, never logged or broadcast. `aidaemon-client-core`: `State::view_request`. `aidaemon-tools`: `ToolSemantics::offered_in_session`; `aidaemon-runtime`: `TurnHost::retain_offered_in_session`, applied when a turn's tools are chosen.
 - New crate `aidaemon-client-core`: the client link (reconnect, resume, resend under the same `request_id`, typed connection states), the event reducer (`State`, now `Serialize`) and sign-in, moved out of `aidaemon-tui`. Sign-in is the local token or a paired device key (`signin::pair`, `signin::sign_in`, `GrantCache` renewing the 15-minute grant), with a `KeyStore` trait and a file implementation. `LinkConfig` takes the client's kind, name and version. `aidaemon-tui` now builds on it.

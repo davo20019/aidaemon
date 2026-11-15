@@ -294,6 +294,11 @@ fn setup_state() -> SetupState {
             model: "synthetic/model-1".into(),
         }],
         model: None,
+        checked: Some(CheckedKey {
+            preset: "openrouter".into(),
+            models: vec!["synthetic/model-1".into(), "synthetic/model-2".into()],
+            suggested: Some("synthetic/model-1".into()),
+        }),
         sign_in: Some(SignIn {
             url: "https://auth.example.invalid/authorize?state=synthetic".into(),
             paste: true,

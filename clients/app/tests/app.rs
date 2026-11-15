@@ -126,6 +126,13 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
     app.wait_for("pay per token")?;
     // A key provider opens its form.
     app.press("Use a key")?;
+    app.wait_for("Check key")?;
+    // The key checks out: the account's own models, the usual one chosen.
+    feed([frame(
+        r#"{"type":"event","at_ms":1,"event":{"type":"setup_updated","setup":{"step":"model","providers":[{"preset":"openrouter","name":"OpenRouter","billing":"per_token","needs_key":true,"model":"synthetic/model-1"}],"checked":{"preset":"openrouter","models":["synthetic/model-1","synthetic/model-2"],"suggested":"synthetic/model-1"}}}}"#,
+    )]);
+    app.wait_for("The key works. Its account offers 2 models.")?;
+    app.wait_for("synthetic/model-2")?;
     app.wait_for("Test and connect")?;
     // The daemon starts with the model, then asks about a chat.
     feed([frame(

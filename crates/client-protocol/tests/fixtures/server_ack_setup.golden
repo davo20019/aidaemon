@@ -10,6 +10,14 @@
           "platform": "telegram"
         }
       ],
+      "checked": {
+        "models": [
+          "synthetic/model-1",
+          "synthetic/model-2"
+        ],
+        "preset": "openrouter",
+        "suggested": "synthetic/model-1"
+      },
       "found": [
         {
           "billing": "plan",

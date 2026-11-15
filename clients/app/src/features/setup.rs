@@ -329,14 +329,13 @@ fn model_step(store: Store) -> View {
                     let mut list = view().gap_2();
                     for option in providers {
                         let preset = option.preset.clone();
-                        let starts_with = option.model.clone();
                         let sign_in = !option.needs_key;
                         let action = move || {
                             if sign_in {
                                 store.setup_step(SetupAction::SignIn { paste: false });
                             } else {
                                 chosen.set(Some(preset.clone()));
-                                model.set(starts_with.clone());
+                                model.set(String::new());
                                 key.set(String::new());
                                 base_url.set(String::new());
                             }
@@ -347,6 +346,7 @@ fn model_step(store: Store) -> View {
                         };
                         let key_url = option.key_url.clone();
                         let needs_base_url = option.needs_base_url;
+                        let preset_id = option.preset.clone();
                         list = list.child(
                             view()
                                 .gap_2()
@@ -399,11 +399,36 @@ fn model_step(store: Store) -> View {
                                             field("https://api.example.com/v1", base_url),
                                         ));
                                     }
+                                    let preset = preset_id.clone();
+                                    let check = {
+                                        let preset = preset.clone();
+                                        move || {
+                                            model.set(String::new());
+                                            store.setup_step(SetupAction::CheckKey {
+                                                provider: ProviderChoice {
+                                                    preset: preset.clone(),
+                                                    base_url: base_url
+                                                        .get_untracked()
+                                                        .trim()
+                                                        .to_owned(),
+                                                    ..ProviderChoice::default()
+                                                },
+                                                key: SecretText(key.get_untracked()),
+                                            })
+                                        }
+                                    };
+                                    // The account's own models, once the key checks out.
+                                    let checked = move || {
+                                        store
+                                            .setup()
+                                            .and_then(|s| s.checked)
+                                            .filter(|c| c.preset == preset)
+                                    };
+                                    let checked_models = checked.clone();
                                     form.child(labeled(
                                         "API key",
                                         secret_field("Paste the key", key),
                                     ))
-                                    .child(labeled("Model", field("Model name", model)))
                                     .child(
                                         view()
                                             .flex_row()
@@ -411,10 +436,10 @@ fn model_step(store: Store) -> View {
                                             .gap_3()
                                             .child(
                                                 btn(
-                                                    "Test and connect",
-                                                    Variant::Primary,
+                                                    "Check key",
+                                                    Variant::Secondary,
                                                     Size::Sm,
-                                                    connect,
+                                                    check,
                                                 )
                                                 .disabled(move || {
                                                     store.setup_busy()
@@ -423,9 +448,84 @@ fn model_step(store: Store) -> View {
                                             )
                                             .child(when(
                                                 move || store.setup_busy(),
-                                                || ui::working("Testing"),
+                                                || ui::working("Asking the provider"),
                                             )),
                                     )
+                                    .child(dynamic(move || {
+                                        let found = checked_models()?;
+                                        // Preselect the usual model when the account has it.
+                                        if model.with_untracked(String::is_empty)
+                                            && let Some(suggested) = found.suggested.clone()
+                                        {
+                                            model.set(suggested);
+                                        }
+                                        Some(untracked(move || {
+                                            let filter = model.get();
+                                            // A model picked shows the others; typing narrows.
+                                            let picked = found.models.contains(&filter);
+                                            let needle = if picked {
+                                                String::new()
+                                            } else {
+                                                filter.to_lowercase()
+                                            };
+                                            let mut matches = view().flex_row().flex_wrap().gap_2();
+                                            for name in found
+                                                .models
+                                                .iter()
+                                                .filter(|m| {
+                                                    needle.is_empty()
+                                                        || m.to_lowercase().contains(&needle)
+                                                })
+                                                .filter(|m| **m != filter)
+                                                .take(8)
+                                                .cloned()
+                                            {
+                                                let pick = name.clone();
+                                                matches = matches.child(btn(
+                                                    name,
+                                                    Variant::Ghost,
+                                                    Size::Sm,
+                                                    move || model.set(pick.clone()),
+                                                ));
+                                            }
+                                            view()
+                                                .gap_2()
+                                                .child(lead(format!(
+                                                    "The key works. Its account offers {} models.",
+                                                    found.models.len()
+                                                )))
+                                                .child(labeled(
+                                                    "Model",
+                                                    field("Type to find one", model),
+                                                ))
+                                                .child(matches)
+                                        }))
+                                    }))
+                                    .child(when(
+                                        move || checked().is_some(),
+                                        move || {
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_3()
+                                                .child(
+                                                    btn(
+                                                        "Test and connect",
+                                                        Variant::Primary,
+                                                        Size::Sm,
+                                                        connect,
+                                                    )
+                                                    .disabled(move || {
+                                                        store.setup_busy()
+                                                            || model.with(|m| m.trim().is_empty())
+                                                    }),
+                                                )
+                                                .child(when(
+                                                    move || store.setup_busy(),
+                                                    || ui::working("Testing"),
+                                                ))
+                                        },
+                                    ))
                                 }))
                                 .child(ui::separator()),
                         );

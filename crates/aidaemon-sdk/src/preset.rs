@@ -26,7 +26,7 @@
 //! | Part | Default | Change with |
 //! |---|---|---|
 //! | Provider | none: name one | [`Preset::provider`], [`Preset::provider_from_env`], [`Preset::provider_from_env_or`] |
-//! | Model | [`Preset::model`]; else `AIDAEMON_MODEL`; else the provider's default (the env providers' [`DEFAULT_ANTHROPIC_MODEL`] / [`DEFAULT_OPENAI_MODEL`], or [`Provider::default_model`], `"scripted"` for a [`ScriptedProvider`](crate::testing)). A provider with no default needs [`Preset::model`]: building fails with [`PresetError::NoModel`] | [`Preset::model`] |
+//! | Model | [`Preset::model`]; else `AIDAEMON_MODEL`; else the provider's default (the env provider's starting model in [`aidaemon_providers::catalog`] ([`DEFAULT_ANTHROPIC_MODEL`], [`DEFAULT_OPENAI_MODEL`], ...), or [`Provider::default_model`], `"scripted"` for a [`ScriptedProvider`](crate::testing)). A provider with no default needs [`Preset::model`]: building fails with [`PresetError::NoModel`] | [`Preset::model`] |
 //! | Safeguards | [`AuthorityHook`] (full authority), [`ScopeGuard`] over the workspace, [`EgressGuard`], [`ApprovalPolicy`] (`DestructiveOnly`), [`Redactor`], [`UntrustedOutput`] | [`Preset::authority`], [`Preset::approvals`], [`Preset::undeclared_writes`], [`Preset::undeclared_reads`], [`Preset::path_free_tool`], [`Preset::without_default_hooks`] |
 //! | Tools | none; with a workspace, [`default_tools`](crate::tools::default_tools) | [`Preset::tool`], [`Preset::workspace`] |
 //! | Run store | in memory ([`MemoryStore`]) | [`Preset::store`], [`Preset::sqlite`] |
@@ -54,11 +54,12 @@ use aidaemon_policies::{
     ApprovalMode, ApprovalPolicy, EgressGuard, MemorySystem, MemoryTurn, Redactor, ScopeGuard,
     UndeclaredAccess, UntrustedOutput,
 };
-use aidaemon_providers::{Anthropic, OpenAiCompatible};
 
-/// The model used with `ANTHROPIC_API_KEY` when `AIDAEMON_MODEL` is unset.
+/// The model used with `ANTHROPIC_API_KEY` when `AIDAEMON_MODEL` is unset
+/// (the catalog's, kept in step by a test).
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
-/// The model used with `OPENAI_API_KEY` when `AIDAEMON_MODEL` is unset.
+/// The model used with `OPENAI_API_KEY` when `AIDAEMON_MODEL` is unset
+/// (the catalog's).
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5";
 
 /// Start a [`Preset`] for an agent with this id.
@@ -70,7 +71,9 @@ pub fn preset(id: impl Into<String>) -> Preset {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PresetError {
-    #[error("no provider: call .provider(..), or set ANTHROPIC_API_KEY or OPENAI_API_KEY")]
+    #[error(
+        "no provider: call .provider(..), or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, ...)"
+    )]
     NoProvider,
     /// The provider names no default model and none was set.
     #[error(
@@ -93,9 +96,12 @@ pub enum PresetError {
 /// A provider read from the environment and its default model.
 pub type EnvProvider = (Arc<dyn Provider>, &'static str);
 
-/// A provider read from the environment, and its default model:
-/// `ANTHROPIC_API_KEY`, else `OPENAI_API_KEY` (with `OPENAI_BASE_URL` for
-/// any OpenAI-compatible server). `None` when neither is set.
+/// A provider read from the environment, and its default model: the first
+/// provider of [`aidaemon_providers::catalog`] whose key is set, in catalog
+/// order (`ANTHROPIC_API_KEY`, then `OPENAI_API_KEY` with `OPENAI_BASE_URL`
+/// for any OpenAI-compatible server, then `GEMINI_API_KEY` /
+/// `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, ...). `None` when
+/// none is set.
 ///
 /// The preset reads it for you: [`Preset::provider_from_env`] fails the
 /// build ([`PresetError::NoProvider`]) when no key is set, for an app that
@@ -103,19 +109,22 @@ pub type EnvProvider = (Arc<dyn Provider>, &'static str);
 /// you give instead, for an example or a test that must run without a key.
 pub fn provider_from_env() -> Result<Option<EnvProvider>, PresetError> {
     let config = |err: aidaemon_providers::ConfigError| PresetError::Provider(err.to_string());
-    if let Some(key) = env("ANTHROPIC_API_KEY") {
-        let provider = Anthropic::builder().api_key(key).build().map_err(config)?;
-        return Ok(Some((Arc::new(provider), DEFAULT_ANTHROPIC_MODEL)));
-    }
-    if let Some(key) = env("OPENAI_API_KEY") {
-        let mut builder = OpenAiCompatible::builder().api_key(key);
-        if let Some(url) = env("OPENAI_BASE_URL") {
-            builder = builder.base_url(url);
-        }
-        let provider = builder.build().map_err(config)?;
-        return Ok(Some((Arc::new(provider), DEFAULT_OPENAI_MODEL)));
-    }
-    Ok(None)
+    let Some(found) = aidaemon_providers::catalog::keys_in_env()
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let base_url = if found.entry.id == "openai" {
+        env("OPENAI_BASE_URL").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let provider = found
+        .entry
+        .provider(&found.key, &base_url)
+        .map_err(config)?;
+    Ok(Some((provider, found.entry.models.primary)))
 }
 
 /// The default memory's turn: the agent's owner, reading and writing one
@@ -599,5 +608,21 @@ impl Preset {
             builder = configure(builder);
         }
         Ok(builder.build()?)
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    /// The documented defaults are the catalog's.
+    #[test]
+    fn the_default_models_are_the_catalogs() {
+        let model = |id| {
+            aidaemon_providers::catalog::find(id)
+                .unwrap()
+                .models
+                .primary
+        };
+        assert_eq!(super::DEFAULT_ANTHROPIC_MODEL, model("anthropic_native"));
+        assert_eq!(super::DEFAULT_OPENAI_MODEL, model("openai"));
     }
 }

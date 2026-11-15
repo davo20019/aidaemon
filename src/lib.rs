@@ -1145,7 +1145,10 @@ fn run_chatgpt_login(paste: bool) -> anyhow::Result<()> {
     println!();
     println!("  [provider]");
     println!("  kind = \"openai_chatgpt\"");
-    println!("  models = {{ default_model = \"gpt-5.6-terra\" }}");
+    let model = aidaemon_providers::catalog::find("openai_chatgpt")
+        .map(|entry| entry.models.primary)
+        .unwrap_or_default();
+    println!("  models = {{ default = \"{model}\" }}");
     Ok(())
 }
 

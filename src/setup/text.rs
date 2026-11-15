@@ -99,13 +99,53 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
                     } else {
                         String::new()
                     };
-                    let primary_model: String = Input::new()
-                        .with_prompt("Model")
-                        .default(option.model.clone())
-                        .interact_text()?;
                     let key = Password::new()
                         .with_prompt(format!("{} API key", option.name))
                         .interact()?;
+                    // The account's own models, from the provider.
+                    println!("  Checking the key...");
+                    let checked = host
+                        .step(
+                            SetupAction::CheckKey {
+                                provider: ProviderChoice {
+                                    preset: option.preset.clone(),
+                                    base_url: base_url.clone(),
+                                    ..ProviderChoice::default()
+                                },
+                                key: SecretText(key.clone()),
+                            },
+                            true,
+                        )
+                        .await;
+                    let models =
+                        match checked {
+                            Ok(state) => state.checked.unwrap_or_else(|| {
+                                aidaemon_client_protocol::CheckedKey {
+                                    preset: option.preset.clone(),
+                                    models: Vec::new(),
+                                    suggested: None,
+                                }
+                            }),
+                            Err(reason) => {
+                                println!("  {reason}");
+                                continue;
+                            }
+                        };
+                    let primary_model = if models.models.is_empty() {
+                        Input::new().with_prompt("Model").interact_text()?
+                    } else {
+                        let default = models
+                            .suggested
+                            .as_ref()
+                            .and_then(|s| models.models.iter().position(|m| m == s))
+                            .unwrap_or(0);
+                        let at = Select::new()
+                            .with_prompt("Model")
+                            .items(&models.models)
+                            .default(default)
+                            .interact()?;
+                        models.models[at].clone()
+                    };
                     SetupAction::ConnectModel {
                         provider: ProviderChoice {
                             preset: option.preset.clone(),
