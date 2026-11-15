@@ -45,8 +45,8 @@ use aidaemon_channels::stop::{self, StopRequest};
 use aidaemon_channels::turns::{MidRunPlacement, Turn, TurnDeps, TurnRunner};
 use aidaemon_client_protocol::{
     Applies, ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance,
-    HistoryMessage, LastReply, MemoryItem, MidRun, OwnerInfo, ProtocolError, Risk, Scope,
-    SearchHit, ServerFrame, SessionChanges, SessionSummary, Settings, SettingsChange,
+    HistoryMessage, LastReply, MemoryItem, MidRun, OwnerInfo, ProjectSummary, ProtocolError, Risk,
+    Scope, SearchHit, ServerFrame, SessionChanges, SessionSummary, Settings, SettingsChange,
     SettingsOutcome, SetupAction, SetupState, SlashCommand, Snapshot, TaskState, TaskSummary,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
@@ -113,6 +113,41 @@ pub trait ClientHost: Send + Sync {
     /// `session_id` worked in; empty when it worked in none.
     async fn changes(&self, _session_id: &str) -> anyhow::Result<SessionChanges> {
         Ok(SessionChanges::default())
+    }
+
+    /// The owner's projects.
+    async fn projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+        Ok(Vec::new())
+    }
+
+    /// Make a project. `Err`: it could not be made, and why, in plain words.
+    async fn create_project(
+        &self,
+        _name: &str,
+        _path: Option<&str>,
+    ) -> Result<ProjectSummary, String> {
+        Err("This daemon has no projects".to_string())
+    }
+
+    /// Rename a project or change its folder (`Some("")` removes it).
+    /// `Err`: nothing changed, and why.
+    async fn update_project(
+        &self,
+        _id: &str,
+        _name: Option<&str>,
+        _path: Option<&str>,
+    ) -> Result<ProjectSummary, String> {
+        Err("This daemon has no projects".to_string())
+    }
+
+    /// Put session `session_id` in project `project_id` (`None`: in no
+    /// project). `Err`: it stayed where it was, and why.
+    async fn set_session_project(
+        &self,
+        _session_id: &str,
+        _project_id: Option<&str>,
+    ) -> Result<(), String> {
+        Err("This daemon has no projects".to_string())
     }
 
     /// The daemon's settings; `None` when this host does not show them.
@@ -544,7 +579,11 @@ impl ClientGateway {
             | Command::ListMemories
             | Command::GetSettings
             | Command::GetSetup
-            | Command::GetChanges { .. } => Some(Scope::Observe),
+            | Command::GetChanges { .. }
+            | Command::ListProjects => Some(Scope::Observe),
+            Command::CreateProject { .. }
+            | Command::UpdateProject { .. }
+            | Command::SetSessionProject { .. } => Some(Scope::Chat),
             Command::ForgetMemory { .. }
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
@@ -565,6 +604,7 @@ impl ClientGateway {
                 text,
                 attachments,
                 mid_run,
+                project_id,
             } => {
                 let placement = match mid_run {
                     Some(MidRun::Steer) => Some(MidRunPlacement::Steer),
@@ -578,6 +618,7 @@ impl ClientGateway {
                     attachments.is_empty(),
                     caller.view_connection,
                     placement,
+                    project_id,
                 )
                 .await
             }
@@ -691,6 +732,61 @@ impl ClientGateway {
                     ))
                 }
             },
+            Command::ListProjects => {
+                let projects = self.host.projects().await.map_err(|e| {
+                    warn!(error = %e, "Listing projects failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not read the projects")
+                })?;
+                Ok(CommandResult::Projects { projects })
+            }
+            Command::CreateProject { name, path } => {
+                let project = self
+                    .host
+                    .create_project(&name, path.as_deref())
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                self.publisher.publish(
+                    None,
+                    Event::ProjectUpdated {
+                        project: project.clone(),
+                    },
+                );
+                Ok(CommandResult::Project { project })
+            }
+            Command::UpdateProject {
+                project_id,
+                name,
+                path,
+            } => {
+                let project = self
+                    .host
+                    .update_project(&project_id, name.as_deref(), path.as_deref())
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                self.publisher.publish(
+                    None,
+                    Event::ProjectUpdated {
+                        project: project.clone(),
+                    },
+                );
+                Ok(CommandResult::Project { project })
+            }
+            Command::SetSessionProject {
+                session_id,
+                project_id,
+            } => {
+                self.host
+                    .set_session_project(&session_id, project_id.as_deref())
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                self.publish_session(&session_id).await;
+                Ok(CommandResult::Reply {
+                    text: match project_id {
+                        Some(_) => "Moved to the project".to_string(),
+                        None => "Taken out of its project".to_string(),
+                    },
+                })
+            }
             Command::GetChanges { session_id } => {
                 let changes = self.host.changes(&session_id).await.map_err(|e| {
                     warn!(error = %e, "Reading a session's changes failed");
@@ -889,6 +985,7 @@ impl ClientGateway {
                     title: Some(title.to_string()),
                     last_activity_ms: Some(bus::now_ms()),
                     writable: true,
+                    project_id: None,
                 },
             },
         );
@@ -1019,6 +1116,22 @@ impl ClientGateway {
         })
     }
 
+    /// Tell every client how session `session_id` looks now (after a move
+    /// between projects).
+    async fn publish_session(&self, session_id: &str) {
+        match self.host.sessions().await {
+            Ok(sessions) => {
+                if let Some(session) = sessions.into_iter().find(|s| s.id == session_id) {
+                    self.publisher.publish(
+                        Some(session_id.to_string()),
+                        Event::SessionUpdated { session },
+                    );
+                }
+            }
+            Err(e) => warn!(error = %e, "Reading sessions after a project move failed"),
+        }
+    }
+
     async fn send_message(
         &self,
         request_id: &str,
@@ -1027,6 +1140,7 @@ impl ClientGateway {
         no_attachments: bool,
         view_connection: Option<u64>,
         placement: Option<MidRunPlacement>,
+        project_id: Option<String>,
     ) -> Result<CommandResult, ProtocolError> {
         if !no_attachments {
             return Err(ProtocolError::new(
@@ -1053,6 +1167,21 @@ impl ClientGateway {
             }
         };
         self.runner.register_session(&session_id, APP_CHANNEL).await;
+        // A new conversation started inside a project is placed there
+        // before its first turn, so that turn already works in its folder.
+        let project_id = match project_id.filter(|_| new_session) {
+            Some(project_id) => match self
+                .host
+                .set_session_project(&session_id, Some(&project_id))
+                .await
+            {
+                Ok(()) => Some(project_id),
+                Err(why) => {
+                    return Err(ProtocolError::new(ErrorCode::Invalid, why));
+                }
+            },
+            None => None,
+        };
         // The turn this message starts may move the sender's view, and only
         // the sender's, when it declared the capability.
         self.views.message_from(&session_id, view_connection);
@@ -1066,6 +1195,7 @@ impl ClientGateway {
                         title: Some(aidaemon_channels::presentation::word_preview(&text, 60)),
                         last_activity_ms: Some(bus::now_ms()),
                         writable: true,
+                        project_id,
                     },
                 },
             );

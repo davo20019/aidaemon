@@ -137,6 +137,7 @@ impl ClientHost for Host {
             title: None,
             last_activity_ms: Some(5),
             writable: false,
+            project_id: None,
         }])
     }
     async fn history(&self, _: &str, _: usize) -> anyhow::Result<Vec<HistoryMessage>> {
@@ -152,6 +153,20 @@ impl ClientHost for Host {
     }
     async fn slash(&self, _: &str, command: &str, _: &str) -> Option<String> {
         (command == "clear").then(|| "Context cleared.".to_string())
+    }
+    async fn create_project(
+        &self,
+        name: &str,
+        path: Option<&str>,
+    ) -> Result<ProjectSummary, String> {
+        if name.trim().is_empty() {
+            return Err("A project needs a name".into());
+        }
+        Ok(ProjectSummary {
+            id: "project-acme".into(),
+            name: name.into(),
+            path: path.map(str::to_string),
+        })
     }
     async fn changes(&self, session_id: &str) -> anyhow::Result<SessionChanges> {
         Ok(SessionChanges {
@@ -344,6 +359,7 @@ fn send(text: &str) -> Command {
         text: text.into(),
         attachments: Vec::new(),
         mid_run: None,
+        project_id: None,
     }
 }
 
@@ -466,6 +482,42 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
         panic!("{changes:?}");
     };
     assert_eq!(changes.repos[0].root, "/home/synthetic/acme");
+    let created = f
+        .post(
+            &[],
+            &command(
+                "r-3c",
+                Command::CreateProject {
+                    name: "Acme site".into(),
+                    path: Some("/home/synthetic/acme-site".into()),
+                },
+            ),
+        )
+        .await;
+    let ServerFrame::Ack {
+        result: CommandResult::Project { project },
+        ..
+    } = created
+    else {
+        panic!("{created:?}");
+    };
+    assert_eq!(project.path.as_deref(), Some("/home/synthetic/acme-site"));
+    let refused = f
+        .post(
+            &[],
+            &command(
+                "r-3d",
+                Command::CreateProject {
+                    name: " ".into(),
+                    path: None,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.message == "A project needs a name"),
+        "{refused:?}"
+    );
     let cleared = f
         .post(
             &[],
@@ -496,6 +548,7 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
                     text: "hi".into(),
                     attachments: Vec::new(),
                     mid_run: None,
+                    project_id: None,
                 },
             ),
         )
@@ -1436,6 +1489,7 @@ async fn a_view_action_reaches_only_the_capable_sender() {
                     text: "Carry on".into(),
                     attachments: Vec::new(),
                     mid_run: None,
+                    project_id: None,
                 },
             ),
         )

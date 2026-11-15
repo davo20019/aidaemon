@@ -7,6 +7,7 @@
         "channel": "app",
         "id": "app:6c1f",
         "last_activity_ms": 1767225600000,
+        "project_id": "project-acme",
         "title": "Synthetic report for Alice Rivera",
         "writable": true
       }

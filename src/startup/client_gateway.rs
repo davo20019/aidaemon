@@ -431,6 +431,13 @@ impl ClientHost for DaemonClientHost {
             }
         };
         let (first, latest) = (said("MIN").await, said("MAX").await);
+        let projects: std::collections::HashMap<String, String> = self
+            .state
+            .session_work_projects()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         Ok(self
             .state
             .load_session_channels()
@@ -450,12 +457,42 @@ impl ClientHost for DaemonClientHost {
                     // their chat by the gateway).
                     writable: true,
                     last_activity_ms: last.get(&id).and_then(|at| stored_ms(at)),
+                    project_id: projects.get(&id).cloned(),
                     id,
                     channel,
                     title,
                 }
             })
             .collect())
+    }
+
+    async fn projects(&self) -> anyhow::Result<Vec<aidaemon_client_protocol::ProjectSummary>> {
+        super::client_projects::projects(self.state.as_ref()).await
+    }
+
+    async fn create_project(
+        &self,
+        name: &str,
+        path: Option<&str>,
+    ) -> Result<aidaemon_client_protocol::ProjectSummary, String> {
+        super::client_projects::create(self.state.as_ref(), name, path).await
+    }
+
+    async fn update_project(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<aidaemon_client_protocol::ProjectSummary, String> {
+        super::client_projects::update(self.state.as_ref(), id, name, path).await
+    }
+
+    async fn set_session_project(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<(), String> {
+        super::client_projects::place(self.state.as_ref(), session_id, project_id).await
     }
 
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {

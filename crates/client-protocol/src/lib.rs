@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 9;
+pub const PROTOCOL_MINOR: u16 = 10;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -230,6 +230,10 @@ pub enum Command {
         /// (protocol 1.3). `None`: the agent reads it and decides.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mid_run: Option<MidRun>,
+        /// The project a new session starts in (protocol 1.10); ignored
+        /// when continuing one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
     },
     /// Stop everything the session has running (`/cancel all`).
     StopTurn { session_id: String },
@@ -301,6 +305,31 @@ pub enum Command {
     /// The uncommitted changes in the git repositories a session worked
     /// in (protocol 1.9), for a client's code view.
     GetChanges { session_id: String },
+    /// The owner's projects (protocol 1.10).
+    ListProjects,
+    /// A new project (protocol 1.10): a name, and the folder its
+    /// conversations work in (any folder; none for a project without one).
+    CreateProject {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Rename a project or change its folder (protocol 1.10). `name` and
+    /// `path` change only when given; an empty `path` removes the folder.
+    UpdateProject {
+        project_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Put a session in a project, or take it out of every project
+    /// (`project_id` absent) (protocol 1.10).
+    SetSessionProject {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -413,6 +442,14 @@ pub enum CommandResult {
     /// `get_changes`.
     Changes {
         changes: SessionChanges,
+    },
+    /// `list_projects`.
+    Projects {
+        projects: Vec<ProjectSummary>,
+    },
+    /// `create_project` and `update_project`: the project as it is now.
+    Project {
+        project: ProjectSummary,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -1158,6 +1195,10 @@ pub enum Event {
     TaskUpdated {
         task: TaskSummary,
     },
+    /// A project was created or changed (protocol 1.10).
+    ProjectUpdated {
+        project: ProjectSummary,
+    },
     /// Only with capability `goals`.
     GoalUpdated {
         goal: GoalSummary,
@@ -1227,6 +1268,7 @@ impl Event {
             Event::ApprovalRequested { .. } => "approval_requested",
             Event::ApprovalResolved { .. } => "approval_resolved",
             Event::TaskUpdated { .. } => "task_updated",
+            Event::ProjectUpdated { .. } => "project_updated",
             Event::GoalUpdated { .. } => "goal_updated",
             Event::ViewAction { .. } => "view_action",
             Event::SettingsUpdated { .. } => "settings_updated",
@@ -1555,6 +1597,21 @@ pub struct SessionSummary {
     /// from that chat.
     #[serde(default)]
     pub writable: bool,
+    /// The project it belongs to (protocol 1.10); `None`: no project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+/// A project: a name, and the folder its conversations work in
+/// (protocol 1.10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProjectSummary {
+    pub id: String,
+    pub name: String,
+    /// An absolute path on the daemon's computer: a repository, a site, a
+    /// folder of designs. `None`: the project has no folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// One message of a session's transcript.

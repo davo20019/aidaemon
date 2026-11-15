@@ -9,6 +9,7 @@
       }
     ],
     "mid_run": "queue",
+    "project_id": "project-acme",
     "text": "Post the synthetic report for Alice Rivera",
     "type": "send_message"
   },

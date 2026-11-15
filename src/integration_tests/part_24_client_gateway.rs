@@ -253,6 +253,7 @@ mod client_gateway {
                 text: "Post the synthetic report for Alice Rivera".into(),
                 attachments: Vec::new(),
                 mid_run: None,
+                project_id: None,
             },
         )
         .await;

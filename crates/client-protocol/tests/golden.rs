@@ -66,6 +66,15 @@ fn session() -> SessionSummary {
         title: Some("Synthetic report for Alice Rivera".into()),
         last_activity_ms: Some(1_767_225_600_000),
         writable: true,
+        project_id: Some("project-acme".into()),
+    }
+}
+
+fn project() -> ProjectSummary {
+    ProjectSummary {
+        id: "project-acme".into(),
+        name: "Acme site".into(),
+        path: Some("/home/synthetic/acme-site".into()),
     }
 }
 
@@ -118,6 +127,10 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetSetup => "get_setup",
         Command::Setup { .. } => "setup",
         Command::GetChanges { .. } => "get_changes",
+        Command::ListProjects => "list_projects",
+        Command::CreateProject { .. } => "create_project",
+        Command::UpdateProject { .. } => "update_project",
+        Command::SetSessionProject { .. } => "set_session_project",
         Command::Unknown => "unknown",
     }
 }
@@ -152,6 +165,8 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::SettingsChanged { .. } => "settings_changed",
         CommandResult::Setup { .. } => "setup",
         CommandResult::Changes { .. } => "changes",
+        CommandResult::Projects { .. } => "projects",
+        CommandResult::Project { .. } => "project",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -189,6 +204,7 @@ fn client_samples() -> Vec<ClientFrame> {
                     size_bytes: Some(2048),
                 }],
                 mid_run: Some(MidRun::Queue),
+                project_id: Some("project-acme".into()),
             },
         ),
         command(
@@ -285,6 +301,29 @@ fn client_samples() -> Vec<ClientFrame> {
             "5d0c2b1e-0015",
             Command::GetChanges {
                 session_id: "app:6c1f".into(),
+            },
+        ),
+        command("5d0c2b1e-0016", Command::ListProjects),
+        command(
+            "5d0c2b1e-0017",
+            Command::CreateProject {
+                name: "Acme site".into(),
+                path: Some("/home/synthetic/acme-site".into()),
+            },
+        ),
+        command(
+            "5d0c2b1e-0018",
+            Command::UpdateProject {
+                project_id: "project-acme".into(),
+                name: Some("Acme Corp site".into()),
+                path: None,
+            },
+        ),
+        command(
+            "5d0c2b1e-0019",
+            Command::SetSessionProject {
+                session_id: "app:6c1f".into(),
+                project_id: Some("project-acme".into()),
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -446,6 +485,7 @@ fn server_samples() -> Vec<ServerFrame> {
             },
         ),
         event(Some(10), Event::TaskUpdated { task: task() }),
+        event(Some(10), Event::ProjectUpdated { project: project() }),
         event(
             Some(11),
             Event::GoalUpdated {
@@ -768,6 +808,10 @@ fn server_samples() -> Vec<ServerFrame> {
                 }],
             },
         }),
+        ack(CommandResult::Projects {
+            projects: vec![project()],
+        }),
+        ack(CommandResult::Project { project: project() }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {
             request_id: Some("5d0c2b1e-0003".into()),

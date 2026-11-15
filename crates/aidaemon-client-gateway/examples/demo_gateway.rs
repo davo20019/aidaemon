@@ -167,6 +167,7 @@ impl ClientHost for Host {
                 title: Some("Plan for Acme Corp".into()),
                 last_activity_ms: Some(now_ms() - 3_600_000),
                 writable: true,
+                project_id: None,
             },
             SessionSummary {
                 id: "telegram:synthetic-user-1".into(),
@@ -174,6 +175,7 @@ impl ClientHost for Host {
                 title: Some("Alice Rivera on Telegram".into()),
                 last_activity_ms: Some(now_ms() - 26 * 3_600_000),
                 writable: false,
+                project_id: None,
             },
         ])
     }

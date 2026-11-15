@@ -769,6 +769,13 @@
               ],
               "description": "What to do with it when the session is already working\n(protocol 1.3). `None`: the agent reads it and decides."
             },
+            "project_id": {
+              "description": "The project a new session starts in (protocol 1.10); ignored\nwhen continuing one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "session_id": {
               "type": [
                 "string",
@@ -1119,6 +1126,94 @@
             "session_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "The owner's projects (protocol 1.10).",
+          "properties": {
+            "type": {
+              "const": "list_projects",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A new project (protocol 1.10): a name, and the folder its\nconversations work in (any folder; none for a project without one).",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "create_project",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Rename a project or change its folder (protocol 1.10). `name` and\n`path` change only when given; an empty `path` removes the folder.",
+          "properties": {
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "update_project",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Put a session in a project, or take it out of every project\n(`project_id` absent) (protocol 1.10).",
+          "properties": {
+            "project_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "set_session_project",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1451,6 +1546,43 @@
           "required": [
             "type",
             "changes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_projects`.",
+          "properties": {
+            "projects": {
+              "items": {
+                "$ref": "#/$defs/ProjectSummary"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "projects",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "projects"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`create_project` and `update_project`: the project as it is now.",
+          "properties": {
+            "project": {
+              "$ref": "#/$defs/ProjectSummary"
+            },
+            "type": {
+              "const": "project",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project"
           ],
           "type": "object"
         }
@@ -2013,6 +2145,23 @@
           "required": [
             "type",
             "task"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A project was created or changed (protocol 1.10).",
+          "properties": {
+            "project": {
+              "$ref": "#/$defs/ProjectSummary"
+            },
+            "type": {
+              "const": "project_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project"
           ],
           "type": "object"
         },
@@ -2827,6 +2976,29 @@
       ],
       "type": "string"
     },
+    "ProjectSummary": {
+      "description": "A project: a name, and the folder its conversations work in\n(protocol 1.10).",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "description": "An absolute path on the daemon's computer: a repository, a site, a\nfolder of designs. `None`: the project has no folder.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
     "ProtocolError": {
       "properties": {
         "code": {
@@ -3384,6 +3556,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "description": "The project it belongs to (protocol 1.10); `None`: no project.",
+          "type": [
+            "string",
             "null"
           ]
         },

@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use aidaemon_client_protocol::{
-    Approval, CommandResult, Event, Feature, HistoryMessage, ServerFrame, SessionSummary,
-    SetupState, Snapshot, TaskState, TaskSummary, TurnState, TurnStatus, ViewAction,
+    Approval, CommandResult, Event, Feature, HistoryMessage, ProjectSummary, ServerFrame,
+    SessionSummary, SetupState, Snapshot, TaskState, TaskSummary, TurnState, TurnStatus,
+    ViewAction,
 };
 
 /// One line of a transcript.
@@ -78,6 +79,9 @@ pub struct State {
     pub order: Vec<String>,
     pub approvals: BTreeMap<String, Approval>,
     pub tasks: BTreeMap<String, TaskSummary>,
+    /// The owner's projects, by id (protocol 1.10).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, ProjectSummary>,
     /// The latest error or notice from the gateway, shown in the status bar.
     pub notice: Option<String>,
     /// The latest view move the agent asked this client for, until the
@@ -237,6 +241,12 @@ impl State {
                 self.notice = Some(report)
             }
             CommandResult::Setup { setup } => self.set_setup(setup),
+            CommandResult::Projects { projects } => {
+                self.projects = projects.into_iter().map(|p| (p.id.clone(), p)).collect();
+            }
+            CommandResult::Project { project } => {
+                self.projects.insert(project.id.clone(), project);
+            }
             _ => {}
         }
     }
@@ -406,6 +416,9 @@ impl State {
             }
             Event::ApprovalResolved { approval_id, .. } => {
                 self.approvals.remove(&approval_id);
+            }
+            Event::ProjectUpdated { project } => {
+                self.projects.insert(project.id.clone(), project);
             }
             Event::TaskUpdated { task } => {
                 if matches!(task.state, TaskState::Running | TaskState::Cancelling) {
