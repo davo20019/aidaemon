@@ -27,6 +27,21 @@ pub fn toggle(
     change: impl Fn(bool) + 'static,
 ) -> nsh_base::SwitchElement {
     let label = label.into();
+    switch_only(label.clone(), on, change).child(
+        text(label)
+            .text_size(px(fit::small()))
+            .text_color(colors::TEXT),
+    )
+}
+
+/// [`toggle`] without its words, for a row that names the setting itself;
+/// `label` is still what assistive technology reads.
+pub fn switch_only(
+    label: impl Into<SharedString>,
+    on: impl Fn() -> bool + Copy + 'static,
+    change: impl Fn(bool) + 'static,
+) -> nsh_base::SwitchElement {
+    let label = label.into();
     switch()
         .checked(on)
         .accessibility_label(label.clone())
@@ -55,11 +70,6 @@ pub fn toggle(
         })
         .disabled_style(|s| s.opacity(0.45))
         .on_change(move |next: &bool| change(*next))
-        .child(
-            text(label)
-                .text_size(px(fit::small()))
-                .text_color(colors::TEXT),
-        )
 }
 
 /// One value from a list: a trigger that shows the chosen title (or

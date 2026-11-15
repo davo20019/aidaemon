@@ -13,11 +13,14 @@ use std::rc::Rc;
 
 use nsh_core::prelude::*;
 
+use crate::features::settings_general;
 use crate::store::{SettingsRead, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, type_scale};
 
 /// The page's tabs.
-const TABS: [&str; 4] = ["Settings", "Providers", "Connections", "Database"];
+const TABS: [&str; 4] = ["General", "Models", "Connections", "Advanced"];
+/// The tab with every setting, the database and Reload or Restart.
+const ADVANCED: usize = 3;
 
 pub fn page(store: Store) -> View {
     let filter = signal(String::new());
@@ -56,7 +59,7 @@ pub fn page(store: Store) -> View {
                     ))
                     .child(ui::tab_bar(tab, &TABS))
                     .child(when(
-                        move || tab.get() == 0,
+                        move || tab.get() == ADVANCED,
                         move || {
                             ui::field("Filter settings", filter)
                                 .label("Filter settings")
@@ -161,7 +164,7 @@ fn ready(
     form: ProviderForm,
 ) -> View {
     let mut page = view().gap_3();
-    if tab == 0 {
+    if tab == ADVANCED {
         page = page.child(muted(format!(
             "Saved to {}. Changes that widen what the assistant may do ask first.",
             settings.config_path
@@ -211,16 +214,16 @@ fn ready(
     }
 
     match tab {
-        1 => return page.child(providers(store, &settings, form)),
+        0 => return page.child(settings_general::general(store, &settings)),
+        1 => {
+            return page
+                .child(providers(store, &settings, form))
+                .child(settings_general::decisions(store, &settings));
+        }
         2 => {
             return page
                 .child(bots(store, &settings.bots))
                 .child(mcp_servers(store, &settings.mcp_servers));
-        }
-        3 => {
-            return page
-                .child(database(store, &settings))
-                .child(apply_section(store));
         }
         _ => {}
     }
@@ -256,7 +259,21 @@ fn ready(
     };
     page = page.child(ui::sections(open, groups));
     if !filtering {
-        page = page.child(other_setting(store));
+        page = page
+            .child(other_setting(store))
+            .child(database(store, &settings))
+            .child(apply_section(store))
+            .child(
+                view().flex_row().child(
+                    ui::btn(
+                        "Undo the last config change",
+                        Variant::Ghost,
+                        Size::Sm,
+                        move || store.change_settings(SettingsChange::RestoreBackup),
+                    )
+                    .disabled(move || store.settings_busy()),
+                ),
+            );
     }
     page
 }
@@ -285,7 +302,12 @@ fn group_section(
         .iter()
         .filter(|s| s.value.is_some() || s.secret_set)
         .count();
-    let label = format!("{} · {} set of {}", group.name, set, shown.len());
+    let title = settings_general::group_title(&group.name);
+    let label = if set == 0 {
+        title
+    } else {
+        format!("{title} · {set} changed")
+    };
     let mut list = view().gap_1().pb_2();
     for setting in shown {
         list = list.child(setting_row(store, setting));
@@ -345,7 +367,12 @@ fn setting_row(store: Store, setting: Setting) -> View {
                         .flex_1()
                         .min_w(px(0.0))
                         .gap(px(2.0))
-                        .child(ui::code(key.clone()).selectable(true))
+                        .child(
+                            text(settings_general::setting_title(&key))
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::body())),
+                        )
+                        .child(faint(key.clone()).selectable(true))
                         .child(
                             text(summary)
                                 .number_of_lines(2)
@@ -705,17 +732,7 @@ fn providers(store: Store, settings: &Settings, form: ProviderForm) -> View {
             .map(|p| p.preset.clone())
             .collect(),
     };
-    page.child(in_use(store, settings, form, known)).child(
-        view().flex_row().child(
-            ui::btn(
-                "Undo the last config change",
-                Variant::Ghost,
-                Size::Sm,
-                move || store.change_settings(SettingsChange::RestoreBackup),
-            )
-            .disabled(move || store.settings_busy()),
-        ),
-    )
+    page.child(in_use(store, settings, form, known))
 }
 
 /// The add form, when it is open at `at`.

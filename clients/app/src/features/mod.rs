@@ -7,6 +7,7 @@ pub mod memory;
 pub mod notify;
 pub mod pairing;
 pub mod settings;
+pub mod settings_general;
 pub mod setup;
 pub mod sidebar;
 pub mod system;
