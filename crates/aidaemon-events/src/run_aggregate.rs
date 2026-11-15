@@ -2956,7 +2956,69 @@ fn hint_matches_target(
         (RequestVerificationTargetKind::ResourceId, ToolTargetHintKind::ResourceId) => {
             target.value == hint.value
         }
+        // A relative path is read as a resource id (it has no root of its
+        // own); a written file whose path ends in it, whole, is that file.
+        (RequestVerificationTargetKind::ResourceId, ToolTargetHintKind::Path) => {
+            relative_target_names(&target.value, &hint.value)
+        }
         _ => false,
+    }
+}
+
+/// A relative target (`app/lib/reading-time.ts`) names a path inside the
+/// run's project, which the daemon's own workspace root is not: a receipt's
+/// absolute path that ends in those same components, whole, names it (live
+/// 2026-11-15: a project run's edits never proved its relative targets, so
+/// finished work was demanded again and then reported "didn't start").
+fn relative_target_names(target: &str, hint: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.starts_with('~')
+        || target.starts_with("..")
+        || !hint.starts_with('/')
+    {
+        return false;
+    }
+    let parts = |path: &str| -> Vec<String> {
+        path.split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_string)
+            .collect()
+    };
+    let (want, have) = (parts(target), parts(hint));
+    // The target, or a file under a target folder, ending the receipt's path.
+    !want.is_empty()
+        && (0..have.len()).any(|start| {
+            have.len() - start >= want.len() && have[start..start + want.len()] == want[..]
+        })
+}
+
+#[cfg(test)]
+mod relative_target_tests {
+    use super::relative_target_names;
+
+    #[test]
+    fn a_relative_target_names_a_written_file_by_whole_components() {
+        let file = "/home/synthetic/site/app/lib/reading-time.ts";
+        assert!(relative_target_names("app/lib/reading-time.ts", file));
+        assert!(relative_target_names("./app/lib/reading-time.ts", file));
+        assert!(
+            relative_target_names("app/lib", file),
+            "a folder target covers its files"
+        );
+        assert!(relative_target_names("reading-time.ts", file));
+        assert!(
+            !relative_target_names("lib/reading-time", file),
+            "never part of a name"
+        );
+        assert!(!relative_target_names("pp/lib/reading-time.ts", file));
+        assert!(!relative_target_names("../app/lib/reading-time.ts", file));
+        assert!(!relative_target_names(
+            "app/lib/reading-time.ts",
+            "app/lib/reading-time.ts"
+        ));
+        assert!(!relative_target_names("goal-7f3e", file));
     }
 }
 

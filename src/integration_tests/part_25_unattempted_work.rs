@@ -420,6 +420,95 @@ async fn a_partial_verdict_with_nothing_in_the_way_goes_on_once() {
     assert!(sent_back);
 }
 
+/// An edit as `edit_file` declares it: a local source write to a path.
+struct SyntheticEdit;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for SyntheticEdit {
+    fn name(&self) -> &str {
+        "apply_synthetic_edit"
+    }
+
+    fn description(&self) -> &str {
+        "Edits a synthetic file"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "apply_synthetic_edit",
+            "description": "Edits a synthetic file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": false}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output("Edited the file.".to_string()))
+    }
+}
+
+impl crate::traits::ToolSemantics for SyntheticEdit {
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        let path = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|args| args.get("path").and_then(|p| p.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE,
+        )
+        .with_target_hint(aidaemon_tools::semantics::ToolTargetHintKind::Path, path)
+    }
+}
+
+/// Live 2026-11-15 (dloornext): a run wrote, tested and committed its
+/// change with plain edits (they name no checklist item), its items linked
+/// to the owner's units and marked done, and its reply still said "I didn't
+/// start these parts" for both units.
+#[tokio::test]
+async fn finished_edits_for_the_owners_units_are_never_reported_unstarted() {
+    let session = "owner-units-finished-edits";
+    let items = |status: &str| {
+        json!({"items": [
+            {"text": "Add the synthetic reading-time helper and show it under each title", "status": status, "mutation_effects": ["local_workspace_write"], "owner_units": [0], "targets": ["app/lib/reading-time.ts"]},
+            {"text": "Add a node test for the synthetic helper", "status": status, "mutation_effects": ["local_workspace_write"], "owner_units": [1]},
+            {"text": "Run the synthetic typecheck and test", "status": status, "requires_observation": true, "owner_units": [0, 1]}
+        ]})
+        .to_string()
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &items("in_progress")),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"/tmp/synthetic-site/app/lib/reading-time.ts"}"#),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"tests/reading-time.test.mjs"}"#),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &{
+                let mut done: serde_json::Value = serde_json::from_str(&items("completed")).unwrap();
+                done["outcome"] = json!("done");
+                done.to_string()
+            },
+        ),
+        MockProvider::text_response("Reading time is added and tested."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[
+        ("Add an estimated reading time under each post's title", true),
+        ("Add a node test for the helper", true),
+    ])]);
+    let edit: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticEdit);
+    let probe: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticSiteList);
+    let harness =
+        setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![edit, probe], None)
+            .await
+            .unwrap();
+    let reply = ask_owner_turn(&harness, session, "Add a reading time with a test.").await;
+    assert!(!reply.contains("didn't start"), "{reply}");
+    assert_eq!(reply, "Reading time is added and tested.");
+}
+
 // ==================== The request is the owner's words ====================
 //
 // Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing
