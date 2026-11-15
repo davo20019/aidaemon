@@ -310,18 +310,6 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .group("Projects"),
         );
     }
-    items.push(
-        CommandItem::new("copy-reply", "Copy the last reply")
-            .group("Conversation")
-            .shortcut("mod+shift+c"),
-    );
-    if store.selected_untracked().is_some() {
-        items.push(
-            CommandItem::new("copy-all", "Copy this conversation as Markdown")
-                .group("Conversation"),
-        );
-        items.push(CommandItem::new("pin", "Pin or unpin this conversation").group("Conversation"));
-    }
     // Every waiting approval, answerable from the keyboard.
     for approval in store.approvals() {
         let what = approval.summary.clone();

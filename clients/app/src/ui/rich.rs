@@ -261,6 +261,8 @@ pub fn file_tree(
                 .accessibility_label(SharedString::from(label))
                 .expanded(move || Some(expanded.get()))
                 .on_expanded_change(move |ids: &Vec<SharedString>| expanded.set(ids.clone()))
+                // The keyboard's row shows, as every other control's does.
+                .item_class("rounded-md focus-visible:ring-2 focus-visible:ring-ring")
                 .selected(nsh_base::SelectValue::Controlled(None))
                 .on_selected_change(move |id: &SharedString| {
                     if let Some(path) = id.strip_prefix("f:") {
