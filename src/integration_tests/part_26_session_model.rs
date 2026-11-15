@@ -88,3 +88,48 @@ async fn a_pin_the_runtime_lost_answers_automatically() {
     let calls = harness.provider.call_log.lock().await.clone();
     assert_eq!(calls[0].model, "primary-model");
 }
+
+/// A conversation's pin wins over a daemon-wide `/model`; a conversation on
+/// automatic follows `/model`.
+#[tokio::test]
+async fn a_pin_beats_a_daemon_wide_model() {
+    use aidaemon_runtime::session_model::{self, PinnedModel, SessionModelSetting};
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response("Pinned."),
+        MockProvider::text_response("Global."),
+    ]);
+    let harness = setup_test_agent_with_models(provider, "primary-model", "smart-model")
+        .await
+        .unwrap();
+    harness.agent.engine().set_model("smart-model".to_string()).await;
+    session_model::set(
+        harness.state.as_ref(),
+        "app:pinned",
+        &SessionModelSetting {
+            pinned: Some(PinnedModel {
+                provider: session_model::MAIN_PROVIDER.into(),
+                model: "primary-model".into(),
+            }),
+            effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    for session in ["app:pinned", "app:automatic"] {
+        harness
+            .agent
+            .handle_message(
+                session,
+                "Hello!",
+                None,
+                UserRole::Owner,
+                ChannelContext::private("app"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let calls = harness.provider.call_log.lock().await.clone();
+    assert_eq!(calls[0].model, "primary-model");
+    assert_eq!(calls[1].model, "smart-model");
+}

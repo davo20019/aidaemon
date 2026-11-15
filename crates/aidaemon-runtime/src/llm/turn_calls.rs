@@ -639,11 +639,13 @@ pub async fn select_turn_model(
             }
         }
     };
-    if is_override {
-        return (own_model().await, false);
-    }
+    // The conversation's own pin is the more specific choice: it wins over
+    // a daemon-wide `/model`.
     if let Some(model) = session_pinned_model(host, snapshot, session_id).await {
         return (model, false);
+    }
+    if is_override {
+        return (own_model().await, false);
     }
     let autonomous = host
         .turn_runtime()
