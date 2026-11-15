@@ -35,19 +35,45 @@ fn send_signal_to_process_group_or_pid(pid: u32, signal: i32) -> bool {
     unsafe { libc::kill(raw_pid, signal) == 0 }
 }
 
-#[cfg(not(unix))]
-fn send_signal_to_process_group_or_pid(_pid: u32, _signal: i32) -> bool {
-    false
-}
-
 /// Send SIGTERM to a process group (or fallback process pid).
+#[cfg(unix)]
 pub fn send_sigterm(pid: u32) -> bool {
     send_signal_to_process_group_or_pid(pid, libc::SIGTERM)
 }
 
 /// Send SIGKILL to a process group (or fallback process pid).
+#[cfg(unix)]
 pub fn send_sigkill(pid: u32) -> bool {
     send_signal_to_process_group_or_pid(pid, libc::SIGKILL)
+}
+
+/// Windows has no signals: ask the process tree to close (`taskkill /T`).
+#[cfg(not(unix))]
+pub fn send_sigterm(pid: u32) -> bool {
+    taskkill(pid, false)
+}
+
+/// End the process tree at once (`taskkill /T /F`).
+#[cfg(not(unix))]
+pub fn send_sigkill(pid: u32) -> bool {
+    taskkill(pid, true)
+}
+
+#[cfg(not(unix))]
+fn taskkill(pid: u32, force: bool) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let mut command = std::process::Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T"]);
+    if force {
+        command.arg("/F");
+    }
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Best-effort process tree termination with TERM->KILL escalation.
@@ -67,8 +93,15 @@ pub async fn terminate_process_tree(pid: u32, child: &mut tokio::process::Child,
 
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(grace, child.wait()).await;
+        // The whole tree, as on Unix: a shell's children too.
+        if !send_sigterm(pid) {
+            let _ = child.start_kill();
+        }
+        if tokio::time::timeout(grace, child.wait()).await.is_err() {
+            if !send_sigkill(pid) {
+                let _ = child.start_kill();
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        }
     }
 }
