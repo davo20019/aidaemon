@@ -56,7 +56,7 @@ pub fn pairing(store: Store) -> View {
             .gap_4()
             .child(
                 text("Pair this device")
-                    .text_size(px(type_scale::TITLE))
+                    .text_size(px(ui::fit::title()))
                     .font_weight(FontWeight::SEMIBOLD),
             )
             .child(

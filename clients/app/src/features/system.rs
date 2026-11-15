@@ -201,6 +201,7 @@ fn fact(label: impl Into<SharedString>, value: impl Into<SharedString>) -> View 
         .child(
             text(value.into())
                 .number_of_lines(1)
+                .tabular_nums()
                 .selectable(true)
                 .text_size(px(ui::fit::body())),
         )

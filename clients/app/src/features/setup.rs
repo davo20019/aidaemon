@@ -15,7 +15,7 @@ use crate::ui::{self, Size, Tone, Variant, btn, colors, field, secret_field, sta
 fn heading(label: &'static str) -> Text {
     text(label)
         .role(AccessibilityRole::Header)
-        .text_size(px(type_scale::TITLE))
+        .text_size(px(ui::fit::title()))
         .font_weight(FontWeight::SEMIBOLD)
 }
 

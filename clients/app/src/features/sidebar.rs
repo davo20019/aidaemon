@@ -675,6 +675,7 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
                                 .map(|at| ui::time::ago(at, now_ms()))
                                 .unwrap_or_default()
                         })
+                        .tabular_nums()
                         .text_size(px(type_scale::XS))
                         .text_color(colors::FAINT),
                     ),

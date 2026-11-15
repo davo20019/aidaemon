@@ -343,16 +343,17 @@ fn header(store: Store, session: Option<String>) -> View {
                 .flex_1()
                 .min_w(px(0.0))
                 .px_2()
-                .child(
-                    text(move || match &title {
-                        Some(id) => store.title(id),
-                        None => "New conversation".into(),
-                    })
-                    .role(AccessibilityRole::Header)
-                    .number_of_lines(1)
-                    .text_size(px(ui::fit::body()))
-                    .font_weight(FontWeight::SEMIBOLD),
-                )
+                // A new conversation's question is its title: the bar
+                // stays quiet until there is a conversation to name.
+                .child(match title {
+                    Some(id) => text(move || store.title(&id))
+                        .role(AccessibilityRole::Header)
+                        .number_of_lines(1)
+                        .text_size(px(ui::fit::body()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .into_element(),
+                    None => view().into_element(),
+                })
                 // Where it lives (a chat's platform and bot) and the
                 // project it works in, under its title.
                 .child(when(
@@ -839,6 +840,7 @@ fn stamp(at: impl Fn() -> u64 + 'static) -> Text {
             ui::time::clock(at)
         }
     })
+    .tabular_nums()
     .text_size(px(type_scale::XS))
     .text_color(colors::FAINT)
 }

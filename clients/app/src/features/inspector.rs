@@ -105,7 +105,7 @@ fn steps(store: Store) -> View {
                                             store.tick();
                                             ui::time::span(now_ms().saturating_sub(started) / 1000)
                                         })
-                                        .font_family(ui::theme::MONO)
+                                        .tabular_nums()
                                         .text_size(px(type_scale::XS))
                                         .text_color(colors::FAINT),
                                     )

@@ -596,6 +596,7 @@ pub fn drawer(
         })
         .popup_style(|s| {
             s.h_full()
+                .py_safe_area()
                 .w(percentage(0.86))
                 .max_w(px(380.0))
                 .bg(colors::SIDEBAR)

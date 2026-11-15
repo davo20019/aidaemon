@@ -95,6 +95,13 @@ pub fn shell(store: Store) -> View {
     let main = view()
         .flex_1()
         .flex_row()
+        // Clear of the notch, the status bar and the home indicator (a
+        // phone's browser in full screen, an installed web app), and of the
+        // on-screen keyboard: what is typed stays in view above it. The
+        // keyboard's height already covers the home indicator.
+        .pt_safe_area()
+        .px_safe_area()
+        .pb(move || px(keyboard_height().0.max(safe_area().bottom.0)))
         // A narrow window shows one thing at a time: a pane, full-screen,
         // or the conversation.
         // A narrow window's panes are drawers over the page: each slides in

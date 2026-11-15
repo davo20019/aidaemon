@@ -540,6 +540,8 @@ pub fn badge(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
         .child(
             text(label)
                 .text_size(px(type_scale::XS))
+                // Counts keep their width as they change.
+                .tabular_nums()
                 .font_weight(FontWeight::MEDIUM)
                 .number_of_lines(1)
                 .text_color(tone.color()),
@@ -855,6 +857,8 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
         .child(
             text(label)
                 .text_size(px(type_scale::SM))
+                // "· 3 tools so far", ticking: the line does not shift.
+                .tabular_nums()
                 .number_of_lines(1)
                 .text_color(colors::MUTED),
         )

@@ -141,14 +141,15 @@ pub mod text {
     pub const SM: f32 = 12.5;
     /// Body and controls.
     pub const BASE: f32 = 13.5;
-    /// Reading text (messages).
-    pub const READ: f32 = 14.5;
-    /// Page titles.
-    pub const TITLE: f32 = 17.0;
+    /// Reading text (messages, the composer): the size chat apps read at,
+    /// a step clear of the controls' 13.5.
+    pub const READ: f32 = 15.5;
+    /// Page and empty-state titles: clearly above reading text.
+    pub const TITLE: f32 = 20.0;
     /// Line heights for each.
     pub const LH_SM: f32 = 17.0;
     pub const LH_BASE: f32 = 19.0;
-    pub const LH_READ: f32 = 22.0;
+    pub const LH_READ: f32 = 24.0;
 }
 
 /// Sizes of the desktop and web family.
@@ -187,7 +188,7 @@ pub mod fit {
         if touch() { 16.0 } else { super::text::READ }
     }
     pub fn read_lh() -> f32 {
-        if touch() { 24.0 } else { super::text::LH_READ }
+        if touch() { 25.0 } else { super::text::LH_READ }
     }
     /// A page's or an empty state's title: on a phone, clearly above the
     /// 16 pt reading text.
