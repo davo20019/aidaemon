@@ -115,6 +115,9 @@ pub struct ModelResponse {
     /// Why the reply may be incomplete (cut off at the token limit, held
     /// back by a safety filter), in the provider's words.
     pub note: Option<String>,
+    /// The reply stopped at the output-token limit, not where the model
+    /// ended it: its text is cut short.
+    pub cut_off: bool,
 }
 
 /// One item of a streamed reply. A well-formed stream yields any number of

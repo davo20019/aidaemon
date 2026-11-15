@@ -604,6 +604,8 @@ struct MessagesDecoder {
     output_tokens: u64,
     cache_read: u64,
     cache_creation: u64,
+    /// `stop_reason` was `max_tokens`.
+    cut_off: bool,
 }
 
 impl MessagesDecoder {
@@ -717,6 +719,10 @@ impl SseDecoder for MessagesDecoder {
                 if let Some(usage) = data.get("usage") {
                     self.absorb_usage(usage);
                 }
+                if data.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+                {
+                    self.cut_off = true;
+                }
             }
             "message_stop" => return Ok(true),
             "error" => {
@@ -792,6 +798,7 @@ impl SseDecoder for MessagesDecoder {
                 cached_input_tokens: self.cache_read,
                 cache_creation_tokens: self.cache_creation,
             },
+            cut_off: self.cut_off,
             ..Default::default()
         })
     }

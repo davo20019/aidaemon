@@ -851,6 +851,7 @@ fn parse_response(data: &Value) -> ModelResponse {
         usage,
         reasoning: (!reasoning.is_empty()).then_some(reasoning),
         note,
+        cut_off: finish_reason == Some("MAX_TOKENS"),
     }
 }
 

@@ -341,6 +341,7 @@ pub fn to_provider_response(response: sdk::ModelResponse, model: &str) -> Provid
         }),
         thinking: response.reasoning,
         response_note: response.note,
+        cut_off: response.cut_off,
     }
 }
 
@@ -526,6 +527,7 @@ pub fn to_sdk_response(response: ProviderResponse) -> sdk::ModelResponse {
         },
         reasoning: response.thinking,
         note: response.response_note,
+        cut_off: response.cut_off,
     }
 }
 

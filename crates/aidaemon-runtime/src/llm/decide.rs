@@ -331,6 +331,7 @@ impl SideCallGateway {
                         }),
                         thinking: None,
                         response_note: None,
+                        cut_off: false,
                     };
                     aidaemon_events::model_call_telemetry::record_background_model_call_telemetry(
                         event_store,

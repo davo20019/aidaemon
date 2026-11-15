@@ -111,6 +111,7 @@ pub async fn record_background_model_call_failure(
         usage: None,
         thinking: None,
         response_note: None,
+        cut_off: false,
     };
     record_background_call(
         event_store,

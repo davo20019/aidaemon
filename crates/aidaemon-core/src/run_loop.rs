@@ -34,6 +34,11 @@ use crate::state::{InFlight, Interruption, Pending, PendingFinish, RunId, RunSta
 use crate::stuck::StuckSignal;
 use crate::tool::{SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
 
+/// Sent when a final reply stopped at the output-token limit.
+const CUT_OFF_REPLY: &str = "Your last reply was cut off at the output limit, so the owner \
+     would get it unfinished. Send the complete answer again, shorter: keep what matters \
+     and drop detail.";
+
 pub(crate) struct Driver<'a> {
     agent: &'a AgentInner,
     state: RunState,
@@ -260,6 +265,8 @@ impl<'a> Driver<'a> {
             }
         }
 
+        // How many cut-off final replies this segment asked again for.
+        let mut cut_off_asks = 0u8;
         loop {
             // 1. Guards: cancellation, hard limits, custom stop conditions.
             if self.cancel.is_cancelled() {
@@ -421,6 +428,18 @@ impl<'a> Driver<'a> {
                 .with_reasoning(response.reasoning.clone());
             self.scrubber().message(&mut message);
             self.state.messages.push(message);
+
+            // A final reply cut off at the output limit would reach the
+            // owner mid-sentence: ask once for the whole answer, shorter.
+            if calls.is_empty() && response.cut_off && cut_off_asks < 1 {
+                cut_off_asks += 1;
+                self.state.messages.push(Message::from_origin(
+                    MessageOrigin::Harness,
+                    CUT_OFF_REPLY.to_string(),
+                ));
+                self.checkpoint().await?;
+                continue;
+            }
 
             // 4a. No tool calls: the model thinks it is done. Ask stop hooks.
             if calls.is_empty() {

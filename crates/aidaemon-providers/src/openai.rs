@@ -323,6 +323,8 @@ struct ChatDecoder {
     calls: BTreeMap<usize, PartialCall>,
     usage: Usage,
     finished: bool,
+    /// `finish_reason` was `length`.
+    cut_off: bool,
 }
 
 impl ChatDecoder {
@@ -435,11 +437,9 @@ impl SseDecoder for ChatDecoder {
                     }
                 }
             }
-            if choice
-                .get("finish_reason")
-                .is_some_and(|reason| !reason.is_null())
-            {
+            if let Some(reason) = choice.get("finish_reason").filter(|r| !r.is_null()) {
                 self.finished = true;
+                self.cut_off |= reason.as_str() == Some("length");
             }
         }
         Ok(false)
@@ -461,6 +461,7 @@ impl SseDecoder for ChatDecoder {
             tool_calls,
             usage: self.usage,
             reasoning: (!self.reasoning.is_empty()).then(|| std::mem::take(&mut self.reasoning)),
+            cut_off: self.cut_off,
             ..Default::default()
         })
     }

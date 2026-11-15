@@ -493,6 +493,10 @@ fn parse_responses(data: &Value) -> Result<ModelResponse, ProviderError> {
         usage: parse_usage(data),
         reasoning: (!reasoning.is_empty()).then(|| reasoning.join("\n")),
         note,
+        cut_off: data
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens"),
     })
 }
 

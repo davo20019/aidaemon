@@ -112,6 +112,36 @@ async fn completes_when_the_model_answers_without_tools() {
     assert!(out.state.messages.iter().all(|m| m.role != Role::System));
 }
 
+/// A final reply cut off at the output limit is not delivered unfinished:
+/// the model is asked once for the whole answer, shorter. A second cut-off
+/// reply stands, so the loop cannot spin on it.
+#[tokio::test]
+async fn a_final_reply_cut_off_at_the_output_limit_is_asked_for_again() {
+    let cut = |body: &str| aidaemon_core::ModelResponse {
+        cut_off: true,
+        ..text(body)
+    };
+    async fn run(replies: Vec<aidaemon_core::ModelResponse>) -> (Option<String>, usize) {
+        let provider = Arc::new(ScriptedProvider::new(replies));
+        let agent = Agent::builder("a")
+            .allow_unguarded()
+            .model("m")
+            .provider(provider.clone())
+            .build()
+            .unwrap();
+        let out = agent.run("s1", "plan it").await.unwrap();
+        (out.final_text, provider.requests().len())
+    }
+
+    let (reply, calls) = run(vec![cut("The plan has three par"), text("Three parts.")]).await;
+    assert_eq!(reply.as_deref(), Some("Three parts."));
+    assert_eq!(calls, 2);
+
+    let (reply, calls) = run(vec![cut("First cut"), cut("Second cut")]).await;
+    assert_eq!(reply.as_deref(), Some("Second cut"));
+    assert_eq!(calls, 2);
+}
+
 #[tokio::test]
 async fn tool_results_are_appended_and_receipted() {
     let agent = base(ScriptedProvider::new([

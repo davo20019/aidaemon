@@ -208,6 +208,8 @@ pub struct ProviderResponse {
     /// Optional provider-specific note about why no useful output was returned
     /// (for example Gemini finishReason/safety blocking metadata).
     pub response_note: Option<String>,
+    /// The reply stopped at the output-token limit: its text is cut short.
+    pub cut_off: bool,
 }
 
 /// A record of token usage from the database.
