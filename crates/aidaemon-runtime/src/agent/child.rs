@@ -156,6 +156,8 @@ impl Agent {
             billing_failed_models: self.billing_failed_models.clone(),
             self_ref: RwLock::new(None),
             task_registry: std::sync::OnceLock::new(),
+            // A child answers in its parent's chat: its follow-ups show there.
+            turn_watch: self.turn_watch.clone(),
             path_aliases: self.path_aliases.clone(),
             inbox_dir: self.inbox_dir.clone(),
             inherited_project_scope,

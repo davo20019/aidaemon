@@ -375,6 +375,10 @@ pub async fn run(
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
     agent.set_task_registry(task_registry.clone());
+    // Empty until the Client Gateway (when enabled) starts watching; the
+    // channels' turns and the agent's background follow-ups share it.
+    let turn_watch = aidaemon_channels::turns::TurnWatch::default();
+    agent.set_turn_watch(turn_watch.clone());
 
     // 11. Channels
     let channel_agent: Arc<dyn crate::runtime_ports::DaemonAgentRuntime> = agent.clone();
@@ -388,8 +392,7 @@ pub async fn run(
         max_file_size_mb: config.files.max_file_size_mb,
         state: state.clone() as Arc<dyn crate::traits::StateStore>,
         watchdog_stale_threshold_secs,
-        // Empty until the Client Gateway (when enabled) starts watching.
-        watch: Default::default(),
+        watch: turn_watch,
     };
     let channel_bundle = startup_channels::build_channels(&config, channel_deps.clone()).await;
 

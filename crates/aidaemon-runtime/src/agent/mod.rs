@@ -219,6 +219,9 @@ pub struct Agent {
     /// the same sender sends while it runs into the run (mid-turn steering).
     /// Set after channel startup via `set_task_registry()`.
     task_registry: std::sync::OnceLock<Arc<aidaemon_channels::tasks::TaskRegistry>>,
+    /// Who sees every turn (the Client Gateway): the background follow-ups
+    /// this agent runs are reported there too. Set after channel startup.
+    turn_watch: std::sync::OnceLock<aidaemon_channels::turns::TurnWatch>,
     /// Configured path alias roots (for example, `projects/...`).
     path_aliases: PathAliasConfig,
     /// Where received attachments are saved: daemon storage, never a project.
@@ -407,6 +410,7 @@ impl Agent {
             billing_failed_models: Arc::new(RwLock::new(HashMap::new())),
             self_ref: RwLock::new(None),
             task_registry: std::sync::OnceLock::new(),
+            turn_watch: std::sync::OnceLock::new(),
             path_aliases,
             inbox_dir,
             inherited_project_scope,
@@ -481,6 +485,16 @@ impl Agent {
     /// messages the same sender queues behind it (mid-turn steering).
     pub fn set_task_registry(&self, registry: Arc<aidaemon_channels::tasks::TaskRegistry>) {
         let _ = self.task_registry.set(registry);
+    }
+
+    /// Report this agent's background follow-up turns where channel turns
+    /// are reported.
+    pub fn set_turn_watch(&self, watch: aidaemon_channels::turns::TurnWatch) {
+        let _ = self.turn_watch.set(watch);
+    }
+
+    pub(crate) fn turn_watch(&self) -> Option<aidaemon_channels::turns::TurnWatch> {
+        self.turn_watch.get().cloned()
     }
 
     /// Set a weak self-reference for background task spawning.

@@ -303,6 +303,11 @@ pub struct TurnFinish<'a> {
 /// show all the work (the Client Gateway). Called inline: return quickly.
 pub trait TurnObserver: Send + Sync {
     fn turn_started(&self, turn: &TurnStart<'_>);
+    /// A turn the daemon starts on its own in a conversation (the
+    /// follow-up to background work it handed off): nobody sent anything,
+    /// so there is no message to show, only the work. Its updates and end
+    /// come as any turn's.
+    fn followup_started(&self, _session_id: &str, _turn: u64, _description: &str) {}
     /// One of the turn's status updates, as the surface gets it.
     fn turn_status(&self, session_id: &str, turn: u64, update: &StatusUpdate);
     fn turn_finished(&self, turn: &TurnFinish<'_>);

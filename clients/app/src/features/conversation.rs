@@ -27,6 +27,8 @@ enum Row {
     Activity(Vec<String>, u64),
     /// The last turn failed or was stopped: send its message again.
     Retry,
+    /// Work handed to the background runs; its report comes here.
+    Background,
 }
 
 impl Row {
@@ -34,6 +36,7 @@ impl Row {
         match self {
             Self::Live => "live".into(),
             Self::Retry => "retry".into(),
+            Self::Background => "background".into(),
             Self::Approval(id) => format!("approval-{id}"),
             Self::Day(label) => format!("day-{label}-{index}"),
             _ => format!("line-{index}"),
@@ -78,6 +81,8 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     }
     if store.live(session).is_some() {
         rows.push(Row::Live);
+    } else if store.in_background(session) {
+        rows.push(Row::Background);
     } else if store.can_retry(session) {
         rows.push(Row::Retry);
     }
@@ -608,6 +613,7 @@ fn transcript_list(
                         Row::Day(_) => 5,
                         Row::Activity(..) => 6,
                         Row::Retry => 7,
+                        Row::Background => 8,
                     })
                 })
             });
@@ -670,6 +676,9 @@ fn transcript_list(
                             })
                         })),
                         7 => column.child(retry(store, session)),
+                        8 => column.child(ui::working(
+                            "Working in the background · the result comes here",
+                        )),
                         _ => column.child(dynamic(move || {
                             let id = row.with(|r| match r {
                                 Some(Row::Approval(id)) => Some(id.clone()),

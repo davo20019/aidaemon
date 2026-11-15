@@ -1516,6 +1516,12 @@ pub trait ConversationRuntime: Send + Sync {
     async fn interpret_background_result(&self, _command: &str, _output: &str) -> Option<String> {
         None
     }
+
+    /// Where its continuations are shown live as turns; `None` when no one
+    /// watches.
+    fn turn_watch(&self) -> Option<aidaemon_channels::turns::TurnWatch> {
+        None
+    }
 }
 
 // ---- Building a child ----

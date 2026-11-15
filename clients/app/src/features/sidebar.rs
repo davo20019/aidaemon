@@ -24,7 +24,7 @@ pub fn sidebar(store: Store) -> View {
     let working = computed(move || {
         ids.with(|ids| {
             ids.iter()
-                .filter(|id| !store.needs_you(id) && store.is_running(id))
+                .filter(|id| !store.needs_you(id) && store.is_working(id))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -32,7 +32,7 @@ pub fn sidebar(store: Store) -> View {
     let rest = computed(move || {
         ids.with(|ids| {
             ids.iter()
-                .filter(|id| !store.needs_you(id) && !store.is_running(id))
+                .filter(|id| !store.needs_you(id) && !store.is_working(id))
                 .cloned()
                 .collect::<Vec<_>>()
         })

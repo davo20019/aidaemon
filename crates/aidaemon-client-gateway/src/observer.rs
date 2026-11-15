@@ -216,34 +216,64 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
     })
 }
 
-impl TurnObserver for GatewayObserver {
-    fn turn_started(&self, turn: &TurnStart<'_>) {
+impl GatewayObserver {
+    /// A turn begins in `session_id`: it is live, running, and shown.
+    fn begin(&self, session_id: &str, turn: u64, description: &str, origin: &str) {
         let started = now_ms();
-        if turn.platform != APP_CHANNEL
-            && let Ok(mut contexts) = self.contexts.lock()
-        {
-            contexts.insert(turn.session_id.to_string(), turn.channel_ctx.clone());
-        }
         if let Ok(mut active) = self.active.lock() {
-            active.insert(turn.session_id.to_string());
+            active.insert(session_id.to_string());
         }
         if let Ok(mut running) = self.running.lock() {
-            running.insert(turn.turn, (turn.description.to_string(), started));
+            running.insert(turn, (description.to_string(), started));
         }
         if let Ok(mut live) = self.live.lock() {
             live.insert(
-                turn.turn,
+                turn,
                 LiveTurnState {
-                    session_id: turn.session_id.to_string(),
-                    turn_id: self.ids.turn(turn.turn),
+                    session_id: session_id.to_string(),
+                    turn_id: self.ids.turn(turn),
                     started_at_ms: started,
                     ..LiveTurnState::default()
                 },
             );
         }
-        let session = Some(turn.session_id.to_string());
+        let session = Some(session_id.to_string());
         self.publisher.publish(
             session.clone(),
+            Event::TurnStarted {
+                turn_id: self.ids.turn(turn),
+                session_id: session_id.to_string(),
+                origin: origin.to_string(),
+            },
+        );
+        self.publisher.publish(
+            session,
+            Event::TaskUpdated {
+                task: TaskSummary {
+                    id: self.ids.task(session_id, turn),
+                    session_id: session_id.to_string(),
+                    number: turn,
+                    description: description.to_string(),
+                    state: TaskState::Running,
+                    started_at_ms: started,
+                    finished_at_ms: None,
+                    error: None,
+                },
+            },
+        );
+    }
+}
+
+impl TurnObserver for GatewayObserver {
+    fn turn_started(&self, turn: &TurnStart<'_>) {
+        if turn.platform != APP_CHANNEL
+            && let Ok(mut contexts) = self.contexts.lock()
+        {
+            contexts.insert(turn.session_id.to_string(), turn.channel_ctx.clone());
+        }
+        // What the sender said comes first, then the work on it.
+        self.publisher.publish(
+            Some(turn.session_id.to_string()),
             Event::UserMessage {
                 session_id: turn.session_id.to_string(),
                 // What the sender typed: the files' notes for the agent
@@ -257,29 +287,11 @@ impl TurnObserver for GatewayObserver {
                 origin: turn.platform.to_string(),
             },
         );
-        self.publisher.publish(
-            session.clone(),
-            Event::TurnStarted {
-                turn_id: self.ids.turn(turn.turn),
-                session_id: turn.session_id.to_string(),
-                origin: turn.platform.to_string(),
-            },
-        );
-        self.publisher.publish(
-            session,
-            Event::TaskUpdated {
-                task: TaskSummary {
-                    id: self.ids.task(turn.session_id, turn.turn),
-                    session_id: turn.session_id.to_string(),
-                    number: turn.turn,
-                    description: turn.description.to_string(),
-                    state: TaskState::Running,
-                    started_at_ms: started,
-                    finished_at_ms: None,
-                    error: None,
-                },
-            },
-        );
+        self.begin(turn.session_id, turn.turn, turn.description, turn.platform);
+    }
+
+    fn followup_started(&self, session_id: &str, turn: u64, description: &str) {
+        self.begin(session_id, turn, description, "background");
     }
 
     fn turn_status(&self, session_id: &str, turn: u64, update: &StatusUpdate) {

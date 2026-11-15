@@ -71,6 +71,10 @@ pub struct SessionView {
     /// they say something.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<String>,
+    /// Its last turn handed work off to run in the background, whose
+    /// report has not come yet: the conversation is working, not idle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// The client's view. Its JSON form (`serde_json::to_value`) is what the
@@ -330,6 +334,8 @@ impl State {
                     attachments,
                 });
                 view.suggestions = suggestions;
+                // A message after a hand-off is its report.
+                view.background = false;
             }
             Event::SetupUpdated { setup } => self.set_setup(setup),
             Event::FeatureRequested {
@@ -350,7 +356,9 @@ impl State {
                 session_id,
                 ..
             } => {
-                self.session(&session_id).live = Some(LiveTurn {
+                let view = self.session(&session_id);
+                view.background = false;
+                view.live = Some(LiveTurn {
                     turn_id,
                     started_ms: at_ms,
                     ..LiveTurn::default()
@@ -420,6 +428,7 @@ impl State {
                         attachments,
                     });
                 }
+                view.background = state == TurnState::HandedOff;
                 match state {
                     TurnState::Cancelled => view.lines.push(Line::Note {
                         text: "Stopped.".into(),
@@ -507,6 +516,56 @@ mod tests {
             session_id: Some("app:s1".into()),
             event,
         }
+    }
+
+    /// A turn that hands its work to the background leaves the
+    /// conversation working until the follow-up starts or the report comes.
+    #[test]
+    fn a_handed_off_turn_stays_working_until_its_report() {
+        let mut state = State::default();
+        let started = |turn: &str| {
+            event(
+                None,
+                Event::TurnStarted {
+                    turn_id: turn.into(),
+                    session_id: "app:s1".into(),
+                    origin: "app".into(),
+                },
+            )
+        };
+        let completed = |turn: &str, state: TurnState| {
+            event(
+                None,
+                Event::TurnCompleted {
+                    turn_id: turn.into(),
+                    text: String::new(),
+                    attachments: Vec::new(),
+                    state,
+                    error: None,
+                },
+            )
+        };
+        state.apply(started("t1"));
+        state.apply(completed("t1", TurnState::HandedOff));
+        assert!(state.sessions["app:s1"].background);
+        // The follow-up is a live turn of its own.
+        state.apply(started("t2"));
+        assert!(!state.sessions["app:s1"].background);
+        state.apply(completed("t2", TurnState::Completed));
+        assert!(!state.sessions["app:s1"].background);
+        // Or the report comes as a message.
+        state.apply(started("t3"));
+        state.apply(completed("t3", TurnState::HandedOff));
+        state.apply(event(
+            Some(9),
+            Event::AssistantMessage {
+                session_id: "app:s1".into(),
+                text: "The synthetic build passed.".into(),
+                attachments: Vec::new(),
+                suggestions: Vec::new(),
+            },
+        ));
+        assert!(!state.sessions["app:s1"].background);
     }
 
     #[test]

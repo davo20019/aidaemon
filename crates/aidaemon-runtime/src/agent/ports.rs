@@ -254,6 +254,10 @@ impl ConversationRuntime for Agent {
     async fn interpret_background_result(&self, command: &str, output: &str) -> Option<String> {
         Agent::interpret_background_result(self, command, output).await
     }
+
+    fn turn_watch(&self) -> Option<aidaemon_channels::turns::TurnWatch> {
+        Agent::turn_watch(self)
+    }
 }
 
 #[async_trait]

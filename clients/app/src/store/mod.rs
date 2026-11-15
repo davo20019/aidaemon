@@ -2492,6 +2492,18 @@ impl Store {
             .with(|s| s.sessions.get(id).and_then(|v| v.live.clone()))
     }
 
+    /// A turn runs, or work it handed to the background does.
+    pub fn is_working(&self, id: &str) -> bool {
+        self.is_running(id) || self.in_background(id)
+    }
+
+    /// Its last turn handed work to the background and the report is
+    /// still to come.
+    pub fn in_background(&self, id: &str) -> bool {
+        self.state
+            .with(|s| s.sessions.get(id).is_some_and(|v| v.background))
+    }
+
     pub fn is_running(&self, id: &str) -> bool {
         self.state.with(|s| {
             s.sessions.get(id).is_some_and(|v| v.live.is_some())

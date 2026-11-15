@@ -3298,7 +3298,72 @@ pub async fn run_background_continuation(
     run_background_continuation_with_timeout(agent, request, BACKGROUND_CONTINUATION_TIMEOUT).await
 }
 
+/// Numbers for follow-up turns as the turn observer sees them, far above
+/// the task registry's own (which count up from 1), so the two never meet.
+static NEXT_FOLLOWUP_TURN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1 << 48);
+
+/// How a follow-up the owner is shown is named in the running-work list.
+const FOLLOWUP_DESCRIPTION: &str = "Following up on background work";
+
 async fn run_background_continuation_with_timeout(
+    agent: &dyn ConversationRuntime,
+    mut request: ConversationRequest,
+    timeout: Duration,
+) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+    // The follow-up is a turn of the conversation like any other: whoever
+    // watches turns (the app) sees it start, its progress and its end, not
+    // only the message it ends with.
+    let observer = agent.turn_watch().and_then(|watch| watch.observer());
+    let watched = match observer {
+        Some(observer) if request.status_tx.is_none() => {
+            let turn = NEXT_FOLLOWUP_TURN.fetch_add(1, Ordering::Relaxed);
+            observer.followup_started(&request.session_id, turn, FOLLOWUP_DESCRIPTION);
+            let (status_tx, mut updates) = mpsc::channel::<StatusUpdate>(16);
+            request.status_tx = Some(status_tx);
+            let forward = {
+                let observer = observer.clone();
+                let session_id = request.session_id.clone();
+                tokio::spawn(async move {
+                    while let Some(update) = updates.recv().await {
+                        observer.turn_status(&session_id, turn, &update);
+                    }
+                })
+            };
+            Some((observer, turn, forward))
+        }
+        _ => None,
+    };
+    let session_id = request.session_id.clone();
+    let result = run_continuation_turn(agent, request, timeout).await;
+    if let Some((observer, turn, forward)) = watched {
+        // The turn has ended and dropped its sender: let what it said reach
+        // the watcher before its end does.
+        let _ = tokio::time::timeout(Duration::from_secs(2), forward).await;
+        let error = result.as_ref().err().map(|error| error.to_string());
+        let end = match &result {
+            Ok(envelope) if envelope.text.trim().is_empty() => {
+                aidaemon_channels::turns::TurnEnd::Empty
+            }
+            Ok(_) => aidaemon_channels::turns::TurnEnd::Delivered,
+            Err(_) => aidaemon_channels::turns::TurnEnd::Failed,
+        };
+        observer.turn_finished(&aidaemon_channels::turns::TurnFinish {
+            session_id: &session_id,
+            turn,
+            platform: "background",
+            end,
+            // The answer goes out as the conversation's message, by the
+            // caller's delivery: the turn itself carries none.
+            reply: "",
+            handed_off: false,
+            error: error.as_deref(),
+        });
+    }
+    result
+}
+
+async fn run_continuation_turn(
     agent: &dyn ConversationRuntime,
     request: ConversationRequest,
     timeout: Duration,
@@ -11484,6 +11549,100 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    /// Watched follow-ups: a runtime that reports one step, then answers.
+    struct ReportingConversationRuntime(aidaemon_channels::turns::TurnWatch);
+
+    #[async_trait::async_trait]
+    impl ConversationRuntime for ReportingConversationRuntime {
+        async fn continue_conversation(
+            &self,
+            request: ConversationRequest,
+        ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+            if let Some(tx) = request.status_tx.as_ref() {
+                let _ = tx.send(StatusUpdate::Thinking(0)).await;
+            }
+            AnsweringConversationRuntime
+                .continue_conversation(request)
+                .await
+        }
+
+        async fn record_continuation_delivery(
+            &self,
+            _session_id: &str,
+            _delivery: aidaemon_events::ResponseDeliveryData,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn turn_watch(&self) -> Option<aidaemon_channels::turns::TurnWatch> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorded(std::sync::Mutex<Vec<String>>);
+
+    impl aidaemon_channels::turns::TurnObserver for Recorded {
+        fn turn_started(&self, _turn: &aidaemon_channels::turns::TurnStart<'_>) {
+            self.0.lock().unwrap().push("owner turn".into());
+        }
+        fn followup_started(&self, session_id: &str, _turn: u64, description: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("started {session_id}: {description}"));
+        }
+        fn turn_status(&self, _session_id: &str, _turn: u64, update: &StatusUpdate) {
+            if matches!(update, StatusUpdate::Thinking(_)) {
+                self.0.lock().unwrap().push("thinking".into());
+            }
+        }
+        fn turn_finished(&self, turn: &aidaemon_channels::turns::TurnFinish<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("finished {:?} reply={:?}", turn.end, turn.reply));
+        }
+    }
+
+    /// A background job's follow-up is a turn the app sees live: it starts
+    /// (with no owner message), reports its work, and ends before its answer
+    /// is delivered as the conversation's message (live 2026-11-15: the
+    /// app showed the conversation idle until the final message).
+    #[tokio::test]
+    async fn a_background_follow_up_is_reported_as_a_live_turn() {
+        let watch = aidaemon_channels::turns::TurnWatch::default();
+        let recorded = Arc::new(Recorded::default());
+        watch.set(recorded.clone());
+        let envelope = run_background_continuation_with_timeout(
+            &ReportingConversationRuntime(watch),
+            ConversationRequest {
+                session_id: "app:synthetic-follow-up".to_string(),
+                user_text: "[Background command finished]".to_string(),
+                status_tx: None,
+                user_role: aidaemon_tools::semantics::UserRole::Owner,
+                channel_ctx: aidaemon_channels::context::ChannelContext::internal(),
+                heartbeat: None,
+                parent_task_id: None,
+                parent_tool_call_id: None,
+                parent_result_id: None,
+                clock: None,
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(envelope.text, "Drupal is installed.");
+        assert_eq!(
+            *recorded.0.lock().unwrap(),
+            vec![
+                format!("started app:synthetic-follow-up: {FOLLOWUP_DESCRIPTION}"),
+                "thinking".to_string(),
+                "finished Delivered reply=\"\"".to_string(),
+            ]
+        );
     }
 
     /// A request answered once its background runs ended gets its total
