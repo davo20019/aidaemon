@@ -310,7 +310,7 @@ fn usage(s: &SystemStatus) -> View {
                             .text_color(colors::MUTED),
                         ),
                 )
-                .child(ui::meter_of(format!("{day}: share of the busiest day"), share)),
+                .child(ui::meter(format!("{day}: share of the busiest day"), share)),
         );
     }
     section("Token use, last 7 days").child(c).child(

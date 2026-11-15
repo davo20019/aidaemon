@@ -9,7 +9,7 @@ use nsh_core::prelude::*;
 
 use crate::features::{conversation, inspector::inspector, sidebar::sidebar};
 use crate::store::{Connection, Store};
-use crate::ui::{colors, radius, size, type_scale};
+use crate::ui::{self, colors, radius, size, type_scale};
 
 pub fn shell(store: Store) -> View {
     let terminal = idiom() == Idiom::Terminal;
@@ -86,14 +86,6 @@ pub fn shell(store: Store) -> View {
     let main = view()
         .flex_1()
         .flex_row()
-        .child(
-            view()
-                .style_when(
-                    move || !(store.sidebar_open() && roomy.get()),
-                    |s| s.hidden(),
-                )
-                .child(sidebar(store)),
-        )
         // A narrow window shows one thing at a time: a pane, full-screen,
         // or the conversation.
         .child(
@@ -114,61 +106,91 @@ pub fn shell(store: Store) -> View {
                 )
                 .child(inspector(store)),
         )
-        .child(dynamic(move || {
-            if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
-                return None;
-            }
-            if store.connection() == Connection::NoDaemon {
-                return Some(untracked(|| {
-                    crate::features::setup::where_page(store).key("where")
-                }));
-            }
-            if in_setup.get() {
-                return Some(untracked(|| {
-                    crate::features::setup::page(store).key("setup")
-                }));
-            }
-            if store.connection() == Connection::NeedsPairing {
-                return Some(untracked(|| {
-                    crate::features::pairing::pairing(store).key("pairing")
-                }));
-            }
-            if store.page() == crate::store::Page::Memory {
-                return Some(untracked(|| {
-                    crate::features::memory::page(store).key("memory")
-                }));
-            }
-            if store.page() == crate::store::Page::Settings {
-                return Some(untracked(|| {
-                    crate::features::settings::page(store).key("settings")
-                }));
-            }
-            if store.page() == crate::store::Page::System {
-                return Some(untracked(|| {
-                    crate::features::system::page(store).key("system")
-                }));
-            }
-            // A new page per conversation: its list and draft are its own.
-            let selected = store.selected();
-            Some(untracked(move || {
-                conversation::page(store, selected.clone())
-                    .key(format!("conversation-{}", selected.unwrap_or_default()))
-            }))
-        }))
+        // A roomy window: the panes beside the page, each as wide as the
+        // owner drags it.
         .child(
             view()
+                .flex_1()
+                .flex_row()
                 .style_when(
-                    move || !(store.inspector_open() && wide.get() && !store.is_compact()),
+                    move || store.is_compact() && (store.sidebar_open() || store.inspector_open()),
                     |s| s.hidden(),
                 )
-                .child(inspector(store)),
+                .child(
+                    ui::split()
+                        .flex_1()
+                        .child(ui::pane(
+                            ui::size::SIDEBAR,
+                            200.0,
+                            420.0,
+                            move || store.sidebar_open() && roomy.get(),
+                            sidebar(store),
+                        ))
+                        .child(ui::pane_rest(page(store, in_setup)))
+                        .child(ui::pane(
+                            ui::size::INSPECTOR,
+                            260.0,
+                            520.0,
+                            move || store.inspector_open() && wide.get() && !store.is_compact(),
+                            inspector(store),
+                        )),
+                ),
         )
-        .child(when(palette, move || palette_dialog(store, palette)));
+        .child(when(palette, move || palette_dialog(store, palette)))
+        .child(ui::toasts(
+            move || store.toast(),
+            move || store.dismiss_toast(),
+        ));
     if terminal {
         view().flex_1().child(main).child(key_line(store))
     } else {
         main
     }
+}
+
+/// The page beside the panes: setup, pairing, a page or a conversation.
+fn page(store: Store, in_setup: Memo<bool>) -> impl IntoElement {
+    view().flex_1().h_full().child(dynamic(move || {
+        if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
+            return None;
+        }
+        if store.connection() == Connection::NoDaemon {
+            return Some(untracked(|| {
+                crate::features::setup::where_page(store).key("where")
+            }));
+        }
+        if in_setup.get() {
+            return Some(untracked(|| {
+                crate::features::setup::page(store).key("setup")
+            }));
+        }
+        if store.connection() == Connection::NeedsPairing {
+            return Some(untracked(|| {
+                crate::features::pairing::pairing(store).key("pairing")
+            }));
+        }
+        if store.page() == crate::store::Page::Memory {
+            return Some(untracked(|| {
+                crate::features::memory::page(store).key("memory")
+            }));
+        }
+        if store.page() == crate::store::Page::Settings {
+            return Some(untracked(|| {
+                crate::features::settings::page(store).key("settings")
+            }));
+        }
+        if store.page() == crate::store::Page::System {
+            return Some(untracked(|| {
+                crate::features::system::page(store).key("system")
+            }));
+        }
+        // A new page per conversation: its list and draft are its own.
+        let selected = store.selected();
+        Some(untracked(move || {
+            conversation::page(store, selected.clone())
+                .key(format!("conversation-{}", selected.unwrap_or_default()))
+        }))
+    }))
 }
 
 /// A binding that fires while the composer has the keyboard too.

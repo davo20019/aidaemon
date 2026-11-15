@@ -148,12 +148,9 @@ fn memory_row(store: Store, item: MemoryItem) -> View {
         .child(
             ui::btn("Forget", Variant::Ghost, Size::Sm, move || {
                 let id = id.clone();
-                ui::confirm(
-                    "Forget this?",
-                    forgotten.clone(),
-                    "Forget",
-                    move || store.forget_memory(&id),
-                )
+                ui::confirm("Forget this?", forgotten.clone(), "Forget", move || {
+                    store.forget_memory(&id)
+                })
             })
             .accessibility_label(format!("Forget: {}", item.value)),
         )

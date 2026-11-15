@@ -40,9 +40,12 @@ pub fn page(store: Store) -> View {
                                 move || store.settings_error().unwrap_or_default(),
                                 Tone::Danger,
                             )
-                            .child(ui::btn("Dismiss", Variant::Ghost, Size::Sm, move || {
-                                store.dismiss_settings_error()
-                            }))
+                            .child(ui::btn(
+                                "Dismiss",
+                                Variant::Ghost,
+                                Size::Sm,
+                                move || store.dismiss_settings_error(),
+                            ))
                         },
                     ))
                     .child(ui::tab_bar(tab, &TABS))
@@ -260,7 +263,11 @@ fn apply(store: Store, how: ApplyHow) {
 }
 
 /// A group as a section: its id, its heading and its rows.
-fn group_section(store: Store, group: &SettingGroup, shown: Vec<Setting>) -> (String, String, View) {
+fn group_section(
+    store: Store,
+    group: &SettingGroup,
+    shown: Vec<Setting>,
+) -> (String, String, View) {
     let set = shown
         .iter()
         .filter(|s| s.value.is_some() || s.secret_set)
@@ -350,12 +357,16 @@ fn setting_row(store: Store, setting: Setting) -> View {
                 }))
                 .child(when(is_bool, move || {
                     let k = toggle_key.clone();
-                    ui::toggle(if on { "On" } else { "Off" }, move || on, move |next: bool| {
-                        store.change_settings(SettingsChange::Set {
-                            key: k.clone(),
-                            value: Some(next.to_string()),
-                        })
-                    })
+                    ui::toggle(
+                        if on { "On" } else { "Off" },
+                        move || on,
+                        move |next: bool| {
+                            store.change_settings(SettingsChange::Set {
+                                key: k.clone(),
+                                value: Some(next.to_string()),
+                            })
+                        },
+                    )
                     .accessibility_label(format!("Turn {toggle_key} on or off"))
                 }))
                 .child(when(!is_bool, move || {
@@ -762,22 +773,26 @@ fn mcp_servers(store: Store, servers: &[McpServerInfo]) -> View {
                 .gap(px(2.0))
                 .child(text(server.name.clone()).number_of_lines(1))
                 .child(ui::code(server.command.clone()).number_of_lines(1)),
-            view().flex_row().items_center().gap_2().child(ui::status(
-                if server.enabled { "On" } else { "Off" },
-                if server.enabled {
-                    Tone::Success
-                } else {
-                    Tone::Neutral
-                },
-            ))
-            .child(faint(format!(
-                "{tools}{}",
-                if server.from_config {
-                    " · config.toml"
-                } else {
-                    ""
-                }
-            ))),
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(ui::status(
+                    if server.enabled { "On" } else { "Off" },
+                    if server.enabled {
+                        Tone::Success
+                    } else {
+                        Tone::Neutral
+                    },
+                ))
+                .child(faint(format!(
+                    "{tools}{}",
+                    if server.from_config {
+                        " · config.toml"
+                    } else {
+                        ""
+                    }
+                ))),
             actions,
         ]);
     }

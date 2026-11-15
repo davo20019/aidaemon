@@ -570,23 +570,6 @@ pub fn banner(message: impl IntoReactive<SharedString>, tone: Tone) -> View {
         )
 }
 
-/// A thin bar showing a share (0–1) for scale; hidden from screen readers
-/// (the row it sits in says the numbers).
-pub fn meter(share: f32) -> View {
-    view()
-        .h(px(4.0))
-        .rounded(px(radius::SMALL))
-        .bg(colors::INSET)
-        .accessibility_elements_hidden(true)
-        .child(
-            view()
-                .h_full()
-                .w(percentage(share.clamp(0.01, 1.0)))
-                .rounded(px(radius::SMALL))
-                .bg(colors::ACCENT),
-        )
-}
-
 /// The terminal's key line: one quiet row of "Key what" pairs.
 pub fn key_line(keys: impl Fn() -> String + 'static) -> View {
     view()

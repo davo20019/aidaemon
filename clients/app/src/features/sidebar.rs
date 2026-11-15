@@ -44,9 +44,8 @@ pub fn sidebar(store: Store) -> View {
         });
     });
     view()
-        .w(px(size::SIDEBAR))
+        .w_full()
         .flex_1()
-        .style_when(move || store.is_compact(), |s| s.w_full())
         .bg(colors::SIDEBAR)
         .border_r_1()
         .border_color(colors::LINE)
@@ -185,7 +184,24 @@ pub fn sidebar(store: Store) -> View {
         .child(connection(store))
 }
 
-fn session_row(store: Store, id: String) -> nsh_base::ButtonElement {
+/// A conversation's row, with its menu on a right click or a long press:
+/// open it, pin or unpin it, stop its work.
+fn session_row(store: Store, id: String) -> View {
+    let (open, pin, stop) = (id.clone(), id.clone(), id.clone());
+    let pinned = untracked(|| store.is_pinned(&id));
+    ui::with_menu(
+        session_button(store, id),
+        vec![
+            ui::MenuAction::new("Open", move || store.select(Some(open.clone()))),
+            ui::MenuAction::new(if pinned { "Unpin" } else { "Pin" }, move || {
+                store.toggle_pin(&pin)
+            }),
+            ui::MenuAction::new("Stop its work", move || store.stop(&stop)),
+        ],
+    )
+}
+
+fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
     let (a, b, c, d, e) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let (f, g, h) = (id.clone(), id.clone(), id.clone());
     let label_id = id.clone();

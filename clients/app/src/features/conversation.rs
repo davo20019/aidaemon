@@ -209,14 +209,6 @@ fn feature_words(feature: aidaemon_client_protocol::Feature) -> (&'static str, &
 /// What the agent's view moves say: a move offered while the owner types,
 /// and a short note after one was taken.
 fn notices(store: Store) -> View {
-    // A note leaves by itself after a few seconds.
-    effect(move || {
-        if store.toast().is_some() {
-            set_timeout(std::time::Duration::from_secs(6), move || {
-                store.dismiss_toast()
-            });
-        }
-    });
     view()
         .items_center()
         .px_4()
@@ -255,16 +247,6 @@ fn notices(store: Store) -> View {
                     ui::Size::Sm,
                     move || store.dismiss_notice(),
                 ))
-            },
-        ))
-        .child(when(
-            move || store.toast().is_some() && store.suggestion().is_none(),
-            move || {
-                ui::banner(move || store.toast().unwrap_or_default(), ui::Tone::Neutral).child(
-                    ui::btn("Dismiss", Variant::Ghost, ui::Size::Sm, move || {
-                        store.dismiss_toast()
-                    }),
-                )
             },
         ))
 }

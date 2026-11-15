@@ -7,16 +7,15 @@ use nsh_core::prelude::*;
 use super::approvals;
 use crate::store::{ActivityKind, Store, now_ms};
 use crate::ui::{
-    self, Glyph, Size, Tone, Variant, badge, btn, colors, radius, section_label, size, type_scale,
+    self, Glyph, Size, Tone, Variant, badge, btn, colors, radius, section_label, type_scale,
 };
 
 pub fn inspector(store: Store) -> View {
     let approvals = computed(move || store.approvals());
     let running = computed(move || store.running());
     view()
-        .w(px(size::INSPECTOR))
+        .w_full()
         .flex_1()
-        .style_when(move || store.is_compact(), |s| s.w_full())
         .bg(colors::SIDEBAR)
         .border_l_1()
         .border_color(colors::LINE)

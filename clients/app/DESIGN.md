@@ -20,9 +20,11 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 - **Type:** 11 / 12.5 / 13.5 / 14.5 (reading) / 17 (titles). Two weights per screen: regular and medium or semibold. Monospace only for code, commands, tool names and keys.
 - **Sizes:** sidebar 248, inspector 320, conversation column 760, rows 30, icon slot 16.
 
-## Components (`src/ui/controls.rs`)
+## Components (`src/ui/controls.rs`, `src/ui/kit.rs`)
 
-`meter`, `key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `secret_field` (masked), `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Features compose these and layout primitives only. A missing look becomes a variant here first.
+`key_line`, `btn`, `btn_icon`, `icon_btn` (variants primary, secondary, ghost, outline, danger, success; sizes sm and md), `field`, `secret_field` (masked), `badge`, `status`, `kbd`, `row`, `surface`, `separator`, `section_label`, `empty`, `working`, `code`, `banner`, `hint` and `with_hint`. Over `nsh_base`'s behaviour-only parts (`kit.rs`; keyboard, focus, roles and the terminal's rendering are nsh's): `toggle` (Switch: a setting that takes effect at once), `choice` (Select; searchable past 8 items; a sheet on phones), `sections` (Accordion, several open), `tab_bar` (Tabs), `data_table` (Table semantics, actions in the last column), `meter` (Progress), `confirm` (the platform's alert, before anything that cannot be undone), `with_menu` (ContextMenu: right click, long press, the menu key), `toasts` (ToastStack and ToastManager: one stack for the app; the terminal's status line), and `split` / `pane` / `pane_rest` (resizable panes).
+
+Features compose these and layout primitives only. A missing look becomes a variant here first.
 
 ## Motion (`src/ui/motion.rs`)
 
@@ -40,9 +42,15 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | Conversation | Reply streams | Markdown `streaming`: only the last block is remade |
 | Conversation | Agent working | Pulse on the status dot (`animate_pulse`) |
 | Inspector, sidebar | Panes fold at narrow widths | Hidden by style, state kept |
+| Inspector, sidebar | Owner drags the line between panes | `split` (resizable panels; sidebar 200–420, inspector 260–520) |
+| All | A short note ("Copied", a setting saved, the view moved) | Toast at the bottom, `ENTER` in, leaves after 6 s, paused while hovered; Escape or a swipe dismisses |
+| Settings | A change is refused | Danger banner that stays until dismissed or the next change |
+| Settings, Memory | Remove, Forget, Restart | The platform's alert asks first |
+| Sidebar | Right click or long press on a conversation | Menu: Open, Pin/Unpin, Stop its work |
+| Settings | True/false settings | A switch in the row, applied at once |
 | Palette | Opens | Native dialog presentation |
 | Conversation | Agent offers a view move while you type | Banner (accent tint) with Go (Cmd/Ctrl+G) and Dismiss; nothing moves until taken |
-| Conversation | Agent moved the view | Neutral note banner, leaves after 6 s |
+| Conversation | Agent moved the view | Toast, leaves after 6 s |
 | Approval card | Brought up by a move | Border thickens to accent until answered |
 | System | Approval arrives while the app is in the background | System notification (closed when answered anywhere); waiting count on the app icon; pressing it shows the card |
 
