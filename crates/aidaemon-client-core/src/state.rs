@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use aidaemon_client_protocol::{
-    Approval, AttachmentRef, CommandResult, Event, Feature, HistoryMessage, ProjectSummary,
-    ServerFrame, SessionSummary, SetupState, Snapshot, TaskState, TaskSummary, TurnState,
-    TurnStatus, ViewAction,
+    Approval, AttachmentRef, CommandResult, ErrorCode, Event, Feature, HistoryMessage,
+    ProjectSummary, ServerFrame, SessionSummary, SetupState, Snapshot, TaskState, TaskSummary,
+    TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -225,6 +225,16 @@ impl State {
                 self.apply_event(session_id, event, at_ms);
             }
             ServerFrame::Ack { result, .. } => self.apply_result(result),
+            // A refused sign-in is the connection's to say (the link signs
+            // in again, or goes offline as refused): not a note that stays
+            // on the page after the link is back.
+            ServerFrame::Error {
+                request_id: None,
+                error,
+            } if matches!(
+                error.code,
+                ErrorCode::Unauthorized | ErrorCode::VersionUnsupported
+            ) => {}
             ServerFrame::Error { error, .. } => self.notice = Some(error.message),
             ServerFrame::Welcome { setup, .. } => {
                 self.setup = setup.filter(|s| s.step != aidaemon_client_protocol::SetupStep::Done)
@@ -510,6 +520,7 @@ fn short(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aidaemon_client_protocol::ProtocolError;
 
     fn event(seq: Option<u64>, event: Event) -> ServerFrame {
         ServerFrame::Event {
@@ -674,6 +685,21 @@ mod tests {
             .clone()
             .expect("live");
         assert_eq!(live.tools.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_sign_in_leaves_no_note_but_a_refused_message_does() {
+        let mut state = State::default();
+        state.apply(ServerFrame::Error {
+            request_id: None,
+            error: ProtocolError::new(ErrorCode::Unauthorized, "A valid client token is required"),
+        });
+        assert_eq!(state.notice, None);
+        state.apply(ServerFrame::Error {
+            request_id: Some("r-1".into()),
+            error: ProtocolError::new(ErrorCode::Invalid, "That conversation is gone"),
+        });
+        assert_eq!(state.notice.as_deref(), Some("That conversation is gone"));
     }
 
     #[test]
