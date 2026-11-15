@@ -10,6 +10,18 @@ pub fn record_not_attempted(
     scope: &TurnScope<'_>,
     aggregate: &aidaemon_events::run_aggregate::RunAggregate,
 ) -> Vec<String> {
+    // What the judgement saw, so a "didn't start" on finished work can be
+    // traced (live 2026-11-15: a run that wrote and committed its change
+    // was told it never started it).
+    tracing::info!(
+        task_id = scope.task_id,
+        unattempted = ?aggregate.unattempted_declared_work(),
+        checklist_owner_units = ?aggregate.checklist_owner_units,
+        owner_units = aggregate.owner_units.len(),
+        mutating_operations = aggregate.operations.values().filter(|op| op.mutating).count(),
+        operations = aggregate.operations.len(),
+        "Declared work judged not attempted"
+    );
     let items: Vec<(Option<usize>, String)> = aggregate
         .unattempted_declared_work()
         .iter()
