@@ -257,12 +257,18 @@ fn looks_like_provider_server_error(recent_errors: &str) -> bool {
 }
 
 /// Graceful response when task token budget is exhausted.
-pub fn graceful_budget_response(learning_ctx: &LearningContext, _tokens_used: u64) -> String {
+pub fn graceful_budget_response(learning_ctx: &LearningContext, tokens_used: u64) -> String {
     let activity = categorize_tool_calls_user_facing(&learning_ctx.tool_calls);
+    // What ran out, plainly: the task's token budget, and how much it used.
+    let used = if tokens_used >= 1_000_000 {
+        format!("{:.1}M", tokens_used as f64 / 1_000_000.0)
+    } else {
+        format!("{}k", tokens_used / 1_000)
+    };
     let mut summary = format!(
-        "I've reached my processing limit for this task. \
-            Here's what I accomplished so far:\n\n{}\
-            The task may be incomplete. You can ask me to continue where I left off.",
+        "I've reached my processing limit for this task: it used its whole token budget \
+            ({used} tokens) before finishing. Here's what I accomplished so far:\n\n{}\
+            The task is incomplete. Ask me to continue and I'll pick up where I left off.",
         activity,
     );
     // Cap to avoid bloating conversation history while preserving key context.
