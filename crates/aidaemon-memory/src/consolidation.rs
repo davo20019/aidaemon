@@ -107,7 +107,7 @@ impl FactConsolidator {
 
         // session -> candidate messages (role, content), and the last turn
         // id seen this pass (for cursor advancement).
-        let mut sessions: HashMap<String, Vec<(TurnRole, String)>> = HashMap::new();
+        let mut sessions: HashMap<String, Vec<Candidate>> = HashMap::new();
         let mut last_seen: HashMap<String, i64> = HashMap::new();
         for session_id in candidates {
             let cursor = cursors.cursor(&session_id).await;
@@ -135,7 +135,11 @@ impl FactConsolidator {
                 // Every message long enough to hold a fact is a candidate;
                 // the model decides what is durable.
                 if worth_extracting(&content) && entry.len() < CANDIDATES_PER_SESSION {
-                    entry.push((turn.role, content));
+                    entry.push(Candidate {
+                        role: turn.role,
+                        content,
+                        at: turn.created_at,
+                    });
                 }
             }
         }
@@ -183,14 +187,14 @@ impl FactConsolidator {
 
             let conversation = messages
                 .iter()
-                .map(|(role, content)| format!("{}: {content}", role.as_str()))
+                .map(|candidate| format!("{}: {}", candidate.role.as_str(), candidate.content))
                 .collect::<Vec<_>>()
                 .join("\n");
             // The owner's own words, for identity evidence.
             let user_text = messages
                 .iter()
-                .filter(|(role, _)| *role == TurnRole::User)
-                .map(|(_, content)| content.as_str())
+                .filter(|candidate| candidate.role == TurnRole::User)
+                .map(|candidate| candidate.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -220,7 +224,7 @@ impl FactConsolidator {
             };
             report.facts_seen += facts.len();
             let channel_id = source.channel_id(session_id);
-            store_consolidated(store, &facts, &user_text, channel_id.as_deref()).await;
+            store_consolidated(store, &facts, messages, &user_text, channel_id.as_deref()).await;
             info!(
                 "Consolidation: extracted {} facts from session {session_id}",
                 facts.len()
@@ -240,11 +244,43 @@ impl FactConsolidator {
     }
 }
 
+/// One message of a session batch the model reads.
+struct Candidate {
+    role: TurnRole,
+    content: String,
+    at: DateTime<Utc>,
+}
+
+/// When the owner last said `value`: the latest owner message in the batch
+/// that contains it, else the batch's oldest message. The store lets an
+/// automated write past a deleted fact only on evidence newer than the
+/// deletion, so a value that cannot be placed counts as the oldest the
+/// batch holds, never as "now".
+fn evidence_time(messages: &[Candidate], value: &str) -> Option<DateTime<Utc>> {
+    // Whole words: "rust" is not stated by "trust".
+    let value = format!(" {} ", crate::text::normalize_fact_value(value));
+    let stated = (value.trim() != "")
+        .then(|| {
+            messages
+                .iter()
+                .filter(|m| {
+                    m.role == TurnRole::User
+                        && format!(" {} ", crate::text::normalize_fact_value(&m.content))
+                            .contains(&value)
+                })
+                .map(|m| m.at)
+                .max()
+        })
+        .flatten();
+    stated.or_else(|| messages.iter().map(|m| m.at).min())
+}
+
 /// Write consolidated facts through the store, which owns deduplication,
 /// the owner-overwrite guard, deletion tombstones and embeddings.
 async fn store_consolidated<S>(
     store: &S,
     facts: &[ExtractedFact],
+    messages: &[Candidate],
     user_text: &str,
     channel_id: Option<&str>,
 ) where
@@ -313,7 +349,7 @@ async fn store_consolidated<S>(
                 "consolidation",
                 channel_id,
                 privacy,
-                Some(Utc::now()),
+                evidence_time(messages, &fact.value),
                 Some(excerpt.as_str()),
             )
             .await
@@ -658,6 +694,30 @@ mod tests {
         assert_eq!(keys, ["task_timing_report"]);
         let prompt = &provider.requests()[0].messages[0].content;
         assert!(!prompt.contains("- behavior:"));
+    }
+
+    #[test]
+    fn a_fact_is_dated_by_the_owner_message_that_states_it() {
+        let at = |minutes| Utc::now() - chrono::Duration::minutes(minutes);
+        let message = |role, content: &str, minutes| Candidate {
+            role,
+            content: content.to_string(),
+            at: at(minutes),
+        };
+        let messages = [
+            message(
+                TurnRole::User,
+                "My sites live under ~/projects/ on this Mac",
+                90,
+            ),
+            message(TurnRole::User, "I trust the nightly build", 60),
+            message(TurnRole::Tool, "Rust 1.90 installed", 30),
+        ];
+        assert_eq!(evidence_time(&messages, "~/projects"), Some(messages[0].at));
+        // "trust" does not state "Rust", and a tool result is not the owner:
+        // an unplaced value counts as the oldest message.
+        assert_eq!(evidence_time(&messages, "Rust"), Some(messages[0].at));
+        assert_eq!(evidence_time(&[], "Rust"), None);
     }
 
     #[test]

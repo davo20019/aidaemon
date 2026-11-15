@@ -491,6 +491,47 @@ impl SqliteMemory {
         scores
     }
 
+    /// Retired rows, with no active row left for their key, that cover an
+    /// automated write of one of `keys = value` in `category`
+    /// ([`retirement_covers`]).
+    async fn retired_knowledge(
+        &self,
+        category: &str,
+        keys: &[&str],
+        value: &str,
+    ) -> anyhow::Result<Vec<RetiredKnowledge>> {
+        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT f.category, f.key, f.value, f.superseded_at, f.superseded_reason
+             FROM facts f
+             WHERE f.superseded_at IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM facts a WHERE a.superseded_at IS NULL
+                                AND a.category = f.category AND a.key = f.key)
+             ORDER BY f.superseded_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(
+                |(retired_category, retired_key, retired_value, _, reason)| {
+                    retirement_covers(
+                        (category, keys, value),
+                        (retired_category, retired_key, retired_value),
+                        reason.as_deref(),
+                    )
+                },
+            )
+            .map(|(category, key, _, retired_at, _)| RetiredKnowledge {
+                category,
+                key,
+                // An unreadable time still retires: no evidence is newer.
+                retired_at: DateTime::parse_from_rfc3339(&retired_at)
+                    .map(|at| at.with_timezone(&Utc))
+                    .unwrap_or(DateTime::<Utc>::MAX_UTC),
+            })
+            .collect())
+    }
+
     /// Ends the active copies of a fact the owner just changed or forgot:
     /// facts in any category that hold the same value under a key whose words
     /// contain, or are contained in, those of `key` (`favorite_tea` beside `test_favorite_tea`,
@@ -501,6 +542,7 @@ impl SqliteMemory {
         changed_id: i64,
         key: &str,
         value: &str,
+        reason: SupersededReason,
     ) -> anyhow::Result<()> {
         let value = value.trim();
         if value.is_empty() {
@@ -528,9 +570,11 @@ impl SqliteMemory {
                 continue;
             }
             sqlx::query(
-                "UPDATE facts SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",
+                "UPDATE facts SET superseded_at = ?, superseded_reason = ?
+                 WHERE id = ? AND superseded_at IS NULL",
             )
             .bind(&now)
+            .bind(reason.as_str())
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -539,6 +583,86 @@ impl SqliteMemory {
             }
         }
         Ok(())
+    }
+}
+
+fn key_tokens(canonical: &str) -> std::collections::HashSet<&str> {
+    canonical.split('_').filter(|t| !t.is_empty()).collect()
+}
+
+/// A retired fact row that an automated write would bring back.
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredKnowledge {
+    pub category: String,
+    pub key: String,
+    pub retired_at: DateTime<Utc>,
+}
+
+/// Whether a retired row (`retired_*`, with no active row for its key)
+/// covers an automated write of `key = value` in `category`.
+///
+/// - Same category, same canonical key: always, whatever the reason.
+/// - Another category, only with the same value: `project/status` and
+///   `technical/status` are different facts. Deleted by the owner: the same
+///   canonical key, or one naming the other with words added. Retired before
+///   reasons were recorded: the same canonical key only, since the row may
+///   be a fold or a value change rather than a deletion.
+///
+/// A value alone never matches: `true` or `main` under unrelated keys are
+/// different facts.
+fn retirement_covers(
+    (category, key, value): (&str, &[&str], &str),
+    (retired_category, retired_key, retired_value): (&str, &str, &str),
+    reason: Option<&str>,
+) -> bool {
+    let retired_canonical = canonicalize_fact_key(retired_key);
+    let same_key = key
+        .iter()
+        .any(|key| canonicalize_fact_key(key) == retired_canonical);
+    if retired_category
+        .trim()
+        .eq_ignore_ascii_case(category.trim())
+    {
+        return same_key;
+    }
+    let value = crate::text::normalize_fact_value(value);
+    if value.is_empty() || value != crate::text::normalize_fact_value(retired_value) {
+        return false;
+    }
+    match reason {
+        Some("deleted") => {
+            same_key
+                || key.iter().any(|key| {
+                    let canonical = canonicalize_fact_key(key);
+                    let (a, b) = (key_tokens(&canonical), key_tokens(&retired_canonical));
+                    !a.is_empty() && !b.is_empty() && (a.is_subset(&b) || b.is_subset(&a))
+                })
+        }
+        None => same_key,
+        Some(_) => false,
+    }
+}
+
+/// Why a fact row stopped being active, stored in `facts.superseded_reason`.
+/// Rows retired before the column existed have none, and are read as
+/// "unknown": a deletion, a fold or a value change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupersededReason {
+    /// The owner forgot it (or a copy of what they forgot).
+    Deleted,
+    /// A newer value replaced it.
+    Replaced,
+    /// It restated another active fact (`folded_into`).
+    Folded,
+}
+
+impl SupersededReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Deleted => "deleted",
+            Self::Replaced => "replaced",
+            Self::Folded => "folded",
+        }
     }
 }
 
@@ -983,9 +1107,12 @@ impl FactStore for SqliteMemory {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         for (folded_id, kept_id) in &folded {
             sqlx::query(
-                "UPDATE facts SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",
+                "UPDATE facts SET superseded_at = ?, superseded_reason = ?, folded_into = ?
+                 WHERE id = ? AND superseded_at IS NULL",
             )
             .bind(&now)
+            .bind(SupersededReason::Folded.as_str())
+            .bind(kept_id)
             .bind(folded_id)
             .execute(&mut *tx)
             .await?;
@@ -1000,6 +1127,12 @@ impl FactStore for SqliteMemory {
             .await?;
         }
         tx.commit().await?;
+        // A folded row leaves recall's projections too, as a copy does.
+        for (folded_id, _) in &folded {
+            if let Err(error) = self.project_fact_memory(*folded_id).await {
+                tracing::warn!(%error, fact_id = folded_id, "Deferred folded-fact projection");
+            }
+        }
         tracing::info!(
             folded = folded.len(),
             "Folded restated facts into their representatives"
@@ -1222,23 +1355,23 @@ impl FactStore for SqliteMemory {
 
         let automated_source = !is_owner_authored_fact_source(source);
         if existing.is_none() && automated_source {
-            // A key with only superseded rows was deleted or merged away.
-            // Background extraction must not resurrect it; the owner can
-            // still re-add it explicitly.
-            let tombstoned: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM facts WHERE category = ? AND key IN (?, ?) LIMIT 1",
-            )
-            .bind(category_clean)
-            .bind(key_clean)
-            .bind(&key_for_write)
-            .fetch_optional(&self.pool)
-            .await?;
-            if tombstoned.is_some() {
+            // Knowledge the owner deleted, or a key merged away, must not be
+            // brought back by background extraction, in any category the
+            // extractor picks. Evidence newer than the retirement is the
+            // owner saying it again, and is let through.
+            if let Some(tombstone) = self
+                .retired_knowledge(category_clean, &[key_clean, &key_for_write], value)
+                .await?
+                .into_iter()
+                .find(|tombstone| first_seen_at.is_none_or(|seen| seen <= tombstone.retired_at))
+            {
                 tracing::debug!(
                     category = category_clean,
                     key = key_clean,
                     source,
-                    "Automated fact write skipped: key was deleted or merged"
+                    retired_category = tombstone.category.as_str(),
+                    retired_key = tombstone.key.as_str(),
+                    "Automated fact write skipped: that knowledge was deleted or merged"
                 );
                 return Ok(());
             }
@@ -1317,7 +1450,7 @@ impl FactStore for SqliteMemory {
                 }
             }
             if old_value != value {
-                sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+                sqlx::query("UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced' WHERE id = ?")
                     .bind(&now)
                     .bind(old_id)
                     .execute(&self.pool)
@@ -1378,7 +1511,7 @@ impl FactStore for SqliteMemory {
                         if updated.rows_affected() == 0 {
                             sqlx::query(
                                 "UPDATE facts
-                                 SET value = ?, source = ?, updated_at = ?, superseded_at = NULL,
+                                 SET value = ?, source = ?, updated_at = ?, superseded_at = NULL, superseded_reason = NULL, folded_into = NULL,
                                      channel_id = ?, privacy = ?,
                                      embedding = COALESCE(?, embedding),
                                      first_seen_at = COALESCE(?, first_seen_at),
@@ -1401,8 +1534,13 @@ impl FactStore for SqliteMemory {
                     Err(e) => return Err(e.into()),
                 }
                 if !automated_source {
-                    self.supersede_copies(*old_id, &key_for_write, old_value)
-                        .await?;
+                    self.supersede_copies(
+                        *old_id,
+                        &key_for_write,
+                        old_value,
+                        SupersededReason::Replaced,
+                    )
+                    .await?;
                 }
             } else {
                 // Same value — update timestamp and backfill embedding.
@@ -1505,7 +1643,7 @@ impl FactStore for SqliteMemory {
                             let id: i64 = row.get("id");
                             sqlx::query(
                                 "UPDATE facts
-                                 SET value = ?, source = ?, updated_at = ?, superseded_at = NULL,
+                                 SET value = ?, source = ?, updated_at = ?, superseded_at = NULL, superseded_reason = NULL, folded_into = NULL,
                                      channel_id = ?, privacy = ?,
                                      embedding = COALESCE(?, embedding),
                                      first_seen_at = COALESCE(?, first_seen_at),
@@ -1604,7 +1742,9 @@ impl FactStore for SqliteMemory {
                             similarity = sim,
                             "Conflict sweep: superseding stale fact with different key"
                         );
-                        let _ = sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
+                        let _ = sqlx::query(
+                            "UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced' WHERE id = ?",
+                        )
                             .bind(&now)
                             .bind(other_id)
                             .execute(&self.pool)
@@ -2024,16 +2164,19 @@ impl FactStore for SqliteMemory {
         .bind(fact_id)
         .fetch_optional(&self.pool)
         .await?;
-        sqlx::query("UPDATE facts SET superseded_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(fact_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted' WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(fact_id)
+        .execute(&self.pool)
+        .await?;
         if let Err(error) = self.project_fact_memory(fact_id).await {
             tracing::warn!(%error, fact_id, "Deferred deleted-fact projection");
         }
         if let Some((category, key, value)) = forgotten {
-            self.supersede_copies(fact_id, &key, &value).await?;
+            self.supersede_copies(fact_id, &key, &value, SupersededReason::Deleted)
+                .await?;
             if is_owner_profile_category(&category) {
                 self.retract_owner_profile_key(&key, "owner_forget").await?;
             }
@@ -2055,7 +2198,7 @@ impl FactStore for SqliteMemory {
         .await?;
         let ids: Vec<i64> = deleted.iter().map(|(id, _, _)| *id).collect();
         let result = sqlx::query(
-            "UPDATE facts SET superseded_at = ? WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'deleted' WHERE LOWER(TRIM(category)) = ? AND LOWER(TRIM(key)) = ? AND superseded_at IS NULL",
         )
         .bind(&now)
         .bind(&cat_clean)
@@ -2071,7 +2214,8 @@ impl FactStore for SqliteMemory {
         // prompt renders as its own block: forgetting the legacy row alone
         // left the old value in front of the model.
         for (id, key, value) in &deleted {
-            self.supersede_copies(*id, key, value).await?;
+            self.supersede_copies(*id, key, value, SupersededReason::Deleted)
+                .await?;
         }
         let canonical = is_owner_profile_category(&cat_clean)
             && self

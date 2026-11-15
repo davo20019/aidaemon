@@ -300,6 +300,16 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     if let Err(e) = migrate_facts_history_schema(pool).await {
         tracing::warn!("Failed to migrate facts schema for history: {}", e);
     }
+    // Why a row stopped being active (`SupersededReason`), and for a fold
+    // or a copy the row that carries its knowledge on. Added after the
+    // legacy rebuild, which copies a fixed column list. NULL on rows retired
+    // before this column existed.
+    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN superseded_reason TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN folded_into INTEGER")
+        .execute(pool)
+        .await;
 
     // Migration: deduplicate people entries and add unique index on LOWER(name).
     // Keeps the row with the lowest id for each name, merging interaction counts.

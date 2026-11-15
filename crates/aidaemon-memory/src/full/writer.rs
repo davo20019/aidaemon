@@ -200,6 +200,7 @@ pub async fn extract_progressive(
         assistant_reply: &run.reply,
         channel_id: run.channel_id.as_deref(),
         already_stored: &already_stored,
+        stated_at: run.run_started_at,
     };
     let facts = match extractor.propose(&exchange).await {
         Ok(facts) => facts,

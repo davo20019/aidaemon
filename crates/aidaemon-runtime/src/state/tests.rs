@@ -5171,6 +5171,92 @@ async fn background_extraction_does_not_resurrect_a_deleted_fact() {
 }
 
 #[tokio::test]
+async fn a_forgotten_fact_stays_forgotten_in_every_category() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "personal",
+            "test_owl_name",
+            "Prumo-66",
+            "agent",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .delete_fact_by_key("personal", "test_owl_name")
+            .await
+            .unwrap()
+    );
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT superseded_reason FROM facts WHERE key = 'test_owl_name'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(reason.as_deref(), Some("deleted"));
+
+    let before_deletion = Utc::now() - chrono::Duration::hours(2);
+    // Consolidation reading the old turn files it elsewhere, under the same
+    // key or a shorter one: neither comes back.
+    for (category, key) in [("user", "test_owl_name"), ("preference", "owl_name")] {
+        store
+            .upsert_fact_with_provenance(
+                category,
+                key,
+                "Prumo-66",
+                "consolidation",
+                None,
+                FactPrivacy::Private,
+                Some(before_deletion),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    // A different value under the same key elsewhere is different knowledge.
+    store
+        .upsert_fact(
+            "project",
+            "test_owl_name",
+            "Owl tracker demo",
+            "consolidation",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    let active: Vec<(String, String)> = store
+        .get_facts(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.category, f.key))
+        .collect();
+    assert_eq!(
+        active,
+        [("project".to_string(), "test_owl_name".to_string())]
+    );
+
+    // The owner saying it again, after the deletion, is new evidence.
+    store
+        .upsert_fact_with_provenance(
+            "user",
+            "test_owl_name",
+            "Prumo-66",
+            "progressive",
+            None,
+            FactPrivacy::Private,
+            Some(Utc::now() + chrono::Duration::seconds(1)),
+            Some("my test owl is Prumo-66"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get_facts(Some("user")).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn fold_restated_facts_keeps_the_most_authoritative_copy() {
     let (store, _db) = setup_test_store().await;
     let now = Utc::now().to_rfc3339();

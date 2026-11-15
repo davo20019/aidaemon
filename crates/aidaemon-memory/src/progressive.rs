@@ -203,6 +203,11 @@ pub struct Exchange<'a> {
     /// The model is shown them and must mark a proposal that restates one,
     /// which is then not stored a second time. Empty for most runs.
     pub already_stored: &'a [Fact],
+    /// When the user's message arrived: the evidence time of every fact
+    /// proposed from it. A fact the owner deleted during this run is retired
+    /// after it, so the retraction ("forget that my tea is oolong") cannot
+    /// store the fact it retracts.
+    pub stated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// At most this many already-stored facts are shown to the model.
@@ -344,7 +349,7 @@ impl ProgressiveExtractor {
         if facts.is_empty() {
             return Vec::new();
         }
-        let first_seen_at = chrono::Utc::now();
+        let first_seen_at = exchange.stated_at;
         // One snapshot of active facts, to suppress recall restatements.
         let existing_facts = store.get_facts(None).await.unwrap_or_default();
         let mut written: Vec<Value> = Vec::new();
@@ -959,6 +964,7 @@ mod tests {
             assistant_reply: "Noted.",
             channel_id: None,
             already_stored,
+            stated_at: chrono::Utc::now(),
         }
     }
 

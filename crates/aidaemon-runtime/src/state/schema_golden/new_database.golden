@@ -137,7 +137,7 @@ CREATE TABLE facts (
             source TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        , superseded_at TEXT, recall_count INTEGER DEFAULT 0, last_recalled_at TEXT, channel_id TEXT, privacy TEXT DEFAULT 'global', embedding BLOB, first_seen_at TEXT, source_excerpt TEXT)
+        , superseded_at TEXT, recall_count INTEGER DEFAULT 0, last_recalled_at TEXT, channel_id TEXT, privacy TEXT DEFAULT 'global', embedding BLOB, first_seen_at TEXT, source_excerpt TEXT, superseded_reason TEXT, folded_into INTEGER)
 
 table episodes on episodes
 CREATE TABLE episodes (
