@@ -3369,11 +3369,13 @@ fn build_background_reengagement_followup(command_summary: &str, output: &str) -
          Continue the exact parent request identified by the attached runtime \
          continuation edge. Treat the linked terminal receipt as authoritative \
          evidence for that invocation and complete only obligations retained by \
-         that parent request. Do NOT call the terminal again to re-run or \
-         re-check this command: its completion receipt is already recorded and \
-         credited, and a redundant check counts as an extra tool call against \
-         the user's request. When reporting how many calls the request used, \
-         count only the original invocation."
+         that parent request: when it asked you to fix what this command \
+         found, fix it now. Do NOT re-run this command just to see its result \
+         again: its completion receipt is already recorded and credited, and a \
+         redundant check counts as an extra tool call against the user's \
+         request. Running it again after you changed files is a new check, not \
+         a redundant one. When reporting how many calls the request used, count \
+         only the original invocation and checks after changes."
     )
 }
 
@@ -11641,6 +11643,8 @@ mod tests {
             "python3 /tmp/ping_latency.py",
             "latency results written to /tmp/latency.txt",
         );
+        // A check that found something to fix may run again after the fix.
+        assert!(followup.contains("after you changed files is a new check"));
         assert!(
             followup.contains("attached runtime continuation edge"),
             "follow-up must name the typed ownership boundary: {followup}"
