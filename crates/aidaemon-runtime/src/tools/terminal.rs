@@ -1287,12 +1287,7 @@ fn format_output(
     let mut truncation = None;
     if result.len() > max_chars {
         let total_chars = result.chars().count();
-        // Find the nearest valid UTF-8 char boundary at or before max_chars
-        let mut truncate_at = max_chars;
-        while truncate_at > 0 && !result.is_char_boundary(truncate_at) {
-            truncate_at -= 1;
-        }
-        result.truncate(truncate_at);
+        result = keep_head_and_tail(&result, max_chars);
         truncation = Some(crate::tools::traits::TruncationInfo {
             shown_chars: result.chars().count(),
             total_chars,
@@ -1300,6 +1295,55 @@ fn format_output(
         });
     }
     (result, truncation)
+}
+
+/// `text` cut to at most `max_bytes`: its first quarter and its end, joined
+/// by a marker. Build and test tools print what decides the outcome last
+/// (the test summary, the compiler's errors, stderr after stdout), so the
+/// end is kept in preference to the middle. Cuts land on line breaks when
+/// one is near, and always on char boundaries.
+fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "\n[... middle of the output omitted ...]\n";
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let floor = |at: usize| {
+        let mut at = at.min(text.len());
+        while at > 0 && !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    if max_bytes <= MARKER.len() * 2 {
+        // Too small for a marker: the end alone.
+        let mut start = text.len() - max_bytes;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        if start == text.len() {
+            // A limit smaller than the last character: show that character.
+            start = text.char_indices().last().map_or(0, |(at, _)| at);
+        }
+        return text[start..].to_string();
+    }
+    let budget = max_bytes - MARKER.len();
+    let head_end = floor(budget / 4);
+    // Prefer ending the head at a line break in its last third.
+    let head_end = text[..head_end]
+        .rfind('\n')
+        .filter(|at| *at >= head_end * 2 / 3)
+        .map_or(head_end, |at| at + 1);
+    let tail_len = budget - head_end;
+    let mut tail_start = text.len() - tail_len;
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // Prefer starting the tail on a fresh line in its first third.
+    let window_end = floor(tail_start + tail_len / 3);
+    let tail_start = text[tail_start..window_end]
+        .find('\n')
+        .map_or(tail_start, |at| tail_start + at + 1);
+    format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
 }
 
 /// A confined command that exits non-zero while producing no output at all is
@@ -13011,14 +13055,33 @@ mod tests {
         // The notice is rendered by the caller (foreground: from metadata;
         // background: inline at the delivery site).
         assert!(!result.contains("OUTPUT TRUNCATED"));
-        assert_eq!(result.len(), 100);
-        assert_eq!(result, "a".repeat(100));
+        assert!(result.len() <= 100, "{} bytes", result.len());
+        assert!(result.contains("middle of the output omitted"));
         // The structured info must report the omitted amount so a caller
         // rendering the notice can't silently let the model fabricate the
         // rest (100 shown of 200 total).
         let info = truncation.expect("truncation info for oversized output");
-        assert_eq!(info.shown_chars, 100);
+        assert_eq!(info.shown_chars, result.chars().count());
         assert_eq!(info.total_chars, 200);
+    }
+
+    #[test]
+    fn long_output_keeps_its_end_where_the_test_summary_is() {
+        let mut out = String::from("   Compiling acme v0.1.0\n");
+        for n in 0..400 {
+            out.push_str(&format!("test tests::case_{n} ... ok\n"));
+        }
+        out.push_str("test result: FAILED. 399 passed; 1 failed\n");
+        let (result, truncation) =
+            format_output(&out, "error: test failed, to rerun pass `--lib`", 4000);
+        assert!(truncation.is_some());
+        assert!(result.len() <= 4000, "{} bytes", result.len());
+        assert!(result.starts_with("   Compiling acme"));
+        assert!(result.contains("test result: FAILED. 399 passed; 1 failed"));
+        assert!(result.ends_with("error: test failed, to rerun pass `--lib`"));
+        // Cut on line boundaries: no half test line after the marker.
+        let after = result.split("omitted ...]\n").nth(1).unwrap();
+        assert!(after.starts_with("test tests::case_"), "{after:.40}");
     }
 
     #[test]
