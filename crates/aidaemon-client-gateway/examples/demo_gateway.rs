@@ -162,10 +162,36 @@ impl SessionChannelStore for NoSessions {}
 
 struct Host;
 
+/// Names and archive flags the owner set, by session id.
+fn marks() -> &'static std::sync::Mutex<std::collections::HashMap<String, (Option<String>, bool)>> {
+    static MARKS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (Option<String>, bool)>>,
+    > = OnceLock::new();
+    MARKS.get_or_init(Default::default)
+}
+
 #[async_trait]
 impl ClientHost for Host {
+    async fn rename_session(&self, id: &str, title: Option<&str>) -> Result<(), String> {
+        marks().lock().unwrap().entry(id.into()).or_default().0 = title.map(str::to_owned);
+        Ok(())
+    }
+    async fn archive_session(&self, id: &str, archived: bool) -> Result<(), String> {
+        marks().lock().unwrap().entry(id.into()).or_default().1 = archived;
+        Ok(())
+    }
     async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
-        Ok(vec![
+        let marks = marks().lock().unwrap().clone();
+        let marked = move |mut s: SessionSummary| {
+            if let Some((title, archived)) = marks.get(&s.id) {
+                if title.is_some() {
+                    s.title = title.clone();
+                }
+                s.archived = *archived;
+            }
+            s
+        };
+        Ok([
             SessionSummary {
                 archived: false,
                 id: "app:plan".into(),
@@ -196,7 +222,10 @@ impl ClientHost for Host {
                 project_id: None,
                 group: true,
             },
-        ])
+        ]
+        .into_iter()
+        .map(marked)
+        .collect())
     }
     async fn automations(
         &self,
