@@ -254,8 +254,6 @@ fn notices(store: Store) -> View {
 
 fn header(store: Store, session: Option<String>) -> View {
     let title = session.clone();
-    let running = session.clone();
-    let stop = session.clone();
     let waiting = computed(move || store.approvals().len());
     view()
         .h(px(ui::fit::bar()))
@@ -286,32 +284,6 @@ fn header(store: Store, session: Option<String>) -> View {
             .text_size(px(ui::fit::body()))
             .font_weight(FontWeight::SEMIBOLD),
         )
-        .child(when(
-            move || running.as_deref().is_some_and(|id| store.is_running(id)),
-            move || {
-                let stopping = {
-                    let stop = stop.clone();
-                    move || stop.as_deref().is_some_and(|id| store.is_stopping(id))
-                };
-                let stop = stop.clone();
-                let press = move || {
-                    if let Some(id) = &stop {
-                        store.stop(id);
-                    }
-                };
-                // A phone's bar keeps room for the title: Stop is a glyph.
-                // Once asked, it says so until the turn ends.
-                when(stopping, || ui::status("Stopping…", ui::Tone::Warning)).otherwise(move || {
-                    let press = press.clone();
-                    if ui::touch() || store.is_compact() {
-                        ui::icon_btn(Glyph::Stop, "Stop", Size::Md, press).into_element()
-                    } else {
-                        btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, press)
-                            .into_element()
-                    }
-                })
-            },
-        ))
         .child(when(
             {
                 let s = session.clone();
@@ -708,11 +680,21 @@ fn markdown(
 
 /// The turn running now: its streamed text and what it is doing.
 fn live(store: Store, session: String) -> View {
+    let (stop, stopping) = (session.clone(), session.clone());
     let streamed = {
         let session = session.clone();
         computed(move || store.live(&session).map(|l| l.streamed).unwrap_or_default())
     };
     let status = computed(move || {
+        // Waiting on its owner is the news, not the last tool it ran.
+        let waiting = store.approvals_for(&session).len();
+        if waiting > 0 {
+            return if waiting == 1 {
+                "Waiting for your approval".to_string()
+            } else {
+                format!("Waiting for {waiting} approvals")
+            };
+        }
         let live = store.live(&session);
         let status = live
             .as_ref()
@@ -730,7 +712,27 @@ fn live(store: Store, session: String) -> View {
             move || streamed.with(|s| !s.is_empty()),
             move || markdown(move || streamed.get().into(), || true),
         ))
-        .child(working(move || status.get()))
+        // What it is doing, and Stop beside it: where the eye already is.
+        // Once asked, Stop says so until the turn ends.
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(working(move || status.get()))
+                .child(
+                    when(
+                        move || store.is_stopping(&stopping),
+                        || ui::status("Stopping…", ui::Tone::Warning),
+                    )
+                    .otherwise(move || {
+                        let stop = stop.clone();
+                        btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, move || {
+                            store.stop(&stop)
+                        })
+                    }),
+                ),
+        )
 }
 
 fn composer(store: Store, session: Option<String>) -> View {

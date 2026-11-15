@@ -7,7 +7,8 @@
 //! the TUI. The agent answers "Done: ..." and streams a status first; a
 //! message with "approve" asks for an approval and waits; "what's waiting"
 //! moves the sender's view to the oldest waiting approval; "open the plan"
-//! opens the synthetic plan session (both through the agent-driven view).
+//! opens the synthetic plan session (both through the agent-driven view);
+//! "markdown" answers with a longer formatted reply.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -97,6 +98,8 @@ impl AgentIngress for Agent {
                 "You asked for the plan",
             );
             format!("Opened the plan ({moved:?}).")
+        } else if text.contains("markdown") {
+            "## Plan for Acme Corp\n\nThree things this week:\n\n1. **Review** the synthetic report with Jordan Lee.\n2. Ship the demo build to `staging`.\n3. Draft the follow-up for Alice Rivera.\n\nThe build command:\n\n```sh\ncargo build --release --features browser\n```\n\n> The demo needs the staging key; it is not in the repo.\n\nDone by **Friday**, if the report lands on Tuesday.".to_string()
         } else {
             format!("Done: {}", request.user_text)
         };

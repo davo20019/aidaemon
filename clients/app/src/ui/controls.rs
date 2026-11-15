@@ -352,6 +352,38 @@ impl Glyph {
     }
 }
 
+/// A conversation's state at a glance, in an icon slot: a filled dot
+/// (working or a new reply) or a ring (quiet), in `color`. A terminal shows
+/// ● or ○.
+pub fn state_dot(
+    filled: impl Fn() -> bool + Clone + 'static,
+    color: impl Fn() -> AdaptiveColor + Clone + 'static,
+) -> View {
+    let slot = view()
+        .w(px(fit::icon_slot()))
+        .h(px(fit::icon_slot()))
+        .items_center()
+        .justify_center()
+        .accessibility_elements_hidden(true);
+    if idiom() == nsh_core::platform::Idiom::Terminal {
+        return slot.child(
+            text(move || if filled() { "●" } else { "○" })
+                .text_size(px(8.0))
+                .text_color(color),
+        );
+    }
+    let fill = color.clone();
+    slot.child(
+        view()
+            .w(px(7.0))
+            .h(px(7.0))
+            .rounded_full()
+            .border(px(1.5))
+            .border_color(color)
+            .bg(move || if filled() { fill() } else { colors::TRANSPARENT }),
+    )
+}
+
 /// A glyph in a fixed square slot, so rows keep their lanes: line art in a
 /// window and in a browser, the plain symbol in a terminal (which has only
 /// cells). It takes the text colour it is given.
@@ -557,7 +589,7 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
         )
 }
 
-/// A quiet line that opens and closes what is under it: a chevron that
+/// A quiet pill that opens and closes what is under it: a chevron that
 /// turns, then its label. The owner of `open` renders the content.
 pub fn disclosure(
     label: impl IntoReactive<SharedString>,
@@ -567,19 +599,23 @@ pub fn disclosure(
         .flex_row()
         .items_center()
         .gap_1()
-        .min_h(px(fit::row() - 6.0))
-        .px_1()
-        .rounded(px(radius::SMALL))
+        .self_start()
+        .min_h(px(fit::row() - 4.0))
+        .pl_1()
+        .pr_2()
+        .rounded(px(radius::CONTROL))
+        .border_1()
+        .border_color(colors::LINE)
         .transition_colors()
         .duration(motion::FAST)
-        .hover(|s| s.bg(colors::HOVER))
+        .hover(|s| s.bg(colors::HOVER).border_color(colors::BORDER))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
         .child(
-            text(move || if open.get() { "▾" } else { "▸" })
-                .w(px(fit::icon_slot()))
-                .text_center()
-                .text_size(px(type_scale::XS))
+            icon(Glyph::Chevron)
                 .text_color(colors::FAINT)
+                .rotate(move || deg(if open.get() { 90.0 } else { 0.0 }))
+                .transition_transform()
+                .duration(motion::FAST)
                 .accessibility_elements_hidden(true),
         )
         .child(

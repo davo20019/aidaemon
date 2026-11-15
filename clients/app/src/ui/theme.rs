@@ -23,7 +23,10 @@ const fn tone(light: Rgba, dark: Rgba) -> AdaptiveColor {
 
 /// Surfaces, text and lines.
 pub mod colors {
-    use super::{AdaptiveColor, rgb, tone};
+    use super::{AdaptiveColor, rgb, rgb_a, tone};
+
+    /// No colour: a fill that is not there.
+    pub const TRANSPARENT: AdaptiveColor = tone(rgb_a(0x000000, 0.0), rgb_a(0x000000, 0.0));
 
     /// The window behind everything.
     pub const BACKGROUND: AdaptiveColor = tone(rgb(0xf7f7f5), rgb(0x0f1012));

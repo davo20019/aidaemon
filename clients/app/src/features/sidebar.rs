@@ -4,7 +4,7 @@
 use nsh_core::prelude::*;
 
 use crate::store::{Connection, Page, SearchRead, Store, now_ms};
-use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, size, status, type_scale};
+use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
 pub fn sidebar(store: Store) -> View {
@@ -225,18 +225,9 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
         Some(SharedString::from(parts.join(", ")))
     })
     // Working (accent, pulsing), a new reply (filled) or quiet (hollow).
-    .child(
-        text(move || {
-            if store.is_running(&c) || store.is_unread(&c) {
-                "●"
-            } else {
-                "○"
-            }
-        })
-        .w(px(size::ICON))
-        .text_center()
-        .text_size(px(8.0))
-        .text_color(move || {
+    .child(ui::state_dot(
+        move || store.is_running(&c) || store.is_unread(&c),
+        move || {
             if store.is_running(&e) {
                 colors::ACCENT
             } else if store.is_unread(&e) {
@@ -244,8 +235,8 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
             } else {
                 colors::FAINT
             }
-        }),
-    )
+        },
+    ))
     .child(
         view()
             .flex_1()

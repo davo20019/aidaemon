@@ -92,7 +92,8 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     app.wait_for("Allow once")?;
     // The conversation waits on its owner: it leads the list.
     app.wait_for("Needs you")?;
-    app.wait_for("text:terminal: cargo test -q...  ·  1 tool so far")?;
+    // Waiting on its owner, the working line says so, not the last tool.
+    app.wait_for("text:Waiting for your approval")?;
     feed([frame(
         r#"{"type":"event","seq":4,"at_ms":6,"session_id":"app:synthetic-1","event":{"type":"turn_completed","turn_id":"t1","text":"It races on the shared port.","state":"completed"}}"#,
     )]);

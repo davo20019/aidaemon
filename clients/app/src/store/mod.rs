@@ -189,6 +189,9 @@ pub struct Store {
     /// The side panes, which the owner and the agent's view moves open.
     sidebar: Signal<bool>,
     inspector: Signal<bool>,
+    /// Whether the inspector shows on a wide window: what the platform
+    /// starts with, restored when a narrow window widens again.
+    inspector_default: Stored<bool>,
     /// A narrow window (a phone): the side panes open full-screen, one at a
     /// time, and picking a conversation closes them.
     compact: Signal<bool>,
@@ -268,6 +271,7 @@ impl Store {
             inspected: signal(None),
             sidebar: signal(true),
             inspector: signal(true),
+            inspector_default: stored(true),
             compact: signal(false),
             suggestion: signal(None),
             spotlight: signal(None),
@@ -1349,6 +1353,7 @@ impl Store {
     }
 
     pub fn set_inspector(&self, open: bool) {
+        self.inspector_default.replace(open);
         self.inspector.set(open);
     }
 
@@ -1366,6 +1371,7 @@ impl Store {
                 self.inspector.set(false);
             } else {
                 self.sidebar.set(true);
+                self.inspector.set(self.inspector_default.get());
             }
         }
     }
