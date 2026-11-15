@@ -298,23 +298,59 @@ fn is_missing_thought_signature_error(body: &str) -> bool {
 
 // ----------------------------------------------------------- request body
 
-/// Recursively strip fields Gemini rejects in function and response
-/// schemas: `$schema` and `additionalProperties`.
+/// The schema fields Gemini accepts (its OpenAPI subset). Anything else
+/// (`$schema`, `additionalProperties`, `uniqueItems`, `$ref`, ...) makes the
+/// whole request a 400, so a schema keeps only these.
+const GEMINI_SCHEMA_FIELDS: &[&str] = &[
+    "type",
+    "format",
+    "title",
+    "description",
+    "nullable",
+    "enum",
+    "default",
+    "example",
+    "properties",
+    "required",
+    "propertyOrdering",
+    "minProperties",
+    "maxProperties",
+    "items",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "minimum",
+    "maximum",
+    "anyOf",
+];
+
+/// Reduce a function or response schema to what Gemini accepts, at every
+/// level. `properties` keys are names, not keywords, so only their values
+/// are cleaned; `oneOf` becomes `anyOf`, the nearest form Gemini takes.
 fn strip_unsupported_fields(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.remove("$schema");
-            map.remove("additionalProperties");
-            for v in map.values_mut() {
-                strip_unsupported_fields(v);
-            }
+    let Value::Object(map) = value else {
+        return;
+    };
+    if !map.contains_key("anyOf")
+        && let Some(one_of) = map.remove("oneOf")
+    {
+        map.insert("anyOf".into(), one_of);
+    }
+    map.retain(|key, _| GEMINI_SCHEMA_FIELDS.contains(&key.as_str()));
+    if let Some(Value::Object(properties)) = map.get_mut("properties") {
+        for property in properties.values_mut() {
+            strip_unsupported_fields(property);
         }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                strip_unsupported_fields(v);
-            }
+    }
+    if let Some(items) = map.get_mut("items") {
+        strip_unsupported_fields(items);
+    }
+    if let Some(Value::Array(options)) = map.get_mut("anyOf") {
+        for option in options.iter_mut() {
+            strip_unsupported_fields(option);
         }
-        _ => {}
     }
 }
 
@@ -1007,7 +1043,7 @@ mod tests {
                         "config": {
                             "type": "object",
                             "$schema": "http://json-schema.org/draft-07/schema#",
-                            "properties": {"items": {"type": "array", "items": {
+                            "properties": {"items": {"type": "array", "uniqueItems": true, "items": {
                                 "$schema": "http://json-schema.org/draft-07/schema#",
                                 "type": "string"
                             }}}
@@ -1020,6 +1056,7 @@ mod tests {
         let body = build_body(&req);
         assert_no_key(&body["tools"], "$schema", "tools");
         assert_no_key(&body["tools"], "additionalProperties", "tools");
+        assert_no_key(&body["tools"], "uniqueItems", "tools");
         let decls = body["tools"][0]["function_declarations"]
             .as_array()
             .unwrap();
@@ -1029,6 +1066,11 @@ mod tests {
         assert_eq!(decls[1]["parameters"]["required"][0], "path");
         assert_eq!(
             decls[1]["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
+        // A property named like a keyword is a name, and stays.
+        assert_eq!(
+            decls[1]["parameters"]["properties"]["config"]["properties"]["items"]["items"]["type"],
             "string"
         );
         // Tools present: no grounding, auto choice sends no tool_config.
