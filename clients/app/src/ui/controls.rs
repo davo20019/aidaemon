@@ -622,17 +622,27 @@ pub fn segmented(
     chosen: impl Fn() -> usize + Copy + 'static,
     choose: impl Fn(usize) + Clone + 'static,
 ) -> View {
-    let mut track = view()
+    use nsh_base::{toggle, toggle_group};
+    let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
+    // One stop of Tab; Left and Right move between the options, Enter or
+    // Space chooses one (the toolbar pattern). Focus is a band or ring;
+    // the chosen option is a raised segment, and in a terminal, which has
+    // no shadows, a dot before its name.
+    let mut group = toggle_group()
         .flex_row()
         .p(px(3.0))
         .gap(px(2.0))
         .rounded(px(radius::CONTROL + 3.0))
-        .bg(colors::HOVER)
-        .label(label);
+        .bg(colors::HOVER);
     for (at, option) in options.iter().copied().enumerate() {
         let choose = choose.clone();
-        track = track.child(
-            button()
+        group = group.child(
+            toggle()
+                .pressed(move || chosen() == at)
+                .on_change(move |_: &bool| {
+                    haptic(nsh_core::Haptic::Selection);
+                    choose(at)
+                })
                 .h(px(if touch() { 38.0 } else { 26.0 }))
                 .px(px(if touch() { 18.0 } else { 12.0 }))
                 .items_center()
@@ -643,30 +653,32 @@ pub fn segmented(
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
                 .focus(focus_band)
                 .style_when(
-                    move || chosen() == at,
+                    move || chosen() == at && !terminal,
                     |s| s.bg(colors::SURFACE).shadow_sm(),
                 )
                 .accessibility_label(option)
-                .selected(move || chosen() == at)
-                .on_press(move || {
-                    haptic(nsh_core::Haptic::Selection);
-                    choose(at)
-                })
                 .child(
-                    text(option)
-                        .text_size(px(fit::small()))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(move || {
-                            if chosen() == at {
-                                colors::TEXT
-                            } else {
-                                colors::MUTED
-                            }
-                        }),
+                    text(move || {
+                        if terminal {
+                            format!("{} {option}", if chosen() == at { "●" } else { "○" })
+                        } else {
+                            option.to_owned()
+                        }
+                    })
+                    .text_size(px(fit::small()))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(move || {
+                        if chosen() == at {
+                            colors::TEXT
+                        } else {
+                            colors::MUTED
+                        }
+                    }),
                 ),
         );
     }
-    track
+    // What screen readers call the group.
+    view().label(label).child(group)
 }
 
 /// One of a few filters side by side: outlined, and filled with the accent

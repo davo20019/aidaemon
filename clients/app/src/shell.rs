@@ -36,7 +36,11 @@ pub fn shell(store: Store) -> View {
     });
 
     on_key("mod+k", move |_| palette.update(|open| *open = !*open));
-    on_key("mod+n", move |_| store.select(None));
+    // A new conversation from the keyboard keeps the project of the one on
+    // screen: Ctrl+N in a project's work stays in that project.
+    on_key("mod+n", move |_| {
+        store.new_in_project(store.current_project())
+    });
     on_key("mod+b", move |_| store.open_sidebar());
     on_key(steps_key(), move |_| store.open_inspector());
     // The changes of the conversation on screen.
@@ -375,7 +379,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 store.refocus_composer();
                             }
                             match id.as_ref() {
-                                "new" => store.select(None),
+                                "new" => store.new_in_project(store.current_project()),
                                 "sidebar" => store.open_sidebar(),
                                 "inspector" => store.open_inspector(),
                                 "changes" => store.show_changes(),
