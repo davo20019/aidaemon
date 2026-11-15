@@ -1671,6 +1671,17 @@ fn local_work_args_ok(program: &str, args: &[String]) -> bool {
 
 fn basename(program: &str) -> &str {
     let name = program.rsplit('/').next().unwrap_or(program);
+    // On Windows `curl.exe` is the real curl (shipped with Windows) and
+    // reads as `curl`: an explicit `.exe` names the program, never an alias.
+    if cfg!(windows)
+        && let Some(stem) = name
+            .len()
+            .checked_sub(4)
+            .filter(|&cut| name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(".exe"))
+            .map(|cut| &name[..cut])
+    {
+        return stem;
+    }
     // Windows PowerShell's `curl` and `wget` are `Invoke-WebRequest`, whose
     // arguments are not curl's: never read as curl.
     if cfg!(windows)
@@ -3011,6 +3022,14 @@ fn segment_effects(tokens: &[String], here: Option<&str>, out: &mut ShellAnalysi
         "tee" | "touch" | "mkdir" => created(name, args, here, out),
         "curl" => curl(args, here, out),
         "wget" => wget(args, here, out),
+        "invoke-webrequest" => powershell_web(args, out),
+        name if in_powershell_table(POWERSHELL_DELETES, name) => {
+            if powershell_args_plain(args) {
+                deleted(tokens, here, out)
+            } else {
+                out.unresolved()
+            }
+        }
         "http" | "https" | "xh" | "xhs" => httpie(args, here, out),
         "nc" | "ncat" | "netcat" => netcat(args, out),
         "ssh" => ssh(args, here, out),
@@ -3018,6 +3037,22 @@ fn segment_effects(tokens: &[String], here: Option<&str>, out: &mut ShellAnalysi
         "rsync" => rsync(args, here, out),
         "git" => git(args, here, out),
         _ => out.opaque(),
+    }
+}
+
+/// PowerShell's web cmdlets (and, in Windows PowerShell, `curl` and
+/// `wget`): every URL argument is an egress, so the network policy still
+/// sees where the call goes. Their method and body options are not modelled,
+/// so the call is never understood.
+fn powershell_web(args: &[String], out: &mut ShellAnalysis) {
+    out.opaque();
+    for arg in args {
+        if arg.contains("://") {
+            match url_effect(arg) {
+                Some(key) => out.add(key),
+                None => out.unresolved(),
+            }
+        }
     }
 }
 
@@ -5753,6 +5788,20 @@ mod tests {
         }
 
         #[test]
+        fn curl_exe_is_curl() {
+            let effects = shell_call_effects("curl.exe -s https://example.invalid/x", None);
+            assert!(
+                effects
+                    .keys
+                    .iter()
+                    .any(|key| key.class == EffectClass::Egress),
+                "{:?}",
+                effects.keys
+            );
+            assert!(only_reads("curl.exe -s https://example.invalid/x"));
+        }
+
+        #[test]
         fn remove_item_targets_are_read() {
             let effects = command_effects(r"Remove-Item -Recurse -Force C:\tmp\aidaemon-test\x");
             assert!(effects.deletes);
@@ -5761,6 +5810,39 @@ mod tests {
                 Some(vec!["C:/tmp/aidaemon-test/x".to_string()])
             );
             assert!(command_effects(r"New-Item -ItemType Directory C:\tmp\x").local_work_only);
+        }
+
+        #[test]
+        fn web_cmdlets_name_where_they_go() {
+            for line in [
+                "curl http://169.254.169.254/latest/meta-data/",
+                "Invoke-WebRequest -Uri http://169.254.169.254/latest/",
+            ] {
+                let effects = shell_call_effects(line, None);
+                assert!(!effects.understood, "{line}");
+                assert!(
+                    effects
+                        .keys
+                        .iter()
+                        .any(|key| key.class == EffectClass::Egress
+                            && key.target.starts_with("169.254.169.254")),
+                    "{line}: {:?}",
+                    effects.keys
+                );
+            }
+        }
+
+        #[test]
+        fn remove_item_declares_its_delete() {
+            let effects = shell_call_effects(r"Remove-Item -Recurse C:\tmp\x", None);
+            assert!(
+                effects
+                    .keys
+                    .iter()
+                    .any(|key| key.class == EffectClass::Delete),
+                "{:?}",
+                effects.keys
+            );
         }
     }
 }

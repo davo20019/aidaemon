@@ -295,10 +295,14 @@ mod tests {
         // The same name again, a missing folder and a relative one are refused.
         assert!(create(state, "acme SITE", None).await.is_err());
         assert!(
-            create(state, "Gone", Some("/nowhere/synthetic-missing"))
-                .await
-                .unwrap_err()
-                .contains("no folder")
+            create(
+                state,
+                "Gone",
+                Some(&crate::testing::abs_path("/nowhere/synthetic-missing"))
+            )
+            .await
+            .unwrap_err()
+            .contains("no folder")
         );
         assert!(create(state, "Rel", Some("projects/acme")).await.is_err());
         // Listed without the default project.

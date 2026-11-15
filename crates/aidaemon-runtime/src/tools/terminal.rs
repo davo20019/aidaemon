@@ -7254,8 +7254,13 @@ async fn host_terminal_execution_request(
             .map(str::to_string)
             .to_vec(),
         );
-        request.stdin =
-            Some(format!("$ErrorActionPreference = 'Stop'\n{shell_source}\n").into_bytes());
+        request.stdin = Some(
+            format!(
+                "$ErrorActionPreference = 'Stop'\n{shell_source}{}",
+                aidaemon_tools::platform_shell::POWERSHELL_EXIT_EPILOGUE
+            )
+            .into_bytes(),
+        );
         request
     } else if script_via_stdin {
         let mut request = ExecutionRequest::argv(

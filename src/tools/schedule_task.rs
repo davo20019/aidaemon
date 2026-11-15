@@ -233,7 +233,7 @@ mod tests {
             "Anything you can do – it runs with your full access"
         );
         assert_eq!(card.ends, "Only when you stop it");
-        assert!(card.details.iter().any(|w| w.starts_with("Next: ")));
+        assert!(card.details.iter().any(|w| w.starts_with("Run 1: ")));
         let OwnerApprovalNeed::Ask(other) = judged(
             &tool,
             json!({"task": "Check API health", "when": "every 2h"}),

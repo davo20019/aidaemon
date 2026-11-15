@@ -46,7 +46,14 @@ fn http_call(method: &str, url: &str, body: Option<&str>) -> crate::traits::Prov
     MockProvider::tool_call_response("http_request", &args.to_string())
 }
 
+/// A terminal call. On Windows a leading `curl` is `curl.exe`, the real
+/// curl that ships with Windows (PowerShell's `curl` is `Invoke-WebRequest`,
+/// which the analysis never reads as curl).
 fn curl_call(command: &str) -> crate::traits::ProviderResponse {
+    let command = match command.strip_prefix("curl ") {
+        Some(rest) if cfg!(windows) => format!("curl.exe {rest}"),
+        _ => command.to_string(),
+    };
     MockProvider::tool_call_response(
         "terminal",
         &json!({"action": "run", "command": command}).to_string(),
@@ -238,7 +245,9 @@ async fn metadata_endpoint_is_refused_before_any_card() {
         assert_eq!(approver.card_count(), 0);
         let results = tool_results(&harness).await;
         assert!(
-            results.iter().any(|r| r.contains("cloud metadata endpoint")),
+            results
+                .iter()
+                .any(|r| r.contains("cloud metadata endpoint")),
             "{results:?}"
         );
     }
@@ -259,7 +268,10 @@ async fn private_address_depends_on_the_tool() {
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
     assert_eq!(approver.card_count(), 0);
     let results = tool_results(&harness).await;
-    assert!(results.iter().any(|r| r.contains("private network")), "{results:?}");
+    assert!(
+        results.iter().any(|r| r.contains("private network")),
+        "{results:?}"
+    );
 
     let (harness, approver) = approvals_harness(
         vec![
@@ -333,13 +345,17 @@ async fn protected_paths_are_refused_in_a_turn() {
         "{results:?}"
     );
     assert!(
-        results.iter().any(|r| r.contains("cannot change sensitive path")),
+        results
+            .iter()
+            .any(|r| r.contains("cannot change sensitive path")),
         "{results:?}"
     );
     assert!(!results.iter().any(|r| r.contains("synthetic-secret-value")));
-    assert!(std::fs::read_to_string(&secret)
-        .unwrap()
-        .contains("synthetic-secret-value"));
+    assert!(
+        std::fs::read_to_string(&secret)
+            .unwrap()
+            .contains("synthetic-secret-value")
+    );
 }
 
 #[tokio::test]
@@ -383,11 +399,11 @@ async fn http_post_card_comes_from_kernel_interrupt() {
         "{decisions:?}"
     );
     assert_eq!(decisions[0]["risk"], "high", "{decisions:?}");
-    assert!(decisions[0]["effects"]
-        .as_array()
-        .is_some_and(|effects| effects
+    assert!(decisions[0]["effects"].as_array().is_some_and(|effects| {
+        effects
             .iter()
-            .any(|e| e.as_str() == Some(&format!("egress localhost:{port}")))));
+            .any(|e| e.as_str() == Some(&format!("egress localhost:{port}")))
+    }));
 }
 
 #[tokio::test]
@@ -436,12 +452,14 @@ impl crate::traits::Tool for OfferedConfigTool {
     fn schema(&self) -> serde_json::Value {
         self.0.schema()
     }
-    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-let output: anyhow::Result<String> = async move {
-        self.0.call(arguments).await
-    }.await;
-output.map(crate::traits::ToolCallOutcome::from_output)
-}
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { self.0.call(arguments).await }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
+    }
 }
 
 impl crate::traits::ToolSemantics for OfferedConfigTool {
@@ -467,12 +485,11 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
     let config_dir = tempfile::tempdir().unwrap();
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, "[provider]\nmodel = \"synthetic-model\"\n").unwrap();
-    let config: Arc<dyn crate::traits::Tool> = Arc::new(OfferedConfigTool(
-        crate::tools::ConfigManagerTool::new(
+    let config: Arc<dyn crate::traits::Tool> =
+        Arc::new(OfferedConfigTool(crate::tools::ConfigManagerTool::new(
             crate::config::config_file(config_path.clone()),
             Arc::new(aidaemon_secrets::MemorySecretStore::new()),
-        ),
-    ));
+        )));
     let (harness, approver) = approvals_harness_with(
         vec![
             http_call("POST", "https://h.example.invalid/x", Some("report")),
@@ -513,9 +530,11 @@ async fn internal_state_tools_are_not_reasked_after_a_decline() {
         facts.iter().any(|fact| fact.key == "report_format"),
         "the fact was stored: {facts:?}"
     );
-    assert!(std::fs::read_to_string(&config_path)
-        .unwrap()
-        .contains("synthetic-model"));
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("synthetic-model")
+    );
 }
 
 /// A card nobody answered is not a refusal (live 2026-11-12: an expired
@@ -539,7 +558,10 @@ async fn approval_timeout_is_no_answer_not_a_decline() {
     assert_eq!(approver.card_count(), 2, "each step gets its own card");
     let results = tool_results(&harness).await;
     for result in &results[..2] {
-        assert!(result.contains(aidaemon_core::OWNER_UNANSWERED), "{results:?}");
+        assert!(
+            result.contains(aidaemon_core::OWNER_UNANSWERED),
+            "{results:?}"
+        );
         assert!(!result.contains("[OWNER DECLINED]"), "{results:?}");
         assert!(result.contains("did not refuse"), "{results:?}");
     }
@@ -554,9 +576,10 @@ async fn approval_timeout_is_no_answer_not_a_decline() {
         .unwrap()
         .pop()
         .expect("the card is held");
-    assert!(held
-        .send(crate::types::ApprovalResponse::AllowOnce)
-        .is_err());
+    assert!(
+        held.send(crate::types::ApprovalResponse::AllowOnce)
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -676,19 +699,21 @@ fn card_runner(
 ) {
     let inbox = tempfile::tempdir().unwrap().keep();
     let registry = Arc::new(crate::tasks::TaskRegistry::new(50));
-    let runner = crate::channels::turns::TurnRunner::new(crate::channels::ChannelRuntimeDeps {
-        agent: Arc::new(agent),
-        config_path: inbox.join("config.toml"),
-        session_map: Arc::default(),
-        task_registry: registry.clone(),
-        files_enabled: false,
-        inbox_dir: inbox,
-        max_file_size_mb: 10,
-        state,
-        watchdog_stale_threshold_secs: 0,
-        watch: Default::default(),
-    }
-    .turn_deps());
+    let runner = crate::channels::turns::TurnRunner::new(
+        crate::channels::ChannelRuntimeDeps {
+            agent: Arc::new(agent),
+            config_path: inbox.join("config.toml"),
+            session_map: Arc::default(),
+            task_registry: registry.clone(),
+            files_enabled: false,
+            inbox_dir: inbox,
+            max_file_size_mb: 10,
+            state,
+            watchdog_stale_threshold_secs: 0,
+            watch: Default::default(),
+        }
+        .turn_deps(),
+    );
     (runner, registry)
 }
 
@@ -879,7 +904,6 @@ async fn egress_guard_curl_local_port_passes_and_secret_body_is_blocked() {
 
 #[tokio::test]
 async fn http_request_outside_kernel_requires_kernel_approval() {
-    
     let (port, sent) = spawn_approvals_server().await;
     let tool = crate::tools::HttpRequestTool::new(Arc::new(tokio::sync::RwLock::new(
         std::collections::HashMap::new(),
@@ -1139,8 +1163,12 @@ async fn declined_terminal_delete_blocks_find_delete_same_path() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1, "the find retry gets no card");
     let results = tool_results(&harness).await;
+    assert_eq!(
+        approver.card_count(),
+        1,
+        "the find retry gets no card: {results:?}"
+    );
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
@@ -1212,7 +1240,6 @@ async fn terminal_semantic_failure_fails_closed_to_card() {
 
 #[tokio::test]
 async fn terminal_outside_kernel_requires_kernel_approval() {
-    
     let pool_file = tempfile::NamedTempFile::new().unwrap();
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
@@ -1385,8 +1412,12 @@ async fn declined_terminal_call_reasks_undeterminable_retry() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 2, "the opaque retry is asked about");
     let results = tool_results(&harness).await;
+    assert_eq!(
+        approver.card_count(),
+        2,
+        "the opaque retry is asked about: {results:?}"
+    );
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
     assert!(!results[1].contains("synthetic-opaque-ran"), "{results:?}");
     assert!(root.join("a").exists());
@@ -1417,7 +1448,11 @@ async fn declined_script_reworded_around_cd_is_refused_by_effect() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
-    assert_eq!(approver.card_count(), 1, "the reworded copy gets no new card");
+    assert_eq!(
+        approver.card_count(),
+        1,
+        "the reworded copy gets no new card"
+    );
     let results = tool_results(&harness).await;
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
     assert!(!root.join("composer.json").exists());
@@ -1459,12 +1494,12 @@ async fn declined_delete_reasks_sandboxed_opaque_script() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
 
+    let results = tool_results(&harness).await;
     assert_eq!(
         approver.card_count(),
         2,
-        "the sandboxed script is asked about"
+        "the sandboxed script is asked about: {results:?}"
     );
-    let results = tool_results(&harness).await;
     assert_eq!(results.len(), 2, "{results:?}");
     assert!(results[0].contains("[OWNER DECLINED]"), "{results:?}");
     assert!(results[1].contains("[OWNER DECLINED]"), "{results:?}");
@@ -1974,12 +2009,14 @@ impl crate::traits::Tool for OfferedManageMcpTool {
     fn schema(&self) -> serde_json::Value {
         self.0.schema()
     }
-    async fn execute(&self, arguments: &str, _facts: &crate::traits::ToolCallContext) -> anyhow::Result<crate::traits::ToolCallOutcome> {
-let output: anyhow::Result<String> = async move {
-        self.0.call(arguments).await
-    }.await;
-output.map(crate::traits::ToolCallOutcome::from_output)
-}
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move { self.0.call(arguments).await }.await;
+        output.map(crate::traits::ToolCallOutcome::from_output)
+    }
 }
 
 #[async_trait::async_trait]
@@ -2012,10 +2049,8 @@ async fn mcp_add_decline_is_kernel_owned_and_retries_do_not_prompt() {
     let backing = setup_test_agent(MockProvider::with_responses(vec![]))
         .await
         .unwrap();
-    let registry = crate::mcp::McpRegistry::new(
-        backing.state.clone(),
-        crate::config::secret_store().clone(),
-    );
+    let registry =
+        crate::mcp::McpRegistry::new(backing.state.clone(), crate::config::secret_store().clone());
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(OfferedManageMcpTool(
         crate::tools::ManageMcpTool::new(registry.clone()),
     ));
@@ -2034,11 +2069,13 @@ async fn mcp_add_decline_is_kernel_owned_and_retries_do_not_prompt() {
     .await;
     run_owner_turn(&harness, ChannelContext::private("telegram")).await;
     assert_eq!(approver.card_count(), 1);
-    assert!(registry
-        .list_servers_with_status()
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        registry
+            .list_servers_with_status()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         ledger_refusals(&harness, APPROVALS_SESSION, "owner_approval_declined").await,
         2
