@@ -1,0 +1,15 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "messages": [
+      {
+        "id": 7,
+        "queued_at_ms": 1767225600000,
+        "text": "Also check the footer"
+      }
+    ],
+    "session_id": "app:6c1f",
+    "type": "queued"
+  },
+  "type": "ack"
+}

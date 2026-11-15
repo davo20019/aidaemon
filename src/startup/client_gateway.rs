@@ -479,6 +479,7 @@ impl ClientHost for DaemonClientHost {
         .unwrap_or_default()
         .into_iter()
         .collect();
+        let marks = super::client_sessions::marks(&self.system.pool).await;
         let projects: std::collections::HashMap<String, String> = self
             .state
             .session_work_projects()
@@ -497,9 +498,13 @@ impl ClientHost for DaemonClientHost {
                 } else {
                     latest.get(&id)
                 };
-                let title = words
-                    .map(|text| aidaemon_channels::presentation::word_preview(text.trim(), 60))
-                    .filter(|t| !t.is_empty());
+                let (named, archived) = marks.get(&id).cloned().unwrap_or_default();
+                // The owner's own name wins over one taken from what was said.
+                let title = named.or_else(|| {
+                    words
+                        .map(|text| aidaemon_channels::presentation::word_preview(text.trim(), 60))
+                        .filter(|t| !t.is_empty())
+                });
                 SessionSummary {
                     // The app replies into chat conversations too (routed to
                     // their chat by the gateway).
@@ -507,6 +512,7 @@ impl ClientHost for DaemonClientHost {
                     last_activity_ms: last.get(&id).and_then(|at| stored_ms(at)),
                     project_id: projects.get(&id).cloned(),
                     group: shared.contains(&id),
+                    archived,
                     id,
                     channel,
                     title,
@@ -678,6 +684,23 @@ impl ClientHost for DaemonClientHost {
             .owner_edit(id, name, when, instructions, notify)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn rename_session(&self, session_id: &str, title: Option<&str>) -> Result<(), String> {
+        super::client_sessions::rename(&self.system.pool, session_id, title).await
+    }
+
+    async fn archive_session(&self, session_id: &str, archived: bool) -> Result<(), String> {
+        super::client_sessions::archive(&self.system.pool, session_id, archived).await
+    }
+
+    async fn revert_file(
+        &self,
+        session_id: &str,
+        root: &str,
+        path: &str,
+    ) -> Result<aidaemon_client_protocol::SessionChanges, String> {
+        super::client_changes::revert_file(&self.system.pool, session_id, root, path).await
     }
 
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {

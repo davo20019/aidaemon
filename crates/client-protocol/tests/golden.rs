@@ -62,6 +62,7 @@ fn task() -> TaskSummary {
 fn session() -> SessionSummary {
     SessionSummary {
         group: Default::default(),
+        archived: false,
         id: "app:6c1f".into(),
         channel: "app".into(),
         title: Some("Synthetic report for Alice Rivera".into()),
@@ -141,6 +142,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListModels => "list_models",
         Command::GetSessionModel { .. } => "get_session_model",
         Command::SetSessionModel { .. } => "set_session_model",
+        Command::RenameSession { .. } => "rename_session",
+        Command::ArchiveSession { .. } => "archive_session",
+        Command::RevertFile { .. } => "revert_file",
+        Command::ListQueued { .. } => "list_queued",
+        Command::EditQueued { .. } => "edit_queued",
         Command::Unknown => "unknown",
     }
 }
@@ -181,6 +187,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Project { .. } => "project",
         CommandResult::Models { .. } => "models",
         CommandResult::SessionModel { .. } => "session_model",
+        CommandResult::Queued { .. } => "queued",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -394,6 +401,42 @@ fn client_samples() -> Vec<ClientFrame> {
                 session_id: "app:6c1f".into(),
                 model: Some(ModelChoice::Auto),
                 effort: Some(Effort::Low),
+            },
+        ),
+        command(
+            "5d0c2b1e-0021",
+            Command::RenameSession {
+                session_id: "app:6c1f".into(),
+                title: Some("Acme invoice".into()),
+            },
+        ),
+        command(
+            "5d0c2b1e-0022",
+            Command::ArchiveSession {
+                session_id: "app:6c1f".into(),
+                archived: true,
+            },
+        ),
+        command(
+            "5d0c2b1e-0023",
+            Command::RevertFile {
+                session_id: "app:6c1f".into(),
+                root: "/home/synthetic/acme-site".into(),
+                path: "src/contact.rs".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0024",
+            Command::ListQueued {
+                session_id: "app:6c1f".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0025",
+            Command::EditQueued {
+                session_id: "app:6c1f".into(),
+                message_id: 7,
+                text: Some("Also check the footer".into()),
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -971,6 +1014,14 @@ fn server_samples() -> Vec<ServerFrame> {
                 },
                 effort: Effort::High,
             },
+        }),
+        ack(CommandResult::Queued {
+            session_id: "app:6c1f".into(),
+            messages: vec![QueuedMessage {
+                id: 7,
+                text: "Also check the footer".into(),
+                queued_at_ms: 1_767_225_600_000,
+            }],
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

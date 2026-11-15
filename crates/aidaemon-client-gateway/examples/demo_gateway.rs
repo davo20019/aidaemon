@@ -167,6 +167,7 @@ impl ClientHost for Host {
     async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         Ok(vec![
             SessionSummary {
+                archived: false,
                 id: "app:plan".into(),
                 channel: "app".into(),
                 title: Some("Plan for Acme Corp".into()),
@@ -176,6 +177,7 @@ impl ClientHost for Host {
                 group: false,
             },
             SessionSummary {
+                archived: false,
                 id: "telegram:synthetic-user-1".into(),
                 channel: "telegram:synthetic_coding_bot".into(),
                 title: Some("Fix the contact form".into()),
@@ -185,6 +187,7 @@ impl ClientHost for Host {
                 group: false,
             },
             SessionSummary {
+                archived: false,
                 id: "telegram:synthetic-group-1".into(),
                 channel: "telegram:synthetic_coding_bot".into(),
                 title: Some("Release notes for the team".into()),

@@ -17,9 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
     AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
-    MidRun, ModelChoice, ModelOptions, ProjectSummary, SearchHit, ServerFrame, SessionChanges,
-    SessionModel, Settings, SettingsChange, SettingsOutcome, SetupAction, SetupStep, SlashCommand,
-    SystemStatus, TaskSummary, TurnStatus,
+    MidRun, ModelChoice, ModelOptions, ProjectSummary, QueuedMessage, SearchHit, ServerFrame,
+    SessionChanges, SessionModel, Settings, SettingsChange, SettingsOutcome, SetupAction,
+    SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
 };
 
 use crate::machine::{DropKind, Update, request_id};
@@ -299,6 +299,14 @@ pub struct Client {
     pub finished: Option<(String, u64)>,
     /// Conversations that wrote files or showed code changes.
     coded: BTreeSet<String>,
+    /// Each conversation's messages waiting for its running work, as last
+    /// read.
+    pub queued: BTreeMap<String, Vec<QueuedMessage>>,
+    /// Messages sent to wait their turn, until accepted: the queue reads
+    /// again then.
+    queue_sends: BTreeSet<String>,
+    /// The file undo in flight: its request and the file.
+    revert_request: Option<(String, String)>,
     /// Turns that already showed the changes, so the owner's own choice
     /// sticks for the rest of a turn.
     changes_shown: BTreeSet<String>,
@@ -629,6 +637,48 @@ impl Client {
             ServerFrame::Ack {
                 request_id,
                 result: CommandResult::Changes { changes },
+            } if self
+                .revert_request
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id) =>
+            {
+                let (_, path) = self.revert_request.take().unwrap_or_default();
+                self.changes = Read::Ready(changes.clone());
+                out.push(Effect::Say(format!("Undid the changes to {path}")));
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .revert_request
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id) =>
+            {
+                self.revert_request = None;
+                out.push(Effect::Say(error.message.clone()));
+                return true;
+            }
+            ServerFrame::Ack {
+                result:
+                    CommandResult::Queued {
+                        session_id,
+                        messages,
+                    },
+                ..
+            } => {
+                self.queued.insert(session_id.clone(), messages.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::MessageAccepted { session_id, .. },
+            } if self.queue_sends.remove(request_id) => {
+                self.refresh_queued(session_id);
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Changes { changes },
             } if mine(&self.changes_request, request_id) => {
                 self.changes_request = None;
                 // Changes found: the conversation is a coding one, and one
@@ -749,6 +799,13 @@ impl Client {
             ServerFrame::Event {
                 event, session_id, ..
             } => {
+                // A turn starting or ending takes waiting messages in.
+                if let (Some(session), Event::TurnStarted { .. } | Event::TurnCompleted { .. }) =
+                    (session_id.as_deref(), event)
+                    && self.queued.get(session).is_some_and(|q| !q.is_empty())
+                {
+                    self.refresh_queued(session);
+                }
                 self.note_activity(event, cx.now_ms);
                 self.note_code(event, cx, out);
                 self.note_reply(session_id.as_deref(), event, cx);
@@ -1708,6 +1765,7 @@ impl Client {
                     }
                     Some(_) => (None, None),
                 };
+                let queueing = matches!(mid_run, Some(MidRun::Queue));
                 let id = self.send(Command::SendMessage {
                     session_id: session.map(str::to_owned),
                     text,
@@ -1717,6 +1775,10 @@ impl Client {
                     model,
                     effort,
                 });
+                // Sent to wait its turn: the queue shows it once accepted.
+                if queueing {
+                    self.queue_sends.insert(id.clone());
+                }
                 if session.is_none() {
                     // The draft is spent once the conversation exists.
                     self.starting = Some(id);
@@ -1789,6 +1851,72 @@ impl Client {
         self.send(Command::CancelTask {
             task_id: task.to_owned(),
         });
+    }
+
+    /// Name conversation `id` (`None` or blank: back to the name taken
+    /// from what was said).
+    pub fn rename_session(&mut self, id: &str, title: Option<String>) {
+        self.send(Command::RenameSession {
+            session_id: id.to_owned(),
+            title: title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
+        });
+    }
+
+    /// Archive conversation `id`, or bring it back.
+    pub fn archive_session(&mut self, id: &str, archived: bool) {
+        self.send(Command::ArchiveSession {
+            session_id: id.to_owned(),
+            archived,
+        });
+    }
+
+    /// Whether the owner archived conversation `id`.
+    pub fn is_archived(&self, id: &str) -> bool {
+        self.state
+            .sessions
+            .get(id)
+            .and_then(|v| v.summary.as_ref())
+            .is_some_and(|s| s.archived)
+    }
+
+    /// Undo the uncommitted changes to `path` in repository `root` of
+    /// `session`'s changes; the changes read back after.
+    pub fn revert_file(&mut self, session: &str, root: &str, path: &str) {
+        let id = self.send(Command::RevertFile {
+            session_id: session.to_owned(),
+            root: root.to_owned(),
+            path: path.to_owned(),
+        });
+        self.revert_request = Some((id, path.to_owned()));
+    }
+
+    /// A file undo is in flight.
+    pub fn reverting(&self) -> bool {
+        self.revert_request.is_some()
+    }
+
+    /// Read `session`'s waiting messages again.
+    pub fn refresh_queued(&mut self, session: &str) {
+        self.send(Command::ListQueued {
+            session_id: session.to_owned(),
+        });
+    }
+
+    /// Change a waiting message's text (`Some`), or take it out (`None`).
+    pub fn edit_queued(&mut self, session: &str, message_id: u64, text: Option<String>) {
+        self.send(Command::EditQueued {
+            session_id: session.to_owned(),
+            message_id,
+            text,
+        });
+    }
+
+    /// `session`'s waiting messages, oldest first.
+    pub fn queued_for(&self, session: &str) -> &[QueuedMessage] {
+        self.queued
+            .get(session)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn resolve(&mut self, approval: &str, decision: ApprovalDecision) {
@@ -1972,6 +2100,41 @@ mod tests {
         assert!(run_is_news(&run(200, RunOutcome::Failed, None), 100));
         assert!(!run_is_news(&run(200, RunOutcome::Done, None), 100));
         assert!(!run_is_news(&run(90, RunOutcome::Failed, None), 100));
+    }
+
+    #[test]
+    fn a_queued_message_reads_the_queue_and_a_revert_reads_the_changes() {
+        let mut client = Client::new();
+        let here = cx(Some("app:a"));
+        client
+            .submit(Some("app:a"), "after this", Some(MidRun::Queue), None)
+            .unwrap();
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"message_accepted","session_id":"app:a"}}}}"#
+            )),
+            &here,
+        );
+        let (_, list) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(list, Command::ListQueued { .. }));
+        client.update(
+            frame(r#"{"type":"ack","request_id":"q","result":{"type":"queued","session_id":"app:a","messages":[{"id":7,"text":"after this","queued_at_ms":5}]}}"#),
+            &here,
+        );
+        assert_eq!(client.queued_for("app:a")[0].id, 7);
+
+        client.revert_file("app:a", "/repo", "a.rs");
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"changes","changes":{{"repos":[]}}}}}}"#
+            )),
+            &here,
+        );
+        assert_eq!(effects, [Effect::Say("Undid the changes to a.rs".into())]);
+        assert!(client.changes.is_ready());
+        assert!(!client.reverting());
     }
 
     #[test]

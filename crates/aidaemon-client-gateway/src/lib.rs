@@ -116,6 +116,28 @@ pub trait ClientHost: Send + Sync {
         Ok(SessionChanges::default())
     }
 
+    /// Name conversation `session_id` (`None` or blank: back to the name
+    /// taken from what was said) (protocol 1.17). `Err`: why not.
+    async fn rename_session(&self, _session_id: &str, _title: Option<&str>) -> Result<(), String> {
+        Err("This daemon does not rename conversations".to_string())
+    }
+
+    /// Archive conversation `session_id`, or bring it back (protocol 1.17).
+    async fn archive_session(&self, _session_id: &str, _archived: bool) -> Result<(), String> {
+        Err("This daemon does not archive conversations".to_string())
+    }
+
+    /// Undo the uncommitted changes to `path` in repository `root`, one of
+    /// session `session_id`'s; the changes after (protocol 1.17).
+    async fn revert_file(
+        &self,
+        _session_id: &str,
+        _root: &str,
+        _path: &str,
+    ) -> Result<SessionChanges, String> {
+        Err("This daemon does not undo changes".to_string())
+    }
+
     /// The owner's projects.
     async fn projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
         Ok(Vec::new())
@@ -667,6 +689,11 @@ impl ClientGateway {
             | Command::ListModels
             | Command::GetSessionModel { .. } => Some(Scope::Observe),
             Command::SetSessionModel { .. } => Some(Scope::Chat),
+            Command::ListQueued { .. } => Some(Scope::Observe),
+            Command::RenameSession { .. }
+            | Command::ArchiveSession { .. }
+            | Command::RevertFile { .. }
+            | Command::EditQueued { .. } => Some(Scope::Chat),
             Command::CreateProject { .. }
             | Command::UpdateProject { .. }
             | Command::SetSessionProject { .. }
@@ -714,6 +741,66 @@ impl ClientGateway {
                     (model, effort),
                 )
                 .await
+            }
+            Command::RenameSession { session_id, title } => {
+                self.host
+                    .rename_session(&session_id, title.as_deref())
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                self.publish_session(&session_id).await;
+                Ok(CommandResult::Reply {
+                    text: "Renamed".to_string(),
+                })
+            }
+            Command::ArchiveSession {
+                session_id,
+                archived,
+            } => {
+                self.host
+                    .archive_session(&session_id, archived)
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                self.publish_session(&session_id).await;
+                Ok(CommandResult::Reply {
+                    text: if archived { "Archived" } else { "Brought back" }.to_string(),
+                })
+            }
+            Command::RevertFile {
+                session_id,
+                root,
+                path,
+            } => Ok(CommandResult::Changes {
+                changes: self
+                    .host
+                    .revert_file(&session_id, &root, &path)
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?,
+            }),
+            Command::ListQueued { session_id } => Ok(self.queued(session_id).await),
+            Command::EditQueued {
+                session_id,
+                message_id,
+                text,
+            } => {
+                let text = text.map(|t| t.trim().to_string());
+                if text.as_deref().is_some_and(str::is_empty) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Invalid,
+                        "A waiting message needs some text; remove it instead",
+                    ));
+                }
+                if !self
+                    .turns
+                    .task_registry
+                    .edit_queued_message(&session_id, message_id, text)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Conflict,
+                        "That message is no longer waiting: it has gone to the agent",
+                    ));
+                }
+                Ok(self.queued(session_id).await)
             }
             Command::ListModels => Ok(CommandResult::Models {
                 options: self.host.model_options().await.map_err(internal)?,
@@ -1183,6 +1270,7 @@ impl ClientGateway {
             Some(session_id.clone()),
             Event::SessionCreated {
                 session: SessionSummary {
+                    archived: false,
                     id: session_id.clone(),
                     channel: APP_CHANNEL.to_string(),
                     title: Some(title.to_string()),
@@ -1410,6 +1498,26 @@ impl ClientGateway {
 
     /// Tell every client how session `session_id` looks now (after a move
     /// between projects).
+    /// `session_id`'s waiting messages, as `queued` gives them.
+    async fn queued(&self, session_id: String) -> CommandResult {
+        let messages = self
+            .turns
+            .task_registry
+            .queued_messages(&session_id)
+            .await
+            .into_iter()
+            .map(|(id, text, at)| aidaemon_client_protocol::QueuedMessage {
+                id,
+                text,
+                queued_at_ms: u64::try_from(at.timestamp_millis()).unwrap_or(0),
+            })
+            .collect();
+        CommandResult::Queued {
+            session_id,
+            messages,
+        }
+    }
+
     async fn publish_session(&self, session_id: &str) {
         match self.host.sessions().await {
             Ok(sessions) => {
@@ -1503,6 +1611,7 @@ impl ClientGateway {
                 Some(session_id.clone()),
                 Event::SessionCreated {
                     session: SessionSummary {
+                        archived: false,
                         id: session_id.clone(),
                         channel: APP_CHANNEL.to_string(),
                         title: Some(if text.trim().is_empty() {

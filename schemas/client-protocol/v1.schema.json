@@ -1680,6 +1680,121 @@
             "session_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "Name a conversation (protocol 1.17); `title` absent or blank: back\nto the name taken from what was said. Answers with `reply`; the\nsession's `session_updated` follows.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "rename_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Archive a conversation, or bring it back (protocol 1.17). Answers\nwith `reply`; `session_updated` follows.",
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "archive_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "archived"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Undo the uncommitted changes to one file of a session's changes\n(protocol 1.17): a changed or deleted file goes back to its last\ncommit, a new one is removed. `root` and `path` as `get_changes`\ngave them. Answers with `changes`, as they are after.",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "revert_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "root",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The messages waiting for a session's running work to end (protocol\n1.17). Answers with `queued`.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "list_queued",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Change a waiting message's text, or take it out (`text` absent)\n(protocol 1.17). Answers with `queued`, as it is after.",
+          "properties": {
+            "message_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "edit_queued",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "message_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2129,6 +2244,30 @@
           "required": [
             "type",
             "session_model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_queued` and `edit_queued`: the session's waiting messages,\noldest first (protocol 1.17).",
+          "properties": {
+            "messages": {
+              "items": {
+                "$ref": "#/$defs/QueuedMessage"
+              },
+              "type": "array"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "queued",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "messages"
           ],
           "type": "object"
         }
@@ -3830,6 +3969,31 @@
       ],
       "type": "object"
     },
+    "QueuedMessage": {
+      "description": "A message waiting for its session's running work to end (protocol\n1.17).",
+      "properties": {
+        "id": {
+          "description": "What `edit_queued` names it by, while it waits.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queued_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "queued_at_ms"
+      ],
+      "type": "object"
+    },
     "RedeemRequest": {
       "description": "`POST /client/v1/enrollments/redeem`.",
       "properties": {
@@ -4286,6 +4450,10 @@
     },
     "SessionSummary": {
       "properties": {
+        "archived": {
+          "description": "The owner archived it (protocol 1.17): lists show it apart.",
+          "type": "boolean"
+        },
         "channel": {
           "description": "The chat it belongs to: `app`, `telegram`...",
           "type": "string"

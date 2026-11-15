@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 16;
+pub const PROTOCOL_MINOR: u16 = 17;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -400,6 +400,37 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
     },
+    /// Name a conversation (protocol 1.17); `title` absent or blank: back
+    /// to the name taken from what was said. Answers with `reply`; the
+    /// session's `session_updated` follows.
+    RenameSession {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Archive a conversation, or bring it back (protocol 1.17). Answers
+    /// with `reply`; `session_updated` follows.
+    ArchiveSession { session_id: String, archived: bool },
+    /// Undo the uncommitted changes to one file of a session's changes
+    /// (protocol 1.17): a changed or deleted file goes back to its last
+    /// commit, a new one is removed. `root` and `path` as `get_changes`
+    /// gave them. Answers with `changes`, as they are after.
+    RevertFile {
+        session_id: String,
+        root: String,
+        path: String,
+    },
+    /// The messages waiting for a session's running work to end (protocol
+    /// 1.17). Answers with `queued`.
+    ListQueued { session_id: String },
+    /// Change a waiting message's text, or take it out (`text` absent)
+    /// (protocol 1.17). Answers with `queued`, as it is after.
+    EditQueued {
+        session_id: String,
+        message_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -628,6 +659,12 @@ pub enum CommandResult {
     /// `get_session_model` and `set_session_model` (protocol 1.16).
     SessionModel {
         session_model: SessionModel,
+    },
+    /// `list_queued` and `edit_queued`: the session's waiting messages,
+    /// oldest first (protocol 1.17).
+    Queued {
+        session_id: String,
+        messages: Vec<QueuedMessage>,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -1918,6 +1955,19 @@ pub struct SessionSummary {
     /// (protocol 1.12). What the app posts there, everyone there sees.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub group: bool,
+    /// The owner archived it (protocol 1.17): lists show it apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+}
+
+/// A message waiting for its session's running work to end (protocol
+/// 1.17).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct QueuedMessage {
+    /// What `edit_queued` names it by, while it waits.
+    pub id: u64,
+    pub text: String,
+    pub queued_at_ms: u64,
 }
 
 /// A project: a name, and the folder its conversations work in

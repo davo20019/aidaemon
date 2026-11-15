@@ -1,0 +1,10 @@
+{
+  "command": {
+    "path": "src/contact.rs",
+    "root": "/home/synthetic/acme-site",
+    "session_id": "app:6c1f",
+    "type": "revert_file"
+  },
+  "request_id": "5d0c2b1e-0023",
+  "type": "command"
+}

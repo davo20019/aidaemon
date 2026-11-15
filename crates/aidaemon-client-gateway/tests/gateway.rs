@@ -135,6 +135,7 @@ struct Host;
 impl ClientHost for Host {
     async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         Ok(vec![SessionSummary {
+            archived: false,
             id: "telegram:synthetic-user-1".into(),
             channel: "telegram".into(),
             title: None,
