@@ -109,6 +109,7 @@ const PINS_KEY: &str = "aidaemon.pins";
 const OPEN_KEY: &str = "aidaemon.open";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
 const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
+const ENTER_QUEUES_KEY: &str = "aidaemon.enter-queues";
 /// The first approval card says how approvals work, once per device.
 const APPROVALS_TAUGHT_KEY: &str = "aidaemon.approvals-taught";
 
@@ -242,6 +243,9 @@ pub struct Store {
     composer_focus: Signal<u64>,
     /// The sidebar lists archived conversations instead of the others.
     show_archived: Signal<bool>,
+    /// While the agent works, Enter queues (sends after) and ⌘↩ tells it
+    /// now, instead of the other way round (this device).
+    enter_queues: Signal<bool>,
     /// The conversation whose name is being edited in the sidebar.
     renaming: Signal<Option<String>>,
     /// When the owner last looked at the automations (this device): runs
@@ -288,6 +292,9 @@ impl Store {
             automation_editing: signal(None),
             composer_focus: signal(0),
             show_archived: signal(false),
+            enter_queues: signal(
+                nsh_core::storage::Storage::get_item(ENTER_QUEUES_KEY).as_deref() == Some("1"),
+            ),
             renaming: signal(None),
             automations_seen: signal(
                 nsh_core::storage::Storage::get_item(AUTOMATIONS_SEEN_KEY)
@@ -1709,6 +1716,18 @@ impl Store {
     /// How many conversations are archived.
     pub fn archived_count(&self) -> usize {
         self.read(|c| c.state.order.iter().filter(|id| c.is_archived(id)).count())
+    }
+
+    /// While the agent works, whether Enter queues the message (sends it
+    /// after) rather than telling the running work now.
+    pub fn enter_queues(&self) -> bool {
+        self.enter_queues.get()
+    }
+
+    pub fn set_enter_queues(&self, queues: bool) {
+        self.enter_queues.set(queues);
+        let _ =
+            nsh_core::storage::Storage::set_item(ENTER_QUEUES_KEY, if queues { "1" } else { "0" });
     }
 
     pub fn showing_archived(&self) -> bool {

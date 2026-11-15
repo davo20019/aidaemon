@@ -3972,6 +3972,10 @@
     "QueuedMessage": {
       "description": "A message waiting for its session's running work to end (protocol\n1.17).",
       "properties": {
+        "after": {
+          "description": "Sent to wait for its own turn (the app's Queue), not to be read by\nthe running work (protocol 1.18).",
+          "type": "boolean"
+        },
         "id": {
           "description": "What `edit_queued` names it by, while it waits.",
           "format": "uint64",

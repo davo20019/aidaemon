@@ -1506,11 +1506,14 @@ impl ClientGateway {
             .queued_messages(&session_id)
             .await
             .into_iter()
-            .map(|(id, text, at)| aidaemon_client_protocol::QueuedMessage {
-                id,
-                text,
-                queued_at_ms: u64::try_from(at.timestamp_millis()).unwrap_or(0),
-            })
+            .map(
+                |(id, text, at, after)| aidaemon_client_protocol::QueuedMessage {
+                    id,
+                    text,
+                    queued_at_ms: u64::try_from(at.timestamp_millis()).unwrap_or(0),
+                    after,
+                },
+            )
             .collect();
         CommandResult::Queued {
             session_id,

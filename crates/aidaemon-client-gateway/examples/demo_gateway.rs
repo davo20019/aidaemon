@@ -163,10 +163,10 @@ impl SessionChannelStore for NoSessions {}
 struct Host;
 
 /// Names and archive flags the owner set, by session id.
-fn marks() -> &'static std::sync::Mutex<std::collections::HashMap<String, (Option<String>, bool)>> {
-    static MARKS: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (Option<String>, bool)>>,
-    > = OnceLock::new();
+type Marks = std::sync::Mutex<std::collections::HashMap<String, (Option<String>, bool)>>;
+
+fn marks() -> &'static Marks {
+    static MARKS: OnceLock<Marks> = OnceLock::new();
     MARKS.get_or_init(Default::default)
 }
 

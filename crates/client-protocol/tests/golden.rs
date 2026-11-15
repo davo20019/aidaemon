@@ -1021,6 +1021,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 id: 7,
                 text: "Also check the footer".into(),
                 queued_at_ms: 1_767_225_600_000,
+                after: true,
             }],
         }),
         ack(CommandResult::Unknown),

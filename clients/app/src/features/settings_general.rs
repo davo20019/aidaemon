@@ -216,7 +216,36 @@ pub fn general(store: Store, settings: &Settings) -> View {
         }
         page = page.child(view().gap_2().child(section_label(*title)).child(list));
     }
-    page
+    page.child(this_device(store))
+}
+
+/// How this device's composer behaves: kept on the device, not the daemon.
+fn this_device(store: Store) -> View {
+    view().gap_2().child(section_label("On this device")).child(
+        ui::surface()
+            .p_3()
+            .gap_2()
+            .child(ui::labeled(
+                "While the agent works, Enter",
+                ui::choice(
+                    "While the agent works, Enter",
+                    "Tells it now",
+                    vec![
+                        ("now".to_owned(), "Tells it now (⌘↩ sends after)".to_owned()),
+                        (
+                            "after".to_owned(),
+                            "Sends after it (⌘↩ tells it now)".to_owned(),
+                        ),
+                    ],
+                    move || Some(if store.enter_queues() { "after" } else { "now" }.to_owned()),
+                    move |chosen| store.set_enter_queues(chosen.as_deref() == Some("after")),
+                ),
+            ))
+            .child(faint(
+                "Telling it now: the running work reads your message at its next step. Sending \
+                 after: it waits under \"Waiting to send\" and runs as its own turn.",
+            )),
+    )
 }
 
 fn row(store: Store, settings: &Settings, item: &Item) -> View {

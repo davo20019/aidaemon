@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 17;
+pub const PROTOCOL_MINOR: u16 = 18;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1968,6 +1968,10 @@ pub struct QueuedMessage {
     pub id: u64,
     pub text: String,
     pub queued_at_ms: u64,
+    /// Sent to wait for its own turn (the app's Queue), not to be read by
+    /// the running work (protocol 1.18).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after: bool,
 }
 
 /// A project: a name, and the folder its conversations work in

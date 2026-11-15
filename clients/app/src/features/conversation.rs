@@ -1084,9 +1084,9 @@ fn composer(store: Store, session: Option<String>) -> View {
         },
         move |_| {
             if running.get_untracked() {
-                // The field's own submit (see `on_submit`) does not steer it.
+                // The field's own submit (see `on_submit`) does not send it.
                 steer_pending.replace(false);
-                store.submit_placed(Some(MidRun::Queue));
+                store.submit_placed(Some(other_placement(store)));
             } else {
                 store.submit();
             }
@@ -1202,7 +1202,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                     spawn(async move {
                                         timer(std::time::Duration::from_millis(40)).await;
                                         if steer_pending.replace(false) {
-                                            store.submit_placed(Some(MidRun::Steer));
+                                            store.submit_placed(Some(enter_placement(store)));
                                         }
                                     })
                                 });
@@ -1255,18 +1255,28 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .child(dictation(store, terminal))
                         .child(
                             text(move || match (running.get(), touch) {
+                                (true, true) if store.enter_queues() => {
+                                    "Working · Send sends after · Now tells it now".to_owned()
+                                }
                                 (true, true) => {
                                     "Working · Send tells it now · Queue sends after".to_owned()
                                 }
-                                (true, false) if terminal => format!(
-                                    "Working · Enter tells it now · {} sends after · Esc or {} stops",
-                                    key_label("mod+enter"),
-                                    key_label("mod+c")
-                                ),
-                                (true, false) => format!(
-                                    "Working · Enter tells it now · {} sends after · Esc stops",
-                                    key_label("mod+enter")
-                                ),
+                                (true, false) => {
+                                    let (enter, other) = if store.enter_queues() {
+                                        ("sends after", "tells it now")
+                                    } else {
+                                        ("tells it now", "sends after")
+                                    };
+                                    let stops = if terminal {
+                                        format!("Esc or {} stops", key_label("mod+c"))
+                                    } else {
+                                        "Esc stops".to_owned()
+                                    };
+                                    format!(
+                                        "Working · Enter {enter} · {} {other} · {stops}",
+                                        key_label("mod+enter")
+                                    )
+                                }
                                 (false, true) => chat_note.clone().unwrap_or_default(),
                                 // Terminals rarely send Shift+Enter; Alt+Enter
                                 // works in all of them.
@@ -1289,11 +1299,22 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .child(when(
                             move || running.get(),
                             move || {
-                                ui::btn("Queue", Variant::Ghost, ui::Size::Sm, move || {
-                                    store.submit_placed(Some(MidRun::Queue))
-                                })
-                                .disabled(move || !can_send())
-                                .accessibility_label("Queue: send after the running work")
+                                // The other way: Queue, or Now when Enter queues.
+                                view().child(dynamic(move || {
+                                    let queues = store.enter_queues();
+                                    Some(untracked(move || {
+                                        let (label, name) = if queues {
+                                            ("Now", "Now: the running work reads it")
+                                        } else {
+                                            ("Queue", "Queue: send after the running work")
+                                        };
+                                        ui::btn(label, Variant::Ghost, ui::Size::Sm, move || {
+                                            store.submit_placed(Some(other_placement(store)))
+                                        })
+                                        .disabled(move || !can_send())
+                                        .accessibility_label(name)
+                                    }))
+                                }))
                             },
                         ))
                         .child(
@@ -1304,7 +1325,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 ui::Size::Sm,
                                 move || {
                                     if running.get_untracked() {
-                                        store.submit_placed(Some(MidRun::Steer));
+                                        store.submit_placed(Some(enter_placement(store)));
                                     } else {
                                         store.submit();
                                     }
@@ -1312,15 +1333,37 @@ fn composer(store: Store, session: Option<String>) -> View {
                             )
                             .disabled(move || !can_send())
                             .accessibility_label(move || {
-                                Some(SharedString::from(if running.get() {
-                                    "Send now: the running work reads it"
-                                } else {
-                                    "Send"
-                                }))
+                                Some(SharedString::from(
+                                    if running.get() && store.enter_queues() {
+                                        "Send after the running work"
+                                    } else if running.get() {
+                                        "Send now: the running work reads it"
+                                    } else {
+                                        "Send"
+                                    },
+                                ))
                             }),
                         ),
                 ),
         )
+}
+
+/// Where Enter (and Send) puts a message while the agent works.
+fn enter_placement(store: Store) -> MidRun {
+    if store.enter_queues() {
+        MidRun::Queue
+    } else {
+        MidRun::Steer
+    }
+}
+
+/// Where ⌘↩ (and the second button) puts it: the other way.
+fn other_placement(store: Store) -> MidRun {
+    if store.enter_queues() {
+        MidRun::Steer
+    } else {
+        MidRun::Queue
+    }
 }
 
 /// Messages sent to wait for the running work, above the composer: each
@@ -1390,6 +1433,27 @@ fn queued_list(store: Store, session: String) -> View {
                             .px_3()
                             .py_1()
                             .child(ui::icon(Glyph::Clock).text_color(colors::FAINT))
+                            // Read by the running work, or run after it.
+                            .child(dynamic(move || {
+                                let after = message.with(|m| m.after);
+                                Some(untracked(move || {
+                                    ui::with_hint(
+                                        if after {
+                                            "Runs as its own turn when the work ends"
+                                        } else {
+                                            "The running work reads it at its next step"
+                                        },
+                                        ui::badge(
+                                            if after { "After" } else { "Now" },
+                                            if after {
+                                                ui::Tone::Neutral
+                                            } else {
+                                                ui::Tone::Accent
+                                            },
+                                        ),
+                                    )
+                                }))
+                            }))
                             .child(
                                 text(move || message.with(|m| m.text.clone()))
                                     .flex_1()

@@ -3,6 +3,7 @@
   "result": {
     "messages": [
       {
+        "after": true,
         "id": 7,
         "queued_at_ms": 1767225600000,
         "text": "Also check the footer"

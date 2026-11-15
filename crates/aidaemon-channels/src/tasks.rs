@@ -520,12 +520,27 @@ impl TaskRegistry {
     /// Messages from different senders/scopes stay queued for a separate turn;
     /// otherwise a group participant could inherit another participant's role.
     fn drain_and_coalesce(queue: &mut VecDeque<QueuedMessage>) -> Option<QueuedMessage> {
-        let mut combined = queue.pop_front()?;
+        // A message meant for the work that just ended runs before ones the
+        // same sender placed for later: they asked for it first in effect.
+        // Another sender's message, or anything not placed for later, keeps
+        // the order.
+        let start = match queue.iter().position(|m| !m.placed_for_later) {
+            Some(at)
+                if at > 0
+                    && queue.iter().take(at).all(|m| {
+                        m.user_role == queue[at].user_role && m.channel_ctx == queue[at].channel_ctx
+                    }) =>
+            {
+                at
+            }
+            _ => 0,
+        };
+        let mut combined = queue.remove(start)?;
         while queue
-            .front()
+            .get(start)
             .is_some_and(|next| combined.can_coalesce_with(next))
         {
-            let msg = queue.pop_front().expect("front was checked");
+            let msg = queue.remove(start).expect("checked");
             combined.text.push('\n');
             combined.text.push_str(&msg.text);
             combined.attachments.extend(msg.attachments);
@@ -603,8 +618,12 @@ impl TaskRegistry {
     }
 
     /// The messages waiting in `session_id`'s queue, oldest first: id,
-    /// text and when each was queued.
-    pub async fn queued_messages(&self, session_id: &str) -> Vec<(u64, String, DateTime<Utc>)> {
+    /// text, when each was queued, and whether the owner placed it for
+    /// after the running work.
+    pub async fn queued_messages(
+        &self,
+        session_id: &str,
+    ) -> Vec<(u64, String, DateTime<Utc>, bool)> {
         self.queues
             .read()
             .await
@@ -612,7 +631,7 @@ impl TaskRegistry {
             .map(|queue| {
                 queue
                     .iter()
-                    .map(|m| (m.id, m.text.clone(), m.queued_at))
+                    .map(|m| (m.id, m.text.clone(), m.queued_at, m.placed_for_later))
                     .collect()
             })
             .unwrap_or_default()
@@ -1402,7 +1421,7 @@ mod queue_edit_tests {
             .queued_messages(session)
             .await
             .into_iter()
-            .map(|(_, text, _)| text)
+            .map(|(_, text, _, _)| text)
             .collect();
         assert_eq!(left, ["first, edited"]);
     }
@@ -1428,8 +1447,24 @@ mod queue_edit_tests {
             .queued_messages(session)
             .await
             .into_iter()
-            .map(|(_, text, _)| text)
+            .map(|(_, text, _, _)| text)
             .collect();
         assert_eq!(left, ["after this"]);
+    }
+
+    #[tokio::test]
+    async fn a_leftover_message_for_the_work_runs_before_one_queued_for_later() {
+        let registry = TaskRegistry::new(10);
+        let session = "app:synthetic-drain";
+        let ctx = ChannelContext::private("app");
+        let later = QueuedMessage::new("after this", UserRole::Owner, ctx.clone(), Vec::new())
+            .placed_for_later();
+        let now = QueuedMessage::new("also this", UserRole::Owner, ctx, Vec::new());
+        registry.queue_message(session, later, None).await;
+        registry.queue_message(session, now, None).await;
+        let first = registry.pop_all_queued_messages(session).await.unwrap();
+        assert_eq!(first.text, "also this");
+        let second = registry.pop_all_queued_messages(session).await.unwrap();
+        assert_eq!(second.text, "after this");
     }
 }

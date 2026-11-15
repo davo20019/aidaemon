@@ -191,6 +191,9 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
     ))]);
+    // What Enter does while the agent works is this device's choice.
+    app.wait_for("On this device")?;
+    app.wait_for("While the agent works, Enter >> nth=0")?;
     app.press("Advanced")?;
     app.wait_for("Another setting")?;
     app.type_text("label:Setting key", "provider.mo")?;
@@ -693,10 +696,12 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
     // A message waiting for the running work shows above the composer.
     app.press("Write the newsletter >> nth=0")?;
     feed([frame(
-        r#"{"type":"ack","request_id":"q1","result":{"type":"queued","session_id":"app:synthetic-10","messages":[{"id":4,"text":"Then add the event dates","queued_at_ms":1}]}}"#,
+        r#"{"type":"ack","request_id":"q1","result":{"type":"queued","session_id":"app:synthetic-10","messages":[{"id":4,"text":"Then add the event dates","queued_at_ms":1,"after":true}]}}"#,
     )]);
     app.wait_for("Waiting to send")?;
     app.wait_for("Then add the event dates")?;
+    // Sent with Queue: it says it runs after.
+    app.wait_for("After")?;
     app.press("Remove from the queue")?;
     wait_sent("edit_queued")?;
     feed([frame(
