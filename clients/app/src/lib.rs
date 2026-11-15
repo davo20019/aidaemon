@@ -84,7 +84,12 @@ pub fn Offline() -> impl IntoElement {
         for update in updates {
             store.update(update);
         }
-        for kind in ["get_changes", "get_settings"] {
+        for kind in [
+            "get_changes",
+            "get_settings",
+            "list_models",
+            "set_session_model",
+        ] {
             if let Some(id) = store.queued_id(kind)
                 && let Ok(mut sent) = SENT.lock()
                 && !sent.iter().any(|(i, _)| *i == id)

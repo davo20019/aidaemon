@@ -148,6 +148,7 @@ struct Reads {
     unread: Memo<BTreeSet<String>>,
     finished: Memo<Option<(String, u64)>>,
     commands: Memo<Vec<SlashCommand>>,
+    models: Memo<Read<aidaemon_client_protocol::ModelOptions>>,
 }
 
 impl Reads {
@@ -180,6 +181,7 @@ impl Reads {
             unread: computed(move || client.with(|c| c.unread.clone())),
             finished: computed(move || client.with(|c| c.finished.clone())),
             commands: computed(move || client.with(|c| c.commands.clone())),
+            models: computed(move || client.with(|c| c.models.clone())),
         }
     }
 }
@@ -630,6 +632,55 @@ impl Store {
 
     pub fn refresh_automations(&self) {
         self.act(Client::refresh_automations);
+    }
+
+    // ----- A conversation's model -------------------------------------------
+
+    /// The providers and models a conversation can answer with.
+    pub fn model_options(&self) -> Read<aidaemon_client_protocol::ModelOptions> {
+        self.reads.models.get()
+    }
+
+    pub fn refresh_models(&self) {
+        self.act(Client::refresh_models);
+    }
+
+    /// Read what `session` answers with, once.
+    pub fn load_session_model(&self, session: &str) {
+        self.act(|c| c.load_session_model(session));
+    }
+
+    pub fn can_pick_model(&self, session: Option<&str>) -> bool {
+        self.read(|c| c.can_pick_model(session))
+    }
+
+    /// The model and effort `session` (`None`: a new conversation) answers
+    /// with.
+    pub fn model_of(
+        &self,
+        session: Option<&str>,
+    ) -> (
+        aidaemon_client_protocol::ModelChoice,
+        aidaemon_client_protocol::Effort,
+    ) {
+        self.read(|c| c.model_of(session))
+    }
+
+    /// The efforts `model` takes besides automatic.
+    pub fn efforts_of(
+        &self,
+        model: &aidaemon_client_protocol::ModelChoice,
+    ) -> Vec<aidaemon_client_protocol::Effort> {
+        self.read(|c| c.efforts_of(model))
+    }
+
+    pub fn set_session_model(
+        &self,
+        session: Option<&str>,
+        model: Option<aidaemon_client_protocol::ModelChoice>,
+        effort: Option<aidaemon_client_protocol::Effort>,
+    ) {
+        self.act(|c| c.set_session_model(session, model, effort));
     }
 
     pub fn automations(&self) -> AutomationsRead {

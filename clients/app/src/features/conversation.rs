@@ -1215,6 +1215,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .text_color(colors::TEXT)
                         .label("Message"),
                 )
+                .child(super::model_picker::model_picker(store, session.clone()))
                 .child(
                     view()
                         .flex_row()

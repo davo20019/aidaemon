@@ -6,6 +6,7 @@ pub mod code;
 pub mod conversation;
 pub mod inspector;
 pub mod memory;
+pub mod model_picker;
 pub mod notify;
 pub mod pairing;
 pub mod settings;

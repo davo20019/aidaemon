@@ -22,6 +22,18 @@ fn wait_sent(kind: &str) -> Result<String, String> {
     Err(format!("no {kind} was sent"))
 }
 
+/// The id of a command of `kind` sent after `before` (the last such id
+/// when the step began): earlier tests' commands stay in the list.
+fn wait_sent_new(kind: &str, before: Option<String>) -> Result<String, String> {
+    for _ in 0..100 {
+        if let Some(id) = sent(kind).filter(|id| Some(id) != before.as_ref()) {
+            return Ok(id);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!("no new {kind} was sent"))
+}
+
 /// The feed is one per process: tests take turns.
 static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -593,5 +605,65 @@ fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
         ),
     ]);
     app.wait_for("Done: Draft the invoice")?;
+    Ok(())
+}
+
+#[test]
+fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_at(390.0, 844.0);
+    app.wait_for("What should we work on?")?;
+    let before = sent("list_models");
+    feed([Update::Connected]);
+    let id = wait_sent_new("list_models", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"models","options":{{"providers":[
+            {{"id":"main","name":"Anthropic","billing":"per_token","models":[{{"id":"synthetic-claude","efforts":["low","medium","high"]}}]}},
+            {{"id":"failover-0","name":"Google Gemini","billing":"per_token","models":[{{"id":"synthetic-gemini"}}]}}
+        ]}}}}}}"#
+    ))]);
+    app.wait_for("Auto model")?;
+    app.wait_for("Auto effort")?;
+    // The picker's row stays on the screen, beside nothing that wraps it.
+    let row = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|n| n.test_id.as_deref() == Some("model-picker") && !n.hidden)
+        .ok_or("no model picker on screen")?;
+    let right = row.bounds.origin.x.0 + row.bounds.size.width.0;
+    assert!(
+        right <= 390.0,
+        "the picker ends at {right} pt on a 390 pt screen"
+    );
+    // Gemini takes no effort: its choice goes.
+    app.press("Auto model")?;
+    app.press("synthetic-gemini · Google Gemini")?;
+    app.wait_for("synthetic-gemini · Google Gemini")?;
+    app.wait_for_gone("Auto effort", std::time::Duration::from_secs(5))?;
+    // An existing conversation's pick goes to the daemon at once (in a
+    // window, where the list of conversations shows).
+    drop(app);
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([Update::Connected]);
+    let id = wait_sent_new("list_models", Some(id))?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"models","options":{{"providers":[
+            {{"id":"main","name":"Anthropic","billing":"per_token","models":[{{"id":"synthetic-claude","efforts":["low","medium","high"]}}]}},
+            {{"id":"failover-0","name":"Google Gemini","billing":"per_token","models":[{{"id":"synthetic-gemini"}}]}}
+        ]}}}}}}"#
+    ))]);
+    feed([frame(
+        r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-m","channel":"app","title":"Pick a model","writable":true}]}}"#,
+    )]);
+    app.wait_for("Pick a model")?;
+    app.press("Pick a model >> nth=0")?;
+    app.wait_for("Auto model")?;
+    app.press("Auto model")?;
+    app.press("synthetic-claude · Anthropic")?;
+    app.wait_for("synthetic-claude · Anthropic")?;
+    wait_sent_new("set_session_model", None)?;
+    app.wait_for("Auto effort")?;
     Ok(())
 }
