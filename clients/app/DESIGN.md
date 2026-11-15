@@ -67,6 +67,8 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Conversation | Stop pressed | Stop becomes "Stopping…" (warning status) until the turn ends |
 | Sidebar | A reply lands elsewhere | Filled dot and full-strength title until opened; pinned (★) first; age at the right |
 | Inbox | Work running | Elapsed time ticks each second; long tool output shows its last 8 lines with Show all / Copy |
+| Inspector | A turn's first file write (edit_file, write_file) in the open conversation | The inspector moves to its Code tab once per turn; the owner's own choice of tab then sticks |
+| Code | A tool that can change files finishes | The changes read again while the tab shows (else on its next showing); a press on a file opens its diff (+ success, − danger, @@ info, first 400 lines with Show all, Copy); All files goes back |
 | System | Open | Reads on open and every 30 s; "Needs a look" (warning tint, alert role) leads when anything fails |
 | System | A reply finishes while the app is in the background | "Done: <conversation>" notification; pressing it opens the conversation |
 | Conversation | A reply's turn used tools | One quiet disclosure line above the reply ("Used 4 tools: read_file ×2, … · 12s"); ▸ turns ▾ and lists every tool in order. The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
@@ -97,7 +99,8 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 - **First run:** where the agent runs, then the daemon's own setup steps (a model, then an optional chat), then the greeting's conversation opens.
 
 - **Conversation:** day breaks ("Today", "Yesterday", weekday, date), times under messages, Copy on every reply, Copy conversation as Markdown and Pin in the header.
-- **Inbox** (the right pane): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
+- **Inbox** (the right pane's first tab): waiting approvals of other conversations, new replies, running work, and the current turn's steps.
+- **Code** (the right pane's second tab): the uncommitted changes in each git repository the open conversation worked in: name, branch, files changed with +/−; files this conversation wrote first, marked with an accent dot; each file's diff on press. Changes by the owner or other sessions in the same tree show too, unmarked.
 - **Memory:** what the daemon remembers about the owner, newest first, filterable, each with Forget.
 - **Settings:** every setting of the daemon by config table (folded; filtering opens them), each with its value or "default (example: …)", "asks" when it needs approval, and when it takes effect; Edit in place as TOML, booleans as Turn on/off, secrets stored masked and never shown; any other key by path; the providers in use with their keys or sign-in, and adding one as main or failover; runtime bots and MCP servers; moving the database and rotating its key; Reload and Restart.
 - **System:** daemon version, uptime and models; what needs a look; token use per day; model call times; scheduled goals; background jobs and queues; health checks.

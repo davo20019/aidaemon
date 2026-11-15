@@ -9,8 +9,8 @@ use aidaemon_client_core::machine::{DropKind, Update, request_id};
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, State, ViewRequest};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, Command, CommandResult, ErrorCode, Event, Feature, MemoryItem,
-    MidRun, SearchHit, ServerFrame, Settings, SettingsChange, SettingsOutcome, SetupAction,
-    SetupState, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
+    MidRun, SearchHit, ServerFrame, SessionChanges, Settings, SettingsChange, SettingsOutcome,
+    SetupAction, SetupState, SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
@@ -135,6 +135,27 @@ pub enum SearchRead {
     Failed(String),
 }
 
+/// The inspector's Code tab: a session's uncommitted changes, as last
+/// read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ChangesRead {
+    #[default]
+    NotYet,
+    Loading,
+    Ready(SessionChanges),
+    Failed(String),
+}
+
+/// The inspector's tabs, in order.
+pub const INSPECTOR_TABS: [&str; 2] = ["Inbox", "Code"];
+/// The Code tab's index in [`INSPECTOR_TABS`].
+pub const CODE_TAB: usize = 1;
+
+/// Tools whose work can change files: the Code tab reads again after one.
+const CHANGING_TOOLS: [&str; 4] = ["edit_file", "write_file", "terminal", "cli_agent"];
+/// Tools that write files themselves: the first in a turn opens the Code tab.
+const WRITING_TOOLS: [&str; 2] = ["edit_file", "write_file"];
+
 /// The Memory page's data, as last read.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum MemoryRead {
@@ -236,6 +257,18 @@ pub struct Store {
     search_request: Stored<Option<String>>,
     memories: Signal<MemoryRead>,
     memories_request: Stored<Option<String>>,
+    /// The Code tab: the selected session's changes, and the session they
+    /// are of.
+    changes: Signal<ChangesRead>,
+    changes_of: Stored<Option<String>>,
+    changes_request: Stored<Option<String>>,
+    /// Something changed while a read was in flight: read again after it.
+    changes_again: Stored<bool>,
+    /// The inspector's open tab (an index of [`INSPECTOR_TABS`]).
+    inspector_tab: Signal<usize>,
+    /// Turns that already opened the Code tab, so the owner's own choice
+    /// of tab sticks for the rest of a turn.
+    code_opened: Stored<BTreeSet<String>>,
     settings: Signal<SettingsRead>,
     settings_request: Stored<Option<String>>,
     /// Settings changes sent and not yet answered.
@@ -299,6 +332,12 @@ impl Store {
             search_request: stored(None),
             memories: signal(MemoryRead::NotYet),
             memories_request: stored(None),
+            changes: signal(ChangesRead::NotYet),
+            changes_of: stored(None),
+            changes_request: stored(None),
+            changes_again: stored(false),
+            inspector_tab: signal(0),
+            code_opened: stored(BTreeSet::new()),
             settings: signal(SettingsRead::NotYet),
             settings_request: stored(None),
             settings_changes: stored(BTreeSet::new()),
@@ -688,6 +727,32 @@ impl Store {
             }
             ServerFrame::Ack {
                 request_id,
+                result: CommandResult::Changes { changes },
+            } if self
+                .changes_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.changes_request.replace(None);
+                self.changes.set(ChangesRead::Ready(changes.clone()));
+                if self.changes_again.replace(false) {
+                    self.refresh_changes();
+                }
+                return;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .changes_request
+                .with(|r| r.as_deref() == Some(request_id.as_str())) =>
+            {
+                self.changes_request.replace(None);
+                self.changes_again.replace(false);
+                self.changes.set(ChangesRead::Failed(error.message.clone()));
+                return;
+            }
+            ServerFrame::Ack {
+                request_id,
                 result: CommandResult::Memories { memories },
             } if self
                 .memories_request
@@ -822,6 +887,7 @@ impl Store {
                 event, session_id, ..
             } => {
                 self.note_activity(event);
+                self.note_code(event);
                 self.note_reply(session_id.as_deref(), event);
             }
             // After a reload or a dropped connection: what running turns
@@ -944,6 +1010,94 @@ impl Store {
         self.send(Command::ForgetMemory {
             memory_id: id.to_owned(),
         });
+    }
+
+    // ----- The inspector's Code tab ------------------------------------------
+
+    /// The inspector's open tab, for its tab bar.
+    pub fn inspector_tab(&self) -> Signal<usize> {
+        self.inspector_tab
+    }
+
+    /// Read the selected session's changes again; one read at a time, and
+    /// one more after it when asked meanwhile.
+    pub fn refresh_changes(&self) {
+        let Some(session_id) = self.selected.get_untracked() else {
+            self.changes_of.replace(None);
+            self.changes.set(ChangesRead::NotYet);
+            return;
+        };
+        if self.changes_request.with(|r| r.is_some()) {
+            self.changes_again.replace(true);
+            return;
+        }
+        let same = self
+            .changes_of
+            .with(|of| of.as_deref() == Some(session_id.as_str()));
+        if !same || !matches!(self.changes.get_untracked(), ChangesRead::Ready(_)) {
+            self.changes.set(ChangesRead::Loading);
+        }
+        self.changes_of.replace(Some(session_id.clone()));
+        let id = self.send(Command::GetChanges { session_id });
+        self.changes_request.replace(Some(id));
+    }
+
+    /// Read the selected session's changes unless those shown are its own
+    /// and current.
+    pub fn refresh_changes_if_stale(&self) {
+        let selected = self.selected.get_untracked();
+        let stale = self.changes_of.with(|of| of.as_ref() != selected.as_ref());
+        if stale {
+            self.refresh_changes();
+        }
+    }
+
+    /// The selected session's changes, as last read.
+    pub fn changes(&self) -> ChangesRead {
+        self.changes.get()
+    }
+
+    /// The Code tab is on screen.
+    fn code_visible(&self) -> bool {
+        self.inspector.get_untracked()
+            && self.inspector_tab.get_untracked() == CODE_TAB
+            && self.page.get_untracked() == Page::Conversation
+    }
+
+    /// A tool that can change files finished in the selected session: the
+    /// Code tab reads again, and the turn's first file write opens it.
+    fn note_code(&self, event: &Event) {
+        let (turn_id, name) = match event {
+            Event::TurnStatus {
+                turn_id,
+                status: TurnStatus::ToolCompleted { name, .. },
+            } => (turn_id, Some(name.as_str())),
+            Event::TurnCompleted { turn_id, .. } => (turn_id, None),
+            _ => return,
+        };
+        let session = self
+            .turns
+            .with_untracked(|t| t.get(turn_id).map(|log| log.session_id.clone()));
+        if session.is_none() || session != self.selected.get_untracked() {
+            return;
+        }
+        if let Some(name) = name {
+            if !CHANGING_TOOLS.contains(&name) {
+                return;
+            }
+            if WRITING_TOOLS.contains(&name) && self.code_opened.with(|o| !o.contains(turn_id)) {
+                self.code_opened.with(|o| {
+                    o.insert(turn_id.clone());
+                });
+                self.inspector_tab.set(CODE_TAB);
+            }
+        }
+        if self.code_visible() {
+            self.refresh_changes();
+        } else {
+            // Read on next showing.
+            self.changes_of.replace(None);
+        }
     }
 
     // ----- The Settings page -------------------------------------------------

@@ -224,3 +224,35 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     app.wait_for("read_file")?;
     Ok(())
 }
+
+#[test]
+fn the_code_tab_reads_changes_and_a_file_write_opens_it() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-2","channel":"app","title":"Add the contact form","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Add the contact form")?;
+    app.press("Add the contact form >> nth=0")?;
+    app.wait_for("Nothing running.")?;
+    // The turn's first file write moves the inspector to Code, which reads.
+    feed([
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-2","event":{"type":"turn_started","turn_id":"t2","session_id":"app:synthetic-2","origin":"app"}}"#,
+        ),
+        frame(
+            r#"{"type":"event","at_ms":2,"session_id":"app:synthetic-2","event":{"type":"turn_status","turn_id":"t2","status":{"kind":"tool_completed","name":"edit_file","summary":"src/contact.rs"}}}"#,
+        ),
+    ]);
+    app.wait_for("Reading changes…")?;
+    // Back to the Inbox, and Code again on press.
+    app.press("Inbox")?;
+    app.wait_for("Nothing running.")?;
+    app.press("Code")?;
+    app.wait_for("Reading changes…")?;
+    Ok(())
+}

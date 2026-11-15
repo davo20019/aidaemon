@@ -1,6 +1,7 @@
 //! One module per area of the app.
 
 pub mod approvals;
+pub mod code;
 pub mod conversation;
 pub mod inspector;
 pub mod memory;
