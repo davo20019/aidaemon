@@ -76,6 +76,27 @@ impl ProviderRuntimeTarget {
     pub fn models_cheap_first(&self) -> Vec<String> {
         cheap_first(self.router.as_ref(), self.all_models_ordered())
     }
+
+    /// The models in the order a turn tries them when it fails over here:
+    /// work that asked for the main provider's fast model starts on this
+    /// provider's fast one; any other starts on its strongest, so a coding
+    /// turn does not fall from the strongest model to the cheapest.
+    pub fn models_for_failover(&self, wants_fast: bool) -> Vec<String> {
+        if wants_fast {
+            return self.models_cheap_first();
+        }
+        let mut models = self.all_models_ordered();
+        if let Some(smart) = self.router.as_ref().map(|router| {
+            router
+                .select(aidaemon_providers::routing::Tier::Smart)
+                .to_string()
+        }) && !smart.trim().is_empty()
+        {
+            models.retain(|model| *model != smart);
+            models.insert(0, smart);
+        }
+        models
+    }
 }
 
 /// `models` reordered so the router's fast tier, when it is one of them,
@@ -482,6 +503,30 @@ mod tests {
             .background_chain_through(model, |provider| provider)
             .chat_with_options(model, messages, &[], &Default::default())
             .await
+    }
+
+    /// A turn failing over to a provider configured with only its cheap
+    /// model starts on that provider's strongest one; work that asked for
+    /// the fast model starts on the fast one.
+    #[test]
+    fn a_failover_starts_on_the_tier_the_turn_asked_for() {
+        let mut models = ModelsConfig {
+            default_model: "claude-haiku-5-5".to_string(),
+            ..ModelsConfig::default()
+        };
+        models.apply_defaults(&ProviderKind::Anthropic);
+        let router = Router::new(models);
+        let target = ProviderRuntimeTarget::new(
+            Arc::new(ScriptedProvider::new([])),
+            (!router.is_uniform()).then_some(router),
+            ProviderKind::Anthropic,
+            "claude-haiku-5-5".to_string(),
+        );
+        assert_eq!(
+            target.models_for_failover(false),
+            vec!["claude-opus-5-5", "claude-haiku-5-5"]
+        );
+        assert_eq!(target.models_for_failover(true)[0], "claude-haiku-5-5");
     }
 
     /// A background call whose primary provider has used up its quota is

@@ -140,12 +140,17 @@ impl ModelsConfig {
     /// Legacy fields (`primary`, `fast`, `smart`) remain populated for
     /// compatibility with older code paths and existing config tooling.
     pub fn apply_defaults(&mut self, provider_kind: &ProviderKind) {
-        let provider_default = match provider_kind {
-            ProviderKind::GoogleGenai => "gemini-3-flash-preview".to_string(),
-            ProviderKind::Anthropic => "claude-sonnet-4-20250514".to_string(),
-            ProviderKind::XaiNative => "grok-4".to_string(),
-            ProviderKind::OpenaiCompatible => "openai/gpt-4o".to_string(),
-            ProviderKind::OpenaiChatgpt => "gpt-5.6-terra".to_string(),
+        // A provider the catalog knows by its kind (one key reaches all its
+        // models) fills any job the owner left unnamed with the catalog's
+        // model for it, so a key alone gives a fast and a strongest model.
+        let catalog = crate::catalog::models_for_kind(*provider_kind);
+        let provider_default = match (catalog, provider_kind) {
+            (Some(models), _) => models.primary.to_string(),
+            (None, ProviderKind::GoogleGenai) => "gemini-3-flash-preview".to_string(),
+            (None, ProviderKind::Anthropic) => "claude-sonnet-5-5".to_string(),
+            (None, ProviderKind::XaiNative) => "grok-4".to_string(),
+            (None, ProviderKind::OpenaiCompatible) => "openai/gpt-4o".to_string(),
+            (None, ProviderKind::OpenaiChatgpt) => "gpt-6-sol".to_string(),
         };
 
         let default_model = if !self.default_model.trim().is_empty() {
@@ -191,10 +196,10 @@ impl ModelsConfig {
             .cloned()
             .unwrap_or_else(|| default_model.clone());
         if self.fast.trim().is_empty() {
-            self.fast = first_fallback.clone();
+            self.fast = catalog.map_or_else(|| first_fallback.clone(), |m| m.fast.to_string());
         }
         if self.smart.trim().is_empty() {
-            self.smart = first_fallback;
+            self.smart = catalog.map_or(first_fallback, |m| m.smart.to_string());
         }
     }
 }
@@ -307,12 +312,13 @@ impl Router {
         }
     }
 
-    /// Returns true when there are no distinct fallback models.
+    /// Returns true when every job uses the default model.
     pub fn is_uniform(&self) -> bool {
-        self.models
-            .fallback_models
-            .iter()
-            .all(|m| m == &self.models.default_model)
+        let default = &self.models.default_model;
+        self.models.fallback_models.iter().all(|m| m == default)
+            && [&self.models.fast, &self.models.smart]
+                .into_iter()
+                .all(|m| m.trim().is_empty() || m == default)
     }
 }
 
@@ -352,6 +358,29 @@ mod tests {
         };
         let router = Router::new(models);
         assert!(!router.is_uniform());
+    }
+
+    #[test]
+    fn a_key_alone_gives_the_catalogs_fast_and_strongest_models() {
+        // The owner named only a default: the jobs left unnamed come from
+        // the catalog, so the provider's strongest model is reachable.
+        let mut models = ModelsConfig {
+            default_model: "claude-haiku-5-5".to_string(),
+            ..ModelsConfig::default()
+        };
+        models.apply_defaults(&ProviderKind::Anthropic);
+        assert_eq!(models.smart, "claude-opus-5-5");
+        assert_eq!(models.fast, "claude-haiku-5-5");
+        assert!(!Router::new(models).is_uniform());
+
+        // An address-dependent server keeps the old derivation.
+        let mut models = ModelsConfig {
+            default_model: "acme/model-a".to_string(),
+            fallback_models: vec!["acme/model-b".to_string()],
+            ..ModelsConfig::default()
+        };
+        models.apply_defaults(&ProviderKind::OpenaiCompatible);
+        assert_eq!(models.smart, "acme/model-b");
     }
 
     #[test]

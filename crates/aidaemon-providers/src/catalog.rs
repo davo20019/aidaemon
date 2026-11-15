@@ -399,6 +399,17 @@ pub fn find(name: &str) -> Option<&'static CatalogEntry> {
     })
 }
 
+/// The models a provider of `kind` starts with, when one catalog entry is
+/// that kind. `None` for OpenAI-compatible servers: which models they offer
+/// depends on the address.
+pub fn models_for_kind(kind: ProviderKind) -> Option<Models> {
+    let mut entries = CATALOG.iter().filter(|entry| entry.kind == kind);
+    match (entries.next(), entries.next()) {
+        (Some(entry), None) => Some(entry.models),
+        _ => None,
+    }
+}
+
 /// A provider key found in the environment.
 #[derive(Clone)]
 pub struct EnvKey {

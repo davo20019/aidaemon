@@ -401,8 +401,12 @@ pub async fn call_llm_with_recovery(
                     .attempts(MAX_STEP_ATTEMPTS),
             );
         }
+        let wants_fast = router.as_ref().is_some_and(|router| {
+            let fast = router.select(aidaemon_providers::routing::Tier::Fast);
+            fast == model && fast != router.default_model()
+        });
         for target in host.llm_runtime().snapshot().failover_targets() {
-            for fallback in target.all_models_ordered() {
+            for fallback in target.models_for_failover(wants_fast) {
                 steps.push(
                     FailoverStep::from_arc(target.provider())
                         .model(fallback)
