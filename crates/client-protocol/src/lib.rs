@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 22;
+pub const PROTOCOL_MINOR: u16 = 23;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1159,12 +1159,20 @@ pub enum SettingsChange {
     /// Remove failover provider `index` (from 0).
     RemoveFailover {
         index: u32,
+        /// The `name` the client showed at `index` (protocol 1.23): the
+        /// daemon refuses when another provider is there now. Empty: no
+        /// check (an older client).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        expect: String,
     },
     /// Move failover `index` to place `to` (both from 0), its keys with it:
     /// failovers are tried in order (protocol 1.22).
     MoveFailover {
         index: u32,
         to: u32,
+        /// As `RemoveFailover`'s `expect` (protocol 1.23).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        expect: String,
     },
     /// Put back the config file as it was before the last change.
     RestoreBackup,

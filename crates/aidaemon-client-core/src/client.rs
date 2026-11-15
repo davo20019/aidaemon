@@ -793,6 +793,10 @@ impl Client {
             } if self.settings_changes.contains(request_id) => {
                 self.settings_changes.remove(request_id);
                 self.settings_error = Some(error.message.clone());
+                // A refusal may be for a page out of date: read it again.
+                if self.settings.is_ready() || cx.settings_open {
+                    self.refresh_settings();
+                }
                 return true;
             }
             ServerFrame::Event {

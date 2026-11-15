@@ -209,7 +209,8 @@ fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<
     for _ in 0..100 {
         moved = nsh_app_aidaemon::settings_sent().iter().any(|c| {
             serde_json::from_str::<serde_json::Value>(c).is_ok_and(|c| {
-                c["change"] == serde_json::json!({"kind": "move_failover", "index": 1, "to": 0})
+                c["change"]
+                    == serde_json::json!({"kind": "move_failover", "index": 1, "to": 0, "expect": "Anthropic"})
             })
         });
         if moved {

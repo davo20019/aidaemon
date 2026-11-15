@@ -607,7 +607,7 @@ impl ClientHost for Host {
                 settings.reload_pending = true;
                 format!("Added {} as failover {}.", option.name, index + 1)
             }
-            SettingsChange::RemoveFailover { index } => {
+            SettingsChange::RemoveFailover { index, .. } => {
                 settings.connected.remove(index as usize + 1);
                 for (at, p) in settings.connected.iter_mut().enumerate().skip(1) {
                     p.failover = Some(at as u32 - 1);
@@ -615,7 +615,7 @@ impl ClientHost for Host {
                 settings.reload_pending = true;
                 format!("Removed failover {}.", index + 1)
             }
-            SettingsChange::MoveFailover { index, to } => {
+            SettingsChange::MoveFailover { index, to, .. } => {
                 let count = settings.connected.len() - 1;
                 if index as usize >= count || to as usize >= count {
                     return Err("No such failover".into());

@@ -4889,6 +4889,10 @@
         {
           "description": "Remove failover provider `index` (from 0).",
           "properties": {
+            "expect": {
+              "description": "The `name` the client showed at `index` (protocol 1.23): the\ndaemon refuses when another provider is there now. Empty: no\ncheck (an older client).",
+              "type": "string"
+            },
             "index": {
               "format": "uint32",
               "minimum": 0,
@@ -4908,6 +4912,10 @@
         {
           "description": "Move failover `index` to place `to` (both from 0), its keys with it:\nfailovers are tried in order (protocol 1.22).",
           "properties": {
+            "expect": {
+              "description": "As `RemoveFailover`'s `expect` (protocol 1.23).",
+              "type": "string"
+            },
             "index": {
               "format": "uint32",
               "minimum": 0,

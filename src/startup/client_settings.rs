@@ -307,6 +307,10 @@ fn provider_args(action: &str, provider: &ProviderChoice) -> Value {
 }
 
 /// The settings side of the daemon's client host.
+/// The refusal for a failover change made from an out-of-date page.
+pub(crate) const STALE_FAILOVERS: &str =
+    "The providers changed since this page was read; it shows them as they are now. Try again.";
+
 pub(crate) struct SettingsHost {
     pub config_path: PathBuf,
     pub tool: ConfigManagerTool,
@@ -546,10 +550,10 @@ impl SettingsHost {
             SettingsChange::AddFailover { provider, .. } => {
                 provider_args("add_failover_provider", provider)
             }
-            SettingsChange::RemoveFailover { index } => {
+            SettingsChange::RemoveFailover { index, .. } => {
                 json!({"action": "remove_failover_provider", "failover_index": index})
             }
-            SettingsChange::MoveFailover { index, to } => json!({
+            SettingsChange::MoveFailover { index, to, .. } => json!({
                 "action": "move_failover_provider",
                 "failover_index": index,
                 "failover_to_index": to,
@@ -566,6 +570,22 @@ impl SettingsHost {
             risk: Risk::High,
             other_device,
         };
+        // A change to failover `index` made from a page that showed another
+        // provider there (the order changed since it was read) is refused:
+        // it would move or remove the wrong one.
+        if let SettingsChange::MoveFailover { index, expect, .. }
+        | SettingsChange::RemoveFailover { index, expect } = change
+            && !expect.is_empty()
+        {
+            let current = self.current().map_err(|e| e.to_string())?;
+            let there = client_providers::connected(&current)
+                .into_iter()
+                .find(|p| p.failover == Some(*index))
+                .map(|p| p.name);
+            if there.as_deref() != Some(expect.as_str()) {
+                return Err(STALE_FAILOVERS.to_string());
+            }
+        }
         if let SettingsChange::Set { key, value } = change {
             let current = self.current().map_err(|e| e.to_string())?;
             if let Some(widens) = widens_authority(key, value.as_deref(), &current) {
@@ -1341,6 +1361,50 @@ default = "synthetic-model-1"
             .await
             .unwrap();
         assert!(settings_upkeep::trial_active(&host.config_path));
+    }
+
+    #[tokio::test]
+    async fn a_failover_change_from_an_out_of_date_page_is_refused() {
+        let _keychain = crate::testing::KeychainIsolation::acquire();
+        let (_dir, host) = host(
+            r#"
+[provider]
+kind = "anthropic"
+api_key = "keychain"
+
+[[provider.fallbacks]]
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "keychain"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "keychain"
+"#,
+        )
+        .await;
+        let shown = host.settings().await.unwrap().connected;
+        let (first, second) = (shown[1].name.clone(), shown[2].name.clone());
+        assert_ne!(first, second);
+        // What the page shows at failover 1 is there: the move goes ahead.
+        let up = SettingsChange::MoveFailover {
+            index: 1,
+            to: 0,
+            expect: second.clone(),
+        };
+        assert_eq!(host.gate(&up).await.unwrap(), SettingsGate::Free);
+        // The page shows another provider there: refused, for either change.
+        let stale = SettingsChange::MoveFailover {
+            index: 1,
+            to: 0,
+            expect: first.clone(),
+        };
+        assert_eq!(host.gate(&stale).await.unwrap_err(), STALE_FAILOVERS);
+        let remove = SettingsChange::RemoveFailover {
+            index: 0,
+            expect: second,
+        };
+        assert_eq!(host.gate(&remove).await.unwrap_err(), STALE_FAILOVERS);
     }
 
     #[tokio::test]

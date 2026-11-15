@@ -1069,18 +1069,22 @@ fn connected_row(
     let order: Option<View> = provider.failover.map(|index| {
         let mut moves = view().flex_row().gap_1();
         let name = provider.name.clone();
+        // What this page shows there: the daemon refuses if it changed.
+        let up_name = name.clone();
         if index > 0 {
             moves = moves.child(
                 ui::icon_btn(Glyph::Up, format!("Move {name} up"), Size::Sm, move || {
                     store.change_settings(SettingsChange::MoveFailover {
                         index,
                         to: index - 1,
+                        expect: up_name.clone(),
                     })
                 })
                 .disabled(move || store.settings_busy()),
             );
         }
         let name = provider.name.clone();
+        let down_name = name.clone();
         if (index as usize) + 1 < failovers {
             moves = moves.child(
                 ui::icon_btn(
@@ -1091,6 +1095,7 @@ fn connected_row(
                         store.change_settings(SettingsChange::MoveFailover {
                             index,
                             to: index + 1,
+                            expect: down_name.clone(),
                         })
                     },
                 )
@@ -1102,6 +1107,7 @@ fn connected_row(
     // Removing a failover sits by its name, away from the everyday actions.
     let remove: Option<View> = provider.failover.map(|index| {
         let asked = format!("Remove {} ({role})?", provider.name);
+        let removed_name = provider.name.clone();
         view().child(ui::icon_btn(
             Glyph::Close,
             "Remove this failover",
@@ -1111,7 +1117,15 @@ fn connected_row(
                     asked.clone(),
                     "It is no longer tried when the providers before it fail.",
                     "Remove",
-                    move || store.change_settings(SettingsChange::RemoveFailover { index }),
+                    {
+                        let removed_name = removed_name.clone();
+                        move || {
+                            store.change_settings(SettingsChange::RemoveFailover {
+                                index,
+                                expect: removed_name.clone(),
+                            })
+                        }
+                    },
                 )
             },
         ))
