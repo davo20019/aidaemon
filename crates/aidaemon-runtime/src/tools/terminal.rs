@@ -421,36 +421,56 @@ struct CompletedProcess {
     completed_at: Instant,
 }
 
-/// Max agent re-engagements from background-command completions per session
-/// within [`REENGAGE_WINDOW`]. Beyond the cap the raw output is delivered
-/// instead of re-entering the agent loop. Guards against runaway cycles where
-/// a re-engaged task stalls, spawns another background command, and its
-/// completion re-engages again (observed 2026-06-06: a stalled task re-spawned
-/// whole-home `find` scans, burning ~24k-token LLM calls for ~30 minutes).
-const MAX_REENGAGEMENTS_PER_WINDOW: usize = 3;
+/// Max agent re-engagements from the completions of one background job (the
+/// same command, the same CLI agent) per session within [`REENGAGE_WINDOW`].
+/// Beyond it the raw output is delivered instead of re-entering the agent
+/// loop. Guards against runaway cycles where a re-engaged task stalls,
+/// spawns the same background command again, and its completion re-engages
+/// again (observed 2026-06-06: a stalled task re-spawned whole-home `find`
+/// scans, burning ~24k-token LLM calls for ~30 minutes). Different jobs are
+/// progress: build, then test, then check (live 2026-11-15: a coding task
+/// was cut off after Codex, a format check and a test run).
+const MAX_REENGAGEMENTS_PER_JOB: usize = 2;
+/// Max re-engagements per session within [`REENGAGE_WINDOW`], whatever the
+/// jobs: a backstop.
+const MAX_REENGAGEMENTS_PER_WINDOW: usize = 12;
 /// Sliding window for the re-engagement cap.
 const REENGAGE_WINDOW: Duration = Duration::from_secs(600);
 const BACKGROUND_DELIVERY_DEDUPE_WINDOW: Duration = Duration::from_secs(600);
 
-/// Sliding-window limiter for background-completion agent re-engagements.
-/// Records `now` and returns `true` when the session still has budget;
-/// returns `false` (recording nothing) once the cap is reached.
+/// Sliding-window limiter for background-completion agent re-engagements:
+/// `job` names what completed (a command line, a CLI agent). Records `now`
+/// and returns `true` when the session still has budget for it; returns
+/// `false` (recording nothing) once that job repeated past its cap or the
+/// session reached its total.
 pub fn reengagement_allowed(
     log: &mut HashMap<String, std::collections::VecDeque<Instant>>,
     session_id: &str,
+    job: &str,
     now: Instant,
 ) -> bool {
-    let entries = log.entry(session_id.to_string()).or_default();
-    while entries
-        .front()
-        .is_some_and(|t| now.duration_since(*t) >= REENGAGE_WINDOW)
+    let job_key = format!(
+        "{session_id}\u{1f}{}",
+        job.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    let mut within = |key: &str, cap: usize| {
+        let entries = log.entry(key.to_string()).or_default();
+        while entries
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= REENGAGE_WINDOW)
+        {
+            entries.pop_front();
+        }
+        entries.len() < cap
+    };
+    if !within(session_id, MAX_REENGAGEMENTS_PER_WINDOW)
+        || !within(&job_key, MAX_REENGAGEMENTS_PER_JOB)
     {
-        entries.pop_front();
-    }
-    if entries.len() >= MAX_REENGAGEMENTS_PER_WINDOW {
         return false;
     }
-    entries.push_back(now);
+    for key in [session_id.to_string(), job_key] {
+        log.entry(key).or_default().push_back(now);
+    }
     true
 }
 
@@ -6226,6 +6246,7 @@ impl TerminalTool {
                                         reengagement_allowed(
                                             &mut log,
                                             &session_for_notify,
+                                            &command_for_notify,
                                             Instant::now(),
                                         )
                                     };
@@ -11660,45 +11681,44 @@ mod tests {
     }
 
     #[test]
-    fn test_reengagement_allowed_caps_per_session_window() {
+    fn test_reengagement_allowed_caps_a_repeating_job_not_progress() {
         let mut log = HashMap::new();
         let t0 = Instant::now();
 
-        // First MAX_REENGAGEMENTS_PER_WINDOW re-engagements pass.
-        for i in 0..MAX_REENGAGEMENTS_PER_WINDOW {
-            assert!(
-                reengagement_allowed(&mut log, "session-a", t0),
-                "re-engagement {} should be allowed",
-                i
-            );
+        // The same job re-engages twice, then its output goes out raw.
+        for _ in 0..MAX_REENGAGEMENTS_PER_JOB {
+            assert!(reengagement_allowed(&mut log, "s", "find ~ -name x", t0));
         }
-        // The next one within the window is blocked.
-        assert!(!reengagement_allowed(&mut log, "session-a", t0));
+        assert!(!reengagement_allowed(&mut log, "s", "find  ~ -name x", t0));
+
+        // Other jobs in the same session are progress: build, test, check.
+        assert!(reengagement_allowed(&mut log, "s", "cargo build", t0));
+        assert!(reengagement_allowed(&mut log, "s", "cargo test -q", t0));
+        assert!(reengagement_allowed(&mut log, "s", "cargo clippy", t0));
 
         // A different session has its own budget.
-        assert!(reengagement_allowed(&mut log, "session-b", t0));
+        assert!(reengagement_allowed(
+            &mut log,
+            "other",
+            "find ~ -name x",
+            t0
+        ));
 
-        // After the window elapses, the budget refills.
+        // After the window elapses, the repeating job's budget refills.
         let later = t0 + REENGAGE_WINDOW + Duration::from_secs(1);
-        assert!(reengagement_allowed(&mut log, "session-a", later));
+        assert!(reengagement_allowed(&mut log, "s", "find ~ -name x", later));
     }
 
     #[test]
-    fn test_reengagement_allowed_sliding_window_partial_expiry() {
+    fn test_reengagement_allowed_has_a_session_backstop() {
         let mut log = HashMap::new();
         let t0 = Instant::now();
-
-        assert!(reengagement_allowed(&mut log, "s", t0));
-        let mid = t0 + REENGAGE_WINDOW / 2;
-        assert!(reengagement_allowed(&mut log, "s", mid));
-        assert!(reengagement_allowed(&mut log, "s", mid));
-        // Budget exhausted at mid-window.
-        assert!(!reengagement_allowed(&mut log, "s", mid));
-
-        // Just past the first entry's expiry, exactly one slot frees up.
-        let after_first = t0 + REENGAGE_WINDOW + Duration::from_secs(1);
-        assert!(reengagement_allowed(&mut log, "s", after_first));
-        assert!(!reengagement_allowed(&mut log, "s", after_first));
+        for n in 0..MAX_REENGAGEMENTS_PER_WINDOW {
+            assert!(reengagement_allowed(&mut log, "s", &format!("job {n}"), t0));
+        }
+        assert!(!reengagement_allowed(&mut log, "s", "one more job", t0));
+        let later = t0 + REENGAGE_WINDOW + Duration::from_secs(1);
+        assert!(reengagement_allowed(&mut log, "s", "one more job", later));
     }
 
     fn extract_pid_from_background_message(msg: &str) -> u32 {

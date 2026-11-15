@@ -3299,6 +3299,7 @@ impl CliAgentTool {
                             crate::tools::terminal::reengagement_allowed(
                                 &mut log,
                                 &notify_session_id,
+                                &format!("cli_agent {tool_name_owned}"),
                                 Instant::now(),
                             )
                         };
