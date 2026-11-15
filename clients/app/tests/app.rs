@@ -434,11 +434,13 @@ fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
     feed([frame(
-        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday at 9:00 AM ET","status":"active","edit":{"when":"every weekday at 9am","instructions":"Summarize the synthetic inbox"}}]}}"#,
+        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday at 9:00 AM ET","status":"active","edit":{"when":"every weekday at 9am","instructions":"Summarize the synthetic inbox","notify":"every_run"}}]}}"#,
     )]);
     app.wait_for("Inbox digest")?;
     app.press("Edit")?;
     app.wait_for("Changes apply from its next run.")?;
+    // What its runs tell you is part of it.
+    app.wait_for("Every run")?;
     app.type_text("label:When it runs", " and saturdays")?;
     app.press("Save")?;
     // The form closes; the answer brings the list as it is now.

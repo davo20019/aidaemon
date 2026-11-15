@@ -452,6 +452,8 @@ fn edit_form(
     let new_when = signal(edit.when.clone());
     let instructions = edit.instructions.clone();
     let new_instructions = signal(instructions.clone().unwrap_or_default());
+    let notify_was = edit.notify;
+    let new_notify = signal(notify_was);
     let changed = |now: String, was: &str| {
         let now = now.trim().to_owned();
         (!now.is_empty() && now != was.trim()).then_some(now)
@@ -466,6 +468,9 @@ fn edit_form(
                 instructions
                     .as_deref()
                     .and_then(|was| changed(new_instructions.get_untracked(), was)),
+                new_notify
+                    .get_untracked()
+                    .filter(|now| Some(*now) != notify_was),
             )
         }
     };
@@ -477,6 +482,7 @@ fn edit_form(
                 && instructions
                     .as_deref()
                     .is_none_or(|was| changed(new_instructions.get(), was).is_none())
+                && new_notify.get() == notify_was
         }
     };
     let mut form = view()
@@ -486,6 +492,37 @@ fn edit_form(
         .child(ui::field("Every weekday at 9am", new_when).label("When it runs"));
     if instructions.is_some() {
         form = form.child(ui::area("What each run does", new_instructions).label("What it does"));
+    }
+    // Quiet unless it matters: what its runs tell you (a reminder always
+    // does). A quiet run is still in its history.
+    if notify_was.is_some() {
+        use aidaemon_client_protocol::AutomationNotify as Notify;
+        let key = |mode: Notify| match mode {
+            Notify::EveryRun => "every_run",
+            Notify::Changes => "changes",
+            Notify::Problems => "problems",
+            Notify::Unknown => "",
+        };
+        form = form.child(ui::choice(
+            "Tell me",
+            "Every run",
+            vec![
+                ("every_run".to_owned(), "Every run".to_owned()),
+                (
+                    "changes".to_owned(),
+                    "Only when something changes".to_owned(),
+                ),
+                ("problems".to_owned(), "Only about problems".to_owned()),
+            ],
+            move || new_notify.get().map(|mode| key(mode).to_owned()),
+            move |chosen| {
+                new_notify.set(match chosen.as_deref() {
+                    Some("changes") => Some(Notify::Changes),
+                    Some("problems") => Some(Notify::Problems),
+                    _ => Some(Notify::EveryRun),
+                })
+            },
+        ));
     }
     form.child(
         text("Changes apply from its next run.")

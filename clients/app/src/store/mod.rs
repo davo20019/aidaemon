@@ -1256,6 +1256,7 @@ impl Store {
         name: Option<String>,
         when: Option<String>,
         instructions: Option<String>,
+        notify: Option<aidaemon_client_protocol::AutomationNotify>,
     ) {
         if self.automations_request.with(|r| r.is_some()) {
             return;
@@ -1267,6 +1268,7 @@ impl Store {
             name,
             when,
             instructions,
+            notify,
         });
         self.automations_request.replace(Some(request));
     }
