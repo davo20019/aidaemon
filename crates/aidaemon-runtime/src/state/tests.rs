@@ -5257,6 +5257,100 @@ async fn a_forgotten_fact_stays_forgotten_in_every_category() {
 }
 
 #[tokio::test]
+async fn one_value_under_a_reworded_key_is_stored_once_in_any_category() {
+    let (store, _db) = setup_test_store().await;
+    let write = |category: &'static str, key: &'static str, channel: Option<&'static str>| {
+        let store = &store;
+        async move {
+            store
+                .upsert_fact(
+                    category,
+                    key,
+                    "/srv/sites/acme-app",
+                    "consolidation",
+                    channel,
+                    FactPrivacy::Channel,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    write("project", "acme_app_local_path", None).await;
+    write("technical", "acme_app_path", None).await;
+    let active = store.get_facts(None).await.unwrap();
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0].key, "acme_app_local_path");
+
+    // Another channel's copy is its own scope.
+    write("technical", "acme_app_path", Some("slack:synthetic-team")).await;
+    assert_eq!(store.get_facts(None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_folded_key_writes_through_to_the_fact_that_kept_it() {
+    let (store, _db) = setup_test_store().await;
+    let now = Utc::now().to_rfc3339();
+    // Seed the copies directly: write-time folding would refuse the second.
+    for (category, key, recall) in [
+        ("project", "acme_app_local_path", 5_i64),
+        ("technical", "acme_app_path", 0),
+    ] {
+        let text = aidaemon_memory::sqlite::build_fact_embedding_text(
+            category,
+            key,
+            "/srv/sites/acme-app",
+        );
+        let vector = store
+            .embedding_service
+            .embed(&[text])
+            .await
+            .unwrap()
+            .remove(0);
+        sqlx::query(
+            "INSERT INTO facts (category, key, value, source, created_at, updated_at, recall_count, privacy, embedding)
+             VALUES (?, ?, '/srv/sites/acme-app', 'consolidation', ?, ?, ?, 'channel', ?)",
+        )
+        .bind(category)
+        .bind(key)
+        .bind(&now)
+        .bind(&now)
+        .bind(recall)
+        .bind(aidaemon_memory::encode_embedding(&vector))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(store.fold_restated_facts().await.unwrap(), 1);
+    let (reason, into): (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT superseded_reason, folded_into FROM facts WHERE key = 'acme_app_path'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(reason.as_deref(), Some("folded"));
+    assert!(into.is_some());
+
+    // The app moved: the extractor writes the folded key again.
+    store
+        .upsert_fact(
+            "technical",
+            "acme_app_path",
+            "/opt/sites/acme-app",
+            "consolidation",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    let active = store.get_facts(None).await.unwrap();
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(
+        (active[0].key.as_str(), active[0].value.as_str()),
+        ("acme_app_local_path", "/opt/sites/acme-app")
+    );
+}
+
+#[tokio::test]
 async fn fold_restated_facts_keeps_the_most_authoritative_copy() {
     let (store, _db) = setup_test_store().await;
     let now = Utc::now().to_rfc3339();

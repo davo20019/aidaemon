@@ -285,12 +285,13 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     // Backfill legacy source values: facts with an unknown source are marked
     // "inferred". The allowlist MUST contain every source value live writers
-    // stamp ('progressive' from progressive extraction, 'agent' from
+    // stamp ('progressive' from progressive extraction, 'owner_quoted' from
+    // its quote-checked flat facts, 'agent' from
     // remember_fact, 'task_learning' from task learning, 'consolidation' from
     // memory consolidation, plus the stamped 'user_stated'/'derived'
     // provenance values) — this runs on every startup, so anything missing
     // here gets its provenance permanently scrubbed.
-    sqlx::query("UPDATE facts SET source = 'inferred' WHERE source NOT IN ('consolidation', 'user_stated', 'derived', 'inferred', 'progressive', 'agent', 'task_learning')")
+    sqlx::query("UPDATE facts SET source = 'inferred' WHERE source NOT IN ('consolidation', 'user_stated', 'derived', 'inferred', 'progressive', 'owner_quoted', 'agent', 'task_learning')")
         .execute(pool)
         .await?;
 

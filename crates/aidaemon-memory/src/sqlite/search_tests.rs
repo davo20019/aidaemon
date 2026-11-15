@@ -307,7 +307,8 @@ async fn fact_dedup_embeds_each_stored_key_once() {
                 .upsert_fact(
                     "project",
                     &key,
-                    "synthetic value",
+                    // Distinct values: one value under many keys is one fact.
+                    &format!("synthetic value for {key}"),
                     "synthetic",
                     None,
                     FactPrivacy::Global,
@@ -405,5 +406,109 @@ async fn a_new_embedding_model_replaces_every_vector_of_the_old_one() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// The active value at `category/key`, with its source.
+async fn active_at(memory: &SqliteMemory, category: &str, key: &str) -> Option<(String, String)> {
+    sqlx::query_as(
+        "SELECT value, source FROM facts WHERE category = ? AND key = ? AND superseded_at IS NULL",
+    )
+    .bind(category)
+    .bind(key)
+    .fetch_optional(&memory.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_value_quoted_from_the_owner_outranks_inferred_ones() {
+    let (memory, _file) = open().await;
+    let write = |value: &'static str, source: &'static str| {
+        let memory = memory.clone();
+        async move {
+            memory
+                .upsert_fact_with_provenance(
+                    "preference",
+                    "tea",
+                    value,
+                    source,
+                    None,
+                    FactPrivacy::Channel,
+                    Some(chrono::Utc::now()),
+                    Some("my tea is oolong"),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    // Quoted replaces inferred.
+    write("green tea", "consolidation").await;
+    write("oolong", OWNER_QUOTED_SOURCE).await;
+    assert_eq!(
+        active_at(&memory, "preference", "tea").await,
+        Some(("oolong".into(), OWNER_QUOTED_SOURCE.into()))
+    );
+    // An older consolidation batch cannot revert it, and restating it does
+    // not lower its rank.
+    write("green tea", "consolidation").await;
+    write("oolong", "consolidation").await;
+    assert_eq!(
+        active_at(&memory, "preference", "tea").await,
+        Some(("oolong".into(), OWNER_QUOTED_SOURCE.into()))
+    );
+    // A new quote changes it; an explicit statement outranks a quote.
+    write("rooibos", OWNER_QUOTED_SOURCE).await;
+    write("mint", "agent").await;
+    write("chamomile", OWNER_QUOTED_SOURCE).await;
+    assert_eq!(
+        active_at(&memory, "preference", "tea").await,
+        Some(("mint".into(), "agent".into()))
+    );
+}
+
+#[tokio::test]
+async fn quoting_an_inferred_fact_raises_it_to_the_quote() {
+    let (memory, _file) = open().await;
+    memory
+        .upsert_fact(
+            "project",
+            "acme_app_path",
+            "/srv/sites/acme-app",
+            "consolidation",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    memory
+        .upsert_fact_with_provenance(
+            "project",
+            "acme_app_path",
+            "/srv/sites/acme-app",
+            OWNER_QUOTED_SOURCE,
+            None,
+            FactPrivacy::Channel,
+            Some(chrono::Utc::now()),
+            Some("acme app lives in /srv/sites/acme-app"),
+        )
+        .await
+        .unwrap();
+    let excerpt: Option<String> = sqlx::query_scalar(
+        "SELECT source_excerpt FROM facts WHERE key = 'acme_app_path' AND superseded_at IS NULL",
+    )
+    .fetch_one(&memory.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        active_at(&memory, "project", "acme_app_path")
+            .await
+            .unwrap()
+            .1,
+        OWNER_QUOTED_SOURCE
+    );
+    assert_eq!(
+        excerpt.as_deref(),
+        Some("acme app lives in /srv/sites/acme-app")
     );
 }

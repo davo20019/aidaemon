@@ -1804,6 +1804,26 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if args.iter().any(|a| a == "--fact-dup-audit") {
+        fact_dup_audit(&pool).await?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--fact-conflict-audit") {
+        fact_conflict_audit(&pool, args.iter().any(|a| a == "--apply")).await?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--retire-inferred-behavior") {
+        retire_inferred_behavior(&pool, args.iter().any(|a| a == "--apply")).await?;
+        return Ok(());
+    }
+    if let Some(days) = args
+        .windows(2)
+        .find(|w| w[0] == "--fact-quality")
+        .and_then(|w| w[1].parse::<i64>().ok())
+    {
+        fact_quality(&pool, days).await?;
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--goals") {
         print_scheduled_goal_state(&pool).await?;
         return Ok(());
@@ -3281,5 +3301,344 @@ async fn print_scheduled_goal_state(pool: &SqlitePool) -> anyhow::Result<()> {
           ORDER BY created_at DESC LIMIT 20",
     )
     .await?;
+    Ok(())
+}
+
+/// Active facts with a vector, as the fold planner reads them.
+async fn fact_fold_candidates(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<aidaemon_memory::sqlite::FoldCandidate>> {
+    let rows = sqlx::query(
+        "SELECT id, category, key, value, source, COALESCE(recall_count, 0) AS recall_count,
+                COALESCE(privacy, 'global') AS privacy, channel_id, embedding
+         FROM facts WHERE superseded_at IS NULL AND embedding IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let blob: Vec<u8> = row.get("embedding");
+            let vector = aidaemon_memory::decode_embedding(&blob)?;
+            let category: String = row.get("category");
+            let source: String = row.get("source");
+            Some(aidaemon_memory::sqlite::FoldCandidate {
+                id: row.get("id"),
+                pinned: aidaemon_memory::full::recall::IDENTITY_CATEGORIES
+                    .contains(&category.trim().to_ascii_lowercase().as_str()),
+                category,
+                key: row.get("key"),
+                value: row.get("value"),
+                source_rank: aidaemon_memory::sqlite::fact_source_rank(&source),
+                recall_count: row.get("recall_count"),
+                privacy: row.get("privacy"),
+                channel_id: row.get("channel_id"),
+                vector,
+            })
+        })
+        .collect())
+}
+
+/// Dry run of the maintenance fold pass: every fact it would retire, the
+/// fact that would keep its knowledge, and which rule matched. Writes
+/// nothing; the daemon's maintenance pass applies the same plan.
+async fn fact_dup_audit(pool: &SqlitePool) -> anyhow::Result<()> {
+    use aidaemon_memory::sqlite::{FoldRule, plan_folds};
+    let mut candidates = fact_fold_candidates(pool).await?;
+    let by_id: std::collections::HashMap<i64, (String, String, String)> = candidates
+        .iter()
+        .map(|c| (c.id, (c.category.clone(), c.key.clone(), c.value.clone())))
+        .collect();
+    let mut folds = plan_folds(&mut candidates);
+    folds.sort_by(|a, b| a.similarity.total_cmp(&b.similarity));
+    let mut rules = std::collections::BTreeMap::<&str, usize>::new();
+    let mut cross_category = 0usize;
+    println!("== fact dup audit: {} active facts ==", by_id.len());
+    for fold in &folds {
+        let (fc, fk, fv) = &by_id[&fold.folded];
+        let (kc, kk, _) = &by_id[&fold.kept];
+        let rule = match fold.rule {
+            FoldRule::Restatement => "restatement",
+            FoldRule::OneValue => "one-value",
+        };
+        *rules.entry(rule).or_default() += 1;
+        cross_category += usize::from(!fc.eq_ignore_ascii_case(kc));
+        println!(
+            "- {:.3} {rule:<11} {fc}/{fk} -> {kc}/{kk} = {}",
+            fold.similarity,
+            fv.chars().take(60).collect::<String>()
+        );
+    }
+    println!(
+        "== {} folds ({} across categories): {:?} ==",
+        folds.len(),
+        cross_category,
+        rules
+    );
+    Ok(())
+}
+
+/// Active fact pairs that look like one attribute with two values: whole-fact
+/// similarity of at least 0.90, keys naming the same attribute, and values
+/// whose numbers differ. Each gets a default: the owner-stated row wins, else
+/// the one first seen later. `--apply` retires every loser as `replaced`,
+/// pointing at the winner; restart the daemon afterwards so recall's
+/// projections catch up.
+async fn fact_conflict_audit(pool: &SqlitePool, apply: bool) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, category, key, value, source, COALESCE(first_seen_at, created_at) AS seen,
+                COALESCE(recall_count, 0) AS recall_count, COALESCE(privacy, 'global') AS privacy,
+                channel_id, source_excerpt, embedding
+         FROM facts WHERE superseded_at IS NULL AND embedding IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    struct Row {
+        id: i64,
+        category: String,
+        key: String,
+        value: String,
+        source: String,
+        seen: String,
+        recall: i64,
+        scope: (String, Option<String>),
+        excerpt: Option<String>,
+        numbers: std::collections::BTreeSet<String>,
+        vector: Vec<f32>,
+    }
+    let rows: Vec<Row> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let value: String = row.get("value");
+            let numbers = value
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
+                .map(str::to_lowercase)
+                .collect();
+            Some(Row {
+                id: row.get("id"),
+                category: row.get("category"),
+                key: row.get("key"),
+                value,
+                source: row.get("source"),
+                seen: row.get("seen"),
+                recall: row.get("recall_count"),
+                scope: (row.get("privacy"), row.get("channel_id")),
+                excerpt: row.get("source_excerpt"),
+                numbers,
+                vector: aidaemon_memory::decode_embedding(&row.get::<Vec<u8>, _>("embedding"))?,
+            })
+        })
+        .collect();
+    let owner = |r: &Row| aidaemon_memory::sqlite::is_owner_authored_fact_source(&r.source);
+    let mut losers: Vec<(i64, i64)> = Vec::new();
+    let mut pairs = 0usize;
+    println!("== fact conflict audit ==");
+    for (i, a) in rows.iter().enumerate() {
+        for b in &rows[i + 1..] {
+            if a.numbers == b.numbers || a.scope != b.scope {
+                continue;
+            }
+            if !aidaemon_memory::sqlite::keys_name_same_attribute(&a.key, &b.key) {
+                continue;
+            }
+            let similarity = aidaemon_memory::cosine(&a.vector, &b.vector);
+            if similarity < 0.90 {
+                continue;
+            }
+            pairs += 1;
+            let winner = match (owner(a), owner(b)) {
+                (true, false) => Some(a),
+                (false, true) => Some(b),
+                (true, true) => None,
+                (false, false) => Some(if a.seen >= b.seen { a } else { b }),
+            };
+            let verdict = match winner {
+                Some(w) => {
+                    let loser = if w.id == a.id { b } else { a };
+                    losers.push((loser.id, w.id));
+                    format!("keep #{}, retire #{}", w.id, loser.id)
+                }
+                None => "both owner-stated: review by hand".to_string(),
+            };
+            println!("- {similarity:.3} {verdict}");
+            for r in [a, b] {
+                println!(
+                    "    #{} {}/{} = {} [{} seen {} recalled {}] {}",
+                    r.id,
+                    r.category,
+                    r.key,
+                    r.value.chars().take(70).collect::<String>(),
+                    r.source,
+                    r.seen.chars().take(10).collect::<String>(),
+                    r.recall,
+                    r.excerpt
+                        .as_deref()
+                        .map(|e| format!("\"{}\"", e.chars().take(60).collect::<String>()))
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
+    // One retirement per row, even when it lost to several.
+    losers.sort();
+    losers.dedup_by_key(|(loser, _)| *loser);
+    println!("== {pairs} pairs, {} rows to retire ==", losers.len());
+    if !apply {
+        println!("Dry run. Add --apply to retire them.");
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for (loser, winner) in &losers {
+        sqlx::query(
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced', folded_into = ?
+             WHERE id = ? AND superseded_at IS NULL",
+        )
+        .bind(&now)
+        .bind(winner)
+        .bind(loser)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    println!(
+        "Retired {} rows. Restart the daemon so recall's projections catch up.",
+        losers.len()
+    );
+    Ok(())
+}
+
+/// Retire every `behavior` fact a background extractor wrote. Extractors
+/// read one session or one task, so they cannot observe a habit; owner-stated
+/// behavior rows stay. Retired, not deleted: the rows stay recoverable
+/// until retention removes old superseded rows, and `--apply` first writes
+/// them to a JSON backup.
+async fn retire_inferred_behavior(pool: &SqlitePool, apply: bool) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, key, value, source, COALESCE(recall_count, 0) AS recall_count
+         FROM facts
+         WHERE superseded_at IS NULL AND LOWER(TRIM(category)) = 'behavior'
+         ORDER BY recall_count DESC, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            !aidaemon_memory::sqlite::is_owner_authored_fact_source(&row.get::<String, _>("source"))
+        })
+        .collect();
+    println!("== {} inferred behavior facts ==", rows.len());
+    for row in rows.iter().take(20) {
+        println!(
+            "- #{} recalled {} {} = {}",
+            row.get::<i64, _>("id"),
+            row.get::<i64, _>("recall_count"),
+            row.get::<String, _>("key"),
+            row.get::<String, _>("value")
+                .chars()
+                .take(90)
+                .collect::<String>()
+        );
+    }
+    if !apply {
+        println!("Dry run (top 20 by recall shown). Add --apply to retire them.");
+        return Ok(());
+    }
+    let backup: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i64, _>("id"),
+                "key": row.get::<String, _>("key"),
+                "value": row.get::<String, _>("value"),
+                "source": row.get::<String, _>("source"),
+                "recall_count": row.get::<i64, _>("recall_count"),
+            })
+        })
+        .collect();
+    let path = format!(
+        "retired-behavior-facts-{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    std::fs::write(&path, serde_json::to_string_pretty(&backup)?)
+        .with_context(|| format!("writing backup {path}"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for row in &rows {
+        sqlx::query(
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'retired'
+             WHERE id = ? AND superseded_at IS NULL",
+        )
+        .bind(&now)
+        .bind(row.get::<i64, _>("id"))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    println!(
+        "Retired {} rows; backup in {path}. Restart the daemon so recall's projections catch up.",
+        rows.len()
+    );
+    Ok(())
+}
+
+/// Memory write quality over the last `days`: new facts by source and
+/// category, how many landed beside an identical value already stored, and
+/// how many retired rows were brought back.
+async fn fact_quality(pool: &SqlitePool, days: i64) -> anyhow::Result<()> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let by_source = sqlx::query(
+        "SELECT source, category, COUNT(*) AS n FROM facts
+         WHERE created_at >= ? GROUP BY source, category ORDER BY n DESC",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await?;
+    println!("== new facts in the last {days} days, by source/category ==");
+    for row in &by_source {
+        println!(
+            "- {}/{}: {}",
+            row.get::<String, _>("source"),
+            row.get::<String, _>("category"),
+            row.get::<i64, _>("n")
+        );
+    }
+    let same_value: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM facts n WHERE n.created_at >= ? AND n.superseded_at IS NULL
+           AND EXISTS (SELECT 1 FROM facts o WHERE o.id <> n.id AND o.superseded_at IS NULL
+                        AND LOWER(TRIM(o.value)) = LOWER(TRIM(n.value)) AND o.created_at < n.created_at)",
+    )
+    .bind(&since)
+    .fetch_one(pool)
+    .await?;
+    let resurrected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM facts n WHERE n.created_at >= ? AND n.superseded_at IS NULL
+           AND n.source IN ('consolidation', 'progressive', 'owner_quoted', 'task_learning')
+           AND EXISTS (SELECT 1 FROM facts d WHERE d.superseded_reason = 'deleted'
+                        AND LOWER(TRIM(d.value)) = LOWER(TRIM(n.value))
+                        AND d.superseded_at < n.created_at)",
+    )
+    .bind(&since)
+    .fetch_one(pool)
+    .await?;
+    let retired = sqlx::query(
+        "SELECT COALESCE(superseded_reason, 'unrecorded') AS reason, COUNT(*) AS n FROM facts
+         WHERE superseded_at >= ? GROUP BY reason ORDER BY n DESC",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await?;
+    println!("== active new facts beside an older identical value: {same_value} ==");
+    println!("== automated facts matching a value the owner deleted: {resurrected} ==");
+    println!("== rows retired, by reason ==");
+    for row in &retired {
+        println!(
+            "- {}: {}",
+            row.get::<String, _>("reason"),
+            row.get::<i64, _>("n")
+        );
+    }
     Ok(())
 }

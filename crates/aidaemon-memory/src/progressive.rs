@@ -437,7 +437,9 @@ impl ProgressiveExtractor {
                     &fact.category,
                     &fact.key,
                     &fact.value,
-                    "progressive",
+                    // Admissible: asserted, with a verbatim quote from the
+                    // owner's own message.
+                    crate::sqlite::OWNER_QUOTED_SOURCE,
                     exchange.channel_id,
                     privacy,
                     Some(first_seen_at),
@@ -1028,7 +1030,7 @@ mod tests {
             vec![Stored {
                 key: "employer".into(),
                 value: "Acme Corp".into(),
-                source: "progressive".into(),
+                source: crate::sqlite::OWNER_QUOTED_SOURCE.into(),
                 excerpt: Some("I work at  ACME Corp now.".into()),
             }]
         );

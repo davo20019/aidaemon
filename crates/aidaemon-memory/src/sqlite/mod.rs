@@ -24,6 +24,7 @@ use aidaemon_core::ChannelVisibility;
 mod claims;
 mod episodes;
 mod export;
+mod fact_folds;
 mod facts;
 mod learning;
 mod people;
@@ -37,10 +38,14 @@ mod structured;
 pub(crate) use claims::memory_visible;
 pub use claims::{MemoryClaimRecord, project_message_span};
 pub use export::ExportFile;
+pub use fact_folds::{
+    FoldCandidate, FoldRule, ONE_VALUE_MIN_SIMILARITY, ONE_WORD_VALUE_MIN_SIMILARITY, PlannedFold,
+    facts_hold_one_value, plan_folds,
+};
 pub(crate) use facts::{FACT_RESTATEMENT_MIN_SIMILARITY, facts_make_the_same_claim};
 pub use facts::{
-    build_fact_embedding_text, fact_category_is_personal, facts_are_restatements,
-    is_owner_authored_fact_source,
+    OWNER_QUOTED_SOURCE, build_fact_embedding_text, fact_category_is_personal, fact_source_rank,
+    facts_are_restatements, is_owner_authored_fact_source, keys_name_same_attribute,
 };
 pub use retention::{MemoryRetention, MemoryRetentionPolicy, MemoryRetentionStats};
 pub use schema::{migrate, rebuild_memory_fts_projections};

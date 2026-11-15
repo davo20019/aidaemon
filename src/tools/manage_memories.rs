@@ -905,13 +905,14 @@ mod tests {
         let state = setup_state().await;
         let tool = test_tool(state.clone());
 
-        // Exact duplicate across categories should be cleaned up.
+        // Exact duplicate across categories should be cleaned up. Stated by
+        // the owner in both: an automated copy is folded at write time.
         state
             .upsert_fact(
                 "preferences",
                 "favorite_color",
                 "blue",
-                "test",
+                "agent",
                 None,
                 FactPrivacy::Global,
             )
@@ -922,7 +923,7 @@ mod tests {
                 "personal",
                 "favorite_color",
                 "blue",
-                "test",
+                "agent",
                 None,
                 FactPrivacy::Global,
             )
