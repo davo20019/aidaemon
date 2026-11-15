@@ -3378,18 +3378,22 @@ async fn fact_dup_audit(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Active fact pairs that look like one attribute with two values: whole-fact
-/// similarity of at least 0.90, keys naming the same attribute, and values
-/// whose numbers differ. Each gets a default: the owner-stated row wins, else
-/// the one first seen later. `--apply` retires every loser as `replaced`,
-/// pointing at the winner; restart the daemon afterwards so recall's
-/// projections catch up.
+/// Active fact pairs that may be one attribute with two values: whole-fact
+/// similarity of at least 0.90, one scope, and values whose numbers differ.
+/// Each gets a default: the owner-stated row wins, else, when the keys name
+/// the same attribute, the one first seen later; keys that may name two
+/// attributes (`version` / `previous_version`) are listed for review and kept.
+/// `behavior` rows are left to `--retire-inferred-behavior`. `--apply`
+/// retires every default loser as `replaced`, pointing at the winner;
+/// restart the daemon afterwards so recall's projections catch up.
 async fn fact_conflict_audit(pool: &SqlitePool, apply: bool) -> anyhow::Result<()> {
     let rows = sqlx::query(
         "SELECT id, category, key, value, source, COALESCE(first_seen_at, created_at) AS seen,
                 COALESCE(recall_count, 0) AS recall_count, COALESCE(privacy, 'global') AS privacy,
                 channel_id, source_excerpt, embedding
-         FROM facts WHERE superseded_at IS NULL AND embedding IS NOT NULL ORDER BY id",
+         FROM facts WHERE superseded_at IS NULL AND embedding IS NOT NULL
+           AND LOWER(TRIM(category)) <> 'behavior'
+         ORDER BY id",
     )
     .fetch_all(pool)
     .await?;
@@ -3439,9 +3443,7 @@ async fn fact_conflict_audit(pool: &SqlitePool, apply: bool) -> anyhow::Result<(
             if a.numbers == b.numbers || a.scope != b.scope {
                 continue;
             }
-            if !aidaemon_memory::sqlite::keys_name_same_attribute(&a.key, &b.key) {
-                continue;
-            }
+            let same_attribute = aidaemon_memory::sqlite::keys_name_same_attribute(&a.key, &b.key);
             let similarity = aidaemon_memory::cosine(&a.vector, &b.vector);
             if similarity < 0.90 {
                 continue;
@@ -3451,7 +3453,8 @@ async fn fact_conflict_audit(pool: &SqlitePool, apply: bool) -> anyhow::Result<(
                 (true, false) => Some(a),
                 (false, true) => Some(b),
                 (true, true) => None,
-                (false, false) => Some(if a.seen >= b.seen { a } else { b }),
+                (false, false) if same_attribute => Some(if a.seen >= b.seen { a } else { b }),
+                (false, false) => None,
             };
             let verdict = match winner {
                 Some(w) => {
@@ -3459,7 +3462,8 @@ async fn fact_conflict_audit(pool: &SqlitePool, apply: bool) -> anyhow::Result<(
                     losers.push((loser.id, w.id));
                     format!("keep #{}, retire #{}", w.id, loser.id)
                 }
-                None => "both owner-stated: review by hand".to_string(),
+                None if owner(a) && owner(b) => "both owner-stated: review by hand".to_string(),
+                None => "keys may name two attributes: kept, review by hand".to_string(),
             };
             println!("- {similarity:.3} {verdict}");
             for r in [a, b] {
