@@ -460,36 +460,48 @@ pub fn toasts(
             sync();
         }
     });
-    toast_stack()
-        .placement(Anchor::BottomCenter)
-        .state(state)
-        .w(px(360.0))
-        .child(each(
-            shown,
-            |(id, _, _)| *id,
-            move |item, _| {
-                toast()
-                    .transition_status(move || item.get().2)
-                    .accessibility_label(move || Some(item.get().1))
-                    .on_dismiss_request(move || {
-                        manager.with(|m| m.dismiss(&item.get().0, now()));
-                    })
-                    .rounded(px(radius::SURFACE))
-                    .px_4()
-                    .py_3()
-                    .bg(colors::PRIMARY)
-                    .shadow_lg()
-                    .transition_all()
-                    .duration(motion::ENTER)
-                    .starting_class("opacity-0 translate-y-4")
-                    .ending_class("opacity-0 scale-95")
-                    .child(
-                        text(move || item.get().1)
-                            .text_size(px(fit::small()))
-                            .text_color(colors::ON_PRIMARY),
-                    )
-            },
-        ))
+    // Over the page, not beside it: a layer at the bottom that takes no
+    // presses itself, so only the toasts do.
+    view()
+        .absolute()
+        .left(px(0.0))
+        .right(px(0.0))
+        .bottom(px(88.0))
+        .items_center()
+        .pointer_events(PointerEvents::BoxNone)
+        .child(
+            toast_stack()
+                .placement(Anchor::BottomCenter)
+                .state(state)
+                .w(px(360.0))
+                .max_w(percentage(0.92))
+                .child(each(
+                    shown,
+                    |(id, _, _)| *id,
+                    move |item, _| {
+                        toast()
+                            .transition_status(move || item.get().2)
+                            .accessibility_label(move || Some(item.get().1))
+                            .on_dismiss_request(move || {
+                                manager.with(|m| m.dismiss(&item.get().0, now()));
+                            })
+                            .rounded(px(radius::SURFACE))
+                            .px_4()
+                            .py_3()
+                            .bg(colors::PRIMARY)
+                            .shadow_lg()
+                            .transition_all()
+                            .duration(motion::ENTER)
+                            .starting_class("opacity-0 translate-y-4")
+                            .ending_class("opacity-0 scale-95")
+                            .child(
+                                text(move || item.get().1)
+                                    .text_size(px(fit::small()))
+                                    .text_color(colors::ON_PRIMARY),
+                            )
+                    },
+                )),
+        )
 }
 
 /// Side-by-side panes the owner resizes by dragging the line between them.

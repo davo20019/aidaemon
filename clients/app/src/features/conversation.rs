@@ -86,6 +86,7 @@ pub fn page(store: Store, session: Option<String>) -> View {
         None => welcome().into_element(),
     };
     view()
+        .test_id("conversation")
         .flex_1()
         .min_w(px(0.0))
         .child(header(store, session.clone()))

@@ -158,47 +158,53 @@ pub fn shell(store: Store) -> View {
 
 /// The page beside the panes: setup, pairing, a page or a conversation.
 fn page(store: Store, in_setup: Memo<bool>) -> impl IntoElement {
-    view().flex_1().h_full().child(dynamic(move || {
-        if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
-            return None;
-        }
-        if store.connection() == Connection::NoDaemon {
-            return Some(untracked(|| {
-                crate::features::setup::where_page(store).key("where")
-            }));
-        }
-        if in_setup.get() {
-            return Some(untracked(|| {
-                crate::features::setup::page(store).key("setup")
-            }));
-        }
-        if store.connection() == Connection::NeedsPairing {
-            return Some(untracked(|| {
-                crate::features::pairing::pairing(store).key("pairing")
-            }));
-        }
-        if store.page() == crate::store::Page::Memory {
-            return Some(untracked(|| {
-                crate::features::memory::page(store).key("memory")
-            }));
-        }
-        if store.page() == crate::store::Page::Settings {
-            return Some(untracked(|| {
-                crate::features::settings::page(store).key("settings")
-            }));
-        }
-        if store.page() == crate::store::Page::System {
-            return Some(untracked(|| {
-                crate::features::system::page(store).key("system")
-            }));
-        }
-        // A new page per conversation: its list and draft are its own.
-        let selected = store.selected();
-        Some(untracked(move || {
-            conversation::page(store, selected.clone())
-                .key(format!("conversation-{}", selected.unwrap_or_default()))
+    // A row, as the page's own `flex_1` grows along it: in a column it would
+    // take only the width its content asks for.
+    view()
+        .flex_1()
+        .flex_row()
+        .min_w(px(0.0))
+        .child(dynamic(move || {
+            if store.is_compact() && (store.sidebar_open() || store.inspector_open()) {
+                return None;
+            }
+            if store.connection() == Connection::NoDaemon {
+                return Some(untracked(|| {
+                    crate::features::setup::where_page(store).key("where")
+                }));
+            }
+            if in_setup.get() {
+                return Some(untracked(|| {
+                    crate::features::setup::page(store).key("setup")
+                }));
+            }
+            if store.connection() == Connection::NeedsPairing {
+                return Some(untracked(|| {
+                    crate::features::pairing::pairing(store).key("pairing")
+                }));
+            }
+            if store.page() == crate::store::Page::Memory {
+                return Some(untracked(|| {
+                    crate::features::memory::page(store).key("memory")
+                }));
+            }
+            if store.page() == crate::store::Page::Settings {
+                return Some(untracked(|| {
+                    crate::features::settings::page(store).key("settings")
+                }));
+            }
+            if store.page() == crate::store::Page::System {
+                return Some(untracked(|| {
+                    crate::features::system::page(store).key("system")
+                }));
+            }
+            // A new page per conversation: its list and draft are its own.
+            let selected = store.selected();
+            Some(untracked(move || {
+                conversation::page(store, selected.clone())
+                    .key(format!("conversation-{}", selected.unwrap_or_default()))
+            }))
         }))
-    }))
 }
 
 /// A binding that fires while the composer has the keyboard too.

@@ -15,9 +15,45 @@ fn frame(json: &str) -> Update {
 static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn start() -> Headless {
+    start_at(1280.0, 820.0)
+}
+
+fn start_at(width: f32, height: f32) -> Headless {
     let mut config = EngineConfig::new(Root::of::<Offline>());
-    config.viewport = Size::new(Points(1280.0), Points(820.0));
+    config.viewport = Size::new(Points(width), Points(height));
     Headless::start(config).unwrap()
+}
+
+/// How wide the conversation page was laid out.
+fn conversation_width(app: &Headless) -> f32 {
+    app.screen()
+        .layout_nodes()
+        .iter()
+        .find(|n| n.test_id.as_deref() == Some("conversation") && !n.hidden)
+        .map(|n| n.bounds.size.width.0)
+        .unwrap_or(0.0)
+}
+
+#[test]
+fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    // A phone: the page alone, as wide as the screen.
+    let mut app = start_at(390.0, 844.0);
+    app.wait_for("What should we work on?")?;
+    let phone = conversation_width(&app);
+    assert!(
+        phone > 380.0,
+        "conversation is {phone} pt wide on a 390 pt screen"
+    );
+    // A roomy window: the page takes what the panes leave.
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    let desk = conversation_width(&app);
+    assert!(
+        desk > 600.0,
+        "conversation is {desk} pt wide in a 1280 pt window"
+    );
+    Ok(())
 }
 
 #[test]
