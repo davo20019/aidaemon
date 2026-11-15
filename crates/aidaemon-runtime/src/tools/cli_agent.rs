@@ -1028,7 +1028,8 @@ fn format_cli_agent_failure(
     max_output: usize,
     diff_section: Option<&str>,
 ) -> String {
-    let captured = truncate_with_note(display_output, max_output);
+    // Its end stays: the error is usually last.
+    let captured = crate::tools::terminal::keep_head_and_tail(display_output, max_output);
     let details = if captured.trim().is_empty() {
         "No stdout or stderr was captured. The process terminated before it produced diagnostics."
             .to_string()
@@ -3971,7 +3972,7 @@ impl CliAgentTool {
                 agent.process_handle.display_id(),
                 agent.prompt_summary,
                 display_output.len(),
-                truncate_with_note(&display_output, 5000)
+                crate::tools::terminal::keep_head_and_tail(&display_output, 5000)
             ))
         }
     }
@@ -4027,7 +4028,7 @@ impl CliAgentTool {
             "Cancelled CLI agent '{}' (was running for {}s).\n\nOutput before cancellation:\n{}",
             agent.tool_name,
             elapsed,
-            truncate_with_note(&display_output, 5000)
+            crate::tools::terminal::keep_head_and_tail(&display_output, 5000)
         ))
     }
 

@@ -26,7 +26,7 @@ use crate::tools::traits::{
 use aidaemon_channels::hub::{MediaKind, MediaMessage};
 use aidaemon_channels::ports::OutboundRouter;
 use aidaemon_core::card::Step;
-use aidaemon_events::text::{truncate_str, truncate_with_note};
+use aidaemon_events::text::truncate_str;
 use aidaemon_events::{
     ApprovalDeniedData, ApprovalGrantedData, ApprovalRequestedData, DecisionPointData,
     DecisionType, DiagnosticSeverity, EventStore, EventType,
@@ -1322,7 +1322,7 @@ fn format_output(
 /// (the test summary, the compiler's errors, stderr after stdout), so the
 /// end is kept in preference to the middle. Cuts land on line breaks when
 /// one is near, and always on char boundaries.
-fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
+pub(crate) fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
     const MARKER: &str = "\n[... middle of the output omitted ...]\n";
     if text.len() <= max_bytes {
         return text.to_string();
@@ -6023,7 +6023,11 @@ impl TerminalTool {
                                     &crate::turn::helpers::render_truncation_notice(info),
                                 );
                             }
-                            let output = truncate_with_note(&with_notice, 2500);
+                            // Its end stays: a build's or a test run's verdict
+                            // is its last lines (live 2026-11-15: a background
+                            // `cargo test` came back cut after "Checking …",
+                            // and the agent could not say whether it passed).
+                            let output = keep_head_and_tail(&with_notice, 2500);
                             let elapsed_secs = started_at_for_notify.elapsed().as_secs();
 
                             // The background transition receipt is nonterminal.
