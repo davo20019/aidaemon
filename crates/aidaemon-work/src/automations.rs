@@ -69,6 +69,68 @@ pub fn context_with_name(context: Option<&str>, name: &str) -> String {
 }
 
 /// A goal's lifecycle status as the owner reads it.
+/// A run's summary in the owner's words. Watching automations record a
+/// typed reason (`mandate_act_satisfied`, `mandate_review_failed:<reason>`);
+/// a summary that already reads as words is kept.
+pub fn run_summary_words(summary: &str) -> String {
+    let summary = summary.trim();
+    let is_code = !summary.is_empty()
+        && summary
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | ':' | '-'));
+    if !is_code {
+        return summary.to_string();
+    }
+    let words = |code: &str| code.replace(['_', '-'], " ");
+    let (head, detail) = match summary.split_once(':') {
+        Some((head, detail)) => (head, Some(words(detail))),
+        None => (summary, None),
+    };
+    let with = |text: &str| match &detail {
+        Some(detail) => format!("{text} ({detail})."),
+        None => format!("{text}."),
+    };
+    match head {
+        "mandate_act_satisfied" => with("Acted, and the result checked out"),
+        "mandate_non_action_satisfied" => with("Checked; nothing needed doing"),
+        "mandate_review_failed" => with("The review didn't finish"),
+        "mandate_reconciliation_required" => with("Its last action needs checking"),
+        other => {
+            let mut text = words(other);
+            if let Some(first) = text.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            with(&text)
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_summary_tests {
+    use super::run_summary_words;
+
+    #[test]
+    fn typed_run_reasons_read_as_words() {
+        assert_eq!(
+            run_summary_words("mandate_act_satisfied"),
+            "Acted, and the result checked out."
+        );
+        assert_eq!(
+            run_summary_words("mandate_non_action_satisfied"),
+            "Checked; nothing needed doing."
+        );
+        assert_eq!(
+            run_summary_words("mandate_reconciliation_required:act_missing_work_task"),
+            "Its last action needs checking (act missing work task)."
+        );
+        assert_eq!(run_summary_words("budget_exhausted"), "Budget exhausted.");
+        assert_eq!(
+            run_summary_words("Published the synthetic diary entry"),
+            "Published the synthetic diary entry"
+        );
+    }
+}
+
 /// A scheduled automation whose runs kept failing: the recovery ledger
 /// paused its schedules, and its next good run (Run now) turns them back on.
 pub const HELD_AFTER_FAILURES: &str = "held_after_failures";

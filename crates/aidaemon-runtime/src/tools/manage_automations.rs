@@ -517,7 +517,7 @@ impl ManageAutomationsTool {
                     status: run.status,
                     summary: run
                         .outcome_summary
-                        .map(|summary| summary.trim().to_string())
+                        .map(|summary| automations::run_summary_words(&summary))
                         .filter(|summary| !summary.is_empty()),
                 })
             })
