@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use aidaemon_client_gateway::{SettingsDone, SettingsGate};
 use aidaemon_client_protocol::{
-    Applies, ApplyHow, BotInfo, DatabaseAction, McpAction, McpServerInfo, ProviderChoice, Risk,
-    Setting, SettingGroup, SettingKind, Settings, SettingsChange,
+    Applies, ApplyHow, BotInfo, CredentialState, DatabaseAction, McpAction, McpServerInfo,
+    ProviderChoice, Risk, Setting, SettingGroup, SettingKind, Settings, SettingsChange,
 };
 use serde_json::{Value, json};
 
@@ -580,8 +580,8 @@ impl SettingsHost {
         if let Some(call) = self.config_call(change)? {
             // A provider change that stores a key asks even when the
             // config tool cannot word it yet (the key is not stored).
-            if let Some((summary, _)) = self.key_change(change)? {
-                return Ok(ask(summary, false));
+            if let Some(key) = self.key_change(change)? {
+                return Ok(ask(key.summary, false));
             }
             if let crate::traits::OwnerApprovalNeed::Ask(request) =
                 self.tool.owner_approval(&call).await
@@ -683,7 +683,7 @@ impl SettingsHost {
             // Its key goes into the slot the provider reads first; the
             // earlier one comes back if the change does not go through.
             let stored_key = match self.key_change(&change)? {
-                Some((_, slot)) => Some(self.store_provider_key(&change, slot).await?),
+                Some(key) => Some(self.store_provider_key(key).await?),
                 None => None,
             };
             let before = std::fs::read_to_string(&self.config_path).ok();
@@ -706,28 +706,77 @@ impl SettingsHost {
         self.other_change(change, approved).await
     }
 
-    /// A provider change carrying a key: its approval card's words and the
-    /// keychain name the key goes under. `None`: it carries none.
-    fn key_change(&self, change: &SettingsChange) -> Result<Option<(String, String)>, String> {
+    /// The key a provider change stores: its approval card's words, the
+    /// keychain name it goes under and the key. `None`: the change stores
+    /// none (its provider takes no key, or the main provider keeps its own).
+    /// A switch with no key borrows the one a failover of the same provider
+    /// has; else the key is asked for, so the main slot's earlier key (made
+    /// for another provider) is never sent to this one.
+    fn key_change(&self, change: &SettingsChange) -> Result<Option<ProviderKey>, String> {
         let (provider, key, failover) = match change {
-            SettingsChange::SwitchProvider {
-                provider,
-                key: Some(key),
-            } => (provider, key, false),
-            SettingsChange::AddFailover {
-                provider,
-                key: Some(key),
-            } => (provider, key, true),
+            SettingsChange::SwitchProvider { provider, key } => (provider, key, false),
+            SettingsChange::AddFailover { provider, key } => (provider, key, true),
             _ => return Ok(None),
         };
-        if key.0.trim().is_empty() {
+        let entry = crate::setup::model::preset(&provider.preset).ok_or("Unknown provider")?;
+        let key = key
+            .as_ref()
+            .map(|k| k.0.trim().to_string())
+            .filter(|k| !k.is_empty());
+        if !entry.needs_api_key() {
+            if key.is_some() {
+                return Err(format!("{} takes no API key", entry.display_name));
+            }
+            if provider.preset == "openai_chatgpt" && !client_providers::chatgpt_signed_in() {
+                return Err("Sign in to ChatGPT first".to_string());
+            }
             return Ok(None);
         }
-        let entry = crate::setup::model::preset(&provider.preset).ok_or("Unknown provider")?;
-        if !entry.needs_api_key() {
-            return Err(format!("{} takes no API key", entry.display_name));
-        }
         let current = self.current().map_err(|e| e.to_string())?;
+        let model = if provider.primary_model.trim().is_empty() {
+            entry.models.primary
+        } else {
+            provider.primary_model.trim()
+        };
+        let (value, words) = match key {
+            Some(key) => (key, "with a new API key".to_string()),
+            None if failover => {
+                return Err(format!("{} needs its API key", entry.display_name));
+            }
+            None => {
+                let connected = client_providers::connected(&current);
+                let keeps_own = connected.first().is_some_and(|main| {
+                    main.preset == provider.preset
+                        && matches!(
+                            main.credential,
+                            CredentialState::KeyStored | CredentialState::KeyInFile
+                        )
+                });
+                if keeps_own {
+                    return Ok(None);
+                }
+                let borrowed = connected.iter().skip(1).find_map(|p| {
+                    (p.preset == provider.preset && p.credential == CredentialState::KeyStored)
+                        .then(|| {
+                            let name = crate::config::keychain_name_for(&p.key_setting)?;
+                            let key = crate::config::resolve_from_keychain(&name).ok()?;
+                            Some((key, p.failover.unwrap_or_default()))
+                        })
+                        .flatten()
+                });
+                match borrowed {
+                    Some((key, index)) => {
+                        (key, format!("with the API key failover {} uses", index + 1))
+                    }
+                    None => {
+                        return Err(format!(
+                            "{} needs its API key: paste it to make it the main provider",
+                            entry.display_name
+                        ));
+                    }
+                }
+            }
+        };
         let setting = if failover {
             format!(
                 "provider.fallbacks[{}].api_key",
@@ -738,53 +787,39 @@ impl SettingsHost {
         };
         let slot = crate::config::keychain_name_for(&setting)
             .ok_or_else(|| format!("`{setting}` is not read from the keychain"))?;
-        let model = if provider.primary_model.trim().is_empty() {
-            entry.models.primary
-        } else {
-            provider.primary_model.trim()
-        };
         let summary = if failover {
             format!(
-                "Add {} ({model}) as a failover provider, with a new API key",
+                "Add {} ({model}) as a failover provider, {words}",
                 entry.display_name
             )
         } else {
             format!(
-                "Make {} ({model}) the main provider, with a new API key",
+                "Make {} ({model}) the main provider, {words}",
                 entry.display_name
             )
         };
-        Ok(Some((summary, slot)))
+        Ok(Some(ProviderKey {
+            summary,
+            slot,
+            value,
+            entry,
+            base_url: provider.base_url.trim().to_string(),
+        }))
     }
 
-    /// Check `change`'s key with its provider, then store it under `slot`,
-    /// keeping what was there to put back.
-    async fn store_provider_key(
-        &self,
-        change: &SettingsChange,
-        slot: String,
-    ) -> Result<EarlierSecret, String> {
-        let (SettingsChange::SwitchProvider {
-            provider,
-            key: Some(key),
-        }
-        | SettingsChange::AddFailover {
-            provider,
-            key: Some(key),
-        }) = change
-        else {
-            return Err("This change carries no key".to_string());
-        };
-        let entry = crate::setup::model::preset(&provider.preset).ok_or("Unknown provider")?;
-        let base = if provider.base_url.trim().is_empty() {
+    /// Check `key` with its provider, then store it in its slot, keeping
+    /// what was there to put back.
+    async fn store_provider_key(&self, key: ProviderKey) -> Result<EarlierSecret, String> {
+        let entry = key.entry;
+        let base = if key.base_url.is_empty() {
             entry.base_url
         } else {
-            provider.base_url.trim()
+            key.base_url.as_str()
         };
         if let Some(endpoint) = aidaemon_providers::key_check::KeyEndpoint::new(entry.kind, base) {
             use aidaemon_providers::key_check::KeyCheck;
             if let KeyCheck::Rejected(detail) =
-                aidaemon_providers::key_check::check_key(&endpoint, key.0.trim()).await
+                aidaemon_providers::key_check::check_key(&endpoint, &key.value).await
             {
                 return Err(format!(
                     "{} did not accept that key ({detail}); nothing was changed",
@@ -794,10 +829,13 @@ impl SettingsHost {
         }
         use aidaemon_secrets::SecretStore as _;
         let store = crate::config::secret_store();
-        let earlier = store.get(&slot).ok().map(|s| s.into_exposed());
-        crate::config::store_in_keychain(&slot, key.0.trim())
+        let earlier = store.get(&key.slot).ok().map(|s| s.into_exposed());
+        crate::config::store_in_keychain(&key.slot, &key.value)
             .map_err(|e| format!("Could not store the key: {e}"))?;
-        Ok(EarlierSecret { slot, earlier })
+        Ok(EarlierSecret {
+            slot: key.slot,
+            earlier,
+        })
     }
 
     /// A change `manage_config` makes.
@@ -1001,6 +1039,17 @@ impl SettingsHost {
             _ => Err("This change is not known to this daemon".to_string()),
         }
     }
+}
+
+/// A key a provider change stores.
+struct ProviderKey {
+    /// The approval card's words.
+    summary: String,
+    /// The keychain name it goes under.
+    slot: String,
+    value: String,
+    entry: &'static aidaemon_providers::catalog::CatalogEntry,
+    base_url: String,
 }
 
 /// What a keychain slot held before a provider key replaced it.
@@ -1287,6 +1336,53 @@ default = "synthetic-model-1"
             .await
             .unwrap();
         assert!(settings_upkeep::trial_active(&host.config_path));
+    }
+
+    #[tokio::test]
+    async fn a_new_main_provider_never_inherits_another_provider_s_key() {
+        let _keychain = crate::testing::KeychainIsolation::acquire();
+        let (_dir, host) = host(
+            r#"
+[provider]
+kind = "anthropic"
+api_key = "keychain"
+
+[[provider.fallbacks]]
+kind = "openai_compatible"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "keychain"
+"#,
+        )
+        .await;
+        crate::config::store_in_keychain("api_key", "synthetic-main-key").unwrap();
+        crate::config::store_in_keychain("provider_fallback_0_api_key", "synthetic-or-key")
+            .unwrap();
+        let switch = |preset: &str| SettingsChange::SwitchProvider {
+            provider: ProviderChoice {
+                preset: preset.into(),
+                ..ProviderChoice::default()
+            },
+            key: None,
+        };
+        // Another provider with no key of its own: asked for, not the
+        // main slot's key.
+        let refused = host.gate(&switch("openai")).await.unwrap_err();
+        assert!(refused.contains("needs its API key"), "{refused}");
+        // A failover's provider brings the failover's key.
+        let borrowed = host.key_change(&switch("openrouter")).unwrap().unwrap();
+        assert_eq!(borrowed.slot, "api_key");
+        assert_eq!(borrowed.value, "synthetic-or-key");
+        assert!(
+            borrowed.summary.contains("failover 1"),
+            "{}",
+            borrowed.summary
+        );
+        // The same provider keeps its own.
+        assert!(
+            host.key_change(&switch("anthropic_native"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

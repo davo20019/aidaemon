@@ -20,7 +20,9 @@ use aidaemon_channels::ports::{
 use aidaemon_channels::turns::{TurnDeps, TurnWatch};
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
 use aidaemon_client_protocol::{
-    HistoryMessage, MemoryItem, SearchHit, SessionSummary, SlashCommand, ViewAction,
+    Billing, CheckedKey, ConnectedProvider, CredentialState, HistoryMessage, MemoryItem,
+    ProviderChoice, ProviderOption, SearchHit, SessionSummary, Settings, SettingsChange, SignIn,
+    SlashCommand, ViewAction,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -377,6 +379,235 @@ impl ClientHost for Host {
         forgotten.push(id.to_string());
         Ok(true)
     }
+    async fn settings(&self) -> anyhow::Result<Option<Settings>> {
+        Ok(Some(demo_settings().lock().unwrap().clone()))
+    }
+    async fn settings_gate(
+        &self,
+        _: &SettingsChange,
+    ) -> Result<aidaemon_client_gateway::SettingsGate, String> {
+        Ok(aidaemon_client_gateway::SettingsGate::Free)
+    }
+    async fn change_settings(
+        &self,
+        change: SettingsChange,
+        _: bool,
+    ) -> Result<aidaemon_client_gateway::SettingsDone, String> {
+        let mut settings = demo_settings().lock().unwrap();
+        let entry = |preset: &str, settings: &Settings| {
+            settings
+                .providers
+                .iter()
+                .find(|p| p.preset == preset)
+                .cloned()
+                .ok_or("Unknown provider".to_string())
+        };
+        let made = |option: &ProviderOption, choice: &ProviderChoice, failover: Option<u32>| {
+            ConnectedProvider {
+                failover,
+                preset: option.preset.clone(),
+                name: option.name.clone(),
+                base_url: choice.base_url.clone(),
+                models: vec![if choice.primary_model.is_empty() {
+                    option.model.clone()
+                } else {
+                    choice.primary_model.clone()
+                }],
+                credential: if option.needs_key {
+                    CredentialState::KeyStored
+                } else {
+                    CredentialState::SignedIn
+                },
+                key_setting: if !option.needs_key {
+                    String::new()
+                } else if let Some(i) = failover {
+                    format!("provider.fallbacks[{i}].api_key")
+                } else {
+                    "provider.api_key".into()
+                },
+            }
+        };
+        let message = match change {
+            SettingsChange::SwitchProvider { provider, .. } => {
+                let option = entry(&provider.preset, &settings)?;
+                settings.connected[0] = made(&option, &provider, None);
+                settings.reload_pending = true;
+                format!("Switched the main provider to {}.", option.name)
+            }
+            SettingsChange::AddFailover { provider, .. } => {
+                let option = entry(&provider.preset, &settings)?;
+                let index = settings.connected.len() as u32 - 1;
+                settings
+                    .connected
+                    .push(made(&option, &provider, Some(index)));
+                settings.reload_pending = true;
+                format!("Added {} as failover {}.", option.name, index + 1)
+            }
+            SettingsChange::RemoveFailover { index } => {
+                settings.connected.remove(index as usize + 1);
+                for (at, p) in settings.connected.iter_mut().enumerate().skip(1) {
+                    p.failover = Some(at as u32 - 1);
+                }
+                settings.reload_pending = true;
+                format!("Removed failover {}.", index + 1)
+            }
+            SettingsChange::CheckKey { provider, key } => {
+                if key.0.contains("bad") {
+                    return Err("The provider did not accept that key (HTTP 401)".into());
+                }
+                let option = entry(&provider.preset, &settings)?;
+                settings.checked = Some(CheckedKey {
+                    preset: option.preset.clone(),
+                    models: vec![option.model.clone(), "synthetic-model-2".into()],
+                    suggested: Some(option.model.clone()),
+                });
+                "The key works.".into()
+            }
+            SettingsChange::SignIn { paste } => {
+                settings.sign_in = Some(SignIn {
+                    url: "https://auth.example.com/oauth/authorize?client=synthetic".into(),
+                    paste,
+                });
+                "Open the sign-in page.".into()
+            }
+            SettingsChange::FinishSignIn { .. } => {
+                settings.sign_in = None;
+                settings.chatgpt_signed_in = true;
+                "Signed in.".into()
+            }
+            SettingsChange::CancelSignIn => {
+                settings.sign_in = None;
+                "Stopped the sign-in.".into()
+            }
+            SettingsChange::Secret { key, .. } => {
+                for p in settings
+                    .connected
+                    .iter_mut()
+                    .filter(|p| p.key_setting == key)
+                {
+                    p.credential = CredentialState::KeyStored;
+                }
+                format!("Stored the secret for `{key}`.")
+            }
+            SettingsChange::Apply { .. } => {
+                settings.reload_pending = false;
+                "Reloaded.".into()
+            }
+            _ => "Done.".into(),
+        };
+        Ok(aidaemon_client_gateway::SettingsDone {
+            message,
+            applies: None,
+        })
+    }
+}
+
+/// Synthetic settings: a ChatGPT main provider and two failovers.
+fn demo_settings() -> &'static std::sync::Mutex<Settings> {
+    static SETTINGS: OnceLock<std::sync::Mutex<Settings>> = OnceLock::new();
+    SETTINGS.get_or_init(|| {
+        let option = |preset: &str, name: &str, billing, needs_key, model: &str| ProviderOption {
+            preset: preset.into(),
+            name: name.into(),
+            billing,
+            needs_key,
+            key_url: if needs_key {
+                "https://example.com/keys".into()
+            } else {
+                String::new()
+            },
+            needs_base_url: preset == "custom_openai_compatible",
+            model: model.into(),
+        };
+        let connected =
+            |failover, preset: &str, name: &str, models: &[&str], credential, key: &str| {
+                ConnectedProvider {
+                    failover,
+                    preset: preset.into(),
+                    name: name.into(),
+                    base_url: String::new(),
+                    models: models.iter().map(|m| m.to_string()).collect(),
+                    credential,
+                    key_setting: key.into(),
+                }
+            };
+        std::sync::Mutex::new(Settings {
+            config_path: "/home/synthetic/.aidaemon/config.toml".into(),
+            providers: vec![
+                option(
+                    "openai_chatgpt",
+                    "OpenAI (ChatGPT subscription)",
+                    Billing::Plan,
+                    false,
+                    "gpt-synthetic-1",
+                ),
+                option(
+                    "anthropic_native",
+                    "Anthropic",
+                    Billing::PerToken,
+                    true,
+                    "claude-synthetic",
+                ),
+                option(
+                    "openai",
+                    "OpenAI",
+                    Billing::PerToken,
+                    true,
+                    "gpt-synthetic-2",
+                ),
+                option(
+                    "openrouter",
+                    "OpenRouter",
+                    Billing::PerToken,
+                    true,
+                    "synthetic/model-1",
+                ),
+                option(
+                    "custom_openai_compatible",
+                    "Custom (OpenAI-compatible)",
+                    Billing::PerToken,
+                    true,
+                    "",
+                ),
+            ],
+            connected: vec![
+                connected(
+                    None,
+                    "openai_chatgpt",
+                    "OpenAI (ChatGPT subscription)",
+                    &["gpt-synthetic-1", "gpt-synthetic-mini", "gpt-synthetic-0"],
+                    CredentialState::SignedIn,
+                    "",
+                ),
+                connected(
+                    Some(0),
+                    "anthropic_native",
+                    "Anthropic",
+                    &["claude-synthetic-fast", "claude-synthetic"],
+                    CredentialState::KeyStored,
+                    "provider.fallbacks[0].api_key",
+                ),
+                connected(
+                    Some(1),
+                    "openrouter",
+                    "OpenRouter",
+                    &["synthetic/model-1"],
+                    CredentialState::KeyInFile,
+                    "provider.fallbacks[1].api_key",
+                ),
+                connected(
+                    Some(2),
+                    "google_ai_studio",
+                    "Google AI Studio",
+                    &["gemini-synthetic"],
+                    CredentialState::KeyMissing,
+                    "provider.fallbacks[2].api_key",
+                ),
+            ],
+            chatgpt_signed_in: true,
+            ..Settings::default()
+        })
+    })
 }
 
 static FORGOTTEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());

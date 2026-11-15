@@ -240,6 +240,8 @@ pub struct Store {
     settings_request: Stored<Option<String>>,
     /// Settings changes sent and not yet answered.
     settings_changes: Stored<BTreeSet<String>>,
+    /// Settings changes sent and not yet answered.
+    settings_sending: Signal<usize>,
     /// Changes waiting for an approval, and whether another device must
     /// give it.
     settings_waiting: Signal<BTreeMap<String, bool>>,
@@ -300,6 +302,7 @@ impl Store {
             settings: signal(SettingsRead::NotYet),
             settings_request: stored(None),
             settings_changes: stored(BTreeSet::new()),
+            settings_sending: signal(0),
             settings_waiting: signal(BTreeMap::new()),
             setup_request: signal(None),
             setup_error: signal(None),
@@ -554,6 +557,9 @@ impl Store {
                 }
             }
             Update::Disconnected(disconnect) => {
+                // Changes in flight get no answer now.
+                self.settings_changes.with(BTreeSet::clear);
+                self.settings_sending.set(0);
                 let retry = u64::try_from(disconnect.retry_in.as_millis()).unwrap_or(0);
                 self.connection.set(Connection::Offline {
                     kind: disconnect.kind,
@@ -754,9 +760,13 @@ impl Store {
                 request_id,
                 result: CommandResult::SettingsChanged { outcome },
             } => {
-                self.settings_changes.with(|c| c.remove(request_id));
+                if self.settings_changes.with(|c| c.remove(request_id)) {
+                    self.settings_sending.update(|n| *n = n.saturating_sub(1));
+                }
                 match outcome {
-                    SettingsOutcome::Done { message, .. } => self.say(message.clone()),
+                    // The daemon announces what it did to every client
+                    // (`settings_updated`): that note says it here too.
+                    SettingsOutcome::Done { .. } => {}
                     SettingsOutcome::AwaitingApproval {
                         approval_id,
                         other_device,
@@ -780,6 +790,7 @@ impl Store {
                 request_id: Some(request_id),
                 error,
             } if self.settings_changes.with(|c| c.remove(request_id)) => {
+                self.settings_sending.update(|n| *n = n.saturating_sub(1));
                 self.settings_error.set(Some(error.message.clone()));
                 return;
             }
@@ -965,6 +976,12 @@ impl Store {
         self.settings_error.set(None);
         let id = self.send(Command::ChangeSettings { change });
         self.settings_changes.with(|c| c.insert(id));
+        self.settings_sending.update(|n| *n += 1);
+    }
+
+    /// A settings change was sent and has no answer yet.
+    pub fn settings_busy(&self) -> bool {
+        self.settings_sending.get() > 0
     }
 
     /// Why the last settings change was refused, until dismissed.
