@@ -39,6 +39,7 @@ SHELL = {
     "providers": "provider construction from the config",
     "config.rs": "config parsing and its mapping onto crate settings",
     "wizard.rs": "setup wizard",
+    "setup": "first run: setup mode's host over the SDK provider catalog, and the terminal setup",
     "updater.rs": "self-update",
     "single_instance.rs": "process handling",
     "daemon.rs": "service install and process handling",
