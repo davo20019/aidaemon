@@ -69,6 +69,7 @@ pub mod outcome;
 pub mod owner_answers;
 pub mod path_class;
 pub mod permission_bypass;
+pub mod platform_shell;
 pub mod process_control;
 pub mod result_spill;
 pub mod sanitize;

@@ -312,7 +312,7 @@ impl Sandbox for LocalSandbox {
     }
 
     fn is_available(&self) -> bool {
-        cfg!(unix) && Path::new("/bin/sh").exists()
+        crate::platform_shell::shell_available()
     }
 
     fn is_contained(&self) -> bool {
@@ -320,8 +320,8 @@ impl Sandbox for LocalSandbox {
     }
 
     async fn run(&self, cmd: &SandboxCommand) -> Result<CommandOutput> {
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(&cmd.command).current_dir(&cmd.cwd);
+        let mut command = crate::platform_shell::shell_command(&cmd.command);
+        command.current_dir(&cmd.cwd);
         run_process(command, cmd, true).await
     }
 }

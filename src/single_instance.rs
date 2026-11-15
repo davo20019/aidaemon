@@ -27,7 +27,11 @@ pub fn acquire(lock_path: &Path) -> anyhow::Result<()> {
     if INSTANCE_LOCK.get().is_some() {
         return Ok(());
     }
-    let file = lock(lock_path)?;
+    let file = if std::env::var_os(RESTART_WAIT_VAR).is_some() {
+        lock_when_free(lock_path)?
+    } else {
+        lock(lock_path)?
+    };
     // Hold the handle for the whole process lifetime so the lock stays held.
     let _ = INSTANCE_LOCK.set(file);
     Ok(())
@@ -42,6 +46,25 @@ pub fn acquire_moved(lock_path: &Path) -> anyhow::Result<()> {
     let file = lock(lock_path)?;
     let _ = MOVED_LOCK.set(file);
     Ok(())
+}
+
+/// Set on a process started to replace this one (a restart where the
+/// platform cannot exec): it waits for the old one's lock instead of
+/// refusing to start.
+pub const RESTART_WAIT_VAR: &str = "AIDAEMON_RESTART_WAIT";
+
+/// [`lock`], retried while the process being replaced lets go (at most 30 s).
+fn lock_when_free(lock_path: &Path) -> anyhow::Result<File> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match lock(lock_path) {
+            Ok(file) => return Ok(file),
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn lock(lock_path: &Path) -> anyhow::Result<File> {

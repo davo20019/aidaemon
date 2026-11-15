@@ -7056,7 +7056,27 @@ async fn host_terminal_execution_request(
         Some(path) => Some(backend.resolve_path(path).await?),
         None => None,
     };
-    let mut request = if script_via_stdin {
+    let mut request = if script_via_stdin && cfg!(windows) {
+        // Windows PowerShell reads the script from stdin; the first failing
+        // step stops the rest, as `sh -eu` does.
+        let mut request = ExecutionRequest::argv(
+            "powershell.exe".to_string(),
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "-",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+        request.stdin =
+            Some(format!("$ErrorActionPreference = 'Stop'\n{shell_source}\n").into_bytes());
+        request
+    } else if script_via_stdin {
         let mut request = ExecutionRequest::argv(
             "/bin/sh".to_string(),
             vec!["-eu".to_string(), "-s".to_string()],

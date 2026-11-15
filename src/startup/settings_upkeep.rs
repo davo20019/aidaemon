@@ -407,7 +407,6 @@ pub(crate) fn arm_trial(config_path: &Path) -> Option<Arc<Trial>> {
 /// this one took from it (a rotated database key, a secret stored there),
 /// and drop those the file no longer has. Variables set outside the file
 /// keep their values.
-#[cfg(unix)]
 fn refresh_env_file_values(command: &mut std::process::Command) {
     let Some(keys) = crate::ENV_FILE_KEYS.get() else {
         return;
@@ -456,8 +455,37 @@ pub(crate) fn restart_in_place() {
         let err = command.exec();
         error!("exec failed: {err}");
     }
+    // No exec: start a fresh copy, which waits for this one's instance
+    // lock, then leave.
     #[cfg(not(unix))]
-    error!("Restarting in place is not supported on this platform; restart aidaemon manually");
+    {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                error!("Failed to get current exe path: {e}");
+                return;
+            }
+        };
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args(&args)
+            .env(crate::single_instance::RESTART_WAIT_VAR, "1");
+        refresh_env_file_values(&mut command);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: it outlives us.
+            command.creation_flags(0x0000_0008 | 0x0000_0200);
+        }
+        match command.spawn() {
+            Ok(_) => {
+                info!(exe = %exe.display(), "Started a fresh process; this one exits");
+                std::process::exit(0);
+            }
+            Err(e) => error!("Could not start a fresh process: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

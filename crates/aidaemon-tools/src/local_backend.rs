@@ -389,11 +389,7 @@ impl ExecutionBackend for LocalBackend {
         let removes_path = request.env_remove.iter().any(|name| name == "PATH");
 
         let mut command = match request.command {
-            CommandSpec::Shell(shell) => {
-                let mut command = Command::new("sh");
-                command.arg("-c").arg(shell);
-                command
-            }
+            CommandSpec::Shell(shell) => crate::platform_shell::shell_command(&shell),
             CommandSpec::Argv { program, args } => {
                 let mut command = Command::new(program);
                 command.args(args);
