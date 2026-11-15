@@ -147,10 +147,54 @@ pub enum ChangesRead {
     Failed(String),
 }
 
-/// The inspector's tabs, in order.
-pub const INSPECTOR_TABS: [&str; 2] = ["Inbox", "Code"];
-/// The Code tab's index in [`INSPECTOR_TABS`].
-pub const CODE_TAB: usize = 1;
+/// The details pane's tabs for a coding conversation, in order; any other
+/// conversation shows only its steps.
+pub const DETAIL_TABS: [&str; 2] = ["Changes", "Steps"];
+/// The Changes tab's index in [`DETAIL_TABS`].
+pub const CHANGES_TAB: usize = 0;
+/// The Steps tab's index in [`DETAIL_TABS`].
+pub const STEPS_TAB: usize = 1;
+
+/// Where a conversation came from, for the sidebar's filter: the app or a
+/// chat platform, and whether others are in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Source {
+    All,
+    App,
+    Telegram,
+    Slack,
+    Discord,
+    Chat,
+    /// Conversations with other people in them, on any platform.
+    Groups,
+}
+
+impl Source {
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::All => "All",
+            Source::App => "App",
+            Source::Telegram => "Telegram",
+            Source::Slack => "Slack",
+            Source::Discord => "Discord",
+            Source::Chat => "Other chats",
+            Source::Groups => "Groups",
+        }
+    }
+}
+
+/// A chat bot the daemon has conversations through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bot {
+    /// Its sessions' `channel`: `telegram:coding_bot`.
+    pub channel: String,
+    /// "Telegram · coding_bot".
+    pub name: String,
+    /// How many conversations it has.
+    pub chats: usize,
+    /// The project its direct-message chats go to.
+    pub project: Option<String>,
+}
 
 /// Tools whose work can change files: the Code tab reads again after one.
 const CHANGING_TOOLS: [&str; 4] = ["edit_file", "write_file", "terminal", "cli_agent"];
@@ -293,17 +337,29 @@ pub struct Store {
     changes_again: Stored<bool>,
     /// The project a new conversation starts in (`None`: no project).
     new_project: Signal<Option<String>>,
+    /// The folder the app was started in (the terminal's): new
+    /// conversations start in the project of that folder.
+    here: Stored<Option<String>>,
     /// Projects shown open in the sidebar.
     open_projects: Signal<BTreeSet<String>>,
     /// The New project form: shown, the request in flight, why it failed.
     project_form: Signal<bool>,
     project_request: Stored<Option<String>>,
     project_error: Signal<Option<String>>,
-    /// The inspector's open tab (an index of [`INSPECTOR_TABS`]).
+    /// The project the form edits; `None`: it makes a new one.
+    project_editing: Signal<Option<String>>,
+    /// The details pane's open tab (an index of [`DETAIL_TABS`]).
     inspector_tab: Signal<usize>,
-    /// Turns that already opened the Code tab, so the owner's own choice
+    /// Turns that already opened the Changes tab, so the owner's own choice
     /// of tab sticks for the rest of a turn.
     code_opened: Stored<BTreeSet<String>>,
+    /// Conversations that wrote files or showed code changes: they get
+    /// the Changes tab.
+    coded: Signal<BTreeSet<String>>,
+    /// The sidebar's source filter.
+    source: Signal<Source>,
+    /// Group conversations the owner chose to post in from here.
+    posting: Signal<BTreeSet<String>>,
     settings: Signal<SettingsRead>,
     settings_request: Stored<Option<String>>,
     /// Settings changes sent and not yet answered.
@@ -376,12 +432,17 @@ impl Store {
             changes_request: stored(None),
             changes_again: stored(false),
             new_project: signal(None),
+            here: stored(None),
             open_projects: signal(BTreeSet::new()),
             project_form: signal(false),
             project_request: stored(None),
             project_error: signal(None),
-            inspector_tab: signal(0),
+            project_editing: signal(None),
+            inspector_tab: signal(STEPS_TAB),
             code_opened: stored(BTreeSet::new()),
+            coded: signal(BTreeSet::new()),
+            source: signal(Source::All),
+            posting: signal(BTreeSet::new()),
             settings: signal(SettingsRead::NotYet),
             settings_request: stored(None),
             settings_changes: stored(BTreeSet::new()),
@@ -512,6 +573,11 @@ impl Store {
         if let Some(mode) = nsh_core::storage::Storage::get_item(ACTIVITY_KEY) {
             self.activity_mode.set(ActivityMode::from_key(&mode));
         }
+        // Started in a folder (a terminal), the app starts on a new
+        // conversation there, as a command-line tool would.
+        if self.here.with(|h| h.is_some()) {
+            return;
+        }
         if let Some(open) =
             nsh_core::storage::Storage::get_item(OPEN_KEY).filter(|id| !id.is_empty())
         {
@@ -638,6 +704,9 @@ impl Store {
                 self.fetched.with(BTreeSet::clear);
                 if let Some(id) = self.selected.get_untracked() {
                     self.load_history(&id);
+                    // Its changes too: whether it works on code, and what.
+                    self.changes_of.replace(None);
+                    self.refresh_changes();
                 }
             }
             Update::Disconnected(disconnect) => {
@@ -651,7 +720,10 @@ impl Store {
                     retry_at_ms: now_ms().saturating_add(retry),
                 });
             }
-            Update::Frame(frame) => self.frame(frame),
+            Update::Frame(frame) => {
+                self.frame(frame);
+                self.settle_here();
+            }
         }
     }
 
@@ -811,6 +883,11 @@ impl Store {
                 self.project_request.replace(None);
                 self.project_form.set(false);
                 self.project_error.set(None);
+                if self.project_editing.get_untracked().is_some() {
+                    self.project_editing.set(None);
+                    self.say(format!("Project {} saved", project.name));
+                    return;
+                }
                 let id = project.id.clone();
                 self.open_projects.update(|open| {
                     open.insert(id.clone());
@@ -838,6 +915,17 @@ impl Store {
                 .with(|r| r.as_deref() == Some(request_id.as_str())) =>
             {
                 self.changes_request.replace(None);
+                // Changes found: the conversation is a coding one, and one
+                // just found to be opens on them.
+                if changes.repos.iter().any(|r| !r.files.is_empty())
+                    && let Some(session) = self.changes_of.with(|of| of.clone())
+                    && !self.is_coding(&session)
+                {
+                    self.mark_coded(&session);
+                    if self.selected.get_untracked().as_deref() == Some(session.as_str()) {
+                        self.inspector_tab.set(CHANGES_TAB);
+                    }
+                }
                 self.changes.set(ChangesRead::Ready(changes.clone()));
                 if self.changes_again.replace(false) {
                     self.refresh_changes();
@@ -1150,6 +1238,39 @@ impl Store {
         }
     }
 
+    /// The app was started in `folder`: new conversations start in its
+    /// project.
+    pub fn set_here(&self, folder: String) {
+        self.here.replace(Some(folder));
+    }
+
+    /// The project whose folder holds the folder the app was started in
+    /// (the innermost).
+    pub fn here_project(&self) -> Option<String> {
+        let here = self.here.with(|h| h.clone())?;
+        let here = here.trim_end_matches('/');
+        untracked(|| self.projects())
+            .into_iter()
+            .filter_map(|p| {
+                let path = p.path.as_deref()?.trim_end_matches('/').to_owned();
+                (here == path || here.starts_with(&format!("{path}/")))
+                    .then_some((path.len(), p.id))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, id)| id)
+    }
+
+    /// Once the projects are known, a new conversation on screen starts in
+    /// the project of the folder the app was started in.
+    fn settle_here(&self) {
+        if self.selected.get_untracked().is_none()
+            && self.new_project.get_untracked().is_none()
+            && let Some(project) = self.here_project()
+        {
+            self.new_project.set(Some(project));
+        }
+    }
+
     /// Start a new conversation in `project` (`None`: in no project).
     pub fn new_in_project(&self, project: Option<String>) {
         self.select(None);
@@ -1183,6 +1304,42 @@ impl Store {
         crate::ui::motion::next_unfold();
         self.project_form.set(show);
         self.project_error.set(None);
+        self.project_editing.set(None);
+    }
+
+    /// Open the project form on project `id`, to rename it or change its
+    /// folder.
+    pub fn edit_project(&self, id: &str) {
+        crate::ui::motion::next_unfold();
+        self.project_error.set(None);
+        self.project_editing.set(Some(id.to_owned()));
+        self.project_form.set(true);
+    }
+
+    /// The project the form edits; `None` when it makes a new one.
+    pub fn project_editing(&self) -> Option<String> {
+        self.project_editing.get()
+    }
+
+    /// Save the form: a new project, or the edited one's name and folder
+    /// (an empty folder removes it).
+    pub fn save_project(&self, name: &str, path: &str) {
+        let Some(id) = self.project_editing.get_untracked() else {
+            self.create_project(name, path);
+            return;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            self.project_error
+                .set(Some("Give the project a name".to_owned()));
+            return;
+        }
+        let request = self.send(Command::UpdateProject {
+            project_id: id,
+            name: Some(name.to_owned()),
+            path: Some(path.trim().to_owned()),
+        });
+        self.project_request.replace(Some(request));
     }
 
     pub fn project_error(&self) -> Option<String> {
@@ -1222,11 +1379,72 @@ impl Store {
         });
     }
 
-    // ----- The inspector's Code tab ------------------------------------------
+    // ----- Chat bots ----------------------------------------------------------
 
-    /// The inspector's open tab, for its tab bar.
+    /// The chat bots with conversations here, by name.
+    pub fn bots(&self) -> Vec<Bot> {
+        let projects = self.projects();
+        let mut bots: BTreeMap<String, usize> = BTreeMap::new();
+        self.state.with(|s| {
+            for view in s.sessions.values() {
+                if let Some(summary) = &view.summary
+                    && platform_of(&summary.channel, &summary.id) != Source::App
+                    && platform_of(&summary.channel, &summary.id) != Source::Chat
+                {
+                    *bots.entry(summary.channel.clone()).or_default() += 1;
+                }
+            }
+        });
+        bots.into_iter()
+            .map(|(channel, chats)| Bot {
+                name: channel_name(&channel, ""),
+                project: projects
+                    .iter()
+                    .find(|p| p.channels.contains(&channel))
+                    .map(|p| p.id.clone()),
+                channel,
+                chats,
+            })
+            .collect()
+    }
+
+    /// Send a bot's direct-message chats to `project` (`None`: to none).
+    pub fn set_bot_project(&self, channel: &str, project: Option<String>) {
+        self.send(Command::SetChannelProject {
+            channel: channel.to_owned(),
+            project_id: project,
+        });
+    }
+
+    // ----- The details pane: Changes and Steps ---------------------------------
+
+    /// The details pane's open tab, for its tab bar.
     pub fn inspector_tab(&self) -> Signal<usize> {
         self.inspector_tab
+    }
+
+    /// Whether conversation `id` works on code: it is in a project with a
+    /// folder, or it wrote files or showed changes.
+    pub fn is_coding(&self, id: &str) -> bool {
+        self.coded.with(|c| c.contains(id))
+            || self
+                .session_project(id)
+                .and_then(|p| self.project(&p))
+                .is_some_and(|p| p.path.is_some())
+    }
+
+    /// Whether what is on screen (the selected conversation, or a new one
+    /// in a project with a folder) works on code.
+    pub fn coding_on_screen(&self) -> bool {
+        match self.selected.get() {
+            Some(id) => self.is_coding(&id),
+            None => false,
+        }
+    }
+
+    /// The Changes tab is the open one (and the conversation has it).
+    pub fn changes_shown(&self) -> bool {
+        self.coding_on_screen() && self.inspector_tab.get() == CHANGES_TAB
     }
 
     /// Read the selected session's changes again; one read at a time, and
@@ -1267,10 +1485,44 @@ impl Store {
         self.changes.get()
     }
 
-    /// The Code tab is on screen.
+    /// How many files the conversation on screen has changed, once read.
+    pub fn changed_files(&self) -> Option<usize> {
+        let selected = self.selected.get()?;
+        if self
+            .changes_of
+            .with(|of| of.as_deref() != Some(selected.as_str()))
+        {
+            return None;
+        }
+        match self.changes.get() {
+            ChangesRead::Ready(changes) => Some(changes.repos.iter().map(|r| r.files.len()).sum()),
+            _ => None,
+        }
+    }
+
+    fn mark_coded(&self, session: &str) {
+        if self.coded.with_untracked(|c| !c.contains(session)) {
+            self.coded.update(|c| {
+                c.insert(session.to_owned());
+            });
+            if self.selected.get_untracked().as_deref() == Some(session) {
+                self.show_details(true);
+            }
+        }
+    }
+
+    /// Show or hide the details beside the conversation, on a wide window
+    /// of a platform that shows them by default (not the terminal).
+    fn show_details(&self, show: bool) {
+        if !self.compact.get_untracked() && self.inspector_default.get() {
+            self.inspector.set(show);
+        }
+    }
+
+    /// The Changes tab is on screen.
     fn code_visible(&self) -> bool {
         self.inspector.get_untracked()
-            && self.inspector_tab.get_untracked() == CODE_TAB
+            && self.inspector_tab.get_untracked() == CHANGES_TAB
             && self.page.get_untracked() == Page::Conversation
     }
 
@@ -1299,7 +1551,10 @@ impl Store {
                 self.code_opened.with(|o| {
                     o.insert(turn_id.clone());
                 });
-                self.inspector_tab.set(CODE_TAB);
+                if let Some(session) = &session {
+                    self.mark_coded(session);
+                }
+                self.inspector_tab.set(CHANGES_TAB);
             }
         }
         if self.code_visible() {
@@ -1489,6 +1744,69 @@ impl Store {
     pub fn needs_you(&self, id: &str) -> bool {
         self.state
             .with(|s| s.approvals.values().any(|a| a.session_id == id))
+    }
+
+    // ----- Where conversations come from ----------------------------------------
+
+    /// Where conversation `id` came from.
+    pub fn source(&self, id: &str) -> Source {
+        platform_of(&self.channel(id).unwrap_or_default(), id)
+    }
+
+    /// Other people are in conversation `id`: what is sent there from here,
+    /// they see.
+    pub fn is_group(&self, id: &str) -> bool {
+        self.state.with(|s| {
+            s.sessions
+                .get(id)
+                .and_then(|v| v.summary.as_ref())
+                .is_some_and(|summary| summary.group)
+        })
+    }
+
+    /// Whether the app may send to conversation `id` now: anywhere but a
+    /// group the owner has not chosen to post in.
+    pub fn may_post(&self, id: &str) -> bool {
+        !self.is_group(id) || self.posting.with(|p| p.contains(id))
+    }
+
+    /// The owner chose to post in group conversation `id` from here.
+    pub fn allow_posting(&self, id: &str) {
+        self.posting.update(|p| {
+            p.insert(id.to_owned());
+        });
+    }
+
+    /// The sidebar's source filter.
+    pub fn source_filter(&self) -> Source {
+        self.source.get()
+    }
+
+    pub fn set_source_filter(&self, source: Source) {
+        self.source.set(source);
+    }
+
+    /// The filters worth offering: every source with a conversation, and
+    /// groups when there are any; nothing when all come from one place.
+    pub fn sources(&self) -> Vec<Source> {
+        let ids = self.session_ids();
+        let mut found: BTreeSet<Source> = ids.iter().map(|id| self.source(id)).collect();
+        if found.len() < 2 {
+            return Vec::new();
+        }
+        if ids.iter().any(|id| self.is_group(id)) {
+            found.insert(Source::Groups);
+        }
+        std::iter::once(Source::All).chain(found).collect()
+    }
+
+    /// Whether conversation `id` passes the source filter.
+    pub fn in_source(&self, id: &str) -> bool {
+        match self.source.get() {
+            Source::All => true,
+            Source::Groups => self.is_group(id),
+            source => self.source(id) == source,
+        }
     }
 
     // ----- Search, unread, stopping ------------------------------------------
@@ -1747,9 +2065,32 @@ impl Store {
         self.inspector.update(|s| *s = !*s);
     }
 
+    pub fn set_sidebar(&self, open: bool) {
+        self.sidebar.set(open);
+    }
+
+    /// Open the details on the Changes of the conversation on screen (its
+    /// Steps when it has no changes).
+    pub fn show_changes(&self) {
+        let coding = self
+            .selected
+            .get_untracked()
+            .is_some_and(|id| self.is_coding(&id));
+        self.inspector_tab
+            .set(if coding { CHANGES_TAB } else { STEPS_TAB });
+        if self.compact.get_untracked() {
+            self.sidebar.set(false);
+        }
+        self.inspector.set(true);
+        if coding {
+            self.refresh_changes();
+        }
+    }
+
     pub fn set_inspector(&self, open: bool) {
         self.inspector_default.replace(open);
-        self.inspector.set(open);
+        self.inspector
+            .set(open && untracked(|| self.coding_on_screen()));
     }
 
     pub fn is_compact(&self) -> bool {
@@ -1766,7 +2107,8 @@ impl Store {
                 self.inspector.set(false);
             } else {
                 self.sidebar.set(true);
-                self.inspector.set(self.inspector_default.get());
+                self.inspector
+                    .set(self.inspector_default.get() && untracked(|| self.coding_on_screen()));
             }
         }
     }
@@ -1989,13 +2331,14 @@ impl Store {
         })
     }
 
-    /// Where a conversation lives, for its second line: platform and place.
+    /// Where a conversation lives, for its second line: platform, bot,
+    /// and whether it is a group.
     pub fn place(&self, id: &str) -> String {
-        let channel = self.channel(id).unwrap_or_default();
-        let platform = platform_name(id);
-        match channel.split_once(':') {
-            Some((_, bot)) if !bot.is_empty() => format!("{platform} · {bot}"),
-            _ => platform.to_owned(),
+        let place = channel_name(&self.channel(id).unwrap_or_default(), id);
+        if self.is_group(id) {
+            format!("{place} · group")
+        } else {
+            place
         }
     }
 
@@ -2108,14 +2451,34 @@ impl Store {
         if let Some(id) = &id {
             self.load_history(id);
             self.inspected.set(self.latest_turn(id));
+            // A coding conversation opens on its changes; a newly picked one
+            // reads them to know whether it is one.
+            self.inspector_tab.set(if self.is_coding(id) {
+                CHANGES_TAB
+            } else {
+                STEPS_TAB
+            });
         } else {
             self.inspected.set(None);
         }
+        // On a wide window the details show beside a coding conversation;
+        // any other gets the room (they are a key away).
+        let coding = id.as_deref().is_some_and(|id| self.is_coding(id));
+        self.show_details(coding);
         let _ = nsh_core::storage::Storage::set_item(OPEN_KEY, id.clone().unwrap_or_default());
-        // A plain new conversation starts in no project; `new_in_project`
-        // places it after this.
-        self.new_project.set(None);
+        // A plain new conversation starts in no project (or the project of
+        // the folder the app runs in); `new_in_project` places it after.
+        self.new_project.set(if id.is_none() {
+            self.here_project()
+        } else {
+            None
+        });
+        let picked = id.is_some();
         self.selected.set(id);
+        // Its changes say whether it works on code (and are ready to show).
+        if picked {
+            self.refresh_changes();
+        }
     }
 
     fn load_history(&self, id: &str) {
@@ -2329,6 +2692,40 @@ fn pane_name(pane: Pane) -> &'static str {
         Pane::Approvals => "approvals",
         Pane::Tasks => "running work",
         Pane::Unknown => "unknown",
+    }
+}
+
+/// Where a session came from: its `channel` (`telegram:coding_bot`,
+/// `app`), else what its id names.
+pub fn platform_of(channel: &str, id: &str) -> Source {
+    let platform = channel.split(':').next().unwrap_or_default();
+    match platform {
+        "app" => Source::App,
+        "telegram" => Source::Telegram,
+        "slack" => Source::Slack,
+        "discord" => Source::Discord,
+        _ => match platform_name(id) {
+            "App" => Source::App,
+            "Telegram" => Source::Telegram,
+            "Slack" => Source::Slack,
+            "Discord" => Source::Discord,
+            _ => Source::Chat,
+        },
+    }
+}
+
+/// A channel as people name it: "Telegram · coding_bot", "App".
+pub fn channel_name(channel: &str, id: &str) -> String {
+    let platform = match platform_of(channel, id) {
+        Source::App => "App",
+        Source::Telegram => "Telegram",
+        Source::Slack => "Slack",
+        Source::Discord => "Discord",
+        _ => platform_name(id),
+    };
+    match channel.split_once(':') {
+        Some((_, bot)) if !bot.is_empty() => format!("{platform} · {bot}"),
+        _ => platform.to_owned(),
     }
 }
 

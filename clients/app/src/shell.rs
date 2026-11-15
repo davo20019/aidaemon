@@ -1,6 +1,8 @@
-//! The window: sidebar, conversation, inspector, and the command palette
-//! over them. The terminal gets the same panes; narrow windows fold the
-//! inspector away first, then the sidebar.
+//! The window: sidebar, conversation, details (Changes and Steps), and the
+//! command palette over them. Narrow windows fold the details away first,
+//! then the sidebar. The terminal is a coding tool first: the conversation
+//! fills it, the list and the details open on a key, and run in a
+//! project's folder it starts in that project.
 
 use aidaemon_client_protocol::ApprovalDecision;
 use nsh_base::{CommandEntry, CommandItem, command, dialog};
@@ -16,6 +18,9 @@ pub fn shell(store: Store) -> View {
     let wide = computed(move || window().width.0 >= 1180.0);
     let roomy = computed(move || window().width.0 >= 760.0);
     store.set_inspector(!terminal);
+    if terminal {
+        store.set_sidebar(false);
+    }
     effect(move || store.set_compact(!roomy.get()));
     crate::features::notify::approvals(store);
     crate::features::notify::replies(store);
@@ -34,6 +39,8 @@ pub fn shell(store: Store) -> View {
     on_key("mod+n", move |_| store.select(None));
     on_key("mod+b", move |_| store.open_sidebar());
     on_key("mod+i", move |_| store.open_inspector());
+    // The changes of the conversation on screen.
+    on_key("mod+d", move |_| store.show_changes());
     on_key("mod+g", move |_| store.take_suggestion());
     // Fires while typing too (an input would keep Esc to itself), and
     // still reaches the input after.
@@ -226,8 +233,12 @@ pub fn key_line(store: Store) -> View {
             (key_label("mod+k"), "commands"),
             (key_label("mod+n"), "new"),
             (key_label("mod+b"), "list"),
-            (key_label("mod+i"), "inbox"),
         ];
+        if store.coding_on_screen() {
+            keys.push((key_label("mod+d"), "changes"));
+        } else {
+            keys.push((key_label("mod+i"), "steps"));
+        }
         if let Some(id) = store.selected()
             && store.is_running(&id)
         {
@@ -252,9 +263,12 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         CommandItem::new("sidebar", "Show or hide the sidebar")
             .group("View")
             .shortcut("mod+b"),
-        CommandItem::new("inspector", "Show or hide the inbox")
+        CommandItem::new("inspector", "Show or hide the steps")
             .group("View")
             .shortcut("mod+i"),
+        CommandItem::new("changes", "Show the changes of this conversation")
+            .group("View")
+            .shortcut("mod+d"),
     ];
     items.push(
         CommandItem::new("system", "System: how the daemon is doing")
@@ -337,6 +351,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 "new" => store.select(None),
                                 "sidebar" => store.open_sidebar(),
                                 "inspector" => store.open_inspector(),
+                                "changes" => store.show_changes(),
                                 "system" => store.open_system(),
                                 "memory" => store.open_memory(),
                                 "settings" => store.open_settings(),

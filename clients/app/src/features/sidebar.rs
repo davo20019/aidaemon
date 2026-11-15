@@ -1,10 +1,12 @@
 //! The sidebar: a new conversation, the conversations that need the owner
 //! or are working (from every project), then each project with its
-//! conversations, the conversations in no project, and the connection.
+//! conversations, the conversations in no project (filterable by where
+//! they came from: the app, each chat platform, groups), and the
+//! connection.
 
 use nsh_core::prelude::*;
 
-use crate::store::{Connection, Page, SearchRead, Store, now_ms};
+use crate::store::{Connection, Page, SearchRead, Source, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
@@ -194,6 +196,7 @@ fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
                     store
                         .session_project(id)
                         .is_none_or(|project| !known.contains(&project))
+                        && store.in_source(id)
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -236,15 +239,18 @@ fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
             },
         ))
         .child(when(
-            move || !unplaced.with(Vec::is_empty),
-            move || {
-                section_label(move || {
-                    if all.with(Vec::is_empty) {
-                        "Conversations"
-                    } else {
-                        "Other conversations"
-                    }
-                })
+            move || !unplaced.with(Vec::is_empty) || store.source_filter() != Source::All,
+            move || section_label("Conversations"),
+        ))
+        .child(sources(store))
+        .child(when(
+            move || unplaced.with(Vec::is_empty) && store.source_filter() != Source::All,
+            || {
+                text("None from here.")
+                    .px_2()
+                    .py_1()
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::FAINT)
             },
         ))
         .child(each(
@@ -254,8 +260,27 @@ fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
         ))
 }
 
+/// Where the conversations came from, as filters: shown only when they
+/// came from more than one place.
+fn sources(store: Store) -> View {
+    view().child(dynamic(move || {
+        let sources = store.sources();
+        Some(untracked(move || {
+            let mut chips = view().flex_row().flex_wrap().gap_1().px_2().pb_1();
+            for source in sources {
+                chips = chips.child(ui::chip(
+                    source.label(),
+                    move || store.source_filter() == source,
+                    move || store.set_source_filter(source),
+                ));
+            }
+            chips
+        }))
+    }))
+}
+
 /// One project: its row (fold, name, folder, New conversation) and, open,
-/// its conversations.
+/// its conversations. Its menu edits it.
 fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
     let mine = {
         let id = id.clone();
@@ -278,9 +303,16 @@ fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
         id.clone(),
     );
     let is_open = computed(move || store.project_open(&open));
+    let (start, edit) = (id.clone(), id.clone());
+    let actions = vec![
+        ui::MenuAction::new("New conversation here", move || {
+            store.new_in_project(Some(start.clone()))
+        }),
+        ui::MenuAction::new("Edit name or folder", move || store.edit_project(&edit)),
+    ];
     view()
         .gap(px(1.0))
-        .child(
+        .child(ui::with_menu(
             view()
                 .flex_row()
                 .items_center()
@@ -352,7 +384,8 @@ fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
                         move || store.new_in_project(Some(id.clone()))
                     },
                 )),
-        )
+            actions,
+        ))
         .child(when(
             move || is_open.get(),
             move || {
@@ -380,10 +413,22 @@ fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
         ))
 }
 
-/// The New project form, under the Projects heading.
+/// The project form, under the Projects heading: a new project, or the
+/// one being edited.
 fn project_form(store: Store) -> View {
-    let name = signal(String::new());
-    let path = signal(String::new());
+    let editing = untracked(|| store.project_editing().and_then(|id| store.project(&id)));
+    let name = signal(editing.as_ref().map(|p| p.name.clone()).unwrap_or_default());
+    let path = signal(
+        editing
+            .as_ref()
+            .and_then(|p| p.path.clone())
+            .unwrap_or_default(),
+    );
+    let saving_label = if editing.is_some() {
+        "Save"
+    } else {
+        "Create project"
+    };
     view()
         .px_2()
         .py_2()
@@ -413,10 +458,10 @@ fn project_form(store: Store) -> View {
                 .flex_row()
                 .gap_2()
                 .child(ui::btn(
-                    "Create project",
+                    saving_label,
                     ui::Variant::Primary,
                     ui::Size::Sm,
-                    move || store.create_project(&name.get_untracked(), &path.get_untracked()),
+                    move || store.save_project(&name.get_untracked(), &path.get_untracked()),
                 ))
                 .child(ui::btn(
                     "Cancel",

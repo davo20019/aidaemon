@@ -1,7 +1,8 @@
 //! The System page: how the daemon itself is doing. Version and models,
 //! what needs a look (failing jobs and checks, overloaded queues), token
 //! use, model call timings, scheduled goals, background jobs and health
-//! checks. Read on open, every 30 seconds while open, and on Refresh.
+//! checks; and the chat bots, each with the project its direct messages
+//! go to. Read on open, every 30 seconds while open, and on Refresh.
 
 use aidaemon_client_protocol::{CheckStatus, GoalRunInfo, SystemStatus};
 use nsh_core::prelude::*;
@@ -87,12 +88,93 @@ fn body(store: Store, read: SystemRead) -> View {
         SystemRead::Ready { status, .. } => column
             .child(overview(&status))
             .child(attention(&status))
+            .child(bots(store))
             .child(runs(store, &status))
             .child(usage(&status))
             .child(schedules(&status))
             .child(jobs(&status))
             .child(checks(&status)),
     }
+}
+
+/// The chat bots with conversations here, each with the project its
+/// direct-message chats work in. A group chat goes to a project only when
+/// the owner moves it there.
+fn bots(store: Store) -> View {
+    let bots = store.bots();
+    if bots.is_empty() {
+        return view();
+    }
+    let projects: Vec<(String, String)> = store
+        .projects()
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect();
+    let mut c = card();
+    for bot in bots {
+        let channel = bot.channel.clone();
+        let current = {
+            let channel = bot.channel.clone();
+            computed(move || {
+                store
+                    .bots()
+                    .into_iter()
+                    .find(|b| b.channel == channel)
+                    .and_then(|b| b.project)
+                    .unwrap_or_default()
+            })
+        };
+        let chats = match bot.chats {
+            1 => "1 conversation".to_owned(),
+            n => format!("{n} conversations"),
+        };
+        c = c.child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .min_h(px(ui::fit::row()))
+                .px_2()
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(bot.name.clone())
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::body())),
+                        )
+                        .child(
+                            text(chats)
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                        ),
+                )
+                .child(
+                    ui::choice(
+                        format!("Project for direct messages to {}", bot.name),
+                        "No project",
+                        std::iter::once((String::new(), "No project".to_owned()))
+                            .chain(projects.iter().cloned())
+                            .collect(),
+                        move || Some(current.get()),
+                        move |picked: Option<String>| {
+                            store.set_bot_project(&channel, picked.filter(|id| !id.is_empty()))
+                        },
+                    )
+                    .w(px(180.0)),
+                ),
+        );
+    }
+    section("Chat bots").child(c).child(
+        text(
+            "Direct messages to a bot work in its project's folder unless moved. \
+             Group chats join a project only when you move them there.",
+        )
+        .px_2()
+        .text_size(px(type_scale::XS))
+        .text_color(colors::FAINT),
+    )
 }
 
 /// A titled block.

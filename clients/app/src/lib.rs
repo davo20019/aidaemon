@@ -33,6 +33,17 @@ pub fn take_parting_words() -> Option<String> {
     PARTING.lock().ok().and_then(|mut p| p.take())
 }
 
+/// The folder the app was started in, when that means something (the
+/// terminal app, run in a project's folder).
+static WORKING_FOLDER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Start new conversations in the project of `folder`.
+pub fn set_working_folder(folder: String) {
+    if let Ok(mut here) = WORKING_FOLDER.lock() {
+        *here = Some(folder);
+    }
+}
+
 /// Frames waiting for an [`Offline`] root, from any thread.
 static FEED: std::sync::Mutex<Vec<aidaemon_client_core::Update>> =
     std::sync::Mutex::new(Vec::new());
@@ -71,6 +82,9 @@ pub fn Offline() -> impl IntoElement {
 pub fn App() -> impl IntoElement {
     let store = store::Store::new();
     provide_context(store);
+    if let Some(folder) = WORKING_FOLDER.lock().ok().and_then(|mut f| f.take()) {
+        store.set_here(folder);
+    }
     store.restore();
     link::start(store);
     view()

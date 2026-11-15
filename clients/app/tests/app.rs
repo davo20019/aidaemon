@@ -69,6 +69,8 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     ]);
     app.wait_for("Fix the flaky test")?;
     app.press("Fix the flaky test >> nth=0")?;
+    // A conversation away from code has its steps a press away.
+    app.press("Steps")?;
     feed([
         frame(
             r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-1","event":{"type":"user_message","session_id":"app:synthetic-1","text":"Why does it fail on CI?","origin":"app"}}"#,
@@ -219,14 +221,15 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     ]);
     app.wait_for("Count the files")?;
     app.press("Count the files >> nth=0")?;
-    // The working line and the inspector both say what it is doing.
+    app.press("Steps")?;
+    // The working line and the steps both say what it is doing.
     app.wait_for("text:terminal: find . -name '*.rs'...  ·  2 tools so far")?;
     app.wait_for("read_file")?;
     Ok(())
 }
 
 #[test]
-fn the_code_tab_reads_changes_and_a_file_write_opens_it() -> Result<(), String> {
+fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     app.wait_for("What should we work on?")?;
@@ -238,8 +241,11 @@ fn the_code_tab_reads_changes_and_a_file_write_opens_it() -> Result<(), String> 
     ]);
     app.wait_for("Add the contact form")?;
     app.press("Add the contact form >> nth=0")?;
-    app.wait_for("Nothing running.")?;
-    // The turn's first file write moves the inspector to Code, which reads.
+    // A conversation that has not touched code has its steps alone, a
+    // press away.
+    app.press("Steps")?;
+    app.wait_for("This turn")?;
+    // The turn's first file write gives it Changes and opens them.
     feed([
         frame(
             r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-2","event":{"type":"turn_started","turn_id":"t2","session_id":"app:synthetic-2","origin":"app"}}"#,
@@ -249,11 +255,40 @@ fn the_code_tab_reads_changes_and_a_file_write_opens_it() -> Result<(), String> 
         ),
     ]);
     app.wait_for("Reading changes…")?;
-    // Back to the Inbox, and Code again on press.
-    app.press("Inbox")?;
-    app.wait_for("Nothing running.")?;
-    app.press("Code")?;
+    // Its steps one press away, and back.
+    app.press("Steps")?;
+    app.wait_for("This turn")?;
+    app.press("Changes")?;
     app.wait_for("Reading changes…")?;
+    Ok(())
+}
+
+#[test]
+fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-5","channel":"app","title":"Weekend plan","writable":true},{"id":"synthetic_coding_bot:7","channel":"telegram:synthetic_coding_bot","title":"Fix the footer","writable":true},{"id":"synthetic_coding_bot:-9","channel":"telegram:synthetic_coding_bot","title":"Team release notes","writable":true,"group":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Weekend plan")?;
+    // Where each came from, as filters.
+    app.wait_for("Telegram · synthetic_coding_bot · group")?;
+    app.press("Groups")?;
+    app.wait_for_gone("Weekend plan", std::time::Duration::from_secs(5))?;
+    app.wait_for("Team release notes")?;
+    // A group: posting from here is the owner's explicit choice.
+    app.press("Team release notes >> nth=0")?;
+    app.wait_for("Post in this group")?;
+    app.press("Post in this group")?;
+    app.wait_for("Also posted in Telegram · synthetic_coding_bot · group")?;
+    // A direct chat posts there too, and says so.
+    app.press("All")?;
+    app.press("Fix the footer >> nth=0")?;
+    app.wait_for("Also posted in Telegram · synthetic_coding_bot")?;
     Ok(())
 }
 
@@ -274,7 +309,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Acme site")?;
     app.wait_for("Design notes")?;
     // A conversation in no project is listed on its own.
-    app.wait_for("Other conversations")?;
+    app.wait_for("Conversations")?;
     app.wait_for("Grocery list")?;
     // A project opens on its conversations.
     app.press("Project Acme site, 1 conversations")?;

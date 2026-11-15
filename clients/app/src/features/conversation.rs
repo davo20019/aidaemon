@@ -104,7 +104,48 @@ pub fn page(store: Store, session: Option<String>) -> View {
         .child(view().flex_1().child(body))
         .child(offers(store, session.clone()))
         .child(notices(store))
-        .child(composer(store, session))
+        .child(match session.clone() {
+            // A group hears what is sent from here: the owner says so first.
+            Some(id) if untracked(|| store.is_group(&id)) => {
+                let gate = id.clone();
+                when(move || store.may_post(&gate), {
+                    let session = session.clone();
+                    move || composer(store, session.clone())
+                })
+                .otherwise(move || group_gate(store, id.clone()))
+                .into_element()
+            }
+            _ => composer(store, session).into_element(),
+        })
+}
+
+/// In a group conversation, instead of the composer until the owner
+/// chooses: what is sent from here is posted for everyone in it.
+fn group_gate(store: Store, session: String) -> View {
+    let bot = untracked(|| {
+        crate::store::channel_name(&store.channel(&session).unwrap_or_default(), &session)
+    });
+    view().items_center().px_4().pb_4().pt_2().child(
+        ui::surface()
+            .w_full()
+            .max_w(px(size::COLUMN))
+            .p_3()
+            .gap_2()
+            .child(
+                text(format!(
+                    "Other people are in this chat. A message sent from here is \
+                     posted there by {bot}, for everyone in it to see."
+                ))
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+            )
+            .child(view().flex_row().gap_2().child(ui::btn(
+                "Post in this group",
+                Variant::Secondary,
+                ui::Size::Sm,
+                move || store.allow_posting(&session),
+            ))),
+    )
 }
 
 /// What the daemon offers in this conversation: features the agent asked
@@ -265,7 +306,9 @@ fn notices(store: Store) -> View {
 
 fn header(store: Store, session: Option<String>) -> View {
     let title = session.clone();
-    let waiting = computed(move || store.approvals().len());
+    let chat = session
+        .clone()
+        .filter(|id| store.source(id) != crate::store::Source::App);
     view()
         .h(px(ui::fit::bar()))
         .flex_row()
@@ -298,12 +341,17 @@ fn header(store: Store, session: Option<String>) -> View {
                     .text_size(px(ui::fit::body()))
                     .font_weight(FontWeight::SEMIBOLD),
                 )
-                // The project it works in, under its title.
+                // Where it lives (a chat's platform and bot) and the
+                // project it works in, under its title.
                 .child(when(
-                    move || store.current_project().is_some(),
+                    {
+                        let chat = chat.clone();
+                        move || chat.is_some() || store.current_project().is_some()
+                    },
                     move || {
+                        let chat = chat.clone();
                         text(move || {
-                            store
+                            let project = store
                                 .current_project()
                                 .and_then(|id| store.project(&id))
                                 .map(|p| match p.path {
@@ -313,8 +361,13 @@ fn header(store: Store, session: Option<String>) -> View {
                                         super::sidebar::short_path(&path)
                                     ),
                                     None => p.name,
-                                })
-                                .unwrap_or_default()
+                                });
+                            let place = chat.as_deref().map(|id| store.place(id));
+                            match (place, project) {
+                                (Some(place), Some(project)) => format!("{place} · {project}"),
+                                (Some(place), None) => place,
+                                (None, project) => project.unwrap_or_default(),
+                            }
                         })
                         .number_of_lines(1)
                         .text_size(px(type_scale::XS))
@@ -378,12 +431,30 @@ fn header(store: Store, session: Option<String>) -> View {
         .child(when(
             move || store.is_compact() || !store.inspector_open(),
             move || {
-                ui::icon_btn_count(
-                    Glyph::Inspector,
-                    "Inbox and code",
-                    move || waiting.get(),
-                    move || store.open_inspector(),
-                )
+                view().child(dynamic(move || {
+                    let coding = store.coding_on_screen();
+                    // A phone names it: the changes are the point of a
+                    // coding conversation there.
+                    if coding && store.is_compact() {
+                        let label = match store.changed_files() {
+                            Some(n) if n > 0 => format!("Changes · {n}"),
+                            _ => "Changes".to_owned(),
+                        };
+                        return Some(untracked(move || {
+                            ui::btn(label, Variant::Ghost, Size::Sm, move || {
+                                store.show_changes()
+                            })
+                            .into_element()
+                        }));
+                    }
+                    let label = if coding { "Changes and steps" } else { "Steps" };
+                    Some(untracked(move || {
+                        ui::icon_btn(Glyph::Inspector, label, Size::Md, move || {
+                            store.open_inspector()
+                        })
+                        .into_element()
+                    }))
+                }))
             },
         ))
 }
@@ -862,7 +933,7 @@ fn draft_files(store: Store) -> View {
 /// the press: a browser opens a new tab only for the tap itself, so the
 /// request is not put off to a task (whether it opened is not awaited).
 fn open_file(url: String) {
-    let _ = open_url(url);
+    drop(open_url(url));
 }
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
@@ -1018,6 +1089,11 @@ fn composer(store: Store, session: Option<String>) -> View {
         },
     );
     let slash = computed(move || store.slash_matches());
+    // A chat's messages from here also go to the chat itself.
+    let chat_note = session
+        .as_deref()
+        .filter(|id| untracked(|| store.source(id)) != crate::store::Source::App)
+        .map(|id| format!("Also posted in {}", untracked(|| store.place(id))));
     view()
         .items_center()
         .px_4()
@@ -1119,7 +1195,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                     "Working · Enter adds to it · {} queues · Esc stops",
                                     key_label("mod+enter")
                                 ),
-                                (false, true) => String::new(),
+                                (false, true) => chat_note.clone().unwrap_or_default(),
                                 // Terminals rarely send Shift+Enter; Alt+Enter
                                 // works in all of them.
                                 (false, false) if terminal => {
@@ -1128,9 +1204,10 @@ fn composer(store: Store, session: Option<String>) -> View {
                                         key_label("alt+enter")
                                     )
                                 }
-                                (false, false) => {
-                                    "Enter to send · Shift+Enter for a new line".to_owned()
-                                }
+                                (false, false) => match &chat_note {
+                                    Some(note) => format!("{note} · Enter to send"),
+                                    None => "Enter to send · Shift+Enter for a new line".to_owned(),
+                                },
                             })
                             .flex_1()
                             .px(px(8.0))

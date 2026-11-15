@@ -1,21 +1,18 @@
-//! The inspector, in two tabs. Inbox: everything waiting on the owner
-//! (approvals across all conversations), the work running now, and what
-//! the current turn did, step by step. Code: the selected conversation's
-//! code changes (`features::code`).
+//! The details pane beside a conversation: for a coding conversation its
+//! Changes (`features::code`) and Steps, for any other its Steps alone:
+//! the work running for it and what its current turn did, step by step.
+//! What waits on the owner across conversations is the sidebar's Needs
+//! you, not here.
 
 use nsh_core::prelude::*;
 
-use super::approvals;
-use aidaemon_client_protocol::{Approval, TaskSummary};
+use aidaemon_client_protocol::TaskSummary;
 
-use crate::store::{ActivityKind, CODE_TAB, INSPECTOR_TABS, Store, now_ms};
-use crate::ui::{
-    self, Glyph, Size, Tone, Variant, badge, btn, colors, radius, section_label, type_scale,
-};
+use crate::store::{ActivityKind, CHANGES_TAB, DETAIL_TABS, Store, now_ms};
+use crate::ui::{self, Glyph, Size, Tone, Variant, btn, colors, radius, section_label, type_scale};
 
 pub fn inspector(store: Store) -> View {
-    let approvals = computed(move || store.approvals());
-    let running = computed(move || store.running());
+    let coding = computed(move || store.coding_on_screen());
     view()
         .w_full()
         .flex_1()
@@ -29,19 +26,18 @@ pub fn inspector(store: Store) -> View {
                 .items_center()
                 .px_4()
                 .child(
-                    view()
-                        .flex_1()
-                        .child(ui::tab_bar(store.inspector_tab(), &INSPECTOR_TABS)),
+                    view().flex_1().child(
+                        when(coding, move || {
+                            ui::tab_bar(store.inspector_tab(), &DETAIL_TABS)
+                        })
+                        .otherwise(|| {
+                            text("Steps")
+                                .role(AccessibilityRole::Header)
+                                .text_size(px(ui::fit::body()))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        }),
+                    ),
                 )
-                .child(when(
-                    move || approvals.with(|a| !a.is_empty()),
-                    move || {
-                        badge(
-                            move || format!("{} waiting", approvals.with(Vec::len)),
-                            Tone::Warning,
-                        )
-                    },
-                ))
                 .child(when(
                     move || store.is_compact(),
                     move || {
@@ -52,138 +48,43 @@ pub fn inspector(store: Store) -> View {
                 )),
         )
         .child(dynamic(move || {
-            let tab = store.inspector_tab().get();
+            let changes = coding.get() && store.inspector_tab().get() == CHANGES_TAB;
             Some(untracked(move || {
-                if tab == CODE_TAB {
+                if changes {
                     super::code::code(store)
                 } else {
-                    inbox(store, approvals, running)
+                    steps(store)
                 }
             }))
         }))
 }
 
-/// The Inbox tab.
-fn inbox(store: Store, approvals: Memo<Vec<Approval>>, running: Memo<Vec<TaskSummary>>) -> View {
+/// The Steps tab: the selected conversation's running work, then its
+/// current turn.
+fn steps(store: Store) -> View {
+    let running = computed(move || {
+        let selected = store.selected();
+        store
+            .running()
+            .into_iter()
+            .filter(|t| Some(&t.session_id) == selected.as_ref())
+            .collect::<Vec<TaskSummary>>()
+    });
     view().flex_1().child(
         scroll().flex_1().child(
             view()
                 .px_3()
                 .pb_4()
                 .gap_2()
-                // Approvals of other conversations: the current one shows
-                // its own inline.
                 .child(when(
+                    move || !running.with(Vec::is_empty),
                     move || {
-                        let current = store.selected();
-                        approvals
-                            .with(|a| a.iter().any(|a| Some(&a.session_id) != current.as_ref()))
-                    },
-                    move || {
-                        view()
-                            .gap_2()
-                            .child(section_label("Waiting for you"))
-                            .child(each(
-                                move || {
-                                    let current = store.selected();
-                                    approvals.with(|a| {
-                                        a.iter()
-                                            .filter(|a| Some(&a.session_id) != current.as_ref())
-                                            .cloned()
-                                            .collect::<Vec<_>>()
-                                    })
-                                },
-                                |a| a.id.clone(),
-                                move |a, _| {
-                                    let approval = a.get_untracked();
-                                    let session = approval.session_id.clone();
-                                    view()
-                                        .gap_1()
-                                        .child(
-                                            ui::row(
-                                                || false,
-                                                move || store.select(Some(session.clone())),
-                                            )
-                                            .child(
-                                                text(move || {
-                                                    format!(
-                                                        "In {}",
-                                                        store.title(
-                                                            &a.with(|a| a.session_id.clone())
-                                                        )
-                                                    )
-                                                })
-                                                .flex_1()
-                                                .number_of_lines(1)
-                                                .text_size(px(type_scale::XS))
-                                                .text_color(colors::MUTED),
-                                            ),
-                                        )
-                                        .child(approvals::card(store, approval))
-                                },
-                            ))
-                    },
-                ))
-                // Replies the owner has not read yet, anywhere.
-                .child(when(
-                    move || store.unread_count() > 0,
-                    move || {
-                        view()
-                            .gap_1()
-                            .child(section_label("New replies"))
-                            .child(each(
-                                move || {
-                                    store
-                                        .session_ids()
-                                        .into_iter()
-                                        .filter(|id| store.is_unread(id))
-                                        .collect::<Vec<_>>()
-                                },
-                                |id: &String| id.clone(),
-                                move |id, _| {
-                                    let id = id.get_untracked();
-                                    let (open, title, place) = (id.clone(), id.clone(), id.clone());
-                                    ui::row(|| false, move || store.select(Some(open.clone())))
-                                        .child(ui::icon(Glyph::Chat).text_color(colors::ACCENT))
-                                        .child(
-                                            view()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .child(
-                                                    text(move || store.title(&title))
-                                                        .number_of_lines(1)
-                                                        .text_size(px(ui::fit::body())),
-                                                )
-                                                .child(
-                                                    text(move || store.place(&place))
-                                                        .number_of_lines(1)
-                                                        .text_size(px(type_scale::XS))
-                                                        .text_color(colors::FAINT),
-                                                ),
-                                        )
-                                },
-                            ))
-                    },
-                ))
-                .child(section_label("Running"))
-                .child(
-                    when(
-                        move || running.with(Vec::is_empty),
-                        || {
-                            text("Nothing running.")
-                                .px_2()
-                                .text_size(px(type_scale::SM))
-                                .text_color(colors::FAINT)
-                        },
-                    )
-                    .otherwise(move || {
-                        view().gap_1().child(each(
+                        view().gap_1().child(section_label("Running")).child(each(
                             running,
                             |t| t.id.clone(),
                             move |task, _| {
                                 let id = task.with_untracked(|t| t.id.clone());
                                 let started = task.with_untracked(|t| t.started_at_ms);
-                                let session = task.with_untracked(|t| t.session_id.clone());
                                 view()
                                     .flex_row()
                                     .items_center()
@@ -192,18 +93,11 @@ fn inbox(store: Store, approvals: Memo<Vec<Approval>>, running: Memo<Vec<TaskSum
                                     .py_1()
                                     .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
                                     .child(
-                                        ui::row(
-                                            || false,
-                                            move || store.select(Some(session.clone())),
-                                        )
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .child(
-                                            text(move || task.with(|t| t.description.clone()))
-                                                .flex_1()
-                                                .number_of_lines(1)
-                                                .text_size(px(type_scale::SM)),
-                                        ),
+                                        text(move || task.with(|t| t.description.clone()))
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .number_of_lines(1)
+                                            .text_size(px(type_scale::SM)),
                                     )
                                     // How long it has run: a clock tick a second.
                                     .child(
@@ -220,8 +114,8 @@ fn inbox(store: Store, approvals: Memo<Vec<Approval>>, running: Memo<Vec<TaskSum
                                     }))
                             },
                         ))
-                    }),
-                )
+                    },
+                ))
                 .child(section_label("This turn"))
                 .child(timeline(store)),
         ),

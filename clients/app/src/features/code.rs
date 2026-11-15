@@ -1,10 +1,11 @@
-//! The inspector's Code tab: the uncommitted changes in the git
-//! repositories the selected conversation worked in. Each repository lists
-//! its changed files (those this conversation wrote first); pressing one
-//! shows its diff. Read when the tab opens, on Refresh, and after a tool
-//! that can change files finishes.
+//! The details pane's Changes tab: whether the last change was checked
+//! (the last command run after it, and how it ended), then the uncommitted
+//! changes in the git repositories the selected conversation worked in.
+//! Each repository lists its changed files (those this conversation wrote
+//! first); pressing one shows its diff. Read when the tab opens, on
+//! Refresh, and after a tool that can change files finishes.
 
-use aidaemon_client_protocol::{FileChange, FileStatus, RepoChanges};
+use aidaemon_client_protocol::{CheckRun, FileChange, FileStatus, RepoChanges};
 use nsh_core::prelude::*;
 
 use crate::store::{ChangesRead, Store};
@@ -52,13 +53,61 @@ fn body(store: Store, read: ChangesRead, open: Signal<Option<(String, String)>>)
             ))
             .child(refresh(store)),
         ChangesRead::Ready(changes) => {
-            let mut list = view().gap_3();
+            let wrote = changes
+                .repos
+                .iter()
+                .any(|repo| repo.files.iter().any(|f| f.by_session));
+            let mut list = view().gap_3().child(check(changes.last_check, wrote));
             for repo in changes.repos {
                 list = list.child(repo_view(store, repo, open));
             }
             list
         }
     }
+}
+
+/// Whether the conversation's last change was checked: the command, and
+/// how it ended. Nothing when it wrote nothing that is still uncommitted.
+fn check(run: Option<CheckRun>, wrote: bool) -> View {
+    let (glyph, tone, line) = match run {
+        Some(run) if run.passed => (
+            Glyph::Check,
+            Tone::Success,
+            format!("Passed: {}", run.command),
+        ),
+        Some(run) => (
+            Glyph::Close,
+            Tone::Danger,
+            match run.exit_code {
+                Some(code) => format!("Failed (exit {code}): {}", run.command),
+                None => format!("Failed: {}", run.command),
+            },
+        ),
+        None if wrote => (
+            Glyph::Dot,
+            Tone::Warning,
+            "Not checked: no command ran after the last change".to_owned(),
+        ),
+        None => return view(),
+    };
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_2()
+        .rounded(px(radius::SMALL))
+        .bg(colors::INSET)
+        .child(ui::icon(glyph).text_color(tone.color()))
+        .child(
+            text(line)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(2)
+                .font_family(ui::theme::MONO)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::TEXT),
+        )
 }
 
 fn refresh(store: Store) -> View {

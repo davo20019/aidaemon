@@ -21,8 +21,9 @@ use aidaemon_channels::turns::{TurnDeps, TurnWatch};
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
 use aidaemon_client_protocol::{
     Billing, CheckedKey, ConnectedProvider, CredentialState, FileChange, FileStatus,
-    HistoryMessage, MemoryItem, ProviderChoice, ProviderOption, RepoChanges, SearchHit,
-    SessionChanges, SessionSummary, Settings, SettingsChange, SignIn, SlashCommand, ViewAction,
+    HistoryMessage, MemoryItem, ProjectSummary, ProviderChoice, ProviderOption, RepoChanges,
+    SearchHit, SessionChanges, SessionSummary, Settings, SettingsChange, SignIn, SlashCommand,
+    ViewAction,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -172,14 +173,31 @@ impl ClientHost for Host {
             },
             SessionSummary {
                 id: "telegram:synthetic-user-1".into(),
-                channel: "telegram".into(),
-                title: Some("Alice Rivera on Telegram".into()),
+                channel: "telegram:synthetic_coding_bot".into(),
+                title: Some("Fix the contact form".into()),
                 last_activity_ms: Some(now_ms() - 26 * 3_600_000),
-                writable: false,
-                project_id: None,
+                writable: true,
+                project_id: Some("project-acme".into()),
                 group: false,
             },
+            SessionSummary {
+                id: "telegram:synthetic-group-1".into(),
+                channel: "telegram:synthetic_coding_bot".into(),
+                title: Some("Release notes for the team".into()),
+                last_activity_ms: Some(now_ms() - 30 * 3_600_000),
+                writable: true,
+                project_id: None,
+                group: true,
+            },
         ])
+    }
+    async fn projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
+        Ok(vec![ProjectSummary {
+            id: "project-acme".into(),
+            name: "Acme site".into(),
+            path: Some("/home/synthetic/acme-site".into()),
+            channels: vec!["telegram:synthetic_coding_bot".into()],
+        }])
     }
     async fn history(&self, session_id: &str, _: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         let lines: &[(&str, &str)] = match session_id {
@@ -212,7 +230,7 @@ impl ClientHost for Host {
             .collect())
     }
     async fn changes(&self, session_id: &str) -> anyhow::Result<SessionChanges> {
-        if session_id != "app:plan" {
+        if session_id != "app:plan" && session_id != "telegram:synthetic-user-1" {
             return Ok(SessionChanges::default());
         }
         let file = |path: &str, status, added, removed, by_session| FileChange {

@@ -571,6 +571,44 @@ pub fn section_label(label: impl IntoReactive<SharedString>) -> Text {
         .pb_1()
 }
 
+/// One of a few filters side by side: outlined, and filled with the accent
+/// when chosen.
+pub fn chip(
+    label: impl Into<SharedString>,
+    selected: impl Fn() -> bool + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let label = label.into();
+    button()
+        .h(px(if touch() { 32.0 } else { 24.0 }))
+        .px_2()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::CONTROL))
+        .border_1()
+        .border_color(colors::BORDER)
+        .transition_colors()
+        .duration(motion::FAST)
+        .hover(|s| s.bg(colors::HOVER))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .style_when(selected, |s| {
+            s.bg(Tone::Accent.tint()).border_color(colors::ACCENT)
+        })
+        .accessibility_label(label.clone())
+        .on_press(on_press)
+        .child(
+            text(label)
+                .text_size(px(type_scale::XS))
+                .text_color(move || {
+                    if selected() {
+                        colors::ACCENT
+                    } else {
+                        colors::MUTED
+                    }
+                }),
+        )
+}
+
 /// A selectable row in a list (the sidebar's sessions, a menu-like list).
 /// The wash fills its whole hit area; selection is stronger than hover.
 pub fn row(

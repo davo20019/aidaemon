@@ -92,6 +92,11 @@ pub fn run() -> io::Result<()> {
             home.join(".aidaemon").join("app-terminal"),
         ));
     }
+    // Run in a project's folder, new conversations start in that project.
+    if let Ok(folder) = std::env::current_dir() {
+        let folder = resolved_folder(folder);
+        nsh_app_aidaemon::set_working_folder(folder);
+    }
     let session = Session::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut view = AppView::new(options);
@@ -115,6 +120,15 @@ pub fn run() -> io::Result<()> {
         let _ = out.flush();
     }
     result
+}
+
+/// `folder` as the daemon stores project folders: resolved (symlinks
+/// followed), as text.
+fn resolved_folder(folder: std::path::PathBuf) -> String {
+    std::fs::canonicalize(&folder)
+        .unwrap_or(folder)
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
