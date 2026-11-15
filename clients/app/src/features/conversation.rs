@@ -1065,6 +1065,9 @@ fn composer(store: Store, session: Option<String>) -> View {
     };
     let field = element_ref();
     let dragging = signal(false);
+    // Enter's steer, held a moment so ⌘↩ can make it a queue instead.
+    let steer_pending = stored(false);
+    let owner = Owner::current();
     let touch = matches!(
         idiom(),
         nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
@@ -1081,6 +1084,8 @@ fn composer(store: Store, session: Option<String>) -> View {
         },
         move |_| {
             if running.get_untracked() {
+                // The field's own submit (see `on_submit`) does not steer it.
+                steer_pending.replace(false);
                 store.submit_placed(Some(MidRun::Queue));
             } else {
                 store.submit();
@@ -1189,7 +1194,18 @@ fn composer(store: Store, session: Option<String>) -> View {
                         })
                         .on_submit(move |_: &str| {
                             if running.get_untracked() {
-                                store.submit_placed(Some(MidRun::Steer));
+                                // A browser's field submits on ⌘↩ too, before
+                                // the Queue shortcut hears it: wait a moment
+                                // for the shortcut to claim it.
+                                steer_pending.replace(true);
+                                owner.run(|| {
+                                    spawn(async move {
+                                        timer(std::time::Duration::from_millis(40)).await;
+                                        if steer_pending.replace(false) {
+                                            store.submit_placed(Some(MidRun::Steer));
+                                        }
+                                    })
+                                });
                             } else {
                                 store.submit();
                             }

@@ -453,6 +453,8 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     )]);
     // What each one did, not only what it will do.
     app.wait_for("It hasn't run yet.")?;
+    // Runs that reported something since the last look are marked.
+    app.wait_for("New since you last looked")?;
     app.wait_for(r"text:/^Last run .* · Failed: The synthetic token expired\.$/")?;
     // Paused after its runs kept failing: the way back is a good run.
     app.wait_for("Paused after failures")?;

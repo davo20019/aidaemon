@@ -66,7 +66,9 @@ pub fn shell(store: Store) -> View {
     );
     // Copy the last reply, anywhere.
     on_key_with("mod+shift+c", always(), move |_| copy_reply(store));
-    on_key(SYSTEM_KEY, move |_| store.open_system());
+    if let Some(key) = SYSTEM_KEY {
+        on_key(key, move |_| store.open_system());
+    }
     if terminal {
         // One meaning per state: stop the turn; else press twice to quit.
         let armed = stored(0_u64);
@@ -276,11 +278,11 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .group("View")
             .shortcut("mod+d"),
     ];
-    items.push(
-        CommandItem::new("system", "System: how the daemon is doing")
-            .group("View")
-            .shortcut(SYSTEM_KEY),
-    );
+    let system = CommandItem::new("system", "System: how the daemon is doing").group("View");
+    items.push(match SYSTEM_KEY {
+        Some(key) => system.shortcut(key),
+        None => system,
+    });
     items.push(
         CommandItem::new(
             "automations",
@@ -436,9 +438,10 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         )
 }
 
-/// The System page's key. A browser keeps ⌘, for its own settings, so the
-/// web build takes the next one free.
+/// The System page's key. A browser keeps ⌘, for its own settings, and a
+/// shifted comma arrives as "<", so the web build has none: the palette and
+/// the sidebar reach the page there.
 #[cfg(not(target_arch = "wasm32"))]
-const SYSTEM_KEY: &str = "mod+,";
+const SYSTEM_KEY: Option<&str> = Some("mod+,");
 #[cfg(target_arch = "wasm32")]
-const SYSTEM_KEY: &str = "mod+shift+,";
+const SYSTEM_KEY: Option<&str> = None;
