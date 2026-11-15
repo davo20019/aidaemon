@@ -182,7 +182,15 @@ pub struct ProgramEnd {
 /// failed; a normal exit succeeded only if it did its work, by the same
 /// [`nothing_done`] rule a sub-agent's run is judged by.
 pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
-    if end.stopped || end.exit_code != Some(0) {
+    // Stopped by the runtime, its exit status says nothing about the work
+    // (a stopped program can still exit 0): it was stopped.
+    if end.stopped {
+        return (
+            RunEnd::Failed(RunFailure::Exited { code: None }),
+            RunEvidence::default(),
+        );
+    }
+    if end.exit_code != Some(0) {
         return (
             RunEnd::Failed(RunFailure::Exited {
                 code: end.exit_code,
@@ -378,10 +386,18 @@ mod tests {
         let errored = ProgramEnd {
             exit_code: Some(2),
             changed_something: true,
-            ..refused
+            ..refused.clone()
         };
         let (end, _) = program_phase(&errored);
         assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: Some(2) }));
+        // Stopped by the runtime: stopped, whatever status it exited with.
+        let stopped = ProgramEnd {
+            exit_code: Some(0),
+            stopped: true,
+            ..refused
+        };
+        let (end, _) = program_phase(&stopped);
+        assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: None }));
     }
 
     #[test]
