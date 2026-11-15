@@ -261,14 +261,6 @@ impl ConfigManagerTool {
         label
     }
 
-    /// The summary of failover entry `index` of `entries`.
-    fn failover_entry_summary(entries: &[toml::Value], index: usize) -> String {
-        entries[index]
-            .as_table()
-            .map(|table| Self::summarize_provider_table(index, table))
-            .unwrap_or_else(|| format!("[{}] (invalid provider entry)", index))
-    }
-
     /// The card summary for a call that asks the owner, read from the
     /// config as the call will find it; `None` for a call that needs no card
     /// (a change that is not security-sensitive, or a call its action
