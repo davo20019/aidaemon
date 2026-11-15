@@ -496,7 +496,9 @@ fn is_broad_delete_target(raw_target: &str, workspace_root: &str) -> bool {
     if is_within_workspace(target, workspace_root) {
         return false;
     }
-    if !Path::new(target).is_absolute() {
+    // `/tmp/x` names a fixed place on every platform; on Windows it is the
+    // current drive's root, which `Path::is_absolute` does not count.
+    if !(target.starts_with('/') || Path::new(target).is_absolute()) {
         return true;
     }
     const BROAD_PREFIXES: &[&str] = &[

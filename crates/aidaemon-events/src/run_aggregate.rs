@@ -2956,20 +2956,15 @@ fn hint_matches_target(
             expected
                 .ok()
                 .zip(actual.ok())
-                .is_some_and(|(target, actual)| {
-                    let root = target.as_str().trim_end_matches('/');
-                    actual.as_str() == target.as_str()
-                        || actual.as_str().starts_with(&format!("{root}/"))
-                })
+                .is_some_and(|(target, actual)| path_is_within(actual.as_str(), target.as_str()))
         }
         (RequestVerificationTargetKind::Path, ToolTargetHintKind::ProjectScope) => {
             let expected = paths.normalize(&target.value);
             let root = paths.normalize(&hint.value);
-            expected.ok().zip(root.ok()).is_some_and(|(target, root)| {
-                let target = target.as_str();
-                let root = root.as_str().trim_end_matches('/');
-                target == root || target.starts_with(&format!("{root}/"))
-            })
+            expected
+                .ok()
+                .zip(root.ok())
+                .is_some_and(|(target, root)| path_is_within(target.as_str(), root.as_str()))
         }
         (RequestVerificationTargetKind::ResourceId, ToolTargetHintKind::ResourceId) => {
             target.value == hint.value
@@ -2981,6 +2976,12 @@ fn hint_matches_target(
         }
         _ => false,
     }
+}
+
+/// `path` is `root` or a path under it, compared by components so a local
+/// Windows path (`C:\w\README.md`) is under its folder as `/w/README.md` is.
+fn path_is_within(path: &str, root: &str) -> bool {
+    std::path::Path::new(path).starts_with(root)
 }
 
 /// A relative target (`app/lib/reading-time.ts`) names a path inside the
