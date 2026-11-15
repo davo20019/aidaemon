@@ -1260,6 +1260,21 @@ pub fn spawn_background_task_lead(
             } else {
                 None
             };
+            // The note goes with what the task lead acts on (the run's
+            // instruction), not only its mission (live 2026-11-15: with it in
+            // the mission alone, the lead never said nothing_new).
+            let user_text = match (goal.goal_type == "continuous")
+                .then(|| {
+                    aidaemon_work::automations::quiet_run_note(
+                        goal.context.as_deref(),
+                        previous_result.as_deref(),
+                    )
+                })
+                .flatten()
+            {
+                Some(note) => format!("{user_text}\n\n{note}"),
+                None => user_text,
+            };
             let mission = if goal.goal_type == "continuous" {
                 aidaemon_work::automations::run_mission(
                     &goal.description,
@@ -1269,6 +1284,15 @@ pub fn spawn_background_task_lead(
             } else {
                 goal.description.clone()
             };
+            if aidaemon_work::automations::NotifyMode::from_context(goal.context.as_deref())
+                != aidaemon_work::automations::NotifyMode::EveryRun
+            {
+                info!(
+                    goal_id = %goal_id,
+                    previous = previous_result.as_deref().unwrap_or("(none)"),
+                    "Quiet automation run starts from its previous result"
+                );
+            }
             let initial_goal = goal.clone();
             let is_mandate_run = goal_run
                 .as_ref()

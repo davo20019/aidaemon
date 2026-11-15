@@ -88,8 +88,18 @@ pub enum NotifyMode {
 /// runs and Run now both start here (live 2026-11-15: a note on the run's
 /// task never reached its task lead, whose mission is the goal's).
 pub fn run_mission(description: &str, context: Option<&str>, previous: Option<&str>) -> String {
+    match quiet_run_note(context, previous) {
+        Some(note) => format!("{description}\n\n{note}"),
+        None => description.to_string(),
+    }
+}
+
+/// What a quiet automation's run is told about the last run and how to say
+/// it found nothing new; `None` for one that tells every run. It goes with
+/// the instruction the run's task lead acts on and with its mission.
+pub fn quiet_run_note(context: Option<&str>, previous: Option<&str>) -> Option<String> {
     if NotifyMode::from_context(context) != NotifyMode::Changes {
-        return description.to_string();
+        return None;
     }
     let since = match previous.map(str::trim).filter(|text| !text.is_empty()) {
         Some(previous) => format!(
@@ -100,7 +110,7 @@ pub fn run_mission(description: &str, context: Option<&str>, previous: Option<&s
         ),
         None => "This is its first run: report what you find.".to_string(),
     };
-    format!("{description}\n\n[SYSTEM: {since}]")
+    Some(format!("[SYSTEM: {since}]"))
 }
 
 /// The goal-context key naming the run whose task lead said it found
