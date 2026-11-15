@@ -227,7 +227,10 @@ mod tests {
             .into_iter()
             .filter(|n| n.notification_type == "evergreen_alert" && n.goal_id == cg.id)
             .count();
-        assert_eq!(alerts, 0, "a scheduled run never says it will keep retrying");
+        assert_eq!(
+            alerts, 0,
+            "a scheduled run never says it will keep retrying"
+        );
     }
 
     #[tokio::test]
