@@ -3032,3 +3032,41 @@ async fn test_a_run_started_now_is_not_retired_as_stale() {
     assert_eq!(tasks.len(), 1);
     assert_ne!(tasks[0].status, "cancelled", "{:?}", tasks[0].error);
 }
+
+/// Run now follows the automation's notify setting like a timed run: a
+/// quiet one's manual run is told how to say nothing changed.
+#[tokio::test]
+async fn test_a_quiet_automations_run_now_is_told_how_to_report_nothing_new() {
+    let state = test_state_store().await;
+    let mut goal = Goal::new_continuous("Read the synthetic status file", "session-1", None, None);
+    goal.context = Some(r#"{"notify":"changes"}"#.to_string());
+    state.create_goal(&goal).await.unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let schedule = GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "0 * * * *".to_string(),
+        tz: "local".to_string(),
+        original_schedule: Some("hourly".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    state.create_goal_schedule(&schedule).await.unwrap();
+    aidaemon_work::tools::scheduled_goal_runs::ScheduledGoalRuns::new(state.clone())
+        .run_now(&goal.id, None)
+        .await
+        .unwrap();
+    let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+    assert!(
+        tasks[0]
+            .description
+            .contains("set track_requirements' outcome to nothing_new"),
+        "{}",
+        tasks[0].description
+    );
+}
