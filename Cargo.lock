@@ -266,6 +266,7 @@ dependencies = [
  "aidaemon-client-protocol",
  "anyhow",
  "base64 0.23.1",
+ "dirs 6.0.0",
  "futures",
  "getrandom 0.4.3",
  "p256",

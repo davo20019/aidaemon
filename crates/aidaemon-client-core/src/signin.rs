@@ -461,3 +461,90 @@ mod tests {
         assert!(matches!(error, SignInError::Unreachable(_)), "{error:?}");
     }
 }
+
+/// A pairing link's parts: the gateway's HTTP base, the offer, its code
+/// and the daemon's fingerprint. Read from the web link
+/// (`http://host/client/v1/next/#offer=…&code=…&fp=…`) or an
+/// `aidaemon-pair:?gateway=…` link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingLink {
+    pub gateway: String,
+    pub offer_id: String,
+    pub code: String,
+    pub fingerprint: Option<String>,
+}
+
+impl PairingLink {
+    pub fn parse(link: &str) -> Option<Self> {
+        let link = link.trim();
+        let (base, query) = if let Some(rest) = link.strip_prefix("aidaemon-pair:?") {
+            (None, rest)
+        } else {
+            let (url, fragment) = link.split_once('#')?;
+            (Some(crate::machine::http_base(url)), fragment)
+        };
+        let mut gateway = base;
+        let (mut offer, mut code, mut fp) = (None, None, None);
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=')?;
+            let value = percent_decode(value);
+            match key {
+                "gateway" => gateway = Some(value.trim_end_matches('/').to_owned()),
+                "offer" => offer = Some(value),
+                "code" => code = Some(value),
+                "fp" => fp = Some(value),
+                _ => {}
+            }
+        }
+        Some(Self {
+            gateway: gateway?,
+            offer_id: offer?,
+            code: code?,
+            fingerprint: fp,
+        })
+    }
+}
+
+/// `text` with its `%XX` escapes decoded.
+pub fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod pairing_link_tests {
+    use super::PairingLink;
+
+    #[test]
+    fn both_pairing_link_forms_read_back() {
+        let web = PairingLink::parse(
+            "http://127.0.0.1:8788/client/v1/next/#offer=of-1&code=K7Q2-9FZD&fp=abc",
+        )
+        .unwrap();
+        assert_eq!(web.gateway, "http://127.0.0.1:8788");
+        assert_eq!(
+            (web.offer_id.as_str(), web.code.as_str()),
+            ("of-1", "K7Q2-9FZD")
+        );
+        let app = PairingLink::parse(
+            "aidaemon-pair:?gateway=https%3A%2F%2Fd.example.invalid&offer=of-2&code=AB&fp=f",
+        )
+        .unwrap();
+        assert_eq!(app.gateway, "https://d.example.invalid");
+        assert!(PairingLink::parse("hello").is_none());
+    }
+}

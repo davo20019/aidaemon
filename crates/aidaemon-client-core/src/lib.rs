@@ -24,6 +24,8 @@ pub mod client;
 pub mod keystore;
 #[cfg(feature = "native")]
 pub mod link;
+#[cfg(feature = "native")]
+pub mod local;
 pub mod machine;
 pub mod signin;
 pub mod state;

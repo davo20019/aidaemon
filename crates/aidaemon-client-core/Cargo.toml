@@ -17,6 +17,7 @@ publish = false
 [dependencies]
 aidaemon-client-protocol = { version = "0.20.0", path = "../client-protocol" }
 anyhow = "1"
+dirs = { version = "6", optional = true }
 base64 = "0.23"
 futures = { version = "0.3", optional = true }
 p256 = { version = "0.14", features = ["ecdsa"] }
@@ -41,7 +42,7 @@ uuid = { version = "1", features = ["v4", "rng-getrandom"] }
 default = ["native"]
 # The tokio link and reqwest sign-in. Without it the
 # crate has no I/O and builds for wasm32-unknown-unknown.
-native = ["dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite"]
+native = ["dep:dirs", "dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite"]
 # wasm32 only: randomness from the page's Web Crypto, for a runtime that
 # registers no getrandom backend of its own.
 browser-random = ["dep:getrandom", "getrandom/wasm_js"]
