@@ -32,7 +32,8 @@ const AUTO_SEND_BLOCKED_PATTERNS: &[&str] = &[
 /// Extract absolute file paths from text (e.g. goal completion messages).
 /// Only returns paths that exist on disk and aren't security-sensitive.
 pub fn extract_file_paths_from_text(text: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"(/[\w./-]+\.\w{1,10})").unwrap();
+    // Unix paths, and Windows ones (`C:\Users\...`, `C:/Users/...`).
+    let re = regex::Regex::new(r"((?:[A-Za-z]:[\\/]|/)[\w./\\-]+\.\w{1,10})").unwrap();
     let mut paths = Vec::new();
     for cap in re.captures_iter(text) {
         let path_str = &cap[1];
@@ -43,8 +44,9 @@ pub fn extract_file_paths_from_text(text: &str) -> Vec<String> {
             continue;
         }
 
-        // Check against blocked patterns
-        let path_display = path.to_string_lossy();
+        // Check against blocked patterns, on `/`-separated text whatever
+        // the platform writes.
+        let path_display = path.to_string_lossy().replace('\\', "/");
         let blocked = AUTO_SEND_BLOCKED_PATTERNS.iter().any(|pattern| {
             if pattern.starts_with('.') || pattern.starts_with('/') {
                 path_display.contains(&format!("/{}", pattern))
