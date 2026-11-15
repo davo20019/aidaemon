@@ -898,7 +898,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains(&format!("completed={completed_at}")));
+        assert!(
+            result.contains(&format!("completed={completed_at}")),
+            "{completed_at} not in {result}"
+        );
     }
 
     #[tokio::test]

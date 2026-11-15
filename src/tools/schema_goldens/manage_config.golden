@@ -19,6 +19,7 @@
             "list_failover_providers",
             "add_failover_provider",
             "remove_failover_provider",
+            "move_failover_provider",
             "enable_stt",
             "enable_client_gateway",
             "enable_exposure"
@@ -29,6 +30,10 @@
           "type": "string"
         },
         "failover_index": {
+          "type": "integer"
+        },
+        "failover_to_index": {
+          "description": "move_failover_provider: new position",
           "type": "integer"
         },
         "fast_model": {

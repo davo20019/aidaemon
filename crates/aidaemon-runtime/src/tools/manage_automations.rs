@@ -1740,6 +1740,11 @@ impl ManageAutomationsTool {
                     .await?
                 {
                     Ok(automation) => automation,
+                    // A goal the list does not show (one with no schedule
+                    // yet) still has its runs, found by its id as before.
+                    Err(_) if kind.is_none_or(|kind| kind == AutomationKind::Scheduled) => {
+                        return self.on_scheduled_goal(&args, facts).await;
+                    }
                     Err(answer) => return Ok(negative(answer)),
                 };
                 let output = self.history(&automation, args.limit.unwrap_or(10)).await?;

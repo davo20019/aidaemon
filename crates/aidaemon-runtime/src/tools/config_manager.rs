@@ -1876,7 +1876,7 @@ fn manage_config_schema() -> Value {
                 "fast_model": { "type": "string" },
                 "smart_model": { "type": "string" },
                 "failover_index": { "type": "integer" },
-                "failover_to_index": { "type": "integer" },
+                "failover_to_index": { "type": "integer", "description": "move_failover_provider: new position" },
                 "stt_cli_path": { "type": "string" },
                 "stt_model_path": { "type": "string" },
                 "stt_language": { "type": "string" }
