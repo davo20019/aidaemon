@@ -323,6 +323,7 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     app.press("src/contact.rs, modified, written in this conversation")?;
     app.wait_for("All files")?;
     app.wait_for("fn main() {}")?;
+    app.wait_for("Undo changes")?;
     app.press("Side by side")?;
     app.press("Next change")?;
     app.press("All files")?;
@@ -665,5 +666,43 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
     app.wait_for("synthetic-claude · Anthropic")?;
     wait_sent_new("set_session_model", None)?;
     app.wait_for("Auto effort")?;
+    Ok(())
+}
+
+#[test]
+fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed()
+-> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-9","channel":"app","title":"Old receipts","writable":true,"archived":true},{"id":"app:synthetic-10","channel":"app","title":"Write the newsletter","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Write the newsletter")?;
+    // An archived conversation is not in the list, only counted under it.
+    app.wait_for("Archived · 1")?;
+    app.wait_for_gone("Old receipts", std::time::Duration::from_secs(2))?;
+    app.press("Archived · 1")?;
+    app.wait_for("Old receipts")?;
+    app.press("Back to your conversations")?;
+    // A message waiting for the running work shows above the composer.
+    app.press("Write the newsletter >> nth=0")?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"q1","result":{"type":"queued","session_id":"app:synthetic-10","messages":[{"id":4,"text":"Then add the event dates","queued_at_ms":1}]}}"#,
+    )]);
+    app.wait_for("Waiting to send")?;
+    app.wait_for("Then add the event dates")?;
+    app.press("Remove from the queue")?;
+    wait_sent("edit_queued")?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"q2","result":{"type":"queued","session_id":"app:synthetic-10","messages":[]}}"#,
+    )]);
+    app.wait_for_gone(
+        "Then add the event dates",
+        std::time::Duration::from_secs(2),
+    )?;
     Ok(())
 }

@@ -283,6 +283,33 @@ fn file_diff(
                     set_clipboard(section.get_untracked())
                 })),
         )
+        // Undoing has a row of its own: the header is full on a narrow pane.
+        .child(view().flex_row().px_2().child({
+            let (root, path) = (root.clone(), path.clone());
+            ui::btn("Undo changes", Variant::Danger, Size::Sm, move || {
+                let new = file_status(store, &root, &path)
+                    .is_some_and(|s| matches!(s, FileStatus::Untracked | FileStatus::Added));
+                let (root, path) = (root.clone(), path.clone());
+                ui::confirm(
+                    format!("Undo the changes to {path}?"),
+                    if new {
+                        "It is a new file: undoing deletes it. This cannot be undone here."
+                    } else {
+                        "It goes back to its last commit. The uncommitted changes are lost."
+                    },
+                    if new {
+                        "Delete the file"
+                    } else {
+                        "Undo changes"
+                    },
+                    move || {
+                        store.revert_file(&root, &path);
+                        open.set(None);
+                    },
+                );
+            })
+            .disabled(move || store.reverting())
+        }))
         .child(dynamic(move || {
             let patch = section.get();
             let label = label.clone();
@@ -341,6 +368,21 @@ fn status_word(status: FileStatus) -> &'static str {
         FileStatus::Renamed => "renamed",
         FileStatus::Modified => "modified",
         FileStatus::Unknown => "changed",
+    }
+}
+
+/// How `path` in repository `root` changed, as last read.
+fn file_status(store: Store, root: &str, path: &str) -> Option<FileStatus> {
+    match untracked(|| store.changes()) {
+        ChangesRead::Ready(changes) => changes
+            .repos
+            .iter()
+            .find(|r| r.root == root)?
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .map(|f| f.status),
+        _ => None,
     }
 }
 

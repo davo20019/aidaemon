@@ -1123,6 +1123,10 @@ fn composer(store: Store, session: Option<String>) -> View {
             move || slash.with(|m| !m.is_empty()),
             move || slash_list(store, slash),
         ))
+        .child(match session.clone() {
+            Some(id) => queued_list(store, id),
+            None => view(),
+        })
         .child(
             ui::surface()
                 .w_full()
@@ -1301,6 +1305,97 @@ fn composer(store: Store, session: Option<String>) -> View {
                         ),
                 ),
         )
+}
+
+/// Messages sent to wait for the running work, above the composer: each
+/// can be edited in place or taken out until the agent takes it.
+fn queued_list(store: Store, session: String) -> View {
+    let items = {
+        let session = session.clone();
+        computed(move || store.queued(&session))
+    };
+    let editing = signal(None::<u64>);
+    let draft = signal(String::new());
+    view()
+        .w_full()
+        .max_w(px(size::COLUMN))
+        .gap_1()
+        .pb_1()
+        .child(when(
+            move || !items.with(Vec::is_empty),
+            || ui::section_label("Waiting to send"),
+        ))
+        .child(each(
+            items,
+            |m| m.id,
+            move |message, _| {
+                let id = message.with_untracked(|m| m.id);
+                let (save_session, remove_session) = (session.clone(), session.clone());
+                view().child(
+                    when(
+                        move || editing.get() == Some(id),
+                        move || {
+                            let save_session = save_session.clone();
+                            view()
+                                .gap_1()
+                                .child(ui::area("What to send", draft).label("Waiting message"))
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .gap_1()
+                                        .child(ui::btn(
+                                            "Save",
+                                            Variant::Primary,
+                                            ui::Size::Sm,
+                                            move || {
+                                                editing.set(None);
+                                                store.edit_queued(
+                                                    &save_session,
+                                                    id,
+                                                    Some(draft.get_untracked()),
+                                                );
+                                            },
+                                        ))
+                                        .child(ui::btn(
+                                            "Cancel",
+                                            Variant::Ghost,
+                                            ui::Size::Sm,
+                                            move || editing.set(None),
+                                        )),
+                                )
+                        },
+                    )
+                    .otherwise(move || {
+                        let remove_session = remove_session.clone();
+                        ui::surface()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1()
+                            .child(ui::icon(Glyph::Clock).text_color(colors::FAINT))
+                            .child(
+                                text(move || message.with(|m| m.text.clone()))
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .number_of_lines(2)
+                                    .text_size(px(type_scale::SM))
+                                    .text_color(colors::MUTED),
+                            )
+                            .child(ui::btn("Edit", Variant::Ghost, ui::Size::Sm, move || {
+                                draft.set(message.with_untracked(|m| m.text.clone()));
+                                editing.set(Some(id));
+                            }))
+                            .child(ui::icon_btn(
+                                Glyph::Close,
+                                "Remove from the queue",
+                                ui::Size::Sm,
+                                move || store.edit_queued(&remove_session, id, None),
+                            ))
+                    }),
+                )
+            },
+        ))
 }
 
 /// The slash commands completing what is typed. Tab takes the first.

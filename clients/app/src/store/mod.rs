@@ -108,6 +108,7 @@ const DRAFT_KEY: &str = "aidaemon.draft.";
 const PINS_KEY: &str = "aidaemon.pins";
 const OPEN_KEY: &str = "aidaemon.open";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
+const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
 /// The first approval card says how approvals work, once per device.
 const APPROVALS_TAUGHT_KEY: &str = "aidaemon.approvals-taught";
 
@@ -239,6 +240,15 @@ pub struct Store {
     automation_editing: Signal<Option<String>>,
     /// Advanced when the keyboard should go back to the composer.
     composer_focus: Signal<u64>,
+    /// The sidebar lists archived conversations instead of the others.
+    show_archived: Signal<bool>,
+    /// The conversation whose name is being edited in the sidebar.
+    renaming: Signal<Option<String>>,
+    /// When the owner last looked at the automations (this device): runs
+    /// after it are news.
+    automations_seen: Signal<u64>,
+    /// The look before this one, while the page is open: what it marks new.
+    automations_seen_before: Signal<u64>,
     /// Group conversations the owner chose to post in from here.
     posting: Signal<BTreeSet<String>>,
     /// Starting the daemon on this computer or pairing with one elsewhere,
@@ -277,6 +287,14 @@ impl Store {
             source: signal(Source::All),
             automation_editing: signal(None),
             composer_focus: signal(0),
+            show_archived: signal(false),
+            renaming: signal(None),
+            automations_seen: signal(
+                nsh_core::storage::Storage::get_item(AUTOMATIONS_SEEN_KEY)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            ),
+            automations_seen_before: signal(0),
             posting: signal(BTreeSet::new()),
             starting_daemon: signal(None),
         }
@@ -627,7 +645,26 @@ impl Store {
 
     pub fn open_automations(&self) {
         self.open_page(Page::Automations);
+        // What came since the last look shows as new while the page is
+        // open; from now on it is seen.
+        let now = now_ms();
+        self.automations_seen_before
+            .set(self.automations_seen.get_untracked());
+        self.automations_seen.set(now);
+        let _ = nsh_core::storage::Storage::set_item(AUTOMATIONS_SEEN_KEY, now.to_string());
         self.refresh_automations();
+    }
+
+    /// Runs with something to read since the owner last looked.
+    pub fn automation_news(&self) -> usize {
+        let seen = self.automations_seen.get();
+        self.reads.automations.with(|_| ());
+        self.client.with_untracked(|c| c.automation_news(seen))
+    }
+
+    /// Whether `run` is new to the owner on the page open now.
+    pub fn run_is_new(&self, run: &aidaemon_client_protocol::AutomationRun) -> bool {
+        aidaemon_client_core::client::run_is_news(run, self.automations_seen_before.get())
     }
 
     pub fn refresh_automations(&self) {
@@ -1093,10 +1130,11 @@ impl Store {
     /// newest first.
     pub fn visible_ids(&self) -> Vec<String> {
         let query = self.filter.get();
+        let archived = self.show_archived.get();
         let mut ids = self.read(|c| {
             c.session_ids()
                 .into_iter()
-                .filter(|id| c.matches(id, &query))
+                .filter(|id| c.is_archived(id) == archived && c.matches(id, &query))
                 .collect::<Vec<_>>()
         });
         ids.sort_by_key(|id| !self.is_pinned(id));
@@ -1631,6 +1669,77 @@ impl Store {
 
     pub fn cancel(&self, task: &str) {
         self.act(|c| c.cancel(task));
+    }
+
+    // ----- Naming, archiving, undoing, waiting messages ------------------
+
+    pub fn renaming(&self) -> Option<String> {
+        self.renaming.get()
+    }
+
+    /// Start (`Some`) or stop editing a conversation's name.
+    pub fn set_renaming(&self, id: Option<String>) {
+        self.renaming.set(id);
+    }
+
+    /// Name conversation `id` (blank: back to the name from what was said).
+    pub fn rename_session(&self, id: &str, title: String) {
+        self.renaming.set(None);
+        self.act(|c| c.rename_session(id, Some(title)));
+    }
+
+    pub fn is_archived(&self, id: &str) -> bool {
+        self.read(|c| c.is_archived(id))
+    }
+
+    /// Archive conversation `id` or bring it back; archiving the one on
+    /// screen moves to a new conversation.
+    pub fn archive_session(&self, id: &str, archived: bool) {
+        self.act(|c| c.archive_session(id, archived));
+        if archived && self.selected.get_untracked().as_deref() == Some(id) {
+            self.select(None);
+        }
+        self.say(if archived {
+            "Archived: it is under Archived at the bottom of the list"
+        } else {
+            "Back in your conversations"
+        });
+    }
+
+    /// How many conversations are archived.
+    pub fn archived_count(&self) -> usize {
+        self.read(|c| c.state.order.iter().filter(|id| c.is_archived(id)).count())
+    }
+
+    pub fn showing_archived(&self) -> bool {
+        self.show_archived.get()
+    }
+
+    pub fn show_archived(&self, show: bool) {
+        crate::ui::motion::next_unfold();
+        self.show_archived.set(show);
+    }
+
+    /// Undo the uncommitted changes to `path` in repository `root` of the
+    /// conversation on screen.
+    pub fn revert_file(&self, root: &str, path: &str) {
+        if let Some(session) = self.selected.get_untracked() {
+            self.act(|c| c.revert_file(&session, root, path));
+        }
+    }
+
+    pub fn reverting(&self) -> bool {
+        self.read(Client::reverting)
+    }
+
+    /// The messages waiting for `session`'s running work, oldest first.
+    pub fn queued(&self, session: &str) -> Vec<aidaemon_client_protocol::QueuedMessage> {
+        self.read(|c| c.queued_for(session).to_vec())
+    }
+
+    /// Change a waiting message's text, or take it out (`None`).
+    pub fn edit_queued(&self, session: &str, message_id: u64, text: Option<String>) {
+        self.act(|c| c.edit_queued(session, message_id, text));
     }
 
     pub fn resolve(&self, approval: &str, decision: ApprovalDecision) {

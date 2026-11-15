@@ -255,7 +255,12 @@ fn card(store: Store, automation: AutomationSummary) -> View {
     }
     // What it did, not only what it will do.
     match automation.recent_runs.first() {
-        Some(run) => c = c.child(last_run(run)),
+        Some(run) => {
+            c = c.child(last_run(run));
+            if store.run_is_new(run) {
+                c = c.child(ui::badge("New since you last looked", Tone::Accent));
+            }
+        }
         None => {
             // A failing check keeps no runs here: its badge says it failed,
             // so "hasn't run" would contradict it.

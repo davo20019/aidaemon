@@ -125,6 +125,7 @@ pub fn sidebar(store: Store) -> View {
                         .otherwise(move || group(store, "Conversations", rest)),
                     )
                     .child(search_hits(store))
+                    .child(archived_toggle(store))
                     .child(when(
                         move || ids.with(Vec::is_empty) && !store.filter().trim().is_empty(),
                         || {
@@ -154,6 +155,20 @@ pub fn sidebar(store: Store) -> View {
 /// A conversation's row, with its menu on a right click or a long press:
 /// open it, pin or unpin it, stop its work, move it to a project.
 fn session_row(store: Store, id: String) -> View {
+    let editing = id.clone();
+    let shown = id.clone();
+    // Rename shows the name as a field in the row's place.
+    view().child(
+        when(
+            move || store.renaming().as_deref() == Some(editing.as_str()),
+            move || rename_field(store, id.clone()),
+        )
+        .otherwise(move || menu_row(store, shown.clone())),
+    )
+}
+
+/// The row with its menu.
+fn menu_row(store: Store, id: String) -> View {
     let (open, pin, stop) = (id.clone(), id.clone(), id.clone());
     let pinned = untracked(|| store.is_pinned(&id));
     let current = untracked(|| store.session_project(&id));
@@ -184,6 +199,20 @@ fn session_row(store: Store, id: String) -> View {
             store.move_to_project(&session, None)
         }));
     }
+    {
+        let session = id.clone();
+        actions.push(ui::MenuAction::new("Rename", move || {
+            store.set_renaming(Some(session.clone()))
+        }));
+    }
+    {
+        let session = id.clone();
+        let archived = untracked(|| store.is_archived(&id));
+        actions.push(ui::MenuAction::new(
+            if archived { "Bring back" } else { "Archive" },
+            move || store.archive_session(&session, !archived),
+        ));
+    }
     let preview = id.clone();
     ui::with_menu(
         ui::with_preview(session_button(store, id), move || {
@@ -191,6 +220,40 @@ fn session_row(store: Store, id: String) -> View {
         }),
         actions,
     )
+}
+
+/// The row's name as a field: Return or Save keeps it, Esc or Cancel
+/// leaves it; an empty name goes back to the one taken from what was said.
+fn rename_field(store: Store, id: String) -> View {
+    let name = signal(untracked(|| store.title(&id)));
+    let save = {
+        let id = id.clone();
+        move || store.rename_session(&id, name.get_untracked())
+    };
+    let keep = save.clone();
+    view()
+        .px_2()
+        .py_1()
+        .gap_1()
+        .child(
+            ui::field("Name", name)
+                .label("Conversation name")
+                .auto_focus(true)
+                .on_submit(move |_: &str| keep())
+                .w_full(),
+        )
+        .child(
+            view()
+                .flex_row()
+                .gap_1()
+                .child(ui::btn("Save", ui::Variant::Primary, ui::Size::Sm, save))
+                .child(ui::btn(
+                    "Cancel",
+                    ui::Variant::Ghost,
+                    ui::Size::Sm,
+                    move || store.set_renaming(None),
+                )),
+        )
 }
 
 /// More about a conversation than its row says: its title, where it is,
@@ -693,7 +756,17 @@ fn pages(store: Store) -> View {
                 )
                 .accessibility_label("Automations: what runs on its own")
                 .child(icon(Glyph::Clock).text_color(colors::MUTED))
-                .child(text("Automations").flex_1().text_size(px(ui::fit::body()))),
+                .child(text("Automations").flex_1().text_size(px(ui::fit::body())))
+                // Runs with something to read since the last look.
+                .child(when(
+                    move || store.automation_news() > 0,
+                    move || {
+                        ui::badge(
+                            move || format!("{} new", store.automation_news()),
+                            Tone::Accent,
+                        )
+                    },
+                )),
             ),
         )
         .child(
@@ -862,6 +935,36 @@ fn connection(store: Store) -> View {
                             .text_color(colors::FAINT),
                     )
             }
+        }))
+    }))
+}
+
+/// At the end of the list: the archived conversations a press away, and
+/// the way back. Nothing while none is archived.
+fn archived_toggle(store: Store) -> View {
+    view().pt_2().child(dynamic(move || {
+        let count = store.archived_count();
+        let showing = store.showing_archived();
+        Some(untracked(move || {
+            if count == 0 && !showing {
+                return view();
+            }
+            let label = if showing {
+                "Back to your conversations".to_string()
+            } else {
+                format!("Archived · {count}")
+            };
+            view().child(
+                row(|| false, move || store.show_archived(!showing))
+                    .accessibility_label(label.clone())
+                    .child(icon(Glyph::Inbox).text_color(colors::FAINT))
+                    .child(
+                        text(label)
+                            .flex_1()
+                            .text_size(px(type_scale::SM))
+                            .text_color(colors::MUTED),
+                    ),
+            )
         }))
     }))
 }

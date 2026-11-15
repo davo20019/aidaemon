@@ -54,7 +54,8 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | All | A short note ("Copied", a setting saved, the view moved) | Toast at the bottom, `ENTER` in, leaves after 6 s, paused while hovered; Escape or a swipe dismisses |
 | Settings | A change is refused | Danger banner that stays until dismissed or the next change |
 | Settings, Memory | Remove, Forget, Restart | The platform's alert asks first |
-| Sidebar | Right click or long press on a conversation | Menu: Open, Pin/Unpin, Stop its work |
+| Sidebar | Right click or long press on a conversation | Menu: Open, Pin/Unpin, Stop its work (only while it works), Move, Rename (the row becomes a name field: Save, Cancel; empty goes back to the name from what was said), Archive / Bring back |
+| Sidebar | Archived conversations | Out of every list; "Archived · N" at the end of the list opens them, "Back to your conversations" returns |
 | Settings | True/false settings | A switch in the row, applied at once |
 | Palette | Opens | Native dialog presentation |
 | Conversation | Agent offers a view move while you type | Banner (accent tint) with Go (Cmd/Ctrl+G) and Dismiss; nothing moves until taken |
@@ -90,6 +91,9 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Conversation | A reply's turn used tools | One quiet disclosure line above the reply ("Used 4 tools: read_file ×2, … · 12s"); ▸ turns ▾ and lists every tool in order. The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
 | Conversation | Agent working, tools used | The working line adds "· N tools so far" |
 | Composer | Typing while the agent works | Send (Enter) tells the running work now; Queue (Mod+Enter) sends after it; the hint says "Enter tells it now · ⌘↩ sends after · Esc stops" |
+| Composer | Messages sent with Queue wait | "Waiting to send" above the composer: each with Edit (in place, Save/Cancel) and Remove, until the agent takes it |
+| Changes | Undo a file | "Undo changes" under a file's diff header asks first (a new file is deleted, a changed one goes back to its last commit), then the list comes back read again |
+| Automations | Runs since the last look | "N new" on the Automations row; "New since you last looked" on each card whose last run reported something or failed |
 | Composer | Draft starts with `/` | The daemon's matching commands above the composer; Tab or a press completes the first |
 | Composer | Up on an empty composer | The last message sent here comes back to edit |
 | Conversation | Last turn failed or was stopped | Retry under it sends the same message again |

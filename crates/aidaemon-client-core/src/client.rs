@@ -365,8 +365,10 @@ impl Client {
                 });
                 self.send(Command::ListCommands);
                 self.send(Command::ListProjects);
-                // Today's token use, for the sidebar.
+                // Today's token use, for the sidebar; what automations did,
+                // for their news.
                 self.refresh_system();
+                self.refresh_automations();
                 // A reconnect may have missed history: ask again on view.
                 self.fetched.clear();
                 if let Some(id) = &cx.selected {
@@ -2030,7 +2032,8 @@ mod tests {
                 "list_sessions",
                 "list_commands",
                 "list_projects",
-                "get_system"
+                "get_system",
+                "list_automations"
             ]
         );
         client.refresh_memories();
