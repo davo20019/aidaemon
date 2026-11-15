@@ -208,6 +208,7 @@ pub aidaemon_core::testing::ModelRequest::options: aidaemon_core::RequestOptions
 pub aidaemon_core::testing::ModelRequest::tool_choice: aidaemon_core::ToolChoice
 pub aidaemon_core::testing::ModelRequest::tools: alloc::vec::Vec<aidaemon_core::ToolSpec>
 pub struct aidaemon_core::testing::ModelResponse
+pub aidaemon_core::testing::ModelResponse::cut_off: bool
 pub aidaemon_core::testing::ModelResponse::note: core::option::Option<alloc::string::String>
 pub aidaemon_core::testing::ModelResponse::reasoning: core::option::Option<alloc::string::String>
 pub aidaemon_core::testing::ModelResponse::text: alloc::string::String
@@ -923,6 +924,7 @@ pub aidaemon_core::ModelRequest::options: aidaemon_core::RequestOptions
 pub aidaemon_core::ModelRequest::tool_choice: aidaemon_core::ToolChoice
 pub aidaemon_core::ModelRequest::tools: alloc::vec::Vec<aidaemon_core::ToolSpec>
 pub struct aidaemon_core::ModelResponse
+pub aidaemon_core::ModelResponse::cut_off: bool
 pub aidaemon_core::ModelResponse::note: core::option::Option<alloc::string::String>
 pub aidaemon_core::ModelResponse::reasoning: core::option::Option<alloc::string::String>
 pub aidaemon_core::ModelResponse::text: alloc::string::String
