@@ -66,7 +66,7 @@ pub fn shell(store: Store) -> View {
     );
     // Copy the last reply, anywhere.
     on_key_with("mod+shift+c", always(), move |_| copy_reply(store));
-    on_key("mod+,", move |_| store.open_system());
+    on_key(SYSTEM_KEY, move |_| store.open_system());
     if terminal {
         // One meaning per state: stop the turn; else press twice to quit.
         let armed = stored(0_u64);
@@ -279,7 +279,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
     items.push(
         CommandItem::new("system", "System: how the daemon is doing")
             .group("View")
-            .shortcut("mod+,"),
+            .shortcut(SYSTEM_KEY),
     );
     items.push(
         CommandItem::new(
@@ -435,3 +435,10 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                 ),
         )
 }
+
+/// The System page's key. A browser keeps ⌘, for its own settings, so the
+/// web build takes the next one free.
+#[cfg(not(target_arch = "wasm32"))]
+const SYSTEM_KEY: &str = "mod+,";
+#[cfg(target_arch = "wasm32")]
+const SYSTEM_KEY: &str = "mod+shift+,";
