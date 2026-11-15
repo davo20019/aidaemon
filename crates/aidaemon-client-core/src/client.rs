@@ -244,6 +244,9 @@ pub struct Client {
     system_request: Option<String>,
     pub settings: Read<Box<Settings>>,
     settings_request: Option<String>,
+    /// The settings were asked for again while a read was out: read once
+    /// more when it lands, so a change made meanwhile is shown.
+    settings_again: bool,
     /// Settings changes sent and not yet answered.
     settings_changes: BTreeSet<String>,
     /// Why the last settings change was refused, until dismissed or the
@@ -371,6 +374,14 @@ impl Client {
                 self.refresh_automations();
                 // A reconnect may have missed history: ask again on view.
                 self.fetched.clear();
+                // A read sent before a daemon restart may never be answered:
+                // read the settings afresh, or the page keeps what it showed
+                // before every change since.
+                self.settings_request = None;
+                self.settings_again = false;
+                if self.settings.is_ready() || cx.settings_open {
+                    self.refresh_settings();
+                }
                 if let Some(id) = &cx.selected {
                     self.load_history(id);
                     // Its changes too: whether it works on code, and what.
@@ -739,6 +750,7 @@ impl Client {
             } if mine(&self.settings_request, request_id) => {
                 self.settings_request = None;
                 self.settings = Read::Ready(Box::new(settings.clone()));
+                self.settings_read_again();
                 return true;
             }
             ServerFrame::Error {
@@ -747,6 +759,7 @@ impl Client {
             } if mine(&self.settings_request, request_id) => {
                 self.settings_request = None;
                 self.settings = Read::Failed(error.message.clone());
+                self.settings_read_again();
                 return true;
             }
             ServerFrame::Ack {
@@ -973,12 +986,19 @@ impl Client {
 
     pub fn refresh_settings(&mut self) {
         if self.settings_request.is_some() {
+            self.settings_again = true;
             return;
         }
         if !self.settings.is_ready() {
             self.settings = Read::Loading;
         }
         self.settings_request = Some(self.send(Command::GetSettings));
+    }
+
+    fn settings_read_again(&mut self) {
+        if std::mem::take(&mut self.settings_again) {
+            self.refresh_settings();
+        }
     }
 
     /// Ask the daemon to make `change`; the answer arrives as a note, and
@@ -2011,6 +2031,56 @@ mod tests {
             selected: selected.map(str::to_owned),
             ..Context::default()
         }
+    }
+
+    fn settings_reads(client: &mut Client) -> Vec<String> {
+        client
+            .take_outgoing()
+            .into_iter()
+            .filter(|(_, c)| matches!(c, Command::GetSettings))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn settings_ack(id: &str) -> Update {
+        frame(&format!(
+            r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings","settings":{{"config_path":"/home/synthetic/config.toml","database_path":"","groups":[]}}}}}}"#
+        ))
+    }
+
+    #[test]
+    fn settings_asked_for_meanwhile_or_lost_to_a_restart_are_read_again() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.refresh_settings();
+        let first = settings_reads(&mut client);
+        assert_eq!(first.len(), 1);
+        // A change lands while the read is out: one more read after it.
+        client.refresh_settings();
+        client.refresh_settings();
+        assert!(settings_reads(&mut client).is_empty());
+        client.update(settings_ack(&first[0]), &cx(None));
+        assert!(client.settings.is_ready());
+        let again = settings_reads(&mut client);
+        assert_eq!(again.len(), 1);
+        // The daemon restarts with that read unanswered: the reconnect reads
+        // afresh, and later changes are not stuck behind the lost read.
+        client.update(
+            Update::Disconnected(crate::machine::Disconnect {
+                kind: crate::machine::DropKind::DaemonNotRunning,
+                reason: "restarting".into(),
+                retry_in: std::time::Duration::from_millis(10),
+            }),
+            &cx(None),
+        );
+        client.update(Update::Connected, &cx(None));
+        let fresh = settings_reads(&mut client);
+        assert_eq!(fresh.len(), 1);
+        assert_ne!(fresh[0], again[0]);
+        client.update(settings_ack(&fresh[0]), &cx(None));
+        client.refresh_settings();
+        assert_eq!(settings_reads(&mut client).len(), 1);
     }
 
     #[test]

@@ -224,7 +224,17 @@ impl ConfigManagerTool {
     /// The owner's card for removing failover `index`: its place counted
     /// from 1, its kind and model, as Settings shows them.
     fn remove_failover_card(entries: &[toml::Value], index: usize) -> String {
-        let table = entries[index].as_table();
+        format!(
+            "Remove failover {}: {}. It is no longer tried when the providers before it fail.",
+            index + 1,
+            Self::failover_label(entries, index)
+        )
+    }
+
+    /// Failover `index` in plain words: where it is (its address's host,
+    /// else its kind) and its model, as "openrouter.ai (model-x)".
+    fn failover_label(entries: &[toml::Value], index: usize) -> String {
+        let table = entries.get(index).and_then(toml::Value::as_table);
         let field = |key: &str| {
             table
                 .and_then(|t| t.get(key))
@@ -238,12 +248,17 @@ impl ConfigManagerTool {
             .and_then(|m| m.get("default").or_else(|| m.get("primary")))
             .and_then(toml::Value::as_str)
             .unwrap_or_default();
-        let mut card = format!("Remove failover {}: {}", index + 1, field("kind"));
+        let base_url = field("base_url");
+        let host = base_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split(['/', ':']).next())
+            .filter(|host| !host.is_empty());
+        let mut label = host.map(str::to_string).unwrap_or_else(|| field("kind"));
         if !model.is_empty() {
-            card.push_str(&format!(" ({model})"));
+            label.push_str(&format!(" ({model})"));
         }
-        card.push_str(". It is no longer tried when the providers before it fail.");
-        card
+        label
     }
 
     /// The summary of failover entry `index` of `entries`.
@@ -1325,7 +1340,7 @@ impl ConfigManagerTool {
                     current.len()
                 ));
             }
-            let summary = Self::failover_entry_summary(current, index);
+            let summary = Self::failover_label(current, index);
             let tables: Vec<toml::Table> = current
                 .iter()
                 .map(|value| {
@@ -1362,7 +1377,9 @@ impl ConfigManagerTool {
         self.delete_stale_keys(cleanup_keys);
 
         let mut response = vec![format!(
-            "Moved failover provider {moved_summary} from #{index} to #{to}."
+            "Moved {moved_summary} to failover {}: it is tried {} now.",
+            to + 1,
+            if to < index { "sooner" } else { "later" }
         )];
         if !notes.is_empty() {
             response.push(String::new());
@@ -1406,7 +1423,7 @@ impl ConfigManagerTool {
                 ));
             }
 
-            let removed_summary = Self::failover_entry_summary(current_entries, index);
+            let removed_summary = Self::failover_label(current_entries, index);
             let existing_tables: Vec<toml::Table> = current_entries
                 .iter()
                 .map(|value| {
@@ -1446,8 +1463,10 @@ impl ConfigManagerTool {
         self.config.write_checked(&new_content).await?;
         self.delete_stale_keys(cleanup_keys);
 
-        let mut response = vec![format!("Removed failover provider #{}.", index)];
-        response.push(format!("- removed: {}", removed_summary));
+        let mut response = vec![format!(
+            "Removed failover {}: {removed_summary}.",
+            index + 1
+        )];
         if index < current_entries_len - 1 {
             response.push("- remaining failover secret references were reindexed.".to_string());
         }
@@ -2692,7 +2711,10 @@ default = "grok-4"
         args.failover_index = Some(0);
 
         let reply = tool.remove_failover_provider(&args).await.unwrap();
-        assert!(reply.contains("Removed failover provider #0."));
+        assert!(
+            reply.starts_with("Removed failover 1: anthropic"),
+            "{reply}"
+        );
 
         let saved = fs::read_to_string(&path).expect("read saved config");
         let fallbacks = fallbacks(&saved);
@@ -2766,7 +2788,12 @@ default = "synthetic-c"
         args.failover_index = Some(2);
         args.failover_to_index = Some(0);
         let reply = tool.move_failover_provider(&args).await.unwrap();
-        assert!(reply.contains("from #2 to #0"), "{reply}");
+        assert!(
+            reply.starts_with(
+                "Moved google_genai (synthetic-c) to failover 1: it is tried sooner now."
+            ),
+            "{reply}"
+        );
         let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
             list.iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
