@@ -523,44 +523,54 @@ fn welcome(store: Store) -> View {
         }))
     }));
     // Where it will work: said before the first word, so a chat and work
-    // on code never look like the same thing.
+    // on code never look like the same thing. Built once per list of
+    // projects: switching keeps the keyboard on the switch (its arrows
+    // choose), and only the project picker comes and goes.
+    let names = computed(move || {
+        store
+            .projects()
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect::<Vec<(String, String)>>()
+    });
     let place = view().child(dynamic(move || {
-        let projects = store.projects();
-        let current = store.current_project();
+        let items = names.get();
         Some(untracked(move || {
-            if projects.is_empty() {
+            if items.is_empty() {
                 return view();
             }
-            let in_project = current.is_some();
-            let first = projects.first().map(|p| p.id.clone());
-            let several = projects.len() > 1;
-            let items: Vec<(String, String)> =
-                projects.into_iter().map(|p| (p.id, p.name)).collect();
-            let mut place = view().items_center().gap_2().child(ui::segmented(
-                "Where this conversation works",
-                &["Chat", "In a project"],
-                move || usize::from(in_project),
-                move |at| {
-                    let project = (at == 1).then(|| first.clone()).flatten();
-                    if (at == 1) != in_project {
-                        store.set_new_project(project);
-                    }
-                },
-            ));
-            if in_project && several {
-                place = place.child(ui::choice(
-                    "Project",
-                    "Choose a project",
-                    items,
-                    move || store.current_project(),
-                    move |chosen| {
-                        if let Some(id) = chosen.filter(|id| !id.is_empty()) {
-                            store.set_new_project(Some(id));
+            let first = items.first().map(|(id, _)| id.clone());
+            let several = items.len() > 1;
+            view()
+                .items_center()
+                .gap_2()
+                .child(ui::segmented(
+                    "Where this conversation works",
+                    &["Chat", "In a project"],
+                    move || usize::from(store.current_project().is_some()),
+                    move |at| {
+                        let in_project = store.current_project().is_some();
+                        if (at == 1) != in_project {
+                            store.place_new_project((at == 1).then(|| first.clone()).flatten());
                         }
                     },
-                ));
-            }
-            place
+                ))
+                .child(when(
+                    move || several && store.current_project().is_some(),
+                    move || {
+                        ui::choice(
+                            "Project",
+                            "Choose a project",
+                            items.clone(),
+                            move || store.current_project(),
+                            move |chosen| {
+                                if let Some(id) = chosen.filter(|id| !id.is_empty()) {
+                                    store.set_new_project(Some(id));
+                                }
+                            },
+                        )
+                    },
+                ))
         }))
     }));
     view()

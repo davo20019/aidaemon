@@ -878,6 +878,12 @@ impl Store {
         self.focus_composer();
     }
 
+    /// Choose where the new conversation on screen works, leaving the
+    /// keyboard where it is (a switch whose arrows choose).
+    pub fn place_new_project(&self, project: Option<String>) {
+        self.new_project.set(project);
+    }
+
     pub fn project_open(&self, id: &str) -> bool {
         self.open_projects.with(|open| open.contains(id))
     }

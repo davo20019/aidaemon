@@ -622,13 +622,13 @@ pub fn segmented(
     chosen: impl Fn() -> usize + Copy + 'static,
     choose: impl Fn(usize) + Clone + 'static,
 ) -> View {
-    use nsh_base::{toggle, toggle_group};
+    use nsh_base::{radio, radio_group};
     let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
-    // One stop of Tab; Left and Right move between the options, Enter or
-    // Space chooses one (the toolbar pattern). Focus is a band or ring;
-    // the chosen option is a raised segment, and in a terminal, which has
-    // no shadows, a dot before its name.
-    let mut group = toggle_group()
+    // One stop of Tab whose arrow keys choose (the radio pattern: a choice
+    // of one, as a mode switch is). Focus is a band or ring; the chosen
+    // option is a raised segment, and in a terminal, which has no shadows,
+    // the radio's own (●) mark.
+    let mut group = radio_group()
         .flex_row()
         .p(px(3.0))
         .gap(px(2.0))
@@ -637,8 +637,8 @@ pub fn segmented(
     for (at, option) in options.iter().copied().enumerate() {
         let choose = choose.clone();
         group = group.child(
-            toggle()
-                .pressed(move || chosen() == at)
+            radio()
+                .checked(move || chosen() == at)
                 .on_change(move |_: &bool| {
                     haptic(nsh_core::Haptic::Selection);
                     choose(at)
@@ -658,22 +658,16 @@ pub fn segmented(
                 )
                 .accessibility_label(option)
                 .child(
-                    text(move || {
-                        if terminal {
-                            format!("{} {option}", if chosen() == at { "●" } else { "○" })
-                        } else {
-                            option.to_owned()
-                        }
-                    })
-                    .text_size(px(fit::small()))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(move || {
-                        if chosen() == at {
-                            colors::TEXT
-                        } else {
-                            colors::MUTED
-                        }
-                    }),
+                    text(option)
+                        .text_size(px(fit::small()))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || {
+                            if chosen() == at {
+                                colors::TEXT
+                            } else {
+                                colors::MUTED
+                            }
+                        }),
                 ),
         );
     }
