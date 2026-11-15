@@ -46,8 +46,8 @@ use aidaemon_channels::turns::{MidRunPlacement, Turn, TurnDeps, TurnRunner};
 use aidaemon_client_protocol::{
     Applies, ApprovalDecision, ClientKind, Command, CommandResult, ErrorCode, Event, Glance,
     HistoryMessage, LastReply, MemoryItem, MidRun, OwnerInfo, ProtocolError, Risk, Scope,
-    SearchHit, ServerFrame, SessionSummary, Settings, SettingsChange, SettingsOutcome, SetupAction,
-    SetupState, SlashCommand, Snapshot, TaskState, TaskSummary,
+    SearchHit, ServerFrame, SessionChanges, SessionSummary, Settings, SettingsChange,
+    SettingsOutcome, SetupAction, SetupState, SlashCommand, Snapshot, TaskState, TaskSummary,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::semantics::UserRole;
@@ -107,6 +107,12 @@ pub trait ClientHost: Send + Sync {
     /// Forget memory `id`; `false` when there is no such memory.
     async fn forget(&self, _id: &str) -> anyhow::Result<bool> {
         Ok(false)
+    }
+
+    /// The uncommitted changes in the git repositories session
+    /// `session_id` worked in; empty when it worked in none.
+    async fn changes(&self, _session_id: &str) -> anyhow::Result<SessionChanges> {
+        Ok(SessionChanges::default())
     }
 
     /// The daemon's settings; `None` when this host does not show them.
@@ -537,7 +543,8 @@ impl ClientGateway {
             | Command::ListCommands
             | Command::ListMemories
             | Command::GetSettings
-            | Command::GetSetup => Some(Scope::Observe),
+            | Command::GetSetup
+            | Command::GetChanges { .. } => Some(Scope::Observe),
             Command::ForgetMemory { .. }
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
@@ -684,6 +691,13 @@ impl ClientGateway {
                     ))
                 }
             },
+            Command::GetChanges { session_id } => {
+                let changes = self.host.changes(&session_id).await.map_err(|e| {
+                    warn!(error = %e, "Reading a session's changes failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not read the changes")
+                })?;
+                Ok(CommandResult::Changes { changes })
+            }
             Command::GetSettings => match self.host.settings().await {
                 Ok(Some(settings)) => Ok(CommandResult::Settings { settings }),
                 Ok(None) => Err(ProtocolError::new(

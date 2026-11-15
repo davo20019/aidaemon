@@ -153,6 +153,17 @@ impl ClientHost for Host {
     async fn slash(&self, _: &str, command: &str, _: &str) -> Option<String> {
         (command == "clear").then(|| "Context cleared.".to_string())
     }
+    async fn changes(&self, session_id: &str) -> anyhow::Result<SessionChanges> {
+        Ok(SessionChanges {
+            repos: vec![RepoChanges {
+                root: format!("/home/synthetic/{session_id}"),
+                branch: Some("main".into()),
+                files: Vec::new(),
+                patch: String::new(),
+                truncated: false,
+            }],
+        })
+    }
 }
 
 /// A chat that shows cards and answers them when told to.
@@ -436,6 +447,25 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
     };
     let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
     assert_eq!((ids, more), (vec!["m2", "m3"], true));
+    let changes = f
+        .post(
+            &[],
+            &command(
+                "r-3b",
+                Command::GetChanges {
+                    session_id: "acme".into(),
+                },
+            ),
+        )
+        .await;
+    let ServerFrame::Ack {
+        result: CommandResult::Changes { changes },
+        ..
+    } = changes
+    else {
+        panic!("{changes:?}");
+    };
+    assert_eq!(changes.repos[0].root, "/home/synthetic/acme");
     let cleared = f
         .post(
             &[],

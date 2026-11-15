@@ -117,6 +117,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ChangeSettings { .. } => "change_settings",
         Command::GetSetup => "get_setup",
         Command::Setup { .. } => "setup",
+        Command::GetChanges { .. } => "get_changes",
         Command::Unknown => "unknown",
     }
 }
@@ -150,6 +151,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Settings { .. } => "settings",
         CommandResult::SettingsChanged { .. } => "settings_changed",
         CommandResult::Setup { .. } => "setup",
+        CommandResult::Changes { .. } => "changes",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -277,6 +279,12 @@ fn client_samples() -> Vec<ClientFrame> {
                     },
                     key: Some(SecretText("sk-synthetic-not-a-key".into())),
                 },
+            },
+        ),
+        command(
+            "5d0c2b1e-0015",
+            Command::GetChanges {
+                session_id: "app:6c1f".into(),
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -733,6 +741,32 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Setup {
             setup: setup_state(),
+        }),
+        ack(CommandResult::Changes {
+            changes: SessionChanges {
+                repos: vec![RepoChanges {
+                    root: "/home/synthetic/acme-site".into(),
+                    branch: Some("feature/contact-form".into()),
+                    files: vec![
+                        FileChange {
+                            path: "src/contact.rs".into(),
+                            status: FileStatus::Modified,
+                            added: 2,
+                            removed: 1,
+                            by_session: true,
+                        },
+                        FileChange {
+                            path: "notes.md".into(),
+                            status: FileStatus::Untracked,
+                            added: 1,
+                            removed: 0,
+                            by_session: false,
+                        },
+                    ],
+                    patch: "diff --git a/src/contact.rs b/src/contact.rs\n--- a/src/contact.rs\n+++ b/src/contact.rs\n@@ -1,2 +1,3 @@\n-fn send() {}\n+fn send() {\n+}\n fn main() {}\n".into(),
+                    truncated: false,
+                }],
+            },
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

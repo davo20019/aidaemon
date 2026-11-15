@@ -1102,6 +1102,23 @@
             "action"
           ],
           "type": "object"
+        },
+        {
+          "description": "The uncommitted changes in the git repositories a session worked\nin (protocol 1.9), for a client's code view.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "get_changes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1417,6 +1434,23 @@
           "required": [
             "type",
             "setup"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`get_changes`.",
+          "properties": {
+            "changes": {
+              "$ref": "#/$defs/SessionChanges"
+            },
+            "type": {
+              "const": "changes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "changes"
           ],
           "type": "object"
         }
@@ -2123,6 +2157,58 @@
         {
           "const": "computer_use",
           "description": "Seeing and using this computer's screen.",
+          "type": "string"
+        }
+      ]
+    },
+    "FileChange": {
+      "description": "One changed file.",
+      "properties": {
+        "added": {
+          "description": "Lines added and removed; 0 and 0 for a binary file.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "by_session": {
+          "description": "This session's file tools wrote it.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Relative to the repository's root, `/`-separated.",
+          "type": "string"
+        },
+        "removed": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/FileStatus"
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "added",
+        "removed"
+      ],
+      "type": "object"
+    },
+    "FileStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "untracked",
+          "description": "New, and not yet added to git.",
           "type": "string"
         }
       ]
@@ -2921,6 +3007,40 @@
       ],
       "type": "object"
     },
+    "RepoChanges": {
+      "description": "One repository's uncommitted changes against `HEAD`, the owner's and\nother sessions' included: a working tree has no record of who made\nthem. `by_session` marks the files this session's tools wrote.",
+      "properties": {
+        "branch": {
+          "description": "The checked-out branch; `None` on a detached `HEAD`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/FileChange"
+          },
+          "type": "array"
+        },
+        "patch": {
+          "description": "The unified diff of `files`, untracked files included.",
+          "type": "string"
+        },
+        "root": {
+          "description": "The repository's top directory, as an absolute path.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "`patch` was cut short to stay small enough to send.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
     "ResolvedBy": {
       "description": "Who answered an approval.",
       "properties": {
@@ -3220,6 +3340,18 @@
           "type": "object"
         }
       ]
+    },
+    "SessionChanges": {
+      "description": "What a session changed in code: the git repositories its tools worked\nin, each with its uncommitted changes. Empty when it worked in none.",
+      "properties": {
+        "repos": {
+          "items": {
+            "$ref": "#/$defs/RepoChanges"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "SessionRequest": {
       "description": "`POST /client/v1/sessions`.",

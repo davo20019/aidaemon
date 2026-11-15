@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 8;
+pub const PROTOCOL_MINOR: u16 = 9;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -298,6 +298,9 @@ pub enum Command {
     /// A step of first-run setup (protocol 1.5). A daemon still in setup
     /// answers only this, `get_setup` and pings.
     Setup { action: SetupAction },
+    /// The uncommitted changes in the git repositories a session worked
+    /// in (protocol 1.9), for a client's code view.
+    GetChanges { session_id: String },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -407,6 +410,10 @@ pub enum CommandResult {
     Setup {
         setup: SetupState,
     },
+    /// `get_changes`.
+    Changes {
+        changes: SessionChanges,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -443,6 +450,66 @@ pub struct MemoryItem {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
     pub updated_ms: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Code changes (protocol 1.9)
+// ---------------------------------------------------------------------------
+
+/// What a session changed in code: the git repositories its tools worked
+/// in, each with its uncommitted changes. Empty when it worked in none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SessionChanges {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<RepoChanges>,
+}
+
+/// One repository's uncommitted changes against `HEAD`, the owner's and
+/// other sessions' included: a working tree has no record of who made
+/// them. `by_session` marks the files this session's tools wrote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RepoChanges {
+    /// The repository's top directory, as an absolute path.
+    pub root: String,
+    /// The checked-out branch; `None` on a detached `HEAD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileChange>,
+    /// The unified diff of `files`, untracked files included.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub patch: String,
+    /// `patch` was cut short to stay small enough to send.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// One changed file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct FileChange {
+    /// Relative to the repository's root, `/`-separated.
+    pub path: String,
+    pub status: FileStatus,
+    /// Lines added and removed; 0 and 0 for a binary file.
+    pub added: u32,
+    pub removed: u32,
+    /// This session's file tools wrote it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_session: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    /// New, and not yet added to git.
+    Untracked,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 // ---------------------------------------------------------------------------
