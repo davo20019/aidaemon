@@ -275,6 +275,16 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .group("View")
             .shortcut("mod+,"),
     );
+    items.push(CommandItem::new("new-project", "New project").group("Projects"));
+    if let Some(project) = store.current_project().and_then(|id| store.project(&id)) {
+        items.push(
+            CommandItem::new(
+                "edit-project",
+                format!("Edit {}: name or folder", project.name),
+            )
+            .group("Projects"),
+        );
+    }
     items.push(CommandItem::new("memory", "Memory: what the daemon remembers").group("View"));
     items.push(CommandItem::new("settings", "Settings: change how the daemon runs").group("View"));
     items.push(
@@ -352,6 +362,16 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 "sidebar" => store.open_sidebar(),
                                 "inspector" => store.open_inspector(),
                                 "changes" => store.show_changes(),
+                                "new-project" => {
+                                    store.reveal_sidebar();
+                                    store.show_project_form(true);
+                                }
+                                "edit-project" => {
+                                    if let Some(id) = store.current_project() {
+                                        store.reveal_sidebar();
+                                        store.edit_project(&id);
+                                    }
+                                }
                                 "system" => store.open_system(),
                                 "memory" => store.open_memory(),
                                 "settings" => store.open_settings(),

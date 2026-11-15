@@ -358,6 +358,9 @@ pub struct Store {
     coded: Signal<BTreeSet<String>>,
     /// The sidebar's source filter.
     source: Signal<Source>,
+    /// Advanced when the keyboard should go back to the composer (a
+    /// conversation picked, a pane closed).
+    composer_focus: Signal<u64>,
     /// Group conversations the owner chose to post in from here.
     posting: Signal<BTreeSet<String>>,
     settings: Signal<SettingsRead>,
@@ -442,6 +445,7 @@ impl Store {
             code_opened: stored(BTreeSet::new()),
             coded: signal(BTreeSet::new()),
             source: signal(Source::All),
+            composer_focus: signal(0),
             posting: signal(BTreeSet::new()),
             settings: signal(SettingsRead::NotYet),
             settings_request: stored(None),
@@ -2059,6 +2063,9 @@ impl Store {
     /// widths it measures, and an animated close would leave it at none.
     pub fn toggle_sidebar(&self) {
         self.sidebar.update(|s| *s = !*s);
+        if !self.sidebar.get_untracked() {
+            self.focus_composer();
+        }
     }
 
     pub fn toggle_inspector(&self) {
@@ -2067,6 +2074,15 @@ impl Store {
 
     pub fn set_sidebar(&self, open: bool) {
         self.sidebar.set(open);
+    }
+
+    /// Changes when the keyboard should go back to the composer.
+    pub fn composer_focus(&self) -> u64 {
+        self.composer_focus.get()
+    }
+
+    fn focus_composer(&self) {
+        self.composer_focus.update(|n| *n += 1);
     }
 
     /// Open the details on the Changes of the conversation on screen (its
@@ -2124,6 +2140,14 @@ impl Store {
         }
     }
 
+    /// Show the sidebar (closing the details on a narrow window).
+    pub fn reveal_sidebar(&self) {
+        if self.compact.get_untracked() {
+            self.inspector.set(false);
+        }
+        self.sidebar.set(true);
+    }
+
     pub fn open_inspector(&self) {
         if self.compact.get_untracked() {
             self.sidebar.set(false);
@@ -2139,6 +2163,7 @@ impl Store {
             self.sidebar.set(false);
             self.inspector.set(false);
         }
+        self.focus_composer();
     }
 
     /// Activity for running turns this client did not see start: their

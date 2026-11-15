@@ -1088,6 +1088,16 @@ fn composer(store: Store, session: Option<String>) -> View {
             store.recall_last();
         },
     );
+    // Back to the composer when a conversation is picked or a pane
+    // closes: typing goes here, not to a list that is gone (a phone keeps
+    // its keyboard down until the composer is tapped).
+    if !touch {
+        effect(move || {
+            if store.composer_focus() > 0 {
+                untracked(|| field.focus());
+            }
+        });
+    }
     let slash = computed(move || store.slash_matches());
     // A chat's messages from here also go to the chat itself.
     let chat_note = session

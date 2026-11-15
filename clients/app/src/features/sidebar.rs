@@ -433,7 +433,13 @@ fn project_form(store: Store) -> View {
         .px_2()
         .py_2()
         .gap_2()
-        .child(ui::field("Name", name).label("Project name").w_full())
+        // The form opens to be typed in (a phone keeps its keyboard down).
+        .child(
+            ui::field("Name", name)
+                .label("Project name")
+                .auto_focus(!ui::touch())
+                .w_full(),
+        )
         .child(
             ui::field("Folder, e.g. ~/projects/acme-site", path)
                 .label("Project folder on the daemon's computer")
