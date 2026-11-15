@@ -430,7 +430,7 @@ fn search_hits(store: Store) -> View {
 }
 
 fn connection(store: Store) -> View {
-    view().px_4().py_3().child(dynamic(move || {
+    view().px_4().py_2().child(dynamic(move || {
         let state = store.connection();
         Some(untracked(move || match state {
             Connection::Online => status("Connected to the daemon", Tone::Success),
@@ -448,16 +448,25 @@ fn connection(store: Store) -> View {
                     DropKind::VersionUnsupported => "The daemon needs a newer app",
                     DropKind::Dropped => "Connection lost",
                 };
-                let retry = retry_at_ms.saturating_sub(now_ms()) / 1000;
-                view().gap_1().child(status(headline, Tone::Danger)).child(
-                    text(if kind == DropKind::Unauthorized {
-                        reason
-                    } else {
-                        format!("Retrying in {}s", retry.max(1))
-                    })
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                )
+                // One row: the footer sits under the conversation list and
+                // must not eat its room on a phone.
+                let detail = if kind == DropKind::Unauthorized {
+                    reason
+                } else {
+                    let retry = (retry_at_ms.saturating_sub(now_ms()) / 1000).max(1);
+                    format!("retrying in {retry}s")
+                };
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(status(headline, Tone::Danger).flex_1().min_w(px(0.0)))
+                    .child(
+                        text(detail)
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
+                    )
             }
         }))
     }))
