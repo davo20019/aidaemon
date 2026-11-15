@@ -509,7 +509,7 @@ pub fn field(placeholder: &'static str, value: Signal<String>) -> Input {
         .rounded(px(radius::CONTROL))
         .bg(colors::SURFACE)
         .border_1()
-        .border_color(colors::BORDER)
+        .border_color(colors::EDGE)
         .transition_colors()
         .duration(motion::FAST)
         .focus(|s| focus_band(s.border_color(colors::ACCENT)))
@@ -609,6 +609,62 @@ pub fn section_label(label: impl IntoReactive<SharedString>) -> Text {
         .px_2()
         .pt_3()
         .pb_1()
+}
+
+/// One of a few ways, all in view (a new conversation's Chat or In a
+/// project): a track, with the chosen one raised on it. `label` names the
+/// group for assistive technology.
+pub fn segmented(
+    label: &'static str,
+    options: &[&'static str],
+    chosen: impl Fn() -> usize + Copy + 'static,
+    choose: impl Fn(usize) + Clone + 'static,
+) -> View {
+    let mut track = view()
+        .flex_row()
+        .p(px(3.0))
+        .gap(px(2.0))
+        .rounded(px(radius::CONTROL + 3.0))
+        .bg(colors::HOVER)
+        .label(label);
+    for (at, option) in options.iter().copied().enumerate() {
+        let choose = choose.clone();
+        track = track.child(
+            button()
+                .h(px(if touch() { 38.0 } else { 26.0 }))
+                .px(px(if touch() { 18.0 } else { 12.0 }))
+                .items_center()
+                .justify_center()
+                .rounded(px(radius::CONTROL))
+                .transition_colors()
+                .duration(motion::FAST)
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                .focus(focus_band)
+                .style_when(
+                    move || chosen() == at,
+                    |s| s.bg(colors::SURFACE).shadow_sm(),
+                )
+                .accessibility_label(option)
+                .selected(move || chosen() == at)
+                .on_press(move || {
+                    haptic(nsh_core::Haptic::Selection);
+                    choose(at)
+                })
+                .child(
+                    text(option)
+                        .text_size(px(fit::small()))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(move || {
+                            if chosen() == at {
+                                colors::TEXT
+                            } else {
+                                colors::MUTED
+                            }
+                        }),
+                ),
+        );
+    }
+    track
 }
 
 /// One of a few filters side by side: outlined, and filled with the accent
@@ -770,7 +826,7 @@ pub fn empty(title: &'static str, detail: impl IntoReactive<SharedString>) -> Vi
         .child(
             text(title)
                 .role(AccessibilityRole::Header)
-                .text_size(px(type_scale::TITLE))
+                .text_size(px(fit::title()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors::TEXT),
         )

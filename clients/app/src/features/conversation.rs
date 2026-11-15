@@ -326,7 +326,14 @@ fn header(store: Store, session: Option<String>) -> View {
         .child(when(
             move || store.is_compact() || !store.sidebar_open(),
             move || {
-                ui::icon_btn(Glyph::Sidebar, "Conversations", Size::Md, move || {
+                // A phone's list is a drawer of conversations, not a pane
+                // to unfold: it gets its own picture, unlike the details'.
+                let glyph = if untracked(|| store.is_compact()) {
+                    Glyph::Chat
+                } else {
+                    Glyph::Sidebar
+                };
+                ui::icon_btn(glyph, "Conversations", Size::Md, move || {
                     store.open_sidebar()
                 })
             },
@@ -434,7 +441,11 @@ fn header(store: Store, session: Option<String>) -> View {
             },
         ))
         .child(when(
-            move || store.is_compact() || !store.inspector_open(),
+            {
+                // A new conversation has no steps or changes to show yet.
+                let started = session.is_some();
+                move || started && (store.is_compact() || !store.inspector_open())
+            },
             move || {
                 view().child(dynamic(move || {
                     let coding = store.coding_on_screen();
@@ -485,8 +496,10 @@ const PROJECT_STARTERS: [(&str, &str); 3] = [
     ("Fix something", "Fix "),
 ];
 
-/// A new conversation: one question, and a few quiet ways to start just
-/// above the composer. The sidebar already lists past conversations.
+/// A new conversation: one question, where it works (a chat, or in a
+/// project's folder) and a few ways to start, together: by the composer
+/// on a phone, in the middle of a window. The sidebar already lists past
+/// conversations.
 fn welcome(store: Store) -> View {
     let chips = view().child(dynamic(move || {
         let in_project = store.current_project().is_some();
@@ -507,22 +520,45 @@ fn welcome(store: Store) -> View {
             chips
         }))
     }));
-    // Where it will work: a project (its folder) or none.
-    let picker = view().items_center().gap_1().child(dynamic(move || {
+    // Where it will work: said before the first word, so a chat and work
+    // on code never look like the same thing.
+    let place = view().child(dynamic(move || {
         let projects = store.projects();
+        let current = store.current_project();
         Some(untracked(move || {
             if projects.is_empty() {
                 return view();
             }
-            let mut items = vec![(String::new(), "No project".to_owned())];
-            items.extend(projects.into_iter().map(|p| (p.id, p.name)));
-            view().child(ui::choice(
-                "Project",
-                "No project",
-                items,
-                move || store.current_project(),
-                move |chosen| store.set_new_project(chosen.filter(|id| !id.is_empty())),
-            ))
+            let in_project = current.is_some();
+            let first = projects.first().map(|p| p.id.clone());
+            let several = projects.len() > 1;
+            let items: Vec<(String, String)> =
+                projects.into_iter().map(|p| (p.id, p.name)).collect();
+            let mut place = view().items_center().gap_2().child(ui::segmented(
+                "Where this conversation works",
+                &["Chat", "In a project"],
+                move || usize::from(in_project),
+                move |at| {
+                    let project = (at == 1).then(|| first.clone()).flatten();
+                    if (at == 1) != in_project {
+                        store.set_new_project(project);
+                    }
+                },
+            ));
+            if in_project && several {
+                place = place.child(ui::choice(
+                    "Project",
+                    "Choose a project",
+                    items,
+                    move || store.current_project(),
+                    move |chosen| {
+                        if let Some(id) = chosen.filter(|id| !id.is_empty()) {
+                            store.set_new_project(Some(id));
+                        }
+                    },
+                ));
+            }
+            place
         }))
     }));
     view()
@@ -530,25 +566,20 @@ fn welcome(store: Store) -> View {
         .items_center()
         .px_4()
         .py_4()
+        .gap_4()
         .child(view().flex_1())
         .child(
             text("What should we work on?")
                 .role(AccessibilityRole::Header)
                 .text_center()
-                .text_size(px(type_scale::TITLE))
+                .text_size(px(ui::fit::title()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(colors::TEXT),
         )
-        .child(view().h(px(8.0)))
-        .child(picker)
-        // On a phone the chips sit by the composer, under the thumb; in a
-        // window they stay under the question.
-        .child(
-            view()
-                .flex_1()
-                .style_when(!ui::touch(), |s| s.flex_none().h(px(16.0))),
-        )
+        .child(place)
         .child(chips)
+        // On a phone all of it sits by the composer, under the thumb; in a
+        // window it is centred.
         .child(view().style_when(!ui::touch(), |s| s.flex_1()))
 }
 
@@ -1145,7 +1176,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                     if dragging.get() {
                         colors::ACCENT
                     } else {
-                        colors::BORDER
+                        colors::EDGE
                     }
                 })
                 .on_file_drag_enter(move |drag: &FileDragEvent| {
@@ -1235,7 +1266,6 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .text_color(colors::TEXT)
                         .label("Message"),
                 )
-                .child(super::model_picker::model_picker(store, session.clone()))
                 .child(
                     view()
                         .flex_row()
@@ -1253,6 +1283,12 @@ fn composer(store: Store, session: Option<String>) -> View {
                             },
                         ))
                         .child(dictation(store, terminal))
+                        // Model and effort, in the same row; a phone's row
+                        // has no room for them beside the working hint.
+                        .child(when(move || !(touch && running.get()), {
+                            let session = session.clone();
+                            move || super::model_picker::model_picker(store, session.clone())
+                        }))
                         .child(
                             text(move || match (running.get(), touch) {
                                 (true, true) if store.enter_queues() => {
@@ -1324,6 +1360,8 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 Variant::Primary,
                                 ui::Size::Sm,
                                 move || {
+                                    // A phone answers the press (nothing elsewhere).
+                                    haptic(nsh_core::Haptic::Impact(nsh_core::HapticImpact::Light));
                                     if running.get_untracked() {
                                         store.submit_placed(Some(enter_placement(store)));
                                     } else {

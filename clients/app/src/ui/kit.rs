@@ -150,12 +150,12 @@ fn choice_sized(
                 .border_color(if compact {
                     colors::SURFACE
                 } else {
-                    colors::BORDER
+                    colors::EDGE
                 })
                 .bg(colors::SURFACE)
                 .transition_colors()
                 .duration(motion::FAST)
-                .hover(|s| s.border_color(colors::FAINT))
+                .hover(|s| s.border_color(colors::MUTED))
                 .focus_visible(|s| s.border_color(colors::ACCENT))
                 .focus(super::controls::focus_band)
                 .child(
@@ -189,7 +189,7 @@ fn choice_sized(
         .popup_style(|s| {
             s.bg(colors::SURFACE)
                 .border_1()
-                .border_color(colors::BORDER)
+                .border_color(colors::EDGE)
                 .rounded(px(radius::CONTROL))
                 .shadow_lg()
                 .p_1()
@@ -460,7 +460,7 @@ pub fn with_menu(trigger: impl IntoElement, actions: Vec<MenuAction>) -> View {
         .popup_style(|s| {
             s.bg(colors::SURFACE)
                 .border_1()
-                .border_color(colors::BORDER)
+                .border_color(colors::EDGE)
                 .rounded(px(radius::CONTROL))
                 .shadow_lg()
                 .p_1()

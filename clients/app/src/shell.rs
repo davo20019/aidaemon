@@ -348,7 +348,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                 .max_w(percentage(0.92))
                 .rounded(px(radius::SURFACE))
                 .border_1()
-                .border_color(colors::BORDER)
+                .border_color(colors::EDGE)
                 .bg(colors::SURFACE)
                 .shadow_lg()
                 .p_2()

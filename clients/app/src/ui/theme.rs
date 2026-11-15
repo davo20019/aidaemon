@@ -44,6 +44,10 @@ pub mod colors {
     pub const SELECTED: AdaptiveColor = tone(rgb(0xdfdfda), rgb(0x2a2c33));
     /// Borders of surfaces and controls.
     pub const BORDER: AdaptiveColor = tone(rgb(0xdcdcd6), rgb(0x2a2c31));
+    /// The edge of what is typed in or chosen from (fields, selects, the
+    /// composer) and of what floats (popups, menus): 3:1 or more on the
+    /// page and on a surface, so the control is found without its text.
+    pub const EDGE: AdaptiveColor = tone(rgb(0x83868c), rgb(0x6e7178));
     /// Hairlines between rows and regions.
     pub const LINE: AdaptiveColor = tone(rgb(0xe6e6e1), rgb(0x202227));
     /// Body text.
@@ -51,7 +55,7 @@ pub mod colors {
     /// Secondary text.
     pub const MUTED: AdaptiveColor = tone(rgb(0x5d6168), rgb(0x9196a0));
     /// Quiet text: timestamps, counts, hints.
-    pub const FAINT: AdaptiveColor = tone(rgb(0x6b6f76), rgb(0x80858f));
+    pub const FAINT: AdaptiveColor = tone(rgb(0x63676e), rgb(0x80858f));
     /// The agent's colour: running work, links, the focus ring, the caret.
     pub const ACCENT: AdaptiveColor = tone(rgb(0x0b7a6e), rgb(0x45d2bf));
     /// The main action's fill.
@@ -185,6 +189,11 @@ pub mod fit {
     pub fn read_lh() -> f32 {
         if touch() { 24.0 } else { super::text::LH_READ }
     }
+    /// A page's or an empty state's title: on a phone, clearly above the
+    /// 16 pt reading text.
+    pub fn title() -> f32 {
+        if touch() { 22.0 } else { super::text::TITLE }
+    }
     /// Body and control text.
     pub fn body() -> f32 {
         if touch() { 15.0 } else { super::text::BASE }
@@ -212,3 +221,40 @@ pub mod fit {
 
 /// Monospace for code, identifiers and keys.
 pub const MONO: &str = "monospace";
+
+#[cfg(test)]
+mod tests {
+    use super::AdaptiveColor;
+    use super::colors::*;
+
+    fn ratio(a: AdaptiveColor, b: AdaptiveColor) -> (f32, f32) {
+        (
+            a.light.contrast_ratio(b.light),
+            a.dark.contrast_ratio(b.dark),
+        )
+    }
+
+    fn at_least(a: AdaptiveColor, b: AdaptiveColor, floor: f32, what: &str) {
+        let (light, dark) = ratio(a, b);
+        assert!(light >= floor, "{what}: light {light:.2} under {floor}");
+        assert!(dark >= floor, "{what}: dark {dark:.2} under {floor}");
+    }
+
+    /// Text reads at 4.5:1 on every surface it sits on, and the edges of
+    /// fields and popups at 3:1 (WCAG 1.4.3 and 1.4.11), in both themes.
+    #[test]
+    fn text_and_edges_keep_their_contrast() {
+        for (name, back) in [
+            ("page", BACKGROUND),
+            ("sidebar", SIDEBAR),
+            ("surface", SURFACE),
+        ] {
+            at_least(TEXT, back, 4.5, &format!("text on {name}"));
+            at_least(MUTED, back, 4.5, &format!("muted on {name}"));
+            at_least(FAINT, back, 4.5, &format!("faint on {name}"));
+            at_least(ACCENT, back, 4.5, &format!("accent on {name}"));
+            at_least(EDGE, back, 3.0, &format!("edge on {name}"));
+        }
+        at_least(ON_PRIMARY, PRIMARY, 4.5, "text on the main action");
+    }
+}

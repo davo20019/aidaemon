@@ -547,7 +547,7 @@ pub fn suggest_field(
             .popup_style(|s| {
                 s.bg(colors::SURFACE)
                     .border_1()
-                    .border_color(colors::BORDER)
+                    .border_color(colors::EDGE)
                     .rounded(px(radius::CONTROL))
                     .shadow_lg()
                     .p_1()
@@ -588,7 +588,7 @@ pub fn with_preview(trigger: impl IntoElement + 'static, card: impl FnOnce() -> 
             .popup_style(|s| {
                 s.bg(colors::SURFACE)
                     .border_1()
-                    .border_color(colors::BORDER)
+                    .border_color(colors::EDGE)
                     .rounded(px(radius::CONTROL))
                     .shadow_lg()
                     .p_3()
