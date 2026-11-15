@@ -44,6 +44,11 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | Conversation | Agent working | Pulse on the status dot (`animate_pulse`) |
 | Inspector, sidebar | Panes fold at narrow widths | Hidden by style, state kept |
 | Inspector, sidebar | Owner drags the line between panes | `split` (resizable panels; sidebar 200–420, inspector 260–520) |
+| All | A page replaces another (conversation, Settings, Memory, System) | `motion::next_layout`: fade, `BASE` |
+| Phone | Sidebar or inspector opens or closes | Made when opened; `next_layout` fade (never grown from hidden) |
+| Desktop | Sidebar or inspector toggles | At once: the resizable group keeps measured widths, so it is not animated |
+| Conversation, Settings | Tools pill, sections unfold | `motion::next_unfold` (content fades in, what is below moves); sections `reveal` |
+| Sidebar | Row menu opens and closes | Grows from where it was asked for (`opacity-0 scale-95`), `BASE` |
 | All | A short note ("Copied", a setting saved, the view moved) | Toast at the bottom, `ENTER` in, leaves after 6 s, paused while hovered; Escape or a swipe dismisses |
 | Settings | A change is refused | Danger banner that stays until dismissed or the next change |
 | Settings, Memory | Remove, Forget, Restart | The platform's alert asks first |
