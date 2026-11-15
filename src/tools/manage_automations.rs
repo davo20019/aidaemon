@@ -769,6 +769,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_check_edit_renames_reschedules_and_reads_back() {
+        let f = fixture().await;
+        let store = Arc::new(
+            crate::health::HealthProbeStore::new(f._harness.state.pool())
+                .await
+                .unwrap(),
+        );
+        let tool =
+            ManageAutomationsTool::new(f.state.clone()).with_health_probes(Some(store.clone()));
+        let mut probe = crate::health::HealthProbe::new(
+            "Synthetic status".into(),
+            crate::health::ProbeType::Http,
+            "https://status.example.test/".into(),
+            "*/5 * * * *".into(),
+            "tool".into(),
+        );
+        probe.next_run_at = chrono::Utc::now() + chrono::Duration::minutes(5);
+        store.upsert_probe(&probe).await.unwrap();
+        let original_next = store
+            .get_probe(&probe.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_run_at;
+        let call = |args: Value| {
+            let tool = &tool;
+            async move { tool.call_with(&args.to_string(), owner()).await.unwrap() }
+        };
+        let renamed = call(
+            json!({"action":"edit", "id":probe.id, "kind":"probe", "new_name":"Synthetic uptime"}),
+        )
+        .await;
+        assert!(renamed.contains("renamed it"), "{renamed}");
+        let saved = store.get_probe(&probe.id).await.unwrap().unwrap();
+        assert_eq!(saved.name, "Synthetic uptime");
+        assert_eq!(saved.next_run_at, original_next);
+        let invalid =
+            call(json!({"action":"edit", "id":probe.id, "kind":"probe", "when":"not a schedule"}))
+                .await;
+        assert!(invalid.contains("Couldn't read the schedule"), "{invalid}");
+        let changed =
+            call(json!({"action":"edit", "id":probe.id, "kind":"probe", "when":"*/10 * * * *"}))
+                .await;
+        assert!(changed.contains("Next run:"), "{changed}");
+        assert_eq!(
+            store.get_probe(&probe.id).await.unwrap().unwrap().schedule,
+            "*/10 * * * *"
+        );
+        let entries = tool.entries().await.unwrap();
+        let entry = entries.iter().find(|entry| entry.id == probe.id).unwrap();
+        assert_eq!(entry.edit.as_ref().unwrap().when, "*/10 * * * *");
+        let (ok, message) = tool
+            .owner_edit(&probe.id, Some("Synthetic web"), None, None, None)
+            .await
+            .unwrap();
+        assert!(ok, "{message}");
+        assert_eq!(
+            store.get_probe(&probe.id).await.unwrap().unwrap().name,
+            "Synthetic web"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_health_check_edit_stays_configured() {
+        let f = fixture().await;
+        let store = Arc::new(
+            crate::health::HealthProbeStore::new(f._harness.state.pool())
+                .await
+                .unwrap(),
+        );
+        let tool =
+            ManageAutomationsTool::new(f.state.clone()).with_health_probes(Some(store.clone()));
+        let probe = crate::health::HealthProbe::new(
+            "Configured status".into(),
+            crate::health::ProbeType::Http,
+            "https://status.example.test/".into(),
+            "*/5 * * * *".into(),
+            "config".into(),
+        );
+        store.upsert_probe(&probe).await.unwrap();
+        let response = tool.call_with(&json!({"action":"edit", "id":probe.id, "kind":"probe", "new_name":"New status", "when":"*/10 * * * *"}).to_string(), owner()).await.unwrap();
+        assert!(response.contains("stays as configured"), "{response}");
+        let saved = store.get_probe(&probe.id).await.unwrap().unwrap();
+        assert_eq!(saved.name, probe.name);
+        assert_eq!(saved.schedule, probe.schedule);
+        assert!(
+            tool.entries()
+                .await
+                .unwrap()
+                .iter()
+                .find(|entry| entry.id == probe.id)
+                .unwrap()
+                .edit
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn a_moved_schedule_action_names_its_new_home_and_runs_nothing() {
         let f = fixture().await;
         f.reminder("Oven", "every weekday at 8am").await;

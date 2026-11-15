@@ -495,10 +495,14 @@ impl ManageAutomationsTool {
                 ),
                 next: (!probe.is_paused).then_some(probe.next_run_at),
                 status: if probe.is_paused { "paused" } else { "active" }.to_string(),
+                edit: (probe.source != "config").then(|| Editable {
+                    when: probe.schedule.clone(),
+                    notify: None,
+                    instructions: None,
+                }),
                 name: Some(probe.name),
                 from_config: probe.source == "config",
                 id: probe.id,
-                edit: None,
             })
             .collect())
     }
@@ -669,7 +673,7 @@ impl ManageAutomationsTool {
         notify: Option<automations::NotifyMode>,
     ) -> anyhow::Result<(bool, String)> {
         let Some(automation) = self
-            .all("", Some(AutomationKind::Scheduled))
+            .all("", None)
             .await?
             .into_iter()
             .find(|automation| automation.id == id)
@@ -680,6 +684,19 @@ impl ManageAutomationsTool {
                     .to_string(),
             ));
         };
+        if automation.kind == AutomationKind::Watching {
+            return Ok((
+                false,
+                "Watching automations change through their mandate.".to_string(),
+            ));
+        }
+        if automation.kind == AutomationKind::Probe && (instructions.is_some() || notify.is_some())
+        {
+            return Ok((
+                false,
+                "Health checks can only change their name or schedule.".to_string(),
+            ));
+        }
         let editable = automation.edit.clone();
         fn differs<'a>(new: Option<&'a str>, old: Option<&str>) -> Option<&'a str> {
             new.map(str::trim)
@@ -706,7 +723,8 @@ impl ManageAutomationsTool {
         let mut said = Vec::new();
         let mut changed = false;
         if name.is_some() || when.is_some() || notify.is_some() {
-            let mut call = json!({ "action": "edit", "id": automation.id, "kind": "scheduled" });
+            let mut call =
+                json!({ "action": "edit", "id": automation.id, "kind": automation.kind.as_str() });
             if let Some(mode) = notify {
                 call["tell_me"] = json!(mode.as_str());
             }
@@ -1067,6 +1085,89 @@ impl ManageAutomationsTool {
         ))
     }
 
+    async fn edit_probe(
+        &self,
+        automation: &Automation,
+        args: &Args,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        if automation.from_config {
+            return Ok(negative(
+                "This health check comes from the config file, so it stays as configured; edit the config file to change it.".to_string(),
+            ));
+        }
+        let Some(store) = &self.probes else {
+            return Ok(negative("Health check storage is unavailable.".to_string()));
+        };
+        if given(&args.snooze_until).is_some() || given(&args.tell_me).is_some() {
+            return Ok(negative(
+                "Health checks can only change `when` or `new_name`.".to_string(),
+            ));
+        }
+        let Some(probe) = store.get_probe(&automation.id).await? else {
+            return Ok(negative("That health check is gone.".to_string()));
+        };
+        let name = given(&args.new_name).unwrap_or(&probe.name).to_string();
+        let schedule = given(&args.when).unwrap_or(&probe.schedule).to_string();
+        if name == probe.name && schedule == probe.schedule {
+            return Ok(negative("Nothing changed.".to_string()));
+        }
+        if name != probe.name
+            && store
+                .list_probes()
+                .await?
+                .iter()
+                .any(|other| other.id != probe.id && other.name.eq_ignore_ascii_case(&name))
+        {
+            return Ok(negative(format!(
+                "A health check is already named \"{name}\"."
+            )));
+        }
+        let next = if schedule == probe.schedule {
+            probe.next_run_at
+        } else {
+            match aidaemon_work::schedule::parse_schedule(&schedule)
+                .and_then(|cron| aidaemon_work::schedule::compute_next_run_local(&cron))
+            {
+                Ok(next) => next.with_timezone(&Utc),
+                Err(error) => {
+                    return Ok(negative(format!(
+                        "Couldn't read the schedule '{schedule}': {error}"
+                    )));
+                }
+            }
+        };
+        if !store.edit_probe(&probe.id, &name, &schedule, next).await? {
+            return Ok(negative(
+                "That health check is gone or comes from the config file.".to_string(),
+            ));
+        }
+        let probe = store
+            .get_probe(&probe.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("edited health check disappeared"))?;
+        if probe.name != name || probe.schedule != schedule || probe.next_run_at != next {
+            return Ok(negative(
+                "The health check edit could not be verified.".to_string(),
+            ));
+        }
+        let mut edits = Vec::new();
+        if name != automation.name.as_deref().unwrap_or_default() {
+            edits.push(format!("renamed it \"{name}\""));
+        }
+        if schedule != automation.card.how_often && given(&args.when).is_some() {
+            edits.push(format!("its schedule is now {schedule}"));
+        }
+        Ok(outcome(
+            format!(
+                "Edited {}: {}. Next run: {}.",
+                automation.title(),
+                edits.join("; "),
+                aidaemon_work::schedule::owner_time(&probe.next_run_at)
+            ),
+            ToolOutcomeStatus::Succeeded,
+        ))
+    }
+
     /// Reschedule, rename or snooze one scheduled automation. Everything is
     /// checked before anything is written.
     async fn edit(
@@ -1082,11 +1183,7 @@ impl ManageAutomationsTool {
                     "A watching automation's limits and cadence change through manage_mandates; pause, resume or cancel it here.".to_string(),
                 ));
             }
-            AutomationKind::Probe => {
-                return Ok(negative(
-                    "A health check is edited by cancelling it and creating it again with health_probe.".to_string(),
-                ));
-            }
+            AutomationKind::Probe => return self.edit_probe(automation, args).await,
         }
         let when = given(&args.when);
         let snooze = given(&args.snooze_until);

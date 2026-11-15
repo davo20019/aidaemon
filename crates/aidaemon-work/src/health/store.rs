@@ -199,6 +199,27 @@ impl HealthProbeStore {
         Ok(result.rows_affected())
     }
 
+    /// Change the owner-editable fields of a tool-created probe.
+    pub async fn edit_probe(
+        &self,
+        id: &str,
+        name: &str,
+        schedule: &str,
+        next_run: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE health_probes SET name = ?, schedule = ?, next_run_at = ?, updated_at = ? WHERE id = ? AND source != 'config'",
+        )
+        .bind(name)
+        .bind(schedule)
+        .bind(next_run.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     fn row_to_probe(&self, row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<HealthProbe> {
         let probe_type_str: String = row.get("probe_type");
         let config_json: String = row.get("config");
