@@ -12,7 +12,14 @@ use std::path::{Component, Path, PathBuf};
 /// `bash -c "a; b"` contributes the segments of `a; b`.
 pub fn command_segments(command: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    collect_segments(command, 0, &mut out);
+    // In PowerShell a backslash is a path separator, not an escape (its
+    // escape is the backtick): on Windows `C:\x\y` and `/tmp/a\b` read as
+    // the paths they are, never with their separators dropped.
+    if cfg!(windows) && command.contains('\\') {
+        collect_segments(&command.replace('\\', "/"), 0, &mut out);
+    } else {
+        collect_segments(command, 0, &mut out);
+    }
     out
 }
 

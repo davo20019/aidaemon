@@ -5433,10 +5433,13 @@ async fn a_memory_write_receipt_credits_the_step_that_declared_it() {
 async fn a_delivery_receipt_credits_the_step_that_declared_it() {
     use crate::testing::MockProvider;
     let workspace = tempfile::tempdir().expect("workspace");
-    let readme = workspace.path().join("README.md");
+    // The folder as tools report it: a Windows runner's temp folder is a
+    // short name (`RUNNER~1`) that send_file resolves to the long one.
+    let root = dunce::canonicalize(workspace.path()).unwrap();
+    let readme = root.join("README.md");
     std::fs::write(&readme, "SYNTHETIC README\n").unwrap();
     let readme = readme.to_string_lossy().to_string();
-    let dir = workspace.path().to_string_lossy().to_string();
+    let dir = root.to_string_lossy().to_string();
     let variants: Vec<(&str, serde_json::Value, bool)> = vec![
         ("no target", serde_json::json!([]), false),
         ("exact path", serde_json::json!([readme.clone()]), false),

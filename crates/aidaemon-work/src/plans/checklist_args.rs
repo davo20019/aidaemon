@@ -120,23 +120,9 @@ pub fn parse_expectation_targets(
     Ok((legacy_targets, observation_targets))
 }
 
-/// On Windows an existing absolute path in its long form, so a target
-/// written with a short name (`C:\\Users\\RUNNER~1\\...`) still covers what
-/// tools report, which they resolve to the long form. Anything else as is.
-fn long_path_form(value: &str) -> std::borrow::Cow<'_, str> {
-    if cfg!(windows)
-        && std::path::Path::new(value).is_absolute()
-        && value.contains('~')
-        && let Ok(path) = dunce::canonicalize(value)
-    {
-        return std::borrow::Cow::Owned(path.to_string_lossy().into_owned());
-    }
-    std::borrow::Cow::Borrowed(value)
-}
-
 pub fn parse_expectation_target(value: &Value) -> Result<RequestObservationTarget, String> {
     let target = if let Some(value) = value.as_str() {
-        RequestObservationTarget::from_legacy_exact(long_path_form(value).into_owned())
+        RequestObservationTarget::from_legacy_exact(value)
             .ok_or_else(|| "target strings must not be empty".to_string())?
     } else {
         serde_json::from_value::<RequestObservationTarget>(value.clone())
