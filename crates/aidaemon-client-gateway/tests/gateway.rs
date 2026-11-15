@@ -244,6 +244,11 @@ struct Fixture {
 }
 
 async fn fixture(risk: RiskLevel) -> Fixture {
+    fixture_after(risk, &[]).await
+}
+
+/// The fixture over a log that a previous process left `earlier` events in.
+async fn fixture_after(risk: RiskLevel, earlier: &[(&str, Event)]) -> Fixture {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .min_connections(1)
@@ -253,6 +258,24 @@ async fn fixture(risk: RiskLevel) -> Fixture {
         .await
         .unwrap();
     let log = SqliteClientEventLog::open(pool).await.unwrap();
+    for (at, (session, event)) in earlier.iter().enumerate() {
+        let turn_id = match event {
+            Event::TurnStarted { turn_id, .. } | Event::TurnCompleted { turn_id, .. } => {
+                Some(turn_id.as_str())
+            }
+            _ => None,
+        };
+        log.append(
+            "owner",
+            at as u64 + 1,
+            Some(session),
+            event.kind(),
+            turn_id,
+            &serde_json::to_string(event).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
     let (approvals_tx, approvals_rx) = mpsc::channel(16);
     let approvals_for_pairing = approvals_tx.clone();
     let agent = Arc::new(ScriptedAgent {
@@ -381,6 +404,51 @@ fn send(text: &str) -> Command {
         model: None,
         effort: None,
     }
+}
+
+/// A turn the previous process left running is ended at start, so a
+/// client resuming from the log stops showing it as working.
+#[tokio::test]
+async fn a_restart_ends_the_turns_the_previous_process_left_running() {
+    let started = |turn: &str| Event::TurnStarted {
+        turn_id: turn.into(),
+        session_id: "app:synthetic-1".into(),
+        origin: "app".into(),
+    };
+    let f = fixture_after(
+        RiskLevel::Medium,
+        &[
+            ("app:synthetic-1", started("t-done")),
+            (
+                "app:synthetic-1",
+                Event::TurnCompleted {
+                    turn_id: "t-done".into(),
+                    text: "Done".into(),
+                    attachments: Vec::new(),
+                    state: TurnState::Completed,
+                    error: None,
+                },
+            ),
+            ("app:synthetic-1", started("t-cut")),
+        ],
+    )
+    .await;
+    let mut since = 3;
+    let seen = f
+        .poll_until(
+            &[],
+            &mut since,
+            |event| matches!(event, Event::TurnCompleted { turn_id, .. } if turn_id == "t-cut"),
+        )
+        .await;
+    let Some(Event::TurnCompleted { state, error, .. }) = seen.last() else {
+        unreachable!()
+    };
+    assert_eq!(*state, TurnState::Cancelled);
+    assert!(error.is_some());
+    assert!(!seen.iter().any(
+        |event| matches!(event, Event::TurnCompleted { turn_id, .. } if turn_id == "t-done" )
+    ));
 }
 
 #[tokio::test]

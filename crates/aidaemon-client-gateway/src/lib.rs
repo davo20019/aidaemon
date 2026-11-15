@@ -49,6 +49,7 @@ use aidaemon_client_protocol::{
     HistoryMessage, LastReply, MemoryItem, MidRun, OwnerInfo, ProjectSummary, ProtocolError, Risk,
     Scope, SearchHit, ServerFrame, SessionChanges, SessionSummary, Settings, SettingsChange,
     SettingsOutcome, SetupAction, SetupState, SlashCommand, Snapshot, TaskState, TaskSummary,
+    TurnState,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::semantics::UserRole;
@@ -448,6 +449,32 @@ impl ClientGateway {
                     .collect(),
             ),
             Err(error) => warn!(%error, "Could not read open approvals from the client log"),
+        }
+        // Turns do not survive a restart either: end those a previous
+        // process left running in the log, so a client that resumes stops
+        // showing them as working (and offering Stop).
+        match bus
+            .log()
+            .open_refs(OWNER, "turn_started", "turn_completed")
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let Some(turn_id) = row.ref_id else { continue };
+                    bus.publish(
+                        row.session_id,
+                        Event::TurnCompleted {
+                            turn_id,
+                            text: String::new(),
+                            attachments: Vec::new(),
+                            state: TurnState::Cancelled,
+                            error: Some("The daemon restarted before this turn finished.".into()),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(error) => warn!(%error, "Could not read open turns from the client log"),
         }
 
         let active = Arc::new(Mutex::new(HashSet::new()));
