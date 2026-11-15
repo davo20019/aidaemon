@@ -254,6 +254,24 @@ const MAX_ACTIVE_EVERGREEN: i64 = 10;
 /// What one change wrote, before it is read back.
 type ChangeNote = Option<String>;
 
+/// One automation as a client lists it (the app's Automations page).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutomationEntry {
+    pub kind: AutomationKind,
+    pub id: String,
+    pub name: Option<String>,
+    /// What it does, in the owner's words.
+    pub what: String,
+    /// When it runs ("Every weekday at 9:00 AM").
+    pub how_often: String,
+    /// `active`, `paused`, `failed`, `awaiting_input`...
+    pub status: String,
+    pub next: Option<DateTime<Utc>>,
+}
+
+/// What the owner can do to an automation from a client.
+pub const CLIENT_CHANGES: [&str; 4] = ["pause", "resume", "cancel", "run_now"];
+
 fn outcome(output: String, status: ToolOutcomeStatus) -> ToolCallOutcome {
     ToolCallOutcome {
         output,
@@ -333,10 +351,11 @@ impl ManageAutomationsTool {
         Ok(found)
     }
 
-    async fn watching(&self, session_id: &str) -> anyhow::Result<Vec<Automation>> {
+    /// Watching automations of `session_id`, or of every session.
+    async fn watching(&self, session_id: Option<&str>) -> anyhow::Result<Vec<Automation>> {
         Ok(self
             .state
-            .list_mandates(Some(session_id), false)
+            .list_mandates(session_id, false)
             .await?
             .into_iter()
             .map(|mandate| Automation {
@@ -380,6 +399,85 @@ impl ManageAutomationsTool {
             .collect())
     }
 
+    /// Every automation the owner has, for a client: scheduled work, every
+    /// session's watching automations, and health probes; next to run first.
+    pub async fn entries(&self) -> anyhow::Result<Vec<AutomationEntry>> {
+        let mut all = self.scheduled().await?;
+        all.extend(self.watching(None).await?);
+        all.extend(self.probes().await?);
+        all.sort_by(|left, right| match (left.next, right.next) {
+            (Some(l), Some(r)) => l.cmp(&r),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.id.cmp(&right.id),
+        });
+        Ok(all
+            .into_iter()
+            .map(|automation| AutomationEntry {
+                kind: automation.kind,
+                id: automation.id,
+                name: automation.name,
+                what: automation.card.what,
+                how_often: automation.card.how_often,
+                status: automation.status,
+                next: automation.next,
+            })
+            .collect())
+    }
+
+    /// Pause, resume, cancel or (scheduled work) run automation `id` now, as
+    /// the owner in a private chat: through this tool's own checks and
+    /// read-back, as when the owner asks the agent. A watching automation is
+    /// changed in the session that approved it. Returns whether it changed,
+    /// and what to tell the owner.
+    pub async fn owner_change(&self, id: &str, action: &str) -> anyhow::Result<(bool, String)> {
+        if !CLIENT_CHANGES.contains(&action) {
+            return Ok((
+                false,
+                format!("Automations cannot be changed with {action}."),
+            ));
+        }
+        let all = self.all("", None).await?;
+        let mut found = all.into_iter().find(|automation| automation.id == id);
+        if found.is_none() {
+            found = self
+                .watching(None)
+                .await?
+                .into_iter()
+                .find(|automation| automation.id == id);
+        }
+        let Some(automation) = found else {
+            return Ok((false, "That automation is gone.".to_string()));
+        };
+        if action == "run_now" && automation.kind != AutomationKind::Scheduled {
+            return Ok((false, "Only scheduled work can run now.".to_string()));
+        }
+        let session_id = match automation.kind {
+            AutomationKind::Watching => self
+                .state
+                .get_mandate(&automation.id)
+                .await?
+                .map(|mandate| mandate.created_by_session)
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let facts = ToolCallContext {
+            session_id,
+            user_role: Some(UserRole::Owner),
+            channel_visibility: Some(ChannelVisibility::Private),
+            ..ToolCallContext::default()
+        };
+        let call = json!({
+            "action": action,
+            "id": automation.id,
+            "kind": automation.kind.as_str(),
+        })
+        .to_string();
+        let result = self.run(&call, &facts).await?;
+        let changed = result.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded);
+        Ok((changed, result.output))
+    }
+
     /// Every automation of `kind` (or every kind), next to run first.
     async fn all(
         &self,
@@ -392,7 +490,7 @@ impl ManageAutomationsTool {
             all.extend(self.scheduled().await?);
         }
         if wants(AutomationKind::Watching) {
-            all.extend(self.watching(session_id).await?);
+            all.extend(self.watching(Some(session_id)).await?);
         }
         if wants(AutomationKind::Probe) {
             all.extend(self.probes().await?);

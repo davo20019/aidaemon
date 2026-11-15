@@ -135,6 +135,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::UpdateProject { .. } => "update_project",
         Command::SetSessionProject { .. } => "set_session_project",
         Command::SetChannelProject { .. } => "set_channel_project",
+        Command::ListAutomations => "list_automations",
+        Command::ChangeAutomation { .. } => "change_automation",
         Command::Unknown => "unknown",
     }
 }
@@ -171,6 +173,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Setup { .. } => "setup",
         CommandResult::Changes { .. } => "changes",
         CommandResult::Projects { .. } => "projects",
+        CommandResult::Automations { .. } => "automations",
         CommandResult::Project { .. } => "project",
         CommandResult::Unknown => "unknown",
     }
@@ -347,6 +350,14 @@ fn client_samples() -> Vec<ClientFrame> {
             Command::SetChannelProject {
                 channel: "telegram:synthetic_coding_bot".into(),
                 project_id: Some("project-acme".into()),
+            },
+        ),
+        command("5d0c2b1e-001b", Command::ListAutomations),
+        command(
+            "5d0c2b1e-001c",
+            Command::ChangeAutomation {
+                automation_id: "goal-7f3e".into(),
+                change: AutomationChange::Pause,
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -850,6 +861,19 @@ fn server_samples() -> Vec<ServerFrame> {
                     truncated: false,
                 }],
             },
+        }),
+        ack(CommandResult::Automations {
+            automations: vec![AutomationSummary {
+                id: "goal-7f3e".into(),
+                kind: AutomationKind::Scheduled,
+                name: Some("Inbox digest".into()),
+                what: "Summarize the synthetic inbox".into(),
+                how_often: "Every weekday at 9:00 AM ET".into(),
+                status: "paused".into(),
+                next_run_ms: None,
+            }],
+            note: Some("Paused \"Inbox digest\" (scheduled). It won't run until you resume it.".into()),
+            changed: true,
         }),
         ack(CommandResult::Projects {
             projects: vec![project()],

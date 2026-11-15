@@ -498,6 +498,33 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
         panic!("{changes:?}");
     };
     assert_eq!(changes.repos[0].root, "/home/synthetic/acme");
+    // A host without automations lists none and refuses a change.
+    let automations = f
+        .post(&[], &command("r-auto-1", Command::ListAutomations))
+        .await;
+    assert!(
+        matches!(
+            &automations,
+            ServerFrame::Ack {
+                result: CommandResult::Automations { automations, changed: false, .. },
+                ..
+            } if automations.is_empty()
+        ),
+        "{automations:?}"
+    );
+    let refused = f
+        .post(
+            &[],
+            &command(
+                "r-auto-2",
+                Command::ChangeAutomation {
+                    automation_id: "goal-1".into(),
+                    change: aidaemon_client_protocol::AutomationChange::Pause,
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(refused, ServerFrame::Error { .. }), "{refused:?}");
     let created = f
         .post(
             &[],

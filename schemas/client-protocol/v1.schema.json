@@ -351,6 +351,88 @@
       ],
       "type": "object"
     },
+    "AutomationChange": {
+      "oneOf": [
+        {
+          "enum": [
+            "pause",
+            "resume",
+            "cancel"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "run_now",
+          "description": "Scheduled work only.",
+          "type": "string"
+        }
+      ]
+    },
+    "AutomationKind": {
+      "oneOf": [
+        {
+          "const": "scheduled",
+          "description": "Runs an instruction or a reminder at set times.",
+          "type": "string"
+        },
+        {
+          "const": "watching",
+          "description": "Works toward an objective within limits the owner approved.",
+          "type": "string"
+        },
+        {
+          "const": "probe",
+          "description": "Checks a service, port, command or file on a schedule.",
+          "type": "string"
+        }
+      ]
+    },
+    "AutomationSummary": {
+      "description": "Something that runs on its own (protocol 1.13).",
+      "properties": {
+        "how_often": {
+          "description": "When it runs (\"Every weekday at 9:00 AM ET\").",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/AutomationKind"
+        },
+        "name": {
+          "description": "The name the owner gave it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_run_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`active`, `paused`, `failed`, `awaiting_input`, `pending_confirmation`...",
+          "type": "string"
+        },
+        "what": {
+          "description": "What it does, in the owner's words.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "what",
+        "how_often",
+        "status"
+      ],
+      "type": "object"
+    },
     "Billing": {
       "description": "How a provider is paid for.",
       "oneOf": [
@@ -1319,6 +1401,40 @@
             "channel"
           ],
           "type": "object"
+        },
+        {
+          "description": "Everything that runs on its own: scheduled work and reminders,\nwatching automations and health checks (protocol 1.13). Answers with\n`automations`.",
+          "properties": {
+            "type": {
+              "const": "list_automations",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Pause, resume, cancel or run one automation now (protocol 1.13).\nAnswers with `automations`: the list as it is after, and what\nhappened.",
+          "properties": {
+            "automation_id": {
+              "type": "string"
+            },
+            "change": {
+              "$ref": "#/$defs/AutomationChange"
+            },
+            "type": {
+              "const": "change_automation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "automation_id",
+            "change"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1688,6 +1804,35 @@
           "required": [
             "type",
             "projects"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_automations` and `change_automation`: every automation, next\nto run first; after a change, what happened (`note`) and whether it\nchanged.",
+          "properties": {
+            "automations": {
+              "items": {
+                "$ref": "#/$defs/AutomationSummary"
+              },
+              "type": "array"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "automations",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "automations"
           ],
           "type": "object"
         },

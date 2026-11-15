@@ -252,6 +252,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_lists_every_automation_and_changes_one_by_id() {
+        let f = fixture().await;
+        f.reminder("Oven", "every weekday at 8am").await;
+        f.watching("Status watch").await;
+        let entries = f.tool.entries().await.unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let oven = entries
+            .iter()
+            .find(|e| e.name.as_deref() == Some("Oven"))
+            .unwrap()
+            .clone();
+        assert_eq!(oven.kind, automations::AutomationKind::Scheduled);
+        assert!(oven.how_often.starts_with("Every weekday at 8:00 AM"));
+        assert!(oven.next.is_some());
+        // Watching ones of every session, changed in their own session.
+        let watch = entries
+            .iter()
+            .find(|e| e.name.as_deref() == Some("Status watch"))
+            .unwrap()
+            .clone();
+        let (changed, said) = f.tool.owner_change(&watch.id, "pause").await.unwrap();
+        assert!(changed, "{said}");
+        assert_eq!(f.mandate_status("Status watch").await, "paused");
+        let (changed, _) = f.tool.owner_change(&watch.id, "resume").await.unwrap();
+        assert!(changed);
+        // Only scheduled work runs now; an unknown change is refused.
+        let (changed, said) = f.tool.owner_change(&watch.id, "run_now").await.unwrap();
+        assert!(
+            !changed && said.starts_with("Only scheduled work"),
+            "{said}"
+        );
+        let (changed, _) = f.tool.owner_change(&oven.id, "edit").await.unwrap();
+        assert!(!changed);
+        let (changed, said) = f.tool.owner_change(&oven.id, "cancel").await.unwrap();
+        assert!(changed, "{said}");
+        assert_eq!(f.scheduled_status("Oven").await, "cancelled");
+        let (changed, said) = f.tool.owner_change(&oven.id, "pause").await.unwrap();
+        assert!(!changed && said == "That automation is gone.", "{said}");
+    }
+
+    #[tokio::test]
     async fn pause_and_resume_by_name_round_trip_for_each_kind() {
         let f = fixture().await;
         f.scheduled_work("Inbox digest", "every day at 9am").await;

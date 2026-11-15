@@ -87,6 +87,13 @@ pub(crate) struct DaemonClientHost {
 }
 
 impl DaemonClientHost {
+    /// The owner's automations as the agent's own tool sees and changes
+    /// them, so the app and a chat apply the same rules.
+    fn automation_tool(&self) -> crate::tools::ManageAutomationsTool {
+        crate::tools::ManageAutomationsTool::new(self.state.clone())
+            .with_health_probes(self.system.health.clone())
+    }
+
     /// The channels of every session, for the chat step's "connected".
     async fn session_channels(&self) -> Vec<String> {
         self.sessions()
@@ -539,6 +546,53 @@ impl ClientHost for DaemonClientHost {
         project_id: Option<&str>,
     ) -> Result<(), String> {
         super::client_projects::send_bot(self.state.as_ref(), channel, project_id).await
+    }
+
+    async fn automations(
+        &self,
+    ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {
+        use aidaemon_client_protocol::{AutomationKind as Kind, AutomationSummary};
+        use aidaemon_work::automations::AutomationKind;
+        Ok(self
+            .automation_tool()
+            .entries()
+            .await?
+            .into_iter()
+            .map(|entry| AutomationSummary {
+                kind: match entry.kind {
+                    AutomationKind::Scheduled => Kind::Scheduled,
+                    AutomationKind::Watching => Kind::Watching,
+                    AutomationKind::Probe => Kind::Probe,
+                },
+                id: entry.id,
+                name: entry.name,
+                what: entry.what,
+                how_often: entry.how_often,
+                status: entry.status,
+                next_run_ms: entry
+                    .next
+                    .and_then(|at| u64::try_from(at.timestamp_millis()).ok()),
+            })
+            .collect())
+    }
+
+    async fn change_automation(
+        &self,
+        id: &str,
+        change: aidaemon_client_protocol::AutomationChange,
+    ) -> Result<(bool, String), String> {
+        use aidaemon_client_protocol::AutomationChange;
+        let action = match change {
+            AutomationChange::Pause => "pause",
+            AutomationChange::Resume => "resume",
+            AutomationChange::Cancel => "cancel",
+            AutomationChange::RunNow => "run_now",
+            AutomationChange::Unknown => return Err("This app asked for an unknown change".into()),
+        };
+        self.automation_tool()
+            .owner_change(id, action)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {

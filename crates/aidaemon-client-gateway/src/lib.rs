@@ -161,6 +161,23 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no projects".to_string())
     }
 
+    /// Everything that runs on its own, next to run first.
+    async fn automations(
+        &self,
+    ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {
+        Ok(Vec::new())
+    }
+
+    /// Change automation `id` as its owner: whether it changed, and what
+    /// to tell them. `Err`: it could not be tried.
+    async fn change_automation(
+        &self,
+        _id: &str,
+        _change: aidaemon_client_protocol::AutomationChange,
+    ) -> Result<(bool, String), String> {
+        Err("This daemon has no automations".to_string())
+    }
+
     /// The daemon's settings; `None` when this host does not show them.
     async fn settings(&self) -> anyhow::Result<Option<Settings>> {
         Ok(None)
@@ -604,11 +621,13 @@ impl ClientGateway {
             | Command::GetSettings
             | Command::GetSetup
             | Command::GetChanges { .. }
-            | Command::ListProjects => Some(Scope::Observe),
+            | Command::ListProjects
+            | Command::ListAutomations => Some(Scope::Observe),
             Command::CreateProject { .. }
             | Command::UpdateProject { .. }
             | Command::SetSessionProject { .. }
-            | Command::SetChannelProject { .. } => Some(Scope::Chat),
+            | Command::SetChannelProject { .. }
+            | Command::ChangeAutomation { .. } => Some(Scope::Chat),
             Command::ForgetMemory { .. }
             | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
@@ -835,6 +854,36 @@ impl ClientGateway {
                     );
                 }
                 Ok(CommandResult::Projects { projects })
+            }
+            Command::ListAutomations => {
+                let automations = self.host.automations().await.map_err(|e| {
+                    warn!(error = %e, "Listing automations failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not list the automations")
+                })?;
+                Ok(CommandResult::Automations {
+                    automations,
+                    note: None,
+                    changed: false,
+                })
+            }
+            Command::ChangeAutomation {
+                automation_id,
+                change,
+            } => {
+                let (changed, note) = self
+                    .host
+                    .change_automation(&automation_id, change)
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                let automations = self.host.automations().await.map_err(|e| {
+                    warn!(error = %e, "Listing automations failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not list the automations")
+                })?;
+                Ok(CommandResult::Automations {
+                    automations,
+                    note: Some(note),
+                    changed,
+                })
             }
             Command::GetChanges { session_id } => {
                 let changes = self.host.changes(&session_id).await.map_err(|e| {

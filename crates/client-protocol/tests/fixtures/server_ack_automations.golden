@@ -1,0 +1,19 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "automations": [
+      {
+        "how_often": "Every weekday at 9:00 AM ET",
+        "id": "goal-7f3e",
+        "kind": "scheduled",
+        "name": "Inbox digest",
+        "status": "paused",
+        "what": "Summarize the synthetic inbox"
+      }
+    ],
+    "changed": true,
+    "note": "Paused \"Inbox digest\" (scheduled). It won't run until you resume it.",
+    "type": "automations"
+  },
+  "type": "ack"
+}

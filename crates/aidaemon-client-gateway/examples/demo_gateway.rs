@@ -191,6 +191,47 @@ impl ClientHost for Host {
             },
         ])
     }
+    async fn automations(
+        &self,
+    ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {
+        use aidaemon_client_protocol::{AutomationKind, AutomationSummary};
+        Ok(vec![
+            AutomationSummary {
+                id: "goal-digest".into(),
+                kind: AutomationKind::Scheduled,
+                name: Some("Inbox digest".into()),
+                what: "Summarize the synthetic inbox and send the highlights".into(),
+                how_often: "Every weekday at 9:00 AM ET".into(),
+                status: "active".into(),
+                next_run_ms: Some(now_ms() + 5 * 3_600_000),
+            },
+            AutomationSummary {
+                id: "mandate-status".into(),
+                kind: AutomationKind::Watching,
+                name: Some("Status watch".into()),
+                what: "Watch the synthetic status page and tell me when it changes".into(),
+                how_often: "Every hour".into(),
+                status: "paused".into(),
+                next_run_ms: None,
+            },
+            AutomationSummary {
+                id: "probe-site".into(),
+                kind: AutomationKind::Probe,
+                name: Some("Acme site up".into()),
+                what: "Check https://acme.example.invalid answers".into(),
+                how_often: "Every 5 minutes".into(),
+                status: "failed".into(),
+                next_run_ms: Some(now_ms() + 300_000),
+            },
+        ])
+    }
+    async fn change_automation(
+        &self,
+        id: &str,
+        change: aidaemon_client_protocol::AutomationChange,
+    ) -> Result<(bool, String), String> {
+        Ok((true, format!("{change:?} {id}: done (demo).")))
+    }
     async fn projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
         Ok(vec![ProjectSummary {
             id: "project-acme".into(),

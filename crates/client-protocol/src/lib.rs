@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 12;
+pub const PROTOCOL_MINOR: u16 = 13;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -348,6 +348,17 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<String>,
     },
+    /// Everything that runs on its own: scheduled work and reminders,
+    /// watching automations and health checks (protocol 1.13). Answers with
+    /// `automations`.
+    ListAutomations,
+    /// Pause, resume, cancel or run one automation now (protocol 1.13).
+    /// Answers with `automations`: the list as it is after, and what
+    /// happened.
+    ChangeAutomation {
+        automation_id: String,
+        change: AutomationChange,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -490,6 +501,16 @@ pub enum CommandResult {
     Projects {
         projects: Vec<ProjectSummary>,
     },
+    /// `list_automations` and `change_automation`: every automation, next
+    /// to run first; after a change, what happened (`note`) and whether it
+    /// changed.
+    Automations {
+        automations: Vec<AutomationSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        changed: bool,
+    },
     /// `create_project` and `update_project`: the project as it is now.
     Project {
         project: ProjectSummary,
@@ -547,6 +568,51 @@ pub struct SessionChanges {
     /// command ran since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check: Option<CheckRun>,
+}
+
+/// Something that runs on its own (protocol 1.13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AutomationSummary {
+    pub id: String,
+    pub kind: AutomationKind,
+    /// The name the owner gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// What it does, in the owner's words.
+    pub what: String,
+    /// When it runs ("Every weekday at 9:00 AM ET").
+    pub how_often: String,
+    /// `active`, `paused`, `failed`, `awaiting_input`, `pending_confirmation`...
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationKind {
+    /// Runs an instruction or a reminder at set times.
+    Scheduled,
+    /// Works toward an objective within limits the owner approved.
+    Watching,
+    /// Checks a service, port, command or file on a schedule.
+    Probe,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationChange {
+    Pause,
+    Resume,
+    Cancel,
+    /// Scheduled work only.
+    RunNow,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// A command a session ran to check its change (protocol 1.12).
