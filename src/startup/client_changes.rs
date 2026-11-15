@@ -610,19 +610,23 @@ mod tests {
 
     #[test]
     fn touched_paths_marks_writes_and_keeps_every_place_worked_in() {
+        let p = crate::testing::abs_path;
         let touched = touched_paths([
             (
                 "edit_file".to_string(),
-                json!({"path": "/work/acme/src/lib.rs"}),
+                json!({"path": p("/work/acme/src/lib.rs")}),
             ),
             (
                 "write_file".to_string(),
-                json!({"file_path": "/work/acme/new.md"}),
+                json!({"file_path": p("/work/acme/new.md")}),
             ),
-            ("terminal".to_string(), json!({"working_dir": "/work/acme"})),
+            (
+                "terminal".to_string(),
+                json!({"working_dir": p("/work/acme")}),
+            ),
             (
                 "spawn_agent".to_string(),
-                json!({"tasks": [{"scope": ["/work/zeta"]}]}),
+                json!({"tasks": [{"scope": [p("/work/zeta")]}]}),
             ),
             ("read_file".to_string(), json!({"path": "relative.txt"})),
             ("web_fetch".to_string(), json!({"url": "https://x.invalid"})),
@@ -630,17 +634,17 @@ mod tests {
         assert_eq!(
             touched.written,
             BTreeSet::from([
-                PathBuf::from("/work/acme/new.md"),
-                PathBuf::from("/work/acme/src/lib.rs")
+                PathBuf::from(p("/work/acme/new.md")),
+                PathBuf::from(p("/work/acme/src/lib.rs"))
             ])
         );
         assert_eq!(
             touched.seen,
             vec![
-                PathBuf::from("/work/acme/src/lib.rs"),
-                PathBuf::from("/work/acme/new.md"),
-                PathBuf::from("/work/acme"),
-                PathBuf::from("/work/zeta"),
+                PathBuf::from(p("/work/acme/src/lib.rs")),
+                PathBuf::from(p("/work/acme/new.md")),
+                PathBuf::from(p("/work/acme")),
+                PathBuf::from(p("/work/zeta")),
             ]
         );
     }

@@ -11,9 +11,9 @@ http_request 2463 616
 list_checkpoints 500 125
 manage_api 1342 336
 manage_auth 1980 495
-manage_automations 1886 472
+manage_automations 2217 555
 manage_config 962 241
-manage_goal_tasks 1658 415
+manage_goal_tasks 1863 466
 manage_mandates 4215 1054
 manage_mcp 726 182
 manage_memories 1359 340
@@ -40,10 +40,10 @@ skill_resources 631 158
 spawn_agent 6608 1652
 system_info 267 67
 terminal 3878 970
-track_requirements 6098 1525
+track_requirements 6230 1558
 use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 76123 19031 (46 tools)
-PER_CALL 32524 8131 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 27 deferred)
+TOTAL 76791 19198 (46 tools)
+PER_CALL 32987 8247 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 27 deferred)
