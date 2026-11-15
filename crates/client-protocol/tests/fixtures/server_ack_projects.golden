@@ -3,6 +3,9 @@
   "result": {
     "projects": [
       {
+        "channels": [
+          "telegram:synthetic_coding_bot"
+        ],
         "id": "project-acme",
         "name": "Acme site",
         "path": "/home/synthetic/acme-site"

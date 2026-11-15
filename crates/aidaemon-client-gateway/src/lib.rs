@@ -151,6 +151,16 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no projects".to_string())
     }
 
+    /// Send chat bot `channel`'s direct-message chats to project
+    /// `project_id` (`None`: to no project).
+    async fn set_channel_project(
+        &self,
+        _channel: &str,
+        _project_id: Option<&str>,
+    ) -> Result<(), String> {
+        Err("This daemon has no projects".to_string())
+    }
+
     /// The daemon's settings; `None` when this host does not show them.
     async fn settings(&self) -> anyhow::Result<Option<Settings>> {
         Ok(None)
@@ -597,7 +607,8 @@ impl ClientGateway {
             | Command::ListProjects => Some(Scope::Observe),
             Command::CreateProject { .. }
             | Command::UpdateProject { .. }
-            | Command::SetSessionProject { .. } => Some(Scope::Chat),
+            | Command::SetSessionProject { .. }
+            | Command::SetChannelProject { .. } => Some(Scope::Chat),
             Command::ForgetMemory { .. }
             | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
@@ -803,6 +814,28 @@ impl ClientGateway {
                     },
                 })
             }
+            Command::SetChannelProject {
+                channel,
+                project_id,
+            } => {
+                self.host
+                    .set_channel_project(&channel, project_id.as_deref())
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                let projects = self.host.projects().await.map_err(|e| {
+                    warn!(error = %e, "Listing projects failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not list the projects")
+                })?;
+                for project in &projects {
+                    self.publisher.publish(
+                        None,
+                        Event::ProjectUpdated {
+                            project: project.clone(),
+                        },
+                    );
+                }
+                Ok(CommandResult::Projects { projects })
+            }
             Command::GetChanges { session_id } => {
                 let changes = self.host.changes(&session_id).await.map_err(|e| {
                     warn!(error = %e, "Reading a session's changes failed");
@@ -1002,6 +1035,7 @@ impl ClientGateway {
                     last_activity_ms: Some(bus::now_ms()),
                     writable: true,
                     project_id: None,
+                    group: false,
                 },
             },
         );
@@ -1172,8 +1206,20 @@ impl ClientGateway {
                             "That conversation's chat is not connected right now",
                         )
                     })?;
+                // Not seen since the daemon started: a chat recorded as a
+                // direct message stays private; anything else is treated
+                // as seen by others.
+                let direct = self
+                    .host
+                    .sessions()
+                    .await
+                    .ok()
+                    .and_then(|all| all.into_iter().find(|s| s.id == session_id))
+                    .is_some_and(|s| !s.group);
                 let mut context = aidaemon_channels::context::ChannelContext::private(&platform);
-                context.visibility = aidaemon_core::ChannelVisibility::Public;
+                if !direct {
+                    context.visibility = aidaemon_core::ChannelVisibility::Public;
+                }
                 context
             }
         };
@@ -1298,6 +1344,7 @@ impl ClientGateway {
                         last_activity_ms: Some(bus::now_ms()),
                         writable: true,
                         project_id,
+                        group: false,
                     },
                 },
             );

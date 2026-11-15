@@ -2,6 +2,12 @@
   "request_id": "5d0c2b1e-0001",
   "result": {
     "changes": {
+      "last_check": {
+        "at_ms": 1767225600000,
+        "command": "cargo test -q contact",
+        "exit_code": 101,
+        "passed": false
+      },
       "repos": [
         {
           "branch": "feature/contact-form",

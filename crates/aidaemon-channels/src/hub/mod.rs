@@ -285,6 +285,18 @@ pub trait SessionChannelStore: Send + Sync {
         Ok(())
     }
 
+    /// A message arrived in chat `session_id` of bot `channel_name`;
+    /// `shared`: other people are in the chat. Records that, and places a
+    /// direct-message chat in the bot's project when it has none yet.
+    async fn chat_seen(
+        &self,
+        _session_id: &str,
+        _channel_name: &str,
+        _shared: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Load all persisted session → channel mappings (for populating session_map on startup).
     async fn load_session_channels(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(vec![])

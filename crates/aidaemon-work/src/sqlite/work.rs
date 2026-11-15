@@ -302,6 +302,64 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
         Ok(true)
     }
 
+    async fn channel_work_projects(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT channel, project_id FROM channel_work_projects ORDER BY channel",
+        )
+        .fetch_all(self.work_pool())
+        .await?)
+    }
+
+    async fn set_channel_work_project(
+        &self,
+        channel: &str,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let Some(project_id) = project_id.filter(|id| *id != DEFAULT_PROJECT_ID) else {
+            sqlx::query("DELETE FROM channel_work_projects WHERE channel = ?")
+                .bind(channel)
+                .execute(self.work_pool())
+                .await?;
+            return Ok(true);
+        };
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM work_projects WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.work_pool())
+                .await?
+                .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO channel_work_projects (channel, project_id, updated_at)
+             VALUES (?, ?, datetime('now'))
+             ON CONFLICT(channel) DO UPDATE
+             SET project_id = excluded.project_id, updated_at = excluded.updated_at",
+        )
+        .bind(channel)
+        .bind(project_id)
+        .execute(self.work_pool())
+        .await?;
+        Ok(true)
+    }
+
+    async fn place_chat_by_channel(&self, session_id: &str, channel: &str) -> anyhow::Result<bool> {
+        // One statement: a chat placed meanwhile (by the owner) keeps its
+        // place.
+        let placed = sqlx::query(
+            "INSERT INTO session_work_projects (session_id, project_id, updated_at)
+             SELECT ?, project_id, datetime('now') FROM channel_work_projects
+             WHERE channel = ?
+             ON CONFLICT(session_id) DO NOTHING",
+        )
+        .bind(session_id)
+        .bind(channel)
+        .execute(self.work_pool())
+        .await?;
+        Ok(placed.rows_affected() > 0)
+    }
+
     async fn start_goal_run(
         &self,
         goal_id: &str,
@@ -2247,6 +2305,53 @@ mod tests {
         assert_eq!(
             store.session_work_projects().await.unwrap(),
             vec![("app:a".to_string(), project.id.clone())]
+        );
+
+        // A bot's chats go to its project, unless placed already: a chat
+        // taken out of a project (placed in the default one) stays out.
+        let bot = "telegram:synthetic_coding_bot";
+        assert!(
+            !store
+                .place_chat_by_channel("synthetic_coding_bot:1", bot)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_channel_work_project(bot, Some(&project.id))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.channel_work_projects().await.unwrap(),
+            vec![(bot.to_string(), project.id.clone())]
+        );
+        assert!(
+            store
+                .place_chat_by_channel("synthetic_coding_bot:1", bot)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .place_chat_by_channel("synthetic_coding_bot:1", bot)
+                .await
+                .unwrap()
+        );
+        assert!(!store.place_chat_by_channel("app:b", "app").await.unwrap());
+        assert!(
+            !store
+                .set_channel_work_project(bot, Some("project-missing"))
+                .await
+                .unwrap()
+        );
+        assert!(store.set_channel_work_project(bot, None).await.unwrap());
+        assert!(store.channel_work_projects().await.unwrap().is_empty());
+        assert!(
+            !store
+                .place_chat_by_channel("synthetic_coding_bot:2", bot)
+                .await
+                .unwrap()
         );
     }
 

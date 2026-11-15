@@ -433,6 +433,17 @@ impl ClientHost for DaemonClientHost {
             }
         };
         let (first, latest) = (said("MIN").await, said("MAX").await);
+        // A chat is direct only when its messages said so; one not heard
+        // from since this was recorded counts as shared.
+        let shared: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+            "SELECT session_id FROM session_channels \
+             WHERE shared IS NOT 0 AND channel_name != 'app'",
+        )
+        .fetch_all(&self.system.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
         let projects: std::collections::HashMap<String, String> = self
             .state
             .session_work_projects()
@@ -460,6 +471,7 @@ impl ClientHost for DaemonClientHost {
                     writable: true,
                     last_activity_ms: last.get(&id).and_then(|at| stored_ms(at)),
                     project_id: projects.get(&id).cloned(),
+                    group: shared.contains(&id),
                     id,
                     channel,
                     title,
@@ -495,6 +507,14 @@ impl ClientHost for DaemonClientHost {
         project_id: Option<&str>,
     ) -> Result<(), String> {
         super::client_projects::place(self.state.as_ref(), session_id, project_id).await
+    }
+
+    async fn set_channel_project(
+        &self,
+        channel: &str,
+        project_id: Option<&str>,
+    ) -> Result<(), String> {
+        super::client_projects::send_bot(self.state.as_ref(), channel, project_id).await
     }
 
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {

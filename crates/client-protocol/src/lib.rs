@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 11;
+pub const PROTOCOL_MINOR: u16 = 12;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -340,6 +340,14 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<String>,
     },
+    /// Send a chat bot's direct-message chats to a project, or to none
+    /// (`project_id` absent) (protocol 1.12). `channel` is a session's
+    /// `channel` (`telegram:coding_bot`). Answers with `projects`.
+    SetChannelProject {
+        channel: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -534,6 +542,23 @@ pub struct MemoryItem {
 pub struct SessionChanges {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repos: Vec<RepoChanges>,
+    /// The last command the session ran after its last file change (a test
+    /// or build, usually), and how it ended (protocol 1.12). `None` when no
+    /// command ran since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<CheckRun>,
+}
+
+/// A command a session ran to check its change (protocol 1.12).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct CheckRun {
+    pub command: String,
+    /// It exited with 0.
+    pub passed: bool,
+    /// Its exit code when it failed with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub at_ms: u64,
 }
 
 /// One repository's uncommitted changes against `HEAD`, the owner's and
@@ -1639,6 +1664,10 @@ pub struct SessionSummary {
     /// The project it belongs to (protocol 1.10); `None`: no project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Other people are in it: a group, or a channel of a workspace
+    /// (protocol 1.12). What the app posts there, everyone there sees.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub group: bool,
 }
 
 /// A project: a name, and the folder its conversations work in
@@ -1651,6 +1680,11 @@ pub struct ProjectSummary {
     /// folder of designs. `None`: the project has no folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The chat bots (session `channel`s, `telegram:coding_bot`) whose
+    /// direct-message chats go to this project unless placed elsewhere
+    /// (protocol 1.12). Group chats are never placed by a bot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
 }
 
 /// One message of a session's transcript.

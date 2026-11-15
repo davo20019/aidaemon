@@ -710,6 +710,34 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok(false)
     }
 
+    /// Every chat bot sending its direct-message chats to a project: (bot
+    /// channel, project id).
+    async fn channel_work_projects(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(vec![])
+    }
+
+    /// Send bot `channel`'s direct-message chats to `project_id`, or to no
+    /// project (`None`). `false` when there is no such project.
+    async fn set_channel_work_project(
+        &self,
+        _channel: &str,
+        _project_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Place a direct-message chat of bot `channel` in that bot's project,
+    /// when the chat was never placed (taking a chat out of its project
+    /// places it in the default one, so that stays). Returns whether it
+    /// was placed now.
+    async fn place_chat_by_channel(
+        &self,
+        _session_id: &str,
+        _channel: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn start_goal_run(
         &self,
         _goal_id: &str,

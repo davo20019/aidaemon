@@ -2,6 +2,9 @@
   "at_ms": 1767225600000,
   "event": {
     "project": {
+      "channels": [
+        "telegram:synthetic_coding_bot"
+      ],
       "id": "project-acme",
       "name": "Acme site",
       "path": "/home/synthetic/acme-site"

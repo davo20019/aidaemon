@@ -399,6 +399,27 @@ impl TurnRunner {
 
     /// Remember that `session_id` belongs to `channel_name`, so outbound
     /// messages (approvals, media, notifications) route back to it.
+    /// [`Self::register_session`] for a message that arrived in a chat:
+    /// also records whether other people are in it, which places a
+    /// direct-message chat in its bot's project the first time.
+    pub async fn register_chat(
+        &self,
+        session_id: &str,
+        channel_name: &str,
+        context: &crate::context::ChannelContext,
+    ) {
+        self.register_session(session_id, channel_name).await;
+        let shared = !matches!(
+            context.visibility,
+            aidaemon_core::ChannelVisibility::Private | aidaemon_core::ChannelVisibility::Internal
+        );
+        let _ = self
+            .deps
+            .sessions
+            .chat_seen(session_id, channel_name, shared)
+            .await;
+    }
+
     pub async fn register_session(&self, session_id: &str, channel_name: &str) {
         self.deps
             .session_map

@@ -1,0 +1,9 @@
+{
+  "command": {
+    "channel": "telegram:synthetic_coding_bot",
+    "project_id": "project-acme",
+    "type": "set_channel_project"
+  },
+  "request_id": "5d0c2b1e-001a",
+  "type": "command"
+}

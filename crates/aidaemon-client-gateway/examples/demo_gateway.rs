@@ -168,6 +168,7 @@ impl ClientHost for Host {
                 last_activity_ms: Some(now_ms() - 3_600_000),
                 writable: true,
                 project_id: None,
+                group: false,
             },
             SessionSummary {
                 id: "telegram:synthetic-user-1".into(),
@@ -176,6 +177,7 @@ impl ClientHost for Host {
                 last_activity_ms: Some(now_ms() - 26 * 3_600_000),
                 writable: false,
                 project_id: None,
+                group: false,
             },
         ])
     }
@@ -221,6 +223,12 @@ impl ClientHost for Host {
             by_session,
         };
         Ok(SessionChanges {
+            last_check: Some(aidaemon_client_protocol::CheckRun {
+                command: "cargo test -q contact".into(),
+                passed: true,
+                exit_code: None,
+                at_ms: now_ms() - 60_000,
+            }),
             repos: vec![RepoChanges {
                 root: "/home/synthetic/acme-site".into(),
                 branch: Some("feature/contact-form".into()),

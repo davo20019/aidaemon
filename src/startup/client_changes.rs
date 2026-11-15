@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aidaemon_client_protocol::{FileChange, FileStatus, RepoChanges, SessionChanges};
+use aidaemon_client_protocol::{CheckRun, FileChange, FileStatus, RepoChanges, SessionChanges};
 use serde_json::Value;
 
 /// How many of the session's latest tool calls are read.
@@ -65,7 +65,100 @@ pub(crate) async fn session_changes(
     {
         touched.seen.insert(0, folder);
     }
-    changes_for(touched).await
+    let check = last_check_call(calls.iter().filter_map(|(tool, data)| {
+        let data: Value = serde_json::from_str(data).ok()?;
+        let name = tool
+            .clone()
+            .or_else(|| data.get("name")?.as_str().map(str::to_string))?;
+        Some((name, data))
+    }));
+    let mut changes = changes_for(touched).await?;
+    if let Some((call_id, command)) = check {
+        changes.last_check = check_result(pool, session_id, &call_id, command).await;
+    }
+    Ok(changes)
+}
+
+/// The last command a session ran after its last file write, latest call
+/// first in `calls` (tool name, call data): its call id and command line.
+/// `None` when it wrote nothing, or ran no command since.
+pub(crate) fn last_check_call(
+    calls: impl IntoIterator<Item = (String, Value)>,
+) -> Option<(String, String)> {
+    let mut check = None;
+    for (tool, data) in calls {
+        match tool.as_str() {
+            "edit_file" | "write_file" => return check,
+            "terminal" if check.is_none() => {
+                let command = data.get("arguments").and_then(|args| {
+                    first_str(args, &["command", "cmd"]).filter(|c| !c.trim().is_empty())
+                });
+                let id = data.get("tool_call_id").and_then(Value::as_str);
+                if let (Some(command), Some(id)) = (command, id) {
+                    check = Some((id.to_string(), command));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// How check `call_id` ended, from its result; `None` while it runs.
+async fn check_result(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    call_id: &str,
+    command: String,
+) -> Option<CheckRun> {
+    let (data, at): (String, String) = sqlx::query_as(
+        "SELECT data, created_at FROM events \
+         WHERE session_id = ? AND event_type = 'tool_result' \
+         AND json_extract(data, '$.tool_call_id') = ? \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(call_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    let data: Value = serde_json::from_str(&data).ok()?;
+    let result = data
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let exit_code = exit_code(result);
+    let failed = exit_code.is_some() || data.get("success") == Some(&Value::Bool(false));
+    Some(CheckRun {
+        command,
+        passed: !failed,
+        exit_code,
+        at_ms: stored_ms(&at).unwrap_or_default(),
+    })
+}
+
+/// The non-zero exit code the terminal tool marks its output with
+/// (`[exit code: N]`, its last such line).
+pub(crate) fn exit_code(output: &str) -> Option<i32> {
+    output.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix("[exit code: ")?
+            .strip_suffix(']')?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+fn stored_ms(text: &str) -> Option<u64> {
+    let at = chrono::DateTime::parse_from_rfc3339(text)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").map(|t| t.and_utc())
+        })
+        .ok()?;
+    u64::try_from(at.timestamp_millis()).ok()
 }
 
 /// Paths a session's tool calls name: `written` by its file tools, and
@@ -176,7 +269,10 @@ pub(crate) async fn changes_for(touched: Touched) -> anyhow::Result<SessionChang
             repos.push(repo);
         }
     }
-    Ok(SessionChanges { repos })
+    Ok(SessionChanges {
+        repos,
+        last_check: None,
+    })
 }
 
 /// The nearest existing directory at or above `path`.
@@ -412,6 +508,43 @@ async fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_last_check_is_the_last_command_after_the_last_write() {
+        let call = |name: &str, id: &str, args: Value| {
+            (
+                name.to_string(),
+                json!({"tool_call_id": id, "name": name, "arguments": args}),
+            )
+        };
+        // Latest first: a test after the edit, and an older build before it.
+        let calls = vec![
+            call("read_file", "c4", json!({"path": "/tmp/a.rs"})),
+            call(
+                "terminal",
+                "c3",
+                json!({"command": "cargo test -q contact"}),
+            ),
+            call("terminal", "c2", json!({"command": "git status"})),
+            call("edit_file", "c1", json!({"path": "/tmp/a.rs"})),
+            call("terminal", "c0", json!({"command": "cargo build"})),
+        ];
+        assert_eq!(
+            last_check_call(calls),
+            Some(("c3".to_string(), "cargo test -q contact".to_string()))
+        );
+        // An edit after the last command: nothing checked it yet.
+        let unchecked = vec![
+            call("write_file", "c2", json!({"path": "/tmp/b.rs"})),
+            call("terminal", "c1", json!({"command": "cargo test"})),
+        ];
+        assert_eq!(last_check_call(unchecked), None);
+        // No change at all: nothing to check.
+        let read_only = vec![call("terminal", "c1", json!({"command": "ls"}))];
+        assert_eq!(last_check_call(read_only), None);
+        assert_eq!(exit_code("FAILED\n[exit code: 101]"), Some(101));
+        assert_eq!(exit_code("test result: ok"), None);
+    }
 
     #[test]
     fn touched_paths_marks_writes_and_keeps_every_place_worked_in() {

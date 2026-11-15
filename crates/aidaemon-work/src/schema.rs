@@ -909,6 +909,17 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
+    // The project a chat bot's direct-message chats go to (`channel`: the
+    // bot's session channel, `telegram:coding_bot`).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS channel_work_projects (
+            channel TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES work_projects(id) ON DELETE CASCADE,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     let _ = sqlx::query("ALTER TABLE goals ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
         .execute(pool)

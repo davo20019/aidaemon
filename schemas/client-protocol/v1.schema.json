@@ -590,6 +590,37 @@
       ],
       "type": "object"
     },
+    "CheckRun": {
+      "description": "A command a session ran to check its change (protocol 1.12).",
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "command": {
+          "type": "string"
+        },
+        "exit_code": {
+          "description": "Its exit code when it failed with one.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "passed": {
+          "description": "It exited with 0.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "command",
+        "passed",
+        "at_ms"
+      ],
+      "type": "object"
+    },
     "CheckStatus": {
       "oneOf": [
         {
@@ -1263,6 +1294,29 @@
           "required": [
             "type",
             "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Send a chat bot's direct-message chats to a project, or to none\n(`project_id` absent) (protocol 1.12). `channel` is a session's\n`channel` (`telegram:coding_bot`). Answers with `projects`.",
+          "properties": {
+            "channel": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "set_channel_project",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "channel"
           ],
           "type": "object"
         }
@@ -3061,6 +3115,13 @@
     "ProjectSummary": {
       "description": "A project: a name, and the folder its conversations work in\n(protocol 1.10).",
       "properties": {
+        "channels": {
+          "description": "The chat bots (session `channel`s, `telegram:coding_bot`) whose\ndirect-message chats go to this project unless placed elsewhere\n(protocol 1.12). Group chats are never placed by a bot.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "id": {
           "type": "string"
         },
@@ -3598,6 +3659,17 @@
     "SessionChanges": {
       "description": "What a session changed in code: the git repositories its tools worked\nin, each with its uncommitted changes. Empty when it worked in none.",
       "properties": {
+        "last_check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CheckRun"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last command the session ran after its last file change (a test\nor build, usually), and how it ended (protocol 1.12). `None` when no\ncommand ran since."
+        },
         "repos": {
           "items": {
             "$ref": "#/$defs/RepoChanges"
@@ -3629,6 +3701,10 @@
         "channel": {
           "description": "The chat it belongs to: `app`, `telegram`...",
           "type": "string"
+        },
+        "group": {
+          "description": "Other people are in it: a group, or a channel of a workspace\n(protocol 1.12). What the app posts there, everyone there sees.",
+          "type": "boolean"
         },
         "id": {
           "type": "string"

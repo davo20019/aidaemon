@@ -2,6 +2,9 @@
   "request_id": "5d0c2b1e-0001",
   "result": {
     "project": {
+      "channels": [
+        "telegram:synthetic_coding_bot"
+      ],
       "id": "project-acme",
       "name": "Acme site",
       "path": "/home/synthetic/acme-site"

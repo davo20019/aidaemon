@@ -89,6 +89,9 @@ impl CommandContext {
                 Arc::new(crate::startup::client_gateway::DeviceCommands),
                 Arc::new(crate::startup::exposure::ExposureCommand),
                 Arc::new(crate::startup::trust_all::TrustAllCommand),
+                Arc::new(crate::startup::client_projects::ProjectCommand {
+                    state: self.state.clone(),
+                }),
             ],
         }
     }

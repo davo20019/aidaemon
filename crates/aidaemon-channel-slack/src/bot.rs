@@ -1711,7 +1711,7 @@ impl SlackBot {
         };
 
         self.runner
-            .register_session(&session_id, &self.channel_name())
+            .register_chat(&session_id, &self.channel_name(), &channel_ctx)
             .await;
         info!(session_id, user_id = %user, "Received Slack message");
 

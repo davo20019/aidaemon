@@ -21,6 +21,30 @@ impl crate::state::types::SessionChannelStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn chat_seen(
+        &self,
+        session_id: &str,
+        channel_name: &str,
+        shared: bool,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE session_channels SET shared = ? WHERE session_id = ?")
+            .bind(i64::from(shared))
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        // Only a direct-message chat follows its bot to a project: a group
+        // works in the owner's folder only when the owner puts it there.
+        if !shared {
+            aidaemon_work::stores::WorkCoordinationStore::place_chat_by_channel(
+                self,
+                session_id,
+                channel_name,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn load_session_channels(&self) -> anyhow::Result<Vec<(String, String)>> {
         let rows = sqlx::query("SELECT session_id, channel_name FROM session_channels")
             .fetch_all(&self.pool)

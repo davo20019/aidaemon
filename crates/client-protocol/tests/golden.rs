@@ -61,6 +61,7 @@ fn task() -> TaskSummary {
 
 fn session() -> SessionSummary {
     SessionSummary {
+        group: Default::default(),
         id: "app:6c1f".into(),
         channel: "app".into(),
         title: Some("Synthetic report for Alice Rivera".into()),
@@ -72,6 +73,7 @@ fn session() -> SessionSummary {
 
 fn project() -> ProjectSummary {
     ProjectSummary {
+        channels: vec!["telegram:synthetic_coding_bot".into()],
         id: "project-acme".into(),
         name: "Acme site".into(),
         path: Some("/home/synthetic/acme-site".into()),
@@ -132,6 +134,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::CreateProject { .. } => "create_project",
         Command::UpdateProject { .. } => "update_project",
         Command::SetSessionProject { .. } => "set_session_project",
+        Command::SetChannelProject { .. } => "set_channel_project",
         Command::Unknown => "unknown",
     }
 }
@@ -336,6 +339,13 @@ fn client_samples() -> Vec<ClientFrame> {
             "5d0c2b1e-0019",
             Command::SetSessionProject {
                 session_id: "app:6c1f".into(),
+                project_id: Some("project-acme".into()),
+            },
+        ),
+        command(
+            "5d0c2b1e-001a",
+            Command::SetChannelProject {
+                channel: "telegram:synthetic_coding_bot".into(),
                 project_id: Some("project-acme".into()),
             },
         ),
@@ -811,6 +821,12 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Changes {
             changes: SessionChanges {
+                last_check: Some(CheckRun {
+                    command: "cargo test -q contact".into(),
+                    passed: false,
+                    exit_code: Some(101),
+                    at_ms: 1_767_225_600_000,
+                }),
                 repos: vec![RepoChanges {
                     root: "/home/synthetic/acme-site".into(),
                     branch: Some("feature/contact-form".into()),

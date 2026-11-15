@@ -141,6 +141,7 @@ impl ClientHost for Host {
             last_activity_ms: Some(5),
             writable: false,
             project_id: None,
+            group: false,
         }])
     }
     async fn history(&self, _: &str, _: usize) -> anyhow::Result<Vec<HistoryMessage>> {
@@ -170,10 +171,12 @@ impl ClientHost for Host {
             id: "project-acme".into(),
             name: name.into(),
             path: path.map(str::to_string),
+            channels: Vec::new(),
         })
     }
     async fn changes(&self, session_id: &str) -> anyhow::Result<SessionChanges> {
         Ok(SessionChanges {
+            last_check: None,
             repos: vec![RepoChanges {
                 root: format!("/home/synthetic/{session_id}"),
                 branch: Some("main".into()),

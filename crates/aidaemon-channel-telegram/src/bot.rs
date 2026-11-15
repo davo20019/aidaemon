@@ -1513,7 +1513,7 @@ impl TelegramBot {
         };
 
         self.runner
-            .register_session(&session_id, &self.channel_name().await)
+            .register_chat(&session_id, &self.channel_name().await, &channel_ctx)
             .await;
         info!(session_id, "Received message from user {}", user_id);
 

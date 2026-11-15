@@ -360,6 +360,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    // Whether other people are in the chat (a group or a workspace
+    // channel), as its latest message said; NULL until a message says.
+    let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN shared INTEGER")
+        .execute(pool)
+        .await;
 
     // Non-destructive `/clear` boundary: hides events at or before
     // `cleared_after_id` from CONTEXT retrieval without deleting them, so the

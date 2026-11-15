@@ -510,7 +510,7 @@ impl DiscordBot {
             trusted: false,
         };
         self.runner
-            .register_session(&session_id, &self.channel_name())
+            .register_chat(&session_id, &self.channel_name(), &channel_ctx)
             .await;
         outlet.kept = self.hub().map(|hub| (hub, session_id.clone()));
         info!(session_id, "Received Discord message from user {}", user_id);
