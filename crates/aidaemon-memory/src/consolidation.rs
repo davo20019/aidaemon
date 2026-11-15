@@ -55,6 +55,10 @@ const CONSOLIDATION_PROMPT: &str = "You are a memory consolidation system. Given
             - \"channel\": Context-specific facts from this conversation\n\
             - \"private\": Sensitive personal info the user would want kept private\n\
             Default to \"channel\" if unsure. People facts should default to \"private\".\n\n\
+            For project, technical and preference facts, write the value as one short clause that makes sense without its key \
+            (\"Local sites live under ~/projects/\", not \"~/projects/\"), at most about 120 characters, in the owner's language. \
+            Copy names, paths, versions, handles and numbers verbatim; no pronouns, no \"the user\", no \"currently\" or \"today\". \
+            User facts and personal_memory values stay bare.\n\n\
             Only extract facts useful in future conversations. If nothing worth remembering, return [].";
 
 /// Consolidates durable facts from owner conversation history with a model.

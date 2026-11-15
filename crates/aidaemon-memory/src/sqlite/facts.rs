@@ -1556,6 +1556,21 @@ impl FactStore for SqliteMemory {
         }
 
         if let Some((old_id, _old_key, old_value)) = &existing {
+            // Spacing and punctuation are not a new value: rewriting
+            // "~/projects/" as "~/projects" refreshes the row instead of
+            // replacing it and resetting its recall history. Case is kept
+            // (paths and handles can be case-sensitive).
+            let words = |text: &str| -> Vec<String> {
+                text.split(|c: char| !c.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            let old_value = if !words(value).is_empty() && words(old_value) == words(value) {
+                value
+            } else {
+                old_value.as_str()
+            };
             // If the value is different, mark old as superseded and insert new.
             //
             // Source priority guard: a write replaces a different value only

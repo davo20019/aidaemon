@@ -512,3 +512,36 @@ async fn quoting_an_inferred_fact_raises_it_to_the_quote() {
         Some("acme app lives in /srv/sites/acme-app")
     );
 }
+
+#[tokio::test]
+async fn punctuation_is_not_a_new_value_but_case_is() {
+    let (memory, _file) = open().await;
+    let write = |value: &'static str| {
+        let memory = memory.clone();
+        async move {
+            memory
+                .upsert_fact(
+                    "project",
+                    "sites_dir",
+                    value,
+                    "consolidation",
+                    None,
+                    FactPrivacy::Channel,
+                )
+                .await
+                .unwrap();
+        }
+    };
+    write("~/projects/").await;
+    write("~/projects").await;
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM facts WHERE key = 'sites_dir'")
+        .fetch_one(&memory.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "refreshed in place, not replaced");
+    write("~/Projects").await;
+    assert_eq!(
+        active_at(&memory, "project", "sites_dir").await.unwrap().0,
+        "~/Projects"
+    );
+}
