@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 21;
+pub const PROTOCOL_MINOR: u16 = 22;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1159,6 +1159,12 @@ pub enum SettingsChange {
     /// Remove failover provider `index` (from 0).
     RemoveFailover {
         index: u32,
+    },
+    /// Move failover `index` to place `to` (both from 0), its keys with it:
+    /// failovers are tried in order (protocol 1.22).
+    MoveFailover {
+        index: u32,
+        to: u32,
     },
     /// Put back the config file as it was before the last change.
     RestoreBackup,

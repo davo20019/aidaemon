@@ -4906,6 +4906,31 @@
           "type": "object"
         },
         {
+          "description": "Move failover `index` to place `to` (both from 0), its keys with it:\nfailovers are tried in order (protocol 1.22).",
+          "properties": {
+            "index": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "move_failover",
+              "type": "string"
+            },
+            "to": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "index",
+            "to"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Put back the config file as it was before the last change.",
           "properties": {
             "kind": {

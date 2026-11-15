@@ -549,6 +549,11 @@ impl SettingsHost {
             SettingsChange::RemoveFailover { index } => {
                 json!({"action": "remove_failover_provider", "failover_index": index})
             }
+            SettingsChange::MoveFailover { index, to } => json!({
+                "action": "move_failover_provider",
+                "failover_index": index,
+                "failover_to_index": to,
+            }),
             SettingsChange::RestoreBackup => json!({"action": "restore"}),
             _ => return Ok(None),
         }))

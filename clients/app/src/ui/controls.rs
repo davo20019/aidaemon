@@ -167,12 +167,13 @@ pub fn btn_icon(
 /// say, and what a terminal shows.
 pub fn icon_btn(
     glyph: Glyph,
-    label: &'static str,
+    label: impl Into<SharedString>,
     size: Size,
     on_press: impl Fn() + 'static,
 ) -> View {
+    let label: SharedString = label.into();
     with_hint(
-        label,
+        label.clone(),
         frame(Variant::Ghost, size, motion::PRESS_SCALE_ICON)
             .w(px(size.height()))
             .accessibility_label(label)

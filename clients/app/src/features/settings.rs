@@ -809,6 +809,7 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
                 settings.chatgpt_signed_in,
                 settings.checked.clone(),
                 at,
+                count - 1,
             ))
             .child(view().px_3().child(form_at(store, form, known.clone(), at)));
         if at + 1 < count {
@@ -976,6 +977,8 @@ fn connected_row(
     signed_in: bool,
     checked: Option<aidaemon_client_protocol::CheckedKey>,
     at: usize,
+    // How many failovers there are: the last one cannot move down.
+    failovers: usize,
 ) -> View {
     let main = provider.failover.is_none();
     let role = match provider.failover {
@@ -1062,6 +1065,40 @@ fn connected_row(
             .accessibility_label(format!("Key for {}", provider.name)),
         );
     }
+    // Failovers are tried in order: each moves up or down a place.
+    let order: Option<View> = provider.failover.map(|index| {
+        let mut moves = view().flex_row().gap_1();
+        let name = provider.name.clone();
+        if index > 0 {
+            moves = moves.child(
+                ui::icon_btn(Glyph::Up, format!("Move {name} up"), Size::Sm, move || {
+                    store.change_settings(SettingsChange::MoveFailover {
+                        index,
+                        to: index - 1,
+                    })
+                })
+                .disabled(move || store.settings_busy()),
+            );
+        }
+        let name = provider.name.clone();
+        if (index as usize) + 1 < failovers {
+            moves = moves.child(
+                ui::icon_btn(
+                    Glyph::Down,
+                    format!("Move {name} down"),
+                    Size::Sm,
+                    move || {
+                        store.change_settings(SettingsChange::MoveFailover {
+                            index,
+                            to: index + 1,
+                        })
+                    },
+                )
+                .disabled(move || store.settings_busy()),
+            );
+        }
+        moves
+    });
     // Removing a failover sits by its name, away from the everyday actions.
     let remove: Option<View> = provider.failover.map(|index| {
         let asked = format!("Remove {} ({role})?", provider.name);
@@ -1110,6 +1147,7 @@ fn connected_row(
                     role,
                     if main { Tone::Accent } else { Tone::Neutral },
                 ))
+                .children(order)
                 .children(remove),
         )
         .child(models)

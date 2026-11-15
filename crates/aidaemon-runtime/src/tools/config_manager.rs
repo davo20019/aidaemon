@@ -309,6 +309,28 @@ impl ConfigManagerTool {
                     Self::failover_entry_summary(entries, index)
                 )))
             }
+            "move_failover_provider" => {
+                let (Some(index), Some(to)) = (args.failover_index, args.failover_to_index) else {
+                    return Ok(None);
+                };
+                let content = self.config.read().await?;
+                let doc: toml::Table = content.parse()?;
+                let provider_table = doc
+                    .get("provider")
+                    .and_then(toml::Value::as_table)
+                    .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+                let Some(entries) = Self::get_failover_array(provider_table)? else {
+                    return Ok(None);
+                };
+                if index >= entries.len() || to >= entries.len() || index == to {
+                    return Ok(None);
+                }
+                Ok(Some(format!(
+                    "Move failover provider {} to position #{}",
+                    Self::failover_entry_summary(entries, index),
+                    to
+                )))
+            }
             _ => Ok(None),
         }
     }
@@ -337,6 +359,11 @@ impl ConfigManagerTool {
             "remove_failover_provider" => json!({
                 "action": args.action,
                 "failover_index": args.failover_index,
+            }),
+            "move_failover_provider" => json!({
+                "action": args.action,
+                "failover_index": args.failover_index,
+                "failover_to_index": args.failover_to_index,
             }),
             "enable_exposure" => json!({
                 "action": args.action,
@@ -1209,6 +1236,145 @@ impl ConfigManagerTool {
         Ok(response.join("\n"))
     }
 
+    /// The failover entries `tables` put in `order` (`order[new] = old`;
+    /// an old index left out is dropped), each entry's keychain secrets
+    /// moved to its new slot. Every moved secret is read before any slot is
+    /// written (through a slot of its own), so a swap or a shift never reads
+    /// a secret another entry has just written. Returns the entries, the
+    /// keychain entries no longer used, and notes.
+    #[allow(clippy::type_complexity)]
+    fn reindex_failovers(
+        &self,
+        tables: Vec<toml::Table>,
+        order: &[usize],
+    ) -> anyhow::Result<(Vec<toml::Value>, Vec<String>, Vec<String>)> {
+        let mut notes = Vec::new();
+        let mut cleanup = Vec::new();
+        let moving = |old: usize| format!("provider_fallback_moving_{old}");
+        let mut staged = Vec::with_capacity(order.len());
+        for (new, &old) in order.iter().enumerate() {
+            let table = tables
+                .get(old)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("failover index {old} out of range"))?;
+            staged.push(if old == new {
+                table
+            } else {
+                self.rekey_provider_table(
+                    &table,
+                    &Self::fallback_key_prefix(old),
+                    &moving(old),
+                    &mut cleanup,
+                    &mut notes,
+                )?
+            });
+        }
+        let mut entries = Vec::with_capacity(order.len());
+        for ((new, &old), table) in order.iter().enumerate().zip(staged) {
+            entries.push(toml::Value::Table(if old == new {
+                table
+            } else {
+                self.rekey_provider_table(
+                    &table,
+                    &moving(old),
+                    &Self::fallback_key_prefix(new),
+                    &mut cleanup,
+                    &mut notes,
+                )?
+            }));
+        }
+        // A slot an entry holds now keeps its secrets, whoever held it before.
+        let held: Vec<String> = (0..entries.len())
+            .map(|new| format!("{}_", Self::fallback_key_prefix(new)))
+            .collect();
+        cleanup.retain(|key| !held.iter().any(|slot| key.starts_with(slot.as_str())));
+        Ok((entries, cleanup, notes))
+    }
+
+    fn delete_stale_keys(&self, mut keys: Vec<String>) {
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if let Err(e) = self.secrets.delete(&key) {
+                warn!(key = %key, error = %e, "Failed to delete stale failover keychain entry");
+            }
+        }
+    }
+
+    async fn move_failover_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
+        let (Some(index), Some(to)) = (args.failover_index, args.failover_to_index) else {
+            return Ok(
+                "Error: 'failover_index' and 'failover_to_index' are required for \
+                       action='move_failover_provider'."
+                    .to_string(),
+            );
+        };
+        let content = self.config.read().await?;
+        let mut doc: toml::Table = content.parse()?;
+        let provider_table = doc
+            .get_mut("provider")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+        let (moved_summary, existing_tables) = {
+            let Some(current) = Self::get_failover_array(provider_table)? else {
+                return Ok("No failover providers configured.".to_string());
+            };
+            if index >= current.len() || to >= current.len() {
+                return Ok(format!(
+                    "Failover provider index out of range. Current count: {}.",
+                    current.len()
+                ));
+            }
+            let summary = Self::failover_entry_summary(current, index);
+            let tables: Vec<toml::Table> = current
+                .iter()
+                .map(|value| {
+                    value
+                        .as_table()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("fallback provider entry is not a table"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            (summary, tables)
+        };
+        if index == to {
+            return Ok(format!("Failover provider #{index} is already there."));
+        }
+        Self::require_kernel_approval(args)?;
+
+        let mut order: Vec<usize> = (0..existing_tables.len()).filter(|&i| i != index).collect();
+        order.insert(to, index);
+        let (entries, cleanup_keys, notes) = self.reindex_failovers(existing_tables, &order)?;
+        *Self::normalize_failover_array_mut(provider_table)? = entries;
+
+        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
+        if let Err(e) = self.config.validate(&new_content) {
+            return Ok(format!(
+                "Refused to move failover provider: {}.\n\nThe config was NOT modified.",
+                e
+            ));
+        }
+        if let Err(e) = self.create_backup().await {
+            warn!("Failed to create backup: {}", e);
+        }
+        self.config.write_checked(&new_content).await?;
+        self.delete_stale_keys(cleanup_keys);
+
+        let mut response = vec![format!(
+            "Moved failover provider {moved_summary} from #{index} to #{to}."
+        )];
+        if !notes.is_empty() {
+            response.push(String::new());
+            response.push("Notes:".to_string());
+            for note in notes {
+                response.push(format!("- {}", note));
+            }
+        }
+        response.push(String::new());
+        response.push("Config validated and saved. Run `/reload` to apply.".to_string());
+        Ok(response.join("\n"))
+    }
+
     async fn remove_failover_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
         let Some(index) = args.failover_index else {
             return Ok(
@@ -1253,27 +1419,9 @@ impl ConfigManagerTool {
         };
         Self::require_kernel_approval(args)?;
 
-        let mut notes = Vec::new();
-        let mut cleanup_keys = Vec::new();
-        let mut remaining_entries = Vec::new();
-        for (old_index, table) in existing_tables.into_iter().enumerate() {
-            if old_index == index {
-                continue;
-            }
-            let new_index = remaining_entries.len();
-            let migrated = if old_index == new_index {
-                table
-            } else {
-                self.rekey_provider_table(
-                    &table,
-                    &Self::fallback_key_prefix(old_index),
-                    &Self::fallback_key_prefix(new_index),
-                    &mut cleanup_keys,
-                    &mut notes,
-                )?
-            };
-            remaining_entries.push(toml::Value::Table(migrated));
-        }
+        let order: Vec<usize> = (0..existing_tables.len()).filter(|&i| i != index).collect();
+        let (remaining_entries, cleanup_keys, notes) =
+            self.reindex_failovers(existing_tables, &order)?;
 
         if remaining_entries.is_empty() {
             provider_table.remove("fallbacks");
@@ -1295,14 +1443,7 @@ impl ConfigManagerTool {
         }
 
         self.config.write_checked(&new_content).await?;
-
-        cleanup_keys.sort();
-        cleanup_keys.dedup();
-        for key in cleanup_keys {
-            if let Err(e) = self.secrets.delete(&key) {
-                warn!(key = %key, error = %e, "Failed to delete stale failover keychain entry");
-            }
-        }
+        self.delete_stale_keys(cleanup_keys);
 
         let mut response = vec![format!("Removed failover provider #{}.", index)];
         response.push(format!("- removed: {}", removed_summary));
@@ -1651,6 +1792,9 @@ struct ConfigArgs {
     smart_model: String,
     #[serde(default)]
     failover_index: Option<usize>,
+    /// Where `move_failover_provider` puts failover `failover_index`.
+    #[serde(default)]
+    failover_to_index: Option<usize>,
     #[serde(default)]
     stt_cli_path: Option<String>,
     #[serde(default)]
@@ -1679,6 +1823,7 @@ impl ConfigArgs {
             fast_model: String::new(),
             smart_model: String::new(),
             failover_index: None,
+            failover_to_index: None,
             stt_cli_path: None,
             stt_model_path: None,
             stt_language: None,
@@ -1709,7 +1854,7 @@ fn manage_config_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "enable_stt", "enable_client_gateway", "enable_exposure"]
+                    "enum": ["read", "get", "set", "unset", "restore", "list_provider_presets", "switch_provider", "list_failover_providers", "add_failover_provider", "remove_failover_provider", "move_failover_provider", "enable_stt", "enable_client_gateway", "enable_exposure"]
                 },
                 "key": { "type": "string" },
                 "value": { "type": "string" },
@@ -1719,6 +1864,7 @@ fn manage_config_schema() -> Value {
                 "fast_model": { "type": "string" },
                 "smart_model": { "type": "string" },
                 "failover_index": { "type": "integer" },
+                "failover_to_index": { "type": "integer" },
                 "stt_cli_path": { "type": "string" },
                 "stt_model_path": { "type": "string" },
                 "stt_language": { "type": "string" }
@@ -1843,6 +1989,7 @@ impl ConfigManagerTool {
             "remove_failover_provider" => {
                 self.remove_failover_provider(&args).await.map(Into::into)
             }
+            "move_failover_provider" => self.move_failover_provider(&args).await.map(Into::into),
             "enable_stt" => self.enable_stt(&args).await.map(Into::into),
             "enable_client_gateway" => self.enable_client_gateway(&args).await,
             "enable_exposure" => self.enable_exposure(&args).await,
@@ -2303,6 +2450,7 @@ mod tests {
             fast_model: String::new(),
             smart_model: String::new(),
             failover_index: None,
+            failover_to_index: None,
             stt_cli_path: None,
             stt_model_path: None,
             stt_language: None,
@@ -2551,6 +2699,117 @@ default = "grok-4"
         assert_eq!(fallbacks[0]["kind"].as_str(), Some("xai_native"));
         assert_eq!(fallbacks[0]["api_key"].as_str(), Some("second-key"));
         assert_eq!(fallbacks[0]["models"]["default"].as_str(), Some("grok-4"));
+    }
+
+    const THREE_KEYCHAIN_FAILOVERS: &str = r#"
+[provider]
+kind = "openai_compatible"
+api_key = "primary-key"
+
+[provider.models]
+default = "primary-model"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "keychain"
+
+[provider.fallbacks.models]
+default = "synthetic-a"
+
+[[provider.fallbacks]]
+kind = "xai_native"
+api_key = "keychain"
+
+[provider.fallbacks.models]
+default = "synthetic-b"
+
+[[provider.fallbacks]]
+kind = "google_genai"
+api_key = "keychain"
+
+[provider.fallbacks.models]
+default = "synthetic-c"
+"#;
+
+    const THREE_KEYS: [(&str, &str); 3] = [
+        ("provider_fallback_0_api_key", "key-a"),
+        ("provider_fallback_1_api_key", "key-b"),
+        ("provider_fallback_2_api_key", "key-c"),
+    ];
+
+    /// Each failover's model and the key in its keychain slot, in order.
+    fn failover_keys(
+        path: &std::path::Path,
+        store: &aidaemon_secrets::MemorySecretStore,
+    ) -> Vec<(String, String)> {
+        let saved = fs::read_to_string(path).expect("read saved config");
+        fallbacks(&saved)
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let key = store
+                    .get(&format!("provider_fallback_{i}_api_key"))
+                    .map(|k| k.expose().to_string())
+                    .unwrap_or_default();
+                (f["models"]["default"].as_str().unwrap().to_string(), key)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn move_failover_provider_moves_each_key_with_its_provider() {
+        let (_dir, path) = write_temp_config(THREE_KEYCHAIN_FAILOVERS);
+        let (tool, store) = tool_with_secrets(path.clone(), &THREE_KEYS);
+        let mut args = test_args();
+        args.action = "move_failover_provider".to_string();
+        args.failover_index = Some(2);
+        args.failover_to_index = Some(0);
+        let reply = tool.move_failover_provider(&args).await.unwrap();
+        assert!(reply.contains("from #2 to #0"), "{reply}");
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            failover_keys(&path, &store),
+            pairs(&[
+                ("synthetic-c", "key-c"),
+                ("synthetic-a", "key-a"),
+                ("synthetic-b", "key-b")
+            ])
+        );
+        // A swap of neighbours.
+        args.failover_index = Some(0);
+        args.failover_to_index = Some(1);
+        tool.move_failover_provider(&args).await.unwrap();
+        assert_eq!(
+            failover_keys(&path, &store),
+            pairs(&[
+                ("synthetic-a", "key-a"),
+                ("synthetic-c", "key-c"),
+                ("synthetic-b", "key-b")
+            ])
+        );
+        assert!(store.get("provider_fallback_moving_0_api_key").is_err());
+    }
+
+    #[tokio::test]
+    async fn removing_the_first_of_three_keychain_failovers_keeps_the_others_keys() {
+        let (_dir, path) = write_temp_config(THREE_KEYCHAIN_FAILOVERS);
+        let (tool, store) = tool_with_secrets(path.clone(), &THREE_KEYS);
+        let mut args = test_args();
+        args.action = "remove_failover_provider".to_string();
+        args.failover_index = Some(0);
+        tool.remove_failover_provider(&args).await.unwrap();
+        assert_eq!(
+            failover_keys(&path, &store),
+            vec![
+                ("synthetic-b".to_string(), "key-b".to_string()),
+                ("synthetic-c".to_string(), "key-c".to_string()),
+            ]
+        );
+        assert!(store.get("provider_fallback_2_api_key").is_err());
     }
 
     #[tokio::test]
