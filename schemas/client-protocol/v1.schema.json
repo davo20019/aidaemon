@@ -300,6 +300,14 @@
     "AttachmentRef": {
       "description": "A file with a message: one a client uploaded before sending it, or one\nthe daemon sent (a picture, a document).",
       "properties": {
+        "height": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -324,6 +332,15 @@
           "description": "Where to fetch it, on the gateway's own origin\n(`/client/v1/files/...`). It needs no token: the path itself is the\npermission, so treat it like the file (protocol 1.11).",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "width": {
+          "description": "A picture's size in pixels, so a client lays it out before it\nloads (protocol 1.12).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         }

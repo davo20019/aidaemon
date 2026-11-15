@@ -306,3 +306,33 @@ fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
     app.wait_for("synthetic-report.pdf")?;
     Ok(())
 }
+
+#[test]
+fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What should we work on?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-pic","channel":"app","title":"Look at this","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Look at this")?;
+    app.press("Look at this")?;
+    feed([frame(
+        r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-pic","event":{"type":"user_message","session_id":"app:synthetic-pic","text":"What is in it?","origin":"app","attachments":[{"id":"0123456789abcdef01234567","name":"shot.png","mime":"image/png","size_bytes":4,"url":"/client/v1/files/0123456789abcdef01234567/sig/shot.png","width":800,"height":400}]}}"#,
+    )]);
+    app.wait_for("What is in it?")?;
+    let picture = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|n| n.test_id.as_deref() == Some("picture"))
+        .ok_or("no picture on screen")?;
+    let (w, h) = (picture.bounds.size.width.0, picture.bounds.size.height.0);
+    // Laid out before it loads: its 2:1 shape, at most 320 wide.
+    assert!(w > 100.0 && w <= 320.0, "{w} x {h}");
+    assert!((w / h - 2.0).abs() < 0.01, "{w} x {h}");
+    Ok(())
+}

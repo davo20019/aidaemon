@@ -25,6 +25,79 @@ pub struct FileRecord {
     pub name: String,
     pub mime: String,
     pub size_bytes: u64,
+    /// A picture's size in pixels, read from its header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixels: Option<(u32, u32)>,
+}
+
+/// A picture's width and height in pixels, from its header (PNG, GIF,
+/// JPEG, WebP); `None` for anything else or a header it cannot read.
+pub fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |at: usize| Some(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]) as u32);
+    let le16 = |at: usize| Some(u16::from_le_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]) as u32);
+    let le24 = |at: usize| {
+        Some(u32::from_le_bytes([
+            *bytes.get(at)?,
+            *bytes.get(at + 1)?,
+            *bytes.get(at + 2)?,
+            0,
+        ]))
+    };
+    let size = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let w = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+        let h = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+        (w, h)
+    } else if bytes.starts_with(b"GIF8") {
+        (le16(6)?, le16(8)?)
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        match bytes.get(12..16)? {
+            b"VP8 " => (le16(26)? & 0x3fff, le16(28)? & 0x3fff),
+            b"VP8L" => {
+                let b = bytes.get(21..25)?;
+                let bits = u32::from_le_bytes(b.try_into().ok()?);
+                ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+            }
+            b"VP8X" => (le24(24)? + 1, le24(27)? + 1),
+            _ => return None,
+        }
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        // Walk the segments to the frame header (SOF0..SOF15, but not DHT,
+        // JPG or DAC, which share the range).
+        let mut at = 2;
+        loop {
+            while *bytes.get(at)? != 0xff {
+                at += 1;
+            }
+            while *bytes.get(at)? == 0xff {
+                at += 1;
+            }
+            let marker = *bytes.get(at)?;
+            at += 1;
+            if matches!(marker, 0xd8 | 0x01 | 0xd0..=0xd7) {
+                continue;
+            }
+            let length = be16(at)? as usize;
+            if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                break (be16(at + 5)?, be16(at + 3)?);
+            }
+            at += length;
+        }
+    } else {
+        return None;
+    };
+    (size.0 > 0 && size.1 > 0).then_some(size)
+}
+
+/// The size of the picture at `path`, read from its first bytes.
+fn image_size_of(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(1024 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    image_size(&head)
 }
 
 /// The registered files and the key their links are signed with.
@@ -146,6 +219,10 @@ impl FileStore {
             name: name.clone(),
             mime: mime.to_string(),
             size_bytes,
+            pixels: mime
+                .starts_with("image/")
+                .then(|| image_size_of(path))
+                .flatten(),
         };
         let record_path = self.record_path(&id);
         std::fs::write(&record_path, serde_json::to_vec(&record)?)?;
@@ -156,6 +233,8 @@ impl FileStore {
             name,
             mime: Some(record.mime),
             size_bytes: Some(size_bytes),
+            width: record.pixels.map(|(w, _)| w),
+            height: record.pixels.map(|(_, h)| h),
         })
     }
 
@@ -288,6 +367,32 @@ mod tests {
         assert!(again.signed(parts[0], parts[1]).is_some());
         assert!(FileStore::inline("image/png"));
         assert!(!FileStore::inline("image/svg+xml"));
+    }
+
+    #[test]
+    fn picture_sizes_come_from_their_headers() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&480u32.to_be_bytes());
+        assert_eq!(image_size(&png), Some((640, 480)));
+        assert_eq!(image_size(b"GIF89a\x20\x00\x10\x00"), Some((32, 16)));
+        // A JPEG: SOI, an APP0 segment, then SOF0 with 100 x 50.
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00,
+            0x32, 0x00, 0x64, 0x03,
+        ];
+        assert_eq!(image_size(&jpeg), Some((100, 50)));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+        webp.extend_from_slice(&[0; 8]);
+        webp.extend_from_slice(&[199, 0, 0, 99, 0, 0]);
+        assert_eq!(image_size(&webp), Some((200, 100)));
+        assert_eq!(image_size(b"%PDF-1.7"), None);
+        assert_eq!(image_size(&png[..18]), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path().join("files"), dir.path().join("inbox")).unwrap();
+        let saved = store.save("shot.png", None, &png).unwrap();
+        assert_eq!((saved.width, saved.height), (Some(640), Some(480)));
     }
 
     #[test]

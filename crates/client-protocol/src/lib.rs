@@ -377,12 +377,20 @@ pub struct AttachmentRef {
     /// permission, so treat it like the file (protocol 1.11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// A picture's size in pixels, so a client lays it out before it
+    /// loads (protocol 1.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 impl AttachmentRef {
     /// Whether it is a picture a client can show.
     pub fn is_image(&self) -> bool {
-        self.mime.as_deref().is_some_and(|m| m.starts_with("image/"))
+        self.mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("image/"))
     }
 }
 

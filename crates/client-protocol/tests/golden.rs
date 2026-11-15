@@ -200,6 +200,8 @@ fn client_samples() -> Vec<ClientFrame> {
                 session_id: None,
                 text: "Post the synthetic report for Alice Rivera".into(),
                 attachments: vec![AttachmentRef {
+                    height: None,
+                    width: None,
                     url: None,
                     id: "up-1".into(),
                     name: "report.pdf".into(),
@@ -703,6 +705,8 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Uploaded {
             attachment: AttachmentRef {
+                height: None,
+                width: None,
                 id: "f-3c9a".into(),
                 name: "receipt.png".into(),
                 mime: Some("image/png".into()),

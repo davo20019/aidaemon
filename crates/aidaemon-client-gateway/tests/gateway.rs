@@ -1728,6 +1728,8 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     session_id: None,
                     text: "and this".into(),
                     attachments: vec![AttachmentRef {
+                        height: None,
+                        width: None,
                         id: "0".repeat(24),
                         name: "gone.png".into(),
                         mime: None,

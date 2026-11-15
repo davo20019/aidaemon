@@ -593,24 +593,46 @@ pub fn row(
         .on_press(on_press)
 }
 
-/// A picture sent with a message: fitted to 320 points wide (less on a
-/// narrow screen), rounded like a card, pressable to open it full size.
+/// A picture sent with a message, pressable to open it full size. A
+/// picture from a link has no size until it loads, so it is laid out from
+/// `pixels` (its width and height): at most 320 points wide and 360 tall,
+/// and never wider than 80% of the column. Without them it gets a 4:3 box
+/// and fits inside it.
 pub fn picture(
     src: String,
     label: String,
+    pixels: Option<(u32, u32)>,
     on_press: impl Fn() + 'static,
-) -> nsh_base::ButtonElement {
-    button()
-        .max_w(px(320.0))
+) -> View {
+    const MAX_W: f32 = 320.0;
+    const MAX_H: f32 = 360.0;
+    let (width, ratio, fit) = match pixels {
+        Some((w, h)) if w > 0 && h > 0 => {
+            let (w, h) = (w as f32, h as f32);
+            let ratio = w / h;
+            (w.min(MAX_W).min(MAX_H * ratio), ratio, ResizeMode::Cover)
+        }
+        _ => (240.0, 4.0 / 3.0, ResizeMode::Contain),
+    };
+    view()
+        .w(px(width))
         .max_w(percentage(0.8))
-        .rounded(px(radius::SURFACE))
-        .overflow_hidden()
-        .border_1()
-        .border_color(colors::BORDER)
-        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
-        .accessibility_label(label)
-        .on_press(on_press)
-        .child(image(src).w_full().max_h(px(360.0)))
+        .aspect_ratio(ratio)
+        .test_id("picture")
+        .child(
+            button()
+                .w_full()
+                .h_full()
+                .rounded(px(radius::SURFACE))
+                .overflow_hidden()
+                .border_1()
+                .border_color(colors::BORDER)
+                .bg(colors::SURFACE)
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                .accessibility_label(label)
+                .on_press(on_press)
+                .child(image(src).w_full().h_full().object_fit(fit)),
+        )
 }
 
 /// A file sent with a message, or attached to one being written: its name
