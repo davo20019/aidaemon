@@ -205,6 +205,13 @@ impl ClientHost for Host {
                 status: "active".into(),
                 next_run_ms: Some(now_ms() + 5 * 3_600_000),
                 recent_runs: Vec::new(),
+                details: vec!["Can do: Read only – makes no changes".into()],
+                edit: Some(aidaemon_client_protocol::AutomationEdit {
+                    when: "every weekday at 9am".into(),
+                    instructions: Some(
+                        "Summarize the synthetic inbox and send the highlights".into(),
+                    ),
+                }),
             },
             AutomationSummary {
                 id: "mandate-status".into(),
@@ -215,6 +222,8 @@ impl ClientHost for Host {
                 status: "paused".into(),
                 next_run_ms: None,
                 recent_runs: Vec::new(),
+                details: Vec::new(),
+                edit: None,
             },
             AutomationSummary {
                 id: "probe-site".into(),
@@ -225,6 +234,8 @@ impl ClientHost for Host {
                 status: "failed".into(),
                 next_run_ms: Some(now_ms() + 300_000),
                 recent_runs: Vec::new(),
+                details: Vec::new(),
+                edit: None,
             },
         ])
     }
