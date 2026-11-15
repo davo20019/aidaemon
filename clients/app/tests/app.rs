@@ -727,6 +727,7 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;
     let mut app = Headless::start(config).unwrap();
+    app.wait_for("What should we work on?")?;
     feed([
         Update::Connected,
         frame(
@@ -747,6 +748,9 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
             r#"{"type":"event","at_ms":2,"session_id":"app:synthetic-11","event":{"type":"turn_status","turn_id":"t11","status":{"kind":"tool_progress","name":"terminal","chunk":"\u001b[32mCompiling\u001b[0m 10%\rCompiling 100%\n✅ 漢字 build ok\n"}}}"#,
         ),
     ]);
-    app.wait_for("✅ 漢字 build ok")?;
+    // The working line says the output's latest line, without escapes.
+    app.wait_for("text:terminal: ✅ 漢字 build ok")?;
+    // Steps shows it as text: the progress line at its last state.
+    app.wait_for("Compiling 100%\n✅ 漢字 build ok")?;
     Ok(())
 }

@@ -127,8 +127,18 @@ pub fn status_text(status: &TurnStatus) -> String {
         TurnStatus::Thinking => "Thinking...".into(),
         TurnStatus::ToolStarted { name, summary } if summary.is_empty() => format!("{name}..."),
         TurnStatus::ToolStarted { name, summary } => format!("{name}: {summary}..."),
+        // The output's latest line as a reader sees it, never its escapes.
         TurnStatus::ToolProgress { name, chunk } => {
-            format!("{name}: {}", chunk.chars().take(80).collect::<String>())
+            let plain = crate::text::plain_output(chunk);
+            let last = plain
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default();
+            format!(
+                "{name}: {}",
+                last.trim().chars().take(80).collect::<String>()
+            )
         }
         TurnStatus::ToolCompleted { name, summary } => format!("✓ {name} {summary}"),
         TurnStatus::PlanStep {

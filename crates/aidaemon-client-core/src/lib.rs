@@ -29,6 +29,7 @@ pub mod local;
 pub mod machine;
 pub mod signin;
 pub mod state;
+pub mod text;
 #[cfg(feature = "native")]
 mod tls;
 
