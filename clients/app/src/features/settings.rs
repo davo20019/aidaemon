@@ -795,8 +795,8 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
             .child(form_at(store, form, known, BELOW));
     }
     section = section.child(muted(
-        "The main provider answers. If it can't, the next one takes over with the same kind \
-         of model (hard work stays on a strong model).",
+        "The main provider answers. If it can't, each failover is tried in order until one \
+         answers, with the same kind of model (hard work stays on a strong model).",
     ));
     let mut list = ui::surface().gap_0();
     let count = settings.connected.len();
