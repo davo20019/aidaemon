@@ -368,6 +368,26 @@
         }
       ]
     },
+    "AutomationEdit": {
+      "description": "An automation's changeable fields as they are now (protocol 1.15).",
+      "properties": {
+        "instructions": {
+          "description": "What its runs do; absent for a reminder, whose message is fixed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "when": {
+          "description": "When it runs, in the words it was set with (\"every weekday at 9am\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "when"
+      ],
+      "type": "object"
+    },
     "AutomationKind": {
       "oneOf": [
         {
@@ -423,6 +443,24 @@
     "AutomationSummary": {
       "description": "Something that runs on its own (protocol 1.13).",
       "properties": {
+        "details": {
+          "description": "The rest of its card, one `\"<label>: <text>\"` line each: what it may\ndo, when it tells you, when it ends, its workspace and budget\n(protocol 1.15).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "edit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AutomationEdit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What can be changed here, as it is now; absent when it changes only\nby asking in a conversation (protocol 1.15)."
+        },
         "how_often": {
           "description": "When it runs (\"Every weekday at 9:00 AM ET\").",
           "type": "string"
@@ -1473,6 +1511,42 @@
             "type",
             "automation_id",
             "change"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Change what an automation is called, when it runs or what its runs\ndo (protocol 1.15); a field left out stays as it is. Only one whose\nsummary carries `edit` takes it. Answers with `automations`.",
+          "properties": {
+            "automation_id": {
+              "type": "string"
+            },
+            "instructions": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "edit_automation",
+              "type": "string"
+            },
+            "when": {
+              "description": "When it runs, in words (\"every weekday at 9am\").",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "automation_id"
           ],
           "type": "object"
         }

@@ -3,6 +3,14 @@
   "result": {
     "automations": [
       {
+        "details": [
+          "Can do: Read only – makes no changes",
+          "Tells you when: a run finishes, or it hits a problem"
+        ],
+        "edit": {
+          "instructions": "Summarize the synthetic inbox",
+          "when": "every weekday at 9am"
+        },
         "how_often": "Every weekday at 9:00 AM ET",
         "id": "goal-7f3e",
         "kind": "scheduled",

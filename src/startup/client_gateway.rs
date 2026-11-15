@@ -592,6 +592,13 @@ impl ClientHost for DaemonClientHost {
                         })
                     })
                     .collect(),
+                details: entry.details,
+                edit: entry
+                    .edit
+                    .map(|edit| aidaemon_client_protocol::AutomationEdit {
+                        when: edit.when,
+                        instructions: edit.instructions,
+                    }),
             })
             .collect())
     }
@@ -611,6 +618,19 @@ impl ClientHost for DaemonClientHost {
         };
         self.automation_tool()
             .owner_change(id, action)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn edit_automation(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        when: Option<&str>,
+        instructions: Option<&str>,
+    ) -> Result<(bool, String), String> {
+        self.automation_tool()
+            .owner_edit(id, name, when, instructions)
             .await
             .map_err(|e| e.to_string())
     }

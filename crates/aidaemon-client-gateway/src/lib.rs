@@ -178,6 +178,18 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no automations".to_string())
     }
 
+    /// Rename, reschedule or re-instruct one automation (protocol 1.15); a
+    /// `None` field stays. Returns whether it changed, and what happened.
+    async fn edit_automation(
+        &self,
+        _id: &str,
+        _name: Option<&str>,
+        _when: Option<&str>,
+        _instructions: Option<&str>,
+    ) -> Result<(bool, String), String> {
+        Err("This daemon has no automations".to_string())
+    }
+
     /// The daemon's settings; `None` when this host does not show them.
     async fn settings(&self) -> anyhow::Result<Option<Settings>> {
         Ok(None)
@@ -627,7 +639,8 @@ impl ClientGateway {
             | Command::UpdateProject { .. }
             | Command::SetSessionProject { .. }
             | Command::SetChannelProject { .. }
-            | Command::ChangeAutomation { .. } => Some(Scope::Chat),
+            | Command::ChangeAutomation { .. }
+            | Command::EditAutomation { .. } => Some(Scope::Chat),
             Command::ForgetMemory { .. }
             | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
@@ -873,6 +886,32 @@ impl ClientGateway {
                 let (changed, note) = self
                     .host
                     .change_automation(&automation_id, change)
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                let automations = self.host.automations().await.map_err(|e| {
+                    warn!(error = %e, "Listing automations failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not list the automations")
+                })?;
+                Ok(CommandResult::Automations {
+                    automations,
+                    note: Some(note),
+                    changed,
+                })
+            }
+            Command::EditAutomation {
+                automation_id,
+                name,
+                when,
+                instructions,
+            } => {
+                let (changed, note) = self
+                    .host
+                    .edit_automation(
+                        &automation_id,
+                        name.as_deref(),
+                        when.as_deref(),
+                        instructions.as_deref(),
+                    )
                     .await
                     .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
                 let automations = self.host.automations().await.map_err(|e| {

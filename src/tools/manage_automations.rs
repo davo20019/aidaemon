@@ -336,6 +336,90 @@ mod tests {
         );
     }
 
+    /// A client sees an automation's details and changes scheduled work in
+    /// place, as others' Scheduled pages do: name, when (in words) and what
+    /// its runs do; a reminder's message stays fixed, and a watching
+    /// automation changes by asking (research 2026-11-15).
+    #[tokio::test]
+    async fn a_client_edits_scheduled_work_in_place() {
+        let f = fixture().await;
+        f.scheduled_work("Inbox digest", "every day at 9am").await;
+        f.reminder("Oven", "every weekday at 8am").await;
+        f.watching("Status watch").await;
+        let entries = f.tool.entries().await.unwrap();
+        let find = |entries: &[AutomationEntry], name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name.as_deref() == Some(name))
+                .unwrap()
+                .clone()
+        };
+        let digest = find(&entries, "Inbox digest");
+        let edit = digest.edit.clone().expect("scheduled work is editable");
+        assert_eq!(edit.when, "every day at 9am");
+        assert_eq!(
+            edit.instructions.as_deref(),
+            Some("Summarize the synthetic inbox")
+        );
+        assert!(
+            digest
+                .details
+                .iter()
+                .any(|line| line.starts_with("Can do: "))
+        );
+        assert!(find(&entries, "Oven").edit.unwrap().instructions.is_none());
+        assert!(find(&entries, "Status watch").edit.is_none());
+
+        let (changed, said) = f
+            .tool
+            .owner_edit(
+                &digest.id,
+                Some("Morning digest"),
+                Some("every weekday at 8am"),
+                Some("Summarize the synthetic inbox; skip newsletters"),
+            )
+            .await
+            .unwrap();
+        assert!(changed, "{said}");
+        let after = find(&f.tool.entries().await.unwrap(), "Morning digest");
+        assert!(
+            after.how_often.starts_with("Every weekday at 8:00 AM"),
+            "{}",
+            after.how_often
+        );
+        assert_eq!(
+            after.edit.unwrap().instructions.as_deref(),
+            Some("Summarize the synthetic inbox; skip newsletters")
+        );
+        assert_eq!(
+            after.what,
+            "Summarize the synthetic inbox; skip newsletters"
+        );
+
+        // Unchanged fields change nothing; a reminder's message is fixed;
+        // a watching automation is changed by asking.
+        let (changed, said) = f
+            .tool
+            .owner_edit(&after.id, Some("Morning digest"), None, None)
+            .await
+            .unwrap();
+        assert!(!changed && said == "Nothing changed.", "{said}");
+        let oven = find(&f.tool.entries().await.unwrap(), "Oven");
+        let (changed, _) = f
+            .tool
+            .owner_edit(&oven.id, None, None, Some("Check the synthetic stove"))
+            .await
+            .unwrap();
+        assert!(!changed);
+        let watch = find(&f.tool.entries().await.unwrap(), "Status watch");
+        let (changed, said) = f
+            .tool
+            .owner_edit(&watch.id, Some("Renamed"), None, None)
+            .await
+            .unwrap();
+        assert!(!changed && said.contains("ask in a conversation"), "{said}");
+    }
+
     #[tokio::test]
     async fn pause_and_resume_by_name_round_trip_for_each_kind() {
         let f = fixture().await;

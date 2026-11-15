@@ -137,6 +137,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::SetChannelProject { .. } => "set_channel_project",
         Command::ListAutomations => "list_automations",
         Command::ChangeAutomation { .. } => "change_automation",
+        Command::EditAutomation { .. } => "edit_automation",
         Command::Unknown => "unknown",
     }
 }
@@ -358,6 +359,15 @@ fn client_samples() -> Vec<ClientFrame> {
             Command::ChangeAutomation {
                 automation_id: "goal-7f3e".into(),
                 change: AutomationChange::Pause,
+            },
+        ),
+        command(
+            "5d0c2b1e-001d",
+            Command::EditAutomation {
+                automation_id: "goal-7f3e".into(),
+                name: None,
+                when: Some("every weekday at 8am".into()),
+                instructions: Some("Summarize the synthetic inbox; skip newsletters".into()),
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -885,6 +895,14 @@ fn server_samples() -> Vec<ServerFrame> {
                         summary: Some("3 new messages, 1 needs a reply.".into()),
                     },
                 ],
+                details: vec![
+                    "Can do: Read only – makes no changes".into(),
+                    "Tells you when: a run finishes, or it hits a problem".into(),
+                ],
+                edit: Some(AutomationEdit {
+                    when: "every weekday at 9am".into(),
+                    instructions: Some("Summarize the synthetic inbox".into()),
+                }),
             }],
             note: Some("Paused \"Inbox digest\" (scheduled). It won't run until you resume it.".into()),
             changed: true,

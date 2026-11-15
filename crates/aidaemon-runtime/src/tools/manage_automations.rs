@@ -132,6 +132,17 @@ struct Automation {
     next: Option<DateTime<Utc>>,
     /// A probe from the config file, which startup would add back.
     from_config: bool,
+    /// What a client may change in place (scheduled work only).
+    edit: Option<Editable>,
+}
+
+/// A scheduled automation's changeable fields as they are now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Editable {
+    /// When it runs, in the words it was set with.
+    pub when: String,
+    /// What its runs do; `None` for a reminder.
+    pub instructions: Option<String>,
 }
 
 impl Automation {
@@ -269,6 +280,11 @@ pub struct AutomationEntry {
     pub next: Option<DateTime<Utc>>,
     /// Its latest runs, newest first.
     pub runs: Vec<RunEntry>,
+    /// The rest of its card: what it may do, when it tells you, when it
+    /// ends, and its details.
+    pub details: Vec<String>,
+    /// What a client may change in place.
+    pub edit: Option<Editable>,
 }
 
 /// One run of an automation, as its records left it.
@@ -342,8 +358,40 @@ impl ManageAutomationsTool {
                 })
                 .collect();
             let reminder = aidaemon_work::reminders::message_from_context(goal.context.as_deref());
-            let mut card =
-                automations::scheduled_card(&goal.description, reminder.as_deref(), &specs, &zone);
+            let edit = Editable {
+                when: schedules
+                    .iter()
+                    .find_map(|schedule| schedule.original_schedule.clone())
+                    .filter(|words| !words.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        schedules
+                            .first()
+                            .map(|schedule| schedule.cron_expr.clone())
+                            .unwrap_or_default()
+                    }),
+                instructions: match reminder {
+                    Some(_) => None,
+                    None => Some(
+                        goal.context
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .and_then(|context| {
+                                context
+                                    .get("run_instructions")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| goal.description.clone()),
+                    ),
+                },
+            };
+            // What its runs do now: the owner's latest instructions when it
+            // was given some, never the compiled run policy around them.
+            let what = edit
+                .instructions
+                .clone()
+                .unwrap_or_else(|| goal.description.clone());
+            let mut card = automations::scheduled_card(&what, reminder.as_deref(), &specs, &zone);
             if let Some(workspace) = goal
                 .context
                 .as_deref()
@@ -382,6 +430,7 @@ impl ManageAutomationsTool {
                 id: goal.id,
                 card,
                 from_config: false,
+                edit: Some(edit),
             });
         }
         Ok(found)
@@ -405,6 +454,7 @@ impl ManageAutomationsTool {
                 status: mandate.status.as_str().to_string(),
                 id: mandate.id,
                 from_config: false,
+                edit: None,
             })
             .collect())
     }
@@ -431,6 +481,7 @@ impl ManageAutomationsTool {
                 name: Some(probe.name),
                 from_config: probe.source == "config",
                 id: probe.id,
+                edit: None,
             })
             .collect())
     }
@@ -454,6 +505,15 @@ impl ManageAutomationsTool {
                 .recent_runs(automation.kind, &automation.id)
                 .await
                 .unwrap_or_default();
+            let details = [
+                format!("Can do: {}", automation.card.can_do),
+                format!("Tells you when: {}", automation.card.tells_you_when),
+                format!("Ends: {}", automation.card.ends),
+            ]
+            .into_iter()
+            .chain(automation.card.details.iter().cloned())
+            .filter(|line| !line.trim_end().ends_with(':'))
+            .collect();
             entries.push(AutomationEntry {
                 kind: automation.kind,
                 id: automation.id,
@@ -463,6 +523,8 @@ impl ManageAutomationsTool {
                 status: automation.status,
                 next: automation.next,
                 runs,
+                details,
+                edit: automation.edit,
             });
         }
         Ok(entries)
@@ -575,6 +637,86 @@ impl ManageAutomationsTool {
         let result = self.run(&call, &facts).await?;
         let changed = result.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded);
         Ok((changed, result.output))
+    }
+
+    /// Rename, reschedule or re-instruct scheduled automation `id` as the
+    /// owner in a private chat, through this tool's own checks and
+    /// read-back; a `None` field stays as it is. Returns whether anything
+    /// changed, and what to tell the owner.
+    pub async fn owner_edit(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        when: Option<&str>,
+        instructions: Option<&str>,
+    ) -> anyhow::Result<(bool, String)> {
+        let Some(automation) = self
+            .all("", Some(AutomationKind::Scheduled))
+            .await?
+            .into_iter()
+            .find(|automation| automation.id == id)
+        else {
+            return Ok((
+                false,
+                "Only scheduled work and reminders change here; ask in a conversation to change this one."
+                    .to_string(),
+            ));
+        };
+        let editable = automation.edit.clone();
+        fn differs<'a>(new: Option<&'a str>, old: Option<&str>) -> Option<&'a str> {
+            new.map(str::trim)
+                .filter(|new| !new.is_empty() && Some(*new) != old.map(str::trim))
+        }
+        let name = differs(name, automation.name.as_deref());
+        let when = differs(when, editable.as_ref().map(|e| e.when.as_str()));
+        let instructions = differs(
+            instructions,
+            editable.as_ref().and_then(|e| e.instructions.as_deref()),
+        );
+        if instructions.is_some() && editable.as_ref().is_some_and(|e| e.instructions.is_none()) {
+            return Ok((
+                false,
+                "A reminder's message is fixed; set a new reminder instead.".to_string(),
+            ));
+        }
+        let facts = ToolCallContext {
+            user_role: Some(UserRole::Owner),
+            channel_visibility: Some(ChannelVisibility::Private),
+            ..ToolCallContext::default()
+        };
+        let mut said = Vec::new();
+        let mut changed = false;
+        if name.is_some() || when.is_some() {
+            let mut call = json!({ "action": "edit", "id": automation.id, "kind": "scheduled" });
+            if let Some(name) = name {
+                call["new_name"] = json!(name);
+            }
+            if let Some(when) = when {
+                call["when"] = json!(when);
+            }
+            let result = self.run(&call.to_string(), &facts).await?;
+            let ok = result.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded);
+            said.push(result.output);
+            if !ok {
+                return Ok((changed, said.join(" ")));
+            }
+            changed = true;
+        }
+        if let Some(instructions) = instructions {
+            let call = json!({
+                "action": "update_instructions",
+                "id": automation.id,
+                "kind": "scheduled",
+                "instructions": instructions,
+            });
+            let result = self.run(&call.to_string(), &facts).await?;
+            changed |= result.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded);
+            said.push(result.output);
+        }
+        if said.is_empty() {
+            return Ok((false, "Nothing changed.".to_string()));
+        }
+        Ok((changed, said.join(" ")))
     }
 
     /// Every automation of `kind` (or every kind), next to run first.

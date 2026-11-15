@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 14;
+pub const PROTOCOL_MINOR: u16 = 15;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -359,6 +359,19 @@ pub enum Command {
         automation_id: String,
         change: AutomationChange,
     },
+    /// Change what an automation is called, when it runs or what its runs
+    /// do (protocol 1.15); a field left out stays as it is. Only one whose
+    /// summary carries `edit` takes it. Answers with `automations`.
+    EditAutomation {
+        automation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// When it runs, in words ("every weekday at 9am").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -590,6 +603,25 @@ pub struct AutomationSummary {
     /// it will do (protocol 1.14).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_runs: Vec<AutomationRun>,
+    /// The rest of its card, one `"<label>: <text>"` line each: what it may
+    /// do, when it tells you, when it ends, its workspace and budget
+    /// (protocol 1.15).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<String>,
+    /// What can be changed here, as it is now; absent when it changes only
+    /// by asking in a conversation (protocol 1.15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<AutomationEdit>,
+}
+
+/// An automation's changeable fields as they are now (protocol 1.15).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AutomationEdit {
+    /// When it runs, in the words it was set with ("every weekday at 9am").
+    pub when: String,
+    /// What its runs do; absent for a reminder, whose message is fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 /// One run of an automation (protocol 1.14).
