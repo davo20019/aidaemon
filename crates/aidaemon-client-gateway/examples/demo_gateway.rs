@@ -608,12 +608,15 @@ impl ClientHost for Host {
                 format!("Added {} as failover {}.", option.name, index + 1)
             }
             SettingsChange::RemoveFailover { index, .. } => {
-                settings.connected.remove(index as usize + 1);
+                let removed = settings.connected.remove(index as usize + 1);
                 for (at, p) in settings.connected.iter_mut().enumerate().skip(1) {
                     p.failover = Some(at as u32 - 1);
                 }
                 settings.reload_pending = true;
-                format!("Removed failover {}.", index + 1)
+                format!(
+                    "Removed {}; it stops being tried after a reload.",
+                    removed.name
+                )
             }
             SettingsChange::MoveFailover { index, to, .. } => {
                 let count = settings.connected.len() - 1;
@@ -621,6 +624,7 @@ impl ClientHost for Host {
                     return Err("No such failover".into());
                 }
                 let moved = settings.connected.remove(index as usize + 1);
+                let name = moved.name.clone();
                 settings.connected.insert(to as usize + 1, moved);
                 for (at, p) in settings.connected.iter_mut().enumerate().skip(1) {
                     p.failover = Some(at as u32 - 1);
@@ -629,7 +633,7 @@ impl ClientHost for Host {
                     }
                 }
                 settings.reload_pending = true;
-                format!("Moved failover {} to place {}.", index + 1, to + 1)
+                format!("{name} is now Failover {} after a reload.", to + 1)
             }
             SettingsChange::CheckKey { provider, key } => {
                 if key.0.contains("bad") {

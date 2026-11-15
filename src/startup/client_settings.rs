@@ -737,7 +737,7 @@ impl SettingsHost {
     }
 
     /// What a failover move or removal did, in the names Settings shows
-    /// ("OpenRouter is now Failover 2."); `None` for other changes, or
+    /// ("OpenRouter is now Failover 2 after a reload."); `None` for other changes, or
     /// when the provider is not found.
     fn failover_words(&self, change: &SettingsChange) -> Option<String> {
         let (index, to) = match change {
@@ -751,8 +751,8 @@ impl SettingsHost {
             .find(|p| p.failover == Some(index))?
             .name;
         Some(match to {
-            Some(to) => format!("{name} is now Failover {}.", to + 1),
-            None => format!("Removed {name}."),
+            Some(to) => format!("{name} is now Failover {} after a reload.", to + 1),
+            None => format!("Removed {name}; it stops being tried after a reload."),
         })
     }
 
@@ -1433,7 +1433,7 @@ api_key = "keychain"
         // Said with the names the page shows.
         assert_eq!(
             host.failover_words(&up).unwrap(),
-            format!("{second} is now Failover 1.")
+            format!("{second} is now Failover 1 after a reload.")
         );
         assert_eq!(
             host.failover_words(&SettingsChange::RemoveFailover {
@@ -1441,7 +1441,7 @@ api_key = "keychain"
                 expect: String::new(),
             })
             .unwrap(),
-            format!("Removed {first}.")
+            format!("Removed {first}; it stops being tried after a reload.")
         );
     }
 
