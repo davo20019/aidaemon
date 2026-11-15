@@ -82,6 +82,29 @@ pub fn choice(
     value: impl Fn() -> Option<String> + Copy + 'static,
     change: impl Fn(Option<String>) + 'static,
 ) -> nsh_base::SelectElement {
+    choice_sized(label, placeholder, items, value, change, false)
+}
+
+/// [`choice`] as a small, borderless trigger, for a toolbar row (the
+/// composer's model and effort).
+pub fn choice_compact(
+    label: impl Into<SharedString>,
+    placeholder: impl Into<SharedString>,
+    items: Vec<(String, String)>,
+    value: impl Fn() -> Option<String> + Copy + 'static,
+    change: impl Fn(Option<String>) + 'static,
+) -> nsh_base::SelectElement {
+    choice_sized(label, placeholder, items, value, change, true)
+}
+
+fn choice_sized(
+    label: impl Into<SharedString>,
+    placeholder: impl Into<SharedString>,
+    items: Vec<(String, String)>,
+    value: impl Fn() -> Option<String> + Copy + 'static,
+    change: impl Fn(Option<String>) + 'static,
+    compact: bool,
+) -> nsh_base::SelectElement {
     let label = label.into();
     let placeholder = placeholder.into();
     let titles = items.clone();
@@ -111,15 +134,24 @@ pub fn choice(
         .accessibility_label(label)
         .trigger(
             view()
-                .h(px(if super::touch() { 44.0 } else { 30.0 }))
-                .min_w(px(180.0))
+                .h(px(match (super::touch(), compact) {
+                    (true, _) => 44.0,
+                    (false, true) => 26.0,
+                    (false, false) => 30.0,
+                }))
+                .min_w(px(if compact { 0.0 } else { 180.0 }))
+                .max_w(px(if compact { 220.0 } else { f32::MAX }))
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .px_3()
+                .gap(px(if compact { 4.0 } else { 8.0 }))
+                .px(px(if compact { 6.0 } else { 12.0 }))
                 .rounded(px(radius::CONTROL))
                 .border_1()
-                .border_color(colors::BORDER)
+                .border_color(if compact {
+                    colors::SURFACE
+                } else {
+                    colors::BORDER
+                })
                 .bg(colors::SURFACE)
                 .transition_colors()
                 .duration(motion::FAST)
@@ -134,9 +166,13 @@ pub fn choice(
                     })
                     .flex_1()
                     .number_of_lines(1)
-                    .text_size(px(fit::small()))
+                    .text_size(px(if compact {
+                        type_scale::XS
+                    } else {
+                        fit::small()
+                    }))
                     .text_color(move || {
-                        if shown().is_some() {
+                        if shown().is_some() && !compact {
                             colors::TEXT
                         } else {
                             colors::FAINT
