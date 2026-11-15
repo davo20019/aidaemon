@@ -1308,10 +1308,13 @@ pub struct WatchdogConfig {
     /// window, and the reaper normally requires a second conclusive sample.
     #[serde(default = "default_background_stall_secs")]
     pub background_stall_secs: u64,
-    /// Hard maximum total runtime for generic notifier-active commands. Known
-    /// long-silent workloads such as filesystem traversal, builds/tests, and
-    /// network transfers treat this as a soft boundary while objective progress
-    /// remains visible. Default: 1200 = 20 min.
+    /// Optional hard maximum total runtime for generic notifier-active
+    /// commands; 0 (the default) sets none. Work is bounded by inactivity
+    /// (`background_stall_secs`), never by how long it takes: a job still
+    /// making progress may run for hours, and the owner sees it running and
+    /// can stop it. Known long-silent workloads (filesystem traversal,
+    /// builds/tests, network transfers) treat a set cap as soft while
+    /// objective progress remains visible.
     #[serde(default = "default_background_max_runtime_secs")]
     pub background_max_runtime_secs: u64,
 }
@@ -1345,7 +1348,7 @@ fn default_background_stall_secs() -> u64 {
     120
 }
 fn default_background_max_runtime_secs() -> u64 {
-    1200
+    0
 }
 
 #[derive(Debug, Deserialize, Clone)]

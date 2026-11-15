@@ -179,10 +179,11 @@ pub(crate) async fn init_heartbeat_coordinator(
             } else {
                 crate::tools::terminal::BACKGROUND_IDLE_REAP_SECS
             };
-            let max_runtime_secs = if config.daemon.watchdog.background_max_runtime_secs > 0 {
-                config.daemon.watchdog.background_max_runtime_secs
-            } else {
-                crate::tools::terminal::BACKGROUND_MAX_RUNTIME_SECS
+            // No cap unless the owner sets one: a job still making progress
+            // may run for hours; inactivity is what ends one.
+            let max_runtime = match config.daemon.watchdog.background_max_runtime_secs {
+                0 => Duration::MAX,
+                secs => Duration::from_secs(secs),
             };
             heartbeat.register_job("terminal_idle_reap", Duration::from_secs(60), move || {
                 let terminal_weak = terminal_weak.clone();
@@ -191,7 +192,6 @@ pub(crate) async fn init_heartbeat_coordinator(
                         return Ok(());
                     };
                     let stall = Duration::from_secs(stall_secs);
-                    let max_runtime = Duration::from_secs(max_runtime_secs);
                     let reaped = terminal
                         .reap_stale_background_processes_with(stall, max_runtime)
                         .await;

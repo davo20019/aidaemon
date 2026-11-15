@@ -51,10 +51,9 @@ const BUFFER_CAP: usize = 1_048_576;
 /// The raw command/worker result is always delivered when this budget expires,
 /// so a slow model or a wedged continuation can never strand the user's final
 /// answer or monopolize the global re-engagement serializer indefinitely.
-/// Ten minutes, not two: a continuation often finishes real work the job left
-/// (start the site, install it, take the screenshot), and two minutes cut one
-/// off mid-install (live 2026-11-11). It stays well under the 30-minute task
-/// timeout.
+/// It is how long a continuation may go without progress (and how long it
+/// may wait for its slot), never how long it may work: ten minutes quiet
+/// means wedged; real work (fix, rebuild, re-test) keeps beating.
 const BACKGROUND_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(600);
 /// `detach=true` is a launch-and-return contract: the process is given this
 /// brief startup window so an immediate failure (bad binary, usage error) is
@@ -116,10 +115,10 @@ pub fn printed_lines(stdout: &[u8], stderr: &[u8]) -> u64 {
 /// and is never reaped on the stall path.
 pub const BACKGROUND_IDLE_REAP_SECS: u64 = 300;
 
-/// Default maximum total runtime (seconds) for a generic notifier-active
-/// background process. This remains a hard leak backstop for unclassified
-/// commands; recognized filesystem, build/test, and network workloads treat it
-/// as soft while objective activity is visible. Used when config is absent.
+/// A total-runtime cap the reaper's tests exercise. The daemon sets none by
+/// default (`background_max_runtime_secs = 0`): work is bounded by
+/// inactivity, never by how long it takes; an owner who wants a cap sets
+/// one, and recognized long workloads treat it as soft while active.
 pub const BACKGROUND_MAX_RUNTIME_SECS: u64 = 1200;
 
 /// Why a background process was reaped — drives the user-facing wording and the
@@ -3408,10 +3407,6 @@ impl Drop for FollowupEnd {
     }
 }
 
-/// The longest a continuation may run while it keeps making progress: the
-/// task timeout. Its idle limit is the timeout it is given.
-const CONTINUATION_HARD_CAP: Duration = Duration::from_secs(30 * 60);
-
 async fn run_continuation_turn(
     agent: &dyn ConversationRuntime,
     mut request: ConversationRequest,
@@ -3428,9 +3423,10 @@ async fn run_continuation_turn(
             )
         })?;
     let clock = request.clock;
-    // Bounded by inactivity, not by the clock: a continuation still making
-    // progress (model calls, tools) runs on, up to the task timeout; one
-    // that goes quiet for `timeout` is stopped (live 2026-11-15: a coding
+    // Bounded by inactivity, never by the clock: a continuation still
+    // making progress (model calls, tools) runs as long as its work takes,
+    // and its token budget bounds its cost; one that goes quiet for
+    // `timeout` is stopped (live 2026-11-15: a coding
     // follow-up that fixed, rebuilt and re-ran its tests was cut off at
     // ten minutes and its raw test output posted instead).
     let unix_now = || {
@@ -3444,7 +3440,6 @@ async fn run_continuation_turn(
         .get_or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(unix_now())))
         .clone();
     heartbeat.store(unix_now(), Ordering::Relaxed);
-    let started = tokio::time::Instant::now();
     let work = agent.continue_conversation(request);
     tokio::pin!(work);
     let mut envelope = loop {
@@ -3456,12 +3451,6 @@ async fn run_continuation_turn(
                     anyhow::bail!(
                         "Background continuation for session {session_id} timed out after {}s without progress",
                         timeout.as_secs()
-                    );
-                }
-                if started.elapsed() >= CONTINUATION_HARD_CAP {
-                    anyhow::bail!(
-                        "Background continuation for session {session_id} timed out after {}s",
-                        CONTINUATION_HARD_CAP.as_secs()
                     );
                 }
             }
