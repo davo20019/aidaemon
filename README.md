@@ -27,6 +27,10 @@ I built this because I wanted to control my computer from my phone, from anywher
 curl -sSfL https://get.aidaemon.ai | bash
 ```
 
+### macOS download
+
+Get `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIdaemon to Applications and open it. No terminal needed.
+
 ### Homebrew
 
 ```bash

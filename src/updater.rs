@@ -98,6 +98,12 @@ impl Updater {
     /// `UpdateMode::CheckOnly` to require manual approval before applying
     /// updates, or `UpdateMode::Disable` to manage updates out-of-band.
     fn perform_update() -> anyhow::Result<String> {
+        if crate::daemon::in_signed_app() {
+            anyhow::bail!(
+                "This AIdaemon came with the app download: get the new version of the app \
+                 (its .dmg) to update both."
+            );
+        }
         warn!(
             "Applying update with HTTPS transport security only — \
              no binary signature verification is available"

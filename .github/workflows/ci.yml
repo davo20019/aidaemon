@@ -258,6 +258,36 @@ jobs:
             cargo semver-checks check-release -p "$crate"
           done
 
+  # Windows is not supported yet: this job measures how far it is (does it
+  # build, which tests fail) without blocking a merge. Make it required once
+  # it passes.
+  windows:
+    name: Windows (not yet supported)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      # SQLCipher links OpenSSL.
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build
+        run: cargo build --all-targets --locked
+
+      - name: Test
+        run: cargo test --lib --locked
+
+      - name: Build the app
+        run: cargo build --locked --manifest-path clients/app/Cargo.toml
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

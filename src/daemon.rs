@@ -164,9 +164,6 @@ pub fn install_service() -> anyhow::Result<()> {
 /// `working_dir`. Returns the plist's path.
 #[cfg(target_os = "macos")]
 fn install_macos_agent(working_dir: &std::path::Path) -> anyhow::Result<String> {
-    use std::path::PathBuf;
-    use std::process::Command;
-
     let exe = std::env::current_exe()?;
     let home = std::env::var("HOME")?;
 
@@ -174,12 +171,63 @@ fn install_macos_agent(working_dir: &std::path::Path) -> anyhow::Result<String> 
     let log_dir = format!("{home}/Library/Logs/aidaemon");
     std::fs::create_dir_all(&log_dir)?;
 
+    // From the signed download (AIdaemon.app's helper), the daemon runs where
+    // it is: it already has its bundle id and a lasting signature.
+    let bundle_bin = match signed_helper(&exe) {
+        Some(path) => path,
+        None => build_dev_bundle(&exe, &home)?,
+    };
+    write_launch_agent(&bundle_bin, working_dir, &home, &log_dir)
+}
+
+/// Whether this daemon runs from the signed app download (its helper):
+/// replacing its file would break the signature, so it is updated with the
+/// app.
+pub(crate) fn in_signed_app() -> bool {
+    #[cfg(target_os = "macos")]
+    return std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| signed_helper(&exe).is_some());
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// `exe` when it is the daemon inside a bundle signed with a Developer ID
+/// (the downloaded app's helper), not ad hoc.
+#[cfg(target_os = "macos")]
+fn signed_helper(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let in_bundle = exe
+        .parent()
+        .is_some_and(|dir| dir.ends_with("Contents/MacOS"));
+    if !in_bundle {
+        return None;
+    }
+    let bundle = exe.parent()?.parent()?.parent()?;
+    let info = std::process::Command::new("codesign")
+        .args(["-dv"])
+        .arg(bundle)
+        .output()
+        .ok()?;
+    let details = String::from_utf8_lossy(&info.stderr);
+    let team = details
+        .lines()
+        .find_map(|line| line.strip_prefix("TeamIdentifier="))?;
+    (team != "not set").then(|| exe.to_path_buf())
+}
+
+/// A checkout's or a script install's daemon: copied into its own signed
+/// `~/Applications/aidaemon.app`, so its permission grants survive rebuilds.
+#[cfg(target_os = "macos")]
+fn build_dev_bundle(exe: &std::path::Path, home: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+    use std::process::Command;
+
     // 1. Build the .app bundle skeleton.
-    let app_dir = PathBuf::from(&home).join("Applications/aidaemon.app");
+    let app_dir = PathBuf::from(home).join("Applications/aidaemon.app");
     let macos_dir = app_dir.join("Contents/MacOS");
     std::fs::create_dir_all(&macos_dir)?;
     let bundle_bin = macos_dir.join("aidaemon");
-    std::fs::copy(&exe, &bundle_bin)?;
+    std::fs::copy(exe, &bundle_bin)?;
 
     let info_plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -225,6 +273,27 @@ fn install_macos_agent(working_dir: &std::path::Path) -> anyhow::Result<String> 
         );
     }
 
+    println!("Installed signed app bundle: {}", app_dir.display());
+    println!(
+        "Signed with {}.",
+        if have_identity {
+            "stable identity 'aidaemon-dev' (grants survive rebuilds)"
+        } else {
+            "ad-hoc signature (run scripts/create-signing-identity.sh for rebuild-durable grants)"
+        }
+    );
+    Ok(bundle_bin)
+}
+
+/// Write the launch agent running `bundle_bin` in `working_dir`. Returns
+/// its path.
+#[cfg(target_os = "macos")]
+fn write_launch_agent(
+    bundle_bin: &std::path::Path,
+    working_dir: &std::path::Path,
+    home: &str,
+    log_dir: &str,
+) -> anyhow::Result<String> {
     // 3. Point launchd at the binary inside the bundle (NOT wrapped in
     //    caffeinate — a wrapper process muddies the TCC identity). Idle-sleep
     //    prevention is handled by the daemon itself at startup (see
@@ -262,15 +331,6 @@ fn install_macos_agent(working_dir: &std::path::Path) -> anyhow::Result<String> 
     let path = format!("{home}/Library/LaunchAgents/ai.aidaemon.plist");
     std::fs::write(&path, plist)?;
 
-    println!("Installed signed app bundle: {}", app_dir.display());
-    println!(
-        "Signed with {}.",
-        if have_identity {
-            "stable identity 'aidaemon-dev' (grants survive rebuilds)"
-        } else {
-            "ad-hoc signature (run scripts/create-signing-identity.sh for rebuild-durable grants)"
-        }
-    );
     println!("Plist written to {path}");
     println!("Logs will be written to {log_dir}/");
     Ok(path)

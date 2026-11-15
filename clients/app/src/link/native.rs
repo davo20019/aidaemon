@@ -114,10 +114,15 @@ fn daemon_binary() -> Option<PathBuf> {
     };
     let beside = std::env::current_exe().ok().and_then(|exe| {
         let dir = exe.parent()?.to_path_buf();
-        // In a macOS bundle the daemon sits in Resources or beside the app.
-        [dir.join(name), dir.join("../Resources").join(name)]
-            .into_iter()
-            .find(|p| p.is_file())
+        // The macOS download carries it as a helper app; elsewhere it sits
+        // beside this one.
+        [
+            dir.join("../Helpers/AIdaemon Daemon.app/Contents/MacOS")
+                .join(name),
+            dir.join(name),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
     });
     beside.or_else(|| {
         std::env::var_os("PATH").and_then(|paths| {
@@ -135,6 +140,17 @@ pub fn install_here(store: Store) {
     spawn(async move {
         let result =
             background(async move {
+                // Run from the disk image, the daemon would vanish when it is
+                // ejected.
+                if cfg!(target_os = "macos")
+                    && std::env::current_exe()
+                        .ok()
+                        .is_some_and(|exe| exe.starts_with("/Volumes"))
+                {
+                    return Err(
+                        "Drag AIdaemon to Applications first, then open it from there.".to_string(),
+                    );
+                }
                 let binary = daemon_binary().ok_or_else(|| {
                     "The aidaemon program is not beside this app. Reinstall the app, or install \
                  AIdaemon with the install script."

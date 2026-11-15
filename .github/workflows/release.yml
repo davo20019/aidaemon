@@ -165,6 +165,28 @@ jobs:
           tar -czvf aidaemon-${{ matrix.name }}.tar.gz -C "$stage" .
           shasum -a 256 aidaemon-${{ matrix.name }}.tar.gz > aidaemon-${{ matrix.name }}.tar.gz.sha256
 
+      # The download for people who do not use a terminal: AIdaemon.app with
+      # the daemon inside, in a disk image, signed and notarized.
+      - name: Signing (macOS)
+        if: runner.os == 'macOS' && steps.build_app.outcome == 'success'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPSTORE_API_KEY_P8_BASE64: ${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: scripts/ci-macos-signing.sh >> "$GITHUB_ENV"
+
+      - name: Package disk image (macOS)
+        if: runner.os == 'macOS' && steps.build_app.outcome == 'success'
+        run: |
+          set -euo pipefail
+          scripts/package-macos-dmg.sh \
+            target/${{ matrix.target }}/release/aidaemon \
+            clients/app/target/${{ matrix.target }}/release/aidaemon-app \
+            "${GITHUB_REF_NAME#v}" "AIdaemon-${{ matrix.name }}.dmg"
+          shasum -a 256 "AIdaemon-${{ matrix.name }}.dmg" > "AIdaemon-${{ matrix.name }}.dmg.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -172,6 +194,8 @@ jobs:
           path: |
             aidaemon-${{ matrix.name }}.tar.gz
             aidaemon-${{ matrix.name }}.tar.gz.sha256
+            AIdaemon-${{ matrix.name }}.dmg
+            AIdaemon-${{ matrix.name }}.dmg.sha256
 
   # The app's web build, once: the daemon's gateway serves it from
   # ~/.aidaemon/app-web at /client/v1/next/ (install.sh puts it there).
@@ -260,6 +284,7 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.dmg
             artifacts/*.sha256
 
   publish-crates:
