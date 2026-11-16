@@ -481,16 +481,24 @@ impl ChannelHub {
                 channel.name()
             );
         }
-        channel
-            .request_approval(
-                &routed_session,
-                command,
-                risk_level,
-                warnings,
-                permission_mode,
-                false,
-            )
+        drop(channel);
+        // Settled like any card, so the owner's apps see it and may answer.
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.settle_approval(ApprovalRequest {
+            command: command.to_string(),
+            session_id: routed_session,
+            risk_level,
+            warnings: warnings.to_vec(),
+            permission_mode,
+            response_tx,
+            kind: ApprovalKind::Command,
+            card: None,
+            expires_at_ms: None,
+        })
+        .await;
+        response_rx
             .await
+            .map_err(|_| anyhow::anyhow!("Approval for session {session_id} was not answered"))
     }
 
     /// Route approval requests from tools to the appropriate channel.
@@ -597,7 +605,9 @@ impl ChannelHub {
         let tap = self.approval_tap();
         let tapped = tap.as_ref().map(|tap| {
             tap.opened(&TappedApproval {
-                session_id: &request.session_id,
+                // The chat the bot shows it in, so the apps place it in the
+                // same conversation (a helper's session is not one).
+                session_id: &routed_session,
                 channel: channel_name.clone(),
                 ask,
                 kind: request.kind,
@@ -1195,7 +1205,7 @@ mod tests {
         fn capabilities(&self) -> ChannelCapabilities {
             ChannelCapabilities {
                 markdown: true,
-                inline_buttons: false,
+                inline_buttons: true,
                 media: false,
                 max_message_len: 4096,
             }
@@ -1528,6 +1538,76 @@ mod tests {
         // Unknown session should return None to prevent cross-channel leaks
         let found = hub.channel_for_session("unknown_session").await;
         assert!(found.is_none());
+    }
+
+    /// Records the session each tapped card is shown for.
+    #[derive(Default)]
+    struct RecordingTap {
+        opened: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ApprovalTap for RecordingTap {
+        fn opened(&self, approval: &TappedApproval<'_>) -> (String, super::super::TapAnswer) {
+            let mut opened = self.opened.lock().unwrap();
+            opened.push(approval.session_id.to_string());
+            // Never answered from the app: the bot's answer settles it.
+            let (_, answered) = tokio::sync::oneshot::channel();
+            (format!("tap-{}", opened.len()), answered)
+        }
+        fn closed(&self, _id: &str, _how: TapClosed) {}
+    }
+
+    #[tokio::test]
+    async fn the_apps_see_a_helpers_card_in_its_parent_chat_and_budget_asks_too() {
+        let channel = Arc::new(NamedTestChannel::new("telegram"));
+        let session_map = session_map_with(vec![("parent-session", "telegram")]);
+        let hub = Arc::new(ChannelHub::new(
+            vec![channel.clone() as Arc<dyn HubChannel>],
+            session_map,
+        ));
+        let tap = Arc::new(RecordingTap::default());
+        hub.set_approval_tap(tap.clone());
+        let _route = hub
+            .register_session_route("specialist:code:child", "parent-session")
+            .await
+            .expect("route guard");
+
+        let (approval_tx, approval_rx) = mpsc::channel(1);
+        let listener = tokio::spawn(hub.clone().approval_listener(approval_rx));
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        approval_tx
+            .send(ApprovalRequest {
+                expires_at_ms: None,
+                card: None,
+                command: "git status".to_string(),
+                session_id: "specialist:code:child".to_string(),
+                risk_level: RiskLevel::Medium,
+                warnings: Vec::new(),
+                permission_mode: PermissionMode::Default,
+                response_tx,
+                kind: Default::default(),
+            })
+            .await
+            .unwrap();
+        response_rx.await.unwrap();
+
+        hub.request_inline_approval(
+            "specialist:code:child",
+            "Extend the budget",
+            RiskLevel::High,
+            &[],
+            PermissionMode::Cautious,
+        )
+        .await
+        .unwrap();
+
+        drop(approval_tx);
+        listener.await.unwrap();
+        assert_eq!(
+            *tap.opened.lock().unwrap(),
+            vec!["parent-session".to_string(), "parent-session".to_string()],
+            "the apps place both cards in the chat the bot shows them in"
+        );
     }
 
     #[tokio::test]

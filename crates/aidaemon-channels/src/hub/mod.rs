@@ -61,7 +61,8 @@ pub struct ApprovalRequest {
 
 /// One approval card as an [`ApprovalTap`] sees it when it opens.
 pub struct TappedApproval<'a> {
-    /// The session the card was asked for.
+    /// The chat the card is shown in: the asker's session, or for a helper
+    /// (a sub-agent) the parent conversation it reports to.
     pub session_id: &'a str,
     /// The bot the card is shown on.
     pub channel: String,
