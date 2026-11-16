@@ -194,7 +194,8 @@ fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
             r#"{"type":"event","seq":1,"at_ms":1,"event":{"type":"view_action","action":{"kind":"open_session","session_id":"app:synthetic-2"},"reason":"the plan is ready"}}"#,
         ),
     ]);
-    app.wait_for("Moved to Plan for Acme Corp · the plan is ready")?;
+    app.wait_for("Moved to Plan for Acme Corp")?;
+    app.wait_for("the plan is ready")?;
     Ok(())
 }
 
@@ -425,10 +426,12 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     app.wait_for("Count the files")?;
     app.press("Count the files >> nth=0")?;
     // The working line says what it is doing; the tools so far are a
-    // line over it; the background work is over the composer, with Cancel.
+    // line over it. The turn is also a running task: Stop alone stops it,
+    // no Cancel beside it.
     app.wait_for("text:terminal: find . -name '*.rs'...")?;
     app.wait_for("2 tools so far: read_file, terminal")?;
-    app.wait_for("Cancel")?;
+    app.wait_for("Stop")?;
+    assert!(app.press("Cancel").is_err());
     Ok(())
 }
 
@@ -820,7 +823,10 @@ fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
     feed([frame(
         r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:synthetic-7","event":{"type":"turn_completed","turn_id":"t7","text":"The invoice is drafted.","state":"completed"}}"#,
     )]);
+    // "Done", what finished under it, and a press opens it.
     app.wait_for("Done: Draft the invoice")?;
+    app.press("label:Open Draft the invoice")?;
+    app.wait_for("The invoice is drafted.")?;
     Ok(())
 }
 

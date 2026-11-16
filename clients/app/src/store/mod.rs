@@ -231,7 +231,7 @@ pub struct Store {
     /// The approval a view move brought into view, shown highlighted.
     spotlight: Signal<Option<String>>,
     /// What the app last told the owner.
-    toast: Signal<Option<String>>,
+    toast: Signal<Option<crate::ui::Note>>,
     page: Signal<Page>,
     /// The sidebar's search.
     filter: Signal<String>,
@@ -1395,10 +1395,11 @@ impl Store {
             ViewAction::Unknown => return,
         };
         let reason = request.reason.trim();
-        self.toast.set(Some(if reason.is_empty() {
-            note
-        } else {
-            format!("{note} · {reason}")
+        // What moved, then why, its own line.
+        self.toast.set(Some(crate::ui::Note {
+            title: note,
+            detail: (!reason.is_empty()).then(|| reason.to_owned()),
+            ..Default::default()
         }));
     }
 
@@ -1412,7 +1413,7 @@ impl Store {
         });
     }
 
-    pub fn toast(&self) -> Option<String> {
+    pub fn toast(&self) -> Option<crate::ui::Note> {
         self.toast.get()
     }
 
@@ -1433,7 +1434,18 @@ impl Store {
 
     /// A short note to the owner ("Copied the reply").
     pub fn say(&self, text: impl Into<String>) {
-        self.toast.set(Some(text.into()));
+        self.toast.set(Some(crate::ui::Note::from(text.into())));
+    }
+
+    /// A conversation not on screen finished its turn: "Done", its title,
+    /// and a press opens it.
+    pub fn say_done(&self, session: &str) {
+        self.toast.set(Some(crate::ui::Note {
+            title: "Done".to_owned(),
+            detail: Some(untracked(|| self.title(session))),
+            done: true,
+            opens: Some(session.to_owned()),
+        }));
     }
 
     pub fn dismiss_toast(&self) {

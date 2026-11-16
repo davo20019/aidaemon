@@ -98,7 +98,7 @@ pub fn replies(store: Store) {
             if lifecycle() == Lifecycle::Active {
                 // In front, but looking at something else: say so here.
                 if !on_screen(store, &session) {
-                    store.say(format!("Done: {}", store.title(&session)));
+                    store.say_done(&session);
                 }
                 return;
             }

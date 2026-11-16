@@ -1113,17 +1113,33 @@ pub fn badge_dot(label: &'static str, tone: Tone) -> View {
 
 /// Work going on: three dots that pulse in turn.
 pub fn working(label: impl IntoReactive<SharedString>) -> View {
+    // Three dots that brighten in turn, a wave that says it is alive
+    // without moving the line.
+    let mut dots = view()
+        .flex_row()
+        .items_center()
+        .gap(px(3.0))
+        .accessibility_elements_hidden(true);
+    for n in 0..3 {
+        dots = dots.child(
+            view()
+                .w(px(5.0))
+                .h(px(5.0))
+                .rounded_full()
+                .bg(colors::ACCENT)
+                .animation(
+                    KeyframeAnimation::new(Keyframes::Pulse)
+                        .duration(1200.0)
+                        .delay(n as f32 * 200.0),
+                ),
+        );
+    }
     view()
         .flex_row()
         .items_center()
         .gap_2()
-        .child(
-            text("●")
-                .text_size(px(8.0))
-                .text_color(colors::ACCENT)
-                .animate_pulse()
-                .accessibility_elements_hidden(true),
-        )
+        .min_w(px(0.0))
+        .child(dots)
         .child(
             text(label)
                 .text_size(px(type_scale::SM))
@@ -1167,9 +1183,13 @@ pub fn disclosure(
         .child(
             text(label)
                 .number_of_lines(1)
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
                 .text_size(px(type_scale::SM))
                 .text_color(colors::MUTED),
         )
+        // Never wider than the column: a long label ends in "…".
+        .max_w(percentage(1.0))
         .on_press(move || {
             motion::next_unfold();
             open.update(|o| *o = !*o)

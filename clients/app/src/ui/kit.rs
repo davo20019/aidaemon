@@ -552,14 +552,39 @@ pub fn press_menu(
     view().child(menu)
 }
 
-/// The app's toasts: short notes at the bottom that leave by themselves
-/// (paused while hovered; the terminal's status line shows the newest).
-/// `current` is the note to show; `clear` is called once it is taken.
+/// A short note for the owner: what happened, and (`detail`) what it was
+/// about. `done`: a finished piece of work, marked with a check. `opens`:
+/// the conversation a press on it opens.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Note {
+    pub title: String,
+    pub detail: Option<String>,
+    pub done: bool,
+    pub opens: Option<String>,
+}
+
+impl From<String> for Note {
+    fn from(title: String) -> Self {
+        Self {
+            title,
+            ..Self::default()
+        }
+    }
+}
+
+/// The app's toasts: short notes that leave by themselves (paused while
+/// hovered or touched; a terminal's status line shows the newest). A card
+/// of the theme's surface, not an inverted slab. On a touch screen they
+/// come in under the top bar and are swiped up, clear of the composer a
+/// thumb is on; with a pointer, at the bottom over the composer, swiped
+/// right. `current` is the note to show, `clear` is called once it is
+/// taken, `open` opens a note's conversation.
 pub fn toasts(
-    current: impl Fn() -> Option<String> + 'static,
+    current: impl Fn() -> Option<Note> + 'static,
     clear: impl Fn() + 'static,
+    open: impl Fn(&str) + Clone + 'static,
 ) -> impl IntoElement {
-    let manager = stored(ToastManager::<u64, SharedString>::new(ToastMotion::sonner()));
+    let manager = stored(ToastManager::<u64, Note>::new(ToastMotion::sonner()));
     let shown = signal(Vec::new());
     let state = ToastStackState::new();
     let next = stored(0_u64);
@@ -576,7 +601,7 @@ pub fn toasts(
             manager.with(|m| {
                 m.push(
                     id,
-                    note.into(),
+                    note,
                     ToastOptions::timeout(Some(Duration::from_secs(6))),
                     now(),
                 )
@@ -590,48 +615,126 @@ pub fn toasts(
             sync();
         }
     });
-    // Over the page, not beside it: a layer at the bottom that takes no
-    // presses itself, so only the toasts do.
-    view()
+    let top = super::touch();
+    // Over the page, not beside it: a layer that takes no presses itself,
+    // so only the toasts do.
+    let layer = view()
         .absolute()
         .left(px(0.0))
         .right(px(0.0))
-        .bottom(px(88.0))
         .items_center()
-        .pointer_events(PointerEvents::BoxNone)
-        .child(
-            toast_stack()
-                .placement(Anchor::BottomCenter)
-                .state(state)
-                .w(px(360.0))
-                .max_w(percentage(0.92))
-                .child(each(
-                    shown,
-                    |(id, _, _)| *id,
-                    move |item, _| {
-                        toast()
-                            .transition_status(move || item.get().2)
-                            .accessibility_label(move || Some(item.get().1))
-                            .on_dismiss_request(move || {
-                                manager.with(|m| m.dismiss(&item.get().0, now()));
-                            })
-                            .rounded(px(radius::SURFACE))
-                            .px_4()
-                            .py_3()
-                            .bg(colors::PRIMARY)
-                            .shadow_lg()
-                            .transition_all()
-                            .duration(motion::ENTER)
-                            .starting_class("opacity-0 translate-y-4")
-                            .ending_class("opacity-0 scale-95")
-                            .child(
-                                text(move || item.get().1)
-                                    .text_size(px(fit::small()))
-                                    .text_color(colors::ON_PRIMARY),
-                            )
-                    },
-                )),
-        )
+        .pointer_events(PointerEvents::BoxNone);
+    let layer = if top {
+        layer.top(px(fit::bar() + 8.0)).pt_safe_area()
+    } else {
+        layer.bottom(px(88.0))
+    };
+    layer.child(
+        toast_stack()
+            .placement(if top {
+                Anchor::TopCenter
+            } else {
+                Anchor::BottomCenter
+            })
+            .state(state)
+            .w(px(380.0))
+            .max_w(percentage(0.92))
+            .child(each(
+                shown,
+                |(id, _, _)| *id,
+                move |item, _| {
+                    let note = item.with_untracked(|(_, n, _)| n.clone());
+                    let id = item.with_untracked(|(id, _, _)| *id);
+                    let said = match &note.detail {
+                        Some(detail) => format!("{}: {detail}", note.title),
+                        None => note.title.clone(),
+                    };
+                    let open = open.clone();
+                    toast()
+                        .transition_status(move || item.get().2)
+                        .accessibility_label(Some(SharedString::from(said)))
+                        .swipe_direction(Some(if top {
+                            nsh_base::SwipeDirection::Up
+                        } else {
+                            nsh_base::SwipeDirection::Right
+                        }))
+                        .on_dismiss_request(move || {
+                            manager.with(|m| m.dismiss(&id, now()));
+                        })
+                        .rounded(px(radius::SURFACE))
+                        .bg(colors::SURFACE)
+                        .border_1()
+                        .border_color(colors::BORDER)
+                        .shadow_lg()
+                        .transition_all()
+                        .duration(motion::ENTER)
+                        .starting_class(if top {
+                            "opacity-0 -translate-y-4"
+                        } else {
+                            "opacity-0 translate-y-4"
+                        })
+                        .ending_class("opacity-0 scale-95")
+                        .child(note_body(note, move |session: &str| {
+                            manager.with(|m| m.dismiss(&id, now()));
+                            open(session);
+                        }))
+                },
+            )),
+    )
+}
+
+/// A toast's content: the check of finished work, its title and what it
+/// was about (two lines at most); a note that opens a conversation is a
+/// button that does, with a chevron to say so.
+fn note_body(note: Note, open: impl Fn(&str) + 'static) -> View {
+    let mut words = view().flex_1().min_w(px(0.0)).gap(px(2.0)).child(
+        text(note.title.clone())
+            .number_of_lines(2)
+            .text_size(px(fit::small()))
+            .font_weight(if note.detail.is_some() {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .text_color(colors::TEXT),
+    );
+    if let Some(detail) = note.detail.clone() {
+        words = words.child(
+            text(detail)
+                .number_of_lines(2)
+                .text_size(px(fit::small()))
+                .text_color(colors::MUTED),
+        );
+    }
+    let mut row = view().flex_row().items_center().gap_3().px_4().py_3();
+    if note.done {
+        row = row.child(
+            icon(Glyph::Check)
+                .text_color(super::Tone::Success.color())
+                .accessibility_elements_hidden(true),
+        );
+    }
+    row = row.child(words);
+    match note.opens {
+        Some(session) => view().child(
+            nsh_base::button()
+                .accessibility_label(SharedString::from(format!(
+                    "Open {}",
+                    note.detail.as_deref().unwrap_or(&note.title)
+                )))
+                .on_press(move || open(&session))
+                .rounded(px(radius::SURFACE))
+                .hover(|s| s.bg(colors::HOVER))
+                .child(
+                    row.child(
+                        icon(Glyph::Chevron)
+                            .text_color(colors::FAINT)
+                            .accessibility_elements_hidden(true),
+                    ),
+                ),
+        ),
+        None => row,
+    }
 }
 
 /// A pane at an edge of a narrow window: it slides in from `side` over the

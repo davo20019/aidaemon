@@ -171,6 +171,7 @@ pub fn shell(store: Store) -> View {
         .child(ui::toasts(
             move || store.toast(),
             move || store.dismiss_toast(),
+            move |session: &str| store.select(Some(session.to_owned())),
         ));
     if terminal {
         view().flex_1().child(main).child(key_line(store))

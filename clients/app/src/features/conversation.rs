@@ -132,7 +132,13 @@ fn running_work(store: Store, session: Option<String>) -> View {
     let Some(session) = session else {
         return view();
     };
+    // While a turn runs, its own Stop stops everything it started (the
+    // daemon lists the turn itself as a task too): one control at a time.
+    // This is the work that outlives a turn.
     let tasks = computed(move || {
+        if store.is_running(&session) {
+            return Vec::new();
+        }
         store
             .running()
             .into_iter()
@@ -1303,11 +1309,17 @@ fn live(store: Store, session: String) -> View {
         // What it is doing, and Stop beside it: where the eye already is.
         // Once asked, Stop says so until the turn ends.
         .child(
+            // The line, then a quiet Stop at its end.
             view()
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(working(move || status.get()))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(working(move || status.get())),
+                )
                 .child(
                     when(
                         move || store.is_stopping(&stopping),
@@ -1315,7 +1327,7 @@ fn live(store: Store, session: String) -> View {
                     )
                     .otherwise(move || {
                         let stop = stop.clone();
-                        btn_icon(Glyph::Stop, "Stop", Variant::Outline, Size::Sm, move || {
+                        btn_icon(Glyph::Stop, "Stop", Variant::Ghost, Size::Sm, move || {
                             store.stop(&stop)
                         })
                     }),
