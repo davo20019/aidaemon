@@ -220,6 +220,34 @@ pub fn fact_source_rank(source: &str) -> u8 {
 /// "twitter_account"); below it, distinct values start to appear.
 pub(crate) const FACT_RESTATEMENT_MIN_SIMILARITY: f32 = 0.93;
 
+/// Whether the other fact's key or value holds one of `words` (lowercase,
+/// three letters or more) as a whole word: the conflict sweep's guard
+/// against superseding an unrelated fact ("tea" is not in "steam").
+fn shares_a_word(words: &std::collections::HashSet<String>, key: &str, value: &str) -> bool {
+    key.split(|c: char| !c.is_alphanumeric())
+        .chain(value.split(|c: char| !c.is_alphanumeric()))
+        .any(|w| w.len() >= 3 && words.contains(&w.to_ascii_lowercase()))
+}
+
+#[cfg(test)]
+mod shares_a_word_tests {
+    use super::shares_a_word;
+
+    #[test]
+    fn only_whole_words_count() {
+        let words: std::collections::HashSet<String> = ["tea", "car", "coffee"]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        assert!(shares_a_word(&words, "beverage", "coffee (cold brew)"));
+        assert!(shares_a_word(&words, "car_model", "a hatchback"));
+        assert!(shares_a_word(&words, "drink", "Green TEA"));
+        assert!(!shares_a_word(&words, "steam_account", "steamer"));
+        assert!(!shares_a_word(&words, "cardiologist", "Dr. Jordan Lee"));
+        assert!(!shares_a_word(&words, "teacher", "Alice Rivera"));
+    }
+}
+
 /// Categories whose keys name a person or their attributes, where a key that
 /// differs by an entity token must stay separate even at high similarity.
 pub fn fact_category_is_personal(category: &str) -> bool {
@@ -1879,9 +1907,10 @@ impl FactStore for SqliteMemory {
                 let blob: Vec<u8> = row.get("embedding");
 
                 // Lexical overlap guard: at least one meaningful word
-                // from the new fact must appear in the other fact.
-                let other_text = format!("{} {}", other_key, other_value).to_ascii_lowercase();
-                let has_overlap = new_words.iter().any(|w| other_text.contains(w.as_str()));
+                // from the new fact must appear in the other fact as a
+                // whole word ("tea" is not in "steam"), or an unrelated
+                // fact is superseded.
+                let has_overlap = shares_a_word(&new_words, &other_key, &other_value);
                 if !has_overlap {
                     continue;
                 }
