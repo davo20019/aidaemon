@@ -40,28 +40,63 @@ pub struct LlmCallTelemetry {
     pub fell_back: bool,
     /// Total provider calls attempted (1 = succeeded on the first try).
     pub attempts: u32,
-    /// The plan's usage limit stopped the chosen model and another answered:
-    /// the owner-facing note saying so.
-    pub answered_past_quota: Option<String>,
+    /// The plan's usage limit stopped the chosen model and another answered.
+    pub answered_past_quota: Option<QuotaFallback>,
 }
 
-/// The owner-facing note when `chosen`'s plan limit was reached and
-/// `answered_by` answered instead, with when the limit resets if known.
-pub(crate) fn quota_fallback_note(
-    chosen: &str,
-    answered_by: &str,
-    resets_at: Option<std::time::SystemTime>,
-    now: std::time::SystemTime,
-) -> String {
-    match resets_at {
-        Some(at) => format!(
-            "{chosen} reached its plan's usage limit, so {answered_by} answered this instead. The limit resets {}.",
-            crate::chat_bridge::describe_reset(at, now)
-        ),
-        None => format!(
-            "{chosen} reached its plan's usage limit, so {answered_by} answered this instead."
-        ),
+/// The chosen model's plan limit was reached and another model answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaFallback {
+    pub chosen: String,
+    pub answered_by: String,
+    /// When the limit resets, if the provider said.
+    pub resets_at: Option<std::time::SystemTime>,
+}
+
+impl QuotaFallback {
+    /// The owner-facing note, with when the limit resets if known.
+    pub fn note(&self, now: std::time::SystemTime) -> String {
+        let (chosen, answered_by) = (&self.chosen, &self.answered_by);
+        match self.resets_at {
+            Some(at) => format!(
+                "{chosen} reached its plan's usage limit, so {answered_by} answered this instead. The limit resets {}.",
+                crate::chat_bridge::describe_reset(at, now)
+            ),
+            None => format!(
+                "{chosen} reached its plan's usage limit, so {answered_by} answered this instead."
+            ),
+        }
     }
+}
+
+/// Per conversation, the limit the owner was last told about: the chosen
+/// model and its reset.
+type ToldLimits = std::collections::HashMap<String, (String, Option<std::time::SystemTime>)>;
+
+static QUOTA_TOLD: std::sync::LazyLock<std::sync::Mutex<ToldLimits>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether conversation `session_id` should hear about `fallback`: once per
+/// limit. It stays quiet while the same model's limit it was told about
+/// has not reset; a different model's limit, or the same one's after its
+/// reset, is told again.
+pub fn quota_note_due(
+    session_id: &str,
+    fallback: &QuotaFallback,
+    now: std::time::SystemTime,
+) -> bool {
+    let mut told = QUOTA_TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    told.retain(|_, (_, reset)| reset.is_none_or(|at| at > now));
+    let quiet = told
+        .get(session_id)
+        .is_some_and(|(chosen, _)| *chosen == fallback.chosen);
+    if !quiet {
+        told.insert(
+            session_id.to_string(),
+            (fallback.chosen.clone(), fallback.resets_at),
+        );
+    }
+    !quiet
 }
 
 fn malformed_reason_label(
@@ -482,12 +517,11 @@ pub async fn call_llm_with_recovery(
                 && let Some(quota) = recovery.quota.lock().ok().and_then(|quota| quota.clone())
             {
                 let error = crate::chat_bridge::sdk_backed::to_daemon_error(quota);
-                telemetry.answered_past_quota = Some(quota_fallback_note(
-                    model,
-                    &telemetry.final_model,
-                    error.resets_at,
-                    std::time::SystemTime::now(),
-                ));
+                telemetry.answered_past_quota = Some(QuotaFallback {
+                    chosen: model.to_string(),
+                    answered_by: telemetry.final_model.clone(),
+                    resets_at: error.resets_at,
+                });
             }
             // The config works: stamp it as last known good.
             host.stamp_lastgood().await;
@@ -718,18 +752,25 @@ pub async fn select_turn_model(
 
 #[cfg(test)]
 mod tests {
-    use super::quota_fallback_note;
+    use super::{QuotaFallback, quota_note_due};
     use std::time::{Duration, SystemTime};
+
+    fn fallback(chosen: &str, resets_at: Option<SystemTime>) -> QuotaFallback {
+        QuotaFallback {
+            chosen: chosen.into(),
+            answered_by: "synthetic-fallback".into(),
+            resets_at,
+        }
+    }
 
     #[test]
     fn the_quota_fallback_note_names_both_models_and_the_reset() {
         let now = SystemTime::now();
-        let note = quota_fallback_note(
+        let note = fallback(
             "synthetic-primary",
-            "synthetic-fallback",
             Some(now + Duration::from_secs(94 * 60)),
-            now,
-        );
+        )
+        .note(now);
         assert!(
             note.starts_with(
                 "synthetic-primary reached its plan's usage limit, so synthetic-fallback answered this instead. The limit resets "
@@ -738,8 +779,31 @@ mod tests {
         );
         assert!(note.ends_with("(in 1h 34m)."), "{note}");
         assert_eq!(
-            quota_fallback_note("synthetic-primary", "synthetic-fallback", None, now),
+            fallback("synthetic-primary", None).note(now),
             "synthetic-primary reached its plan's usage limit, so synthetic-fallback answered this instead."
         );
+    }
+
+    #[test]
+    fn a_conversation_hears_about_a_limit_once_until_it_resets() {
+        let now = SystemTime::now();
+        let session = "app:synthetic-quota-once";
+        let limit = fallback("synthetic-primary", Some(now + Duration::from_secs(3600)));
+        assert!(quota_note_due(session, &limit, now));
+        // Later replies in the same limit window stay quiet.
+        assert!(!quota_note_due(
+            session,
+            &limit,
+            now + Duration::from_secs(60)
+        ));
+        // Another conversation hears it once too.
+        assert!(quota_note_due("app:synthetic-quota-other", &limit, now));
+        // Another model's limit is new.
+        let other = fallback("synthetic-other", Some(now + Duration::from_secs(3600)));
+        assert!(quota_note_due(session, &other, now));
+        // After the reset, the next limit is told again.
+        let later = now + Duration::from_secs(7200);
+        let next = fallback("synthetic-other", Some(later + Duration::from_secs(3600)));
+        assert!(quota_note_due(session, &next, later));
     }
 }

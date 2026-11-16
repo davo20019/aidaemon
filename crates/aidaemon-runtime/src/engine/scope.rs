@@ -63,9 +63,9 @@ pub struct TurnScope<'a> {
     /// Each with its checklist index; `None`: one of the owner's own units
     /// of work, which has no step on the card.
     pub not_attempted: std::sync::Mutex<Vec<(Option<usize>, String)>>,
-    /// The plan's usage limit stopped the chosen model and another answered
-    /// (the owner-facing note naming both): the reply says so.
-    pub answered_past_quota: std::sync::Mutex<Option<String>>,
+    /// The plan's usage limit stopped the chosen model and another answered:
+    /// the reply says so, once per limit in a conversation.
+    pub answered_past_quota: std::sync::Mutex<Option<crate::llm::turn_calls::QuotaFallback>>,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger
