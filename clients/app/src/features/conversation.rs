@@ -489,7 +489,7 @@ fn header(store: Store, session: Option<String>) -> View {
             move || store.is_compact(),
             move || {
                 // A new conversation in the same project.
-                ui::icon_btn(Glyph::Plus, "New conversation", Size::Md, move || {
+                ui::icon_btn(Glyph::Compose, "New conversation", Size::Md, move || {
                     store.new_in_project(store.current_project())
                 })
             },
