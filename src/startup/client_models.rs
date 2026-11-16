@@ -68,16 +68,64 @@ fn provider_name<'a>(options: &'a ModelOptions, id: &'a str) -> &'a str {
 }
 
 fn available_models(options: &ModelOptions) -> String {
-    let models: Vec<&str> = options
+    let providers: Vec<String> = options
         .providers
         .iter()
-        .flat_map(|provider| provider.models.iter().map(|model| model.id.as_str()))
+        .filter(|provider| !provider.models.is_empty())
+        .map(|provider| {
+            format!(
+                "{}: {}",
+                provider.name,
+                provider
+                    .models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
         .collect();
-    if models.is_empty() {
+    if providers.is_empty() {
         "No models are available.".to_string()
     } else {
-        format!("Available models: {}", models.join(", "))
+        format!("Available models:\n{}", providers.join("\n"))
     }
+}
+
+/// Small edit distance for command input, so a typo does not require a catalog dependency.
+fn model_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (row, character) in left.chars().enumerate() {
+        let mut current = vec![row + 1; right.len() + 1];
+        for (column, other) in right.iter().enumerate() {
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(previous[column] + usize::from(character != *other));
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn suggested_model<'a>(requested: &str, options: &'a ModelOptions) -> Option<&'a str> {
+    let models = options
+        .providers
+        .iter()
+        .flat_map(|provider| provider.models.iter().map(|model| model.id.as_str()));
+    // A missing version suffix can be much longer than an ordinary typo.
+    let suffix = models.clone().find(|model| {
+        model
+            .strip_prefix(requested)
+            .is_some_and(|rest| rest.starts_with('-'))
+    });
+    suffix.or_else(|| {
+        models
+            .map(|model| (model, model_distance(requested, model)))
+            .filter(|(model, distance)| *distance <= if model.len() >= 8 { 2 } else { 1 })
+            .min_by_key(|(_, distance)| *distance)
+            .map(|(model, _)| model)
+    })
 }
 
 /// Handle the app's per-conversation model commands. Other slash commands
@@ -114,8 +162,11 @@ pub(crate) async fn slash(
                     })
             });
             let Some(selected) = selected else {
+                let suggestion = suggested_model(requested, &choices)
+                    .map(|model| format!("Did you mean {model}?\n"))
+                    .unwrap_or_default();
                 return Some(format!(
-                    "Unknown model `{requested}`. {}",
+                    "{suggestion}Unknown model {requested}.\n{}",
                     available_models(&choices)
                 ));
             };
@@ -304,6 +355,34 @@ mod tests {
         assert_eq!(ids(1), ["synthetic-gemini", "synthetic-gemini-catalog"]);
     }
 
+    #[test]
+    fn unknown_model_response_groups_by_display_name_and_suggests_only_close_names() {
+        let choices = options(&runtime());
+        assert_eq!(
+            available_models(&choices),
+            "Available models:\nAnthropic: synthetic-claude, synthetic-claude-catalog, synthetic-shared\nGoogle Gemini: synthetic-gemini, synthetic-gemini-catalog"
+        );
+        assert_eq!(
+            suggested_model("synthetic-gemni", &choices),
+            Some("synthetic-gemini")
+        );
+        let mut versioned = choices.clone();
+        versioned.providers[0].models.push(ModelOption {
+            id: "synthetic-opus-5-5".into(),
+            efforts: vec![],
+        });
+        assert_eq!(
+            suggested_model("synthetic-opus", &versioned),
+            Some("synthetic-opus-5-5"),
+            "a missing version suffix is suggested"
+        );
+        assert_eq!(suggested_model("unrelated", &choices), None);
+        assert_eq!(
+            available_models(&ModelOptions { providers: vec![] }),
+            "No models are available."
+        );
+    }
+
     #[tokio::test]
     async fn efforts_follow_the_provider_and_unknown_models_are_refused() {
         let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
@@ -411,9 +490,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(unknown.contains("Unknown model `synthetic-missing`"));
-        assert!(unknown.contains("synthetic-claude-catalog"));
-        assert!(unknown.contains("synthetic-gemini-catalog"));
+        assert_eq!(
+            unknown,
+            "Unknown model synthetic-missing.\nAvailable models:\nAnthropic: synthetic-claude, synthetic-claude-catalog, synthetic-shared\nGoogle Gemini: synthetic-gemini, synthetic-gemini-catalog"
+        );
+        let typo = slash(
+            settings,
+            &llm,
+            "app:synthetic-one",
+            "model",
+            "synthetic-gemni",
+        )
+        .await
+        .unwrap();
+        assert!(
+            typo.starts_with("Did you mean synthetic-gemini?\nUnknown model synthetic-gemni.\nAvailable models:\nAnthropic:"),
+            "{typo}"
+        );
         assert_eq!(
             current(settings, &llm, "app:synthetic-one").await.model,
             pin("failover-0", "synthetic-gemini-catalog").unwrap(),
