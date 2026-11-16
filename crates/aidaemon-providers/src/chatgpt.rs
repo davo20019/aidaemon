@@ -223,9 +223,15 @@ impl ChatGpt {
         credentials: &ChatGptCredentials,
         body: &Value,
     ) -> Result<reqwest::Response, ProviderError> {
-        self.client
-            .post(format!("{}/responses", self.base_url))
-            .timeout(self.timeout)
+        let mut post = self.client.post(format!("{}/responses", self.base_url));
+        // The backend routes a conversation to its prompt cache by the
+        // `session-id` header, not by `prompt_cache_key` alone: without it,
+        // calls in one run land on cold shards (as Codex does, both carry
+        // the same id).
+        if let Some(key) = session_id(body) {
+            post = post.header("session-id", key);
+        }
+        post.timeout(self.timeout)
             .bearer_auth(&credentials.access_token)
             .header("chatgpt-account-id", &credentials.account_id)
             .header("OpenAI-Beta", "responses=experimental")
@@ -405,6 +411,11 @@ fn prompt_cache_key(seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     let hex: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
     format!("aidaemon-{hex}")
+}
+
+/// The `session-id` header for a body: its cache-routing key.
+fn session_id(body: &Value) -> Option<&str> {
+    body.get("prompt_cache_key").and_then(Value::as_str)
 }
 
 /// The Responses `input` items and `instructions` for a transcript.
@@ -976,6 +987,8 @@ mod tests {
                 .unwrap()
                 .contains("synthetic-user-1")
         );
+        // The backend routes by the session-id header: same key, both places.
+        assert_eq!(session_id(&first), first["prompt_cache_key"].as_str());
     }
 
     /// The reasoning that led to a tool call goes back just before that call,
