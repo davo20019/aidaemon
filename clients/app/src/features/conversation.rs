@@ -4,7 +4,9 @@
 
 use aidaemon_client_core::state::Line;
 use aidaemon_client_protocol::{AttachmentRef, MidRun, ToolCallInfo};
-use nsh_base::{MarkdownOptions, TextViewLinks, button, input, text_view};
+use nsh_base::{
+    MarkdownOptions, TextViewLinks, TextViewPart, TextViewParts, button, input, text_view,
+};
 use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
@@ -1241,6 +1243,11 @@ fn markdown(
     content: impl Fn() -> SharedString + 'static,
     streaming: impl Fn() -> bool + 'static,
 ) -> impl IntoElement {
+    // Inline code at the prose's scale and line (see `fit::read_code`).
+    provide_context(TextViewParts::new().part(TextViewPart::Code, |s| {
+        s.text_size(px(ui::fit::read_code()))
+            .line_height(px(ui::fit::read_lh()))
+    }));
     text_view()
         .markdown(move || Some(content()))
         .options(move || MarkdownOptions {

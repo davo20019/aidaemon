@@ -108,7 +108,7 @@ impl AgentIngress for Agent {
             );
             format!("Opened the plan ({moved:?}).")
         } else if text.contains("markdown") {
-            "## Plan for Acme Corp\n\nThree things this week:\n\n1. **Review** the synthetic report with Jordan Lee.\n2. Ship the demo build to `staging`.\n3. Draft the follow-up for Alice Rivera.\n\nThe build command:\n\n```sh\ncargo build --release --features browser\n```\n\n> The demo needs the staging key; it is not in the repo.\n\nDone by **Friday**, if the report lands on Tuesday.".to_string()
+            "## Plan for Acme Corp\n\nBuilt `intervals` in `~/projects/acme-eval/cache-test` with `merge_overlapping` and a `pytest-asyncio` check. Three things this week:\n\n1. **Review** the synthetic report with Jordan Lee.\n2. Ship the demo build to `staging`.\n3. Draft the follow-up for Alice Rivera.\n\nThe build command:\n\n```sh\ncargo build --release --features browser\n```\n\n> The demo needs the staging key; it is not in the repo.\n\nDone by **Friday**, if the report lands on Tuesday.".to_string()
         } else {
             format!("Done: {}", request.user_text)
         };

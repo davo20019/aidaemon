@@ -197,6 +197,13 @@ pub mod fit {
     pub fn read_lh() -> f32 {
         if touch() { 25.0 } else { super::text::LH_READ }
     }
+    /// Inline code inside reading text (`a/path`, `fn_name`): 0.875 of it,
+    /// GitHub's ratio for mono in prose, so a span's background (which
+    /// spans only its own font's ascent to descent) fills the line's text
+    /// band instead of sitting short and low as a fixed 13 does.
+    pub fn read_code() -> f32 {
+        read() * 0.875
+    }
     /// A page's or an empty state's title: on a phone, clearly above the
     /// 16 pt reading text.
     pub fn title() -> f32 {
