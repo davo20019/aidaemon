@@ -896,6 +896,7 @@ impl TurnEngine<'_> {
             user_role: Some(user_role),
             channel_visibility: Some(channel_ctx.visibility),
             untrusted_trigger_session: crate::turn::loop_utils::is_trigger_session(session_id),
+            project: memory_turn.project.clone(),
             terminal: terminal_approvals,
             tools: crate::approvals::ApprovalTools::new(self.tools().iter().cloned()),
             run_declines: run_declines.clone(),

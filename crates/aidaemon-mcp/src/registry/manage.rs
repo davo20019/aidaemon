@@ -68,9 +68,21 @@ impl ManageMcpTool {
         let Some(name) = name.filter(|name| !name.trim().is_empty()) else {
             return OwnerApprovalNeed::NotNeeded;
         };
+        // Fails closed: a start judged without its project still asks, so a
+        // judgment that cannot see what will run never lets it run unasked.
         let Ok((project, server)) = Self::project_server(project, name) else {
-            return OwnerApprovalNeed::NotNeeded;
+            return OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+                card: None,
+                effects: Vec::new(),
+                summary: format!("Start the project's MCP server '{name}'"),
+                subject: json!({"action": "project_start", "name": name}).to_string(),
+                risk: aidaemon_core::ApprovalRisk::High,
+                warnings: vec![
+                    "The project's repository chose this server's command. Only approve if you trust the repository.".to_string(),
+                ],
+            });
         };
+        // What the start refuses never reaches the owner: it never runs.
         if server.unusable.is_some() || !ALLOWED_COMMANDS.contains(&server.command.as_str()) {
             return OwnerApprovalNeed::NotNeeded;
         }
@@ -818,16 +830,20 @@ mod tests {
         };
         assert_ne!(card.subject, changed.subject);
         // What the start refuses never reaches the owner.
-        for name in ["shell", "keyed", "missing"] {
+        for name in ["shell", "keyed"] {
             assert!(matches!(
                 ManageMcpTool::project_start_approval(Some(&project), Some(name)),
                 OwnerApprovalNeed::NotNeeded
             ));
         }
-        assert!(matches!(
-            ManageMcpTool::project_start_approval(None, Some("docs")),
-            OwnerApprovalNeed::NotNeeded
-        ));
+        // Judged without its project, or for a name it cannot find, a start
+        // still asks: it fails closed.
+        for (project, name) in [(None, "docs"), (Some(&project), "missing")] {
+            assert!(matches!(
+                ManageMcpTool::project_start_approval(project, Some(name)),
+                OwnerApprovalNeed::Ask(_)
+            ));
+        }
         let effects = ManageMcpTool::effects_for(r#"{"action":"project_start","name":"docs"}"#);
         assert!(!effects.complete);
         assert_eq!(

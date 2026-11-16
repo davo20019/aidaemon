@@ -86,6 +86,10 @@ pub struct AppApprovalRules {
     /// The session was started by an automated trigger (an email, an
     /// event), not by the owner: its terminal calls always ask.
     pub untrusted_trigger_session: bool,
+    /// The project the turn works in, as its tool calls see it
+    /// (`ToolCallContext::project`): a tool judges the same project it will
+    /// run in.
+    pub project: Option<aidaemon_core::ProjectRef>,
     /// The turn's tool whose calls are judged in canonical form (the
     /// terminal), with the turn's canonicalizer.
     pub terminal: Option<TerminalApprovals>,
@@ -353,6 +357,7 @@ impl AppApprovalRules {
             mandate_preapproved: self.mandate_preapproved,
             untrusted_source: self.untrusted_trigger_session,
             scope_escalation: escalation,
+            project: self.project.clone(),
             ..Default::default()
         }
     }
@@ -1266,6 +1271,20 @@ mod tests {
     use aidaemon_core as sdk;
     use aidaemon_policies::{ApprovalRules, RuleDecision};
     use serde_json::json;
+
+    /// A tool judges the same project it will run in: the facts the rules
+    /// hand its approval request carry the turn's project. Without it a
+    /// project server's start was judged with no project and ran unasked.
+    #[test]
+    fn approval_facts_carry_the_turns_project() {
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None);
+        let rules = AppApprovalRules {
+            project: project.clone(),
+            ..Default::default()
+        };
+        assert_eq!(rules.call_facts(None).project, project);
+        assert_eq!(AppApprovalRules::default().call_facts(None).project, None);
+    }
 
     /// Only the owner's own request in a private chat may reach a card.
     #[test]
