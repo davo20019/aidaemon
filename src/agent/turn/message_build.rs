@@ -1782,6 +1782,106 @@ mod tests {
         );
     }
 
+    /// A turn that stopped before it finished (the owner stopped it, or the
+    /// daemon restarted with no `task_end` written) says so in the history
+    /// the next turn's model sees, from the turn's typed terminal state, so
+    /// the new message is answered as itself instead of the old request
+    /// being redone. A normal finished turn carries no such marker.
+    #[tokio::test]
+    async fn stopped_or_cut_off_turn_is_marked_in_history_and_finished_turn_is_not() {
+        let cut_off = aidaemon_events::TerminalState::Interrupted
+            .cut_off_marker()
+            .unwrap();
+        let stopped = aidaemon_events::TerminalState::Cancelled
+            .cut_off_marker()
+            .unwrap();
+        // (earlier turn's recorded end, expected marker). `in_progress`
+        // writes no task_end: the daemon restarted mid-turn.
+        let cases = [
+            ("in_progress", Some(cut_off)),
+            ("cancelled", Some(stopped)),
+            ("completed", None),
+        ];
+        for (status, expected) in cases {
+            // Both a new request and a typed follow-up see the marker.
+            for preserve_archived_context in [false, true] {
+                let harness = crate::testing::setup_test_agent_with_models(
+                    MockProvider::new(),
+                    "mock-model",
+                    "mock-model",
+                )
+                .await
+                .unwrap();
+                let store = seed_store(&harness).await;
+                let session = format!("cut-off-{status}-{preserve_archived_context}");
+                seed_turn(
+                    &store,
+                    &session,
+                    "earlier-turn",
+                    "Run a synthetic sleep for a while, then reply done.",
+                    Some(("terminal", "exit 0")),
+                    if status == "completed" { "done" } else { "" },
+                    status,
+                )
+                .await;
+                let new_message = "Reply with one synthetic word.";
+                seed_turn(
+                    &store,
+                    &session,
+                    "new-turn",
+                    new_message,
+                    None,
+                    "",
+                    "in_progress",
+                )
+                .await;
+                set_current_turn(&harness, &session, "new-turn").await;
+
+                let payload = build_payload_with_continuity(
+                    &harness,
+                    &session,
+                    new_message,
+                    1,
+                    preserve_archived_context,
+                )
+                .await;
+                let json = serde_json::to_string(&payload).unwrap();
+                let request = payload
+                    .iter()
+                    .position(|m| {
+                        m["content"].as_str()
+                            == Some("Run a synthetic sleep for a while, then reply done.")
+                    })
+                    .unwrap_or_else(|| panic!("earlier request kept: {json}"));
+                let current = payload
+                    .iter()
+                    .rposition(|m| m["content"].as_str() == Some(new_message))
+                    .unwrap_or_else(|| panic!("new message present: {json}"));
+                for marker in [cut_off, stopped] {
+                    // Consecutive assistant messages are merged, so the
+                    // marker may share a message with the turn's placeholder.
+                    let at = payload.iter().position(|m| {
+                        m["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains(marker))
+                    });
+                    if Some(marker) == expected {
+                        let at = at.unwrap_or_else(|| {
+                            panic!("{status}: the earlier turn must say it was cut off: {json}")
+                        });
+                        assert_eq!(payload[at]["role"], "assistant", "{json}");
+                        assert!(
+                            request < at && at < current,
+                            "{status}: the marker sits after the old request, before the new message: {json}"
+                        );
+                    } else {
+                        assert!(at.is_none(), "{status}: no stray marker: {json}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn new_request_dialogue_window_is_recent_bounded_and_tool_free() {
         let now = chrono::Utc::now();

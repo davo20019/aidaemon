@@ -846,6 +846,9 @@ pub async fn build_turn_messages(
         cache_hit: bool,
         cache_reason: &'static str,
         contains_prior_assistant: bool,
+        /// Set when the turn stopped before it finished (typed terminal
+        /// state, never the turn's wording); see [`TerminalState::cut_off_marker`].
+        cut_off_marker: Option<&'static str>,
     }
 
     let mut archived_renders: Vec<ArchivedRender> = Vec::with_capacity(turns.len());
@@ -942,6 +945,7 @@ pub async fn build_turn_messages(
                 cache_hit: hit,
                 cache_reason: reason,
                 contains_prior_assistant,
+                cut_off_marker: terminal_state.cut_off_marker(),
             });
         }
     }
@@ -1098,6 +1102,18 @@ pub async fn build_turn_messages(
             }));
         }
         messages.extend(r.bytes.iter().cloned());
+        // The one place an earlier turn's ending reaches the model: a turn
+        // stopped by the owner or cut off (a restart) says so right after
+        // it, whichever form it was rendered in (cached, adjacent or compact
+        // shell). Otherwise its request, left without a reply, reads as still
+        // open and the model redoes it instead of answering the new message.
+        // Picking it up again is the resume path's job, on the owner's ask.
+        if let Some(marker) = r.cut_off_marker {
+            messages.push(json!({
+                "role": "assistant",
+                "content": marker,
+            }));
+        }
     }
     // The current region begins here. Current-region fitting (step 7) re-locates
     // it by the current user message (content == user_text) AFTER provider-validity
