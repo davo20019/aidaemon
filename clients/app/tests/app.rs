@@ -487,29 +487,6 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
 }
 
 #[test]
-fn a_long_day_shows_a_few_and_more_on_request() -> Result<(), String> {
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    let mut app = start();
-    app.wait_for("What can I help with?")?;
-    feed([
-        Update::Connected,
-        frame(
-            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-d1","channel":"app","title":"Day note 1","writable":true},{"id":"app:synthetic-d2","channel":"app","title":"Day note 2","writable":true},{"id":"app:synthetic-d3","channel":"app","title":"Day note 3","writable":true},{"id":"app:synthetic-d4","channel":"app","title":"Day note 4","writable":true},{"id":"app:synthetic-d5","channel":"app","title":"Day note 5","writable":true},{"id":"app:synthetic-d6","channel":"app","title":"Day note 6","writable":true},{"id":"app:synthetic-d7","channel":"app","title":"Day note 7","writable":true}]}}"#,
-        ),
-    ]);
-    app.wait_for("Day note 7")?;
-    // Five, then the whole day in one press; Show fewer, by the heading,
-    // folds it back.
-    app.wait_for("Show 2 more")?;
-    app.wait_for_gone("Day note 1", std::time::Duration::from_secs(2))?;
-    app.press("Show 2 more")?;
-    app.wait_for("Day note 1")?;
-    app.press("Show fewer")?;
-    app.wait_for_gone("Day note 1", std::time::Duration::from_secs(5))?;
-    Ok(())
-}
-
-#[test]
 fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

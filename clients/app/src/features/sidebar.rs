@@ -1,7 +1,8 @@
 //! The sidebar. Home: search and one New conversation, the conversations
 //! that need the owner or are working, the pinned ones, the projects used
 //! last (one line each; a press goes inside one), then every conversation
-//! by day, tagged with its project or the chat it came from. A project's
+//! newest first, each with its time and tagged with its project or the
+//! chat it came from. A project's
 //! page: its folder, its conversations, New conversation there, Edit.
 //! Then the pages and, when something is wrong, the connection.
 
@@ -338,7 +339,7 @@ fn new_here(store: Store) {
 const HOME_PROJECTS: usize = 4;
 
 /// Home: what needs the owner, what is working, the pinned, the projects
-/// used last, then every other conversation by day.
+/// used last, then every other conversation, newest first.
 fn home(
     store: Store,
     needs: Memo<Vec<String>>,
@@ -407,19 +408,19 @@ fn home(
             )
             .otherwise(move || new_project_row(store)),
         )
-        // Where they came from, as one filter: only when they came from
-        // more than one place.
-        .child(when(
-            move || !store.sources().is_empty(),
-            move || {
-                view()
-                    .flex_row()
-                    .items_center()
-                    .child(section_label("Conversations").flex_1())
-                    .child(source_filter(store))
-            },
-        ))
-        .child(by_day(store, recent))
+        // Their heading, with where they came from as one filter (only
+        // when they came from more than one place).
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .child(section_label("Conversations").flex_1())
+                .child(when(
+                    move || !store.sources().is_empty(),
+                    move || source_filter(store),
+                )),
+        )
+        .child(listed(store, recent))
         .child(when(
             move || recent.with(Vec::is_empty) && store.source_filter() != Source::All,
             || {
@@ -588,7 +589,7 @@ fn all_projects(store: Store, _ids: Memo<Vec<String>>) -> View {
         ))
 }
 
-/// One project: its name and folder, Edit, then its conversations by day
+/// One project: its name and folder, Edit, then its conversations
 /// (New conversation, above, starts one here).
 fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
     let mine = {
@@ -645,113 +646,17 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                 )
             },
         ))
-        .child(by_day(store, mine))
+        .child(listed(store, mine))
 }
 
-/// Conversations under the day they were last active: Today, Yesterday,
-/// Earlier (each with its date). A long day shows its first few, and Show
-/// more brings the rest a few at a time.
-fn by_day(store: Store, ids: Memo<Vec<String>>) -> View {
-    let days_ago = move |id: &String| {
-        store
-            .last_activity(id)
-            .map_or(i64::MAX, |at| ui::time::day(now_ms()) - ui::time::day(at))
-    };
-    let part = move |keep: fn(i64) -> bool| {
-        computed(move || {
-            ids.with(|ids| {
-                ids.iter()
-                    .filter(|id| keep(days_ago(id)))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-        })
-    };
-    view()
-        .gap(px(1.0))
-        .child(day_group(store, "Today", part(|d| d <= 0), false))
-        .child(day_group(store, "Yesterday", part(|d| d == 1), false))
-        .child(day_group(store, "Earlier", part(|d| d > 1), true))
-}
-
-/// How many of a day's conversations show at first.
-const DAY_FIRST: usize = 5;
-
-/// One day's conversations: the first [`DAY_FIRST`], then "Show N more"
-/// right where the list stops, which shows the whole day in one press.
-/// Shown whole, the day's heading sticks to the top while its rows scroll
-/// by and offers "Show fewer", so folding it back is never a long scroll
-/// away (the App Store's and Music's "See All" beside a heading).
-fn day_group(store: Store, title: &'static str, ids: Memo<Vec<String>>, dated: bool) -> View {
-    let whole = signal(false);
-    let shown = computed(move || {
-        let whole = whole.get();
-        ids.with(|ids| {
-            ids.iter()
-                .take(if whole { usize::MAX } else { DAY_FIRST })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-    });
-    let hidden = move || ids.with(Vec::len).saturating_sub(DAY_FIRST);
-    view()
-        .gap(px(1.0))
-        .child(when(
-            move || !ids.with(Vec::is_empty),
-            move || {
-                view()
-                    .sticky()
-                    .top_0()
-                    .bg(colors::SIDEBAR)
-                    .flex_row()
-                    .items_center()
-                    .child(section_label(title).flex_1())
-                    .child(when(
-                        move || whole.get() && hidden() > 0,
-                        move || {
-                            view().child(
-                                row(|| false, move || whole.set(false))
-                                    .accessibility_label("Show fewer")
-                                    .child(
-                                        text("Show fewer")
-                                            .text_size(px(type_scale::XS))
-                                            .text_color(colors::MUTED),
-                                    ),
-                            )
-                        },
-                    ))
-            },
-        ))
-        .child(each(
-            shown,
-            |id: &String| id.clone(),
-            move |id, _| session_row(store, id.get_untracked(), dated),
-        ))
-        .child(when(
-            move || !whole.get() && hidden() > 0,
-            move || {
-                more_row(
-                    move || format!("Show {} more", hidden()),
-                    move || whole.set(true),
-                )
-            },
-        ))
-}
-
-/// A quiet press under a list: Show N more.
-fn more_row(label: impl Fn() -> String + Clone + 'static, on_press: impl Fn() + 'static) -> View {
-    let name = label.clone();
-    view().child(
-        row(|| false, on_press)
-            .accessibility_label(move || Some(SharedString::from(name())))
-            // Lined up with the titles, past the dot's slot.
-            .child(view().w(px(ui::fit::icon_slot())))
-            .child(
-                text(label)
-                    .text_size(px(type_scale::SM))
-                    .text_color(colors::MUTED),
-            ),
-    )
+/// Conversations newest first, each with when it last moved; no day
+/// headings, nothing held back.
+fn listed(store: Store, ids: Memo<Vec<String>>) -> View {
+    view().gap(px(1.0)).child(each(
+        ids,
+        |id: &String| id.clone(),
+        move |id, _| session_row(store, id.get_untracked(), true),
+    ))
 }
 
 /// Where the listed conversations came from, as one filter.
@@ -1075,13 +980,13 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
         .text_color(colors::FAINT),
     )
-    // Under Earlier: the day it was last active ("Oct 30").
+    // When it last moved: "3h" within a day, else its date ("Oct 30").
     .child(when(dated, move || {
         let at = date_id.clone();
         text(move || {
             store
                 .last_activity(&at)
-                .map(|at| ui::time::short_date(at, now_ms()))
+                .map(|at| ui::time::stamp(at, now_ms()))
                 .unwrap_or_default()
         })
         .tabular_nums()
