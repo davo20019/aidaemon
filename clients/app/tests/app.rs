@@ -156,6 +156,15 @@ fn offline_says_why() -> Result<(), String> {
 }
 
 #[test]
+fn the_name_carries_the_connection_as_a_dot() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    feed([Update::Connected]);
+    app.wait_for("label:Connected to the daemon")?;
+    Ok(())
+}
+
+#[test]
 fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

@@ -1008,6 +1008,32 @@ pub fn corner_dot(tone: impl Fn() -> Tone + 'static) -> View {
         .accessibility_elements_hidden(true)
 }
 
+/// A state as one small dot beside a name (the connection beside the
+/// app's): `label` is what screen readers and the tooltip say, and a
+/// press says it too, for a phone with no hover.
+pub fn status_dot(
+    tone: impl Fn() -> Tone + 'static,
+    label: impl Fn() -> String + Clone + 'static,
+    on_press: impl Fn() + 'static,
+) -> View {
+    let hint = label.clone();
+    with_hint(
+        move || SharedString::from(hint()),
+        frame(Variant::Ghost, Size::Sm, motion::PRESS_SCALE_ICON)
+            .w(px(Size::Sm.height()))
+            .accessibility_label(move || SharedString::from(label()))
+            .on_press(on_press)
+            .child(
+                view()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(move || tone().color())
+                    .accessibility_elements_hidden(true),
+            ),
+    )
+}
+
 /// A small coloured dot and a word, at a row's end: "Needs you".
 pub fn badge_dot(label: &'static str, tone: Tone) -> View {
     view()

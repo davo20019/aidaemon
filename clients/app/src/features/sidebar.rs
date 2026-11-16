@@ -34,6 +34,8 @@ pub fn sidebar(store: Store) -> View {
         })
     });
     let query = signal(store.filter());
+    // The dot by the name, pressed: its words at the foot until pressed again.
+    let status_shown = signal(false);
     effect(move || {
         let q = query.get();
         untracked(|| {
@@ -51,7 +53,7 @@ pub fn sidebar(store: Store) -> View {
         .border_color(colors::LINE)
         // The top line: the name, Search, (a phone's) New conversation and
         // Close; Search turns the line into the field, Cancel turns it back.
-        .child(top_line(store, query))
+        .child(top_line(store, query, status_shown))
         .child(when(!ui::touch(), move || {
             view().px_2().child(
                 row(move || store.selected().is_none(), move || new_here(store))
@@ -105,12 +107,18 @@ pub fn sidebar(store: Store) -> View {
             ),
         )
         .child(pages(store))
-        // On a phone the line shows only when something is wrong: connected
-        // is the normal state, not news worth a row.
+        // The line shows only when something is wrong: the dot by the name
+        // says connected or reconnecting.
         .child(
             view()
                 .style_when(
-                    move || ui::touch() && store.felt() == Felt::Online,
+                    move || {
+                        !status_shown.get()
+                            && matches!(
+                                store.felt(),
+                                Felt::Online | Felt::Connecting | Felt::Reconnecting
+                            )
+                    },
                     |s| s.hidden(),
                 )
                 .child(ui::separator())
@@ -261,7 +269,7 @@ fn session_preview(store: Store, id: String) -> View {
 /// (a phone's; a window has its own row) and Close (or ⌘K's hint). Open:
 /// the search field across the line, focused, and Cancel, which clears it.
 /// A search left in the field keeps it open.
-fn top_line(store: Store, query: Signal<String>) -> View {
+fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> View {
     let open = signal(!untracked(|| query.get()).trim().is_empty());
     let close = move || {
         query.set(String::new());
@@ -300,11 +308,18 @@ fn top_line(store: Store, query: Signal<String>) -> View {
                     .gap_1()
                     .child(
                         text("AIDaemon")
-                            .flex_1()
                             .role(AccessibilityRole::Header)
                             .text_size(px(ui::fit::body()))
                             .font_weight(FontWeight::SEMIBOLD),
                     )
+                    // The connection at a glance; its words come to the
+                    // footer only when something is wrong.
+                    .child(ui::status_dot(
+                        move || felt_status(&store.felt()).0,
+                        move || felt_status(&store.felt()).1,
+                        move || status_shown.update(|shown| *shown = !*shown),
+                    ))
+                    .child(view().flex_1())
                     .child(ui::icon_btn(
                         Glyph::Search,
                         "Search conversations",
@@ -1288,6 +1303,26 @@ fn search_hits(store: Store) -> View {
             }
         }))
     }))
+}
+
+/// The connection's dot colour and words.
+fn felt_status(felt: &Felt) -> (Tone, String) {
+    match felt {
+        Felt::Online => (Tone::Success, "Connected to the daemon".into()),
+        Felt::Connecting => (Tone::Warning, "Connecting…".into()),
+        Felt::Reconnecting => (Tone::Warning, "Reconnecting…".into()),
+        Felt::NeedsPairing => (Tone::Warning, "Not paired yet".into()),
+        Felt::NoDaemon => (Tone::Warning, "No daemon yet".into()),
+        Felt::Down { kind, reason } => (
+            Tone::Danger,
+            match kind {
+                DropKind::DaemonNotRunning => "The daemon is not running".into(),
+                DropKind::Unauthorized => format!("The daemon refused this app: {reason}"),
+                DropKind::VersionUnsupported => "The daemon needs a newer app".into(),
+                DropKind::Dropped => "Connection lost".into(),
+            },
+        ),
+    }
 }
 
 fn connection(store: Store) -> View {

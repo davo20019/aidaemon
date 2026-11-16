@@ -1453,12 +1453,10 @@ fn composer(store: Store, session: Option<String>) -> View {
                             Felt::Connecting | Felt::NeedsPairing | Felt::NoDaemon => {
                                 "Connecting to the daemon…".to_owned()
                             }
-                            Felt::Reconnecting => {
-                                "Reconnecting. Messages send once it is back.".to_owned()
-                            }
-                            Felt::Down { .. } => {
-                                "Offline. Messages send once the daemon is back.".to_owned()
-                            }
+                            // Short enough for a phone's field: what is
+                            // written now still sends on reconnect.
+                            Felt::Reconnecting => "Reconnecting…".to_owned(),
+                            Felt::Down { .. } => "Offline: sends once it's back".to_owned(),
                         })
                         .placeholder_color(|| color(colors::FAINT))
                         .caret_color(|| color(colors::ACCENT))
