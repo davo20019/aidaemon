@@ -39,6 +39,26 @@ fn labeled(label: &'static str, control: impl IntoElement) -> View {
         .child(control)
 }
 
+/// A provider or its model by name, behind the provider's mark when it has
+/// one.
+fn provider_name(preset: &str, name: String, weight: FontWeight) -> View {
+    let mut row = view().flex_row().items_center().gap_2();
+    // One without a mark keeps its name in line with the others.
+    row = row.child(match ui::provider_glyph(preset) {
+        Some(glyph) => ui::icon(glyph).accessibility_elements_hidden(true),
+        None => ui::icon(ui::Glyph::Dot)
+            .text_color(colors::FAINT)
+            .accessibility_elements_hidden(true),
+    });
+    row.child(
+        text(name)
+            .flex_1()
+            .min_w(px(0.0))
+            .text_size(px(type_scale::BASE))
+            .font_weight(weight),
+    )
+}
+
 fn frame(content: View) -> View {
     // Centred while it fits; a long step scrolls from its top.
     view().flex_1().child(
@@ -339,11 +359,11 @@ fn model_step(store: Store) -> View {
                     ui::surface()
                         .p_4()
                         .gap_2()
-                        .child(
-                            text(format!("Found: {}", best.name))
-                                .text_size(px(type_scale::BASE))
-                                .font_weight(FontWeight::MEDIUM),
-                        )
+                        .child(provider_name(
+                            &best.preset,
+                            format!("Found: {}", best.name),
+                            FontWeight::MEDIUM,
+                        ))
                         .child(lead(format!(
                             "{} · {}. It answered a test just now.",
                             best.source,
@@ -431,7 +451,11 @@ fn choices(
                                     view()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .child(text(model.name).text_size(px(type_scale::BASE)))
+                                        .child(provider_name(
+                                            &model.preset,
+                                            model.name,
+                                            FontWeight::NORMAL,
+                                        ))
                                         .child(lead(detail)),
                                 )
                                 .child(when(model.works, move || {
@@ -497,7 +521,16 @@ fn choices(
             }))
         }))
         // Every provider, each saying how it bills.
-        .child(ui::section_label("Or connect"))
+        .child(ui::section_label(
+            if store
+                .setup()
+                .is_some_and(|s| s.found.iter().any(|m| m.works))
+            {
+                "Or connect"
+            } else {
+                "Connect"
+            },
+        ))
         .child(dynamic(move || {
             let providers = store.setup().map(|s| s.providers).unwrap_or_default();
             Some(untracked(move || {
@@ -534,10 +567,11 @@ fn choices(
                                         view()
                                             .flex_1()
                                             .min_w(px(0.0))
-                                            .child(
-                                                text(option.name.clone())
-                                                    .text_size(px(type_scale::BASE)),
-                                            )
+                                            .child(provider_name(
+                                                &option.preset,
+                                                option.name.clone(),
+                                                FontWeight::NORMAL,
+                                            ))
                                             .child(lead(billing_words(option.billing))),
                                     )
                                     .child(

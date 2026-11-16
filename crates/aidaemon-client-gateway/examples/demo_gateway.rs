@@ -209,8 +209,20 @@ fn demo_setup() -> &'static std::sync::Mutex<Option<aidaemon_client_protocol::Se
                     Billing::Plan,
                     false,
                 ),
-                provider("anthropic", "Anthropic", Billing::PerToken, true),
+                provider("anthropic_native", "Anthropic", Billing::PerToken, true),
+                provider("openai", "OpenAI", Billing::PerToken, true),
+                provider("google_ai_studio", "Google Gemini", Billing::PerToken, true),
                 provider("openrouter", "OpenRouter", Billing::PerToken, true),
+                provider("xai", "xAI (Grok)", Billing::PerToken, true),
+                provider("deepseek", "DeepSeek", Billing::PerToken, true),
+                provider("moonshot", "Moonshot AI (Kimi)", Billing::PerToken, true),
+                provider("minimax", "MiniMax", Billing::PerToken, true),
+                provider(
+                    "cloudflare_gateway",
+                    "Cloudflare AI Gateway",
+                    Billing::PerToken,
+                    true,
+                ),
             ],
             ..SetupState::default()
         }))
@@ -936,7 +948,7 @@ fn demo_settings() -> &'static std::sync::Mutex<Settings> {
                 connected(
                     Some(2),
                     "google_ai_studio",
-                    "Google AI Studio",
+                    "Google Gemini",
                     &["gemini-synthetic"],
                     CredentialState::KeyMissing,
                     "provider.fallbacks[2].api_key",

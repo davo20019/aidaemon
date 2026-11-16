@@ -674,10 +674,16 @@ pub fn toasts(
                             "opacity-0 translate-y-4"
                         })
                         .ending_class("opacity-0 scale-95")
-                        .child(note_body(note, move |session: &str| {
-                            manager.with(|m| m.dismiss(&id, now()));
-                            open(session);
-                        }))
+                        .child(note_body(
+                            note,
+                            move |session: &str| {
+                                manager.with(|m| m.dismiss(&id, now()));
+                                open(session);
+                            },
+                            move || {
+                                manager.with(|m| m.dismiss(&id, now()));
+                            },
+                        ))
                 },
             )),
     )
@@ -685,8 +691,8 @@ pub fn toasts(
 
 /// A toast's content: the check of finished work, its title and what it
 /// was about (two lines at most); a note that opens a conversation is a
-/// button that does, with a chevron to say so.
-fn note_body(note: Note, open: impl Fn(&str) + 'static) -> View {
+/// button that does, with a chevron to say so. A close button ends it.
+fn note_body(note: Note, open: impl Fn(&str) + 'static, close: impl Fn() + 'static) -> View {
     let mut words = view().flex_1().min_w(px(0.0)).gap(px(2.0)).child(
         text(note.title.clone())
             .number_of_lines(2)
@@ -715,8 +721,15 @@ fn note_body(note: Note, open: impl Fn(&str) + 'static) -> View {
         );
     }
     row = row.child(words);
-    match note.opens {
-        Some(session) => view().child(
+    // Closed with a press too: a swipe is not something a card says.
+    let close = view().pr_2().child(super::icon_btn(
+        Glyph::Close,
+        "Dismiss",
+        super::Size::Sm,
+        close,
+    ));
+    let body = match note.opens {
+        Some(session) => view().flex_1().min_w(px(0.0)).child(
             nsh_base::button()
                 .accessibility_label(SharedString::from(format!(
                     "Open {}",
@@ -733,8 +746,9 @@ fn note_body(note: Note, open: impl Fn(&str) + 'static) -> View {
                     ),
                 ),
         ),
-        None => row,
-    }
+        None => row.flex_1().min_w(px(0.0)),
+    };
+    view().flex_row().items_center().child(body).child(close)
 }
 
 /// A pane at an edge of a narrow window: it slides in from `side` over the

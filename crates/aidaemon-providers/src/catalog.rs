@@ -246,7 +246,7 @@ pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         id: "google_ai_studio",
         aliases: &["google", "googleaistudio", "gemini"],
-        display_name: "Google AI Studio",
+        display_name: "Google Gemini",
         kind: ProviderKind::GoogleGenai,
         base_url: "",
         models: Models {

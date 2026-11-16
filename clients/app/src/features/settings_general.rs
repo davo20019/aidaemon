@@ -381,7 +381,7 @@ fn backend_words(backend: &str) -> &'static str {
         }
         "gemini" => {
             "Google's Decisions API: fast, with calibrated confidence. What it decides on is \
-             sent to Google. Empty key: your Google AI Studio provider's key."
+             sent to Google. Empty key: your Google Gemini provider's key."
         }
         "typesafe" => {
             "TypeSafe's Jev, a System One model: typed answers with calibrated probabilities \
@@ -473,7 +473,7 @@ pub fn decisions(store: Store, settings: &Settings) -> View {
                 let status = if key_set {
                     ui::status("Key in the keychain", Tone::Success)
                 } else if chosen == "gemini" {
-                    ui::status("Uses your Google AI Studio provider's key", Tone::Neutral)
+                    ui::status("Uses your Google Gemini provider's key", Tone::Neutral)
                 } else {
                     ui::status("No key: it cannot answer", Tone::Danger)
                 };

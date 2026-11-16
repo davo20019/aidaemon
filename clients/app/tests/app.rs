@@ -535,7 +535,16 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     app.press("src/contact.rs, modified, written in this conversation")?;
     app.wait_for("All files")?;
     app.wait_for("fn main() {}")?;
-    app.wait_for("Undo changes")?;
+    // Undo asks first; Cancel leaves the file as it is.
+    app.answer_dialogs_myself();
+    app.press("Undo changes…")?;
+    let asked = app.pending_dialog().and_then(|d| d.title.clone());
+    assert_eq!(
+        asked.as_deref(),
+        Some("Undo the changes to src/contact.rs?")
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Cancel".into()))?;
+    assert!(sent("revert_file").is_none());
     app.press("Side by side")?;
     app.press("Next change")?;
     app.press("All files")?;
@@ -888,6 +897,8 @@ fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
     )]);
     // "Done", what finished under it, and a press opens it.
     app.wait_for("Done: Draft the invoice")?;
+    // It can be closed without opening anything.
+    app.wait_for("label:Dismiss")?;
     app.press("label:Open Draft the invoice")?;
     app.wait_for("The invoice is drafted.")?;
     Ok(())
