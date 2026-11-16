@@ -71,7 +71,7 @@ fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), 
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     // A phone: the page alone, as wide as the screen.
     let mut app = start_at(390.0, 844.0);
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     let phone = conversation_width(&app);
     assert!(
         phone > 380.0,
@@ -79,7 +79,7 @@ fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), 
     );
     // A roomy window: the page takes what the panes leave.
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     let desk = conversation_width(&app);
     assert!(
         desk > 600.0,
@@ -92,7 +92,7 @@ fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), 
 fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -182,7 +182,7 @@ fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     let before = sent("get_settings");
     feed([Update::Connected]);
     // From the keyboard: the command palette, then Settings.
@@ -246,7 +246,7 @@ fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<
 fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([Update::Connected]);
     app.press("Settings: change how the daemon runs")?;
     app.wait_for("Reading settings…")?;
@@ -389,7 +389,7 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
 fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -409,7 +409,7 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
 fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -459,7 +459,7 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
 fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -488,13 +488,13 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
 fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     // Code before any project exists says how to make the first.
     app.press("Code")?;
     app.wait_for("No projects yet")?;
     app.wait_for("New project")?;
     app.press("Chat")?;
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -514,22 +514,25 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Contact form copy")?;
     // Its "+" starts a conversation there: the header names the project.
     app.press("New conversation in this project >> nth=0")?;
-    app.wait_for("Which project?")?;
+    app.wait_for("Which project are we working on?")?;
     app.wait_for("Works in /home/synthetic/acme-site")?;
     // The header's switch says what a new conversation is: Chat leaves
     // the project and brings the question; Code asks which project, in
     // one list, and names the chosen one's folder.
     app.press("Chat")?;
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     app.press("Code")?;
-    app.wait_for("Which project?")?;
+    app.wait_for("Which project are we working on?")?;
     app.wait_for("Works in /home/synthetic/acme-site")?;
+    // Its "+" opens the form for a new project.
+    app.press("Make a new project")?;
+    app.wait_for("Project name")?;
     // A new conversation from the keyboard, in a project's conversation,
     // stays in that project.
     app.press("Contact form copy >> nth=0")?;
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
     app.press_key("mod+n")?;
-    app.wait_for("Which project?")?;
+    app.wait_for("Which project are we working on?")?;
     // The paperclip offers pictures and files (and the camera, where a
     // phone's browser has one).
     app.press("Attach")?;
@@ -542,7 +545,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
 fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -563,7 +566,7 @@ fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
 fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -593,7 +596,7 @@ fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
 fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([Update::Connected]);
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
@@ -648,7 +651,7 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
 fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([Update::Connected]);
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
@@ -678,7 +681,7 @@ fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
 fn resting_the_pointer_on_a_conversation_previews_it() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start_desktop();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -725,7 +728,7 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
     config.environment.idiom = nsh_core::platform::Idiom::Desktop;
     config.speech = Some(std::sync::Arc::new(Hears));
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     app.type_text("label:Message", "Fix the footer")?;
     app.press("Speak instead of typing")?;
     app.wait_for("Stop listening")?;
@@ -739,7 +742,7 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
 fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -764,7 +767,7 @@ fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
 fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start_at(390.0, 844.0);
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     let before = sent("list_models");
     feed([Update::Connected]);
     let id = wait_sent_new("list_models", before)?;
@@ -797,7 +800,7 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
     // window, where the list of conversations shows).
     drop(app);
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([Update::Connected]);
     let id = wait_sent_new("list_models", Some(id))?;
     feed([frame(&format!(
@@ -825,7 +828,7 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
 -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(
@@ -867,7 +870,7 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("What should we work on?")?;
+    app.wait_for("What can I help with?")?;
     feed([
         Update::Connected,
         frame(

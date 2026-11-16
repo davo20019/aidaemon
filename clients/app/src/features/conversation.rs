@@ -522,13 +522,21 @@ fn welcome(store: Store) -> View {
                 if code {
                     code_start(store)
                 } else {
-                    view().child(heading("What should we work on?"))
+                    view().child(heading("What can I help with?"))
                 }
             }))
         })))
         // On a phone all of it sits by the composer, under the thumb; in a
         // window it is centred.
         .child(view().style_when(!ui::touch(), |s| s.flex_1()))
+}
+
+/// Opens the sidebar's form for a new project (the drawer on a phone).
+fn new_project_form(store: Store) {
+    if !store.sidebar_open() {
+        store.open_sidebar();
+    }
+    store.show_project_form(true);
 }
 
 /// Code: the project to work in, one list however many there are, with
@@ -564,30 +572,39 @@ fn code_start(store: Store) -> View {
                         "New project",
                         Variant::Outline,
                         ui::Size::Sm,
-                        move || {
-                            if !store.sidebar_open() {
-                                store.open_sidebar();
-                            }
-                            store.show_project_form(true);
-                        },
+                        move || new_project_form(store),
                     ));
             }
             view()
                 .w_full()
                 .items_center()
                 .gap_3()
-                .child(heading("Which project?"))
-                .child(ui::choice(
-                    "Project to work in",
-                    "Choose a project",
-                    items,
-                    move || store.current_project(),
-                    move |chosen| {
-                        if let Some(id) = chosen.filter(|id| !id.is_empty()) {
-                            store.set_new_project(Some(id));
-                        }
-                    },
-                ))
+                .child(heading("Which project are we working on?"))
+                // A new one is made with the sidebar's form, as its "+"
+                // does; once made, this conversation starts in it.
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(ui::choice(
+                            "Project to work in",
+                            "Choose a project",
+                            items,
+                            move || store.current_project(),
+                            move |chosen| {
+                                if let Some(id) = chosen.filter(|id| !id.is_empty()) {
+                                    store.set_new_project(Some(id));
+                                }
+                            },
+                        ))
+                        .child(ui::icon_btn(
+                            Glyph::Plus,
+                            "Make a new project",
+                            Size::Md,
+                            move || new_project_form(store),
+                        )),
+                )
                 .child(
                     text(move || {
                         let path = store
