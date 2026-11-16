@@ -203,6 +203,23 @@ mod client_gateway {
             self.seqs.last().copied().unwrap_or(0)
         }
 
+        /// Mark every `skip` frame received before the last `mark` frame
+        /// as taken, so a later step does not mistake it for its own.
+        fn skip_before_last(
+            &mut self,
+            mark: impl Fn(&ServerFrame) -> bool,
+            skip: impl Fn(&ServerFrame) -> bool,
+        ) {
+            let Some(end) = self.frames.iter().rposition(&mark) else {
+                return;
+            };
+            for at in 0..end {
+                if skip(&self.frames[at]) {
+                    self.taken.insert(at);
+                }
+            }
+        }
+
         fn take(&mut self, want: &impl Fn(&ServerFrame) -> bool) -> Option<ServerFrame> {
             let at = (0..self.frames.len())
                 .find(|at| !self.taken.contains(at) && want(&self.frames[*at]))?;
@@ -624,6 +641,13 @@ mod client_gateway {
                 },
             )
             .await;
+        // The pairing's own card (confirmed in Telegram above) can reach
+        // the log after the browser connected: the turn's card is the one
+        // after the turn started.
+        until(&mut socket, &mut applied, |f| is_event(f, "turn_started")).await;
+        applied.skip_before_last(|f| is_event(f, "turn_started"), |f| {
+            is_event(f, "approval_requested")
+        });
         let asked = until(&mut socket, &mut applied, |f| {
             is_event(f, "approval_requested")
         })
