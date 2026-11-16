@@ -89,6 +89,14 @@ pub(crate) struct DaemonClientHost {
 }
 
 impl DaemonClientHost {
+    /// config.toml as it is now, for names the owner sees (as Settings shows them).
+    fn config_table(&self) -> Option<toml::Table> {
+        std::fs::read_to_string(&self.commands.config_path)
+            .ok()?
+            .parse()
+            .ok()
+    }
+
     /// The owner's automations as the agent's own tool sees and changes
     /// them, so the app and a chat apply the same rules.
     fn automation_tool(&self) -> crate::tools::ManageAutomationsTool {
@@ -616,7 +624,10 @@ impl ClientHost for DaemonClientHost {
     }
 
     async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
-        Ok(super::client_models::options(&self.llm))
+        Ok(super::client_models::named(
+            super::client_models::options(&self.llm),
+            self.config_table().as_ref(),
+        ))
     }
 
     async fn session_model(
@@ -1009,9 +1020,15 @@ impl ClientHost for DaemonClientHost {
     }
 
     async fn slash(&self, session_id: &str, command: &str, args: &str) -> Option<String> {
-        if let Some(reply) =
-            super::client_models::slash(self.state.as_ref(), &self.llm, session_id, command, args)
-                .await
+        if let Some(reply) = super::client_models::slash(
+            self.state.as_ref(),
+            &self.llm,
+            self.config_table().as_ref(),
+            session_id,
+            command,
+            args,
+        )
+        .await
         {
             return Some(reply);
         }

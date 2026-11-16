@@ -58,6 +58,26 @@ pub(crate) fn options(llm: &SharedLlmRuntime) -> ModelOptions {
     }
 }
 
+/// `options` with each provider named as Settings names it ("OpenRouter",
+/// not its kind's "OpenAI-compatible"), from the config the providers came
+/// from. Without a config, or for a provider it does not list, the kind's
+/// name stays.
+pub(crate) fn named(mut options: ModelOptions, config: Option<&toml::Table>) -> ModelOptions {
+    let Some(config) = config else {
+        return options;
+    };
+    for provider in super::client_providers::connected(config) {
+        let id = match provider.failover {
+            None => session_model::MAIN_PROVIDER.to_string(),
+            Some(index) => format!("failover-{index}"),
+        };
+        if let Some(option) = options.providers.iter_mut().find(|option| option.id == id) {
+            option.name = provider.name;
+        }
+    }
+    options
+}
+
 /// The name the picker shows for provider `id` (the id when unknown).
 fn provider_name<'a>(options: &'a ModelOptions, id: &'a str) -> &'a str {
     options
@@ -133,6 +153,7 @@ fn suggested_model<'a>(requested: &str, options: &'a ModelOptions) -> Option<&'a
 pub(crate) async fn slash(
     settings: &dyn SettingsStore,
     llm: &SharedLlmRuntime,
+    config: Option<&toml::Table>,
     session_id: &str,
     command: &str,
     args: &str,
@@ -144,13 +165,14 @@ pub(crate) async fn slash(
                 let current = current(settings, llm, session_id).await;
                 return Some(match current.model {
                     ModelChoice::Pinned { provider, model } => {
-                        let provider = provider_name(&options(llm), &provider).to_owned();
+                        let provider =
+                            provider_name(&named(options(llm), config), &provider).to_owned();
                         format!("This conversation uses `{model}` ({provider}).")
                     }
                     _ => "This conversation uses automatic model routing.".to_string(),
                 });
             }
-            let choices = options(llm);
+            let choices = named(options(llm), config);
             let selected = choices.providers.iter().find_map(|provider| {
                 provider
                     .models
@@ -356,6 +378,25 @@ mod tests {
     }
 
     #[test]
+    fn providers_are_named_as_settings_names_them() {
+        let config: toml::Table = r#"
+            [provider]
+            kind = "anthropic"
+            [[provider.fallbacks]]
+            kind = "openai_compatible"
+            base_url = "https://openrouter.ai/api/v1"
+        "#
+        .parse()
+        .unwrap();
+        let mut choices = options(&runtime());
+        choices.providers[1].name = "OpenAI-compatible".into();
+        let choices = named(choices, Some(&config));
+        assert_eq!(choices.providers[0].name, "Anthropic");
+        assert_eq!(choices.providers[1].name, "OpenRouter");
+        assert_eq!(named(options(&runtime()), None), options(&runtime()));
+    }
+
+    #[test]
     fn unknown_model_response_groups_by_display_name_and_suggests_only_close_names() {
         let choices = options(&runtime());
         assert_eq!(
@@ -460,6 +501,7 @@ mod tests {
         let selected = slash(
             settings,
             &llm,
+            None,
             "app:synthetic-one",
             "model",
             "synthetic-gemini-catalog",
@@ -476,7 +518,7 @@ mod tests {
             ModelChoice::Auto
         );
 
-        let report = slash(settings, &llm, "app:synthetic-one", "model", "")
+        let report = slash(settings, &llm, None, "app:synthetic-one", "model", "")
             .await
             .unwrap();
         assert!(report.contains("synthetic-gemini-catalog"), "{report}");
@@ -484,6 +526,7 @@ mod tests {
         let unknown = slash(
             settings,
             &llm,
+            None,
             "app:synthetic-one",
             "model",
             "synthetic-missing",
@@ -497,6 +540,7 @@ mod tests {
         let typo = slash(
             settings,
             &llm,
+            None,
             "app:synthetic-one",
             "model",
             "synthetic-gemni",
@@ -513,11 +557,11 @@ mod tests {
             "an unknown model must not change the existing pin"
         );
         assert_eq!(
-            slash(settings, &llm, "app:synthetic-one", "help", "").await,
+            slash(settings, &llm, None, "app:synthetic-one", "help", "").await,
             None
         );
 
-        let auto = slash(settings, &llm, "app:synthetic-one", "auto", "")
+        let auto = slash(settings, &llm, None, "app:synthetic-one", "auto", "")
             .await
             .unwrap();
         assert!(auto.contains("automatic model routing"));
@@ -525,7 +569,7 @@ mod tests {
             current(settings, &llm, "app:synthetic-one").await.model,
             ModelChoice::Auto
         );
-        let report = slash(settings, &llm, "app:synthetic-one", "model", "")
+        let report = slash(settings, &llm, None, "app:synthetic-one", "model", "")
             .await
             .unwrap();
         assert!(report.contains("automatic model routing"), "{report}");
