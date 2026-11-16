@@ -344,8 +344,8 @@ fn header(store: Store, session: Option<String>) -> View {
                 .flex_1()
                 .min_w(px(0.0))
                 .px_2()
-                // A new conversation's question is its title: the bar
-                // stays quiet until there is a conversation to name.
+                // A new conversation has no title yet: the bar says what
+                // it is, a chat or work on code.
                 .child(match title {
                     Some(id) => text(move || store.title(&id))
                         .role(AccessibilityRole::Header)
@@ -353,14 +353,16 @@ fn header(store: Store, session: Option<String>) -> View {
                         .text_size(px(ui::fit::body()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .into_element(),
-                    None => view().into_element(),
+                    None => view().items_center().child(new_kind(store)).into_element(),
                 })
                 // Where it lives (a chat's platform and bot) and the
                 // project it works in, under its title.
                 .child(when(
                     {
                         let chat = chat.clone();
-                        move || chat.is_some() || store.current_project().is_some()
+                        // A new conversation's project is picked on the page.
+                        let started = session.is_some();
+                        move || started && (chat.is_some() || store.current_project().is_some())
                     },
                     move || {
                         let chat = chat.clone();
@@ -477,15 +479,14 @@ fn header(store: Store, session: Option<String>) -> View {
         ))
 }
 
-/// What a new conversation can start from: a tap puts the words in the
-/// composer to finish or send as they are.
-const STARTERS: [(&str, &str); 3] = [
+/// What a chat can start from: a tap puts the words in the composer to
+/// finish or send as they are.
+const STARTERS: [(&str, &str); 2] = [
     ("What can you do?", "What can you do on this computer?"),
-    ("Start a coding task", "Start a coding task in "),
     ("Set a reminder", "Remind me "),
 ];
 
-/// The same, in a project: the agent already works in its folder.
+/// The same, for code: the agent already works in the project's folder.
 const PROJECT_STARTERS: [(&str, &str); 3] = [
     (
         "Explain this project",
@@ -498,101 +499,180 @@ const PROJECT_STARTERS: [(&str, &str); 3] = [
     ("Fix something", "Fix "),
 ];
 
-/// A new conversation: one question, where it works (a chat, or in a
-/// project's folder) and a few ways to start, together: by the composer
-/// on a phone, in the middle of a window. The sidebar already lists past
-/// conversations.
+/// What a new conversation is, in its header: a chat, or work on code in
+/// a project's folder. Said before the first word, so the two never look
+/// like the same thing.
+fn new_kind(store: Store) -> View {
+    ui::segmented(
+        "What this conversation is",
+        &["Chat", "Code"],
+        move || usize::from(store.new_is_code()),
+        move |at| {
+            if (at == 1) != untracked(|| store.new_is_code()) {
+                store.place_new(at == 1);
+            }
+        },
+    )
+}
+
+fn starters(store: Store, from: &'static [(&'static str, &'static str)]) -> View {
+    let mut chips = view().flex_row().flex_wrap().justify_center().gap_2();
+    for (label, words) in from.iter().copied() {
+        chips = chips.child(
+            ui::btn(label, Variant::Outline, ui::Size::Sm, move || {
+                store.set_draft(words.to_owned())
+            })
+            .accessibility_label(format!("Start with: {}", words.trim_end())),
+        );
+    }
+    chips
+}
+
+fn heading(words: &'static str) -> Text {
+    text(words)
+        .role(AccessibilityRole::Header)
+        .text_center()
+        .text_size(px(ui::fit::title()))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(colors::TEXT)
+}
+
+/// A new conversation: what the header's switch chose. A chat asks one
+/// question and offers a few ways to start; code lists the projects to
+/// work in (each a folder), then ways to start there. Together by the
+/// composer on a phone, in the middle of a window. The sidebar already
+/// lists past conversations.
 fn welcome(store: Store) -> View {
-    let chips = view().child(dynamic(move || {
-        let in_project = store.current_project().is_some();
-        Some(untracked(move || {
-            let mut chips = view().flex_row().flex_wrap().justify_center().gap_2();
-            for (label, words) in if in_project {
-                PROJECT_STARTERS
-            } else {
-                STARTERS
-            } {
-                chips = chips.child(
-                    ui::btn(label, Variant::Outline, ui::Size::Sm, move || {
-                        store.set_draft(words.to_owned())
-                    })
-                    .accessibility_label(format!("Start with: {}", words.trim_end())),
-                );
-            }
-            chips
-        }))
-    }));
-    // Where it will work: said before the first word, so a chat and work
-    // on code never look like the same thing. Built once per list of
-    // projects: switching keeps the keyboard on the switch (its arrows
-    // choose), and only the project picker comes and goes.
-    let names = computed(move || {
-        store
-            .projects()
-            .into_iter()
-            .map(|p| (p.id, p.name))
-            .collect::<Vec<(String, String)>>()
-    });
-    let place = view().child(dynamic(move || {
-        let items = names.get();
-        Some(untracked(move || {
-            if items.is_empty() {
-                return view();
-            }
-            let first = items.first().map(|(id, _)| id.clone());
-            let several = items.len() > 1;
-            view()
-                .items_center()
-                .gap_2()
-                .child(ui::segmented(
-                    "Where this conversation works",
-                    &["Chat", "In a project"],
-                    move || usize::from(store.current_project().is_some()),
-                    move |at| {
-                        let in_project = store.current_project().is_some();
-                        if (at == 1) != in_project {
-                            store.place_new_project((at == 1).then(|| first.clone()).flatten());
-                        }
-                    },
-                ))
-                .child(when(
-                    move || several && store.current_project().is_some(),
-                    move || {
-                        ui::choice(
-                            "Project",
-                            "Choose a project",
-                            items.clone(),
-                            move || store.current_project(),
-                            move |chosen| {
-                                if let Some(id) = chosen.filter(|id| !id.is_empty()) {
-                                    store.set_new_project(Some(id));
-                                }
-                            },
-                        )
-                    },
-                ))
-        }))
-    }));
+    let code = computed(move || store.new_is_code());
     view()
         .flex_1()
         .items_center()
         .px_4()
         .py_4()
-        .gap_4()
         .child(view().flex_1())
-        .child(
-            text("What should we work on?")
-                .role(AccessibilityRole::Header)
-                .text_center()
-                .text_size(px(ui::fit::title()))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(colors::TEXT),
-        )
-        .child(place)
-        .child(chips)
+        .child(view().w_full().items_center().child(dynamic(move || {
+            let code = code.get();
+            Some(untracked(move || {
+                if code {
+                    code_start(store)
+                } else {
+                    view()
+                        .items_center()
+                        .gap_4()
+                        .child(heading("What should we work on?"))
+                        .child(starters(store, &STARTERS))
+                }
+            }))
+        })))
         // On a phone all of it sits by the composer, under the thumb; in a
         // window it is centred.
         .child(view().style_when(!ui::touch(), |s| s.flex_1()))
+}
+
+/// Code: the projects, one chosen, then ways to start in it. With no
+/// project yet, how to make the first.
+fn code_start(store: Store) -> View {
+    let projects = computed(move || {
+        store
+            .projects()
+            .into_iter()
+            .map(|p| (p.id, p.name, p.path))
+            .collect::<Vec<_>>()
+    });
+    view().w_full().items_center().child(dynamic(move || {
+        let items = projects.get();
+        Some(untracked(move || {
+            if items.is_empty() {
+                return view()
+                    .items_center()
+                    .gap_4()
+                    .child(heading("No projects yet"))
+                    .child(
+                        text(
+                            "A project is a folder on the daemon's computer. \
+                             Work on code happens in one.",
+                        )
+                        .text_center()
+                        .max_w(px(420.0))
+                        .text_size(px(ui::fit::body()))
+                        .text_color(colors::MUTED),
+                    )
+                    .child(ui::btn(
+                        "New project",
+                        Variant::Outline,
+                        ui::Size::Sm,
+                        move || {
+                            if !store.sidebar_open() {
+                                store.open_sidebar();
+                            }
+                            store.show_project_form(true);
+                        },
+                    ));
+            }
+            // Past a few, the list scrolls in place: the starters and the
+            // composer stay where they are.
+            let many = items.len() > 5;
+            let mut list = view().w_full().gap_1();
+            for (id, name, path) in items {
+                let chosen = id.clone();
+                let is = move || store.current_project().as_deref() == Some(chosen.as_str());
+                let marked = is.clone();
+                list = list.child(
+                    ui::row(is, move || store.set_new_project(Some(id.clone())))
+                        .py_1()
+                        .accessibility_label(format!("Work in {name}"))
+                        .child(
+                            ui::icon(Glyph::Folder)
+                                .text_color(colors::MUTED)
+                                .accessibility_elements_hidden(true),
+                        )
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(
+                                    text(name)
+                                        .number_of_lines(1)
+                                        .text_size(px(ui::fit::body()))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(colors::TEXT),
+                                )
+                                .child(
+                                    text(match path {
+                                        Some(path) => super::sidebar::short_path(&path),
+                                        None => "No folder".to_owned(),
+                                    })
+                                    .number_of_lines(1)
+                                    .text_size(px(type_scale::XS))
+                                    .text_color(colors::FAINT),
+                                ),
+                        )
+                        .child(when(marked, || {
+                            ui::icon(Glyph::Check)
+                                .text_color(colors::ACCENT)
+                                .accessibility_elements_hidden(true)
+                        })),
+                );
+            }
+            let list = if many {
+                scroll()
+                    .w_full()
+                    .max_w(px(420.0))
+                    .h(px(5.5 * (ui::fit::row() + 14.0)))
+                    .child(list)
+                    .into_element()
+            } else {
+                list.max_w(px(420.0)).into_element()
+            };
+            view()
+                .w_full()
+                .items_center()
+                .gap_4()
+                .child(heading("Pick a project to work in"))
+                .child(list)
+                .child(starters(store, &PROJECT_STARTERS))
+        }))
+    }))
 }
 
 /// The transcript, and a "Jump to latest" pill while the owner reads back.
@@ -1276,6 +1356,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                         // A phone would raise its keyboard over the page.
                         .auto_focus(!touch)
                         .placeholder(move || match store.connection() {
+                            // A phone's field is narrow: the hint about
+                            // commands is the list that `/` brings.
+                            Connection::Online if touch => "Message AIdaemon…".to_owned(),
                             Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
                             Connection::Connecting
                             | Connection::NeedsPairing
@@ -1306,12 +1389,17 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .child(when(
                             move || !terminal && store.takes_files(),
                             move || {
-                                ui::icon_btn(
-                                    Glyph::Attach,
-                                    "Attach pictures",
-                                    Size::Md,
-                                    move || store.pick_pictures(),
-                                )
+                                let mut ways = Vec::new();
+                                if untracked(|| store.takes_pictures()) {
+                                    ways.push(ui::MenuAction::new("Take a picture", move || {
+                                        store.take_picture()
+                                    }));
+                                }
+                                ways.push(ui::MenuAction::new("Pictures", move || {
+                                    store.pick_pictures()
+                                }));
+                                ways.push(ui::MenuAction::new("Files", move || store.pick_files()));
+                                ui::press_menu(Glyph::Attach, "Attach", ways)
                             },
                         ))
                         .child(dictation(store, terminal))
@@ -1386,12 +1474,8 @@ fn composer(store: Store, session: Option<String>) -> View {
                             },
                         ))
                         .child(
-                            ui::btn_icon(
-                                Glyph::Send,
-                                "Send",
-                                Variant::Primary,
-                                ui::Size::Sm,
-                                move || {
+                            {
+                                let send = move || {
                                     // A phone answers the press (nothing elsewhere).
                                     haptic(nsh_core::Haptic::Impact(nsh_core::HapticImpact::Light));
                                     if running.get_untracked() {
@@ -1399,8 +1483,21 @@ fn composer(store: Store, session: Option<String>) -> View {
                                     } else {
                                         store.submit();
                                     }
-                                },
-                            )
+                                };
+                                // The arrow alone says Send; a terminal's
+                                // glyph needs the word.
+                                if terminal {
+                                    ui::btn_icon(
+                                        Glyph::Send,
+                                        "Send",
+                                        Variant::Primary,
+                                        ui::Size::Sm,
+                                        send,
+                                    )
+                                } else {
+                                    ui::icon_btn_primary(Glyph::Send, "Send", send)
+                                }
+                            }
                             .disabled(move || !can_send())
                             .accessibility_label(move || {
                                 Some(SharedString::from(

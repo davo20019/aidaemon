@@ -105,3 +105,42 @@ export class Socket {
     this.ws.close();
   }
 }
+
+/**
+ * Take a picture with the device's camera (a phone's browser opens it for a
+ * file input with `capture`): its JPEG bytes, scaled to fit `maxDimension`
+ * and upright, or null when nothing was taken.
+ */
+export function takePicture(maxDimension) {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.capture = "environment";
+    input.style.display = "none";
+    let answered = false;
+    const answer = async (file) => {
+      if (answered) return;
+      answered = true;
+      input.remove();
+      if (!file) return resolve(null);
+      try {
+        const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+        const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+        const blob = await new Promise((done) => canvas.toBlob(done, "image/jpeg", 0.9));
+        resolve(blob ? new Uint8Array(await blob.arrayBuffer()) : null);
+      } catch {
+        resolve(null);
+      }
+    };
+    input.addEventListener("change", () => answer(input.files?.[0]));
+    input.addEventListener("cancel", () => answer(null));
+    document.body.append(input);
+    input.click();
+  });
+}

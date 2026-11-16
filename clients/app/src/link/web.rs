@@ -32,6 +32,8 @@ extern "C" {
     fn pairing_link() -> Vec<String>;
     #[wasm_bindgen(js_name = forgetPairingLink)]
     fn forget_pairing_link();
+    #[wasm_bindgen(js_name = takePicture)]
+    fn take_picture_js(max_dimension: u32) -> js_sys::Promise;
 
     type Socket;
     #[wasm_bindgen(constructor)]
@@ -40,6 +42,13 @@ extern "C" {
     fn send(this: &Socket, text: &str);
     #[wasm_bindgen(method)]
     fn close(this: &Socket);
+}
+
+/// A picture taken with the device's camera: its JPEG bytes, scaled to fit
+/// `max_dimension`; `None` when nothing was taken.
+pub async fn take_picture(max_dimension: u32) -> Option<Vec<u8>> {
+    let taken = JsFuture::from(take_picture_js(max_dimension)).await.ok()?;
+    (!taken.is_null() && !taken.is_undefined()).then(|| js_sys::Uint8Array::new(&taken).to_vec())
 }
 
 async fn text_of(promise: js_sys::Promise) -> Result<String, String> {

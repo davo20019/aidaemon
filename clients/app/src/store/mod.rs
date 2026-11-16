@@ -228,6 +228,8 @@ pub struct Store {
     gateway_base: Stored<String>,
     /// The project a new conversation starts in (`None`: no project).
     new_project: Signal<Option<String>>,
+    /// Code was chosen for the new conversation while no project exists.
+    new_code: Signal<bool>,
     /// The folder the app was started in (the terminal's): new
     /// conversations start in the project of that folder.
     here: Stored<Option<String>>,
@@ -287,6 +289,7 @@ impl Store {
             activity_mode: signal(ActivityMode::default()),
             gateway_base: stored(String::new()),
             new_project: signal(None),
+            new_code: signal(false),
             here: stored(None),
             open_projects: signal(BTreeSet::new()),
             project_form: signal(false),
@@ -891,10 +894,23 @@ impl Store {
         self.focus_composer();
     }
 
-    /// Choose where the new conversation on screen works, leaving the
-    /// keyboard where it is (a switch whose arrows choose).
-    pub fn place_new_project(&self, project: Option<String>) {
-        self.new_project.set(project);
+    /// Whether the new conversation on screen is for code: it works in a
+    /// project (or waits for the first one to be made).
+    pub fn new_is_code(&self) -> bool {
+        self.new_project.get().is_some() || self.new_code.get()
+    }
+
+    /// Choose what the new conversation on screen is, a chat or work on
+    /// code, leaving the keyboard where it is (a switch whose arrows
+    /// choose). Code starts in the first project until another is picked.
+    pub fn place_new(&self, code: bool) {
+        self.new_code.set(code);
+        if !code {
+            self.new_project.set(None);
+        } else if self.new_project.get_untracked().is_none() {
+            let first = self.reads.projects.get_untracked().into_iter().next();
+            self.new_project.set(first.map(|p| p.id));
+        }
     }
 
     pub fn project_open(&self, id: &str) -> bool {
@@ -1612,6 +1628,7 @@ impl Store {
         } else {
             None
         });
+        self.new_code.set(false);
         let picked = id.is_some();
         self.selected.set(id);
         // Its changes say whether it works on code (and are ready to show).
@@ -1695,6 +1712,36 @@ impl Store {
                 store.attach_file(file.name, file.mime, file.data.bytes());
             }
         });
+    }
+
+    /// Pick files of any type to attach, as they are.
+    pub fn pick_files(&self) {
+        let store = *self;
+        spawn(async move {
+            let request = nsh_core::picker::FilePickRequest::new(true, 4);
+            for file in pick_files(request).await {
+                store.attach_file(file.name, file.mime, file.data.bytes());
+            }
+        });
+    }
+
+    /// Whether a picture can be taken here: a phone's or tablet's browser
+    /// opens its camera when asked.
+    pub fn takes_pictures(&self) -> bool {
+        cfg!(target_arch = "wasm32") && crate::ui::touch()
+    }
+
+    /// Take a picture with the camera and attach it (scaled to fit 2048 px).
+    pub fn take_picture(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store = *self;
+            spawn(async move {
+                if let Some(bytes) = crate::link::web::take_picture(2048).await {
+                    store.attach_file("photo.jpg".to_owned(), "image/jpeg".to_owned(), &bytes);
+                }
+            });
+        }
     }
 
     pub fn remove_draft_file(&self, number: u64) {

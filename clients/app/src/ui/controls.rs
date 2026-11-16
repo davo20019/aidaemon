@@ -186,6 +186,28 @@ pub fn icon_btn(
     )
 }
 
+/// The one main action as a filled, round glyph button (the composer's
+/// Send): smaller than a text button, a full touch target with its margin.
+/// `label` is what screen readers and the tooltip say.
+pub fn icon_btn_primary(
+    glyph: Glyph,
+    label: impl Into<SharedString>,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    let side = if touch() { 40.0 } else { size::CONTROL_SM };
+    frame(Variant::Primary, Size::Sm, motion::PRESS_SCALE_ICON)
+        .h(px(side))
+        .w(px(side))
+        .rounded(px(side / 2.0))
+        .accessibility_label(label.into())
+        .on_press(on_press)
+        .child(
+            icon(glyph)
+                .text_color(ink(Variant::Primary))
+                .accessibility_elements_hidden(true),
+        )
+}
+
 /// `control` with the app's tooltip.
 pub fn with_hint(label: impl IntoReactive<SharedString>, control: impl IntoElement) -> View {
     view().tooltip(hint(label)).child(control)

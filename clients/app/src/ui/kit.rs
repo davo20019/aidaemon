@@ -9,7 +9,7 @@ use std::time::Duration;
 use nsh_base::{
     Anchor, SelectEntry, SelectItem, SelectValue, ToastManager, ToastMotion, ToastOptions,
     ToastStackState, accordion, accordion_header, accordion_item, accordion_panel,
-    accordion_trigger, alert_dialog, context_menu, h_resizable, menu_item, progress,
+    accordion_trigger, alert_dialog, context_menu, h_resizable, menu, menu_item, progress,
     resizable_panel, select, sheet, switch, tab, table, table_body, table_cell, table_head,
     table_header, table_row, tabs, toast, toast_stack,
 };
@@ -452,44 +452,88 @@ impl MenuAction {
     }
 }
 
+/// One row of a menu.
+fn menu_row(action: MenuAction) -> impl IntoElement {
+    let run = action.run;
+    let shown = action.shown.clone();
+    menu_item()
+        .style_when(move || shown.as_ref().is_some_and(|f| !f()), |s| s.hidden())
+        .accessibility_label(action.label.clone())
+        .px_2()
+        .py(px(if super::touch() { 12.0 } else { 5.0 }))
+        .rounded(px(radius::SMALL))
+        .focus(|s| s.bg(colors::HOVER))
+        .hover(|s| s.bg(colors::HOVER))
+        .on_select(run)
+        .child(
+            text(action.label)
+                .text_size(px(fit::small()))
+                .text_color(colors::TEXT),
+        )
+}
+
+fn menu_surface(s: nsh_core::element::StyleRefinement) -> nsh_core::element::StyleRefinement {
+    s.bg(colors::SURFACE)
+        .border_1()
+        .border_color(colors::EDGE)
+        .rounded(px(radius::CONTROL))
+        .shadow_lg()
+        .p_1()
+        .min_w(px(180.0))
+        .transition_all()
+        .duration(motion::BASE)
+}
+
 /// `trigger` with a menu on a secondary press (right click, a long press,
 /// the context-menu key).
 pub fn with_menu(trigger: impl IntoElement, actions: Vec<MenuAction>) -> View {
     let mut menu = context_menu()
         .trigger(trigger)
-        .popup_style(|s| {
-            s.bg(colors::SURFACE)
-                .border_1()
-                .border_color(colors::EDGE)
-                .rounded(px(radius::CONTROL))
-                .shadow_lg()
-                .p_1()
-                .min_w(px(180.0))
-                .transition_all()
-                .duration(motion::BASE)
-        })
+        .popup_style(menu_surface)
         // It grows from where it was asked for, and fades as it goes.
         .popup_starting_class("opacity-0 scale-95")
         .popup_ending_class("opacity-0 scale-95");
     for action in actions {
-        let run = action.run;
-        let shown = action.shown.clone();
-        menu = menu.child(
-            menu_item()
-                .style_when(move || shown.as_ref().is_some_and(|f| !f()), |s| s.hidden())
-                .accessibility_label(action.label.clone())
-                .px_2()
-                .py(px(5.0))
-                .rounded(px(radius::SMALL))
-                .focus(|s| s.bg(colors::HOVER))
+        menu = menu.child(menu_row(action));
+    }
+    view().child(menu)
+}
+
+/// A square glyph that opens a menu when pressed (the composer's Attach):
+/// a popup at the glyph in a window, a sheet at the bottom of a phone.
+/// `label` names it for screen readers.
+pub fn press_menu(
+    glyph: super::Glyph,
+    label: impl Into<SharedString>,
+    actions: Vec<MenuAction>,
+) -> View {
+    let side = if super::touch() { 44.0 } else { 32.0 };
+    let mut menu = menu()
+        .trigger(
+            view()
+                .role(AccessibilityRole::Button)
+                .label(label.into())
+                .h(px(side))
+                .w(px(side))
+                .items_center()
+                .justify_center()
+                .rounded(px(radius::CONTROL))
+                .transition_colors()
+                .duration(motion::FAST)
                 .hover(|s| s.bg(colors::HOVER))
-                .on_select(run)
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                .focus(super::controls::focus_band)
                 .child(
-                    text(action.label)
-                        .text_size(px(fit::small()))
-                        .text_color(colors::TEXT),
+                    super::icon(glyph)
+                        .text_color(colors::MUTED)
+                        .accessibility_elements_hidden(true),
                 ),
-        );
+        )
+        .popup_style(menu_surface)
+        .popup_starting_class("opacity-0 scale-95")
+        .popup_ending_class("opacity-0 scale-95");
+    for action in actions {
+        menu = menu.child(menu_row(action));
     }
     view().child(menu)
 }

@@ -489,6 +489,12 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     app.wait_for("What should we work on?")?;
+    // Code before any project exists says how to make the first.
+    app.press("Code")?;
+    app.wait_for("No projects yet")?;
+    app.wait_for("New project")?;
+    app.press("Chat")?;
+    app.wait_for("What should we work on?")?;
     feed([
         Update::Connected,
         frame(
@@ -509,19 +515,28 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     // Its "+" starts a conversation there: the header names the project.
     app.press("New conversation in this project >> nth=0")?;
     app.wait_for("Explain this project")?;
-    app.wait_for("Acme site · /home/synthetic/acme-site")?;
-    // A new conversation says where it works: Chat leaves the project and
-    // brings the everyday starters; In a project goes back to one.
+    app.wait_for("Pick a project to work in")?;
+    // The header's switch says what a new conversation is: Chat leaves
+    // the project and brings the question and the everyday starters; Code
+    // lists the projects to work in, and a press picks another.
     app.press("Chat")?;
+    app.wait_for("What should we work on?")?;
     app.wait_for("Set a reminder")?;
-    app.press("In a project")?;
+    app.press("Code")?;
+    app.wait_for("Pick a project to work in")?;
     app.wait_for("Explain this project")?;
+    app.press("Work in Design notes")?;
     // A new conversation from the keyboard, in a project's conversation,
     // stays in that project.
     app.press("Contact form copy >> nth=0")?;
-    app.press_key("mod+n")?;
-    app.wait_for("Explain this project")?;
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
+    app.press_key("mod+n")?;
+    app.wait_for("Pick a project to work in")?;
+    // The paperclip offers pictures and files (and the camera, where a
+    // phone's browser has one).
+    app.press("Attach")?;
+    app.wait_for("Pictures")?;
+    app.wait_for("Files")?;
     Ok(())
 }
 
