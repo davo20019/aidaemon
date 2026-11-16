@@ -51,6 +51,8 @@ extern "C" {
         max_dimension: u32,
     ) -> js_sys::Promise;
 
+    #[wasm_bindgen(js_name = appleDevice)]
+    fn apple_device_js() -> bool;
     #[wasm_bindgen(js_name = pageVisible)]
     fn page_visible() -> bool;
     #[wasm_bindgen(js_name = onWake)]
@@ -73,6 +75,11 @@ pub fn download(url: &str, name: &str) {
 }
 
 /// Whether the browser has a share sheet.
+/// An iPhone, iPad or Mac: its system font is Apple's own.
+pub fn apple_device() -> bool {
+    apple_device_js()
+}
+
 pub fn can_share() -> bool {
     can_share_js()
 }

@@ -95,6 +95,11 @@ export function forgetPairingLink() {
  * phone freezes a background page, and its socket may have died meanwhile.
  */
 /** Whether the owner can see this page now. */
+// An iPhone, iPad or Mac (an iPad says it is a Mac).
+export function appleDevice() {
+  return /Macintosh|iPhone|iPad|iPod/.test(navigator.userAgent);
+}
+
 export function pageVisible() {
   return document.visibilityState === "visible";
 }

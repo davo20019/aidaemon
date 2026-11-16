@@ -139,6 +139,7 @@ pub fn App() -> impl IntoElement {
         store.set_here(folder);
     }
     store.restore();
+    ui::face::load();
     link::start(store);
     view()
         .flex_1()

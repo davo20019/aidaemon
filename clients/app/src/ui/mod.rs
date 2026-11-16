@@ -2,6 +2,7 @@
 //! Features import from here and never style `nsh_base` controls directly.
 
 pub mod controls;
+pub mod face;
 pub mod kit;
 pub mod motion;
 pub mod rich;

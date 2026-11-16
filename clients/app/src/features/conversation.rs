@@ -503,17 +503,28 @@ fn header(store: Store, session: Option<String>) -> View {
             move || {
                 view().child(dynamic(move || {
                     let coding = store.coding_on_screen();
-                    // A phone names it: the changes are the point of a
-                    // coding conversation there.
+                    // A phone shows the changes themselves, the point of
+                    // a coding conversation there: an icon like the bar's
+                    // others, its count of files on its corner.
                     if coding && store.is_compact() {
-                        let label = match store.changed_files() {
-                            Some(n) if n > 0 => format!("Changes · {n}"),
-                            _ => "Changes".to_owned(),
+                        let files = store.changed_files().unwrap_or(0);
+                        let label = match files {
+                            0 => "Changes".to_owned(),
+                            1 => "Changes, 1 file".to_owned(),
+                            n => format!("Changes, {n} files"),
                         };
                         return Some(untracked(move || {
-                            ui::btn(label, Variant::Ghost, Size::Sm, move || {
-                                store.show_changes()
-                            })
+                            let button = view().relative().child(ui::icon_btn(
+                                Glyph::Changes,
+                                label,
+                                Size::Md,
+                                move || store.show_changes(),
+                            ));
+                            if files > 0 {
+                                button.child(ui::corner_count(move || files))
+                            } else {
+                                button
+                            }
                             .into_element()
                         }));
                     }
@@ -1006,16 +1017,11 @@ fn reply_footer(
         .items_center()
         .gap_2()
         .child(stamp(at))
-        .child(ui::btn_icon(
-            Glyph::Copy,
-            "Copy",
-            Variant::Ghost,
-            Size::Sm,
-            move || {
-                set_clipboard(content());
-                store.say("Copied the reply");
-            },
-        ))
+        // An icon, as chat apps keep it: the reply is what is read.
+        .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
+            set_clipboard(content());
+            store.say("Copied the reply");
+        }))
 }
 
 /// "Today", centred between hairlines.

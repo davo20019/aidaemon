@@ -288,6 +288,8 @@ pub enum Glyph {
     Work,
     Approval,
     Inspector,
+    /// A coding conversation's changes: a file with a diff's marks.
+    Changes,
     Sidebar,
     Settings,
     Copy,
@@ -385,6 +387,7 @@ impl Glyph {
             Self::Work => "◎",
             Self::Approval => "◆",
             Self::Inspector => "▥",
+            Self::Changes => "±",
             Self::Sidebar => "▤",
             Self::Settings => "⚙",
             Self::Copy => "⧉",
@@ -476,6 +479,9 @@ impl Glyph {
             }
             Self::Inspector => {
                 r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/>"#
+            }
+            Self::Changes => {
+                r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M9 10h6M12 7v6M9 17h6"/>"#
             }
             Self::Sidebar => {
                 r#"<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>"#
@@ -1006,6 +1012,33 @@ pub fn corner_dot(tone: impl Fn() -> Tone + 'static) -> View {
         .border_color(colors::BACKGROUND)
         .bg(move || tone().color())
         .accessibility_elements_hidden(true)
+}
+
+/// A count on an icon button's corner (a coding conversation's changed
+/// files): small, in the accent, ringed off what it sits on.
+pub fn corner_count(count: impl Fn() -> usize + 'static) -> View {
+    view()
+        .absolute()
+        .top(px(2.0))
+        .right(px(0.0))
+        .min_w(px(16.0))
+        .h(px(16.0))
+        .px(px(4.0))
+        .rounded_full()
+        .items_center()
+        .justify_center()
+        .border(px(1.5))
+        .border_color(colors::BACKGROUND)
+        .bg(colors::ACCENT)
+        .accessibility_elements_hidden(true)
+        .child(
+            text(move || count().to_string())
+                .tabular_nums()
+                .text_size(px(10.0))
+                .line_height(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors::ON_STATUS),
+        )
 }
 
 /// The app's name at the top as a button home, as other chat apps do:
