@@ -1634,10 +1634,20 @@ fn submit(store: Store, adding: Adding, form: ProviderForm, ready: Rc<dyn Fn() -
 }
 
 fn bots(store: Store, bots: &[BotInfo]) -> View {
-    let mut section = view().gap_2().child(section_label("Connected bots"));
+    let mut section =
+        view()
+            .gap_2()
+            .child(section_label("Connected bots"))
+            .child(view().flex_row().child(ui::btn(
+                "Reach it from your phone",
+                Variant::Outline,
+                Size::Sm,
+                move || crate::features::setup::reach_from_phone(store),
+            )));
     if bots.is_empty() {
         return section.child(muted(
-            "No bots were connected at runtime. Bots in config.toml are settings above.",
+            "No bots yet. Connect a Telegram, Slack or Discord bot to talk to your agent from \
+             your phone. Bots in config.toml are settings above.",
         ));
     }
     let mut rows = Vec::new();

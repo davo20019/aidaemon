@@ -37,6 +37,14 @@ pub(crate) fn load(config_path: &Path) -> Option<Progress> {
     (!progress.channel_done || !progress.greeted).then_some(progress)
 }
 
+/// What the file says, finished or not; a default when there is none.
+pub(crate) fn load_any(config_path: &Path) -> Progress {
+    std::fs::read_to_string(path(config_path))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 pub(crate) fn save(config_path: &Path, progress: &Progress) -> anyhow::Result<()> {
     let path = path(config_path);
     std::fs::write(&path, serde_json::to_string_pretty(progress)?)?;

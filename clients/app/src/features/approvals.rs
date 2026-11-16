@@ -156,7 +156,8 @@ pub fn card(store: Store, approval: Approval) -> View {
         .child(when(teach, || {
             detail_text(
                 "Your agent asks before anything that sends, posts, deletes or spends. Allow \
-                 it once, for this conversation, or always; Deny stops just this step."
+                 it once, for this conversation, or always; Deny stops just this step. What it may \
+                 do on its own is under Settings, Checks and limits."
                     .to_string(),
             )
         }))

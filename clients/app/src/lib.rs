@@ -59,6 +59,15 @@ pub fn feed(updates: impl IntoIterator<Item = aidaemon_client_core::Update>) {
 /// `type`: tests answer them as the daemon would.
 static SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 static SETTINGS_SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+static SETUP_SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Every setup step an [`Offline`] root queued, as JSON, oldest first.
+pub fn setup_sent() -> Vec<String> {
+    SETUP_SENT
+        .lock()
+        .map(|s| s.iter().map(|(_, json)| json.clone()).collect())
+        .unwrap_or_default()
+}
 
 /// Every settings change an [`Offline`] root queued, as JSON, oldest first.
 pub fn settings_sent() -> Vec<String> {
@@ -115,10 +124,12 @@ pub fn Offline() -> impl IntoElement {
                 sent.push((id, kind.to_owned()));
             }
         }
-        if let Ok(mut sent) = SETTINGS_SENT.lock() {
-            for (id, json) in store.queued_of("change_settings") {
-                if !sent.iter().any(|(i, _)| *i == id) {
-                    sent.push((id, json));
+        for (log, kind) in [(&SETTINGS_SENT, "change_settings"), (&SETUP_SENT, "setup")] {
+            if let Ok(mut sent) = log.lock() {
+                for (id, json) in store.queued_of(kind) {
+                    if !sent.iter().any(|(i, _)| *i == id) {
+                        sent.push((id, json));
+                    }
                 }
             }
         }

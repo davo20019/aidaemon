@@ -1,9 +1,10 @@
-//! First run. With no daemon to sign in to: where the agent runs (this
-//! computer, or a machine elsewhere paired with its printed link). Then the
-//! daemon's own setup steps: connect a model (the one that must pass; each
-//! provider says how it bills), and optionally reach the agent from a
-//! phone, which ends when the owner's first message there has been
-//! answered.
+//! First run. With no daemon to sign in to, the desktop app starts one on
+//! this computer at once (pairing with a machine elsewhere is the other way
+//! in; a browser or terminal asks). Then the daemon's own setup step:
+//! connect a model, one click when one is found here. The first
+//! conversation opens next; reaching the agent from a phone waits until the
+//! owner asks for it in Settings, and ends when their first message there
+//! has been answered.
 
 use aidaemon_client_protocol::{Billing, ProviderChoice, SecretText, SetupAction, SetupStep};
 use nsh_core::prelude::*;
@@ -56,8 +57,111 @@ fn billing_words(billing: Billing) -> &'static str {
     }
 }
 
-/// No daemon yet: run one here, or connect to one elsewhere.
+/// The desktop app was opened to run the agent here: start it on the first
+/// look, once per launch, rather than ask (a retry is a button).
+static STARTED_HERE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The owner asked for the phone step (from Settings). First run skips it,
+/// so the first conversation comes before any bot token.
+static PHONE_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Open the phone step: talk to the agent from Telegram, Slack or Discord.
+pub fn reach_from_phone(store: Store) {
+    PHONE_ASKED.store(true, std::sync::atomic::Ordering::Relaxed);
+    store.setup_step(SetupAction::Detect);
+}
+
+/// No daemon yet. The desktop app starts one here at once; pairing with a
+/// machine elsewhere is the other way in. A browser or a terminal asks.
 pub fn where_page(store: Store) -> View {
+    let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
+    let auto = link::RUNS_DAEMON && !terminal;
+    if auto
+        && !STARTED_HERE.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && store.starting_daemon().is_none()
+    {
+        spawn(async move { link::install_here(store) });
+    }
+    let elsewhere = signal(!link::RUNS_DAEMON);
+    frame(
+        view()
+            .gap_4()
+            .child(heading(if auto {
+                "Welcome to AIdaemon"
+            } else {
+                "Where should your agent run?"
+            }))
+            .child(lead(
+                "AIdaemon is an agent that works for you around the clock. It runs on a computer \
+                 you choose; this app is how you talk to it.",
+            ))
+            .child(when(link::RUNS_DAEMON, move || run_here(store, auto)))
+            .child(when(
+                move || auto && !elsewhere.get(),
+                move || {
+                    view().flex_row().child(btn(
+                        "Run it on another machine instead",
+                        Variant::Ghost,
+                        Size::Sm,
+                        move || elsewhere.set(true),
+                    ))
+                },
+            ))
+            .child(when(
+                move || !auto || elsewhere.get(),
+                move || pair_elsewhere(store),
+            )),
+    )
+}
+
+/// This computer: started already (`auto`), or a button.
+fn run_here(store: Store, auto: bool) -> View {
+    ui::surface()
+        .p_4()
+        .gap_2()
+        .child(
+            text("On this computer")
+                .text_size(px(type_scale::BASE))
+                .font_weight(FontWeight::MEDIUM),
+        )
+        .child(lead(
+            "Starts now and whenever you log in. No administrator password. It is offline while \
+             this computer sleeps.",
+        ))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(when(
+                    move || !auto || store.starting_daemon().is_some_and(|(_, failed)| failed),
+                    move || {
+                        btn(
+                            if auto { "Try again" } else { "Run it here" },
+                            Variant::Primary,
+                            Size::Md,
+                            move || link::install_here(store),
+                        )
+                        .disabled(move || {
+                            store.starting_daemon().is_some_and(|(_, failed)| !failed)
+                        })
+                    },
+                ))
+                .child(dynamic(move || {
+                    let (what, failed) = store.starting_daemon()?;
+                    Some(untracked(move || {
+                        if failed {
+                            status(what, Tone::Danger).flex_1().min_w(px(0.0))
+                        } else {
+                            ui::working(what).flex_1().min_w(px(0.0))
+                        }
+                    }))
+                })),
+        )
+}
+
+/// A daemon elsewhere, paired with the link it printed.
+fn pair_elsewhere(store: Store) -> View {
     let link_text = signal(String::new());
     let name = signal(String::from("Desktop"));
     let pairing = signal(None::<(String, Tone)>);
@@ -71,86 +175,39 @@ pub fn where_page(store: Store) -> View {
             }
         });
     };
-    frame(
-        view()
-            .gap_4()
-            .child(heading("Where should your agent run?"))
-            .child(lead(
-                "AIdaemon is an agent that works for you around the clock. It runs on a computer \
-                 you choose; this app is how you talk to it.",
-            ))
-            .child(when(link::RUNS_DAEMON, move || {
-                ui::surface()
-                    .p_4()
-                    .gap_2()
-                    .child(
-                        text("On this computer")
-                            .text_size(px(type_scale::BASE))
-                            .font_weight(FontWeight::MEDIUM),
-                    )
-                    .child(lead(
-                        "Starts now and whenever you log in. No administrator password. It is \
-                         offline while this computer sleeps.",
-                    ))
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                btn("Run it here", Variant::Primary, Size::Md, move || {
-                                    link::install_here(store)
-                                })
-                                .disabled(move || {
-                                    store.starting_daemon().is_some_and(|(_, failed)| !failed)
-                                }),
-                            )
-                            .child(dynamic(move || {
-                                let (what, failed) = store.starting_daemon()?;
-                                Some(untracked(move || {
-                                    status(what, if failed { Tone::Danger } else { Tone::Accent })
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                }))
-                            })),
-                    )
-            }))
-            .child(
-                ui::surface()
-                    .p_4()
-                    .gap_2()
-                    .child(
-                        text("On another machine")
-                            .text_size(px(type_scale::BASE))
-                            .font_weight(FontWeight::MEDIUM),
-                    )
-                    .child(lead(
-                        "A server or another computer that stays on. Start `aidaemon` there; \
-                         it prints a link and a code. Paste the link here.",
-                    ))
-                    .child(labeled(
-                        "Pairing link",
-                        field("http://…/client/v1/next/#offer=…", link_text),
-                    ))
-                    .child(labeled("This device's name", field("Desktop", name)))
-                    .child(
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                btn("Connect", Variant::Secondary, Size::Md, pair)
-                                    .disabled(move || link_text.with(|l| l.trim().is_empty())),
-                            )
-                            .child(dynamic(move || {
-                                let (message, tone) = pairing.get()?;
-                                Some(untracked(move || {
-                                    status(message, tone).flex_1().min_w(px(0.0))
-                                }))
-                            })),
-                    ),
-            ),
-    )
+    ui::surface()
+        .p_4()
+        .gap_2()
+        .child(
+            text("On another machine")
+                .text_size(px(type_scale::BASE))
+                .font_weight(FontWeight::MEDIUM),
+        )
+        .child(lead(
+            "A server or another computer that stays on. Start `aidaemon` there; it prints a link \
+             and a code. Paste the link here.",
+        ))
+        .child(labeled(
+            "Pairing link",
+            field("http://…/client/v1/next/#offer=…", link_text),
+        ))
+        .child(labeled("This device's name", field("Desktop", name)))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(
+                    btn("Connect", Variant::Secondary, Size::Md, pair)
+                        .disabled(move || link_text.with(|l| l.trim().is_empty())),
+                )
+                .child(dynamic(move || {
+                    let (message, tone) = pairing.get()?;
+                    Some(untracked(move || {
+                        status(message, tone).flex_1().min_w(px(0.0))
+                    }))
+                })),
+        )
 }
 
 /// The daemon's setup steps.
@@ -159,7 +216,19 @@ pub fn page(store: Store) -> View {
     view().flex_1().child(dynamic(move || {
         let step = step.get();
         Some(untracked(move || match step {
-            Some(SetupStep::Channel) => channel_step(store).key("setup-channel"),
+            Some(SetupStep::Channel) if PHONE_ASKED.load(std::sync::atomic::Ordering::Relaxed) => {
+                channel_step(store).key("setup-channel")
+            }
+            // First run: the first conversation before any bot token; the
+            // phone step waits in Settings.
+            Some(SetupStep::Channel) => {
+                spawn(async move {
+                    if !store.setup_busy() {
+                        store.setup_step(SetupAction::SkipChannel);
+                    }
+                });
+                opening(store).key("setup-opening")
+            }
             Some(SetupStep::Starting) => starting(store).key("setup-starting"),
             _ => model_step(store).key("setup-model"),
         }))
@@ -187,6 +256,16 @@ fn problem(store: Store) -> View {
         }))
 }
 
+fn opening(store: Store) -> View {
+    frame(
+        view()
+            .gap_4()
+            .child(heading("Ready"))
+            .child(ui::working("Opening your first conversation"))
+            .child(problem(store)),
+    )
+}
+
 fn starting(store: Store) -> View {
     frame(
         view()
@@ -212,7 +291,12 @@ fn model_step(store: Store) -> View {
     let key = signal(String::new());
     let model = signal(String::new());
     let base_url = signal(String::new());
-    let redirect = signal(String::new());
+    let more = signal(false);
+    let has_found = computed(move || {
+        store
+            .setup()
+            .is_some_and(|s| s.found.iter().any(|m| m.works))
+    });
     let connect = move || {
         let Some(preset) = chosen.get_untracked() else {
             return;
@@ -232,22 +316,205 @@ fn model_step(store: Store) -> View {
             .gap_4()
             .child(heading("Connect a model"))
             .child(lead(
-                "Your agent thinks with an AI model. Pick one you already have; nothing is saved \
-                 until it answers a test.",
+                "Your agent thinks with an AI model. Nothing is saved until it answers a test.",
             ))
-            // Found on this machine, tested.
+            // A tested model found here is one click; the rest wait under
+            // "Use something else".
             .child(dynamic(move || {
                 let found = store.setup().map(|s| s.found).unwrap_or_default();
-                (!found.is_empty()).then(|| {
-                    untracked(move || {
-                        let mut list = view().gap_2().child(ui::section_label("Found here"));
-                        for (index, model) in found.into_iter().enumerate() {
-                            let detail = if model.works {
-                                format!("{} · {}", model.source, billing_words(model.billing))
-                            } else {
-                                format!("{} · did not answer: {}", model.source, model.detail)
-                            };
-                            list = list.child(
+                let (index, best) = found.iter().enumerate().find(|(_, m)| m.works)?;
+                let (index, best) = (index, best.clone());
+                Some(untracked(move || {
+                    ui::surface()
+                        .p_4()
+                        .gap_2()
+                        .child(
+                            text(format!("Found: {}", best.name))
+                                .text_size(px(type_scale::BASE))
+                                .font_weight(FontWeight::MEDIUM),
+                        )
+                        .child(lead(format!(
+                            "{} · {}. It answered a test just now.",
+                            best.source,
+                            billing_words(best.billing)
+                        )))
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    btn(
+                                        format!("Continue with {}", best.name),
+                                        Variant::Primary,
+                                        Size::Md,
+                                        move || {
+                                            store.setup_step(SetupAction::UseFound {
+                                                index: index as u32,
+                                            })
+                                        },
+                                    )
+                                    .disabled(move || store.setup_busy()),
+                                )
+                                .child(when(
+                                    move || store.setup_busy(),
+                                    || ui::working("Connecting"),
+                                )),
+                        )
+                }))
+            }))
+            .child(when(
+                move || has_found.get() && !more.get(),
+                move || {
+                    view().flex_row().child(btn(
+                        "Use something else",
+                        Variant::Ghost,
+                        Size::Sm,
+                        move || more.set(true),
+                    ))
+                },
+            ))
+            .child(when(
+                move || more.get() || !has_found.get(),
+                move || choices(store, chosen, key, model, base_url, connect),
+            ))
+            .child(lead(
+                "Your conversations and memory stay on the machine AIdaemon runs on. There is no \
+                 account and no usage data is sent; it talks to the model you pick and the sites \
+                 you ask about.",
+            ))
+            .child(problem(store)),
+    )
+}
+
+/// Every other way in: other models found here, a sign-in, a provider key.
+fn choices(
+    store: Store,
+    chosen: Signal<Option<String>>,
+    key: Signal<String>,
+    model: Signal<String>,
+    base_url: Signal<String>,
+    connect: impl Fn() + Copy + 'static,
+) -> View {
+    let redirect = signal(String::new());
+    view()
+        .gap_4()
+        // Found on this machine, tested.
+        .child(dynamic(move || {
+            let found = store.setup().map(|s| s.found).unwrap_or_default();
+            (!found.is_empty()).then(|| {
+                untracked(move || {
+                    let mut list = view().gap_2().child(ui::section_label("Found here"));
+                    for (index, model) in found.into_iter().enumerate() {
+                        let detail = if model.works {
+                            format!("{} · {}", model.source, billing_words(model.billing))
+                        } else {
+                            format!("{} · did not answer: {}", model.source, model.detail)
+                        };
+                        list = list.child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .child(text(model.name).text_size(px(type_scale::BASE)))
+                                        .child(lead(detail)),
+                                )
+                                .child(when(model.works, move || {
+                                    btn("Use it", Variant::Primary, Size::Sm, move || {
+                                        store.setup_step(SetupAction::UseFound {
+                                            index: index as u32,
+                                        })
+                                    })
+                                    .disabled(move || store.setup_busy())
+                                })),
+                        );
+                    }
+                    list
+                })
+            })
+        }))
+        // A sign-in under way.
+        .child(dynamic(move || {
+            let sign_in = store.setup().and_then(|s| s.sign_in)?;
+            Some(untracked(move || {
+                let url = sign_in.url.clone();
+                let mut card = ui::surface()
+                    .p_4()
+                    .gap_2()
+                    .child(
+                        text("Sign in to ChatGPT")
+                            .text_size(px(type_scale::BASE))
+                            .font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(btn(
+                        "Open the sign-in page",
+                        Variant::Primary,
+                        Size::Sm,
+                        move || {
+                            drop(open_url(url.clone()));
+                        },
+                    ))
+                    .child(ui::code(sign_in.url.clone()).number_of_lines(2));
+                if sign_in.paste {
+                    card = card
+                        .child(lead(
+                            "When the browser shows it cannot reach the page it ends on, \
+                                 copy that page's address and paste it here.",
+                        ))
+                        .child(field(
+                            "http://localhost:1455/auth/callback?code=…",
+                            redirect,
+                        ))
+                        .child(
+                            btn("Finish sign-in", Variant::Secondary, Size::Sm, move || {
+                                store.setup_step(SetupAction::FinishSignIn {
+                                    redirect: redirect.get_untracked(),
+                                })
+                            })
+                            .disabled(move || {
+                                store.setup_busy() || redirect.with(|r| r.trim().is_empty())
+                            }),
+                        );
+                } else {
+                    card = card.child(ui::working("Waiting for you to finish in the browser"));
+                }
+                card
+            }))
+        }))
+        // Every provider, each saying how it bills.
+        .child(ui::section_label("Or connect"))
+        .child(dynamic(move || {
+            let providers = store.setup().map(|s| s.providers).unwrap_or_default();
+            Some(untracked(move || {
+                let mut list = view().gap_2();
+                for option in providers {
+                    let preset = option.preset.clone();
+                    let sign_in = !option.needs_key;
+                    let action = move || {
+                        if sign_in {
+                            store.setup_step(SetupAction::SignIn { paste: false });
+                        } else {
+                            chosen.set(Some(preset.clone()));
+                            model.set(String::new());
+                            key.set(String::new());
+                            base_url.set(String::new());
+                        }
+                    };
+                    let open = {
+                        let preset = option.preset.clone();
+                        move || chosen.with(|c| c.as_deref() == Some(preset.as_str()))
+                    };
+                    let key_url = option.key_url.clone();
+                    let needs_base_url = option.needs_base_url;
+                    let preset_id = option.preset.clone();
+                    list = list.child(
+                        view()
+                            .gap_2()
+                            .child(
                                 view()
                                     .flex_row()
                                     .items_center()
@@ -256,179 +523,73 @@ fn model_step(store: Store) -> View {
                                         view()
                                             .flex_1()
                                             .min_w(px(0.0))
-                                            .child(text(model.name).text_size(px(type_scale::BASE)))
-                                            .child(lead(detail)),
-                                    )
-                                    .child(when(model.works, move || {
-                                        btn("Use it", Variant::Primary, Size::Sm, move || {
-                                            store.setup_step(SetupAction::UseFound {
-                                                index: index as u32,
-                                            })
-                                        })
-                                        .disabled(move || store.setup_busy())
-                                    })),
-                            );
-                        }
-                        list
-                    })
-                })
-            }))
-            // A sign-in under way.
-            .child(dynamic(move || {
-                let sign_in = store.setup().and_then(|s| s.sign_in)?;
-                Some(untracked(move || {
-                    let url = sign_in.url.clone();
-                    let mut card = ui::surface()
-                        .p_4()
-                        .gap_2()
-                        .child(
-                            text("Sign in to ChatGPT")
-                                .text_size(px(type_scale::BASE))
-                                .font_weight(FontWeight::MEDIUM),
-                        )
-                        .child(btn(
-                            "Open the sign-in page",
-                            Variant::Primary,
-                            Size::Sm,
-                            move || {
-                                drop(open_url(url.clone()));
-                            },
-                        ))
-                        .child(ui::code(sign_in.url.clone()).number_of_lines(2));
-                    if sign_in.paste {
-                        card = card
-                            .child(lead(
-                                "When the browser shows it cannot reach the page it ends on, \
-                                 copy that page's address and paste it here.",
-                            ))
-                            .child(field(
-                                "http://localhost:1455/auth/callback?code=…",
-                                redirect,
-                            ))
-                            .child(
-                                btn("Finish sign-in", Variant::Secondary, Size::Sm, move || {
-                                    store.setup_step(SetupAction::FinishSignIn {
-                                        redirect: redirect.get_untracked(),
-                                    })
-                                })
-                                .disabled(move || {
-                                    store.setup_busy() || redirect.with(|r| r.trim().is_empty())
-                                }),
-                            );
-                    } else {
-                        card = card.child(ui::working("Waiting for you to finish in the browser"));
-                    }
-                    card
-                }))
-            }))
-            // Every provider, each saying how it bills.
-            .child(ui::section_label("Or connect"))
-            .child(dynamic(move || {
-                let providers = store.setup().map(|s| s.providers).unwrap_or_default();
-                Some(untracked(move || {
-                    let mut list = view().gap_2();
-                    for option in providers {
-                        let preset = option.preset.clone();
-                        let sign_in = !option.needs_key;
-                        let action = move || {
-                            if sign_in {
-                                store.setup_step(SetupAction::SignIn { paste: false });
-                            } else {
-                                chosen.set(Some(preset.clone()));
-                                model.set(String::new());
-                                key.set(String::new());
-                                base_url.set(String::new());
-                            }
-                        };
-                        let open = {
-                            let preset = option.preset.clone();
-                            move || chosen.with(|c| c.as_deref() == Some(preset.as_str()))
-                        };
-                        let key_url = option.key_url.clone();
-                        let needs_base_url = option.needs_base_url;
-                        let preset_id = option.preset.clone();
-                        list = list.child(
-                            view()
-                                .gap_2()
-                                .child(
-                                    view()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_3()
-                                        .child(
-                                            view()
-                                                .flex_1()
-                                                .min_w(px(0.0))
-                                                .child(
-                                                    text(option.name.clone())
-                                                        .text_size(px(type_scale::BASE)),
-                                                )
-                                                .child(lead(billing_words(option.billing))),
-                                        )
-                                        .child(
-                                            btn(
-                                                if sign_in { "Sign in" } else { "Use a key" },
-                                                if sign_in {
-                                                    Variant::Primary
-                                                } else {
-                                                    Variant::Outline
-                                                },
-                                                Size::Sm,
-                                                action,
+                                            .child(
+                                                text(option.name.clone())
+                                                    .text_size(px(type_scale::BASE)),
                                             )
-                                            .disabled(move || store.setup_busy()),
-                                        ),
-                                )
-                                .child(when(open, move || {
-                                    let key_url = key_url.clone();
-                                    let mut form = view().gap_2().pl_3();
-                                    if !key_url.is_empty() {
-                                        let url = key_url.clone();
-                                        form = form.child(btn(
-                                            "Get a key",
-                                            Variant::Ghost,
-                                            Size::Sm,
-                                            move || {
-                                                drop(open_url(url.clone()));
+                                            .child(lead(billing_words(option.billing))),
+                                    )
+                                    .child(
+                                        btn(
+                                            if sign_in { "Sign in" } else { "Use a key" },
+                                            if sign_in {
+                                                Variant::Primary
+                                            } else {
+                                                Variant::Outline
                                             },
-                                        ));
-                                    }
-                                    if needs_base_url {
-                                        form = form.child(labeled(
-                                            "Address",
-                                            field("https://api.example.com/v1", base_url),
-                                        ));
-                                    }
-                                    let preset = preset_id.clone();
-                                    let check = {
-                                        let preset = preset.clone();
+                                            Size::Sm,
+                                            action,
+                                        )
+                                        .disabled(move || store.setup_busy()),
+                                    ),
+                            )
+                            .child(when(open, move || {
+                                let key_url = key_url.clone();
+                                let mut form = view().gap_2().pl_3();
+                                if !key_url.is_empty() {
+                                    let url = key_url.clone();
+                                    form = form.child(btn(
+                                        "Get a key",
+                                        Variant::Ghost,
+                                        Size::Sm,
                                         move || {
-                                            model.set(String::new());
-                                            store.setup_step(SetupAction::CheckKey {
-                                                provider: ProviderChoice {
-                                                    preset: preset.clone(),
-                                                    base_url: base_url
-                                                        .get_untracked()
-                                                        .trim()
-                                                        .to_owned(),
-                                                    ..ProviderChoice::default()
-                                                },
-                                                key: SecretText(key.get_untracked()),
-                                            })
-                                        }
-                                    };
-                                    // The account's own models, once the key checks out.
-                                    let checked = move || {
-                                        store
-                                            .setup()
-                                            .and_then(|s| s.checked)
-                                            .filter(|c| c.preset == preset)
-                                    };
-                                    let checked_models = checked.clone();
-                                    form.child(labeled(
-                                        "API key",
-                                        secret_field("Paste the key", key),
-                                    ))
+                                            drop(open_url(url.clone()));
+                                        },
+                                    ));
+                                }
+                                if needs_base_url {
+                                    form = form.child(labeled(
+                                        "Address",
+                                        field("https://api.example.com/v1", base_url),
+                                    ));
+                                }
+                                let preset = preset_id.clone();
+                                let check = {
+                                    let preset = preset.clone();
+                                    move || {
+                                        model.set(String::new());
+                                        store.setup_step(SetupAction::CheckKey {
+                                            provider: ProviderChoice {
+                                                preset: preset.clone(),
+                                                base_url: base_url
+                                                    .get_untracked()
+                                                    .trim()
+                                                    .to_owned(),
+                                                ..ProviderChoice::default()
+                                            },
+                                            key: SecretText(key.get_untracked()),
+                                        })
+                                    }
+                                };
+                                // The account's own models, once the key checks out.
+                                let checked = move || {
+                                    store
+                                        .setup()
+                                        .and_then(|s| s.checked)
+                                        .filter(|c| c.preset == preset)
+                                };
+                                let checked_models = checked.clone();
+                                form.child(labeled("API key", secret_field("Paste the key", key)))
                                     .child(
                                         view()
                                             .flex_row()
@@ -513,15 +674,13 @@ fn model_step(store: Store) -> View {
                                                 ))
                                         },
                                     ))
-                                }))
-                                .child(ui::separator()),
-                        );
-                    }
-                    list
-                }))
+                            }))
+                            .child(ui::separator()),
+                    );
+                }
+                list
             }))
-            .child(problem(store)),
-    )
+        }))
 }
 
 fn channel_step(store: Store) -> View {
@@ -550,8 +709,9 @@ fn channel_step(store: Store) -> View {
                     .map(|m| format!("{m} is connected. "))
                     .unwrap_or_default();
                 format!(
-                    "{model}You can also talk to your agent in a chat app. This is optional: \
-                     you can do it later in Settings."
+                    "{model}Talk to your agent from Telegram, Slack or Discord too: make a \
+                     bot there, paste its token, then send it a message. You can come back to \
+                     this from Settings."
                 )
             }))
             .child(dynamic(move || {
@@ -565,6 +725,7 @@ fn channel_step(store: Store) -> View {
                             Tone::Success,
                         ))
                         .child(btn("Continue", Variant::Primary, Size::Md, move || {
+                            PHONE_ASKED.store(false, std::sync::atomic::Ordering::Relaxed);
                             store.setup_step(SetupAction::Finish)
                         })),
                     Some(wait) => view()
@@ -633,7 +794,8 @@ fn channel_step(store: Store) -> View {
             }))
             .child(problem(store))
             .child(
-                btn("Skip for now", Variant::Ghost, Size::Sm, move || {
+                btn("Not now", Variant::Ghost, Size::Sm, move || {
+                    PHONE_ASKED.store(false, std::sync::atomic::Ordering::Relaxed);
                     store.setup_step(SetupAction::SkipChannel)
                 })
                 .disabled(move || store.setup_busy()),

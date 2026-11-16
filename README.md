@@ -43,7 +43,7 @@ brew install davo20019/tap/aidaemon
 cargo install aidaemon
 ```
 
-Then open the AIdaemon app (`aidaemon app`, or `aidaemon-app` from a release) and choose **Run it here**: the daemon starts now and at login, with no administrator password. The app finds a model already on the computer (a ChatGPT sign-in, a provider key in the environment) or connects one you pick, and tests it before saving anything; each provider says whether it uses your plan or bills per token. Connecting Telegram, Slack or Discord is optional and can wait.
+Then open the AIdaemon app (`aidaemon app`, or `aidaemon-app` from a release). The desktop app starts the daemon on this computer right away, now and at login, with no administrator password (**Run it on another machine instead** pairs with a server). It finds a model already on the computer (a ChatGPT sign-in, a provider key in the environment) and offers it in one click, or connects one you pick; each is tested before anything is saved, and each provider says whether it uses your plan or bills per token. Your first conversation opens next. To talk to your agent from Telegram, Slack or Discord later, use **Settings → Reach it from your phone**.
 
 On a server, run `aidaemon` there with no config: it prints a link and a one-time code. Reach the machine's port 8788 through an SSH tunnel or your own HTTPS tunnel, open the link on your laptop or phone, and set it up from there (the code pairs the first device only). Prefer a terminal? `aidaemon setup` connects the model right there.
 

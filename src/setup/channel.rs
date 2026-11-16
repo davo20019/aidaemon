@@ -30,16 +30,23 @@ pub(crate) fn greeting(agent_name: &str, on_server: bool) -> (String, Vec<String
         "I run on this computer. While it sleeps, I'm offline"
     };
     let text = format!(
-        "Hi, I'm {name}. I can research, write, organize files, run commands and keep an eye \
-         on things for you on a schedule. {place}.\n\n\
+        "Hi, I'm {name}. I research, write, organize files, run commands and keep an eye on \
+         things for you on a schedule. {place}.\n\n\
          I read and look things up on my own. Before anything that sends, posts, deletes or \
          spends, I ask you first.\n\n\
-         Want a different name or personality for me? Just say so. Or start with one of these:"
+         Try one of these, or ask for anything. Want a different name or personality? Just say \
+         so. To talk to me from your phone, open Settings and choose Reach it from your phone."
     );
+    // Something that finishes in a minute first, then one that pays off
+    // tomorrow.
     let suggestions = vec![
-        "What can you do on this computer?".to_string(),
+        if on_server {
+            "What can you do on this server?".to_string()
+        } else {
+            "Look through my Downloads folder and suggest what to clean up".to_string()
+        },
+        "Find today's three biggest tech stories and summarize each in two lines".to_string(),
         "Every weekday at 8, send me a short summary of news on a topic I pick".to_string(),
-        "Look through my Downloads folder and suggest what to clean up".to_string(),
     ];
     (text, suggestions)
 }
@@ -89,7 +96,22 @@ impl ChannelSetup {
         action: SetupAction,
         sessions: &[String],
     ) -> Result<SetupState, String> {
-        let mut progress = self.progress().ok_or("This daemon is already set up")?;
+        let mut progress = match self.progress() {
+            Some(progress) => progress,
+            // Set up already: the owner asks for the chat step from
+            // Settings. It opens again; the greeting is not posted twice.
+            None if matches!(action, SetupAction::Detect) => {
+                let progress = Progress {
+                    channel_done: false,
+                    greeted: true,
+                    bot: None,
+                    ..progress::load_any(&self.config_path)
+                };
+                progress::save(&self.config_path, &progress).map_err(|e| e.to_string())?;
+                progress
+            }
+            None => return Err("This daemon is already set up".into()),
+        };
         match action {
             SetupAction::ConnectChannel {
                 platform,
@@ -257,9 +279,59 @@ mod tests {
         assert!(text.contains("sends, posts, deletes or spends"));
         assert!(text.contains("While it sleeps, I'm offline"));
         assert_eq!(suggestions.len(), 3);
-        let (server, _) = greeting("", true);
+        assert!(suggestions[0].contains("Downloads"));
+        let (server, on_server) = greeting("", true);
+        assert!(!on_server[0].contains("Downloads"));
         assert!(server.starts_with("Hi, I'm AIdaemon."));
         assert!(!server.contains("sleeps"));
+    }
+
+    #[tokio::test]
+    async fn the_chat_step_opens_again_from_settings_without_a_second_greeting() {
+        use crate::events::EventStoreForTests;
+        use crate::state::SqliteStateStore;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let db = db.to_str().unwrap();
+        let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
+        let state = Arc::new(
+            SqliteStateStore::for_tests(db, 100, None, embeddings)
+                .await
+                .unwrap(),
+        );
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{db}"))
+            .await
+            .unwrap();
+        let events = Arc::new(crate::events::EventStore::new(pool).await.unwrap());
+        let config_path = dir.path().join("config.toml");
+        let setup = ChannelSetup {
+            config_path: config_path.clone(),
+            state,
+            events,
+        };
+        // Finished: nothing left, and any other step is refused.
+        progress::save(
+            &config_path,
+            &Progress {
+                channel_done: true,
+                greeted: true,
+                model: "Synthetic model".into(),
+                ..Progress::default()
+            },
+        )
+        .unwrap();
+        assert!(setup.state(&[]).await.is_none());
+        assert!(setup.step(SetupAction::SkipChannel, &[]).await.is_err());
+
+        let opened = setup.step(SetupAction::Detect, &[]).await.unwrap();
+        assert_eq!(opened.step, SetupStep::Channel);
+        assert_eq!(opened.model.as_deref(), Some("Synthetic model"));
+        let progress = progress::load(&config_path).unwrap();
+        assert!(!progress.channel_done && progress.greeted);
+
+        let done = setup.step(SetupAction::SkipChannel, &[]).await.unwrap();
+        assert_eq!(done.step, SetupStep::Done);
+        assert!(progress::load(&config_path).is_none());
     }
 
     #[test]

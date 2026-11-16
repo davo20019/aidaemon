@@ -356,7 +356,8 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
 }
 
 #[test]
-fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -> Result<(), String> {
+fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -> Result<(), String>
+{
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     feed([
