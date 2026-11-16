@@ -1195,6 +1195,7 @@ fn composer(store: Store, session: Option<String>) -> View {
         let session = session.clone();
         computed(move || session.as_deref().is_some_and(|id| store.is_running(id)))
     };
+    let ongoing = session.is_some();
     let field = element_ref();
     let dragging = signal(false);
     // Enter's steer, held a moment so ⌘↩ can make it a queue instead.
@@ -1345,13 +1346,28 @@ fn composer(store: Store, session: Option<String>) -> View {
                         // A phone would raise its keyboard over the page.
                         .auto_focus(!touch)
                         .placeholder(move || match store.connection() {
-                            // A phone's field is narrow: the hint about
-                            // commands is the list that `/` brings.
                             Connection::Online if store.needs_project() => {
                                 "Choose a project first".to_owned()
                             }
-                            Connection::Online if touch => "Message AIdaemon…".to_owned(),
-                            Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
+                            Connection::Online => {
+                                // The field says what to write here.
+                                let ask = if running.get() {
+                                    "Add to the work or queue what's next"
+                                } else if ongoing {
+                                    "Reply"
+                                } else if store.new_is_code() {
+                                    "Describe the change, fix or task"
+                                } else {
+                                    "Ask anything, or tell it what to do"
+                                };
+                                // A phone's field is narrow: the hint about
+                                // commands is the list that `/` brings.
+                                if touch {
+                                    ask.to_owned()
+                                } else {
+                                    format!("{ask} (/ for commands)")
+                                }
+                            }
                             Connection::Connecting
                             | Connection::NeedsPairing
                             | Connection::NoDaemon => "Connecting to the daemon…".to_owned(),
