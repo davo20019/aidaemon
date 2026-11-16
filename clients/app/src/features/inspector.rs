@@ -6,9 +6,7 @@
 
 use nsh_core::prelude::*;
 
-use aidaemon_client_protocol::TaskSummary;
-
-use crate::store::{ActivityKind, CHANGES_TAB, DETAIL_TABS, Store, now_ms};
+use crate::store::{ActivityKind, CHANGES_TAB, DETAIL_TABS, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, btn, colors, radius, section_label, type_scale};
 
 pub fn inspector(store: Store) -> View {
@@ -26,15 +24,27 @@ pub fn inspector(store: Store) -> View {
                 .items_center()
                 .px_4()
                 .child(
+                    // Only a coding conversation has this pane. A phone
+                    // shows its changes alone (the steps are under each
+                    // reply, and a pane over the chat hides them as they
+                    // run); a desktop has Steps beside them, to watch a
+                    // turn's commands and output next to the chat.
                     view().flex_1().child(
-                        when(coding, move || {
-                            ui::tab_bar(store.inspector_tab(), &DETAIL_TABS)
-                        })
-                        .otherwise(|| {
-                            text("Steps")
-                                .role(AccessibilityRole::Header)
-                                .text_size(px(ui::fit::body()))
-                                .font_weight(FontWeight::SEMIBOLD)
+                        when(
+                            move || coding.get() && !store.is_compact(),
+                            move || ui::tab_bar(store.inspector_tab(), &DETAIL_TABS),
+                        )
+                        .otherwise(move || {
+                            text(move || {
+                                if store.is_compact() {
+                                    "Changes"
+                                } else {
+                                    "Steps"
+                                }
+                            })
+                            .role(AccessibilityRole::Header)
+                            .text_size(px(ui::fit::body()))
+                            .font_weight(FontWeight::SEMIBOLD)
                         }),
                     ),
                 )
@@ -48,7 +58,8 @@ pub fn inspector(store: Store) -> View {
                 )),
         )
         .child(dynamic(move || {
-            let changes = coding.get() && store.inspector_tab().get() == CHANGES_TAB;
+            let changes =
+                coding.get() && (store.is_compact() || store.inspector_tab().get() == CHANGES_TAB);
             Some(untracked(move || {
                 if changes {
                     super::code::code(store)
@@ -59,63 +70,16 @@ pub fn inspector(store: Store) -> View {
         }))
 }
 
-/// The Steps tab: the selected conversation's running work, then its
-/// current turn.
+/// The Steps tab: the current turn's steps as they happen, its commands'
+/// output in a terminal. (Work running in the background is over the
+/// composer.)
 fn steps(store: Store) -> View {
-    let running = computed(move || {
-        let selected = store.selected();
-        store
-            .running()
-            .into_iter()
-            .filter(|t| Some(&t.session_id) == selected.as_ref())
-            .collect::<Vec<TaskSummary>>()
-    });
     view().flex_1().child(
         scroll().flex_1().child(
             view()
                 .px_3()
                 .pb_4()
                 .gap_2()
-                .child(when(
-                    move || !running.with(Vec::is_empty),
-                    move || {
-                        view().gap_1().child(section_label("Running")).child(each(
-                            running,
-                            |t| t.id.clone(),
-                            move |task, _| {
-                                let id = task.with_untracked(|t| t.id.clone());
-                                let started = task.with_untracked(|t| t.started_at_ms);
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
-                                    .child(
-                                        text(move || task.with(|t| t.description.clone()))
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .number_of_lines(1)
-                                            .text_size(px(type_scale::SM)),
-                                    )
-                                    // How long it has run: a clock tick a second.
-                                    .child(
-                                        text(move || {
-                                            store.tick();
-                                            ui::time::span(now_ms().saturating_sub(started) / 1000)
-                                        })
-                                        .tabular_nums()
-                                        .text_size(px(type_scale::XS))
-                                        .text_color(colors::FAINT),
-                                    )
-                                    .child(btn("Cancel", Variant::Ghost, Size::Sm, move || {
-                                        store.cancel(&id)
-                                    }))
-                            },
-                        ))
-                    },
-                ))
                 .child(section_label("This turn"))
                 .child(timeline(store)),
         ),
@@ -141,7 +105,7 @@ fn timeline(store: Store) -> View {
         .child(when(
             move || items.with(Vec::is_empty),
             || {
-                text("Tool calls and steps of the current turn show here as they happen.")
+                text("No turn is running. Each reply lists the tools it used under it.")
                     .px_2()
                     .text_size(px(type_scale::SM))
                     .text_color(colors::FAINT)

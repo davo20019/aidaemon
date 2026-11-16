@@ -101,8 +101,9 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     ]);
     app.wait_for("Fix the flaky test")?;
     app.press("Fix the flaky test >> nth=0")?;
-    // A conversation away from code has its steps a press away.
-    app.press("Steps")?;
+    // A conversation away from code has no details pane: its steps are
+    // in the chat, as they run and under the reply after.
+    assert!(app.press("Steps").is_err());
     feed([
         frame(
             r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-1","event":{"type":"user_message","session_id":"app:synthetic-1","text":"Why does it fail on CI?","origin":"app"}}"#,
@@ -125,8 +126,7 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
         ),
     ]);
     app.wait_for("Why does it fail on CI?")?;
-    app.wait_for("terminal")?;
-    app.wait_for("test port_race ... FAILED")?;
+    app.wait_for("1 tool so far: terminal")?;
     app.wait_for("git push origin fix-port")?;
     app.wait_for("Allow once")?;
     // The conversation waits on its owner: it leads the list.
@@ -136,7 +136,6 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     feed([frame(
         r#"{"type":"event","seq":4,"at_ms":6,"session_id":"app:synthetic-1","event":{"type":"turn_completed","turn_id":"t1","text":"It races on the shared port.","state":"completed"}}"#,
     )]);
-    app.wait_for("Turn finished.")?;
     // The reply keeps a line of what its turn did.
     app.wait_for("Used 1 tool: terminal")?;
     Ok(())
@@ -425,10 +424,11 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     ]);
     app.wait_for("Count the files")?;
     app.press("Count the files >> nth=0")?;
-    app.press("Steps")?;
-    // The working line and the steps both say what it is doing.
-    app.wait_for("text:terminal: find . -name '*.rs'...  ·  2 tools so far")?;
-    app.wait_for("read_file")?;
+    // The working line says what it is doing; the tools so far are a
+    // line over it; the background work is over the composer, with Cancel.
+    app.wait_for("text:terminal: find . -name '*.rs'...")?;
+    app.wait_for("2 tools so far: read_file, terminal")?;
+    app.wait_for("Cancel")?;
     Ok(())
 }
 
@@ -445,10 +445,8 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     ]);
     app.wait_for("Add the contact form")?;
     app.press("Add the contact form >> nth=0")?;
-    // A conversation that has not touched code has its steps alone, a
-    // press away.
-    app.press("Steps")?;
-    app.wait_for("This turn")?;
+    // A conversation that has not touched code has no details pane.
+    assert!(app.press("Changes and steps").is_err());
     // The turn's first file write gives it Changes and opens them.
     feed([
         frame(
@@ -459,11 +457,8 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
         ),
     ]);
     app.wait_for("Reading changes…")?;
-    // Its steps one press away, and back.
-    app.press("Steps")?;
-    app.wait_for("This turn")?;
-    app.press("Changes")?;
-    app.wait_for("Reading changes…")?;
+    // A phone's pane is the changes alone: the steps are in the chat.
+    assert!(app.press("Steps").is_err());
     // The changes arrive; a file opens on its diff, which fills the pane.
     let patch = r#"diff --git a/src/contact.rs b/src/contact.rs\n--- a/src/contact.rs\n+++ b/src/contact.rs\n@@ -1,2 +1,3 @@\n-fn send() {}\n+fn send() {\n+}\n fn main() {}\n"#;
     let id = wait_sent("get_changes")?;
@@ -950,17 +945,26 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
             r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-11","channel":"app","title":"Run the build","writable":true}]}}"#,
         ),
     ]);
-    // A terminal sends Ctrl+I as Tab: the steps' key there is O.
-    app.wait_for(r"text:/O steps/")?;
     // The terminal starts on the conversation; the list is a key away.
     app.press("label:Conversations")?;
     app.wait_for("Run the build")?;
     app.press("Run the build >> nth=0")?;
-    app.press("label:Steps")?;
+    // Work on code has the details pane; its Steps tab shows the output.
     feed([
         frame(
             r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-11","event":{"type":"turn_started","turn_id":"t11","session_id":"app:synthetic-11","origin":"app"}}"#,
         ),
+        frame(
+            r#"{"type":"event","at_ms":2,"session_id":"app:synthetic-11","event":{"type":"turn_status","turn_id":"t11","status":{"kind":"tool_completed","name":"edit_file","summary":"build.rs"}}}"#,
+        ),
+    ]);
+    // Work on code gets the details; Steps is the tab beside Changes.
+    // A terminal sends Ctrl+I as Tab: the steps' key there is O.
+    app.wait_for(r"text:/O steps/")?;
+    app.wait_for("label:Changes and steps")?;
+    app.press("label:Changes and steps")?;
+    app.press("label:Steps")?;
+    feed([
         // Colours, a redrawn progress line and a wide character.
         frame(
             r#"{"type":"event","at_ms":2,"session_id":"app:synthetic-11","event":{"type":"turn_status","turn_id":"t11","status":{"kind":"tool_progress","name":"terminal","chunk":"\u001b[32mCompiling\u001b[0m 10%\rCompiling 100%\n✅ 漢字 build ok\n"}}}"#,

@@ -120,6 +120,9 @@ pub enum SidebarView {
     Project(String),
 }
 
+/// Said when the details are asked for in a conversation away from code.
+const NO_DETAILS: &str = "Each reply lists the tools it used under it";
+
 const LAST_PROJECT_KEY: &str = "aidaemon.last_project";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
 const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
@@ -1482,22 +1485,20 @@ impl Store {
         self.composer_focus.update(|n| *n += 1);
     }
 
-    /// Open the details on the Changes of the conversation on screen (its
-    /// Steps when it has no changes).
+    /// Open the details on the Changes of the conversation on screen. A
+    /// conversation away from code has no details: its steps are under
+    /// each reply.
     pub fn show_changes(&self) {
-        let coding = self
-            .selected
-            .get_untracked()
-            .is_some_and(|id| untracked(|| self.is_coding(&id)));
-        self.inspector_tab
-            .set(if coding { CHANGES_TAB } else { STEPS_TAB });
+        if !untracked(|| self.coding_on_screen()) {
+            self.say(NO_DETAILS);
+            return;
+        }
+        self.inspector_tab.set(CHANGES_TAB);
         if self.compact.get_untracked() {
             self.sidebar.set(false);
         }
         self.inspector.set(true);
-        if coding {
-            self.refresh_changes();
-        }
+        self.refresh_changes();
     }
 
     pub fn set_inspector(&self, open: bool) {
@@ -1545,8 +1546,19 @@ impl Store {
         self.sidebar.set(true);
     }
 
+    /// The details pane, which only a coding conversation has.
+    pub fn details_open(&self) -> bool {
+        self.inspector.get() && self.coding_on_screen()
+    }
+
     pub fn open_inspector(&self) {
+        if !untracked(|| self.coding_on_screen()) {
+            self.say(NO_DETAILS);
+            return;
+        }
         if self.compact.get_untracked() {
+            // A phone's details are the changes alone.
+            self.inspector_tab.set(CHANGES_TAB);
             self.sidebar.set(false);
             self.inspector.set(true);
         } else {

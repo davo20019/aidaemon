@@ -110,6 +110,7 @@ pub fn page(store: Store, session: Option<String>) -> View {
         .child(view().flex_1().child(body))
         .child(offers(store, session.clone()))
         .child(notices(store))
+        .child(running_work(store, session.clone()))
         .child(match session.clone() {
             // A group hears what is sent from here: the owner says so first.
             Some(id) if untracked(|| store.is_group(&id)) => {
@@ -123,6 +124,58 @@ pub fn page(store: Store, session: Option<String>) -> View {
             }
             _ => composer(store, session).into_element(),
         })
+}
+
+/// This conversation's work running in the background, over the composer
+/// where the eye already is: what it is, how long it has run, Cancel.
+fn running_work(store: Store, session: Option<String>) -> View {
+    let Some(session) = session else {
+        return view();
+    };
+    let tasks = computed(move || {
+        store
+            .running()
+            .into_iter()
+            .filter(|t| t.session_id == session)
+            .collect::<Vec<_>>()
+    });
+    view().items_center().px_4().child(each(
+        tasks,
+        |t| t.id.clone(),
+        move |task, _| {
+            let id = task.with_untracked(|t| t.id.clone());
+            let started = task.with_untracked(|t| t.started_at_ms);
+            view()
+                .w_full()
+                .max_w(px(size::COLUMN))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .pl_1()
+                .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
+                .child(
+                    text(move || task.with(|t| t.description.clone()))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .text_size(px(ui::fit::small()))
+                        .text_color(colors::MUTED),
+                )
+                // How long it has run: a clock tick a second.
+                .child(
+                    text(move || {
+                        store.tick();
+                        ui::time::span(crate::store::now_ms().saturating_sub(started) / 1000)
+                    })
+                    .tabular_nums()
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                )
+                .child(ui::btn("Cancel", Variant::Ghost, Size::Sm, move || {
+                    store.cancel(&id)
+                }))
+        },
+    ))
 }
 
 /// In a group conversation, instead of the composer until the owner
@@ -496,17 +549,21 @@ fn header(store: Store, session: Option<String>) -> View {
         ))
         .child(when(
             {
-                // A new conversation has no steps or changes to show yet.
+                // Only a coding conversation has details: a chat's steps
+                // are under each reply.
                 let started = session.is_some();
-                move || started && (store.is_compact() || !store.inspector_open())
+                move || {
+                    started
+                        && store.coding_on_screen()
+                        && (store.is_compact() || !store.inspector_open())
+                }
             },
             move || {
                 view().child(dynamic(move || {
-                    let coding = store.coding_on_screen();
                     // A phone shows the changes themselves, the point of
                     // a coding conversation there: an icon like the bar's
                     // others, its count of files on its corner.
-                    if coding && store.is_compact() {
+                    if store.is_compact() {
                         let files = store.changed_files().unwrap_or(0);
                         let label = match files {
                             0 => "Changes".to_owned(),
@@ -528,9 +585,8 @@ fn header(store: Store, session: Option<String>) -> View {
                             .into_element()
                         }));
                     }
-                    let label = if coding { "Changes and steps" } else { "Steps" };
                     Some(untracked(move || {
-                        ui::icon_btn(Glyph::Inspector, label, Size::Md, move || {
+                        ui::icon_btn(Glyph::Inspector, "Changes and steps", Size::Md, move || {
                             store.open_inspector()
                         })
                         .into_element()
@@ -843,14 +899,18 @@ fn transcript_list(
                         2 => column.child(note(content)),
                         5 => column.child(day_break(content)),
                         3 => column.child(live(store, session)),
-                        6 => column.child(activity(store, move || {
-                            row.with(|r| match r {
-                                Some(Row::Activity(tools, secs, calls)) => {
-                                    (tools.clone(), *secs, calls.clone())
-                                }
-                                _ => (Vec::new(), 0, Vec::new()),
-                            })
-                        })),
+                        6 => column.child(activity(
+                            store,
+                            move || {
+                                row.with(|r| match r {
+                                    Some(Row::Activity(tools, secs, calls)) => {
+                                        (tools.clone(), *secs, calls.clone())
+                                    }
+                                    _ => (Vec::new(), 0, Vec::new()),
+                                })
+                            },
+                            false,
+                        )),
                         7 => column.child(retry(store, session)),
                         8 => column.child(ui::working(
                             "Working in the background · the result comes here",
@@ -895,13 +955,14 @@ fn transcript_list(
 fn activity(
     store: Store,
     data: impl Fn() -> (Vec<String>, u64, Vec<ToolCallInfo>) + Clone + 'static,
+    live: bool,
 ) -> View {
     let open = signal(untracked(|| store.activity_mode()) == ActivityMode::Expanded);
     let summary = {
         let data = data.clone();
         move || {
             let (tools, secs, _) = data();
-            activity_summary(&tools, secs)
+            activity_summary(&tools, secs, live)
         }
     };
     view()
@@ -948,8 +1009,9 @@ fn tool_call(number: usize, tool: &str, call: Option<ToolCallInfo>) -> View {
         ))
 }
 
-/// "Used 4 tools: read_file ×2, web_search, terminal · 12s".
-fn activity_summary(tools: &[String], secs: u64) -> String {
+/// "Used 4 tools: read_file ×2, web_search, terminal · 12s"; while the
+/// turn runs, "2 tools so far: read_file, terminal".
+fn activity_summary(tools: &[String], secs: u64, live: bool) -> String {
     let mut counted: Vec<(&str, usize)> = Vec::new();
     for tool in tools {
         match counted.iter_mut().find(|(name, _)| name == tool) {
@@ -977,7 +1039,11 @@ fn activity_summary(tools: &[String], secs: u64) -> String {
         1..60 => format!(" · {secs}s"),
         _ => format!(" · {}m {}s", secs / 60, secs % 60),
     };
-    format!("Used {count} {noun}: {names}{more}{took}")
+    if live {
+        format!("{count} {noun} so far: {names}{more}")
+    } else {
+        format!("Used {count} {noun}: {names}{more}{took}")
+    }
 }
 
 /// Under a failed or stopped turn: send its message again.
@@ -1192,29 +1258,44 @@ fn live(store: Store, session: String) -> View {
         let session = session.clone();
         computed(move || store.live(&session).map(|l| l.streamed).unwrap_or_default())
     };
-    let status = computed(move || {
-        // Waiting on its owner is the news, not the last tool it ran.
-        let waiting = store.approvals_for(&session).len();
-        if waiting > 0 {
-            return if waiting == 1 {
-                "Waiting for your approval".to_string()
-            } else {
-                format!("Waiting for {waiting} approvals")
-            };
-        }
-        let live = store.live(&session);
-        let status = live
-            .as_ref()
-            .and_then(|l| l.status.clone())
-            .unwrap_or_else(|| "Working…".into());
-        match live.map(|l| l.tools.len()).unwrap_or(0) {
-            0 => status,
-            1 => format!("{status}  ·  1 tool so far"),
-            n => format!("{status}  ·  {n} tools so far"),
+    let status = computed({
+        let session = session.clone();
+        move || {
+            // Waiting on its owner is the news, not the last tool it ran.
+            let waiting = store.approvals_for(&session).len();
+            if waiting > 0 {
+                return if waiting == 1 {
+                    "Waiting for your approval".to_string()
+                } else {
+                    format!("Waiting for {waiting} approvals")
+                };
+            }
+            store
+                .live(&session)
+                .and_then(|l| l.status)
+                .unwrap_or_else(|| "Working…".into())
         }
     });
+    // The tools so far, a line that opens to each in place (what the
+    // reply keeps once done): the steps without leaving the chat.
+    let so_far = {
+        let session = session.clone();
+        move || {
+            store
+                .live(&session)
+                .map(|l| (l.tools, 0, l.calls))
+                .unwrap_or_default()
+        }
+    };
+    let has_tools = {
+        let so_far = so_far.clone();
+        computed(move || !so_far().0.is_empty())
+    };
     view()
         .gap_2()
+        .child(when(has_tools, move || {
+            activity(store, so_far.clone(), true)
+        }))
         .child(when(
             move || streamed.with(|s| !s.is_empty()),
             move || markdown(move || streamed.get().into(), || true),

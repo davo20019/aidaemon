@@ -122,7 +122,7 @@ pub fn shell(store: Store) -> View {
                     ))
                     .child(ui::drawer(
                         Placement::Right,
-                        move || store.inspector_open(),
+                        move || store.details_open(),
                         move || store.close_panes(),
                         inspector(store),
                     ))
@@ -156,7 +156,7 @@ pub fn shell(store: Store) -> View {
                             ui::size::INSPECTOR,
                             260.0,
                             520.0,
-                            move || store.inspector_open() && wide.get(),
+                            move || store.details_open() && wide.get(),
                             inspector(store),
                         )),
                 )
@@ -258,9 +258,9 @@ pub fn key_line(store: Store) -> View {
             (key_label("mod+n"), "new"),
             (key_label("mod+b"), "list"),
         ];
+        // Only work on code has the details (changes, and steps beside).
         if store.coding_on_screen() {
             keys.push((key_label("mod+d"), "changes"));
-        } else {
             keys.push((key_label(steps_key()), "steps"));
         }
         if let Some(id) = store.selected()
@@ -287,7 +287,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         CommandItem::new("sidebar", "Show or hide the sidebar")
             .group("View")
             .shortcut("mod+b"),
-        CommandItem::new("inspector", "Show or hide the steps")
+        CommandItem::new("inspector", "Show or hide the changes and steps")
             .group("View")
             .shortcut(steps_key()),
         CommandItem::new("changes", "Show the changes of this conversation")
