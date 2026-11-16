@@ -27,6 +27,11 @@ pub mod colors {
 
     /// What dims the page behind a drawer or a sheet.
     pub const SCRIM: AdaptiveColor = tone(rgb_a(0x000000, 0.32), rgb_a(0x000000, 0.55));
+    /// Behind a picture opened over the page: near black in both modes.
+    pub const LIGHTBOX: AdaptiveColor = tone(rgb_a(0x000000, 0.92), rgb_a(0x000000, 0.92));
+    /// A round control over [`LIGHTBOX`] and the glyph on it.
+    pub const LIGHTBOX_CONTROL: AdaptiveColor = tone(rgb_a(0xffffff, 0.14), rgb_a(0xffffff, 0.14));
+    pub const ON_LIGHTBOX: AdaptiveColor = tone(rgb(0xffffff), rgb(0xffffff));
     /// No colour: a fill that is not there.
     pub const TRANSPARENT: AdaptiveColor = tone(rgb_a(0x000000, 0.0), rgb_a(0x000000, 0.0));
 

@@ -319,6 +319,10 @@ pub enum Glyph {
     Mic,
     /// A folder.
     Folder,
+    /// Save a copy.
+    Download,
+    /// Open outside the app.
+    External,
 }
 
 impl Glyph {
@@ -356,6 +360,8 @@ impl Glyph {
             Self::Columns => "◫",
             Self::Mic => "◉",
             Self::Folder => "▸",
+            Self::Download => "⤓",
+            Self::External => "↗",
         }
     }
 }
@@ -371,6 +377,12 @@ impl Glyph {
                 r#"<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>"#
             }
             Self::Close => r#"<path d="M18 6 6 18M6 6l12 12"/>"#,
+            Self::External => {
+                r#"<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#
+            }
+            Self::Download => {
+                r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>"#
+            }
             Self::Clock => r#"<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>"#,
             Self::Search => r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#,
             Self::Chat => {

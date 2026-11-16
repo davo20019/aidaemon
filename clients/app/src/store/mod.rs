@@ -260,6 +260,7 @@ pub struct Store {
     /// project picker for it shows.
     moving: Signal<Option<String>>,
     moving_open: Signal<bool>,
+    viewing: Signal<Option<crate::ui::Viewed>>,
     /// When the owner last looked at the automations (this device): runs
     /// after it are news.
     automations_seen: Signal<u64>,
@@ -311,6 +312,7 @@ impl Store {
             renaming: signal(None),
             moving: signal(None),
             moving_open: signal(false),
+            viewing: signal(None),
             automations_seen: signal(
                 nsh_core::storage::Storage::get_item(AUTOMATIONS_SEEN_KEY)
                     .and_then(|v| v.parse().ok())
@@ -1810,6 +1812,16 @@ impl Store {
     /// Whether the project picker for a move shows.
     pub fn moving_open(&self) -> Signal<bool> {
         self.moving_open
+    }
+
+    /// The picture shown over the page, if any (a press on a sent picture
+    /// opens it; Close, Escape or the backdrop closes it).
+    pub fn viewing(&self) -> Signal<Option<crate::ui::Viewed>> {
+        self.viewing
+    }
+
+    pub fn view_picture(&self, picture: crate::ui::Viewed) {
+        self.viewing.set(Some(picture));
     }
 
     /// Start (`Some`) or stop editing a conversation's name.

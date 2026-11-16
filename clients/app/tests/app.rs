@@ -605,6 +605,12 @@ fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
     // Laid out before it loads: its 2:1 shape, at most 320 wide.
     assert!(w > 100.0 && w <= 320.0, "{w} x {h}");
     assert!((w / h - 2.0).abs() < 0.01, "{w} x {h}");
+    // A press opens it over the page (not a browser tab); Close closes it.
+    app.press("Picture: shot.png")?;
+    app.wait_for("Open in browser")?;
+    app.wait_for("Close")?;
+    app.press("Close")?;
+    app.wait_for_gone("Open in browser", std::time::Duration::from_secs(5))?;
     Ok(())
 }
 

@@ -17,6 +17,7 @@ use nsh_base::{
 use nsh_core::prelude::*;
 use nsh_core::time::now;
 
+use super::controls::{Glyph, icon, with_hint};
 use super::motion;
 use super::theme::{colors, fit, radius, text as type_scale};
 
@@ -1136,4 +1137,127 @@ fn pick_body(
                 .text_color(colors::TEXT),
         )
         .child(list)
+}
+
+/// A picture sent in a conversation, opened over the page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Viewed {
+    pub url: String,
+    pub name: String,
+    /// Its size in pixels, when the daemon knows it.
+    pub pixels: Option<(u32, u32)>,
+}
+
+/// What the viewer offers besides closing: save a copy (the web) or open
+/// it outside the app (a window).
+pub struct ViewerAction {
+    pub label: &'static str,
+    pub glyph: Glyph,
+    pub run: std::rc::Rc<dyn Fn(&Viewed)>,
+}
+
+/// The picture viewer: the picture over a dark backdrop, as large as fits,
+/// its name, the action and Close above it. A press on the picture or the
+/// backdrop, Escape or back closes it. Mount once; `viewing` holds what it
+/// shows.
+pub fn picture_viewer(viewing: Signal<Option<Viewed>>, action: ViewerAction) -> View {
+    let action = std::rc::Rc::new(action);
+    view().child(dynamic(move || {
+        let shown = viewing.get()?;
+        let action = action.clone();
+        Some(untracked(move || viewer(shown, &action, viewing)))
+    }))
+}
+
+fn viewer(
+    shown: Viewed,
+    action: &std::rc::Rc<ViewerAction>,
+    viewing: Signal<Option<Viewed>>,
+) -> View {
+    let close = move || viewing.set(None);
+    let ratio = shown
+        .pixels
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| w as f32 / h as f32);
+    let picture = image(shown.url.clone())
+        .max_w(percentage(1.0))
+        .max_h(percentage(1.0))
+        .object_fit(ResizeMode::Contain);
+    let picture = match ratio {
+        Some(ratio) => picture.w_full().aspect_ratio(ratio),
+        None => picture.w_full().h_full(),
+    };
+    let run = {
+        let shown = shown.clone();
+        let action = action.clone();
+        move || (action.run)(&shown)
+    };
+    let bar = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .child(
+            text(shown.name.clone())
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::ON_LIGHTBOX),
+        )
+        .child(viewer_btn(action.glyph, action.label, run))
+        .child(viewer_btn(Glyph::Close, "Close", close));
+    view().child(
+        dialog()
+            .label(format!("Picture: {}", shown.name))
+            .on_cancel(close)
+            .child(
+                view()
+                    .absolute()
+                    .inset_0()
+                    .bg(colors::LIGHTBOX)
+                    .flex_col()
+                    .pt_safe_area()
+                    .pb_safe_area()
+                    .test_id("picture-viewer")
+                    .child(bar)
+                    .child(
+                        // The backdrop: a press here (the picture too) closes.
+                        view()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .w_full()
+                            .p_4()
+                            .items_center()
+                            .justify_center()
+                            .focusable(false)
+                            .on_press(close)
+                            .child(picture),
+                    ),
+            ),
+    )
+}
+
+/// A round glyph button over the viewer's dark backdrop.
+fn viewer_btn(glyph: Glyph, label: &'static str, on_press: impl Fn() + 'static) -> View {
+    let side = if super::touch() { 44.0 } else { 36.0 };
+    with_hint(
+        label,
+        nsh_base::button()
+            .w(px(side))
+            .h(px(side))
+            .rounded_full()
+            .items_center()
+            .justify_center()
+            .bg(colors::LIGHTBOX_CONTROL)
+            .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+            .accessibility_label(label)
+            .on_press(on_press)
+            .child(
+                icon(glyph)
+                    .text_color(colors::ON_LIGHTBOX)
+                    .accessibility_elements_hidden(true),
+            ),
+    )
 }

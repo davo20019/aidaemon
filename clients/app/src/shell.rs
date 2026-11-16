@@ -164,6 +164,7 @@ pub fn shell(store: Store) -> View {
         }))
         .child(when(palette, move || palette_dialog(store, palette)))
         .child(crate::features::sidebar::move_picker(store))
+        .child(crate::ui::picture_viewer(store.viewing(), picture_action()))
         .child(ui::toasts(
             move || store.toast(),
             move || store.dismiss_toast(),
@@ -470,5 +471,30 @@ fn steps_key() -> &'static str {
         "mod+o"
     } else {
         "mod+i"
+    }
+}
+
+/// What the picture viewer offers: the browser saves a copy; a window opens
+/// it in the system's browser, where it can be saved.
+fn picture_action() -> crate::ui::ViewerAction {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::ui::ViewerAction {
+            label: "Download",
+            glyph: crate::ui::Glyph::Download,
+            run: std::rc::Rc::new(|shown: &crate::ui::Viewed| {
+                crate::link::web::download(&shown.url, &shown.name)
+            }),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::ui::ViewerAction {
+            label: "Open in browser",
+            glyph: crate::ui::Glyph::External,
+            run: std::rc::Rc::new(|shown: &crate::ui::Viewed| {
+                drop(nsh_core::prelude::open_url(shown.url.clone()))
+            }),
+        }
     }
 }

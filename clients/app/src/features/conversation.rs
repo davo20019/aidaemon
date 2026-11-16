@@ -1005,12 +1005,17 @@ fn files(store: Store, attached: impl Fn() -> Vec<AttachmentRef> + 'static, mine
                 let open = url.clone();
                 if file.is_image() && idiom() != Idiom::Terminal {
                     let pixels = file.width.zip(file.height);
+                    let name = file.name.clone();
                     list = list.child(ui::picture(
                         url,
                         format!("Picture: {}", file.name),
                         pixels,
                         move || {
-                            open_file(open.clone());
+                            store.view_picture(ui::Viewed {
+                                url: open.clone(),
+                                name: name.clone(),
+                                pixels,
+                            });
                         },
                     ));
                 } else {

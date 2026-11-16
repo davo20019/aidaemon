@@ -144,3 +144,17 @@ export function takePicture(maxDimension) {
     input.click();
   });
 }
+
+/**
+ * Save a file the page can reach (same origin) under `name`: the browser's
+ * own download, without leaving the page.
+ */
+export function downloadUrl(url, name) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
