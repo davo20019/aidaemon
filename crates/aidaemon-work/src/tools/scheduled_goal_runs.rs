@@ -745,6 +745,7 @@ impl ScheduledGoalRuns {
         let mut pending = 0usize;
         let mut running = 0usize;
         let mut blocked = 0usize;
+        let mut missed = 0usize;
         for run in &runs {
             match run.status.as_str() {
                 "failed" => failed += 1,
@@ -752,12 +753,13 @@ impl ScheduledGoalRuns {
                 "pending" => pending += 1,
                 "running" => running += 1,
                 "blocked" => blocked += 1,
+                crate::goals::GOAL_RUN_MISSED => missed += 1,
                 _ => {}
             }
         }
 
         let mut out = format!(
-            "**Scheduled Run History**\n\n- Goal: {}\n- ID: {}\n- Showing: {} run(s)\n- Status mix: completed {}, failed {}, running {}, pending {}, blocked {}\n",
+            "**Scheduled Run History**\n\n- Goal: {}\n- ID: {}\n- Showing: {} run(s)\n- Status mix: completed {}, failed {}, running {}, pending {}, blocked {}, missed {}\n",
             goal.description,
             goal.id,
             runs.len(),
@@ -765,7 +767,8 @@ impl ScheduledGoalRuns {
             failed,
             running,
             pending,
-            blocked
+            blocked,
+            missed
         );
 
         if let Some(recovery) = self.state.get_scheduled_recovery_state(&goal.id).await? {

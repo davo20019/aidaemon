@@ -37,7 +37,12 @@ pub async fn active_scheduled_root_task_id<S: SchedulerStore + ?Sized>(
         .ok()?
         .into_iter()
         .filter(|run| is_scheduled_cycle_trigger(&run.trigger_type))
-        .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
+        .filter(|run| {
+            !matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "cancelled" | crate::goals::GOAL_RUN_MISSED
+            )
+        })
         .find_map(|run| run.root_task_id)
 }
 

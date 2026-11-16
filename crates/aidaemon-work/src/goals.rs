@@ -488,6 +488,11 @@ pub struct WorkProject {
     pub updated_at: String,
 }
 
+/// The status of a scheduled occurrence that never ran: the daemon was not
+/// running when it was due, and it was past its catch-up window when the
+/// daemon came back. A closed run, but neither a success nor a failure.
+pub const GOAL_RUN_MISSED: &str = "missed";
+
 /// One execution of a goal. Finite goals normally have one run; each scheduled
 /// firing gets a distinct run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -499,7 +504,8 @@ pub struct GoalRun {
     pub trigger_type: String,
     pub schedule_id: Option<String>,
     pub root_task_id: Option<String>,
-    /// "pending", "running", "completed", "failed", "blocked", or "cancelled"
+    /// "pending", "running", "completed", "failed", "blocked", "cancelled",
+    /// or [`GOAL_RUN_MISSED`]
     pub status: String,
     pub outcome_summary: Option<String>,
     pub started_at: String,

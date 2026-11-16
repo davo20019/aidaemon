@@ -18,6 +18,12 @@
         "name": "Inbox digest",
         "recent_runs": [
           {
+            "finished_ms": 1767092400000,
+            "outcome": "missed",
+            "started_ms": 1767088800000,
+            "summary": "The daemon wasn't running when this was due."
+          },
+          {
             "finished_ms": 1767002460000,
             "outcome": "failed",
             "started_ms": 1767002400000,

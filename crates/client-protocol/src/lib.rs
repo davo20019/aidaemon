@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 27;
+pub const PROTOCOL_MINOR: u16 = 28;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -829,6 +829,10 @@ pub enum RunOutcome {
     /// It stopped on something it needs (an answer, access, a fix).
     Blocked,
     Cancelled,
+    /// It was due but never ran: the daemon was not running then, and it
+    /// was too late to catch up when it came back (protocol 1.28). Not a
+    /// failure. An older client reads it as `Unknown`.
+    Missed,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -2637,6 +2641,32 @@ mod tests {
                 pane: Pane::Unknown
             }
         );
+    }
+
+    /// A run outcome added later (`missed`, protocol 1.28) still decodes
+    /// in a client that predates it, as `Unknown`: the frame is never lost.
+    #[test]
+    fn a_missed_run_decodes_and_an_unknown_outcome_is_kept() {
+        let run: AutomationRun =
+            serde_json::from_str(r#"{"started_ms":1,"outcome":"missed"}"#).unwrap();
+        assert_eq!(run.outcome, RunOutcome::Missed);
+        // What a client built before 1.28 does with it: its enum had no
+        // `missed`, so the `#[serde(other)]` arm takes it.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderOutcome {
+            Done,
+            #[serde(other)]
+            Unknown,
+        }
+        let older: OlderOutcome = serde_json::from_str(r#""missed""#).unwrap();
+        assert!(matches!(older, OlderOutcome::Unknown));
+        assert!(matches!(
+            serde_json::from_str::<OlderOutcome>(r#""done""#).unwrap(),
+            OlderOutcome::Done
+        ));
+        let later: RunOutcome = serde_json::from_str(r#""postponed""#).unwrap();
+        assert_eq!(later, RunOutcome::Unknown);
     }
 
     #[test]

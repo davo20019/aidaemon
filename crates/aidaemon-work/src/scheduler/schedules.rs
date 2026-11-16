@@ -5,6 +5,9 @@ use super::*;
 /// How soon a one-shot that failed to fire is tried again.
 const ONE_SHOT_RETRY_SECS: i64 = 60;
 
+/// What a missed run's record says, as the owner reads it in History.
+const MISSED_RUN_SUMMARY: &str = "The daemon wasn't running when this was due.";
+
 impl GoalCycle {
     /// Check for due schedules across active orchestration goals and enqueue tasks.
     ///
@@ -335,6 +338,22 @@ impl GoalCycle {
                 schedule.next_run_at = next.to_rfc3339();
                 schedule.updated_at = now_ts.clone();
                 self.state.update_goal_schedule(&schedule).await?;
+                // The miss is part of the automation's history (its History
+                // and last-run line), not only a notice: a run that was due
+                // and never ran must stay provable. It is recorded closed and
+                // apart from the failure budget: a miss is not a failure.
+                if let Err(error) = self
+                    .state
+                    .record_missed_goal_run(
+                        &goal.id,
+                        Some(&schedule.id),
+                        &due.to_rfc3339(),
+                        MISSED_RUN_SUMMARY,
+                    )
+                    .await
+                {
+                    warn!(goal_id = %goal.id, %error, "Failed to record the missed run");
+                }
                 let msg = format!(
                     "Missed the {} run of \"{}\": the daemon wasn't running then, and it is \
                      too late to be useful now. Next run: {}.",

@@ -987,6 +987,12 @@ fn server_samples() -> Vec<ServerFrame> {
                 next_run_ms: None,
                 recent_runs: vec![
                     AutomationRun {
+                        started_ms: 1_767_088_800_000,
+                        finished_ms: Some(1_767_092_400_000),
+                        outcome: RunOutcome::Missed,
+                        summary: Some("The daemon wasn't running when this was due.".into()),
+                    },
+                    AutomationRun {
                         started_ms: 1_767_002_400_000,
                         finished_ms: Some(1_767_002_460_000),
                         outcome: RunOutcome::Failed,

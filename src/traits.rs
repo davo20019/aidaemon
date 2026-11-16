@@ -33,11 +33,11 @@ pub use aidaemon_events::provider::{
 };
 #[allow(unused_imports)]
 pub use aidaemon_work::goals::{
-    BackgroundSpawn, DEFAULT_PROJECT_ID, Goal, GoalRun, GoalSchedule, GoalTokenBudgetStatus,
-    HandoffArtifact, NotificationEntry, REMOTE_CHANGE_ACTIVITY, ScheduledFailureKind,
-    ScheduledRecoveryDisposition, ScheduledRecoveryState, ScheduledRunHealth, ScheduledRunState,
-    Task, TaskActivity, TaskAttempt, TaskAttemptPatch, TaskHandoff, TaskJournalEntry,
-    TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary, WorkerProfile,
+    BackgroundSpawn, DEFAULT_PROJECT_ID, GOAL_RUN_MISSED, Goal, GoalRun, GoalSchedule,
+    GoalTokenBudgetStatus, HandoffArtifact, NotificationEntry, REMOTE_CHANGE_ACTIVITY,
+    ScheduledFailureKind, ScheduledRecoveryDisposition, ScheduledRecoveryState, ScheduledRunHealth,
+    ScheduledRunState, Task, TaskActivity, TaskAttempt, TaskAttemptPatch, TaskHandoff,
+    TaskJournalEntry, TaskWorkspace, WorkGoalSummary, WorkProject, WorkTaskSummary, WorkerProfile,
 };
 #[allow(unused_imports)]
 pub(crate) use aidaemon_work::goals::{ExpiredAttemptRecovery, task_execution_graph};

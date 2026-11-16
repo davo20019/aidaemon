@@ -2224,7 +2224,7 @@ pub fn run_is_news(run: &aidaemon_client_protocol::AutomationRun, seen_ms: u64) 
     let ended = run.finished_ms.unwrap_or(run.started_ms);
     ended > seen_ms
         && match run.outcome {
-            RunOutcome::Failed | RunOutcome::Blocked => true,
+            RunOutcome::Failed | RunOutcome::Blocked | RunOutcome::Missed => true,
             RunOutcome::Done => run.summary.as_deref().is_some_and(|s| !s.trim().is_empty()),
             RunOutcome::Running | RunOutcome::Cancelled | RunOutcome::Unknown => false,
         }
@@ -2584,6 +2584,29 @@ mod tests {
         assert!(run_is_news(&run(200, RunOutcome::Failed, None), 100));
         assert!(!run_is_news(&run(200, RunOutcome::Done, None), 100));
         assert!(!run_is_news(&run(90, RunOutcome::Failed, None), 100));
+        // A run that was due and never ran is news, though not a failure.
+        assert!(run_is_news(&run(200, RunOutcome::Missed, None), 100));
+        assert!(!run_is_news(&run(90, RunOutcome::Missed, None), 100));
+    }
+
+    /// A missed run arrives in an automation's runs as its own outcome,
+    /// newest first, and counts as news since the last look.
+    #[test]
+    fn a_missed_run_is_kept_in_the_automations_and_is_news() {
+        use aidaemon_client_protocol::RunOutcome;
+        let mut client = Client::new();
+        client.refresh_automations();
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"automations","automations":[{{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every day at 9:00 AM ET","status":"active","recent_runs":[{{"started_ms":300,"finished_ms":400,"outcome":"missed","summary":"The daemon wasn't running when this was due."}},{{"started_ms":100,"finished_ms":120,"outcome":"done"}}]}}]}}}}"#
+            )),
+            &cx(None),
+        );
+        let all = client.automations.ready().unwrap();
+        assert_eq!(all[0].recent_runs[0].outcome, RunOutcome::Missed);
+        assert_eq!(all[0].recent_runs[1].outcome, RunOutcome::Done);
+        assert_eq!(client.automation_news(200), 1);
     }
 
     #[test]

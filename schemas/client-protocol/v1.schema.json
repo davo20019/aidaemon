@@ -4207,6 +4207,11 @@
           "const": "blocked",
           "description": "It stopped on something it needs (an answer, access, a fix).",
           "type": "string"
+        },
+        {
+          "const": "missed",
+          "description": "It was due but never ran: the daemon was not running then, and it\nwas too late to catch up when it came back (protocol 1.28). Not a\nfailure. An older client reads it as `Unknown`.",
+          "type": "string"
         }
       ]
     },

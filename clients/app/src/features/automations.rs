@@ -146,6 +146,8 @@ fn outcome_word(outcome: RunOutcome) -> (&'static str, Tone) {
         RunOutcome::Failed => ("Failed", Tone::Danger),
         RunOutcome::Blocked => ("Blocked", Tone::Warning),
         RunOutcome::Cancelled => ("Cancelled", Tone::Neutral),
+        // Due while the daemon was off: it never ran. Not a failure.
+        RunOutcome::Missed => ("Missed", Tone::Warning),
         RunOutcome::Unknown => ("Ended", Tone::Neutral),
     }
 }
@@ -159,10 +161,15 @@ fn ran_at(at_ms: u64) -> String {
     )
 }
 
-/// Its latest run in one line: when, how it ended, what it said.
+/// Its latest run in one line: when, how it ended, what it said. A missed
+/// run says it was due and never ran, not that it ran.
 fn last_run(run: &AutomationRun) -> Text {
     let (word, _) = outcome_word(run.outcome);
-    let mut line = format!("Last run {} · {word}", ran_at(run.started_ms));
+    let mut line = if run.outcome == RunOutcome::Missed {
+        format!("Last run due {} · {word}", ran_at(run.started_ms))
+    } else {
+        format!("Last run {} · {word}", ran_at(run.started_ms))
+    };
     if let Some(summary) = run.summary.as_deref() {
         line.push_str(": ");
         line.push_str(summary);

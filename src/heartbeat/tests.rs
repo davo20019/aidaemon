@@ -2949,6 +2949,26 @@ async fn test_a_recurring_run_past_its_catch_up_window_is_skipped_and_said() {
         .filter(|n| n.notification_type == "missed_run")
         .count();
     assert_eq!(again, 1);
+    // The miss is part of the automation's history, dated when it was due,
+    // and is not a failure.
+    let runs = state.get_goal_runs(&goal.id).await.unwrap();
+    assert_eq!(runs.len(), 1, "one missed occurrence, one record");
+    assert_eq!(runs[0].status, crate::traits::GOAL_RUN_MISSED);
+    assert_eq!(runs[0].schedule_id.as_deref(), Some(schedule.id.as_str()));
+    assert_eq!(
+        runs[0].outcome_summary.as_deref(),
+        Some("The daemon wasn't running when this was due.")
+    );
+    let due = chrono::DateTime::parse_from_rfc3339(&runs[0].started_at).unwrap();
+    assert!(due < now, "dated when it was due, not when it was noticed");
+    assert!(
+        state
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .is_none_or(|r| r.consecutive_failures == 0),
+        "a miss never counts toward the failure budget"
+    );
 }
 
 /// A run the owner starts now (Run now, Try again) is the goal's current

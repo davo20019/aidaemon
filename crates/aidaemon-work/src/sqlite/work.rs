@@ -1,8 +1,8 @@
 use super::*;
 use crate::traits::{
-    DEFAULT_PROJECT_ID, GoalRun, HandoffArtifact, TaskAttempt, TaskAttemptPatch, TaskHandoff,
-    TaskJournalEntry, TaskWorkspace, WorkCoordinationStore, WorkGoalSummary, WorkProject,
-    WorkTaskSummary, WorkerProfile,
+    DEFAULT_PROJECT_ID, GOAL_RUN_MISSED, GoalRun, HandoffArtifact, TaskAttempt, TaskAttemptPatch,
+    TaskHandoff, TaskJournalEntry, TaskWorkspace, WorkCoordinationStore, WorkGoalSummary,
+    WorkProject, WorkTaskSummary, WorkerProfile,
 };
 
 const DEFAULT_LEASE_SECS: i64 = 180;
@@ -493,6 +493,52 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(run)
+    }
+
+    async fn record_missed_goal_run(
+        &self,
+        goal_id: &str,
+        schedule_id: Option<&str>,
+        due_at: &str,
+        summary: &str,
+    ) -> anyhow::Result<GoalRun> {
+        let project_id = sqlx::query_scalar::<_, String>(
+            "SELECT project_id FROM goals
+             WHERE id = ? AND domain = 'orchestration'",
+        )
+        .bind(goal_id)
+        .fetch_optional(self.work_pool())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal not found or not dispatchable"))?;
+        // Closed from the start: no task, no worker, and never through
+        // `finish_goal_run`, so the scheduled recovery ledger (the failure
+        // budget that pauses an automation) does not see it.
+        let mut run = GoalRun::new(goal_id, &project_id, "scheduled");
+        run.schedule_id = schedule_id.map(str::to_string);
+        run.status = GOAL_RUN_MISSED.to_string();
+        run.outcome_summary = Some(summary.to_string());
+        run.started_at = due_at.to_string();
+        run.completed_at = Some(run.created_at.clone());
+        sqlx::query(
+            "INSERT INTO goal_runs
+                (id, project_id, goal_id, trigger_type, schedule_id, root_task_id,
+                 status, outcome_summary, started_at, completed_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&run.id)
+        .bind(&run.project_id)
+        .bind(&run.goal_id)
+        .bind(&run.trigger_type)
+        .bind(&run.schedule_id)
+        .bind(&run.status)
+        .bind(&run.outcome_summary)
+        .bind(&run.started_at)
+        .bind(&run.completed_at)
+        .bind(&run.created_at)
+        .bind(&run.updated_at)
+        .execute(self.work_pool())
+        .await?;
         Ok(run)
     }
 
@@ -3640,6 +3686,106 @@ mod tests {
             "a recovery proven by receipts under the bound worker session must heal the objective"
         );
         assert_eq!(healthy.consecutive_failures, 0);
+    }
+
+    /// A run the scheduler skipped (the daemon was off) is recorded in the
+    /// automation's history as `missed`, closed, at the time it was due; it
+    /// neither counts toward the failure budget nor resets it, so misses
+    /// never pause an automation, and the run after them still opens.
+    #[tokio::test]
+    async fn a_missed_run_is_history_and_does_not_count_toward_the_failure_budget() {
+        let (store, _database) = test_store().await;
+        let goal = Goal::new_continuous("synthetic daily digest", "session-a", None, None);
+        store.create_goal(&goal).await.unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let schedule = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            goal_id: goal.id.clone(),
+            cron_expr: "0 9 * * *".to_string(),
+            tz: "local".to_string(),
+            original_schedule: Some("daily at 9am".to_string()),
+            fire_policy: "coalesce".to_string(),
+            is_one_shot: false,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.create_goal_schedule(&schedule).await.unwrap();
+        // Two real failures: one short of the budget of three.
+        for _ in 0..2 {
+            let run = store
+                .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .finish_goal_run(&run.id, "failed", Some("synthetic failure"))
+                    .await
+                    .unwrap()
+            );
+        }
+        // Then the daemon is off for three occurrences in a row.
+        let due = (chrono::Utc::now() - chrono::Duration::hours(30)).to_rfc3339();
+        for _ in 0..3 {
+            let missed = store
+                .record_missed_goal_run(
+                    &goal.id,
+                    Some(&schedule.id),
+                    &due,
+                    "The daemon wasn't running when this was due.",
+                )
+                .await
+                .unwrap();
+            assert_eq!(missed.status, GOAL_RUN_MISSED);
+            assert_eq!(missed.started_at, due, "a miss is dated when it was due");
+            assert!(missed.completed_at.is_some(), "a miss is closed");
+        }
+        let recovery = store
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.consecutive_failures, 2, "misses are not failures");
+        assert_eq!(
+            recovery.disposition,
+            crate::traits::ScheduledRecoveryDisposition::Recovering
+        );
+        assert!(
+            !store.get_schedules_for_goal(&goal.id).await.unwrap()[0].is_paused,
+            "misses never pause an automation"
+        );
+        // The misses are in its history, and none is an open run.
+        let runs = store.get_goal_runs(&goal.id).await.unwrap();
+        assert_eq!(
+            runs.iter().filter(|r| r.status == GOAL_RUN_MISSED).count(),
+            3
+        );
+        assert!(
+            store
+                .get_current_goal_run(&goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The next real run opens fresh; its failure is the third, so the
+        // budget counts runs that ran, not misses.
+        let run = store
+            .start_goal_run(&goal.id, "scheduled", Some(&schedule.id), None)
+            .await
+            .unwrap();
+        assert!(runs.iter().all(|r| r.id != run.id));
+        store
+            .finish_goal_run(&run.id, "failed", Some("synthetic failure"))
+            .await
+            .unwrap();
+        let recovery = store
+            .get_scheduled_recovery_state(&goal.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.consecutive_failures, 3);
     }
 }
 

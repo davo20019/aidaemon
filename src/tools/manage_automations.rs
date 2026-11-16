@@ -336,6 +336,37 @@ mod tests {
         );
     }
 
+    /// A run the daemon missed (it was off when the run was due) is in the
+    /// automation's recent runs as `missed`, with what happened; three
+    /// misses in a row do not hold it after failures.
+    #[tokio::test]
+    async fn a_client_sees_a_missed_run_and_misses_never_hold_an_automation() {
+        let f = fixture().await;
+        f.scheduled_work("Repo check", "every day at 8am").await;
+        let goal_id = f.scheduled.lock().unwrap()["Repo check"].clone();
+        let due = (chrono::Utc::now() - chrono::Duration::hours(26)).to_rfc3339();
+        for _ in 0..3 {
+            f.state
+                .record_missed_goal_run(
+                    &goal_id,
+                    None,
+                    &due,
+                    "The daemon wasn't running when this was due.",
+                )
+                .await
+                .unwrap();
+        }
+        let entry = f.tool.entries().await.unwrap().remove(0);
+        assert_eq!(entry.status, "active", "misses are not failures");
+        assert!(entry.next.is_some(), "it still has a next run");
+        assert_eq!(entry.runs.len(), 3);
+        assert_eq!(entry.runs[0].status, crate::traits::GOAL_RUN_MISSED);
+        assert_eq!(
+            entry.runs[0].summary.as_deref(),
+            Some("The daemon wasn't running when this was due.")
+        );
+    }
+
     /// A client sees an automation's details and changes scheduled work in
     /// place, as others' Scheduled pages do: name, when (in words) and what
     /// its runs do; a reminder's message stays fixed, and a watching

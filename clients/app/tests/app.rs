@@ -877,6 +877,30 @@ fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
     Ok(())
 }
 
+/// A run that was due while the daemon was off reads as missed, in plain
+/// words, in the last-run line and in History; not as failed.
+#[test]
+fn a_missed_run_reads_as_missed_in_the_last_run_line_and_history() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help with?")?;
+    feed([Update::Connected]);
+    app.press("Automations: what runs on its own")?;
+    app.wait_for("Reading your automations…")?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every day at 9:00 AM ET","status":"active","edit":{"when":"every day at 9am","instructions":"Summarize the synthetic inbox"},"recent_runs":[{"started_ms":1767088800000,"finished_ms":1767092400000,"outcome":"missed","summary":"The daemon wasn't running when this was due."},{"started_ms":1767002400000,"finished_ms":1767002460000,"outcome":"done","summary":"3 new messages, 1 needs a reply."}]}]}}"#,
+    )]);
+    app.wait_for(
+        r"text:/^Last run due .* · Missed: The daemon wasn't running when this was due\.$/",
+    )?;
+    // Its recent runs, under Details, say the same.
+    app.press("Details")?;
+    app.wait_for("Recent runs")?;
+    app.wait_for("Missed")?;
+    app.wait_for("3 new messages, 1 needs a reply.")?;
+    Ok(())
+}
+
 #[test]
 fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());

@@ -335,6 +335,21 @@ impl SystemSources {
     }
 }
 
+/// How a stored run ended, as a client reads it. A missed run (the daemon
+/// was off when it was due) is its own outcome, never `Failed`.
+fn run_outcome(status: &str) -> aidaemon_client_protocol::RunOutcome {
+    use aidaemon_client_protocol::RunOutcome;
+    match status {
+        "pending" | "running" => RunOutcome::Running,
+        "completed" => RunOutcome::Done,
+        "failed" => RunOutcome::Failed,
+        "blocked" => RunOutcome::Blocked,
+        "cancelled" => RunOutcome::Cancelled,
+        aidaemon_work::goals::GOAL_RUN_MISSED => RunOutcome::Missed,
+        _ => RunOutcome::Unknown,
+    }
+}
+
 /// A run's report as the owner reads it: a bare status code
 /// (`mandate_act_satisfied`) becomes words ("Mandate act satisfied").
 fn outcome_words(outcome: &str) -> Option<String> {
@@ -672,9 +687,7 @@ impl ClientHost for DaemonClientHost {
     async fn automations(
         &self,
     ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {
-        use aidaemon_client_protocol::{
-            AutomationKind as Kind, AutomationRun, AutomationSummary, RunOutcome,
-        };
+        use aidaemon_client_protocol::{AutomationKind as Kind, AutomationRun, AutomationSummary};
         use aidaemon_work::automations::AutomationKind;
         let ms = |at: chrono::DateTime<chrono::Utc>| u64::try_from(at.timestamp_millis()).ok();
         Ok(self
@@ -701,14 +714,7 @@ impl ClientHost for DaemonClientHost {
                         Some(AutomationRun {
                             started_ms: ms(run.started)?,
                             finished_ms: run.finished.and_then(ms),
-                            outcome: match run.status.as_str() {
-                                "pending" | "running" => RunOutcome::Running,
-                                "completed" => RunOutcome::Done,
-                                "failed" => RunOutcome::Failed,
-                                "blocked" => RunOutcome::Blocked,
-                                "cancelled" => RunOutcome::Cancelled,
-                                _ => RunOutcome::Unknown,
-                            },
+                            outcome: run_outcome(&run.status),
                             summary: run.summary,
                         })
                     })
@@ -1338,8 +1344,24 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CALL_OUTPUT_CHARS, outcome_words, session_ends, shown_output, snippet, tool_calls,
+        CALL_OUTPUT_CHARS, outcome_words, run_outcome, session_ends, shown_output, snippet,
+        tool_calls,
     };
+
+    /// A run the scheduler skipped reaches the app as `missed`, never as
+    /// `failed`; a status this build does not know stays `unknown`.
+    #[test]
+    fn a_missed_run_reaches_the_app_as_missed_not_failed() {
+        use aidaemon_client_protocol::RunOutcome;
+        assert_eq!(
+            run_outcome(aidaemon_work::goals::GOAL_RUN_MISSED),
+            RunOutcome::Missed
+        );
+        assert_eq!(run_outcome("failed"), RunOutcome::Failed);
+        assert_eq!(run_outcome("completed"), RunOutcome::Done);
+        assert_eq!(run_outcome("pending"), RunOutcome::Running);
+        assert_eq!(run_outcome("something_new"), RunOutcome::Unknown);
+    }
 
     #[tokio::test]
     async fn the_conversation_list_reads_each_session_s_first_and_latest_message() {

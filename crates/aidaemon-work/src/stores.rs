@@ -756,6 +756,21 @@ pub trait WorkCoordinationStore: Send + Sync {
         anyhow::bail!("goal runs are not supported by this store")
     }
 
+    /// Record an occurrence the scheduler skipped (the daemon was not
+    /// running and it is past its catch-up window) as a closed run with
+    /// status `missed`, started at the time it was due. It is part of the
+    /// automation's history, but never goes through [`Self::finish_goal_run`]:
+    /// a miss is not a failure and leaves the failure budget as it was.
+    async fn record_missed_goal_run(
+        &self,
+        _goal_id: &str,
+        _schedule_id: Option<&str>,
+        _due_at: &str,
+        _summary: &str,
+    ) -> anyhow::Result<crate::traits::GoalRun> {
+        anyhow::bail!("goal runs are not supported by this store")
+    }
+
     async fn get_current_goal_run(
         &self,
         _goal_id: &str,
