@@ -60,9 +60,16 @@ pub fn sidebar(store: Store) -> View {
                     .accessibility_label("New conversation")
                     .child(icon(Glyph::Compose).text_color(colors::MUTED))
                     .child(
-                        text("New conversation")
-                            .flex_1()
-                            .text_size(px(type_scale::BASE)),
+                        text(move || match store.sidebar_view() {
+                            SidebarView::Project(id) => format!(
+                                "New conversation in {}",
+                                store.project(&id).map(|p| p.name).unwrap_or_default()
+                            ),
+                            _ => "New conversation".to_owned(),
+                        })
+                        .flex_1()
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::BASE)),
                     )
                     .child(ui::kbd(key_label("mod+n"))),
             )
@@ -825,15 +832,32 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
             move || store.project_form_open(),
             move || project_form(store),
         ))
+        // On a phone, starting one here is in view, not only behind the
+        // pencil (a window's top row already names the project): it opens
+        // a new Code conversation in this project's folder.
+        .child(when(ui::touch(), move || {
+            let (start, named) = (empty.clone(), empty.clone());
+            row(|| false, move || store.new_in_project(Some(start.clone())))
+                .accessibility_label("New conversation in this project")
+                .child(icon(Glyph::Compose).text_color(colors::MUTED))
+                .child(
+                    text(move || {
+                        let name = store.project(&named).map(|p| p.name).unwrap_or_default();
+                        format!("New conversation in {name}")
+                    })
+                    .flex_1()
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::BASE)),
+                )
+        }))
         .child(when(
             move || mine.with(Vec::is_empty),
             move || {
-                let id = empty.clone();
-                row(|| false, move || store.new_in_project(Some(id.clone()))).child(
-                    text("No conversations yet. Start one")
-                        .text_size(px(type_scale::SM))
-                        .text_color(colors::FAINT),
-                )
+                text("No conversations yet")
+                    .px_2()
+                    .py_1()
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::FAINT)
             },
         ))
         .child(listed(store, mine))
