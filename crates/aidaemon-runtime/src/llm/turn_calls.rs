@@ -48,6 +48,9 @@ pub struct LlmCallTelemetry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotaFallback {
     pub chosen: String,
+    /// The provider account whose plan ran out: its other models share the
+    /// limit (a ChatGPT plan's every model), so one note covers them all.
+    pub account: String,
     pub answered_by: String,
     /// When the limit resets, if the provider said.
     pub resets_at: Option<std::time::SystemTime>,
@@ -69,17 +72,19 @@ impl QuotaFallback {
     }
 }
 
-/// Per conversation, the limit the owner was last told about: the chosen
-/// model and its reset.
+/// Per conversation, the limit the owner was last told about: the account
+/// whose plan ran out and its reset.
 type ToldLimits = std::collections::HashMap<String, (String, Option<std::time::SystemTime>)>;
 
 static QUOTA_TOLD: std::sync::LazyLock<std::sync::Mutex<ToldLimits>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Whether conversation `session_id` should hear about `fallback`: once per
-/// limit. It stays quiet while the same model's limit it was told about
-/// has not reset; a different model's limit, or the same one's after its
-/// reset, is told again.
+/// limit. It stays quiet while the same account's limit it was told about
+/// has not reset, whichever of that account's models was chosen (live
+/// 2026-11-16: one ChatGPT plan's limit was told twice, once per model);
+/// another account's limit, or the same one's after its reset, is told
+/// again.
 pub fn quota_note_due(
     session_id: &str,
     fallback: &QuotaFallback,
@@ -89,11 +94,11 @@ pub fn quota_note_due(
     told.retain(|_, (_, reset)| reset.is_none_or(|at| at > now));
     let quiet = told
         .get(session_id)
-        .is_some_and(|(chosen, _)| *chosen == fallback.chosen);
+        .is_some_and(|(account, _)| *account == fallback.account);
     if !quiet {
         told.insert(
             session_id.to_string(),
-            (fallback.chosen.clone(), fallback.resets_at),
+            (fallback.account.clone(), fallback.resets_at),
         );
     }
     !quiet
@@ -519,6 +524,7 @@ pub async fn call_llm_with_recovery(
                 let error = crate::chat_bridge::sdk_backed::to_daemon_error(quota);
                 telemetry.answered_past_quota = Some(QuotaFallback {
                     chosen: model.to_string(),
+                    account: plan_account(&host.llm_runtime().snapshot(), model),
                     answered_by: telemetry.final_model.clone(),
                     resets_at: error.resets_at,
                 });
@@ -671,6 +677,16 @@ pub async fn session_effort(host: &dyn TurnHost, session_id: &str, model: &str) 
 
 /// The provider a request for `model` goes to: the first provider of the
 /// runtime that lists it, else `fallback` (the main provider).
+/// The provider a model's requests go to (its plan's account), or the
+/// model itself when no configured provider lists it.
+fn plan_account(snapshot: &crate::llm::LlmRuntimeSnapshot, model: &str) -> String {
+    crate::session_model::pickable(snapshot)
+        .into_iter()
+        .find(|provider| provider.models.iter().any(|known| known == model))
+        .map(|provider| provider.id)
+        .unwrap_or_else(|| model.to_string())
+}
+
 fn owner_of(
     snapshot: &crate::llm::LlmRuntimeSnapshot,
     model: &str,
@@ -763,6 +779,7 @@ mod tests {
     fn fallback(chosen: &str, resets_at: Option<SystemTime>) -> QuotaFallback {
         QuotaFallback {
             chosen: chosen.into(),
+            account: format!("account-of-{chosen}"),
             answered_by: "synthetic-fallback".into(),
             resets_at,
         }
@@ -803,7 +820,13 @@ mod tests {
         ));
         // Another conversation hears it once too.
         assert!(quota_note_due("app:synthetic-quota-other", &limit, now));
-        // Another model's limit is new.
+        // Another model on the same plan shares its limit: still quiet.
+        let sibling = QuotaFallback {
+            chosen: "synthetic-primary-mini".into(),
+            ..limit.clone()
+        };
+        assert!(!quota_note_due(session, &sibling, now));
+        // Another account's limit is new.
         let other = fallback("synthetic-other", Some(now + Duration::from_secs(3600)));
         assert!(quota_note_due(session, &other, now));
         // After the reset, the next limit is told again.
