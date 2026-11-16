@@ -428,6 +428,22 @@ pub const CATALOG: &[CatalogEntry] = &[
         custom_base_url: false,
         gateway_token: false,
     },
+    CatalogEntry {
+        id: "llamacpp",
+        aliases: &["llama.cpp", "llamaserver", "llamacpplocal"],
+        display_name: "llama.cpp (local)",
+        kind: ProviderKind::OpenaiCompatible,
+        // `llama-server`'s default port, used when the owner names no
+        // address. This daemon's own health port has the same default, so
+        // one of the two often moves: the address can be named.
+        base_url: "http://localhost:8080/v1",
+        models: same(""),
+        offered: OfferedModels::ByAddress,
+        credential: Credential::None,
+        billing: Billing::Local,
+        custom_base_url: true,
+        gateway_token: false,
+    },
 ];
 
 fn normalize(name: &str) -> String {
@@ -715,6 +731,7 @@ mod tests {
             "custom_openai_compatible",
             "cloudflare_gateway",
             "ollama",
+            "llamacpp",
         ] {
             assert!(find(id).unwrap().offered.models().is_empty(), "{id}");
         }

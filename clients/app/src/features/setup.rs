@@ -612,7 +612,13 @@ fn choices(
                                         },
                                     ));
                                 }
-                                if needs_base_url {
+                                if needs_base_url && local {
+                                    // Its usual address unless another is named.
+                                    form = form.child(labeled(
+                                        "Address (leave empty for its usual one)",
+                                        field("http://localhost:8081/v1", base_url),
+                                    ));
+                                } else if needs_base_url {
                                     form = form.child(labeled(
                                         "Address",
                                         field("https://api.example.com/v1", base_url),
@@ -651,7 +657,7 @@ fn choices(
                                          many steps; larger ones do better.",
                                     ));
                                 }
-                                if needs_base_url {
+                                if needs_base_url && !local {
                                     form = form.child(labeled(
                                         "API key (leave empty if your server needs none)",
                                         secret_field("Paste the key", key),
@@ -683,7 +689,9 @@ fn choices(
                                             .disabled(
                                                 move || {
                                                     store.setup_busy()
-                                                        || if needs_base_url {
+                                                        || if local {
+                                                            false
+                                                        } else if needs_base_url {
                                                             base_url.with(|b| b.trim().is_empty())
                                                         } else {
                                                             !local

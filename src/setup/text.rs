@@ -93,7 +93,13 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
                     if !option.key_url.is_empty() {
                         println!("  Get a key at {}", option.key_url);
                     }
-                    let base_url = if option.needs_base_url {
+                    let local = option.billing == aidaemon_client_protocol::Billing::Local;
+                    let base_url = if option.needs_base_url && local {
+                        Input::new()
+                            .with_prompt("Address (empty for its default)")
+                            .allow_empty(true)
+                            .interact_text()?
+                    } else if option.needs_base_url {
                         Input::new()
                             .with_prompt("Address (OpenAI-compatible, ending in /v1)")
                             .interact_text()?
@@ -102,7 +108,6 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
                     };
                     // A server on this machine takes no key; the owner's
                     // own endpoint may take none.
-                    let local = option.billing == aidaemon_client_protocol::Billing::Local;
                     let key = if local {
                         String::new()
                     } else if option.needs_base_url {

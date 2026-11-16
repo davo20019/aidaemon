@@ -44,7 +44,7 @@ const NO_KEY: &str = "none";
 
 /// Whether `entry` may be connected with no key: the owner's own endpoint.
 fn key_optional(entry: &CatalogEntry) -> bool {
-    entry.custom_base_url && !entry.gateway_token
+    entry.needs_api_key() && entry.custom_base_url && !entry.gateway_token
 }
 
 /// A local provider's name without its "(local)".
@@ -130,6 +130,11 @@ impl Candidate {
                 .unwrap_or_default()
         } else {
             self.choice.primary_model.clone()
+        };
+        // llama.cpp names a model by its file's path: the file says enough.
+        let model = match model.rsplit_once(['/', '\\']) {
+            Some((_, file)) if model.ends_with(".gguf") => file.to_string(),
+            _ => model,
         };
         if model.is_empty() {
             display
@@ -292,7 +297,10 @@ pub(crate) async fn check_key(
         .await
         .map_err(|why| {
             if keyless {
-                format!("Nothing answered at {base} ({why}). Is the model server running there?")
+                format!(
+                    "No model server answered at {base} ({why}). Is it running there? If it uses \
+                     another port, enter its address."
+                )
             } else {
                 format!("The key works, but its models could not be listed: {why}")
             }
@@ -744,13 +752,15 @@ mod tests {
         assert_eq!(options[0].preset, CHATGPT);
         assert_eq!(options[0].billing, Billing::Plan);
         assert!(!options[0].needs_key);
-        let ollama = options.iter().find(|o| o.preset == "ollama").unwrap();
-        assert_eq!(ollama.billing, Billing::Local);
-        assert!(!ollama.needs_key);
+        for local in ["ollama", "llamacpp"] {
+            let option = options.iter().find(|o| o.preset == local).unwrap();
+            assert_eq!(option.billing, Billing::Local);
+            assert!(!option.needs_key);
+        }
         assert!(
             options
                 .iter()
-                .filter(|o| o.preset != CHATGPT && o.preset != "ollama")
+                .filter(|o| o.preset != CHATGPT && o.billing != Billing::Local)
                 .all(|o| o.billing == Billing::PerToken)
         );
         assert!(options.iter().any(|o| o.preset == "openai" && o.needs_key));
@@ -772,6 +782,35 @@ mod tests {
         assert_eq!(ollama.base_url, "http://localhost:11434/v1");
         assert_eq!(ollama.models.primary, "synthetic-local");
         assert_eq!(ollama.models.fast, "synthetic-local");
+        // llama.cpp: its default address unless the owner names one.
+        let llama = |base_url: &str| Candidate {
+            choice: ProviderChoice {
+                preset: "llamacpp".into(),
+                base_url: base_url.into(),
+                primary_model: "synthetic-local".into(),
+                ..ProviderChoice::default()
+            },
+            key: None,
+        };
+        assert_eq!(
+            Candidate {
+                choice: ProviderChoice {
+                    preset: "llamacpp".into(),
+                    primary_model: "/home/synthetic/models/synthetic-2b.gguf".into(),
+                    ..ProviderChoice::default()
+                },
+                key: None,
+            }
+            .name(),
+            "llama.cpp (local) · synthetic-2b.gguf"
+        );
+        let default = provider_of(&llama("")).await.unwrap();
+        assert_eq!(default.base_url, "http://localhost:8080/v1");
+        let moved = provider_of(&llama("http://localhost:8081/v1"))
+            .await
+            .unwrap();
+        assert_eq!(moved.base_url, "http://localhost:8081/v1");
+        assert!(!key_optional(preset("llama.cpp").unwrap()));
         // The owner's endpoint with no key: its models are listed.
         let base = fake_provider().await;
         let custom = preset("custom_openai_compatible").unwrap();
@@ -781,7 +820,7 @@ mod tests {
         assert!(!key_optional(preset("openai").unwrap()));
         // Nothing listening: the answer says where it looked.
         let nothing = check_key(custom, "http://127.0.0.1:9/v1", "").await;
-        assert!(nothing.unwrap_err().contains("Is the model server running"));
+        assert!(nothing.unwrap_err().contains("No model server answered"));
     }
 
     /// An OpenAI-compatible endpoint that answers key `sk-synthetic-good`

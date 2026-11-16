@@ -224,6 +224,7 @@ fn demo_setup() -> &'static std::sync::Mutex<Option<aidaemon_client_protocol::Se
                     true,
                 ),
                 provider("ollama", "Ollama (local)", Billing::Local, false),
+                provider("llamacpp", "llama.cpp (local)", Billing::Local, false),
             ],
             ..SetupState::default()
         }))
