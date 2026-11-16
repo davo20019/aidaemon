@@ -107,6 +107,8 @@ pub const STEPS_TAB: usize = 1;
 const DRAFT_KEY: &str = "aidaemon.draft.";
 const PINS_KEY: &str = "aidaemon.pins";
 const OPEN_KEY: &str = "aidaemon.open";
+/// The project this device last started work on code in.
+const LAST_PROJECT_KEY: &str = "aidaemon.last_project";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
 const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
 const ENTER_QUEUES_KEY: &str = "aidaemon.enter-queues";
@@ -884,14 +886,26 @@ impl Store {
     /// Start a new conversation in `project` (`None`: in no project).
     pub fn new_in_project(&self, project: Option<String>) {
         self.select(None);
+        if let Some(id) = &project {
+            let _ = nsh_core::storage::Storage::set_item(LAST_PROJECT_KEY, id.clone());
+        }
         self.new_project.set(project);
     }
 
     /// Choose the project the new conversation on screen starts in; then
     /// typing goes on in the composer.
     pub fn set_new_project(&self, project: Option<String>) {
+        if let Some(id) = &project {
+            let _ = nsh_core::storage::Storage::set_item(LAST_PROJECT_KEY, id.clone());
+        }
         self.new_project.set(project);
         self.focus_composer();
+    }
+
+    /// Whether the new conversation on screen is for code but has no
+    /// project yet: it cannot be sent until one is chosen.
+    pub fn needs_project(&self) -> bool {
+        self.selected.get().is_none() && self.new_code.get() && self.new_project.get().is_none()
     }
 
     /// Whether the new conversation on screen is for code: it works in a
@@ -902,14 +916,19 @@ impl Store {
 
     /// Choose what the new conversation on screen is, a chat or work on
     /// code, leaving the keyboard where it is (a switch whose arrows
-    /// choose). Code starts in the first project until another is picked.
+    /// choose). Code starts in the project this device last worked in,
+    /// while it still exists; otherwise in none until one is chosen.
     pub fn place_new(&self, code: bool) {
         self.new_code.set(code);
         if !code {
             self.new_project.set(None);
         } else if self.new_project.get_untracked().is_none() {
-            let first = self.reads.projects.get_untracked().into_iter().next();
-            self.new_project.set(first.map(|p| p.id));
+            let last = nsh_core::storage::Storage::get_item(LAST_PROJECT_KEY).filter(|id| {
+                self.reads
+                    .projects
+                    .with_untracked(|p| p.iter().any(|p| &p.id == id))
+            });
+            self.new_project.set(last);
         }
     }
 
@@ -1658,6 +1677,10 @@ impl Store {
             .drafts
             .with_untracked(|d| d.get(key.as_deref().unwrap_or(NEW)).cloned())
             .unwrap_or_default();
+        if untracked(|| self.needs_project()) {
+            self.say("Choose a project first");
+            return;
+        }
         let project = self.new_project.get_untracked();
         match self.act(|c| c.submit(key.as_deref(), &text, mid_run, project)) {
             Ok(true) => {

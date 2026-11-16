@@ -495,19 +495,11 @@ fn new_kind(store: Store) -> View {
     )
 }
 
-fn heading(words: &'static str) -> Text {
-    text(words)
-        .role(AccessibilityRole::Header)
-        .text_center()
-        .text_size(px(ui::fit::title()))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(colors::TEXT)
-}
-
-/// A new conversation: what the header's switch chose, and nothing else.
-/// A chat asks one question; code asks which project (each a folder) to
-/// work in. By the composer on a phone, in the middle of a window. The
-/// sidebar already lists past conversations.
+/// A new conversation: what the header's switch chose. Both ways have
+/// the same shape, a question over a room of one height (empty for a
+/// chat; the project list for code), so switching changes the words and
+/// nothing moves. By the composer on a phone, in the middle of a window.
+/// The sidebar already lists past conversations.
 fn welcome(store: Store) -> View {
     let code = computed(move || store.new_is_code());
     view()
@@ -516,16 +508,33 @@ fn welcome(store: Store) -> View {
         .px_4()
         .py_4()
         .child(view().flex_1())
-        .child(view().w_full().items_center().child(dynamic(move || {
-            let code = code.get();
-            Some(untracked(move || {
-                if code {
-                    code_start(store)
-                } else {
-                    view().child(heading("What can I help with?"))
-                }
-            }))
-        })))
+        .child(
+            view()
+                .w_full()
+                .items_center()
+                .gap_3()
+                .child(
+                    text(move || {
+                        if code.get() {
+                            "Which project are we working on?"
+                        } else {
+                            "What can I help with?"
+                        }
+                    })
+                    .role(AccessibilityRole::Header)
+                    .text_center()
+                    .text_size(px(ui::fit::title()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(colors::TEXT),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .items_center()
+                        .min_h(px(if ui::touch() { 72.0 } else { 56.0 }))
+                        .child(when(move || code.get(), move || code_start(store))),
+                ),
+        )
         // On a phone all of it sits by the composer, under the thumb; in a
         // window it is centred.
         .child(view().style_when(!ui::touch(), |s| s.flex_1()))
@@ -539,9 +548,9 @@ fn new_project_form(store: Store) {
     store.show_project_form(true);
 }
 
-/// Code: the project to work in, one list however many there are, with
-/// the chosen one's folder under it. With no project yet, how to make the
-/// first.
+/// Code: the project list, with a "+" for a new one, and under it the
+/// chosen project's folder (or what to do). With no project yet, New
+/// project in the list's place.
 fn code_start(store: Store) -> View {
     let projects = computed(move || {
         store
@@ -550,36 +559,32 @@ fn code_start(store: Store) -> View {
             .map(|p| (p.id, p.name))
             .collect::<Vec<(String, String)>>()
     });
+    let note = |words: Box<dyn Fn() -> String>| {
+        text(words)
+            .number_of_lines(1)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT)
+    };
     view().w_full().items_center().child(dynamic(move || {
         let items = projects.get();
         Some(untracked(move || {
             if items.is_empty() {
                 return view()
                     .items_center()
-                    .gap_4()
-                    .child(heading("No projects yet"))
-                    .child(
-                        text(
-                            "A project is a folder on the daemon's computer. \
-                             Work on code happens in one.",
-                        )
-                        .text_center()
-                        .max_w(px(420.0))
-                        .text_size(px(ui::fit::body()))
-                        .text_color(colors::MUTED),
-                    )
+                    .gap_2()
                     .child(ui::btn(
                         "New project",
                         Variant::Outline,
                         ui::Size::Sm,
                         move || new_project_form(store),
-                    ));
+                    ))
+                    .child(note(Box::new(|| {
+                        "A project is a folder on the daemon's computer".to_owned()
+                    })));
             }
             view()
-                .w_full()
                 .items_center()
-                .gap_3()
-                .child(heading("Which project are we working on?"))
+                .gap_2()
                 // A new one is made with the sidebar's form, as its "+"
                 // does; once made, this conversation starts in it.
                 .child(
@@ -605,21 +610,17 @@ fn code_start(store: Store) -> View {
                             move || new_project_form(store),
                         )),
                 )
-                .child(
-                    text(move || {
-                        let path = store
-                            .current_project()
-                            .and_then(|id| store.project(&id))
-                            .and_then(|p| p.path);
-                        match path {
-                            Some(path) => format!("Works in {}", super::sidebar::short_path(&path)),
+                .child(note(Box::new(move || {
+                    match store.current_project().and_then(|id| store.project(&id)) {
+                        Some(p) => match p.path {
+                            Some(path) => {
+                                format!("Works in {}", super::sidebar::short_path(&path))
+                            }
                             None => "This project has no folder".to_owned(),
-                        }
-                    })
-                    .number_of_lines(1)
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                )
+                        },
+                        None => "The agent works in the project's folder".to_owned(),
+                    }
+                })))
         }))
     }))
 }
@@ -1145,6 +1146,7 @@ fn composer(store: Store, session: Option<String>) -> View {
     let online = move || store.is_online();
     let can_send = move || {
         online()
+            && !store.needs_project()
             && (!store.draft().trim().is_empty()
                 || store
                     .draft_files()
@@ -1307,6 +1309,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .placeholder(move || match store.connection() {
                             // A phone's field is narrow: the hint about
                             // commands is the list that `/` brings.
+                            Connection::Online if store.needs_project() => {
+                                "Choose a project first".to_owned()
+                            }
                             Connection::Online if touch => "Message AIdaemon…".to_owned(),
                             Connection::Online => "Message AIdaemon… (/ for commands)".to_owned(),
                             Connection::Connecting

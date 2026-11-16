@@ -491,7 +491,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("What can I help with?")?;
     // Code before any project exists says how to make the first.
     app.press("Code")?;
-    app.wait_for("No projects yet")?;
+    app.wait_for("Which project are we working on?")?;
     app.wait_for("New project")?;
     app.press("Chat")?;
     app.wait_for("What can I help with?")?;
@@ -523,6 +523,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("What can I help with?")?;
     app.press("Code")?;
     app.wait_for("Which project are we working on?")?;
+    // The project this device last worked in is chosen again.
     app.wait_for("Works in /home/synthetic/acme-site")?;
     // Its "+" opens the form for a new project.
     app.press("Make a new project")?;
