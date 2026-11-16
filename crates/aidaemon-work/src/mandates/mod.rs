@@ -2311,6 +2311,10 @@ pub enum MandateFinalizationRejectReason {
     DecisionMissing,
     InvalidDecisionState,
     DeliberatorFailed,
+    /// An orphaned ACT review with no reserved mutation or dispatch claim.
+    /// The review was interrupted after deciding, before any external action
+    /// could run; it is safe to suspend the intention and retry.
+    ActInterruptedBeforeDispatch,
     /// An ACT review whose action ledger proves nothing reached the outside
     /// world: no mutation succeeded, none has an unknown outcome. Retried
     /// with backoff; the owner has nothing to reconcile.
@@ -2326,6 +2330,9 @@ impl MandateFinalizationRejectReason {
             }
             Self::DecisionMissing => "was interrupted before it decided anything. Nothing was done",
             Self::DeliberatorFailed => "stopped before it finished",
+            Self::ActInterruptedBeforeDispatch => {
+                "decided to act but was interrupted before any action was dispatched. Nothing was done"
+            }
             Self::ActChangedNothing => {
                 "decided to act, but the action did not go through, so nothing changed"
             }
@@ -2336,7 +2343,10 @@ impl MandateFinalizationRejectReason {
     pub fn retries_automatically(self) -> bool {
         matches!(
             self,
-            Self::DecisionMissing | Self::DeliberatorFailed | Self::ActChangedNothing
+            Self::DecisionMissing
+                | Self::DeliberatorFailed
+                | Self::ActInterruptedBeforeDispatch
+                | Self::ActChangedNothing
         )
     }
 
@@ -2346,6 +2356,7 @@ impl MandateFinalizationRejectReason {
             Self::DecisionMissing => "decision_missing",
             Self::InvalidDecisionState => "invalid_decision_state",
             Self::DeliberatorFailed => "deliberator_failed",
+            Self::ActInterruptedBeforeDispatch => "act_interrupted_before_dispatch",
             Self::ActChangedNothing => "act_changed_nothing",
         }
     }
@@ -2358,6 +2369,9 @@ impl MandateFinalizationRejectReason {
             Self::DecisionMissing => "it was interrupted before it decided anything",
             Self::InvalidDecisionState => "its decision could not be confirmed",
             Self::DeliberatorFailed => "it could not finish",
+            Self::ActInterruptedBeforeDispatch => {
+                "it was interrupted after deciding to act, before any action was dispatched"
+            }
             Self::ActChangedNothing => "the action it decided on did not go through",
         }
     }

@@ -1188,6 +1188,7 @@ pub async fn finalize_mandate_review(
             // failures the owner hears about; deliver no other.
             MandateFinalizationRejectReason::DecisionMissing
             | MandateFinalizationRejectReason::DeliberatorFailed
+            | MandateFinalizationRejectReason::ActInterruptedBeforeDispatch
             | MandateFinalizationRejectReason::ActChangedNothing => {
                 let failures = state
                     .get_goal(&goal.id)

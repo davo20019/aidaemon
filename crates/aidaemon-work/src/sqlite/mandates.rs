@@ -1220,7 +1220,7 @@ async fn reconcile_orphaned_mandate_runs(
         // than being silently re-deliberated.
         let retry_reason = match decision_outcome.as_deref() {
             None => Some(MandateFinalizationRejectReason::DecisionMissing),
-            Some("act") => Some(MandateFinalizationRejectReason::DeliberatorFailed),
+            Some("act") => Some(MandateFinalizationRejectReason::ActInterruptedBeforeDispatch),
             Some(_) => None,
         };
         if let (Some(reason), 0, 0) = (
@@ -5717,8 +5717,10 @@ mod tests {
             "cancelled"
         );
         assert_eq!(
-            store.get_goal_runs(&goal.id).await.unwrap()[0].status,
-            "failed"
+            store.get_goal_runs(&goal.id).await.unwrap()[0]
+                .outcome_summary
+                .as_deref(),
+            Some("mandate_review_failed:act_interrupted_before_dispatch")
         );
         let notification_message: String = sqlx::query_scalar(
             "SELECT message FROM notification_queue
@@ -5730,6 +5732,15 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
+        assert!(
+            notification_message.contains("decided to act"),
+            "{notification_message}"
+        );
+        assert!(
+            notification_message.contains("interrupted before any action was dispatched"),
+            "{notification_message}"
+        );
+        assert!(!notification_message.contains("stopped before it finished"));
         assert!(notification_message.contains("will retry automatically"));
         let intention_status =
             sqlx::query_scalar::<_, String>("SELECT status FROM intentions WHERE id = ?")
@@ -7117,6 +7128,12 @@ mod tests {
         );
         let current = store.get_mandate(&mandate.id).await.unwrap().unwrap();
         assert_eq!(current.status, MandateStatus::Active);
+        assert_eq!(
+            store.get_goal_runs(&goal.id).await.unwrap()[0]
+                .outcome_summary
+                .as_deref(),
+            Some("mandate_review_failed:deliberator_failed")
+        );
     }
 
     #[tokio::test]
