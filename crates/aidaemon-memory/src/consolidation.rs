@@ -219,8 +219,6 @@ impl FactConsolidator {
                 .visibility(session_id)
                 .await
                 .unwrap_or(ChannelVisibility::Public);
-            let shown = nearby_facts(store, messages, channel_id.as_deref(), visibility).await;
-            let conversation = with_stored_facts(conversation, &shown);
             let project = match &self.project_notes {
                 Some(notes) => source
                     .project(session_id)
@@ -228,6 +226,17 @@ impl FactConsolidator {
                     .map(|project| (notes.as_ref(), project)),
                 None => None,
             };
+            // A session in a project is shown its notes first, so a
+            // restatement is not stored again and a correction lands on
+            // the note it corrects.
+            let mut shown = match &project {
+                Some((notes, project)) => {
+                    crate::project::notes_as_shown_facts(&notes.entries(project))
+                }
+                None => Vec::new(),
+            };
+            shown.extend(nearby_facts(store, messages, channel_id.as_deref(), visibility).await);
+            let conversation = with_stored_facts(conversation, &shown);
             let system = match &project {
                 Some((_, project)) => format!(
                     "{system_prompt}\n\n{}",
@@ -457,6 +466,7 @@ async fn store_consolidated<S>(
             (None, None) => (fact.category.as_str(), fact.key.as_str()),
         };
         let updating = shown_fact(&fact.updates).is_some();
+        let updating_note = shown_fact(&fact.updates).is_some_and(crate::project::is_note_fact);
         // People are recorded only as structured personal memory.
         if category == "people" {
             warn!(
@@ -485,14 +495,15 @@ async fn store_consolidated<S>(
         // A session in a project keeps what belongs to the project in its
         // notes; a correction of a shown fact stays with that fact.
         if let Some((notes, project)) = project
-            && !updating
-            && crate::project::route(
-                category,
-                fact.scope
-                    .as_deref()
-                    .and_then(crate::project::MemoryScope::parse),
-                true,
-            ) == crate::project::MemoryScope::Project
+            && (updating_note
+                || (!updating
+                    && crate::project::route(
+                        category,
+                        fact.scope
+                            .as_deref()
+                            .and_then(crate::project::MemoryScope::parse),
+                        true,
+                    ) == crate::project::MemoryScope::Project))
         {
             let note = crate::project::NoteWrite {
                 kind: crate::project::kind_for_category(category),
@@ -915,6 +926,38 @@ mod tests {
             .collect();
         assert_eq!(names, ["deploy_target"]);
         assert!(provider.requests()[0].messages[0].content.contains("SCOPE"));
+
+        // A later pass is shown the note, and a correction lands on it even
+        // when the model calls it personal.
+        let correction = r#"[{"category":"technical","key":"deploys","value":"Deploys go to Render","updates":"deploy_target","scope":"personal"}]"#;
+        let later = History {
+            turns: vec![turn(
+                4,
+                TurnRole::User,
+                "We moved deploys from Fly.io to Render last week",
+            )],
+            project: Some(project.clone()),
+            ..owner_history()
+        };
+        let corrected = Arc::new(ScriptedProvider::new([text(correction)]));
+        let (later_cursors, later_facts) = (Cursors::default(), Facts::default());
+        FactConsolidator::new(corrected.clone(), "mock")
+            .with_project_notes(Some(notes.clone()))
+            .consolidate(&later, &later_cursors, &later_facts, Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            corrected.requests()[0].messages[1]
+                .content
+                .contains("deploy_target: Deploys go to Fly.io")
+        );
+        assert!(later_facts.0.lock().unwrap().is_empty());
+        assert!(
+            notes
+                .read(&project, crate::project::NoteKind::Fact, "deploy_target")
+                .unwrap()
+                .contains("Render")
+        );
 
         // Without notes configured the same session learns as before.
         let provider = Arc::new(ScriptedProvider::new([text(reply)]));

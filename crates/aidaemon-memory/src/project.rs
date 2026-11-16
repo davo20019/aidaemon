@@ -115,6 +115,53 @@ pub fn kind_for_category(category: &str) -> NoteKind {
     }
 }
 
+/// The `source` of a [`crate::records::Fact`] that stands for a project
+/// note in an extractor's ALREADY STORED list ([`notes_as_shown_facts`]).
+pub const NOTE_FACT_SOURCE: &str = "project_note";
+
+/// At most this many notes are shown to an extractor.
+const MAX_NOTES_SHOWN: usize = 12;
+
+/// The project's notes as stored facts an extractor is shown, so a
+/// restatement of a note is marked instead of stored again and a correction
+/// names the note it corrects. Each has a negative id, never a store row's.
+pub fn notes_as_shown_facts(entries: &[NoteEntry]) -> Vec<crate::records::Fact> {
+    let long_ago = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default();
+    entries
+        .iter()
+        .filter(|entry| entry.kind.is_some())
+        .take(MAX_NOTES_SHOWN)
+        .enumerate()
+        .map(|(i, entry)| crate::records::Fact {
+            id: -(i as i64) - 1,
+            category: entry.category.clone().unwrap_or_else(|| {
+                entry
+                    .kind
+                    .map(NoteKind::as_str)
+                    .unwrap_or("project")
+                    .to_string()
+            }),
+            key: entry.name.clone(),
+            value: entry.description.clone(),
+            source: NOTE_FACT_SOURCE.to_string(),
+            created_at: long_ago,
+            updated_at: long_ago,
+            superseded_at: None,
+            recall_count: 0,
+            last_recalled_at: None,
+            channel_id: None,
+            privacy: crate::records::FactPrivacy::Private,
+            first_seen_at: None,
+            source_excerpt: None,
+        })
+        .collect()
+}
+
+/// Whether `fact` stands for a project note ([`notes_as_shown_facts`]).
+pub fn is_note_fact(fact: &crate::records::Fact) -> bool {
+    fact.id < 0 && fact.source == NOTE_FACT_SOURCE
+}
+
 /// What a note holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NoteKind {

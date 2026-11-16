@@ -82,6 +82,10 @@ pub struct InlineFact {
         skip_serializing_if = "Option::is_none"
     )]
     pub scope: Option<String>,
+    /// Set when the fact corrects a shown project note: it is written to
+    /// that note.
+    #[serde(skip)]
+    pub updates_note: bool,
 }
 
 fn lenient_stance<'de, D: Deserializer<'de>>(deserializer: D) -> Result<FactStance, D::Error> {
@@ -423,6 +427,11 @@ impl ProgressiveExtractor {
                         fact.category = target.category.clone();
                         fact.key = target.key.clone();
                         fact.restates = None;
+                        // A correction of a project note goes to that note.
+                        if crate::project::is_note_fact(target) {
+                            fact.updates = None;
+                            fact.updates_note = true;
+                        }
                     }
                     None => {
                         fact.updates = None;
@@ -482,6 +491,7 @@ impl ProgressiveExtractor {
             }
             // An update keeps the category of the fact it corrects.
             if fact.updates.is_none()
+                && !fact.updates_note
                 && !crate::records::automated_fact_category_allowed(&fact.category)
             {
                 debug!(
@@ -533,13 +543,14 @@ impl ProgressiveExtractor {
             // its notes. A correction of a shown fact stays with that fact.
             if let Some((notes, project)) = exchange.project
                 && fact.updates.is_none()
-                && crate::project::route(
-                    &fact.category,
-                    fact.scope
-                        .as_deref()
-                        .and_then(crate::project::MemoryScope::parse),
-                    true,
-                ) == crate::project::MemoryScope::Project
+                && (fact.updates_note
+                    || crate::project::route(
+                        &fact.category,
+                        fact.scope
+                            .as_deref()
+                            .and_then(crate::project::MemoryScope::parse),
+                        true,
+                    ) == crate::project::MemoryScope::Project)
             {
                 let note = crate::project::NoteWrite {
                     kind: crate::project::kind_for_category(&fact.category),
@@ -1214,6 +1225,61 @@ mod tests {
         let (_, provider) =
             propose_and_write(&store, &super::tests::exchange(user, &[]), "[]").await;
         assert!(!provider.requests()[0].messages[0].content.contains("SCOPE"));
+    }
+
+    #[tokio::test]
+    async fn a_project_turn_sees_its_notes_so_restatements_and_corrections_land_on_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::project::ProjectNotes::new(dir.path());
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None).unwrap();
+        for (key, body) in [
+            ("test_command", "Tests run with make test"),
+            ("db", "Postgres 15"),
+        ] {
+            notes
+                .write(
+                    &project,
+                    &crate::project::NoteWrite {
+                        kind: crate::project::NoteKind::Fact,
+                        key: key.into(),
+                        category: Some("technical".into()),
+                        description: None,
+                        body: body.into(),
+                        source: crate::project::NoteSource::Agent,
+                    },
+                )
+                .unwrap();
+        }
+        let shown = crate::project::notes_as_shown_facts(&notes.entries(&project));
+        let user = "As noted, tests run with make test. We moved the database to Postgres 16.";
+        let mut exchange = exchange(user, &[]);
+        exchange.nearby = &shown;
+        exchange.project = Some((&notes, &project));
+        let reply = r#"[
+            {"category":"technical","key":"testing","value":"Tests run with make test","stance":"asserted","evidence":"tests run with make test","restates":"test_command","scope":"project"},
+            {"category":"technical","key":"database","value":"Postgres 16","stance":"asserted","evidence":"We moved the database to Postgres 16","updates":"db","scope":"personal"}]"#;
+        let store = RecordingFacts::default();
+        let (_, provider) = propose_and_write(&store, &exchange, reply).await;
+        assert!(
+            provider.requests()[0].messages[1]
+                .content
+                .contains("technical/db: Postgres 15")
+        );
+        // Nothing reached the personal store, no second note was made, and
+        // the correction replaced the note it named.
+        assert!(store.stored.lock().unwrap().is_empty());
+        let names: Vec<String> = notes
+            .entries(&project)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["db", "test_command"]);
+        assert!(
+            notes
+                .read(&project, crate::project::NoteKind::Fact, "db")
+                .unwrap()
+                .contains("Postgres 16")
+        );
     }
 
     #[tokio::test]

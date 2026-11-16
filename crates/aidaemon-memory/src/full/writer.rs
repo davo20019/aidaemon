@@ -213,6 +213,16 @@ pub async fn extract_progressive(
         )
         .await
         .unwrap_or_default();
+    // On a turn in a project, its notes are shown first, so a restatement
+    // of one is not stored again and a correction lands on it.
+    let nearby = match &run.project {
+        Some((notes, project)) => {
+            let mut shown = crate::project::notes_as_shown_facts(&notes.entries(project));
+            shown.extend(nearby);
+            shown
+        }
+        None => nearby,
+    };
     let exchange = Exchange {
         user_text: &run.user_text,
         assistant_reply: &run.reply,
