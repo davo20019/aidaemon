@@ -64,8 +64,8 @@ pub struct TurnScope<'a> {
     /// of work, which has no step on the card.
     pub not_attempted: std::sync::Mutex<Vec<(Option<usize>, String)>>,
     /// The plan's usage limit stopped the chosen model and another answered
-    /// (the limit in words, the model that answered): the reply says so.
-    pub answered_past_quota: std::sync::Mutex<Option<(String, String)>>,
+    /// (the owner-facing note naming both): the reply says so.
+    pub answered_past_quota: std::sync::Mutex<Option<String>>,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger

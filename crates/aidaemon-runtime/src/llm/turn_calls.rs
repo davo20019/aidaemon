@@ -41,8 +41,27 @@ pub struct LlmCallTelemetry {
     /// Total provider calls attempted (1 = succeeded on the first try).
     pub attempts: u32,
     /// The plan's usage limit stopped the chosen model and another answered:
-    /// the owner-facing words for that limit.
+    /// the owner-facing note saying so.
     pub answered_past_quota: Option<String>,
+}
+
+/// The owner-facing note when `chosen`'s plan limit was reached and
+/// `answered_by` answered instead, with when the limit resets if known.
+pub(crate) fn quota_fallback_note(
+    chosen: &str,
+    answered_by: &str,
+    resets_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> String {
+    match resets_at {
+        Some(at) => format!(
+            "{chosen} reached its plan's usage limit, so {answered_by} answered this instead. The limit resets {}.",
+            crate::chat_bridge::describe_reset(at, now)
+        ),
+        None => format!(
+            "{chosen} reached its plan's usage limit, so {answered_by} answered this instead."
+        ),
+    }
 }
 
 fn malformed_reason_label(
@@ -462,8 +481,13 @@ pub async fn call_llm_with_recovery(
             if telemetry.fell_back
                 && let Some(quota) = recovery.quota.lock().ok().and_then(|quota| quota.clone())
             {
-                telemetry.answered_past_quota =
-                    Some(crate::chat_bridge::sdk_backed::to_daemon_error(quota).user_message());
+                let error = crate::chat_bridge::sdk_backed::to_daemon_error(quota);
+                telemetry.answered_past_quota = Some(quota_fallback_note(
+                    model,
+                    &telemetry.final_model,
+                    error.resets_at,
+                    std::time::SystemTime::now(),
+                ));
             }
             // The config works: stamp it as last known good.
             host.stamp_lastgood().await;
@@ -689,5 +713,33 @@ pub async fn select_turn_model(
         (snapshot.primary_model(), false)
     } else {
         (own_model().await, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quota_fallback_note;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_quota_fallback_note_names_both_models_and_the_reset() {
+        let now = SystemTime::now();
+        let note = quota_fallback_note(
+            "synthetic-primary",
+            "synthetic-fallback",
+            Some(now + Duration::from_secs(94 * 60)),
+            now,
+        );
+        assert!(
+            note.starts_with(
+                "synthetic-primary reached its plan's usage limit, so synthetic-fallback answered this instead. The limit resets "
+            ),
+            "{note}"
+        );
+        assert!(note.ends_with("(in 1h 34m)."), "{note}");
+        assert_eq!(
+            quota_fallback_note("synthetic-primary", "synthetic-fallback", None, now),
+            "synthetic-primary reached its plan's usage limit, so synthetic-fallback answered this instead."
+        );
     }
 }

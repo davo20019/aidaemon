@@ -1527,16 +1527,13 @@ impl TurnEngine<'_> {
                 // The chosen model's plan ran out and another answered: the
                 // owner hears it, with the model that did (live 2026-11-15:
                 // a coding run quietly ran on a small fallback and stopped).
-                if let Some((limit, model)) = scope
+                if let Some(note) = scope
                     .answered_past_quota
                     .lock()
                     .ok()
                     .and_then(|slot| slot.clone())
                 {
-                    reply = format!(
-                        "{}\n\n⚠️ {limit} This answer came from {model}, a fallback model.",
-                        reply.trim_end()
-                    );
+                    reply = format!("{}\n\n⚠️ {note}", reply.trim_end());
                 }
                 let not_done = abandoned
                     .not_done

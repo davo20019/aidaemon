@@ -412,7 +412,7 @@ impl TurnEngine<'_> {
         if let Some(limit) = telemetry.answered_past_quota.clone()
             && let Ok(mut slot) = scope.answered_past_quota.lock()
         {
-            slot.get_or_insert((limit, telemetry.final_model.clone()));
+            slot.get_or_insert(limit);
         }
         aidaemon_events::model_call_telemetry::record_model_call_telemetry(
             scope.emitter,
