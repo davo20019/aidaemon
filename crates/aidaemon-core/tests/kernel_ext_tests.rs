@@ -281,7 +281,58 @@ impl Tool for PerCallIdempotent {
 }
 
 #[tokio::test]
-async fn recovery_reruns_a_per_call_idempotent_call() {
+async fn ending_a_stranded_batch_never_replays_even_idempotent_calls_or_calls_the_model() {
+    use aidaemon_core::{InFlight, InvocationStage, RunState};
+
+    let store = Arc::new(MemoryStore::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = ScriptedProvider::new([text("must not be requested")]);
+    let agent = Agent::builder("worker")
+        .allow_unguarded()
+        .model("m")
+        .provider(provider.clone())
+        .tool(HangsOnce {
+            name: "write_report",
+            idempotent: true,
+            calls: calls.clone(),
+        })
+        .store(store.clone())
+        .build()
+        .unwrap();
+    let mut state = RunState::new("worker", "s", "write a report");
+    state.in_flight = Some(InFlight {
+        calls: vec![
+            call("c1", "write_report", json!({})),
+            call("c2", "write_report", json!({})),
+        ],
+        started: vec!["c1".to_string()],
+        done: Vec::new(),
+    });
+    let out = agent.end_in_flight(state).await.unwrap();
+    assert_eq!(out.status, RunStatus::Cancelled);
+    assert!(out.state.in_flight.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(provider.requests().is_empty());
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Indeterminate);
+    assert_eq!(out.receipts()[0].stage, InvocationStage::Dispatched);
+    assert_eq!(out.receipts()[1].status, ReceiptStatus::Cancelled);
+    assert_eq!(
+        out.receipts()[1].stage,
+        InvocationStage::RejectedBeforeDispatch
+    );
+    let events = store.events(out.state.run_id);
+    assert!(events.iter().any(|event| matches!(event, Event::Recovered { reran, indeterminate } if reran.is_empty() && indeterminate == &["c1"])));
+    assert!(matches!(
+        events.last(),
+        Some(Event::Finished {
+            status: RunStatus::Cancelled,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_crashed_per_call_idempotent_call_is_recorded_without_replaying() {
     let store = Arc::new(MemoryStore::new());
     let calls = Arc::new(AtomicUsize::new(0));
     let run_id: Arc<Mutex<Option<RunId>>> = Arc::default();
@@ -311,16 +362,13 @@ async fn recovery_reruns_a_per_call_idempotent_call() {
 
     let id = run_id.lock().unwrap().unwrap();
     let saved = store.load_state(id).await.unwrap().expect("checkpoint");
-    let second = build(ScriptedProvider::new([text("done")]))
-        .build()
-        .unwrap();
-    let out = second
-        .run_from(saved, CancellationToken::new())
-        .await
-        .unwrap();
-    assert_eq!(out.status, RunStatus::Completed);
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "re-run, not indeterminate");
-    assert!(out.receipts().iter().all(|r| r.succeeded()));
+    let second_provider = ScriptedProvider::new([text("must not be requested")]);
+    let second = build(second_provider.clone()).build().unwrap();
+    let out = second.end_in_flight(saved).await.unwrap();
+    assert_eq!(out.status, RunStatus::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no automatic re-run");
+    assert!(second_provider.requests().is_empty());
+    assert_eq!(out.receipts()[0].status, ReceiptStatus::Indeterminate);
 }
 
 // ---------- typed message origins, error flags, timeout hints, with_limits ----------

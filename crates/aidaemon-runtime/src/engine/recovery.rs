@@ -2,9 +2,11 @@
 //! next turn of its session starts.
 //!
 //! The kernel checkpoints a run's state into the host's store. A run whose
-//! last checkpoint is `in_flight` stopped mid tool batch: the kernel finishes
-//! that batch under its own rules (idempotent calls run again, others are
-//! marked indeterminate rather than repeated). A run that is `pending` was
+//! last checkpoint is `in_flight` stopped mid tool batch: calls with no
+//! result are recorded as indeterminate if started, or cancelled if not,
+//! and the run ends without executing a tool or calling the model. Picking
+//! the work up again requires the owner's request through the normal resume
+//! path. A run that is `pending` was
 //! waiting for an owner decision that no longer exists in memory. It is
 //! declined without a card and ended there, because the owner has moved on
 //! and sent a new message: the turn says what was not done instead. The
@@ -187,6 +189,7 @@ pub async fn settle(
                 .resume_resolving(state, resolution, run_cancel, &resolver)
                 .await?
         }
+        None if state.in_flight.is_some() => agent.end_in_flight(state).await?,
         None => agent.run_resolving(state, run_cancel, &resolver).await?,
     };
     if matches!(outcome.status, sdk::RunStatus::Interrupted { .. }) {

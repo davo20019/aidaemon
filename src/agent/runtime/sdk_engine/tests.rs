@@ -4523,17 +4523,14 @@ async fn sdk_turn_journals_its_run_and_wipe_erases_it() {
     assert_eq!(left_events, 0, "/wipe must erase the session's journal");
 }
 
-/// A run a restart left mid tool batch is settled before the session's next
-/// turn: the next turn finds no unfinished run and proceeds normally.
+/// A run a restart left mid tool batch ends before the session's next turn:
+/// the next turn's only model call answers its own message.
 #[tokio::test]
 async fn a_turn_settles_the_run_a_restart_left_in_flight() {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::MockProvider;
 
-    let provider = MockProvider::with_responses(vec![
-        MockProvider::text_response("Recovered."),
-        MockProvider::text_response("Noted."),
-    ]);
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Noted.")]);
     let mut harness = crate::testing::setup_test_agent_sdk(provider)
         .await
         .unwrap();
@@ -4550,14 +4547,16 @@ async fn a_turn_settles_the_run_a_restart_left_in_flight() {
     stranded.in_flight = Some(aidaemon_core::InFlight::default());
     store.upsert_state(&stranded).await.unwrap();
 
-    harness
+    let reply = harness
         .agent
         .handle_inbound_message(owner_request("Hello again."))
         .await
         .unwrap();
+    assert!(reply.text.contains("Noted."), "{}", reply.text);
 
-    // The stranded run was settled (its model call ran) before the new turn.
-    assert_eq!(harness.provider.call_count().await, 2);
+    // No model call belongs to the stranded run.
+    assert_eq!(harness.provider.call_count().await, 1);
+    assert!(store.run_ended(stranded.run_id).await.unwrap());
     let latest = store
         .latest_state_for_session(session)
         .await
@@ -4567,13 +4566,10 @@ async fn a_turn_settles_the_run_a_restart_left_in_flight() {
     assert_ne!(latest.run_id, stranded.run_id);
 }
 
-/// A stranded run's batch that, settled before the next turn, outlives the
-/// background threshold is the stranded run's job: it never takes over the
-/// new turn, whose reply to the owner's new message ships as the model wrote
-/// it (live 2026-11-16: a settled `sleep 45` went to the background and its
-/// launch line replaced the answer to a new message).
+/// A stranded call that could have handed off background work is not executed
+/// by recovery; the new reply belongs entirely to the new message.
 #[tokio::test]
-async fn work_settled_from_a_stranded_run_never_replaces_the_new_reply() {
+async fn a_stranded_call_never_launches_background_work_on_the_new_turn() {
     use crate::runtime_ports::AgentIngress;
     use crate::testing::{MockProvider, MockTool};
     use crate::traits::ToolCallMetadata;
@@ -4622,7 +4618,7 @@ async fn work_settled_from_a_stranded_run_never_replaces_the_new_reply() {
         aidaemon_core::RunState::new("aidaemon", session, "Run the long command, then reply.");
     stranded.in_flight = Some(aidaemon_core::InFlight {
         calls: vec![call],
-        started: Vec::new(),
+        started: vec!["c1".to_string()],
         done: Vec::new(),
     });
     store.upsert_state(&stranded).await.unwrap();
@@ -4647,7 +4643,16 @@ async fn work_settled_from_a_stranded_run_never_replaces_the_new_reply() {
         .expect("the session has runs");
     assert!(latest.in_flight.is_none(), "no run stays in flight");
     assert_ne!(latest.run_id, stranded.run_id);
-    // The new turn hands nothing off: no handoff decision was recorded.
+    assert!(store.run_ended(stranded.run_id).await.unwrap());
+    use aidaemon_core::RunStore;
+    let ended = store.load_state(stranded.run_id).await.unwrap().unwrap();
+    assert_eq!(ended.receipts.len(), 1);
+    assert_eq!(
+        ended.receipts[0].status,
+        aidaemon_core::ReceiptStatus::Indeterminate
+    );
+    // The mock's background finish was not reached, so the earlier run
+    // records uncertainty rather than a handoff or successful execution.
     let handed_off = harness
         .agent
         .event_store()

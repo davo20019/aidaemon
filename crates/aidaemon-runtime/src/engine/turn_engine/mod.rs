@@ -1379,8 +1379,8 @@ impl TurnEngine<'_> {
                 cancel: cancel.clone(),
             },
         };
-        // A run the daemon stopped on (a crash, a restart) is settled first,
-        // so its batch finishes under the kernel's rules before this turn.
+        // A run the daemon stopped on (a crash, a restart) is settled first:
+        // its in-flight calls are recorded but never executed again here.
         let stranded =
             recovery::stranded_run(self.run_store().map(|store| &**store), session_id).await;
         let abandoned = crate::approvals::AbandonedRunResolver {

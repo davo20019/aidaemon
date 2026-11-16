@@ -1530,6 +1530,54 @@ impl<'a> Driver<'a> {
             .await
     }
 
+    /// End a run whose batch was running when the process stopped, without
+    /// running anything: no tool call and no model call. A call that had
+    /// started and has no result gets an `Indeterminate` receipt (it may or
+    /// may not have taken effect), a call that never started a `Cancelled`
+    /// one, and the run ends `Cancelled`. Picking the work up again is the
+    /// owner's call, made in a new run.
+    pub(crate) async fn end_in_flight(mut self) -> Result<RunOutcome, CoreError> {
+        let Some(in_flight) = self.state.in_flight.clone() else {
+            return self.finish(RunStatus::Cancelled, None).await;
+        };
+        let mut indeterminate = Vec::new();
+        for call in &in_flight.calls {
+            if in_flight.done.contains(&call.id) {
+                continue;
+            }
+            let started = in_flight.started.contains(&call.id);
+            let (status, reason) = if started {
+                indeterminate.push(call.id.clone());
+                (
+                    ReceiptStatus::Indeterminate,
+                    format!(
+                        "`{}` was running when the agent restarted and may or may not have \
+                         completed. It was not run again.",
+                        call.name
+                    ),
+                )
+            } else {
+                (
+                    ReceiptStatus::Cancelled,
+                    "the agent restarted before this call started; it was not run".to_string(),
+                )
+            };
+            let (mut receipt, mut output) =
+                rejection(self.state.run_id, call, self.state.turn, status, reason);
+            if started {
+                receipt.stage = InvocationStage::Dispatched;
+            }
+            self.append(receipt, &mut output).await?;
+        }
+        self.emit(Event::Recovered {
+            reran: Vec::new(),
+            indeterminate,
+        })
+        .await?;
+        self.state.finishing = None;
+        self.finish(RunStatus::Cancelled, None).await
+    }
+
     fn is_done(&self, call_id: &str) -> bool {
         self.state
             .in_flight

@@ -194,6 +194,22 @@ impl Agent {
         self.settle_interruptions(outcome, cancel, resolver).await
     }
 
+    /// End a run a crash or restart left mid tool batch without running
+    /// anything more: unlike [`Agent::run_from`], no call is re-run and no
+    /// model call is made. A call that had started gets an
+    /// [`crate::ReceiptStatus::Indeterminate`] receipt, one that never
+    /// started a [`crate::ReceiptStatus::Cancelled`] one, and the run ends
+    /// [`RunStatus::Cancelled`]. A state that is not in flight just ends.
+    pub async fn end_in_flight(&self, state: RunState) -> Result<RunOutcome, CoreError> {
+        self.check_owner(&state)?;
+        if state.pending.is_some() {
+            return Err(CoreError::PendingInterruption);
+        }
+        Driver::new(&self.inner, state, CancellationToken::new())
+            .end_in_flight()
+            .await
+    }
+
     /// Like [`Agent::resume_with_cancel`], but settles each later
     /// interruption with `resolver`, as [`Agent::run_resolving`] does.
     pub async fn resume_resolving(
