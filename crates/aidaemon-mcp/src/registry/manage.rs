@@ -32,6 +32,223 @@ impl ManageMcpTool {
         Self { registry }
     }
 
+    /// The project's declared server `name`, when the turn works in a
+    /// project with a folder.
+    fn project_server(
+        project: Option<&aidaemon_core::ProjectRef>,
+        name: &str,
+    ) -> Result<(aidaemon_core::ProjectRef, super::project::ProjectServer), String> {
+        let project = project
+            .ok_or("This conversation does not work in a project, so it has no project servers.")?;
+        let root = project
+            .root
+            .as_deref()
+            .ok_or("This project has no folder, so it declares no servers.")?;
+        let servers = super::project::read_project_servers(root, &project.id)?;
+        let server = servers
+            .into_iter()
+            .find(|server| server.name == name)
+            .ok_or_else(|| {
+                format!(
+                    "{} declares no server named '{name}' in {}.",
+                    project.name,
+                    super::project::PROJECT_MCP_FILE
+                )
+            })?;
+        Ok((project.clone(), server))
+    }
+
+    /// The owner approval for one `project_start`: the exact command the
+    /// repository declares, for this project. A changed entry is a new card.
+    /// A call the start would refuse needs no card: it never runs.
+    pub fn project_start_approval(
+        project: Option<&aidaemon_core::ProjectRef>,
+        name: Option<&str>,
+    ) -> OwnerApprovalNeed {
+        let Some(name) = name.filter(|name| !name.trim().is_empty()) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        let Ok((project, server)) = Self::project_server(project, name) else {
+            return OwnerApprovalNeed::NotNeeded;
+        };
+        if server.unusable.is_some() || !ALLOWED_COMMANDS.contains(&server.command.as_str()) {
+            return OwnerApprovalNeed::NotNeeded;
+        }
+        let env_keys: Vec<&String> = server.env.keys().collect();
+        OwnerApprovalNeed::Ask(aidaemon_core::OwnerApprovalRequest {
+            card: None,
+            effects: Vec::new(),
+            summary: format!(
+                "Start MCP server '{}' that project {} declares ({} {})",
+                server.name,
+                project.name,
+                server.command,
+                server.args.join(" ")
+            ),
+            subject: json!({
+                "action": "project_start",
+                "project": project.id,
+                "name": server.name,
+                "command": server.command,
+                "args": server.args,
+                "env": server.env,
+            })
+            .to_string(),
+            risk: aidaemon_core::ApprovalRisk::High,
+            warnings: vec![format!(
+                "The project's repository chose this command{}. It runs as a local process for \
+                 this project's conversations until the daemon restarts. Only approve if you \
+                 trust the repository.",
+                if env_keys.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " and its environment ({})",
+                        env_keys
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            )],
+        })
+    }
+
+    async fn handle_project_list(
+        &self,
+        project: Option<&aidaemon_core::ProjectRef>,
+    ) -> anyhow::Result<String> {
+        let Some(project) = project else {
+            return Ok(
+                "This conversation does not work in a project, so it has no project servers."
+                    .to_string(),
+            );
+        };
+        let Some(root) = project.root.as_deref() else {
+            return Ok(format!(
+                "{} has no folder, so it declares no servers.",
+                project.name
+            ));
+        };
+        let servers = match super::project::read_project_servers(root, &project.id) {
+            Ok(servers) => servers,
+            Err(why) => return Ok(format!("Could not read {}'s servers: {why}", project.name)),
+        };
+        if servers.is_empty() {
+            return Ok(format!(
+                "{} declares no MCP servers (no {} at its root).",
+                project.name,
+                super::project::PROJECT_MCP_FILE
+            ));
+        }
+        let running: Vec<String> = self
+            .registry
+            .list_servers()
+            .await
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        let mut out = format!(
+            "{} declares these MCP servers in {} (start one with project_start; the owner approves its command):",
+            project.name,
+            super::project::PROJECT_MCP_FILE
+        );
+        for server in &servers {
+            let state = if running.contains(&server.registered_name) {
+                "running".to_string()
+            } else if let Some(why) = &server.unusable {
+                format!("cannot start: {why}")
+            } else if !ALLOWED_COMMANDS.contains(&server.command.as_str()) {
+                format!(
+                    "cannot start: '{}' is not an allowed command ({})",
+                    server.command,
+                    ALLOWED_COMMANDS.join(", ")
+                )
+            } else {
+                "not started".to_string()
+            };
+            out.push_str(&format!(
+                "\n- {} (`{} {}`): {state}",
+                server.name,
+                server.command,
+                server.args.join(" ")
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Starts a project's server. The owner was asked by the kernel first.
+    async fn handle_project_start(
+        &self,
+        project: Option<&aidaemon_core::ProjectRef>,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        let (project, server) = match Self::project_server(project, name) {
+            Ok(found) => found,
+            Err(why) => return Ok(why),
+        };
+        if let Some(why) = &server.unusable {
+            return Ok(format!("'{}' cannot be started: {why}.", server.name));
+        }
+        if !ALLOWED_COMMANDS.contains(&server.command.as_str()) {
+            return Ok(format!(
+                "'{}' cannot be started: '{}' is not an allowed command. Allowed commands: {}",
+                server.name,
+                server.command,
+                ALLOWED_COMMANDS.join(", ")
+            ));
+        }
+        let running = self.registry.list_servers().await;
+        if running
+            .iter()
+            .any(|info| info.name == server.registered_name)
+        {
+            return Ok(format!(
+                "'{}' is already running for {}.",
+                server.name, project.name
+            ));
+        }
+        // Not saved: a project server lasts until the daemon restarts.
+        let tools = self
+            .registry
+            .add_server(&server.registered_name, server.config(), false)
+            .await?;
+        info!(
+            server = %server.registered_name,
+            project = %project.id,
+            tools = tools.len(),
+            "Project MCP server started"
+        );
+        Ok(format!(
+            "Started '{}' for {} as {}. Its tools ({}) are offered in this project's conversations from the next message.",
+            server.name,
+            project.name,
+            server.registered_name,
+            tools.join(", ")
+        ))
+    }
+
+    async fn handle_project_stop(
+        &self,
+        project: Option<&aidaemon_core::ProjectRef>,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        let Some(project) = project else {
+            return Ok(
+                "This conversation does not work in a project, so it has no project servers."
+                    .to_string(),
+            );
+        };
+        let registered = super::project::registered_name(&project.id, name);
+        let running = self.registry.list_servers().await;
+        if !running.iter().any(|info| info.name == registered) {
+            return Ok(format!("'{name}' is not running for {}.", project.name));
+        }
+        self.registry.remove_server(&registered).await?;
+        Ok(format!("Stopped '{name}' for {}.", project.name))
+    }
+
     /// The owner approval for one `add` call. Starting an external process
     /// always asks, even in a trusted session. A call the add path would
     /// refuse (unknown command, missing fields) needs no card: it never runs.
@@ -71,8 +288,20 @@ impl ManageMcpTool {
         let Ok(args) = serde_json::from_str::<ManageMcpArgs>(arguments) else {
             return CallEffects::unknown();
         };
-        if args.action == "list" {
+        if matches!(args.action.as_str(), "list" | "project_list") {
             return CallEffects::none();
+        }
+        // A project server's command is the repository's: unknown here, so
+        // the effects stay incomplete; its process key names the server.
+        if args.action == "project_start"
+            && let Some(name) = args.name.clone().filter(|name| !name.trim().is_empty())
+        {
+            let mut effects = CallEffects::unknown();
+            effects.keys.push(EffectKey::named(
+                EffectClass::Process,
+                &server_process_key(&format!("project:{name}")),
+            ));
+            return effects;
         }
         let mut effects = CallEffects::unknown();
         if args.action == "add"
@@ -285,7 +514,7 @@ struct ManageMcpArgs {
 
 /// The tool's one description: the schema the model reads and
 /// `description()` both use it.
-const TOOL_DESCRIPTION: &str = "Manage MCP servers at runtime. set_env binds an env var to `mcp_<server>_<KEY>`, which the owner stores with `aidaemon keychain set`; values are never args.";
+const TOOL_DESCRIPTION: &str = "Manage MCP servers at runtime. set_env binds an env var to `mcp_<server>_<KEY>`, which the owner stores with `aidaemon keychain set`; values are never args. In a project conversation, project_list shows the servers its .mcp.json declares and project_start/project_stop run one for this project only.";
 
 fn manage_mcp_schema() -> Value {
     json!({
@@ -296,9 +525,9 @@ fn manage_mcp_schema() -> Value {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add", "list", "remove", "set_env", "restart", "enable", "disable"]
+                    "enum": ["add", "list", "remove", "set_env", "restart", "enable", "disable", "project_list", "project_start", "project_stop"]
                 },
-                "name": { "type": "string", "description": "Server name" },
+                "name": { "type": "string", "description": "Server name (for project_start/project_stop, its name in .mcp.json)" },
                 "command": {
                     "type": "string",
                     "description": "Spawn command (add). Allowed: npx, uvx, node, python, python3"
@@ -329,19 +558,45 @@ impl Tool for ManageMcpTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &ToolCallContext,
+        facts: &ToolCallContext,
     ) -> anyhow::Result<ToolCallOutcome> {
-        self.run(arguments).await.map(ToolCallOutcome::from_output)
+        self.run_in(arguments, facts.project.as_ref())
+            .await
+            .map(ToolCallOutcome::from_output)
     }
 }
 
 impl ManageMcpTool {
     /// Run one call. Approval is judged by the kernel before this runs.
     pub async fn run(&self, arguments: &str) -> anyhow::Result<String> {
+        self.run_in(arguments, None).await
+    }
+
+    /// Run one call on a turn in `project` (the project actions need one).
+    pub async fn run_in(
+        &self,
+        arguments: &str,
+        project: Option<&aidaemon_core::ProjectRef>,
+    ) -> anyhow::Result<String> {
         let args: ManageMcpArgs = serde_json::from_str(arguments)
             .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
 
         match args.action.as_str() {
+            "project_list" => self.handle_project_list(project).await,
+            "project_start" => {
+                let name = args
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'name' is required for project_start"))?;
+                self.handle_project_start(project, name).await
+            }
+            "project_stop" => {
+                let name = args
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("'name' is required for project_stop"))?;
+                self.handle_project_stop(project, name).await
+            }
             "add" => {
                 let name = args
                     .name
@@ -394,7 +649,7 @@ impl ManageMcpTool {
                 self.handle_disable(name).await
             }
             other => Ok(format!(
-                "Unknown action '{}'. Valid actions: add, list, remove, set_env, restart, enable, disable",
+                "Unknown action '{}'. Valid actions: add, list, remove, set_env, restart, enable, disable, project_list, project_start, project_stop",
                 other
             )),
         }
@@ -408,10 +663,15 @@ impl ToolSemantics for ManageMcpTool {
     async fn owner_approval_request(
         &self,
         call: &ApprovalCall<'_>,
-        _facts: &ToolCallContext,
+        facts: &ToolCallContext,
     ) -> OwnerApprovalNeed {
         if call.refused {
             return OwnerApprovalNeed::NotNeeded;
+        }
+        if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
+            && args.action == "project_start"
+        {
+            return Self::project_start_approval(facts.project.as_ref(), args.name.as_deref());
         }
         if let Ok(args) = serde_json::from_value::<ManageMcpArgs>(call.arguments.clone())
             && matches!(args.action.as_str(), "restart" | "enable")
@@ -429,7 +689,11 @@ impl ToolSemantics for ManageMcpTool {
     }
 
     fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(arguments, &["list"], ToolMutationEffects::CONFIGURATION)
+        semantics_for_exact_read_actions(
+            arguments,
+            &["list", "project_list"],
+            ToolMutationEffects::CONFIGURATION,
+        )
     }
 
     fn capabilities(&self) -> ToolCapabilities {
@@ -507,6 +771,209 @@ mod tests {
             ),
             OwnerApprovalNeed::NotNeeded
         ));
+    }
+
+    fn project_with(mcp_json: Option<&str>) -> (aidaemon_core::ProjectRef, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(text) = mcp_json {
+            std::fs::write(dir.path().join(".mcp.json"), text).unwrap();
+        }
+        let project = aidaemon_core::ProjectRef::new(
+            "project-0a1b2c3d-0000-4000-8000-000000000001",
+            "Acme Site",
+            Some(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        (project, dir)
+    }
+
+    const DOCS: &str = r#"{"mcpServers": {
+        "docs": {"command": "npx", "args": ["-y", "docs-mcp"], "env": {"MODE": "ro"}},
+        "shell": {"command": "bash", "args": ["-c", "evil"]},
+        "keyed": {"command": "uvx", "args": ["t"], "env": {"TOKEN": "${API_TOKEN}"}}
+    }}"#;
+
+    #[test]
+    fn starting_a_project_server_asks_for_its_exact_command() {
+        let (project, dir) = project_with(Some(DOCS));
+        let OwnerApprovalNeed::Ask(card) =
+            ManageMcpTool::project_start_approval(Some(&project), Some("docs"))
+        else {
+            panic!("a project server start must ask");
+        };
+        assert!(card.summary.contains("npx -y docs-mcp"), "{}", card.summary);
+        assert!(card.summary.contains("Acme Site"));
+        assert!(card.warnings[0].contains("MODE"));
+        assert_eq!(card.risk, aidaemon_core::ApprovalRisk::High);
+        // A changed entry is a new card.
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            DOCS.replace("docs-mcp", "docs-mcp@2"),
+        )
+        .unwrap();
+        let OwnerApprovalNeed::Ask(changed) =
+            ManageMcpTool::project_start_approval(Some(&project), Some("docs"))
+        else {
+            panic!("a project server start must ask");
+        };
+        assert_ne!(card.subject, changed.subject);
+        // What the start refuses never reaches the owner.
+        for name in ["shell", "keyed", "missing"] {
+            assert!(matches!(
+                ManageMcpTool::project_start_approval(Some(&project), Some(name)),
+                OwnerApprovalNeed::NotNeeded
+            ));
+        }
+        assert!(matches!(
+            ManageMcpTool::project_start_approval(None, Some("docs")),
+            OwnerApprovalNeed::NotNeeded
+        ));
+        let effects = ManageMcpTool::effects_for(r#"{"action":"project_start","name":"docs"}"#);
+        assert!(!effects.complete);
+        assert_eq!(
+            ManageMcpTool::effects_for(r#"{"action":"project_list"}"#),
+            aidaemon_core::CallEffects::none()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_actions_list_and_refuse_without_starting_anything() {
+        use aidaemon_secrets::MemorySecretStore;
+        let tool = ManageMcpTool::new(McpRegistry::new(
+            std::sync::Arc::new(OneServerStore::default()),
+            std::sync::Arc::new(MemorySecretStore::default()),
+        ));
+        let (project, _dir) = project_with(Some(DOCS));
+        let list = tool
+            .run_in(r#"{"action":"project_list"}"#, Some(&project))
+            .await
+            .unwrap();
+        assert!(
+            list.contains("- docs (`npx -y docs-mcp`): not started"),
+            "{list}"
+        );
+        assert!(list.contains("'bash' is not an allowed command"), "{list}");
+        assert!(list.contains("never expanded"), "{list}");
+        let refused = tool
+            .run_in(
+                r#"{"action":"project_start","name":"shell"}"#,
+                Some(&project),
+            )
+            .await
+            .unwrap();
+        assert!(refused.contains("not an allowed command"), "{refused}");
+        let outside = tool
+            .run_in(r#"{"action":"project_start","name":"docs"}"#, None)
+            .await
+            .unwrap();
+        assert!(outside.contains("does not work in a project"), "{outside}");
+        let (bare, _bare_dir) = project_with(None);
+        let none = tool
+            .run_in(r#"{"action":"project_list"}"#, Some(&bare))
+            .await
+            .unwrap();
+        assert!(none.contains("declares no MCP servers"), "{none}");
+        let stop = tool
+            .run_in(r#"{"action":"project_stop","name":"docs"}"#, Some(&project))
+            .await
+            .unwrap();
+        assert!(stop.contains("is not running"), "{stop}");
+        assert!(tool.registry.list_servers().await.is_empty());
+    }
+
+    /// A minimal stdio MCP server in Python, with one tool `lookup`.
+    const PY_SERVER: &str = r#"
+import json, sys
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if "id" not in msg:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg["params"]["protocolVersion"], "capabilities": {"tools": {}}, "serverInfo": {"name": "py", "version": "0"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "lookup", "description": "Look a word up", "inputSchema": {"type": "object", "properties": {}}}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn an_approved_project_server_runs_under_its_project_and_stops() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 not found; skipped");
+            return;
+        }
+        use aidaemon_secrets::MemorySecretStore;
+        let (project, dir) = project_with(None);
+        std::fs::write(dir.path().join("server.py"), PY_SERVER).unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            format!(
+                r#"{{"mcpServers": {{"dict": {{"command": "python3", "args": ["{}"]}}}}}}"#,
+                dir.path()
+                    .join("server.py")
+                    .display()
+                    .to_string()
+                    .replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let store = std::sync::Arc::new(OneServerStore::default());
+        let tool = ManageMcpTool::new(McpRegistry::new(
+            store.clone(),
+            std::sync::Arc::new(MemorySecretStore::default()),
+        ));
+        let started = tool
+            .run_in(
+                r#"{"action":"project_start","name":"dict"}"#,
+                Some(&project),
+            )
+            .await
+            .unwrap();
+        assert!(started.contains("prj_0a1b2c3d_dict__lookup"), "{started}");
+        let names: Vec<String> = tool
+            .registry
+            .list_servers()
+            .await
+            .into_iter()
+            .flat_map(|info| info.tool_names)
+            .collect();
+        assert_eq!(names, ["prj_0a1b2c3d_dict__lookup"]);
+        assert!(super::super::project::offered_in_project(
+            &names[0],
+            Some(&project.id)
+        ));
+        assert!(!super::super::project::offered_in_project(&names[0], None));
+        // Not saved: nothing reached the server store.
+        assert!(store.rows.lock().unwrap().is_empty());
+        let again = tool
+            .run_in(
+                r#"{"action":"project_start","name":"dict"}"#,
+                Some(&project),
+            )
+            .await
+            .unwrap();
+        assert!(again.contains("already running"), "{again}");
+        let list = tool
+            .run_in(r#"{"action":"project_list"}"#, Some(&project))
+            .await
+            .unwrap();
+        assert!(list.contains("): running"), "{list}");
+        let stopped = tool
+            .run_in(r#"{"action":"project_stop","name":"dict"}"#, Some(&project))
+            .await
+            .unwrap();
+        assert!(stopped.starts_with("Stopped 'dict'"), "{stopped}");
+        assert!(tool.registry.list_servers().await.is_empty());
     }
 
     /// One disabled server in memory, as its database row.

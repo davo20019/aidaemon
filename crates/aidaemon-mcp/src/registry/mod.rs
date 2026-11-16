@@ -5,6 +5,7 @@
 
 #[cfg(feature = "registry")]
 pub mod manage;
+pub mod project;
 #[cfg(feature = "registry")]
 mod proxied;
 #[cfg(feature = "registry")]

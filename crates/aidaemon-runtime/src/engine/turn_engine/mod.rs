@@ -738,6 +738,18 @@ impl TurnEngine<'_> {
                 } else {
                     offered_mcp
                 };
+                // A project's own servers are offered only on that
+                // project's turns, and on those always.
+                let project_id = memory_turn.project.as_ref().map(|p| p.id.as_str());
+                names.retain(|name| {
+                    aidaemon_mcp::registry::project::offered_in_project(name, project_id)
+                });
+                if project_id.is_some() {
+                    names.extend(self.mcp_tool_names().await.into_iter().filter(|name| {
+                        aidaemon_mcp::registry::project::is_project_scoped(name)
+                            && aidaemon_mcp::registry::project::offered_in_project(name, project_id)
+                    }));
+                }
                 names.retain(|name| !self.tools().iter().any(|tool| tool.name() == name.as_str()));
                 names.sort();
                 names.dedup();

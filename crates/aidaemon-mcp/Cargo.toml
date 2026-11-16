@@ -42,6 +42,7 @@ aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 # Enables the fake server binary for integration tests.
 aidaemon-mcp = { path = ".", features = ["test-server", "registry"] }
 tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt", "rt-multi-thread"] }
+tempfile = "3"
 
 [[bin]]
 name = "fake_mcp_server"
