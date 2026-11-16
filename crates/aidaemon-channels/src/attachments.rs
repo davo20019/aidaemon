@@ -32,6 +32,27 @@ pub fn format_file_stub(
 /// Prefix for channel-injected file metadata blocks (`format_file_stub`).
 pub const INBOUND_FILE_STUB_PREFIX: &str = "[File received:";
 
+/// Prefix for the line that follows a marked-up picture's stub
+/// ([`markup_stub`]).
+pub const INBOUND_MARKUP_STUB_PREFIX: &str = "[Marked up by the owner:";
+
+/// What the model is told about a picture the owner drew marks over: the
+/// marks are theirs and point at what they mean; `original` is where the
+/// unmarked picture is, when the reader may see local paths.
+pub fn markup_stub(original: Option<&str>) -> String {
+    let mut stub = format!(
+        "{INBOUND_MARKUP_STUB_PREFIX} the red strokes on this picture are theirs, drawn to point \
+         at what the message is about; focus on the marked areas"
+    );
+    if let Some(original) = original {
+        stub.push_str(&format!(
+            ". The unmarked picture, for what the marks cover: {original}"
+        ));
+    }
+    stub.push(']');
+    stub
+}
+
 /// Prefix for the opaque resource handle line paired with an inbound file stub.
 pub const INBOUND_RESOURCE_STUB_PREFIX: &str = "[Resource: res_";
 
@@ -75,6 +96,19 @@ pub fn strip_inbound_file_stubs(text: &str) -> String {
                 cursor += 1;
             }
         }
+        // A marked-up picture's note follows its stub: metadata as well.
+        if text[cursor..].starts_with(INBOUND_MARKUP_STUB_PREFIX) {
+            let Some(close_rel) = text[cursor..].find(']') else {
+                out.push_str(&text[cursor..]);
+                break;
+            };
+            cursor += close_rel + 1;
+            if text[cursor..].starts_with("\r\n") {
+                cursor += 2;
+            } else if text[cursor..].starts_with('\n') {
+                cursor += 1;
+            }
+        }
     }
     out.trim().to_string()
 }
@@ -95,8 +129,12 @@ pub fn build_inbound_text(user_text: &str, attachments: &[MessageAttachment]) ->
                 &a.mime_type,
                 Path::new(&a.local_path),
             );
-            match a.resource_id.as_deref() {
+            let stub = match a.resource_id.as_deref() {
                 Some(resource_id) => format!("{stub}\n[Resource: {resource_id}]"),
+                None => stub,
+            };
+            match a.marked_up_from.as_deref() {
+                Some(original) => format!("{stub}\n{}", markup_stub(Some(original))),
                 None => stub,
             }
         })
@@ -135,6 +173,11 @@ pub fn build_inbound_text_without_local_paths(
                 .as_deref()
                 .map(|id| format!("\n[Resource: {id}]"))
                 .unwrap_or_default()
+                + &attachment
+                    .marked_up_from
+                    .as_ref()
+                    .map(|_| format!("\n{}", markup_stub(None)))
+                    .unwrap_or_default()
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -163,6 +206,7 @@ pub fn message_attachment(
         provenance: AttachmentProvenance::Inbound,
         source_tool: None,
         sha256: sha256_file(&dest_path),
+        marked_up_from: None,
     }
 }
 
@@ -232,6 +276,27 @@ mod tests {
         let text = build_inbound_text("what is this?", &attachments);
         assert!(text.contains("[File received: a.png"));
         assert!(text.ends_with("what is this?"));
+    }
+
+    #[test]
+    fn a_marked_up_picture_says_whose_marks_and_where_the_unmarked_one_is() {
+        let mut marked = message_attachment(
+            PathBuf::from("/tmp/uploads/b_shot-marked.jpg"),
+            "shot-marked.jpg".to_string(),
+            "image/jpeg".to_string(),
+            100,
+        );
+        marked.marked_up_from = Some("/tmp/uploads/a_shot.png".to_string());
+        let text = build_inbound_text("what is this part?", std::slice::from_ref(&marked));
+        assert!(text.contains(INBOUND_MARKUP_STUB_PREFIX), "{text}");
+        assert!(text.contains("red strokes"), "{text}");
+        assert!(text.contains("/tmp/uploads/a_shot.png"), "{text}");
+        // The note is metadata: only the owner's words are theirs.
+        assert_eq!(user_authored_text(&text), "what is this part?");
+        // Without local paths: the note, no path.
+        let text = build_inbound_text_without_local_paths("what is this part?", &[marked]);
+        assert!(text.contains(INBOUND_MARKUP_STUB_PREFIX), "{text}");
+        assert!(!text.contains("/tmp/uploads"), "{text}");
     }
 
     #[test]

@@ -1782,6 +1782,7 @@ impl Store {
         {
             let store = *self;
             let url = shown.url.clone();
+            let original = shown.id.clone();
             let stem = shown
                 .name
                 .rsplit_once('.')
@@ -1797,11 +1798,19 @@ impl Store {
                 )
                 .await
                 {
-                    Some(bytes) => store.attach_file(
-                        format!("{stem}-marked.jpg"),
-                        "image/jpeg".to_owned(),
-                        &bytes,
-                    ),
+                    Some(bytes) => {
+                        let note = store.act(|c| {
+                            c.attach_marked_up(
+                                format!("{stem}-marked.jpg"),
+                                "image/jpeg".to_owned(),
+                                &bytes,
+                                original,
+                            )
+                        });
+                        if let Err(note) = note {
+                            store.say(note);
+                        }
+                    }
                     None => store.say("Couldn't read that picture to mark it up".to_owned()),
                 }
                 store.viewing.set(None);

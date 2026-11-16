@@ -1142,6 +1142,8 @@ fn pick_body(
 /// A picture sent in a conversation, opened over the page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Viewed {
+    /// Its attachment id.
+    pub id: String,
     pub url: String,
     pub name: String,
     /// Its size in pixels, when the daemon knows it.

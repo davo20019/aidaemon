@@ -1771,6 +1771,101 @@ async fn no_view_action_can_resolve_an_approval() {
 }
 
 #[tokio::test]
+async fn a_marked_up_picture_tells_the_agent_where_the_unmarked_one_is() {
+    use base64::Engine as _;
+    let f = fixture(RiskLevel::Medium).await;
+    let upload = |id: &'static str, name: &'static str, marked_from: Option<String>| {
+        command(
+            id,
+            Command::UploadFile {
+                name: name.into(),
+                mime: None,
+                data: base64::engine::general_purpose::STANDARD.encode(
+                    [b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice(), name.as_bytes()].concat(),
+                ),
+                marked_from,
+            },
+        )
+    };
+    let uploaded = |ack: ServerFrame| match ack {
+        ServerFrame::Ack {
+            result: CommandResult::Uploaded { attachment },
+            ..
+        } => attachment,
+        other => panic!("{other:?}"),
+    };
+    let original = uploaded(f.post(&[], &upload("up-1", "shot.png", None)).await);
+    let marked = uploaded(
+        f.post(
+            &[],
+            &upload("up-2", "shot-marked.jpg", Some(original.id.clone())),
+        )
+        .await,
+    );
+    assert_eq!(marked.marked_from.as_deref(), Some(original.id.as_str()));
+    // A file the gateway does not have is not noted.
+    let stray = uploaded(
+        f.post(&[], &upload("up-3", "other.png", Some("0".repeat(24))))
+            .await,
+    );
+    assert_eq!(stray.marked_from, None);
+
+    let ack = f
+        .post(
+            &[],
+            &command(
+                "r-marked",
+                Command::SendMessage {
+                    session_id: None,
+                    text: "What is this part?".into(),
+                    attachments: vec![marked.clone()],
+                    mid_run: None,
+                    project_id: None,
+                    model: None,
+                    effort: None,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            ack,
+            ServerFrame::Ack {
+                result: CommandResult::MessageAccepted { .. },
+                ..
+            }
+        ),
+        "{ack:?}"
+    );
+    let mut since = 0;
+    let events = f
+        .poll_until(&[], &mut since, |e| {
+            matches!(e, Event::TurnCompleted { .. })
+        })
+        .await;
+    // The agent's file names the unmarked picture.
+    let got = f.agent.files.lock().unwrap().clone();
+    assert_eq!(got.len(), 1);
+    let unmarked = got[0].marked_up_from.clone().expect("noted as marked up");
+    assert!(unmarked.ends_with("shot.png"), "{unmarked}");
+    // Clients see the owner's words and the marked picture, still marked.
+    let shown = events
+        .iter()
+        .find_map(|e| match e {
+            Event::UserMessage {
+                text, attachments, ..
+            } => Some((text.clone(), attachments.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(shown.0, "What is this part?");
+    assert_eq!(
+        shown.1[0].marked_from.as_deref(),
+        Some(original.id.as_str())
+    );
+}
+
+#[tokio::test]
 async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
     use base64::Engine as _;
     let f = fixture(RiskLevel::Medium).await;
@@ -1784,6 +1879,7 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     name: "receipt.png".into(),
                     mime: None,
                     data: base64::engine::general_purpose::STANDARD.encode(png),
+                    marked_from: None,
                 },
             ),
         )
@@ -1881,6 +1977,7 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     session_id: None,
                     text: "and this".into(),
                     attachments: vec![AttachmentRef {
+                        marked_from: None,
                         height: None,
                         width: None,
                         id: "0".repeat(24),

@@ -967,7 +967,12 @@ impl ClientGateway {
                 })?;
                 Ok(CommandResult::Memories { memories })
             }
-            Command::UploadFile { name, mime, data } => self.upload(name, mime, data),
+            Command::UploadFile {
+                name,
+                mime,
+                data,
+                marked_from,
+            } => self.upload(name, mime, data, marked_from),
             Command::ForgetMemory { memory_id } => match self.host.forget(&memory_id).await {
                 Ok(true) => Ok(CommandResult::Forgotten { memory_id }),
                 Ok(false) => Err(ProtocolError::new(ErrorCode::NotFound, "No such memory")),
@@ -1363,6 +1368,7 @@ impl ClientGateway {
         name: String,
         mime: Option<String>,
         data: String,
+        marked_from: Option<String>,
     ) -> Result<CommandResult, ProtocolError> {
         use base64::Engine as _;
         let Some(files) = &self.files else {
@@ -1392,10 +1398,17 @@ impl ClientGateway {
         if bytes.len() > files::MAX_UPLOAD_BYTES {
             return Err(too_big());
         }
-        let attachment = files.save(&name, mime.as_deref(), &bytes).map_err(|e| {
+        let mut attachment = files.save(&name, mime.as_deref(), &bytes).map_err(|e| {
             warn!(error = %e, "Saving an uploaded file failed");
             ProtocolError::new(ErrorCode::Internal, "Could not keep the file")
         })?;
+        if let Some(original) = marked_from {
+            match files.mark_up(&attachment.id, &original) {
+                Ok(true) => attachment.marked_from = Some(original),
+                Ok(false) => warn!("A marked-up picture names a file the gateway does not have"),
+                Err(e) => warn!(error = %e, "Noting a marked-up picture failed"),
+            }
+        }
         Ok(CommandResult::Uploaded { attachment })
     }
 
@@ -1422,12 +1435,19 @@ impl ClientGateway {
                         format!("No uploaded file {}: upload it again", attachment.id),
                     )
                 })?;
-                Ok(aidaemon_channels::attachments::message_attachment(
+                let mut file = aidaemon_channels::attachments::message_attachment(
                     record.path,
                     record.name,
                     record.mime,
                     record.size_bytes,
-                ))
+                );
+                // Drawn over another picture: the agent is told so, and
+                // where the unmarked one is.
+                file.marked_up_from = record
+                    .marked_from
+                    .and_then(|original| files.get(&original))
+                    .map(|original| original.path.to_string_lossy().into_owned());
+                Ok(file)
             })
             .collect()
     }

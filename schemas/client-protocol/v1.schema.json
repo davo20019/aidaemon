@@ -311,6 +311,13 @@
         "id": {
           "type": "string"
         },
+        "marked_from": {
+          "description": "The picture the owner marked up to make this one, by its `id`\n(`upload_file`'s `marked_from`; protocol 1.25).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mime": {
           "type": [
             "string",
@@ -1306,6 +1313,13 @@
           "properties": {
             "data": {
               "type": "string"
+            },
+            "marked_from": {
+              "description": "The picture the owner drew marks over to make this one: its\nattachment `id`. The agent is told the marks are the owner's and\nwhere the unmarked picture is (protocol 1.25).",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "mime": {
               "type": [

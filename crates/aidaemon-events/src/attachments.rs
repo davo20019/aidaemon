@@ -46,6 +46,7 @@ pub fn tool_artifact_attachment(
         provenance: AttachmentProvenance::ToolArtifact,
         source_tool: Some(source_tool.to_string()),
         sha256: sha256_file(path),
+        marked_up_from: None,
     }
 }
 
@@ -72,6 +73,7 @@ pub fn save_tool_observation_image(
         provenance: AttachmentProvenance::ToolObservation,
         source_tool: Some(source_tool.to_string()),
         sha256: Some(hex::encode(Sha256::digest(bytes))),
+        marked_up_from: None,
     })
 }
 

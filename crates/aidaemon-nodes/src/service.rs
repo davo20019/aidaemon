@@ -764,6 +764,7 @@ impl NodeService {
             provenance: Default::default(),
             source_tool: None,
             sha256: Some(upload.expected_sha256.clone()),
+            marked_up_from: None,
         };
         let result = ingress
             .respond_with_attachment(&context, prompt, attachment)

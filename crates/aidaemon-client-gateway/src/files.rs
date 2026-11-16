@@ -28,6 +28,10 @@ pub struct FileRecord {
     /// A picture's size in pixels, read from its header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pixels: Option<(u32, u32)>,
+    /// The file whose picture the owner drew marks over to make this one,
+    /// by its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_from: Option<String>,
 }
 
 /// A picture's width and height in pixels, from its header (PNG, GIF,
@@ -214,7 +218,11 @@ impl FileStore {
     ) -> std::io::Result<AttachmentRef> {
         let id = hex::encode(&Sha256::digest(path.to_string_lossy().as_bytes())[..12]);
         let name = sanitize_name(name);
+        // Registered again (a message shown): what it was marked up from
+        // stays.
+        let marked_from = self.get(&id).and_then(|r| r.marked_from);
         let record = FileRecord {
+            marked_from,
             path: path.to_path_buf(),
             name: name.clone(),
             mime: mime.to_string(),
@@ -235,7 +243,21 @@ impl FileStore {
             size_bytes: Some(size_bytes),
             width: record.pixels.map(|(w, _)| w),
             height: record.pixels.map(|(_, h)| h),
+            marked_from: record.marked_from,
         })
+    }
+
+    /// Note that the owner drew marks over file `original`'s picture to
+    /// make file `id`; an unknown `original` is not noted.
+    pub fn mark_up(&self, id: &str, original: &str) -> std::io::Result<bool> {
+        let (Some(mut record), Some(_)) = (self.get(id), self.get(original)) else {
+            return Ok(false);
+        };
+        record.marked_from = Some(original.to_string());
+        let record_path = self.record_path(id);
+        std::fs::write(&record_path, serde_json::to_vec(&record)?)?;
+        aidaemon_tools::config_file::set_owner_only_permissions(&record_path);
+        Ok(true)
     }
 
     /// Save `bytes` (an upload, or a picture the agent sent) and register

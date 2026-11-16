@@ -170,6 +170,9 @@ pub struct DraftFile {
     pub number: u64,
     pub name: String,
     pub state: DraftFileState,
+    /// A copy of a sent picture the owner drew marks over: that picture's
+    /// attachment id.
+    pub marked_from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1890,6 +1893,29 @@ impl Client {
     /// Attach a file to the message being written: it uploads now. `Err`
     /// with what to tell the owner when it is too large.
     pub fn attach_file(&mut self, name: String, mime: String, bytes: &[u8]) -> Result<(), String> {
+        self.attach(name, mime, bytes, None)
+    }
+
+    /// Attach a picture the owner drew marks over: a copy of sent
+    /// attachment `marked_from`. The daemon tells the agent the marks are
+    /// the owner's.
+    pub fn attach_marked_up(
+        &mut self,
+        name: String,
+        mime: String,
+        bytes: &[u8],
+        marked_from: String,
+    ) -> Result<(), String> {
+        self.attach(name, mime, bytes, Some(marked_from))
+    }
+
+    fn attach(
+        &mut self,
+        name: String,
+        mime: String,
+        bytes: &[u8],
+        marked_from: Option<String>,
+    ) -> Result<(), String> {
         use base64::Engine as _;
         if bytes.len() > MAX_FILE_BYTES {
             return Err(format!(
@@ -1903,11 +1929,13 @@ impl Client {
             number,
             name: name.clone(),
             state: DraftFileState::Uploading,
+            marked_from: marked_from.clone(),
         });
         let id = self.send(Command::UploadFile {
             name,
             mime: (!mime.is_empty()).then_some(mime),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            marked_from,
         });
         self.uploads.insert(id, number);
         Ok(())
@@ -2136,6 +2164,42 @@ mod tests {
         client.update(settings_ack(&fresh[0]), &cx(None));
         client.refresh_settings();
         assert_eq!(settings_reads(&mut client).len(), 1);
+    }
+
+    #[test]
+    fn a_marked_up_picture_names_the_picture_it_was_drawn_over() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client
+            .attach_marked_up(
+                "shot-marked.jpg".into(),
+                "image/jpeg".into(),
+                b"jpeg",
+                "0123456789abcdef01234567".into(),
+            )
+            .unwrap();
+        let (_, sent) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            sent,
+            Command::UploadFile { marked_from: Some(ref id), .. } if id == "0123456789abcdef01234567"
+        ));
+        assert_eq!(
+            client.draft_files[0].marked_from.as_deref(),
+            Some("0123456789abcdef01234567")
+        );
+        // A plain attachment names none.
+        client
+            .attach_file("notes.txt".into(), "text/plain".into(), b"hi")
+            .unwrap();
+        let (_, sent) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            sent,
+            Command::UploadFile {
+                marked_from: None,
+                ..
+            }
+        ));
     }
 
     #[test]

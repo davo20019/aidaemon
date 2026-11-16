@@ -1,6 +1,7 @@
 {
   "command": {
     "data": "iVBORw0KGgo=",
+    "marked_from": "0123456789abcdef01234567",
     "mime": "image/png",
     "name": "receipt.png",
     "type": "upload_file"

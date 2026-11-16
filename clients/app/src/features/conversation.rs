@@ -1006,12 +1006,14 @@ fn files(store: Store, attached: impl Fn() -> Vec<AttachmentRef> + 'static, mine
                 if file.is_image() && idiom() != Idiom::Terminal {
                     let pixels = file.width.zip(file.height);
                     let name = file.name.clone();
+                    let id = file.id.clone();
                     list = list.child(ui::picture(
                         url,
                         format!("Picture: {}", file.name),
                         pixels,
                         move || {
                             store.view_picture(ui::Viewed {
+                                id: id.clone(),
                                 url: open.clone(),
                                 name: name.clone(),
                                 pixels,
@@ -1080,9 +1082,6 @@ fn draft_files(store: Store) -> View {
 fn open_file(url: String) {
     drop(open_url(url));
 }
-
-/// The end of a marked-up picture's name (`Store::attach_marked`).
-const MARKED: &str = "-marked.jpg";
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
     view()
@@ -1360,7 +1359,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                             Connection::Online => {
                                 // The field says what to write here.
                                 let files = store.draft_files();
-                                let ask = if files.iter().any(|f| f.name.ends_with(MARKED)) {
+                                let ask = if files.iter().any(|f| f.marked_from.is_some()) {
                                     "Say what to do with the marked part"
                                 } else if !files.is_empty() {
                                     "Say what to do with it, or just send"

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 24;
+pub const PROTOCOL_MINOR: u16 = 25;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -304,6 +304,11 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime: Option<String>,
         data: String,
+        /// The picture the owner drew marks over to make this one: its
+        /// attachment `id`. The agent is told the marks are the owner's and
+        /// where the unmarked picture is (protocol 1.25).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        marked_from: Option<String>,
     },
     /// Forget one remembered fact, by its `id` from `list_memories`.
     ForgetMemory { memory_id: String },
@@ -551,6 +556,10 @@ pub struct AttachmentRef {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// The picture the owner marked up to make this one, by its `id`
+    /// (`upload_file`'s `marked_from`; protocol 1.25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_from: Option<String>,
 }
 
 impl AttachmentRef {

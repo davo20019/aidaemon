@@ -44,6 +44,10 @@ pub struct MessageAttachment {
     /// re-checks this before sensitive use to detect stale/replaced files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// The owner drew marks over a picture to make this one: the unmarked
+    /// picture's local path. The model is told the marks are the owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_up_from: Option<String>,
 }
 
 /// Categorization of a tool for role-based scoping.
