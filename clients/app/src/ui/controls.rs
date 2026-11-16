@@ -1019,8 +1019,12 @@ pub fn status_dot(
     let hint = label.clone();
     with_hint(
         move || SharedString::from(hint()),
+        // The whole target to press, the dot at its start: it sits by the
+        // name it belongs to.
         frame(Variant::Ghost, Size::Sm, motion::PRESS_SCALE_ICON)
             .w(px(Size::Sm.height()))
+            .justify_start()
+            .pl(px(2.0))
             .accessibility_label(move || SharedString::from(label()))
             .on_press(on_press)
             // The footer's own dot ([`status`]), so the two match.
