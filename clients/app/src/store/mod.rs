@@ -932,22 +932,12 @@ impl Store {
         pinned
     }
 
-    /// Home's projects: every pinned one, then the ones used last, `room`
-    /// in all unless more are pinned.
+    /// Home's projects: the first `room` of [`Self::sorted_projects`], or
+    /// every pinned one when more are pinned.
     pub fn home_projects(&self, room: usize) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .sorted_projects()
-            .into_iter()
-            .filter(|id| self.is_project_pinned(id))
-            .collect();
-        let fill = room.saturating_sub(ids.len());
-        ids.extend(
-            self.recent_projects()
-                .into_iter()
-                .filter(|id| !self.is_project_pinned(id))
-                .take(fill),
-        );
-        ids
+        let ids = self.sorted_projects();
+        let pinned = ids.iter().filter(|id| self.is_project_pinned(id)).count();
+        ids.into_iter().take(room.max(pinned)).collect()
     }
 
     pub fn is_project_pinned(&self, id: &str) -> bool {

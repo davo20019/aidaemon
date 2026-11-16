@@ -770,6 +770,21 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
     )?;
     app.press("Back to all conversations >> nth=0")?;
     app.wait_for("label:Project Echo blog, pinned, 0 conversations")?;
+    // Home's projects drag the same way, in the main list.
+    assert!(above(app.screen(), "Acme site", "Beta app"));
+    app.drag(
+        "id:drag:project-beta",
+        nsh_engine::Point {
+            x: Points(0.0),
+            y: Points(-31.0),
+        },
+    )?;
+    app.wait_until(
+        "Beta app above Acme site",
+        std::time::Duration::from_secs(5),
+        |s| above(s, "Beta app", "Acme site"),
+    )?;
+    assert!(above(app.screen(), "Echo blog", "Beta app"));
     // Delete asks first and says what happens to its conversations and
     // folder.
     app.long_press("Project Acme site, 1 conversations")?;

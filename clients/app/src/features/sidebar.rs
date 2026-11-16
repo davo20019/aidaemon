@@ -386,8 +386,9 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         })
     });
     let all = computed(move || store.projects());
-    // The pinned, then the ones used last; "All projects" takes the last
-    // place when some are left out.
+    // As sorted (the pinned first, then the owner's order, else the ones
+    // used last); "All projects" takes the last place when some are left
+    // out.
     let shown = computed(move || {
         let room = if all.with(Vec::len) > HOME_PROJECTS {
             HOME_PROJECTS - 1
@@ -397,6 +398,7 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         store.home_projects(room)
     });
     let more = computed(move || all.with(Vec::len) > shown.with(Vec::len));
+    let reorder = Reorder::new(shown, false);
     view()
         .gap(px(1.0))
         .child(group(store, "Needs you", needs))
@@ -406,11 +408,11 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
             move || store.project_form_open(),
             move || project_form(store),
         ))
-        .child(each(
+        .child(view().gap(px(ROW_GAP)).child(each(
             shown,
             |id: &String| id.clone(),
-            move |id, _| project_row(store, id.get_untracked(), None),
-        ))
+            move |id, _| project_row(store, id.get_untracked(), Some(reorder)),
+        )))
         .child(
             when(more, move || {
                 row(
@@ -454,20 +456,38 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         ))
 }
 
-/// A drag reordering the projects (the list of every project): which one
-/// and how far it moved, and the list as it stands.
+/// A drag reordering a list of projects (Home's, or every project's):
+/// which one and how far it moved, the list as it stands, and how tall its
+/// rows are (`detailed`: a second line, the folder).
 #[derive(Clone, Copy)]
 struct Reorder {
     drag: Signal<Option<(String, f32)>>,
     order: Memo<Vec<String>>,
+    detailed: bool,
 }
 
-/// A row of the list of every project, and the gap between two: a drag
-/// moves a row a place each this far.
-fn detailed_row() -> f32 {
-    ui::fit::row() + 14.0
-}
+/// The gap between two project rows.
 const ROW_GAP: f32 = 1.0;
+
+impl Reorder {
+    fn new(order: Memo<Vec<String>>, detailed: bool) -> Self {
+        Self {
+            drag: signal(None),
+            order,
+            detailed,
+        }
+    }
+
+    /// A row's height.
+    fn row(&self) -> f32 {
+        ui::fit::row() + if self.detailed { 14.0 } else { 0.0 }
+    }
+
+    /// A drag moves a row a place each this far.
+    fn step(&self) -> f32 {
+        self.row() + ROW_GAP
+    }
+}
 
 impl Reorder {
     /// Where the dragged row would land: `(from, to)`.
@@ -475,7 +495,7 @@ impl Reorder {
         let (id, dy) = self.drag.get()?;
         self.order.with(|ids| {
             let from = ids.iter().position(|p| *p == id)?;
-            let step = detailed_row() + ROW_GAP;
+            let step = self.step();
             let to = (from as f32 + (dy / step).round()).clamp(0.0, (ids.len() - 1) as f32);
             Some((from, to as usize))
         })
@@ -494,7 +514,7 @@ impl Reorder {
             return 0.0;
         };
         let at = self.order.with(|ids| ids.iter().position(|p| p == id));
-        let step = detailed_row() + ROW_GAP;
+        let step = self.step();
         match at {
             Some(at) if from < to && at > from && at <= to => -step,
             Some(at) if to < from && at >= to && at < from => step,
@@ -504,8 +524,8 @@ impl Reorder {
 }
 
 /// A project's row: its name and how many conversations it has; a press
-/// goes inside it, its menu pins, moves or deletes it. `reorder` (the list
-/// of every project) adds its folder and a handle to drag it by.
+/// goes inside it, its menu pins, moves or deletes it. `reorder` adds a
+/// handle to drag it by (and, detailed, its folder).
 fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
     let (name, folder, label, open, count_id) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
@@ -548,7 +568,7 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
             .number_of_lines(1)
             .text_size(px(ui::fit::body())),
     );
-    if reorder.is_some() {
+    if reorder.is_some_and(|r| r.detailed) {
         names = names.child(
             text(move || {
                 store
@@ -593,7 +613,7 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
             actions,
         );
     };
-    line = line.h(px(detailed_row()));
+    line = line.h(px(reorder.row()));
     let (moving, offset_id, handle_id) = (id.clone(), id.clone(), id.clone());
     let lifted = move || {
         reorder
@@ -628,7 +648,7 @@ fn drag_handle(store: Store, reorder: Reorder, id: String) -> View {
     view()
         .test_id(&format!("drag:{id}"))
         .w(px(ui::fit::icon_slot() + 8.0))
-        .h(px(detailed_row()))
+        .h(px(reorder.row()))
         .items_center()
         .justify_center()
         // The mouse's and a finger's; the keyboard and a screen reader
@@ -733,10 +753,7 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
 /// Every project, each with its folder, the pinned first and each dragged
 /// into place by its handle, then New project.
 fn all_projects(store: Store, _ids: Memo<Vec<String>>) -> View {
-    let reorder = Reorder {
-        drag: signal(None),
-        order: computed(move || store.sorted_projects()),
-    };
+    let reorder = Reorder::new(computed(move || store.sorted_projects()), true);
     view()
         .gap(px(1.0))
         .child(page_head(store, || "Projects".to_owned(), view()))
