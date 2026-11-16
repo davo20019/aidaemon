@@ -134,10 +134,14 @@ fn suggested_model<'a>(requested: &str, options: &'a ModelOptions) -> Option<&'a
         .iter()
         .flat_map(|provider| provider.models.iter().map(|model| model.id.as_str()));
     // A missing version suffix can be much longer than an ordinary typo.
+    // So can a vendor prefix ("kimi" for "moonshotai/kimi-k2.5").
     let suffix = models.clone().find(|model| {
-        model
-            .strip_prefix(requested)
-            .is_some_and(|rest| rest.starts_with('-'))
+        let name = model.rsplit('/').next().unwrap_or(model);
+        [*model, name].iter().any(|candidate| {
+            candidate
+                .strip_prefix(requested)
+                .is_some_and(|rest| rest.starts_with('-'))
+        })
     });
     suffix.or_else(|| {
         models
@@ -416,6 +420,15 @@ mod tests {
             suggested_model("synthetic-opus", &versioned),
             Some("synthetic-opus-5-5"),
             "a missing version suffix is suggested"
+        );
+        versioned.providers[1].models.push(ModelOption {
+            id: "synthetic-vendor/synthetic-kimi-k2".into(),
+            efforts: vec![],
+        });
+        assert_eq!(
+            suggested_model("synthetic-kimi", &versioned),
+            Some("synthetic-vendor/synthetic-kimi-k2"),
+            "a missing vendor prefix is suggested"
         );
         assert_eq!(suggested_model("unrelated", &choices), None);
         assert_eq!(
