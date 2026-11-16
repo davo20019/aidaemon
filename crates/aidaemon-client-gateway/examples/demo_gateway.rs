@@ -172,8 +172,136 @@ fn marks() -> &'static Marks {
     MARKS.get_or_init(Default::default)
 }
 
+/// First-run setup, tried with `AIDAEMON_DEMO_SETUP=1` (a model is found
+/// here) or `=none` (none is): `None` once it is done.
+fn demo_setup() -> &'static std::sync::Mutex<Option<aidaemon_client_protocol::SetupState>> {
+    use aidaemon_client_protocol::{Billing, FoundModel, ProviderOption, SetupState, SetupStep};
+    static SETUP: OnceLock<std::sync::Mutex<Option<SetupState>>> = OnceLock::new();
+    SETUP.get_or_init(|| {
+        let mode = std::env::var("AIDAEMON_DEMO_SETUP").unwrap_or_default();
+        let provider = |preset: &str, name: &str, billing, needs_key| ProviderOption {
+            preset: preset.into(),
+            name: name.into(),
+            billing,
+            needs_key,
+            key_url: String::new(),
+            needs_base_url: false,
+            model: String::new(),
+        };
+        std::sync::Mutex::new((!mode.is_empty()).then(|| SetupState {
+            step: SetupStep::Model,
+            found: if mode == "none" {
+                Vec::new()
+            } else {
+                vec![FoundModel {
+                    preset: "openai_chatgpt".into(),
+                    name: "OpenAI (ChatGPT subscription) · gpt-synthetic".into(),
+                    source: "ChatGPT sign-in on this computer".into(),
+                    billing: Billing::Plan,
+                    works: true,
+                    detail: String::new(),
+                }]
+            },
+            providers: vec![
+                provider(
+                    "openai_chatgpt",
+                    "OpenAI (ChatGPT subscription)",
+                    Billing::Plan,
+                    false,
+                ),
+                provider("anthropic", "Anthropic", Billing::PerToken, true),
+                provider("openrouter", "OpenRouter", Billing::PerToken, true),
+            ],
+            ..SetupState::default()
+        }))
+    })
+}
+
+fn demo_channel_step() -> aidaemon_client_protocol::SetupState {
+    use aidaemon_client_protocol::{ChannelOption, SetupState, SetupStep};
+    let chat = |platform: &str, name: &str, needs_app_token| ChannelOption {
+        platform: platform.into(),
+        name: name.into(),
+        help_url: "https://example.invalid/make-a-bot".into(),
+        needs_app_token,
+    };
+    SetupState {
+        step: SetupStep::Channel,
+        model: Some("OpenAI (ChatGPT subscription) · gpt-synthetic".into()),
+        channels: vec![
+            chat("telegram", "Telegram", false),
+            chat("slack", "Slack", true),
+            chat("discord", "Discord", false),
+        ],
+        ..SetupState::default()
+    }
+}
+
 #[async_trait]
 impl ClientHost for Host {
+    async fn setup(&self) -> Option<aidaemon_client_protocol::SetupState> {
+        demo_setup().lock().unwrap().clone()
+    }
+    async fn setup_step(
+        &self,
+        action: aidaemon_client_protocol::SetupAction,
+    ) -> Result<aidaemon_client_protocol::SetupState, String> {
+        use aidaemon_client_protocol::{SetupAction, SetupState, SetupStep};
+        let next = match action {
+            SetupAction::UseFound { .. } | SetupAction::ConnectModel { .. } => {
+                // The daemon would restart with the model; then the chat step.
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    *demo_setup().lock().unwrap() = Some(demo_channel_step());
+                    if let Some(gateway) = GATEWAY.get() {
+                        gateway.setup_updated(demo_channel_step());
+                    }
+                });
+                SetupState {
+                    step: SetupStep::Starting,
+                    model: Some("OpenAI (ChatGPT subscription) · gpt-synthetic".into()),
+                    ..SetupState::default()
+                }
+            }
+            SetupAction::Detect => demo_channel_step(),
+            SetupAction::SkipChannel | SetupAction::Finish => {
+                static GREETED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                demo_setup().lock().unwrap().take();
+                if !GREETED.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && let Some(gateway) = GATEWAY.get()
+                {
+                    gateway
+                        .post_greeting(
+                            &aidaemon_client_gateway::new_app_session_id(),
+                            "Welcome",
+                            "Hi, I'm AIdaemon. I research, write, organize files, run commands \
+                             and keep an eye on things for you on a schedule. I run on this \
+                             computer. While it sleeps, I'm offline.\n\nI read and look things \
+                             up on my own. Before anything that sends, posts, deletes or spends, \
+                             I ask you first.\n\nTry one of these, or ask for anything.",
+                            vec![
+                                "Look through my Downloads folder and suggest what to clean up"
+                                    .into(),
+                                "Find today's three biggest tech stories and summarize each in \
+                                 two lines"
+                                    .into(),
+                                "Every weekday at 8, send me a short summary of news on a topic \
+                                 I pick"
+                                    .into(),
+                            ],
+                        )
+                        .await;
+                }
+                return Ok(SetupState {
+                    step: SetupStep::Done,
+                    ..SetupState::default()
+                });
+            }
+            _ => return Err("The demo takes no keys or tokens".into()),
+        };
+        Ok(next)
+    }
     async fn rename_session(&self, id: &str, title: Option<&str>) -> Result<(), String> {
         marks().lock().unwrap().entry(id.into()).or_default().0 = title.map(str::to_owned);
         Ok(())

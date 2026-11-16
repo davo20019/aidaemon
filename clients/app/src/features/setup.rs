@@ -40,13 +40,23 @@ fn labeled(label: &'static str, control: impl IntoElement) -> View {
 }
 
 fn frame(content: View) -> View {
-    view().flex_1().items_center().justify_center().p_6().child(
-        ui::surface()
-            .w(px(520.0))
-            .max_w(percentage(1.0))
-            .p_6()
-            .gap_4()
-            .child(content),
+    // Centred while it fits; a long step scrolls from its top.
+    view().flex_1().child(
+        scroll().flex_1().child(
+            view()
+                .min_h(percentage(1.0))
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(
+                    ui::surface()
+                        .w(px(520.0))
+                        .max_w(percentage(1.0))
+                        .p_6()
+                        .gap_4()
+                        .child(content),
+                ),
+        ),
     )
 }
 
@@ -69,7 +79,7 @@ static PHONE_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Open the phone step: talk to the agent from Telegram, Slack or Discord.
 pub fn reach_from_phone(store: Store) {
     PHONE_ASKED.store(true, std::sync::atomic::Ordering::Relaxed);
-    store.setup_step(SetupAction::Detect);
+    store.setup_step_later(SetupAction::Detect);
 }
 
 /// No daemon yet. The desktop app starts one here at once; pairing with a
@@ -345,16 +355,11 @@ fn model_step(store: Store) -> View {
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    btn(
-                                        format!("Continue with {}", best.name),
-                                        Variant::Primary,
-                                        Size::Md,
-                                        move || {
-                                            store.setup_step(SetupAction::UseFound {
-                                                index: index as u32,
-                                            })
-                                        },
-                                    )
+                                    btn("Continue", Variant::Primary, Size::Md, move || {
+                                        store.setup_step(SetupAction::UseFound {
+                                            index: index as u32,
+                                        })
+                                    })
                                     .disabled(move || store.setup_busy()),
                                 )
                                 .child(when(
@@ -403,10 +408,15 @@ fn choices(
         // Found on this machine, tested.
         .child(dynamic(move || {
             let found = store.setup().map(|s| s.found).unwrap_or_default();
-            (!found.is_empty()).then(|| {
+            // The first that works is the card above.
+            let above = found.iter().position(|m| m.works);
+            (found.len() > usize::from(above.is_some())).then(|| {
                 untracked(move || {
-                    let mut list = view().gap_2().child(ui::section_label("Found here"));
+                    let mut list = view().gap_2().child(ui::section_label("Also found here"));
                     for (index, model) in found.into_iter().enumerate() {
+                        if Some(index) == above {
+                            continue;
+                        }
                         let detail = if model.works {
                             format!("{} · {}", model.source, billing_words(model.billing))
                         } else {
@@ -703,18 +713,10 @@ fn channel_step(store: Store) -> View {
         view()
             .gap_4()
             .child(heading("Reach it from your phone"))
-            .child(lead(move || {
-                let model = store
-                    .setup()
-                    .and_then(|s| s.model)
-                    .map(|m| format!("{m} is connected. "))
-                    .unwrap_or_default();
-                format!(
-                    "{model}Talk to your agent from Telegram, Slack or Discord too: make a \
-                     bot there, paste its token, then send it a message. You can come back to \
-                     this from Settings."
-                )
-            }))
+            .child(lead(
+                "Talk to your agent from Telegram, Slack or Discord too: make a bot there, paste \
+                 its token, then send it a message. You can come back to this from Settings.",
+            ))
             .child(dynamic(move || {
                 let setup = store.setup()?;
                 Some(untracked(move || match setup.channel {
@@ -727,7 +729,7 @@ fn channel_step(store: Store) -> View {
                         ))
                         .child(btn("Continue", Variant::Primary, Size::Md, move || {
                             PHONE_ASKED.store(false, std::sync::atomic::Ordering::Relaxed);
-                            store.setup_step(SetupAction::Finish)
+                            store.setup_step_later(SetupAction::Finish)
                         })),
                     Some(wait) => view()
                         .gap_3()
@@ -797,7 +799,7 @@ fn channel_step(store: Store) -> View {
             .child(
                 btn("Not now", Variant::Ghost, Size::Sm, move || {
                     PHONE_ASKED.store(false, std::sync::atomic::Ordering::Relaxed);
-                    store.setup_step(SetupAction::SkipChannel)
+                    store.setup_step_later(SetupAction::SkipChannel)
                 })
                 .disabled(move || store.setup_busy()),
             ),

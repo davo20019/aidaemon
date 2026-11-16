@@ -484,6 +484,11 @@ impl Store {
         self.act(|c| c.setup_step(action));
     }
 
+    /// A setup step taken from Settings, after first run.
+    pub fn setup_step_later(&self, action: SetupAction) {
+        self.act(|c| c.setup_step_later(action));
+    }
+
     pub fn setup_busy(&self) -> bool {
         self.reads.setup_busy.get()
     }

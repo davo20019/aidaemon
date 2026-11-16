@@ -418,7 +418,8 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
     ]);
     app.wait_for("Connect a model")?;
     // The model found here is one click; the rest wait.
-    app.wait_for("Continue with OpenAI (ChatGPT subscription) · gpt-synthetic")?;
+    app.wait_for("Found: OpenAI (ChatGPT subscription) · gpt-synthetic")?;
+    app.wait_for("Continue")?;
     app.wait_for(
         "ChatGPT sign-in on this computer · uses your plan · has limits. It answered a test just now.",
     )?;

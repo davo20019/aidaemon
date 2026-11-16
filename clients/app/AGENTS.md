@@ -25,7 +25,9 @@ The web build is served by the gateway from `[client_gateway] app_dir`
 at `/client/v1/next/` (same origin, so sign-in needs no CORS). The demo
 gateway serves it with
 `AIDAEMON_APP_DIR=<path to .nsh/out/AIdaemon> cargo run -p aidaemon-client-gateway --example demo_gateway -- <port>`;
-its pairing link approves itself (use `/client/v1/next/#offer=…`).
+its pairing link approves itself (use `/client/v1/next/#offer=…`). With
+`AIDAEMON_DEMO_SETUP=1` it starts in first-run setup with a model found
+(`=none`: with none), so the setup screens can be tried with no real key.
 
 ## Invariants
 
