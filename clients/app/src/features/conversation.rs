@@ -334,9 +334,33 @@ fn header(store: Store, session: Option<String>) -> View {
                 } else {
                     Glyph::Sidebar
                 };
-                ui::icon_btn(glyph, "Conversations", Size::Md, move || {
-                    store.open_sidebar()
-                })
+                // Something elsewhere waits on the owner (amber) or works
+                // (accent): a dot on the button, so the list need not be
+                // opened to know.
+                let elsewhere = move |is: fn(&Store, &str) -> bool| {
+                    let here = store.selected();
+                    store
+                        .session_ids()
+                        .iter()
+                        .any(|id| Some(id) != here.as_ref() && is(&store, id))
+                };
+                view()
+                    .relative()
+                    .child(ui::icon_btn(glyph, "Conversations", Size::Md, move || {
+                        store.open_sidebar()
+                    }))
+                    .child(when(
+                        move || elsewhere(Store::needs_you) || elsewhere(Store::is_working),
+                        move || {
+                            ui::corner_dot(move || {
+                                if elsewhere(Store::needs_you) {
+                                    ui::Tone::Warning
+                                } else {
+                                    ui::Tone::Accent
+                                }
+                            })
+                        },
+                    ))
             },
         ))
         .child(

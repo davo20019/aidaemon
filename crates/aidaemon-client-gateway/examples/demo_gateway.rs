@@ -53,7 +53,9 @@ impl AgentIngress for Agent {
                     kind: aidaemon_core::card::ActivityKind::Read,
                 })
                 .await;
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            // "slow" keeps it working a while, to watch a working row.
+            let pause = if text.contains("slow") { 30_000 } else { 600 };
+            tokio::time::sleep(Duration::from_millis(pause)).await;
         }
         let gateway = GATEWAY.get().cloned();
         let reply = if text.contains("approve") {

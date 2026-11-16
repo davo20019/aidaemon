@@ -912,6 +912,72 @@ pub fn empty(title: &'static str, detail: impl IntoReactive<SharedString>) -> Vi
         )
 }
 
+/// Work going on, in a row's end: a small ring that turns (still, with
+/// reduced motion). `label` is what screen readers hear.
+pub fn spinner(label: &'static str) -> View {
+    let ring = svg(nsh_core::element::ImageSrc::svg_markup(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-opacity="0.25"/><path d="M8 2a6 6 0 0 1 6 6" stroke="currentColor"/></svg>"#,
+    ))
+    .w(px(14.0))
+    .h(px(14.0))
+    .text_color(colors::ACCENT);
+    let ring = if reduce_motion() {
+        ring
+    } else {
+        ring.animate_spin()
+    };
+    view()
+        .w(px(fit::icon_slot()))
+        .h(px(fit::icon_slot()))
+        .items_center()
+        .justify_center()
+        .role(AccessibilityRole::Progressbar)
+        .label(label)
+        .child(if idiom() == nsh_core::platform::Idiom::Terminal {
+            view().child(text("◌").text_color(colors::ACCENT))
+        } else {
+            view().child(ring)
+        })
+}
+
+/// A dot on a button's corner: something behind it wants a look
+/// (`tone`: amber waits on the owner, accent works).
+pub fn corner_dot(tone: impl Fn() -> Tone + 'static) -> View {
+    view()
+        .absolute()
+        .top(px(6.0))
+        .right(px(6.0))
+        .w(px(8.0))
+        .h(px(8.0))
+        .rounded_full()
+        .border(px(1.5))
+        .border_color(colors::BACKGROUND)
+        .bg(move || tone().color())
+        .accessibility_elements_hidden(true)
+}
+
+/// A small coloured dot and a word, at a row's end: "Needs you".
+pub fn badge_dot(label: &'static str, tone: Tone) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(
+            view()
+                .w(px(7.0))
+                .h(px(7.0))
+                .rounded_full()
+                .bg(tone.color())
+                .accessibility_elements_hidden(true),
+        )
+        .child(
+            text(label)
+                .text_size(px(if touch() { 12.0 } else { type_scale::XS }))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(tone.color()),
+        )
+}
+
 /// Work going on: three dots that pulse in turn.
 pub fn working(label: impl IntoReactive<SharedString>) -> View {
     view()

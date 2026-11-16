@@ -14,7 +14,8 @@ use aidaemon_client_core::machine::DropKind;
 
 pub fn sidebar(store: Store) -> View {
     let ids = computed(move || store.visible_ids());
-    // Grouped by what each needs: an answer, then work running, then the rest.
+    // What waits on the owner first; the rest by time, each row saying
+    // whether it works.
     let needs = computed(move || {
         ids.with(|ids| {
             ids.iter()
@@ -23,18 +24,10 @@ pub fn sidebar(store: Store) -> View {
                 .collect::<Vec<_>>()
         })
     });
-    let working = computed(move || {
-        ids.with(|ids| {
-            ids.iter()
-                .filter(|id| !store.needs_you(id) && store.is_working(id))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-    });
     let rest = computed(move || {
         ids.with(|ids| {
             ids.iter()
-                .filter(|id| !store.needs_you(id) && !store.is_working(id))
+                .filter(|id| !store.needs_you(id))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -148,11 +141,10 @@ pub fn sidebar(store: Store) -> View {
                                 return view()
                                     .gap(px(1.0))
                                     .child(group(store, "Needs you", needs))
-                                    .child(group(store, "Working", working))
                                     .child(group(store, "Conversations", rest));
                             }
                             match shown {
-                                SidebarView::Home => home(store, needs, working, rest),
+                                SidebarView::Home => home(store, needs, rest),
                                 SidebarView::Projects => all_projects(store, ids),
                                 SidebarView::Project(id) => project_page(store, id, ids),
                             }
@@ -338,14 +330,9 @@ fn new_here(store: Store) {
 /// (one fewer) and "All projects" in the last one's place.
 const HOME_PROJECTS: usize = 4;
 
-/// Home: what needs the owner, what is working, the pinned, the projects
+/// Home: what needs the owner, the pinned, the projects
 /// used last, then every other conversation, newest first.
-fn home(
-    store: Store,
-    needs: Memo<Vec<String>>,
-    working: Memo<Vec<String>>,
-    rest: Memo<Vec<String>>,
-) -> View {
+fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View {
     let pinned = computed(move || {
         rest.with(|ids| {
             ids.iter()
@@ -375,7 +362,6 @@ fn home(
     view()
         .gap(px(1.0))
         .child(group(store, "Needs you", needs))
-        .child(group(store, "Working", working))
         .child(group(store, "Pinned", pinned))
         .child(section_label("Projects"))
         .child(when(
@@ -930,14 +916,12 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         }
         Some(SharedString::from(parts.join(", ")))
     })
-    // Working (accent, pulsing) or a new reply (filled); nothing while
-    // quiet, in the same slot so the names line up.
+    // A new reply: a filled dot; nothing otherwise, in the same slot so
+    // the names line up.
     .child(ui::state_dot(
-        move || store.is_running(&c) || store.is_unread(&c),
+        move || store.is_unread(&c),
         move || {
-            if store.is_running(&e) {
-                colors::ACCENT
-            } else if store.is_unread(&e) {
+            if store.is_unread(&e) {
                 colors::TEXT
             } else {
                 colors::TRANSPARENT
@@ -980,19 +964,43 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
         .text_color(colors::FAINT),
     )
-    // When it last moved: "3h" within a day, else its date ("Oct 30").
-    .child(when(dated, move || {
+    // At the end, what it is doing: waiting on the owner ("Needs you",
+    // amber), working (a turning ring), else when it last moved ("3h",
+    // "Oct 30") where the list shows times.
+    .child(dynamic(move || {
+        let state = if store.needs_you(&date_id) {
+            RowState::NeedsYou
+        } else if store.is_working(&date_id) {
+            RowState::Working
+        } else {
+            RowState::Quiet
+        };
         let at = date_id.clone();
-        text(move || {
-            store
-                .last_activity(&at)
-                .map(|at| ui::time::stamp(at, now_ms()))
-                .unwrap_or_default()
-        })
-        .tabular_nums()
-        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-        .text_color(colors::FAINT)
+        Some(untracked(move || match state {
+            RowState::NeedsYou => ui::badge_dot("Needs you", Tone::Warning),
+            RowState::Working => ui::spinner("Working"),
+            RowState::Quiet => view().child(when(dated, move || {
+                let at = at.clone();
+                text(move || {
+                    store
+                        .last_activity(&at)
+                        .map(|at| ui::time::stamp(at, now_ms()))
+                        .unwrap_or_default()
+                })
+                .tabular_nums()
+                .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                .text_color(colors::FAINT)
+            })),
+        }))
     }))
+}
+
+/// What a conversation's row says at its end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowState {
+    NeedsYou,
+    Working,
+    Quiet,
 }
 
 /// Automations, System, Memory and Settings: rows on a desktop; on a phone
