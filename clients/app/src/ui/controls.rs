@@ -665,6 +665,10 @@ pub fn badge(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
         )
 }
 
+/// The size a status dot is set at (the "●" glyph; it draws about two
+/// thirds of it): the footer's and the one by the app's name.
+const STATUS_DOT: f32 = 10.0;
+
 /// A status dot before a word: the word carries the meaning, the dot the
 /// colour.
 pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
@@ -674,7 +678,7 @@ pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
         .gap_1p5()
         .child(
             text(Glyph::Dot.symbol())
-                .text_size(px(8.0))
+                .text_size(px(STATUS_DOT))
                 .text_color(tone.color()),
         )
         .child(
@@ -1030,7 +1034,7 @@ pub fn status_dot(
             // The footer's own dot ([`status`]), so the two match.
             .child(
                 text(Glyph::Dot.symbol())
-                    .text_size(px(8.0))
+                    .text_size(px(STATUS_DOT))
                     .text_color(move || tone().color())
                     .accessibility_elements_hidden(true),
             ),
