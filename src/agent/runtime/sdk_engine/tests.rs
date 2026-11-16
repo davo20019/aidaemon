@@ -3476,6 +3476,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
     };
     for (tool, turn_authority) in [("spawn_agent", None), ("note_probe", Some(&turn))] {
         let ctx = crate::agent::tool_exec::ToolExecCtx {
+            project: None,
             file_fence: None,
             produced_files: None,
             mcp_tool: None,

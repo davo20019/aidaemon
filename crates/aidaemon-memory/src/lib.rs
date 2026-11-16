@@ -94,6 +94,7 @@ pub mod people_intelligence;
 pub mod policy;
 pub mod profile;
 pub mod progressive;
+pub mod project;
 mod recall;
 pub mod records;
 pub mod render;

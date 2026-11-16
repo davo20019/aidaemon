@@ -486,3 +486,167 @@ mod tests {
         assert!(file.is_file());
     }
 }
+
+/// `/memory` in a chat: where the memory of the project this chat works in
+/// is kept and what it holds. Read only.
+pub(crate) struct ProjectMemoryCommand {
+    pub state: std::sync::Arc<dyn StateStore>,
+    /// The config file, for `[memory]` as it stands now.
+    pub config_path: PathBuf,
+}
+
+/// The `[memory]` table of the config file, alone: nothing else is read,
+/// so no secret is resolved for a read-only command.
+fn project_notes_from(
+    config_path: &Path,
+) -> Option<std::sync::Arc<aidaemon_memory::project::ProjectNotes>> {
+    #[derive(serde::Deserialize, Default)]
+    struct MemoryOnly {
+        #[serde(default)]
+        memory: crate::config::MemoryConfig,
+    }
+    let memory = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| toml::from_str::<MemoryOnly>(&text).ok())
+        .unwrap_or_default()
+        .memory;
+    memory.project_notes()
+}
+
+#[async_trait::async_trait]
+impl aidaemon_channels::slash::SlashCommand for ProjectMemoryCommand {
+    fn handles(&self, cmd: &str) -> bool {
+        cmd == "/memory"
+    }
+
+    fn commands(&self) -> Vec<aidaemon_channels::slash::CommandDef> {
+        vec![aidaemon_channels::slash::CommandDef {
+            name: "memory",
+            description: "Show the memory of the project this chat works in",
+            usage: Some("/memory"),
+            category: aidaemon_channels::slash::CommandCategory::Core,
+        }]
+    }
+
+    async fn run(
+        &self,
+        _cmd: &str,
+        _args: &str,
+        call: &aidaemon_channels::slash::SlashCall<'_>,
+    ) -> String {
+        if call.user_role != crate::types::UserRole::Owner {
+            return "Only the owner can see project memory.".to_string();
+        }
+        let Some(notes) = project_notes_from(&self.config_path) else {
+            return "Project memory is off ([memory] project_memory = false).".to_string();
+        };
+        let Some(project) = aidaemon_runtime::turn::turn_project::resolve_turn_project(
+            self.state.as_ref() as &dyn aidaemon_work::stores::WorkCoordinationStore,
+            &[call.session_id],
+            None,
+        )
+        .await
+        else {
+            return "This chat is in no project, so it keeps no project memory. \
+                    Use /project <name> to work in one."
+                .to_string();
+        };
+        project_memory_reply(&notes, &project)
+    }
+}
+
+fn project_memory_reply(
+    notes: &aidaemon_memory::project::ProjectNotes,
+    project: &aidaemon_core::ProjectRef,
+) -> String {
+    let Some(dir) = notes.dir(project) else {
+        return format!("{} has no memory directory.", project.name);
+    };
+    let entries = notes.entries(project);
+    if entries.is_empty() {
+        return format!(
+            "{} keeps its memory in {}. Nothing is saved there yet: what this chat learns about \
+             the project is kept there as it goes.",
+            project.name,
+            dir.display()
+        );
+    }
+    let mut reply = format!(
+        "{} keeps {} note{} in {}:",
+        project.name,
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" },
+        dir.display()
+    );
+    const SHOWN: usize = 30;
+    for entry in entries.iter().take(SHOWN) {
+        let kind = entry.kind.map(|k| k.as_str()).unwrap_or("note");
+        reply.push_str(&format!("\n- {kind} {}: {}", entry.name, entry.description));
+    }
+    if entries.len() > SHOWN {
+        reply.push_str(&format!(
+            "\n…and {} more; MEMORY.md there lists them all.",
+            entries.len() - SHOWN
+        ));
+    }
+    reply.push_str("\nEdit or delete the files directly, or ask me to forget one.");
+    reply
+}
+
+#[cfg(test)]
+mod project_memory_command_tests {
+    use super::*;
+
+    #[test]
+    fn the_reply_names_the_directory_and_lists_the_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = aidaemon_memory::project::ProjectNotes::new(dir.path());
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None).unwrap();
+        let empty = project_memory_reply(&notes, &project);
+        assert!(empty.contains("Nothing is saved there yet"), "{empty}");
+        notes
+            .write(
+                &project,
+                &aidaemon_memory::project::NoteWrite {
+                    kind: aidaemon_memory::project::NoteKind::Fact,
+                    key: "test_command".into(),
+                    category: None,
+                    description: None,
+                    body: "Tests run with make test.".into(),
+                    source: aidaemon_memory::project::NoteSource::Agent,
+                },
+            )
+            .unwrap();
+        let reply = project_memory_reply(&notes, &project);
+        assert!(reply.starts_with("Acme Site keeps 1 note in "), "{reply}");
+        assert!(
+            reply.contains("- fact test_command: Tests run with make test."),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn the_config_switch_and_directory_are_read_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[memory]\nproject_memory = false\n[provider]\napi_key = \"keychain:x\"\n",
+        )
+        .unwrap();
+        assert!(project_notes_from(&config).is_none());
+        std::fs::write(
+            &config,
+            format!(
+                "[memory]\nprojects_dir = '{}'\n",
+                dir.path().join("p").display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            project_notes_from(&config).unwrap().root(),
+            dir.path().join("p")
+        );
+        assert!(project_notes_from(&dir.path().join("missing.toml")).is_some());
+    }
+}

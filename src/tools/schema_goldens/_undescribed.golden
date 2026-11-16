@@ -113,6 +113,7 @@ remember_fact.category
 remember_fact.facts
 remember_fact.facts[].category
 remember_fact.facts[].key
+remember_fact.facts[].scope
 remember_fact.key
 report_blocker.artifacts
 report_blocker.blocker_class

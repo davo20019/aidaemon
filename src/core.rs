@@ -123,6 +123,7 @@ pub async fn run(
         embedding_service.clone(),
     );
 
+    let project_notes = config.memory.project_notes();
     let memory = crate::agent::memory_plugin::configured_memory(
         &config.memory,
         &llm_runtime,
@@ -134,6 +135,12 @@ pub async fn run(
 
     // Paths in the configured file inbox are shown to the owner by name.
     aidaemon_tools::internal_markers::register_inbox_dir(&config.files.inbox_dir);
+    // The owner's own instructions for every project, beside the config.
+    if let Some(home) = dirs::home_dir() {
+        aidaemon_runtime::turn::project_instructions::set_user_instructions_file(
+            home.join(".aidaemon").join("AGENTS.md"),
+        );
+    }
 
     let startup_tools::ToolSetup {
         tools,
@@ -157,6 +164,7 @@ pub async fn run(
             memory: startup_tools::ToolMemoryAccess {
                 store: memory_store.clone(),
                 own_memory: memory.own_memory(),
+                project_notes: project_notes.clone(),
             },
             pool: pool.clone(),
             event_store: event_store.clone(),
@@ -240,6 +248,7 @@ pub async fn run(
             state: state.clone(),
             event_store: event_store.clone(),
             tools,
+            project_notes: project_notes.clone(),
         },
         model,
         system_prompt: base_system_prompt,

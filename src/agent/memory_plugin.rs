@@ -146,8 +146,11 @@ pub(crate) async fn configured_memory(
             ));
             let builder = aidaemon_memory::Memory::builder(store, embedder).extractor(extractor);
             tracing::info!(path = %config.path, "Memory backend: aidaemon-memory");
-            let system: Arc<dyn aidaemon_policies::MemorySystem> =
-                Arc::new(aidaemon_memory::ScopedMemory::new(builder));
+            let mut scoped = aidaemon_memory::ScopedMemory::new(builder);
+            if let Some(notes) = config.project_notes() {
+                scoped = scoped.with_project_notes(notes);
+            }
+            let system: Arc<dyn aidaemon_policies::MemorySystem> = Arc::new(scoped);
             let mut memory = ConfiguredMemory::replaced_by(system.clone());
             if config.learn_from_history {
                 memory.services.push(
@@ -195,6 +198,9 @@ pub(crate) struct DaemonMemoryInner {
     side_calls: crate::llm_runtime::gateway::SideCallGateway,
     context_window_config: crate::config::ContextWindowConfig,
     record_decision_points: bool,
+    /// Project memory, when on: the automatic writers keep project facts
+    /// here on turns that work in a project.
+    project_notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
     /// The full memory system's recall over `store`.
     #[cfg_attr(not(test), allow(dead_code))]
     recall: Arc<aidaemon_memory::full::RecallSource>,
@@ -212,8 +218,9 @@ impl DaemonMemory {
         max_facts: usize,
         record_decision_points: bool,
         system_prompt: &str,
+        project_notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
     ) -> Self {
-        let recall = Arc::new(aidaemon_memory::full::RecallSource::new(
+        let mut recall = aidaemon_memory::full::RecallSource::new(
             store.clone(),
             aidaemon_memory::full::RecallSettings {
                 max_facts,
@@ -221,7 +228,11 @@ impl DaemonMemory {
                     system_prompt,
                 ),
             },
-        ));
+        );
+        if let Some(notes) = &project_notes {
+            recall = recall.with_project_notes(notes.clone());
+        }
+        let recall = Arc::new(recall);
         let inner = Arc::new(DaemonMemoryInner {
             recall: recall.clone(),
             state,
@@ -231,6 +242,7 @@ impl DaemonMemory {
             side_calls,
             context_window_config,
             record_decision_points,
+            project_notes,
         });
         let host_inner = inner.clone();
         let full = Arc::new(aidaemon_memory::full::FullMemory::new(recall));
@@ -282,6 +294,7 @@ impl MemoryWrites for DaemonMemoryInner {
             turn.channel_ctx.visibility,
             turn.user_role,
             run_started_at,
+            self.project_notes.clone().zip(turn.project.clone()),
         );
     }
 
@@ -317,14 +330,16 @@ impl MemoryWrites for DaemonMemoryInner {
         task: crate::traits::Task,
         model: String,
         taint: crate::memory::task_learning::RunTaint,
+        project: Option<aidaemon_core::ProjectRef>,
     ) {
         let state = self.state.clone();
         let store = self.store.clone();
         let side_calls = self.side_calls.clone();
+        let project = self.project_notes.clone().zip(project);
         tokio::spawn(async move {
             let task_id = task.id.clone();
             if let Err(error) = crate::memory::task_learning::extract_task_knowledge(
-                state, store, side_calls, model, task, taint,
+                state, store, side_calls, model, task, taint, project,
             )
             .await
             {
@@ -411,6 +426,7 @@ pub(super) mod test_support {
         use crate::events::EventStoreForTests as _;
         let events = Arc::new(crate::events::EventStore::new(pool).await.unwrap());
         MemoryTurn {
+            project: None,
             session_id: session_id.to_string(),
             task_id: "task-1".to_string(),
             turn_id: "turn-1".to_string(),

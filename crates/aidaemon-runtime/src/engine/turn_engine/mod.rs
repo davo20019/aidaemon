@@ -140,6 +140,9 @@ pub struct SdkTurnSetup {
     /// The single-project scope lock, passed to tools as
     /// `ToolCallContext::project_scope`.
     pub project_scope: Option<String>,
+    /// The project the turn works in (`TurnContext::project`). Memory and
+    /// tools get it only where `memory_project` allows.
+    pub project: Option<aidaemon_core::ProjectRef>,
     /// What this turn may do, resolved from explicit facts: the kernel's
     /// `AuthorityHook` enforces its level and tool set, and the
     /// controller-side scope check judges each call's access manifest
@@ -488,6 +491,7 @@ impl TurnEngine<'_> {
             conversation_summary,
             known_project_dir,
             project_scope,
+            project: turn_project,
             explicit_workspace,
             authority,
             authorized_scopes,
@@ -634,6 +638,12 @@ impl TurnEngine<'_> {
             learning: learning.clone(),
             verdict: verdict.clone(),
             learning_consent,
+            project: crate::turn::memory::memory_project(
+                turn_project.as_ref(),
+                user_role,
+                &channel_ctx,
+                self.mandate_execution().is_some(),
+            ),
         };
         let memory = memory_parts(self.memory_plugin(), &memory_turn).await;
         // Tools: the set bootstrap offered for this turn (role, policy and
@@ -1218,6 +1228,7 @@ impl TurnEngine<'_> {
             contract: &contract,
             learning: learning.clone(),
             learning_consent: memory_turn.learning_consent.clone(),
+            project: memory_turn.project.clone(),
             latest_tool_output: std::sync::Mutex::new(None),
             reply_retry_used: AtomicBool::new(false),
             text_only_next_call: text_only_next_call.clone(),

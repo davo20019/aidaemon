@@ -612,6 +612,20 @@ pub async fn run_bootstrap(
     // at its first model call only if its memory policy allows reading and
     // its inputs match. It writes nothing until then.
     if !is_mandate_execution {
+        // The project as the turn will most often resolve it (a placed
+        // conversation); a turn that resolves another one renders its own
+        // block instead of adopting this.
+        let project = if crate::turn::memory::memory_project_allowed(user_role, &channel_ctx, false)
+        {
+            crate::turn::turn_project::resolve_turn_project(
+                agent.projects(),
+                &[session_id, agent.approval_session_id().unwrap_or_default()],
+                agent.inherited_project_scope(),
+            )
+            .await
+        } else {
+            None
+        };
         agent
             .memory_plugin()
             .warm(&crate::turn::memory::MemoryWarmup {
@@ -620,6 +634,7 @@ pub async fn run_bootstrap(
                 user_role,
                 channel_ctx: channel_ctx.clone(),
                 depth: agent.depth(),
+                project,
             });
     }
     // Resume checkpoints can contain prior tool arguments/results and broader

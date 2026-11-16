@@ -125,6 +125,7 @@ mod tests {
         .await
         .unwrap();
         let ctx = crate::agent::tool_exec::ToolExecCtx {
+            project: None,
             file_fence: None,
             produced_files: None,
             mcp_tool: None,

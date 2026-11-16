@@ -145,6 +145,10 @@ pub struct ExtractionRun {
     pub user_role: UserRole,
     /// Facts the agent stored itself since then are not extracted again.
     pub run_started_at: DateTime<Utc>,
+    /// The project the turn works in, with where its notes are kept: what
+    /// the user says about the project is kept there (see
+    /// [`crate::project`]). `None` extracts exactly as before.
+    pub project: Option<(Arc<crate::project::ProjectNotes>, aidaemon_core::ProjectRef)>,
 }
 
 /// What an extraction stored, for the host's audit trail.
@@ -216,6 +220,10 @@ pub async fn extract_progressive(
         already_stored: &already_stored,
         nearby: &nearby,
         stated_at: run.run_started_at,
+        project: run
+            .project
+            .as_ref()
+            .map(|(notes, project)| (notes.as_ref(), project)),
     };
     let facts = match extractor.propose(&exchange).await {
         Ok(facts) => facts,

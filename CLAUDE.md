@@ -90,13 +90,20 @@ background tasks`.
   `spawn_agent`.
 - MCP: `src/startup/mcp.rs`, `src/tools/manage_mcp.rs`,
   `src/state/sqlite/dynamic_mcp.rs`.
+- Project memory: notes per project id in `aidaemon_memory::project`
+  (files, never the database); a turn's project is resolved from typed state
+  in `aidaemon-runtime/src/turn/turn_project.rs` and gated by
+  `turn::memory::memory_project` (owner, private/internal, no mandate).
+  Personal-only categories never become notes (`project::route`).
 
 ## Project Instruction Loading
 
-The daemon's agents load project guidance through `src/project_instructions.rs`
+The daemon's agents load project guidance through
+`crates/aidaemon-runtime/src/turn/project_instructions.rs`
 (one shared resolver for direct and CLI agents; keep it that way). Per
 directory it prefers `AGENTS.override.md`, then `AGENTS.md`, then `CLAUDE.md` /
-`GEMINI.md`; never `README.md`. Nested instructions entering scope defer the
+`GEMINI.md`; never `README.md`. The owner's `~/.aidaemon/AGENTS.md` comes
+first, as the broadest file. Nested instructions entering scope defer the
 tool batch so the model reviews them first. Project instructions apply only in
 their directory scope and can never expand authority, grant secrets, authorize
 destructive or external actions, or override system/security rules or the

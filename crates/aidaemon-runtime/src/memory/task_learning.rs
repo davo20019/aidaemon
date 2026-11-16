@@ -33,6 +33,10 @@ pub async fn extract_task_knowledge(
     model: String,
     task: Task,
     taint: RunTaint,
+    project: Option<(
+        Arc<aidaemon_memory::project::ProjectNotes>,
+        aidaemon_core::ProjectRef,
+    )>,
 ) -> anyhow::Result<()> {
     if taint == RunTaint::Tainted {
         info!(task_id = %task.id, "Skipping task knowledge extraction: the run read untrusted content");
@@ -106,6 +110,9 @@ pub async fn extract_task_knowledge(
                 description: &task.description,
                 result: task.result.as_deref(),
                 activity_log: &activity_log,
+                project: project
+                    .as_ref()
+                    .map(|(notes, project)| (notes.as_ref(), project)),
             },
         )
         .await
@@ -213,6 +220,7 @@ mod tests {
             "m".into(),
             task,
             RunTaint::Clean,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -229,9 +237,17 @@ mod tests {
         .await;
         let (state, store) = stores_with_finished_task("task-1").await;
         let task = state.get_task("task-1").await.unwrap().unwrap();
-        extract_task_knowledge(state, store, gateway, "m".into(), task, RunTaint::Clean)
-            .await
-            .unwrap();
+        extract_task_knowledge(
+            state,
+            store,
+            gateway,
+            "m".into(),
+            task,
+            RunTaint::Clean,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(ok_calls(&events, "task_learning").await, 1);
         assert_eq!(failed_calls(&events, "task_learning").await, 0);
     }
@@ -255,6 +271,7 @@ mod tests {
             "m".into(),
             task,
             RunTaint::Tainted,
+            None,
         )
         .await
         .unwrap();
@@ -275,6 +292,7 @@ mod tests {
             "m".into(),
             task,
             RunTaint::Clean,
+            None,
         )
         .await
         .unwrap();

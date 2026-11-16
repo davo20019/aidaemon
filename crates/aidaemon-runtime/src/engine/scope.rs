@@ -126,6 +126,9 @@ pub struct TurnScope<'a> {
     pub run_id: aidaemon_core::RunId,
     /// The single-project scope lock passed to tools.
     pub project_scope: Option<String>,
+    /// The project whose memory the turn keeps (`memory_project`), passed
+    /// to tools as `ToolCallContext::project`.
+    pub project: Option<aidaemon_core::ProjectRef>,
     /// See `SdkTurnSetup::authority`.
     pub authority: &'a crate::authority::ResolvedAuthority,
     /// The chat's live `/readonly` ceiling, read by the hook per call and by

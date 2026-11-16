@@ -92,6 +92,10 @@ impl CommandContext {
                 Arc::new(crate::startup::client_projects::ProjectCommand {
                     state: self.state.clone(),
                 }),
+                Arc::new(crate::startup::client_projects::ProjectMemoryCommand {
+                    state: self.state.clone(),
+                    config_path: self.config_path.clone(),
+                }),
             ],
         }
     }

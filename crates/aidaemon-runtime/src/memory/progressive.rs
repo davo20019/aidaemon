@@ -33,6 +33,10 @@ pub fn spawn_progressive_extraction(
     visibility: ChannelVisibility,
     user_role: UserRole,
     run_started_at: chrono::DateTime<chrono::Utc>,
+    project: Option<(
+        Arc<aidaemon_memory::project::ProjectNotes>,
+        aidaemon_core::ProjectRef,
+    )>,
 ) {
     tokio::spawn(async move {
         if !aidaemon_memory::progressive::may_extract(user_role, visibility) {
@@ -53,6 +57,7 @@ pub fn spawn_progressive_extraction(
                 visibility,
                 user_role,
                 run_started_at,
+                project,
             },
         )
         .await;
@@ -87,6 +92,11 @@ impl ExtractionProvenance for EventProvenance {
                     "source_task_id": record.source_task_id,
                     "source_event_id": record.source_event_id,
                     "channel_id": record.channel_id,
+                    "project_facts": record
+                        .facts
+                        .iter()
+                        .filter(|fact| fact["scope"] == "project")
+                        .count(),
                     "facts": record.facts,
                     "source_excerpt": record.source_excerpt,
                 },

@@ -680,7 +680,11 @@ pub fn render_workspace_section(workspace: &str) -> String {
         "[Workspace]\nThis work happens in {workspace}. Read, edit and run commands there; a \
          relative path means a path inside it, and a command without a directory runs there. \
          Files outside it can be read but not changed. When a request names files that \
-         also exist in another copy elsewhere, it means the ones in {workspace}."
+         also exist in another copy elsewhere, it means the ones in {workspace}. Asked to \
+         `/init` it (or to set up its agent instructions), read the project and write a short \
+         AGENTS.md at its root: the build, test and lint commands, where things are, and the \
+         rules the code does not show; when an instruction file is already there, propose \
+         edits to it instead of replacing it."
     )
 }
 

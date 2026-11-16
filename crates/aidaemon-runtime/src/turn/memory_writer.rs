@@ -25,8 +25,16 @@ pub trait MemoryWrites: Send + Sync {
     /// Post-task learning (procedures, expertise, failure patterns).
     fn learn(&self, learning: LearningContext);
     /// Durable knowledge from a completed delegated task's activity log,
-    /// extracted with `model`; a tainted run teaches nothing.
-    fn learn_from_task(&self, task: aidaemon_work::traits::Task, model: String, taint: RunTaint);
+    /// extracted with `model`; a tainted run teaches nothing. What applies
+    /// only to `project` (the project the work belongs to) is kept as its
+    /// memory when the host keeps project memory.
+    fn learn_from_task(
+        &self,
+        task: aidaemon_work::traits::Task,
+        model: String,
+        taint: RunTaint,
+        project: Option<aidaemon_core::ProjectRef>,
+    );
 }
 
 /// Whether the run a task finished in read untrusted content.

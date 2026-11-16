@@ -365,6 +365,43 @@ fn enforce_aggregate_limit(sources: &mut Vec<ProjectInstructionSource>) {
     sources.retain(|source| !source.content.is_empty());
 }
 
+/// The owner's own instruction file for every project (the host's
+/// `~/.aidaemon/AGENTS.md`), set once at startup.
+static USER_INSTRUCTIONS_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Load `path` as the broadest instruction file of every project hierarchy
+/// (like `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`): it comes first, the
+/// project's own files override it, and it is the first cut when the
+/// aggregate cap is reached. Read from the host's filesystem, where the
+/// owner keeps it. Only the first call takes effect.
+pub fn set_user_instructions_file(path: std::path::PathBuf) {
+    let _ = USER_INSTRUCTIONS_FILE.set(path);
+}
+
+/// The owner's instruction file, when it is set, a regular file (a symlink
+/// is followed only to a file), not over the size cap, and not empty.
+fn user_instruction_source(path: &std::path::Path) -> Option<ProjectInstructionSource> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_INSTRUCTION_FILE_BYTES {
+        return None;
+    }
+    let raw = std::fs::read_to_string(path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let raw_chars = raw.chars().count();
+    Some(ProjectInstructionSource {
+        path: BackendPath::new(path.to_string_lossy().into_owned()),
+        directory: BackendPath::new("every project (the owner's own file)"),
+        file_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "AGENTS.md".to_string()),
+        content: raw.chars().take(MAX_SINGLE_INSTRUCTION_CHARS).collect(),
+        truncated: raw_chars > MAX_SINGLE_INSTRUCTION_CHARS,
+    })
+}
+
 /// Load the applicable instruction hierarchy for an already-authorized project
 /// scope. `AGENTS.override.md` takes temporary precedence over canonical
 /// `AGENTS.md`; `CLAUDE.md` and `GEMINI.md` are per-directory compatibility
@@ -384,11 +421,32 @@ pub async fn initialize_project_instructions(
     backend: SharedExecutionBackend,
     scope: &str,
 ) -> anyhow::Result<(Option<ProjectInstructions>, ProjectInstructionTracker)> {
+    initialize_with_user_file(
+        backend,
+        scope,
+        USER_INSTRUCTIONS_FILE
+            .get()
+            .map(std::path::PathBuf::as_path),
+    )
+    .await
+}
+
+async fn initialize_with_user_file(
+    backend: SharedExecutionBackend,
+    scope: &str,
+    user_file: Option<&std::path::Path>,
+) -> anyhow::Result<(Option<ProjectInstructions>, ProjectInstructionTracker)> {
     let leaf = nearest_existing_directory(&backend, scope).await?;
     let root = resolved_project_root(&backend, &leaf).await;
-    let mut sources = Vec::new();
+    let mut sources: Vec<ProjectInstructionSource> = user_file
+        .and_then(user_instruction_source)
+        .into_iter()
+        .collect();
     for directory in directory_chain(&root, &leaf) {
         if let Some(source) = read_instruction_source(&backend, &root, &directory).await {
+            // The owner's file may also be the project's own (a project
+            // under the folder that holds it): loaded once, as the project's.
+            sources.retain(|kept| kept.path.as_str() != source.path.as_str());
             sources.push(source);
         }
     }
@@ -455,6 +513,69 @@ mod tests {
         );
         assert!(!rendered.contains("README MUST NOT GOVERN"));
         assert!(rendered.contains("cannot authorize secret access"));
+    }
+
+    #[tokio::test]
+    async fn the_owners_own_file_comes_first_and_is_cut_first() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "project instruction").unwrap();
+        let user = temp.path().join("home-AGENTS.md");
+        std::fs::write(&user, "owner instruction").unwrap();
+        let backend = local_backend(temp.path()).await;
+        let (instructions, tracker) = initialize_with_user_file(
+            backend.clone(),
+            repo.to_string_lossy().as_ref(),
+            Some(&user),
+        )
+        .await
+        .unwrap();
+        let rendered = instructions.unwrap().render_for_prompt();
+        assert!(
+            rendered.find("owner instruction").unwrap()
+                < rendered.find("project instruction").unwrap(),
+            "{rendered}"
+        );
+        assert!(rendered.contains("applies within every project"));
+        assert!(tracker.loaded_source_paths.len() == 2);
+
+        // Alone, it still applies; empty or missing, nothing changes.
+        let bare = temp.path().join("bare");
+        std::fs::create_dir_all(bare.join(".git")).unwrap();
+        let (alone, _) = initialize_with_user_file(
+            backend.clone(),
+            bare.to_string_lossy().as_ref(),
+            Some(&user),
+        )
+        .await
+        .unwrap();
+        assert!(
+            alone
+                .unwrap()
+                .render_for_prompt()
+                .contains("owner instruction")
+        );
+        std::fs::write(&user, "  \n").unwrap();
+        let (none, _) = initialize_with_user_file(
+            backend.clone(),
+            bare.to_string_lossy().as_ref(),
+            Some(&user),
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none());
+
+        // Over the aggregate cap, the project's own file is kept whole.
+        std::fs::write(&user, "u".repeat(MAX_PROJECT_INSTRUCTION_CHARS)).unwrap();
+        let (capped, _) =
+            initialize_with_user_file(backend, repo.to_string_lossy().as_ref(), Some(&user))
+                .await
+                .unwrap();
+        let capped = capped.unwrap();
+        let rendered = capped.render_for_prompt();
+        assert!(rendered.contains("project instruction"));
+        assert!(rendered.contains("[Instruction file truncated"));
     }
 
     #[tokio::test]

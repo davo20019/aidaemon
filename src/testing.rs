@@ -640,10 +640,13 @@ pub struct TestHarness {
     pub state: Arc<SqliteStateStore>,
     pub provider: Arc<MockProvider>,
     pub channel: Arc<TestChannel>,
+    /// Project memory, in a temp dir of its own (see [`test_project_notes`]).
+    pub project_notes: Arc<aidaemon_memory::project::ProjectNotes>,
     /// Keep the temp file alive — DB is deleted when this drops.
     _db_file: tempfile::NamedTempFile,
     /// Keep the skills temp dir alive.
     _skills_dir: tempfile::TempDir,
+    _projects_dir: tempfile::TempDir,
 }
 
 /// What keeps a [`TestHarness`]'s database and skills directory alive after
@@ -652,6 +655,7 @@ pub struct HarnessFiles {
     pub state: Arc<SqliteStateStore>,
     _db_file: tempfile::NamedTempFile,
     _skills_dir: tempfile::TempDir,
+    _projects_dir: tempfile::TempDir,
 }
 
 impl TestHarness {
@@ -664,9 +668,21 @@ impl TestHarness {
                 state: self.state,
                 _db_file: self._db_file,
                 _skills_dir: self._skills_dir,
+                _projects_dir: self._projects_dir,
             },
         )
     }
+}
+
+/// Project memory in a temp dir of its own, as the daemon keeps it under
+/// `~/.aidaemon/projects` with `[memory] project_memory` on (the default).
+pub fn test_project_notes() -> anyhow::Result<(
+    tempfile::TempDir,
+    Arc<aidaemon_memory::project::ProjectNotes>,
+)> {
+    let dir = tempfile::TempDir::new()?;
+    let notes = Arc::new(aidaemon_memory::project::ProjectNotes::new(dir.path()));
+    Ok((dir, notes))
 }
 
 /// Build a fully-wired agent with mock provider and temp-file SQLite DB.
@@ -937,6 +953,7 @@ async fn setup_test_agent_internal(
 
     // Temp dir for skills
     let skills_dir = tempfile::TempDir::new()?;
+    let (projects_dir, project_notes) = test_project_notes()?;
 
     // Embedding service (downloads ~25MB model on first run, cached afterwards)
     let embedding_service = Arc::new(EmbeddingService::deterministic());
@@ -957,7 +974,10 @@ async fn setup_test_agent_internal(
             Arc::new(SystemInfoTool::new(
                 crate::execution::active_execution_backend(),
             )),
-            Arc::new(RememberFactTool::new(state.memory_stores())),
+            Arc::new(
+                RememberFactTool::new(state.memory_stores())
+                    .with_project_notes(project_notes.clone()),
+            ),
             Arc::new(TrackRequirementsTool::new(Arc::new(
                 PlanStore::new(state.pool()).await?,
             ))),
@@ -1005,6 +1025,7 @@ async fn setup_test_agent_internal(
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
             tools,
+            project_notes: Some(project_notes.clone()),
         },
         model: "mock-model".to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
@@ -1081,6 +1102,8 @@ async fn setup_test_agent_internal(
         channel,
         _db_file: db_file,
         _skills_dir: skills_dir,
+        _projects_dir: projects_dir,
+        project_notes,
     })
 }
 
@@ -1117,6 +1140,7 @@ pub async fn setup_test_agent_with_models_and_policy(
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
+    let (projects_dir, project_notes) = test_project_notes()?;
     let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state =
         Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
@@ -1129,7 +1153,9 @@ pub async fn setup_test_agent_with_models_and_policy(
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(state.memory_stores())),
+        Arc::new(
+            RememberFactTool::new(state.memory_stores()).with_project_notes(project_notes.clone()),
+        ),
         Arc::new(TrackRequirementsTool::new(Arc::new(
             PlanStore::new(state.pool()).await?,
         ))),
@@ -1163,6 +1189,7 @@ pub async fn setup_test_agent_with_models_and_policy(
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
             tools,
+            project_notes: Some(project_notes.clone()),
         },
         model: primary_model.to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
@@ -1212,6 +1239,8 @@ pub async fn setup_test_agent_with_models_and_policy(
         channel,
         _db_file: db_file,
         _skills_dir: skills_dir,
+        _projects_dir: projects_dir,
+        project_notes,
     })
 }
 
@@ -1223,6 +1252,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
+    let (projects_dir, project_notes) = test_project_notes()?;
     let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state =
         Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
@@ -1235,7 +1265,9 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(state.memory_stores())),
+        Arc::new(
+            RememberFactTool::new(state.memory_stores()).with_project_notes(project_notes.clone()),
+        ),
         Arc::new(TrackRequirementsTool::new(Arc::new(
             PlanStore::new(state.pool()).await?,
         ))),
@@ -1269,6 +1301,7 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
             tools,
+            project_notes: Some(project_notes.clone()),
         },
         model: "primary-model".to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
@@ -1317,6 +1350,8 @@ pub async fn setup_test_agent_orchestrator(provider: MockProvider) -> anyhow::Re
         channel,
         _db_file: db_file,
         _skills_dir: skills_dir,
+        _projects_dir: projects_dir,
+        project_notes,
     })
 }
 
@@ -1474,8 +1509,10 @@ pub struct FullStackTestHarness {
     pub channel: Arc<TestChannel>,
     pub hub: Arc<ChannelHub>,
     pub session_map: SessionMap,
+    pub project_notes: Arc<aidaemon_memory::project::ProjectNotes>,
     _db_file: tempfile::NamedTempFile,
     _skills_dir: tempfile::TempDir,
+    _projects_dir: tempfile::TempDir,
     _approval_task: tokio::task::JoinHandle<()>,
 }
 
@@ -1504,6 +1541,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // Temp dir for skills
     let skills_dir = tempfile::TempDir::new()?;
+    let (projects_dir, project_notes) = test_project_notes()?;
 
     // Embedding service
     let embedding_service = Arc::new(EmbeddingService::deterministic());
@@ -1539,7 +1577,9 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(state.memory_stores())),
+        Arc::new(
+            RememberFactTool::new(state.memory_stores()).with_project_notes(project_notes.clone()),
+        ),
         terminal_tool,
     ];
     tools.extend(extra_tools);
@@ -1575,6 +1615,7 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
             tools,
+            project_notes: Some(project_notes.clone()),
         },
         model: "mock-model".to_string(),
         system_prompt: "You are a helpful test assistant.".to_string(),
@@ -1646,6 +1687,8 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
         session_map,
         _db_file: db_file,
         _skills_dir: skills_dir,
+        _projects_dir: projects_dir,
+        project_notes,
         _approval_task: approval_task,
     })
 }
@@ -1664,8 +1707,11 @@ pub struct LiveHarness {
     #[allow(dead_code)]
     pub state: Arc<SqliteStateStore>,
     pub event_store: Arc<EventStore>,
+    #[allow(dead_code)]
+    pub project_notes: Arc<aidaemon_memory::project::ProjectNotes>,
     _db_file: tempfile::NamedTempFile,
     _skills_dir: tempfile::TempDir,
+    _projects_dir: tempfile::TempDir,
 }
 
 pub async fn setup_live_agent(
@@ -1676,6 +1722,7 @@ pub async fn setup_live_agent(
     let db_file = tempfile::NamedTempFile::new()?;
     let db_path = db_file.path().to_str().unwrap().to_string();
     let skills_dir = tempfile::TempDir::new()?;
+    let (projects_dir, project_notes) = test_project_notes()?;
     let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state =
         Arc::new(SqliteStateStore::for_tests(&db_path, 100, None, embedding_service).await?);
@@ -1705,7 +1752,9 @@ pub async fn setup_live_agent(
         Arc::new(SystemInfoTool::new(
             crate::execution::active_execution_backend(),
         )),
-        Arc::new(RememberFactTool::new(state.memory_stores())),
+        Arc::new(
+            RememberFactTool::new(state.memory_stores()).with_project_notes(project_notes.clone()),
+        ),
         Arc::new(crate::tools::ReadFileTool::new(
             crate::execution::active_execution_backend(),
         )),
@@ -1740,6 +1789,7 @@ pub async fn setup_live_agent(
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store: event_store.clone(),
             tools,
+            project_notes: Some(project_notes.clone()),
         },
         model: model.to_string(),
         system_prompt: "You are aidaemon, a helpful personal assistant with tools.".to_string(),
@@ -1781,6 +1831,8 @@ pub async fn setup_live_agent(
         event_store,
         _db_file: db_file,
         _skills_dir: skills_dir,
+        _projects_dir: projects_dir,
+        project_notes,
     })
 }
 

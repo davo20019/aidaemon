@@ -30,6 +30,7 @@ mod limits;
 pub mod mandate_card;
 mod message;
 mod outcome;
+mod project;
 mod provider;
 mod quota;
 mod receipt;
@@ -73,6 +74,7 @@ pub use limits::LimitGrants;
 pub use limits::{HARD_TURN_CAP, LimitKind, Limits, RunSnapshot, StopCondition};
 pub use message::{Audio, Image, Message, MessageOrigin, Role, ToolCall};
 pub use outcome::{CallResult, FinishOutcome, RunOutcome, RunStatus};
+pub use project::ProjectRef;
 pub use provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions, ResponseFormat, Retry,
     StreamEvent, ToolChoice, ToolSpec, Usage, collect_stream,

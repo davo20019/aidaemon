@@ -10,16 +10,24 @@ use aidaemon_tools::semantics::{
     ToolCallSemantics, ToolCapabilities, ToolMutationEffects, ToolRole,
 };
 
+use crate::project::{MemoryScope, NoteKind, NoteSource, NoteWrite, ProjectNotes};
 use crate::records::{
     FactPrivacy, PersonalAliasCandidate, PersonalEntityCandidate, PersonalFactCandidate,
     PersonalMemoryWrite,
 };
 use crate::stores::FactStore;
+use aidaemon_core::ProjectRef;
 
 pub struct RememberFactTool {
     state: Arc<dyn FactStore>,
     /// Current channel_id set by the agent before tool execution.
     pub current_channel_id: Arc<RwLock<Option<String>>>,
+    /// Project memory: on a turn that works in a project, what the turn
+    /// learns about the project is kept here instead of in `state`.
+    project_notes: Option<Arc<ProjectNotes>>,
+    /// The project of the one turn this instance serves, for a host whose
+    /// dispatcher does not set `ToolCallContext::project`.
+    turn_project: Option<ProjectRef>,
 }
 
 impl RememberFactTool {
@@ -27,7 +35,34 @@ impl RememberFactTool {
         Self {
             state,
             current_channel_id: Arc::new(RwLock::new(None)),
+            project_notes: None,
+            turn_project: None,
         }
+    }
+
+    /// Keep project facts in `notes` on turns that work in a project.
+    pub fn with_project_notes(mut self, notes: Arc<ProjectNotes>) -> Self {
+        self.project_notes = Some(notes);
+        self
+    }
+
+    /// This instance serves one turn that works in `project`.
+    pub fn for_project(mut self, project: Option<ProjectRef>) -> Self {
+        self.turn_project = project;
+        self
+    }
+
+    /// The project the call's turn works in, when project memory is on.
+    fn project(
+        &self,
+        facts: &aidaemon_tools::semantics::ToolCallContext,
+    ) -> Option<(Arc<ProjectNotes>, ProjectRef)> {
+        let notes = self.project_notes.clone()?;
+        let project = facts
+            .project
+            .clone()
+            .or_else(|| self.turn_project.clone())?;
+        Some((notes, project))
     }
 }
 
@@ -45,7 +80,24 @@ struct RememberArgs {
     /// that still sends them is answered with that and stores nothing.
     #[serde(default)]
     personal_memory: Option<PersonalMemoryWrite>,
+    /// `project` or `personal`, for the single fact and as the default of
+    /// `facts` entries without their own.
+    #[serde(default)]
+    scope: Option<String>,
 }
+
+/// The `scope` parameter, shared by the single fact and `facts` entries.
+static SCOPE_SCHEMA: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+    json!({
+        "type": "string",
+        "enum": ["project", "personal"],
+        "description": "In a project conversation: project (default) keeps it in the project's notes, personal keeps it for the owner. Facts about the owner are always personal."
+    })
+});
+
+/// The `scope` of a `facts` entry: as [`SCOPE_SCHEMA`], described once.
+static ENTRY_SCOPE_SCHEMA: std::sync::LazyLock<Value> =
+    std::sync::LazyLock::new(|| json!({"type": "string", "enum": ["project", "personal"]}));
 
 /// How a call that still carries people is answered.
 pub const PEOPLE_MOVED: &str = "remember_fact no longer stores people; nothing was stored. Send the same personal_memory to manage_people with action \"remember\", and any owner facts here without it.";
@@ -58,6 +110,8 @@ struct FactEntry {
     value: String,
     #[serde(default)]
     delete: bool,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// True when this exact call would delete at least one fact. Mirrors the
@@ -104,6 +158,7 @@ impl Tool for RememberFactTool {
                         "type": "boolean",
                         "description": "Forget category/key; value is ignored."
                     },
+                    "scope": SCOPE_SCHEMA.clone(),
                     "facts": {
                         "type": "array",
                         "items": {
@@ -122,7 +177,8 @@ impl Tool for RememberFactTool {
                                 "delete": {
                                     "type": "boolean",
                                     "description": "Forget this fact; value is ignored."
-                                }
+                                },
+                                "scope": ENTRY_SCOPE_SCHEMA.clone()
                             },
                             "required": ["category", "key"]
                         }
@@ -169,8 +225,61 @@ impl Tool for RememberFactTool {
                     key,
                     value,
                     delete: args.delete,
+                    scope: None,
                 }]
             };
+            // Each entry's own scope, else the call's.
+            let call_scope = args.scope.clone();
+            let entries: Vec<FactEntry> = entries
+                .into_iter()
+                .map(|mut entry| {
+                    if entry.scope.is_none() {
+                        entry.scope = call_scope.clone();
+                    }
+                    entry
+                })
+                .collect();
+
+            // On a turn in a project, what belongs to the project becomes
+            // its notes and never reaches the fact store, so it cannot
+            // replace or merge with any of the owner's facts.
+            let project = self.project(_facts);
+            let mut project_indices = std::collections::BTreeSet::new();
+            for (index, entry) in entries.iter().enumerate() {
+                let requested = match entry.scope.as_deref() {
+                    None => None,
+                    Some(raw) => match MemoryScope::parse(raw) {
+                        Some(scope) => Some(scope),
+                        None => {
+                            results.push(format!(
+                                "Not stored [{}] {}: scope must be \"project\" or \"personal\"",
+                                entry.category, entry.key
+                            ));
+                            project_indices.insert(index);
+                            continue;
+                        }
+                    },
+                };
+                let in_project = project.is_some();
+                if requested == Some(MemoryScope::Project) && !in_project {
+                    results.push(format!(
+                        "Not stored [{}] {}: project memory is not available in this conversation; leave scope out to remember it for the owner",
+                        entry.category, entry.key
+                    ));
+                    project_indices.insert(index);
+                    continue;
+                }
+                if crate::project::route(&entry.category, requested, in_project)
+                    != MemoryScope::Project
+                {
+                    continue;
+                }
+                project_indices.insert(index);
+                let Some((notes, project)) = project.clone() else {
+                    continue;
+                };
+                results.push(project_note(notes, project, entry).await);
+            }
 
             let mut structured = PersonalMemoryWrite {
                 direct_user_statement: true,
@@ -179,10 +288,12 @@ impl Tool for RememberFactTool {
             let mut owner_added = false;
             let mut structured_indices = std::collections::BTreeSet::new();
             for (index, entry) in entries.iter().enumerate() {
-                if !matches!(
-                    entry.category.trim().to_ascii_lowercase().as_str(),
-                    "user" | "personal" | "profile"
-                ) {
+                if project_indices.contains(&index)
+                    || !matches!(
+                        entry.category.trim().to_ascii_lowercase().as_str(),
+                        "user" | "personal" | "profile"
+                    )
+                {
                     continue;
                 }
                 let key = entry.key.trim().to_ascii_lowercase();
@@ -283,7 +394,7 @@ impl Tool for RememberFactTool {
             }
 
             for (index, entry) in entries.iter().enumerate() {
-                if structured_indices.contains(&index) {
+                if structured_indices.contains(&index) || project_indices.contains(&index) {
                     continue;
                 }
                 if entry.delete {
@@ -337,6 +448,53 @@ impl Tool for RememberFactTool {
             }
             outcome
         })
+    }
+}
+
+/// Writes or deletes one entry in `project`'s notes, as a result line.
+async fn project_note(notes: Arc<ProjectNotes>, project: ProjectRef, entry: &FactEntry) -> String {
+    let kind = crate::project::kind_for_category(&entry.category);
+    let label = format!("[{}] {}", entry.category, entry.key);
+    let name = project.name.clone();
+    let category = entry.category.clone();
+    let key = entry.key.clone();
+    if entry.delete {
+        let deleted = tokio::task::spawn_blocking(move || notes.delete(&project, Some(kind), &key))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        return match deleted {
+            Ok(true) => format!("Deleted from project {name}: {label}"),
+            Ok(false) => format!("Not found in project {name} (nothing to delete): {label}"),
+            Err(error) => format!("Not deleted {label}: {error}"),
+        };
+    }
+    if entry.value.trim().is_empty() {
+        return format!("Not stored {label}: value is empty (set delete: true to forget it)");
+    }
+    let value = entry.value.clone();
+    let write = NoteWrite {
+        kind,
+        key,
+        category: Some(category),
+        description: None,
+        body: value.clone(),
+        source: NoteSource::Agent,
+    };
+    let written = tokio::task::spawn_blocking(move || notes.write(&project, &write))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    match written {
+        Ok(_) => {
+            let kind = if kind == NoteKind::Fact {
+                String::new()
+            } else {
+                format!(" ({})", kind.as_str())
+            };
+            format!("Remembered for project {name}{kind}: {label} = {value}")
+        }
+        Err(error) => format!("Not stored {label}: {error}"),
     }
 }
 
@@ -599,5 +757,190 @@ mod tests {
             !effects(json!({"key": "", "delete": true}))
                 .satisfies(ToolMutationEffects::DESTRUCTIVE)
         );
+    }
+
+    mod project_scope {
+        use super::*;
+        use crate::project::{NoteKind, ProjectNotes};
+        use aidaemon_tools::semantics::ToolCallContext;
+
+        struct Fixture {
+            tool: RememberFactTool,
+            state: Arc<SqliteMemory>,
+            notes: Arc<ProjectNotes>,
+            project: ProjectRef,
+            _dir: tempfile::TempDir,
+        }
+
+        async fn fixture() -> Fixture {
+            let state = memory().await;
+            let dir = tempfile::tempdir().unwrap();
+            let notes = Arc::new(ProjectNotes::new(dir.path()));
+            let tool = RememberFactTool::new(state.clone()).with_project_notes(notes.clone());
+            let project = ProjectRef::new(
+                "project-00000000-0000-4000-8000-000000000001",
+                "Acme Site",
+                None,
+            )
+            .unwrap();
+            Fixture {
+                tool,
+                state,
+                notes,
+                project,
+                _dir: dir,
+            }
+        }
+
+        async fn call_in(
+            tool: &RememberFactTool,
+            project: Option<&ProjectRef>,
+            args: Value,
+        ) -> String {
+            let facts = ToolCallContext {
+                project: project.cloned(),
+                ..Default::default()
+            };
+            tool.execute(&args.to_string(), &facts)
+                .await
+                .unwrap()
+                .output
+        }
+
+        #[tokio::test]
+        async fn a_project_fact_never_touches_personal_memory() {
+            let f = fixture().await;
+            for (category, key, value) in [
+                ("user", "name", "Alice Rivera"),
+                ("preference", "editor", "vim"),
+                ("technical", "test_command", "pytest -q"),
+            ] {
+                f.state
+                    .upsert_fact(category, key, value, "user", None, FactPrivacy::Global)
+                    .await
+                    .unwrap();
+            }
+            let before = f.state.get_facts(None).await.unwrap();
+            // Same key as a personal fact, and a near-synonym of another.
+            let out = call_in(
+                &f.tool,
+                Some(&f.project),
+                json!({"facts": [
+                    {"category": "technical", "key": "test_command", "value": "make test"},
+                    {"category": "technical", "key": "editor_config", "value": "vim modelines are off here"}
+                ]}),
+            )
+            .await;
+            assert!(out.contains("Remembered for project Acme Site"), "{out}");
+            let after = f.state.get_facts(None).await.unwrap();
+            let ids = |facts: &[crate::records::Fact]| {
+                let mut v: Vec<_> = facts.iter().map(|x| (x.id, x.value.clone())).collect();
+                v.sort();
+                v
+            };
+            assert_eq!(ids(&before), ids(&after));
+            assert!(
+                f.notes
+                    .read(&f.project, NoteKind::Fact, "test_command")
+                    .unwrap()
+                    .contains("make test")
+            );
+            assert_eq!(f.notes.entries(&f.project).len(), 2);
+        }
+
+        #[tokio::test]
+        async fn without_a_project_nothing_changes() {
+            let f = fixture().await;
+            let out = call_in(
+                &f.tool,
+                None,
+                json!({"category": "technical", "key": "test_command", "value": "make test"}),
+            )
+            .await;
+            assert_eq!(out, "Remembered: [technical] test_command = make test");
+            assert!(f.notes.entries(&f.project).is_empty());
+            let out = call_in(
+                &f.tool,
+                None,
+                json!({"category": "technical", "key": "db", "value": "Postgres", "scope": "project"}),
+            )
+            .await;
+            assert!(out.contains("project memory is not available"), "{out}");
+            assert!(
+                f.state
+                    .get_facts(None)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|x| x.key != "db")
+            );
+        }
+
+        #[tokio::test]
+        async fn the_owner_stays_personal_in_a_project() {
+            let f = fixture().await;
+            let out = call_in(
+                &f.tool,
+                Some(&f.project),
+                json!({"facts": [
+                    {"category": "user", "key": "residence", "value": "Springfield", "scope": "project"},
+                    {"category": "preference", "key": "indentation", "value": "tabs"},
+                    {"category": "technical", "key": "laptop", "value": "a synthetic laptop", "scope": "personal"}
+                ]}),
+            )
+            .await;
+            assert!(out.contains("canonical"), "{out}");
+            let facts = f.state.get_facts(None).await.unwrap();
+            assert!(facts.iter().any(|x| x.key == "indentation"), "{facts:?}");
+            assert!(facts.iter().any(|x| x.key == "laptop"), "{facts:?}");
+            assert!(f.notes.entries(&f.project).is_empty());
+        }
+
+        #[tokio::test]
+        async fn project_notes_are_deleted_by_key_and_bad_scopes_store_nothing() {
+            let f = fixture().await;
+            call_in(
+                &f.tool,
+                Some(&f.project),
+                json!({"category": "pitfall", "key": "migrations", "value": "Run migrations before seeding."}),
+            )
+            .await;
+            assert!(
+                f.notes
+                    .read(&f.project, NoteKind::Pitfall, "migrations")
+                    .is_some()
+            );
+            let out = call_in(
+                &f.tool,
+                Some(&f.project),
+                json!({"category": "pitfall", "key": "migrations", "delete": true}),
+            )
+            .await;
+            assert!(out.starts_with("Deleted from project"), "{out}");
+            assert!(f.notes.entries(&f.project).is_empty());
+            let out = call_in(
+                &f.tool,
+                Some(&f.project),
+                json!({"category": "technical", "key": "db", "value": "Postgres", "scope": "team"}),
+            )
+            .await;
+            assert!(out.contains("scope must be"), "{out}");
+            assert!(f.notes.entries(&f.project).is_empty());
+            assert!(f.state.get_facts(None).await.unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_tool_without_notes_keeps_todays_behaviour_in_a_project() {
+            let state = memory().await;
+            let tool = RememberFactTool::new(state.clone());
+            let project = ProjectRef::new("project-x", "X", None).unwrap();
+            let out = call_in(
+                &tool,
+                Some(&project),
+                json!({"category": "technical", "key": "db", "value": "Postgres"}),
+            )
+            .await;
+            assert_eq!(out, "Remembered: [technical] db = Postgres");
+        }
     }
 }

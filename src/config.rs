@@ -373,6 +373,15 @@ pub struct MemoryConfig {
     /// Changing it re-embeds the stored memory once, in the background.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
+    /// Keep what a conversation placed in a project learns about that
+    /// project in the project's own notes, apart from personal memory.
+    /// Off: project conversations remember like any other chat.
+    #[serde(default = "default_true")]
+    pub project_memory: bool,
+    /// Where project memory is kept, one directory per project id
+    /// (default `~/.aidaemon/projects`).
+    #[serde(default)]
+    pub projects_dir: Option<String>,
 }
 
 impl Default for MemoryConfig {
@@ -382,7 +391,34 @@ impl Default for MemoryConfig {
             path: default_sdk_memory_path(),
             learn_from_history: false,
             embedding_model: default_embedding_model(),
+            project_memory: true,
+            projects_dir: None,
         }
+    }
+}
+
+impl MemoryConfig {
+    /// Project memory as configured, or `None` when it is off or no home
+    /// directory is known.
+    pub fn project_notes(&self) -> Option<std::sync::Arc<aidaemon_memory::project::ProjectNotes>> {
+        if !self.project_memory {
+            return None;
+        }
+        let root = match self.projects_dir.as_deref().map(str::trim) {
+            Some(dir) if !dir.is_empty() => {
+                if let Some(rest) = dir.strip_prefix("~/").or_else(|| dir.strip_prefix("~\\")) {
+                    dirs::home_dir()?.join(rest)
+                } else if dir == "~" {
+                    dirs::home_dir()?
+                } else {
+                    std::path::PathBuf::from(dir)
+                }
+            }
+            _ => dirs::home_dir()?.join(".aidaemon").join("projects"),
+        };
+        Some(std::sync::Arc::new(
+            aidaemon_memory::project::ProjectNotes::new(root),
+        ))
     }
 }
 

@@ -66,6 +66,7 @@ async fn setup_memory_manager_with_responses(
         SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
         Duration::from_secs(60),
         None,
+        None,
     );
     (store, provider, jobs, db_file)
 }
@@ -415,6 +416,7 @@ async fn test_consolidation_skips_public_external_sessions() {
         SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
         Duration::from_secs(60),
         None,
+        None,
     );
 
     mgr.consolidate(Utc::now()).await.unwrap();
@@ -522,6 +524,7 @@ async fn test_consolidation_skips_non_owner_sessions() {
         llm_runtime.clone(),
         SideCallGateway::new(llm_runtime, store.clone(), test_event_store(&store).await),
         Duration::from_secs(60),
+        None,
         None,
     );
 

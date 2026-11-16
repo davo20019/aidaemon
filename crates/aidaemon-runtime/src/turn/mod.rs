@@ -39,6 +39,7 @@ pub mod tool_result_notices;
 pub mod tool_summary;
 pub mod turn_context;
 pub mod turn_eviction;
+pub mod turn_project;
 pub mod turn_render;
 pub mod turn_render_cache;
 pub mod validation_state;

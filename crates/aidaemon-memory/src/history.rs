@@ -86,6 +86,13 @@ pub trait ConversationSource: Send + Sync {
 
     /// The channel facts learned in this session are scoped to.
     fn channel_id(&self, session_id: &str) -> Option<String>;
+
+    /// The project the session works in, when what is learned from it may
+    /// be kept as that project's memory (see [`crate::project`]). `None` by
+    /// default: everything is learned as personal memory, as before.
+    async fn project(&self, _session_id: &str) -> Option<aidaemon_core::ProjectRef> {
+        None
+    }
 }
 
 /// Per-session progress of a consolidation pass, so history is read once.

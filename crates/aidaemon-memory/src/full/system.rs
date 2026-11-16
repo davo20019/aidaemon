@@ -45,6 +45,11 @@ pub struct FullMemory {
     /// Recall started when a session's latest message arrived
     /// ([`FullMemory::speculate`]), waiting for that turn.
     speculative: std::sync::Mutex<std::collections::HashMap<String, SpeculativeRecall>>,
+    /// The store its tools write, for the per-turn `remember_fact` of a turn
+    /// that works in a project ([`FullMemory::with_project_notes`]).
+    store: Option<Arc<dyn MemoryStores>>,
+    /// Project memory, when on.
+    project_notes: Option<Arc<crate::project::ProjectNotes>>,
 }
 
 struct Opened {
@@ -77,7 +82,28 @@ impl FullMemory {
             recorder: None,
             opened: None,
             speculative: std::sync::Mutex::default(),
+            store: None,
+            project_notes: None,
         }
+    }
+
+    /// Keep what a turn that works in a project learns about it in `notes`
+    /// (see [`crate::project`]): recall shows the project's notes, and the
+    /// turn's `remember_fact` writes project facts there instead of in the
+    /// fact store. A turn without a project is unaffected. For a system
+    /// from [`FullMemory::open`] or [`FullMemory::over`]; one built from a
+    /// shared [`RecallSource`] gives the notes to that source with
+    /// [`RecallSource::with_project_notes`] instead.
+    pub fn with_project_notes(mut self, notes: Arc<crate::project::ProjectNotes>) -> Self {
+        match Arc::get_mut(&mut self.recall) {
+            Some(source) => source.set_project_notes(notes.clone()),
+            None => tracing::warn!(
+                "FullMemory::with_project_notes: the recall source is shared; \
+                 give it the notes with RecallSource::with_project_notes"
+            ),
+        }
+        self.project_notes = Some(notes);
+        self
     }
 
     /// Starts recall for a message as it arrives, before its turn's memory
@@ -149,8 +175,10 @@ impl FullMemory {
         settings: RecallSettings,
         host_settings: Arc<dyn SettingsStore>,
     ) -> Self {
-        Self::new(Arc::new(RecallSource::new(store.clone(), settings)))
-            .with_tools(tools::kernel_tools(store, host_settings))
+        let mut system = Self::new(Arc::new(RecallSource::new(store.clone(), settings)))
+            .with_tools(tools::kernel_tools(store.clone(), host_settings));
+        system.store = Some(store);
+        system
     }
 
     /// The whole system in a SQLite file (created and migrated if needed),
@@ -251,6 +279,7 @@ fn plain_turn(turn: &MemoryTurn) -> RecallTurn {
         sender_id: None,
         allowed: turn.read,
         depth: usize::from(turn.explicit_writes_only),
+        project: turn.project.clone(),
     }
 }
 
@@ -279,14 +308,24 @@ impl MemorySystem for FullMemory {
         {
             hooks.push(recorder.clone());
         }
-        MemoryParts {
-            hooks,
-            tools: if turn.read || turn.write {
-                self.tools.clone()
-            } else {
-                Vec::new()
-            },
+        let mut tools = if turn.read || turn.write {
+            self.tools.clone()
+        } else {
+            Vec::new()
+        };
+        // A turn in a project gets a `remember_fact` that knows it.
+        if let (Some(project), Some(notes), Some(store)) =
+            (&turn.project, &self.project_notes, &self.store)
+            && let Some(slot) = tools
+                .iter_mut()
+                .find(|tool| tool.spec().name == "remember_fact")
+        {
+            let tool = tools::RememberFactTool::new(store.clone())
+                .with_project_notes(notes.clone())
+                .for_project(Some(project.clone()));
+            *slot = Arc::new(aidaemon_tools::KernelAdapter::new(Arc::new(tool)));
         }
+        MemoryParts { hooks, tools }
     }
 
     fn services(&self) -> Vec<Arc<dyn Service>> {
@@ -327,6 +366,7 @@ mod tests {
         ));
         let turn = MemoryTurn {
             session_id: "test:synthetic-user".into(),
+            project: None,
             scope: "owner".into(),
             read: true,
             write: true,
@@ -347,6 +387,95 @@ mod tests {
         .await
         .unwrap();
         assert!(note.contains("teal"), "{note}");
+    }
+
+    /// A turn in a project sees its notes after the owner's own sections;
+    /// a turn without one, and a turn in another project, renders exactly
+    /// what it rendered before; and the turn's `remember_fact` writes notes.
+    #[tokio::test]
+    async fn a_project_turn_sees_its_notes_and_keeps_the_rest() {
+        use crate::project::{NoteKind, NoteSource, NoteWrite, ProjectNotes};
+        let dir = tempfile::tempdir().unwrap();
+        let notes = Arc::new(ProjectNotes::new(dir.path()));
+        let system = FullMemory::open(None)
+            .await
+            .unwrap()
+            .with_project_notes(notes.clone());
+        let store = system.store.clone().unwrap();
+        crate::stores::FactStore::upsert_fact(
+            store.as_ref(),
+            "preference",
+            "favorite_color",
+            "teal",
+            "user",
+            None,
+            crate::records::FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None).unwrap();
+        let other = aidaemon_core::ProjectRef::new("project-b", "Other", None).unwrap();
+        notes
+            .write(
+                &project,
+                &NoteWrite {
+                    kind: NoteKind::Fact,
+                    key: "test_command".into(),
+                    category: Some("technical".into()),
+                    description: None,
+                    body: "Tests run with make test.".into(),
+                    source: NoteSource::Agent,
+                },
+            )
+            .unwrap();
+        let render = |project: Option<aidaemon_core::ProjectRef>| {
+            let source = system.recall.clone();
+            async move {
+                let turn = MemoryTurn {
+                    project,
+                    ..MemoryTurn::owner("test:synthetic-user")
+                };
+                let recall = FullRecall::new(source, Arc::new(NoHost), plain_turn(&turn));
+                recall.render_block("what is my favorite color?").await
+            }
+        };
+        let plain = render(None).await;
+        let in_other = render(Some(other)).await;
+        let in_project = render(Some(project.clone())).await;
+        assert!(plain.contains("teal"), "{plain}");
+        assert!(!plain.contains("Project Memory"), "{plain}");
+        assert_eq!(plain, in_other);
+        assert!(in_project.starts_with(&plain), "{in_project}");
+        assert!(
+            in_project.contains("## Project Memory (Acme Site)"),
+            "{in_project}"
+        );
+        assert!(in_project.contains("fact-test_command.md"), "{in_project}");
+
+        // The project turn's remember_fact keeps the project's facts apart.
+        let turn = MemoryTurn {
+            project: Some(project.clone()),
+            ..MemoryTurn::owner("test:synthetic-user")
+        };
+        let parts = system.turn(&turn).await;
+        let tool = parts
+            .tools
+            .iter()
+            .find(|t| t.spec().name == "remember_fact")
+            .unwrap()
+            .clone();
+        let ctx = aidaemon_core::testing::tool_context();
+        tool.call(
+            serde_json::json!({"category": "technical", "key": "db", "value": "Postgres 16"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(notes.read(&project, NoteKind::Fact, "db").is_some());
+        let facts = crate::stores::FactStore::get_facts(store.as_ref(), None)
+            .await
+            .unwrap();
+        assert!(facts.iter().all(|f| f.key != "db"), "{facts:?}");
     }
 
     /// A recall started early renders the same block the model call would
@@ -408,6 +537,7 @@ mod tests {
             user_text: Some("what is my favorite color?".into()),
             ..plain_turn(&MemoryTurn {
                 session_id: "test:synthetic-user".into(),
+                project: None,
                 scope: "owner".into(),
                 read: true,
                 write: false,
@@ -523,6 +653,7 @@ mod tests {
             user_text: Some("what is my favorite color?".into()),
             ..plain_turn(&MemoryTurn {
                 session_id: "test:synthetic-user".into(),
+                project: None,
                 scope: "owner".into(),
                 read: true,
                 write: false,
@@ -558,6 +689,7 @@ mod tests {
         );
         let mut turn = MemoryTurn {
             session_id: "test:synthetic-user".into(),
+            project: None,
             scope: "owner".into(),
             read: true,
             write: true,

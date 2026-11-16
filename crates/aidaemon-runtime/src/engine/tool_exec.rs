@@ -24,6 +24,8 @@ pub struct ToolExecCtx<'a> {
     pub channel_visibility: ChannelVisibility,
     pub channel_id: Option<&'a str>,
     pub project_scope: Option<&'a str>,
+    /// See `TurnScope::project`.
+    pub project: Option<&'a aidaemon_core::ProjectRef>,
     pub trusted: bool,
     pub user_role: UserRole,
     /// Present only after `ChannelContext::active_workspace_grant` validated

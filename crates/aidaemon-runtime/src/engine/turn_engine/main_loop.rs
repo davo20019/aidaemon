@@ -1162,6 +1162,7 @@ impl TurnEngine<'_> {
                 project_scope: (!turn_context.allow_multi_project_scope)
                     .then(|| turn_context.primary_project_scope.clone())
                     .flatten(),
+                project: turn_context.project.clone(),
                 scopes_are_guess: scopes_are_only_a_guess(
                     user_role,
                     channel_ctx.active_workspace_grant(user_role).is_some(),

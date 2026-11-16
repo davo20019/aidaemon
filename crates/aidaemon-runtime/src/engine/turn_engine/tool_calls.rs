@@ -1453,6 +1453,7 @@ impl TurnEngine<'_> {
             channel_visibility: scope.channel_ctx.visibility,
             channel_id: scope.channel_ctx.channel_id.as_deref(),
             project_scope: scope.project_scope.as_deref(),
+            project: scope.project.as_ref(),
             trusted: scope.channel_ctx.trusted,
             user_role: scope.user_role,
             workspace_grant: scope.channel_ctx.active_workspace_grant(scope.user_role),

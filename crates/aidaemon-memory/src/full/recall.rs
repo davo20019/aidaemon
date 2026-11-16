@@ -53,6 +53,9 @@ pub struct RecallTurn {
     pub allowed: bool,
     /// Sub-agent depth: the core profile is for the top-level run only.
     pub depth: usize,
+    /// The project the turn works in: its notes are shown after the rest of
+    /// the block (see [`crate::project`]).
+    pub project: Option<aidaemon_core::ProjectRef>,
 }
 
 /// A recall decision the host may record for diagnostics.
@@ -122,6 +125,8 @@ pub struct RecallSource {
     /// Per session, the entities the core profile selected last, so the
     /// selection stays stable across turns.
     core_profile_ids: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// Project memory, shown on a turn that works in a project.
+    project_notes: Option<Arc<crate::project::ProjectNotes>>,
 }
 
 impl RecallSource {
@@ -130,7 +135,31 @@ impl RecallSource {
             store,
             settings,
             core_profile_ids: tokio::sync::RwLock::new(HashMap::new()),
+            project_notes: None,
         }
+    }
+
+    /// Show `notes` on turns that work in a project.
+    pub fn with_project_notes(mut self, notes: Arc<crate::project::ProjectNotes>) -> Self {
+        self.set_project_notes(notes);
+        self
+    }
+
+    pub(super) fn set_project_notes(&mut self, notes: Arc<crate::project::ProjectNotes>) {
+        self.project_notes = Some(notes);
+    }
+
+    /// The project section for `turn`, when it works in a project with
+    /// notes and may read memory.
+    async fn project_section(&self, turn: &RecallTurn) -> Option<String> {
+        if !turn.allowed {
+            return None;
+        }
+        let (notes, project) = (self.project_notes.clone()?, turn.project.clone()?);
+        tokio::task::spawn_blocking(move || notes.section(&project))
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -236,6 +265,7 @@ impl SpeculativeRecall {
             && started.channel_id == turn.channel_id
             && started.sender_id == turn.sender_id
             && started.depth == turn.depth
+            && started.project == turn.project
     }
 }
 
@@ -721,6 +751,14 @@ impl FullRecall {
             block.push_str(&core_profile);
         }
         block.push_str(&report.prompt);
+        // Project notes come last, so the owner's own sections keep their
+        // place and a turn without a project renders exactly as before.
+        if let Some(section) = source.project_section(turn).await {
+            if !block.trim().is_empty() {
+                block.push_str("\n\n");
+            }
+            block.push_str(&section);
+        }
         block.trim_start().to_string()
     }
 }

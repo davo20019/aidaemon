@@ -62,6 +62,7 @@ fn system_turn(turn: &MemoryTurn) -> Option<aidaemon_policies::MemoryTurn> {
         write: turn.memory_persistence_allowed,
         explicit_writes_only: turn.memory_isolated(),
         learning: turn.learning_consent.clone(),
+        project: turn.project.clone(),
         host: Default::default(),
     })
 }
@@ -80,6 +81,7 @@ fn host_system_turn(
         write: turn.memory_persistence_allowed,
         explicit_writes_only: turn.memory_isolated(),
         learning: turn.learning_consent.clone(),
+        project: turn.project.clone(),
         host,
     }
 }

@@ -99,6 +99,8 @@ pub struct MemoryJobs {
     host: Arc<dyn JobsHost>,
     embedder: Arc<dyn Embedder>,
     schedule: JobSchedule,
+    /// Project memory, for consolidation of sessions that work in a project.
+    project_notes: Option<Arc<crate::project::ProjectNotes>>,
 }
 
 impl MemoryJobs {
@@ -114,7 +116,17 @@ impl MemoryJobs {
             host,
             embedder,
             schedule: JobSchedule::default(),
+            project_notes: None,
         }
+    }
+
+    /// Consolidation keeps project facts of a session that works in a
+    /// project ([`ConversationSource::project`]) in `notes`.
+    ///
+    /// [`ConversationSource::project`]: crate::history::ConversationSource::project
+    pub fn with_project_notes(mut self, notes: Option<Arc<crate::project::ProjectNotes>>) -> Self {
+        self.project_notes = notes;
+        self
     }
 
     pub fn with_schedule(mut self, schedule: JobSchedule) -> Self {
@@ -179,6 +191,7 @@ impl MemoryJobs {
     pub async fn consolidate(&self, now: DateTime<Utc>) -> anyhow::Result<()> {
         let (provider, model) = self.host.model(JobCall::FactConsolidation);
         let report = crate::consolidation::FactConsolidator::new(provider, model)
+            .with_project_notes(self.project_notes.clone())
             .consolidate(
                 self.log.as_ref(),
                 self.log.as_ref(),

@@ -93,6 +93,7 @@ async fn chat(memory: Arc<dyn MemorySystem>) -> Result<(), Box<dyn std::error::E
         write: true,
         explicit_writes_only: true,
         learning: Default::default(),
+        project: None,
         host: Default::default(),
     };
     let agent = aidaemon_sdk::preset("assistant")

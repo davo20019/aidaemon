@@ -38,6 +38,8 @@ pub struct ScopedMemory {
     memory: Memory,
     /// Each session's scope, set when its turn starts.
     scopes: Arc<RwLock<SessionScopes>>,
+    /// Project memory shown on turns that work in a project.
+    project_notes: Option<Arc<crate::project::ProjectNotes>>,
 }
 
 /// How often recall decay and retention run.
@@ -101,7 +103,19 @@ impl ScopedMemory {
                     .unwrap_or_else(|| session_scope(session_id))
             })
             .build();
-        Self { memory, scopes }
+        Self {
+            memory,
+            scopes,
+            project_notes: None,
+        }
+    }
+
+    /// Show the project's notes (see [`crate::project`]) on turns that work
+    /// in a project and may read memory. This system's own memory is
+    /// unchanged: `remember` keeps writing to the turn's scope.
+    pub fn with_project_notes(mut self, notes: Arc<crate::project::ProjectNotes>) -> Self {
+        self.project_notes = Some(notes);
+        self
     }
 
     /// The memory behind this system.
@@ -126,6 +140,11 @@ impl MemorySystem for ScopedMemory {
             parts
                 .tools
                 .push(Arc::new(RecallTool::new(self.memory.clone())));
+            if let (Some(notes), Some(project)) = (&self.project_notes, &turn.project) {
+                parts.hooks.push(Arc::new(MemoryInjection::new(
+                    crate::project::ProjectNotesRecall::new(notes.clone(), project.clone()),
+                )));
+            }
         }
         if turn.write {
             parts
@@ -249,6 +268,7 @@ mod tests {
     fn turn(read: bool, write: bool, explicit_writes_only: bool) -> MemoryTurn {
         MemoryTurn {
             session_id: "telegram:synthetic-user-1".to_string(),
+            project: None,
             scope: "owner".to_string(),
             read,
             write,

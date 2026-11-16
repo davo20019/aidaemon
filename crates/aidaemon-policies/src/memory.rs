@@ -94,6 +94,14 @@ pub struct MemoryTurn {
     /// (at run end, in background work), not when the turn starts: the
     /// user or the model may opt the turn out while it runs.
     pub learning: TurnLearning,
+    /// The project the turn works in, when the host placed it in one and
+    /// the turn may keep project memory (the owner's own private turns). A
+    /// memory system keeps what the turn learns about the project apart
+    /// from the scope's memory, keyed by [`ProjectRef::id`]. `None` on every
+    /// other turn.
+    ///
+    /// [`ProjectRef::id`]: aidaemon_core::ProjectRef::id
+    pub project: Option<aidaemon_core::ProjectRef>,
     /// What the host knows about the turn beyond the above, for a memory
     /// system built to read it (see [`HostTurn`]). Empty by default.
     pub host: HostTurn,
@@ -110,6 +118,7 @@ impl MemoryTurn {
             write: true,
             explicit_writes_only: false,
             learning: Default::default(),
+            project: None,
             host: Default::default(),
         }
     }

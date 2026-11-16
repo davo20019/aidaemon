@@ -1929,6 +1929,22 @@ impl TurnEngine<'_> {
             let declaration = parent_authority.child_declaration.clone()?;
             Some((family.coordination(), declaration))
         });
+        // The project the delegated work belongs to, for what its task
+        // teaches (resolved before the spec takes the scope).
+        let learning_project = if crate::turn::memory::memory_project_allowed(
+            user_role,
+            &channel_ctx,
+            mandate_execution.is_some(),
+        ) {
+            crate::turn::turn_project::resolve_turn_project(
+                self.host().projects(),
+                &[effective_approval_session_id.as_deref().unwrap_or_default()],
+                effective_project_scope.as_deref(),
+            )
+            .await
+        } else {
+            None
+        };
         let child = self
             .create_child(ChildSpec {
                 tools: scoped_tools,
@@ -2301,8 +2317,12 @@ impl TurnEngine<'_> {
                     self.llm_runtime().snapshot().primary_model()
                 }
             };
-            self.transcript_writes()
-                .learn_from_task(completed_task, model, taint);
+            self.transcript_writes().learn_from_task(
+                completed_task,
+                model,
+                taint,
+                learning_project,
+            );
         }
 
         let trust = child_result_trust(child_flagged_untrusted, &child_tainted_turns);

@@ -52,6 +52,7 @@ pub(crate) mod tests {
             _task: crate::traits::Task,
             _model: String,
             _taint: crate::memory::task_learning::RunTaint,
+            _project: Option<aidaemon_core::ProjectRef>,
         ) {
         }
     }

@@ -67,6 +67,7 @@ pub(crate) fn warmup_recall_turn(warmup: &super::MemoryWarmup) -> RecallTurn {
         sender_id: warmup.channel_ctx.sender_id.clone(),
         allowed: true,
         depth: warmup.depth,
+        project: warmup.project.clone(),
     }
 }
 
@@ -84,6 +85,7 @@ pub(crate) fn recall_turn(turn: &MemoryTurn) -> RecallTurn {
         sender_id: turn.channel_ctx.sender_id.clone(),
         allowed: turn.memory_pipeline_allowed,
         depth: turn.depth,
+        project: turn.project.clone(),
     }
 }
 
@@ -438,6 +440,7 @@ mod tests {
             10,
             false,
             "",
+            None,
         );
         let base = crate::agent::memory_plugin::test_support::turn(
             "memory-policy-session",
@@ -497,6 +500,7 @@ mod tests {
             10,
             false,
             "",
+            None,
         );
         let turn = super::MemoryTurn {
             depth: 1,

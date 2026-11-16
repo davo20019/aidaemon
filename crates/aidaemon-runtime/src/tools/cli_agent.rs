@@ -681,6 +681,8 @@ pub struct CliAgentTool {
     /// Stored facts handed to delegated agents, when the daemon's own memory
     /// keeps them.
     context_facts: Option<Arc<dyn crate::tools::traits::FactStore>>,
+    /// Project memory, handed to delegated agents of a turn in a project.
+    project_notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
     backend: SharedExecutionBackend,
     // MUST be std::sync::RwLock because schema() is sync
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
@@ -1536,6 +1538,7 @@ impl CliAgentTool {
 
         let tool = CliAgentTool {
             context_facts: None,
+            project_notes: None,
             backend,
             tools: Arc::new(std::sync::RwLock::new(tools)),
             tool_names: Arc::new(std::sync::RwLock::new(tool_names)),
@@ -1564,6 +1567,15 @@ impl CliAgentTool {
     /// Set channel hub reference for immediate background completion delivery.
     pub fn with_context_facts(mut self, facts: Arc<dyn crate::tools::traits::FactStore>) -> Self {
         self.context_facts = Some(facts);
+        self
+    }
+
+    /// Hand delegated agents of a turn in a project its memory index.
+    pub fn with_project_notes(
+        mut self,
+        notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
+    ) -> Self {
+        self.project_notes = notes;
         self
     }
 
@@ -1870,6 +1882,7 @@ impl CliAgentTool {
         system_instruction: &str,
         task_prompt: &str,
         working_dir: Option<&str>,
+        project: Option<&aidaemon_core::ProjectRef>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
 
@@ -2094,6 +2107,13 @@ impl CliAgentTool {
                 "## Project Instructions\n{}",
                 project_instructions_text
             ));
+        }
+        // The project's memory index, after its instructions.
+        if let (Some(notes), Some(project)) = (self.project_notes.clone(), project.cloned())
+            && let Ok(Some(section)) =
+                tokio::task::spawn_blocking(move || notes.section(&project)).await
+        {
+            parts.push(section);
         }
         if !facts_text.is_empty() {
             parts.push(format!("## Known Facts\n{}", facts_text));
@@ -2336,6 +2356,7 @@ impl CliAgentTool {
         status_tx: Option<mpsc::Sender<StatusUpdate>>,
         spec: &crate::helper_run::HelperSpec,
         grant_session: &str,
+        project: Option<&aidaemon_core::ProjectRef>,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic) = {
@@ -2594,6 +2615,7 @@ impl CliAgentTool {
                 instruction,
                 prompt,
                 canonical_working_dir.as_deref(),
+                project,
             )
             .await
         } else {
@@ -5415,6 +5437,7 @@ impl CliAgentTool {
                             status_tx.clone(),
                             &spec,
                             &grant_session,
+                            facts.project.as_ref(),
                         )
                         .await
                     {
@@ -5854,6 +5877,7 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
+            project_notes: None,
             backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
@@ -5896,6 +5920,7 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
+            project_notes: None,
             backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash-agent".to_string()])),
@@ -7608,6 +7633,7 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
+            project_notes: None,
             backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["echo".to_string()])),
@@ -7671,6 +7697,7 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
+            project_notes: None,
             backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
@@ -7827,6 +7854,7 @@ mod tests {
 
         let tool = CliAgentTool {
             context_facts: None,
+            project_notes: None,
             backend: aidaemon_tools::testing::active_execution_backend(),
             tools: Arc::new(std::sync::RwLock::new(tools_map)),
             tool_names: Arc::new(std::sync::RwLock::new(vec!["bash".to_string()])),
@@ -8516,6 +8544,7 @@ mod tests {
                 "You are a security auditor",
                 "Audit this codebase",
                 None,
+                None,
             )
             .await;
 
@@ -8530,7 +8559,7 @@ mod tests {
         let (tool, _db) = setup_echo_tool().await;
 
         let prompt = tool
-            .build_enriched_prompt("test-session", "", "Just do the task", None)
+            .build_enriched_prompt("test-session", "", "Just do the task", None, None)
             .await;
 
         // Empty instruction should not appear
@@ -8560,6 +8589,7 @@ mod tests {
                 "You are a code reviewer",
                 "Review this codebase",
                 project.path().to_str(),
+                None,
             )
             .await;
 

@@ -66,6 +66,9 @@ const CONSOLIDATION_PROMPT: &str = "You are a memory consolidation system. Given
 pub struct FactConsolidator {
     provider: Arc<dyn Provider>,
     model: String,
+    /// Project memory: a session that works in a project keeps what it
+    /// says about the project there ([`ConversationSource::project`]).
+    project_notes: Option<Arc<crate::project::ProjectNotes>>,
 }
 
 /// What one consolidation pass did.
@@ -82,7 +85,14 @@ impl FactConsolidator {
         Self {
             provider,
             model: model.into(),
+            project_notes: None,
         }
+    }
+
+    /// Keep project facts of sessions that work in a project in `notes`.
+    pub fn with_project_notes(mut self, notes: Option<Arc<crate::project::ProjectNotes>>) -> Self {
+        self.project_notes = notes;
+        self
     }
 
     /// Consolidate history older than one hour before `now`. Only
@@ -211,12 +221,23 @@ impl FactConsolidator {
                 .unwrap_or(ChannelVisibility::Public);
             let shown = nearby_facts(store, messages, channel_id.as_deref(), visibility).await;
             let conversation = with_stored_facts(conversation, &shown);
+            let project = match &self.project_notes {
+                Some(notes) => source
+                    .project(session_id)
+                    .await
+                    .map(|project| (notes.as_ref(), project)),
+                None => None,
+            };
+            let system = match &project {
+                Some((_, project)) => format!(
+                    "{system_prompt}\n\n{}",
+                    crate::progressive::project_scope_instruction(project)
+                ),
+                None => system_prompt.clone(),
+            };
             let request = ModelRequest {
                 model: self.model.clone(),
-                messages: vec![
-                    Message::system(system_prompt.as_str()),
-                    Message::user(conversation),
-                ],
+                messages: vec![Message::system(system), Message::user(conversation)],
                 ..Default::default()
             };
             let response = match self.provider.complete(&request).await {
@@ -243,6 +264,7 @@ impl FactConsolidator {
                 &shown,
                 &user_text,
                 channel_id.as_deref(),
+                project.as_ref().map(|(notes, project)| (*notes, project)),
             )
             .await;
             info!(
@@ -371,6 +393,7 @@ async fn store_consolidated<S>(
     shown: &[Fact],
     user_text: &str,
     channel_id: Option<&str>,
+    project: Option<(&crate::project::ProjectNotes, &aidaemon_core::ProjectRef)>,
 ) where
     S: FactStore + ?Sized,
 {
@@ -459,6 +482,31 @@ async fn store_consolidated<S>(
             );
             continue;
         }
+        // A session in a project keeps what belongs to the project in its
+        // notes; a correction of a shown fact stays with that fact.
+        if let Some((notes, project)) = project
+            && !updating
+            && crate::project::route(
+                category,
+                fact.scope
+                    .as_deref()
+                    .and_then(crate::project::MemoryScope::parse),
+                true,
+            ) == crate::project::MemoryScope::Project
+        {
+            let note = crate::project::NoteWrite {
+                kind: crate::project::kind_for_category(category),
+                key: key.to_string(),
+                category: Some(category.to_string()),
+                description: None,
+                body: fact.value.clone(),
+                source: crate::project::NoteSource::Extracted,
+            };
+            if let Err(error) = notes.write(project, &note) {
+                warn!(%error, key, "Failed to store consolidated project note");
+            }
+            continue;
+        }
         let privacy = fact
             .privacy
             .as_deref()
@@ -516,6 +564,9 @@ pub struct ExtractedFact {
     /// The key of a shown stored fact whose attribute this gives a new value.
     #[serde(default, deserialize_with = "deserialize_optional_key")]
     pub updates: Option<String>,
+    /// For a session that works in a project: `project` or `personal`.
+    #[serde(default, deserialize_with = "deserialize_optional_key")]
+    pub scope: Option<String>,
 }
 
 fn deserialize_optional_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -665,6 +716,7 @@ mod tests {
         turns: Vec<HistoryTurn>,
         owner_only: bool,
         visibility: Option<ChannelVisibility>,
+        project: Option<aidaemon_core::ProjectRef>,
     }
 
     fn turn(id: i64, role: TurnRole, content: &str) -> HistoryTurn {
@@ -728,6 +780,9 @@ mod tests {
         }
         fn channel_id(&self, _: &str) -> Option<String> {
             Some("telegram:synthetic-chat".to_string())
+        }
+        async fn project(&self, _: &str) -> Option<aidaemon_core::ProjectRef> {
+            self.project.clone()
         }
     }
 
@@ -793,6 +848,7 @@ mod tests {
             ],
             owner_only: true,
             visibility: Some(ChannelVisibility::Private),
+            project: None,
         }
     }
 
@@ -818,6 +874,57 @@ mod tests {
         // The assistant's words and the too-short message never reach the model.
         let sent = &provider.requests()[0].messages[1].content;
         assert!(sent.contains("Lisbon") && !sent.contains("Pixel") && !sent.contains("user: ok"));
+    }
+
+    #[tokio::test]
+    async fn a_project_session_keeps_project_facts_in_its_notes() {
+        let reply = r#"[{"category":"user","key":"city","value":"Lisbon","privacy":"global","scope":"project"},
+            {"category":"technical","key":"deploy_target","value":"Deploys go to Fly.io","scope":"project"},
+            {"category":"preference","key":"code_style","value":"Prefers small commits"}]"#;
+        let dir = tempfile::tempdir().unwrap();
+        let notes = Arc::new(crate::project::ProjectNotes::new(dir.path()));
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None).unwrap();
+        let history = History {
+            turns: vec![turn(
+                1,
+                TurnRole::User,
+                "I moved to Lisbon, deploys go to Fly.io, and I prefer small commits",
+            )],
+            project: Some(project.clone()),
+            ..owner_history()
+        };
+        let provider = Arc::new(ScriptedProvider::new([text(reply)]));
+        let (cursors, facts) = (Cursors::default(), Facts::default());
+        FactConsolidator::new(provider.clone(), "mock")
+            .with_project_notes(Some(notes.clone()))
+            .consolidate(&history, &cursors, &facts, Utc::now())
+            .await
+            .unwrap();
+        let stored: Vec<String> = facts
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.0.clone())
+            .collect();
+        assert_eq!(stored, ["city", "code_style"]);
+        let names: Vec<String> = notes
+            .entries(&project)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["deploy_target"]);
+        assert!(provider.requests()[0].messages[0].content.contains("SCOPE"));
+
+        // Without notes configured the same session learns as before.
+        let provider = Arc::new(ScriptedProvider::new([text(reply)]));
+        let (cursors, facts) = (Cursors::default(), Facts::default());
+        FactConsolidator::new(provider.clone(), "mock")
+            .consolidate(&history, &cursors, &facts, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(facts.0.lock().unwrap().len(), 3);
+        assert!(!provider.requests()[0].messages[0].content.contains("SCOPE"));
     }
 
     #[tokio::test]

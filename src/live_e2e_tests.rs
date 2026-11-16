@@ -122,6 +122,7 @@ async fn setup_live_agent() -> anyhow::Result<LiveTestHarness> {
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
             tools,
+            project_notes: None,
         },
         model,
         system_prompt:
@@ -309,6 +310,7 @@ async fn setup_live_agent_with_prompt(system_prompt: &str) -> anyhow::Result<Liv
             state: state.clone() as Arc<dyn crate::traits::StateStore>,
             event_store,
             tools,
+            project_notes: None,
         },
         model,
         system_prompt: system_prompt.to_string(),

@@ -74,6 +74,14 @@ pub struct InlineFact {
     pub personal_memory: Option<PersonalMemoryWrite>,
     #[serde(default)]
     pub lifetime: FactLifetime,
+    /// On a turn that works in a project: `project` or `personal` (see
+    /// [`crate::project::route`]). Ignored on any other turn.
+    #[serde(
+        default,
+        deserialize_with = "lenient_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scope: Option<String>,
 }
 
 fn lenient_stance<'de, D: Deserializer<'de>>(deserializer: D) -> Result<FactStance, D::Error> {
@@ -217,6 +225,32 @@ pub struct Exchange<'a> {
     /// after it, so the retraction ("forget that my tea is oolong") cannot
     /// store the fact it retracts.
     pub stated_at: chrono::DateTime<chrono::Utc>,
+    /// The project the turn works in and where its notes are kept: what the
+    /// user says about the project goes to its notes instead of the store.
+    /// `None` on every other turn, which extracts exactly as before.
+    pub project: Option<(
+        &'a crate::project::ProjectNotes,
+        &'a aidaemon_core::ProjectRef,
+    )>,
+}
+
+/// What the extraction prompt adds on a turn that works in a project.
+pub(crate) fn project_scope_instruction(project: &aidaemon_core::ProjectRef) -> String {
+    let name: String = project
+        .name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(80)
+        .collect();
+    format!(
+        "SCOPE (this conversation works in the project \"{name}\"): set \"scope\" on every fact. \
+         \"project\": about this project only (its code, commands, conventions, layout, decisions, \
+         environments), for later work in it. \"personal\": about the user, or true beyond this \
+         project. Facts in the user category and the user's own preferences are personal unless the \
+         user says they apply to this project.\n\n"
+    )
 }
 
 /// At most this many stored facts are shown to the model.
@@ -332,6 +366,10 @@ impl ProgressiveExtractor {
                         - \"Do you know what kind of car I drive?\" → [] (a question: the user asks, and only presupposes owning a car)\n\
                         - \"How's the weather?\" → []\n\n\
                         IMPORTANT: Return ONLY the JSON array, no other text.\n\n", FACT_LIFETIME_INSTRUCTION].concat();
+        let system = match exchange.project {
+            Some((_, project)) => format!("{system}\n\n{}", project_scope_instruction(project)),
+            None => system,
+        };
         let user = extraction_input(exchange);
         let request = ModelRequest {
             model: self.model.clone(),
@@ -489,6 +527,44 @@ impl ProgressiveExtractor {
                     category = fact.category,
                     "Skipping progressive fact already stored under another category"
                 );
+                continue;
+            }
+            // On a turn in a project, what belongs to the project goes to
+            // its notes. A correction of a shown fact stays with that fact.
+            if let Some((notes, project)) = exchange.project
+                && fact.updates.is_none()
+                && crate::project::route(
+                    &fact.category,
+                    fact.scope
+                        .as_deref()
+                        .and_then(crate::project::MemoryScope::parse),
+                    true,
+                ) == crate::project::MemoryScope::Project
+            {
+                let note = crate::project::NoteWrite {
+                    kind: crate::project::kind_for_category(&fact.category),
+                    key: fact.key.clone(),
+                    category: Some(fact.category.clone()),
+                    description: None,
+                    body: fact.value.clone(),
+                    source: crate::project::NoteSource::Extracted,
+                };
+                match notes.write(project, &note) {
+                    Ok(outcome) => {
+                        if outcome != crate::project::WriteOutcome::Unchanged {
+                            written.push(json!({
+                                "category": fact.category,
+                                "key": fact.key,
+                                "value": fact.value,
+                                "scope": "project",
+                                "project_id": project.id,
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, key = fact.key, "Failed to store progressive project note")
+                    }
+                }
                 continue;
             }
             // Personal facts default to private, others to the channel,
@@ -1034,6 +1110,7 @@ mod tests {
             already_stored,
             nearby: &[],
             stated_at: chrono::Utc::now(),
+            project: None,
         }
     }
 
@@ -1071,6 +1148,7 @@ mod tests {
             already_stored: &[],
             nearby: &nearby,
             stated_at: chrono::Utc::now(),
+            project: None,
         };
         let reply = r#"[
             {"category":"user","key":"current_city","value":"Lisbon","stance":"asserted","evidence":"I moved to Lisbon","updates":"home_city"},
@@ -1093,6 +1171,49 @@ mod tests {
                 ("desk".to_string(), "standing desk".to_string()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_project_turn_keeps_project_facts_in_its_notes_and_the_owner_personal() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::project::ProjectNotes::new(dir.path());
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None).unwrap();
+        let store = RecordingFacts::default();
+        let user = "Tests here run with make test, I prefer dark mode, and deploys go through staging first.";
+        let mut exchange = exchange(user, &[]);
+        exchange.project = Some((&notes, &project));
+        let reply = r#"[
+            {"category":"technical","key":"test_command","value":"Tests run with make test","stance":"asserted","evidence":"Tests here run with make test","scope":"project"},
+            {"category":"preference","key":"ui_theme","value":"Prefers dark mode","stance":"asserted","evidence":"I prefer dark mode"},
+            {"category":"user","key":"deploy_habit","value":"Deploys through staging first","stance":"asserted","evidence":"deploys go through staging first","scope":"project"},
+            {"category":"project","key":"deploy_flow","value":"Deploys go through staging first","stance":"asserted","evidence":"deploys go through staging first"}]"#;
+        let (written, provider) = propose_and_write(&store, &exchange, reply).await;
+        let system = &provider.requests()[0].messages[0].content;
+        assert!(
+            system.contains("works in the project \"Acme Site\""),
+            "{system}"
+        );
+        let stored: Vec<String> = store
+            .stored
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.key.clone())
+            .collect();
+        // The preference has no scope and the user fact is always personal.
+        assert_eq!(stored, ["ui_theme", "deploy_habit"]);
+        let names: Vec<String> = notes
+            .entries(&project)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["deploy_flow", "test_command"]);
+        assert_eq!(written.len(), 4);
+        // Without a project the prompt carries no scope instruction.
+        let store = RecordingFacts::default();
+        let (_, provider) =
+            propose_and_write(&store, &super::tests::exchange(user, &[]), "[]").await;
+        assert!(!provider.requests()[0].messages[0].content.contains("SCOPE"));
     }
 
     #[tokio::test]

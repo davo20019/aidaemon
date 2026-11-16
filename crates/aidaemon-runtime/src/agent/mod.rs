@@ -80,6 +80,9 @@ pub struct AgentDependencies {
     pub memory_store: Arc<dyn aidaemon_memory::stores::MemoryStores>,
     pub event_store: Arc<EventStore>,
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Project memory (`aidaemon_memory::project`), when on: what a turn
+    /// that works in a project learns about it is kept there.
+    pub project_notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
 }
 
 /// What a root agent is built from: its services, settings and limits.
@@ -275,6 +278,8 @@ impl Agent {
                     memory_store,
                     event_store,
                     tools,
+                    // Read by the host's memory (its ports), not the agent.
+                    project_notes: _,
                 },
             model,
             system_prompt,

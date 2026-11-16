@@ -40,6 +40,7 @@ pub fn memory_jobs(
     side_calls: SideCallGateway,
     consolidation_interval: Duration,
     consolidator: Option<Arc<Consolidator>>,
+    project_notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
 ) -> Arc<MemoryJobs> {
     let history = Arc::new(EventHistory::new(pool.clone(), Some(state)));
     let host = Arc::new(DaemonJobsHost {
@@ -49,10 +50,12 @@ pub fn memory_jobs(
         consolidator,
     });
     Arc::new(
-        MemoryJobs::new(memory, history, host, embedder).with_schedule(JobSchedule {
-            consolidation: consolidation_interval,
-            ..JobSchedule::default()
-        }),
+        MemoryJobs::new(memory, history, host, embedder)
+            .with_schedule(JobSchedule {
+                consolidation: consolidation_interval,
+                ..JobSchedule::default()
+            })
+            .with_project_notes(project_notes),
     )
 }
 

@@ -2220,6 +2220,11 @@ pub struct ToolCallContext {
     pub mandate_version: Option<i64>,
     /// The single project the turn is scoped to.
     pub project_scope: Option<String>,
+    /// The project the owner's turn works in (an app project, a chat placed
+    /// in one), set only by the dispatcher from typed turn state. `None` for
+    /// guests, public channels and mandate runs: project-scoped writes (a
+    /// memory tool's project notes) key on it.
+    pub project: Option<aidaemon_core::ProjectRef>,
     /// A guest's granted workspace root (only under an active grant).
     pub workspace_collaboration_root: Option<String>,
     /// The turn's trusted file roots (set for `terminal`), so a run moved to

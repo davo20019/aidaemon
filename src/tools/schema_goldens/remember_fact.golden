@@ -27,6 +27,13 @@
               "key": {
                 "type": "string"
               },
+              "scope": {
+                "enum": [
+                  "project",
+                  "personal"
+                ],
+                "type": "string"
+              },
               "value": {
                 "description": "Stored as written, including \"none\".",
                 "type": "string"
@@ -41,6 +48,14 @@
           "type": "array"
         },
         "key": {
+          "type": "string"
+        },
+        "scope": {
+          "description": "In a project conversation: project (default) keeps it in the project's notes, personal keeps it for the owner. Facts about the owner are always personal.",
+          "enum": [
+            "project",
+            "personal"
+          ],
           "type": "string"
         },
         "value": {

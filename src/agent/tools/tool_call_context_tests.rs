@@ -160,6 +160,7 @@ fn owner_ctx<'a>(
     authority: &'a crate::agent::authority::InheritedAuthority,
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
+        project: None,
         file_fence: None,
         produced_files: None,
         mcp_tool: None,
@@ -410,6 +411,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
     };
     let ctx = ToolExecCtx {
+        project: None,
         file_fence: None,
         produced_files: None,
         mcp_tool: None,
@@ -491,6 +493,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
 
 fn mandate_free_ctx() -> ToolExecCtx<'static> {
     ToolExecCtx {
+        project: None,
         file_fence: None,
         produced_files: None,
         mcp_tool: None,

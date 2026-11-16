@@ -64,6 +64,7 @@ pub async fn maybe_handle_stop_command(
                 channel_visibility: channel_ctx.visibility,
                 channel_id: channel_ctx.channel_id.as_deref(),
                 project_scope: None,
+                project: None,
                 trusted: channel_ctx.trusted,
                 user_role,
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),

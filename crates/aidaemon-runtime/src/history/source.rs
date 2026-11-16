@@ -440,6 +440,24 @@ impl aidaemon_memory::history::ConversationSource for EventHistory {
     fn channel_id(&self, session_id: &str) -> Option<String> {
         aidaemon_events::session::derive_channel_id_from_session(session_id)
     }
+
+    /// The project the owner placed the session in, for a private or
+    /// internal conversation (a shared one keeps today's memory).
+    async fn project(&self, session_id: &str) -> Option<aidaemon_core::ProjectRef> {
+        let state = self.state.as_ref()?;
+        if !matches!(
+            self.visibility(session_id).await,
+            Some(ChannelVisibility::Private | ChannelVisibility::Internal)
+        ) {
+            return None;
+        }
+        crate::turn::turn_project::resolve_turn_project(
+            state.as_ref() as &dyn aidaemon_work::stores::WorkCoordinationStore,
+            &[session_id],
+            None,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]

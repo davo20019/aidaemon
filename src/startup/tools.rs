@@ -66,6 +66,8 @@ pub struct ToolMemoryAccess {
     /// False when another memory system replaced the daemon's. Its tools are
     /// hidden then, and tools outside memory stop reading the daemon's store.
     pub own_memory: bool,
+    /// Project memory, when on (`[memory] project_memory`).
+    pub project_notes: Option<Arc<aidaemon_memory::project::ProjectNotes>>,
 }
 
 pub struct ToolSetupDependencies {
@@ -854,7 +856,9 @@ pub async fn register_optional_tools(
                 )
                 .await;
                 if memory.own_memory {
-                    cli_tool = cli_tool.with_context_facts(memory.store.clone());
+                    cli_tool = cli_tool
+                        .with_context_facts(memory.store.clone())
+                        .with_project_notes(memory.project_notes.clone());
                 }
                 has_cli_agents = cli_tool.has_tools();
                 let arc = Arc::new(cli_tool);
@@ -1215,7 +1219,12 @@ async fn build_base_tool(
             }
         }
         BaseToolId::RememberFact => BuiltBaseTool {
-            tool: Arc::new(RememberFactTool::new(memory.store.clone())),
+            tool: Arc::new(match &memory.project_notes {
+                Some(notes) => {
+                    RememberFactTool::new(memory.store.clone()).with_project_notes(notes.clone())
+                }
+                None => RememberFactTool::new(memory.store.clone()),
+            }),
             terminal_tool: None,
         },
         BaseToolId::ManageMemories => BuiltBaseTool {
@@ -1366,6 +1375,7 @@ pub(crate) mod lint_catalog {
             ToolMemoryAccess {
                 store: state.memory_stores(),
                 own_memory: true,
+                project_notes: None,
             },
             state.pool(),
             event_store.clone(),
@@ -1381,6 +1391,7 @@ pub(crate) mod lint_catalog {
             ToolMemoryAccess {
                 store: state.memory_stores(),
                 own_memory: true,
+                project_notes: None,
             },
             state.pool(),
             event_store.clone(),
@@ -1405,6 +1416,7 @@ pub(crate) mod lint_catalog {
             ToolMemoryAccess {
                 store: state.memory_stores(),
                 own_memory: true,
+                project_notes: None,
             },
             mcp_registry,
         )
@@ -1931,6 +1943,7 @@ mod tests {
             ToolMemoryAccess {
                 store: state.memory_stores(),
                 own_memory: true,
+                project_notes: None,
             },
             state.pool(),
             event_store,

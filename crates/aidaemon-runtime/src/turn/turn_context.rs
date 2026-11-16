@@ -71,6 +71,11 @@ pub struct TurnContext {
     /// from a completed antecedent whose durable safety constraints alone may
     /// carry into a related turn.
     pub inherited_outstanding_obligations: bool,
+    /// The project the turn works in (`turn_project::resolve_turn_project`):
+    /// the conversation's placement, else the project holding the bound
+    /// workspace. Typed state only; who may keep project memory is decided
+    /// where it is used.
+    pub project: Option<aidaemon_core::ProjectRef>,
 }
 
 impl TurnContext {
@@ -659,6 +664,13 @@ pub trait TurnHistory: TurnHost {
         if self.role() == aidaemon_events::traits::AgentRole::Executor {
             completion_contract = scope_contract_for_delegated_executor(completion_contract);
         }
+        // A sub-agent works for the chat that started the work.
+        let project = crate::turn::turn_project::resolve_turn_project(
+            self.projects(),
+            &[session_id, self.approval_session_id().unwrap_or_default()],
+            bound_workspace.as_deref(),
+        )
+        .await;
         TurnContext {
             goal_user_text,
             assessment_recent_messages: extract_recent_parent_messages(
@@ -687,6 +699,7 @@ pub trait TurnHistory: TurnHost {
             completion_contract,
             inherited_completion_contract,
             inherited_outstanding_obligations,
+            project,
         }
     }
 

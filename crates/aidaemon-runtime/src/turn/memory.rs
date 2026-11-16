@@ -92,6 +92,9 @@ pub struct MemoryWarmup {
     pub user_role: UserRole,
     pub channel_ctx: ChannelContext,
     pub depth: usize,
+    /// The project the conversation is placed in, when it may keep project
+    /// memory ([`memory_project`]).
+    pub project: Option<aidaemon_core::ProjectRef>,
 }
 
 /// Everything a plugin needs to scope memory for one turn.
@@ -123,6 +126,32 @@ pub struct MemoryTurn {
     /// Whether the turn may be learned from ("don't remember this"), shared
     /// with whatever memory system serves the turn.
     pub learning_consent: aidaemon_policies::TurnLearning,
+    /// The project the turn works in, when it may keep project memory
+    /// ([`memory_project`]); `None` otherwise.
+    pub project: Option<aidaemon_core::ProjectRef>,
+}
+
+/// The project whose memory a turn reads and writes: the turn's project,
+/// only on the owner's own turns in a private or internal channel, never
+/// under a mandate. Guests, groups and public channels keep today's memory.
+pub fn memory_project(
+    project: Option<&aidaemon_core::ProjectRef>,
+    user_role: UserRole,
+    channel_ctx: &ChannelContext,
+    mandate: bool,
+) -> Option<aidaemon_core::ProjectRef> {
+    memory_project_allowed(user_role, channel_ctx, mandate)
+        .then(|| project.cloned())
+        .flatten()
+}
+
+/// Whether a turn may keep project memory at all (see [`memory_project`]).
+pub fn memory_project_allowed(
+    user_role: UserRole,
+    channel_ctx: &ChannelContext,
+    mandate: bool,
+) -> bool {
+    user_role == UserRole::Owner && channel_ctx.should_inject_personal_memory() && !mandate
 }
 
 impl MemoryTurn {

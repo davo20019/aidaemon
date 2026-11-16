@@ -58,6 +58,13 @@ pub struct FinishedTask<'a> {
     pub result: Option<&'a str>,
     /// The task's activity, one line per tool call, result or status change.
     pub activity_log: &'a str,
+    /// The project the task's work belongs to, with where its notes are
+    /// kept: know-how that holds only in it is kept there (see
+    /// [`crate::project`]). `None` learns exactly as before.
+    pub project: Option<(
+        &'a crate::project::ProjectNotes,
+        &'a aidaemon_core::ProjectRef,
+    )>,
 }
 
 /// What one task taught, and how much of it was stored.
@@ -66,6 +73,8 @@ pub struct TaskLearningReport {
     pub procedures: usize,
     pub error_solutions: usize,
     pub stored: usize,
+    /// Of `stored`, how many went to the project's notes.
+    pub project_notes: usize,
 }
 
 /// Extracts durable knowledge from finished tasks with a model.
@@ -98,6 +107,19 @@ impl TaskLearner {
         {\n  \"procedures\": [{\"name\": \"...\", \"trigger_pattern\": \"...\", \"steps\": [\"...\"]}],\n  \
         \"error_solutions\": [{\"error_pattern\": \"...\", \"solution_summary\": \"...\", \"domain\": \"...\"}]\n}\n\
         Only extract knowledge that would be useful for FUTURE tasks. If nothing worth remembering, return empty arrays.";
+        let system_prompt = match task.project {
+            Some((_, project)) => format!(
+                "{system_prompt}\n\nThe task worked in the project \"{}\". Give every procedure and error \
+                 solution a \"scope\": \"project\" when it holds only in this project (its commands, paths, \
+                 configuration, conventions), \"general\" when it would help in other projects too.",
+                project
+                    .name
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            None => system_prompt.to_string(),
+        };
 
         let user_prompt = format!(
             "## Task\n{}\n\n## Result\n{}\n\n## Activity Log\n{}",
@@ -117,8 +139,46 @@ impl TaskLearner {
         let extraction = parse_extraction_response(&response.text)?;
 
         let mut stored = 0usize;
+        let mut project_notes = 0usize;
+        // What holds only in the task's project becomes its notes.
+        let in_project = |scope: &Option<String>| {
+            task.project.filter(|_| {
+                scope
+                    .as_deref()
+                    .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("project"))
+            })
+        };
         for proc in &extraction.procedures {
             if proc.name.is_empty() || proc.steps.is_empty() {
+                continue;
+            }
+            if let Some((notes, project)) = in_project(&proc.scope) {
+                let mut body = String::new();
+                if !proc.trigger_pattern.trim().is_empty() {
+                    body.push_str(&format!("When: {}\n\n", proc.trigger_pattern.trim()));
+                }
+                for (i, step) in proc.steps.iter().enumerate() {
+                    body.push_str(&format!("{}. {}\n", i + 1, step.trim()));
+                }
+                let note = crate::project::NoteWrite {
+                    kind: crate::project::NoteKind::Procedure,
+                    key: proc.name.clone(),
+                    category: None,
+                    description: Some(if proc.trigger_pattern.trim().is_empty() {
+                        proc.name.clone()
+                    } else {
+                        proc.trigger_pattern.clone()
+                    }),
+                    body,
+                    source: crate::project::NoteSource::Learned,
+                };
+                match notes.write(project, &note) {
+                    Ok(_) => {
+                        stored += 1;
+                        project_notes += 1;
+                    }
+                    Err(e) => warn!(error = %e, "Failed to store project procedure note"),
+                }
                 continue;
             }
             let now = chrono::Utc::now();
@@ -144,6 +204,28 @@ impl TaskLearner {
             if es.error_pattern.is_empty() || es.solution_summary.is_empty() {
                 continue;
             }
+            if let Some((notes, project)) = in_project(&es.scope) {
+                let note = crate::project::NoteWrite {
+                    kind: crate::project::NoteKind::Pitfall,
+                    key: es.error_pattern.clone(),
+                    category: None,
+                    description: Some(es.error_pattern.clone()),
+                    body: format!(
+                        "Problem: {}\n\nWhat works: {}",
+                        es.error_pattern.trim(),
+                        es.solution_summary.trim()
+                    ),
+                    source: crate::project::NoteSource::Learned,
+                };
+                match notes.write(project, &note) {
+                    Ok(_) => {
+                        stored += 1;
+                        project_notes += 1;
+                    }
+                    Err(e) => warn!(error = %e, "Failed to store project pitfall note"),
+                }
+                continue;
+            }
             let now = chrono::Utc::now();
             let solution = ErrorSolution {
                 id: 0,
@@ -166,6 +248,7 @@ impl TaskLearner {
             procedures: extraction.procedures.len(),
             error_solutions: extraction.error_solutions.len(),
             stored,
+            project_notes,
         };
         info!(?report, "Task knowledge extraction complete");
         Ok(report)
@@ -189,6 +272,8 @@ struct ExtractedProcedure {
     trigger_pattern: String,
     #[serde(default)]
     steps: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +284,8 @@ struct ExtractedErrorSolution {
     solution_summary: String,
     #[serde(default)]
     domain: String,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Parse the LLM extraction response, handling markdown fences and partial JSON.
@@ -329,6 +416,7 @@ mod learner_tests {
 
     fn task() -> FinishedTask<'static> {
         FinishedTask {
+            project: None,
             description: "Ship the release",
             result: Some("shipped"),
             activity_log: "TOOL_CALL: terminal args={}\n",
@@ -347,5 +435,66 @@ mod learner_tests {
         assert!(procedures[0].name.starts_with("deploy-"));
         let solutions = store.solutions.lock().unwrap();
         assert_eq!(solutions[0].success_count, 0, "extracted, not yet observed");
+    }
+
+    #[tokio::test]
+    async fn project_only_know_how_becomes_the_projects_notes() {
+        let reply = r#"{"procedures": [
+            {"name": "deploy", "trigger_pattern": "deploy the site", "steps": ["make build", "make ship"], "scope": "project"},
+            {"name": "bisect", "trigger_pattern": "find a regression", "steps": ["git bisect"], "scope": "general"}],
+          "error_solutions": [
+            {"error_pattern": "port 5433 in use", "solution_summary": "stop the old dev db", "scope": "project"},
+            {"error_pattern": "connection refused", "solution_summary": "start the db"}]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::project::ProjectNotes::new(dir.path());
+        let project = aidaemon_core::ProjectRef::new("project-a", "Acme Site", None).unwrap();
+        let provider = Arc::new(ScriptedProvider::new([text(reply)]));
+        let store = Recorder::default();
+        let report = TaskLearner::new(provider.clone(), "mock")
+            .learn(
+                &store,
+                &FinishedTask {
+                    project: Some((&notes, &project)),
+                    ..task()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((report.stored, report.project_notes), (4, 2));
+        assert_eq!(store.procedures.lock().unwrap().len(), 1);
+        assert_eq!(store.solutions.lock().unwrap().len(), 1);
+        let entries = notes.entries(&project);
+        let kinds: Vec<_> = entries.iter().map(|e| (e.kind, e.name.clone())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (
+                    Some(crate::project::NoteKind::Procedure),
+                    "deploy".to_string()
+                ),
+                (
+                    Some(crate::project::NoteKind::Pitfall),
+                    "port_5433_in_use".to_string()
+                ),
+            ]
+        );
+        let deploy = notes
+            .read(&project, crate::project::NoteKind::Procedure, "deploy")
+            .unwrap();
+        assert!(deploy.contains("1. make build\n2. make ship"), "{deploy}");
+        assert!(
+            provider.requests()[0].messages[0]
+                .content
+                .contains("\"scope\"")
+        );
+        // Without a project, scopes are ignored and the prompt is unchanged.
+        let provider = Arc::new(ScriptedProvider::new([text(reply)]));
+        let store = Recorder::default();
+        TaskLearner::new(provider.clone(), "mock")
+            .learn(&store, &task())
+            .await
+            .unwrap();
+        assert_eq!(store.procedures.lock().unwrap().len(), 2);
+        assert!(!provider.requests()[0].messages[0].content.contains("scope"));
     }
 }

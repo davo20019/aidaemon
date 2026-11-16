@@ -59,6 +59,7 @@ pub fn build_memory_pipeline(
         side_calls,
         consolidation_interval,
         Some(consolidator.clone()),
+        config.memory.project_notes(),
     );
 
     MemoryPipelineBundle {

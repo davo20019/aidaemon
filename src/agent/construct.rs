@@ -30,6 +30,7 @@ pub(crate) fn host_ports(parts: &AgentParts) -> HostPorts {
         parts.max_facts,
         parts.record_decision_points,
         &parts.system_prompt,
+        deps.project_notes.clone(),
     );
     let transcript_writes = daemon_memory.writes();
     HostPorts {
@@ -84,6 +85,7 @@ pub(crate) fn set_context_compaction_tokens_for_test(
         0,
         false,
         "",
+        None,
     )
     .writes();
     agent.set_test_transcript_writes(writes);
@@ -138,6 +140,7 @@ mod tests {
                 state: state.clone() as Arc<dyn crate::traits::StateStore>,
                 event_store,
                 tools: Vec::new(),
+                project_notes: None,
             },
             model: "mock-model".to_string(),
             system_prompt: "You are a helpful test assistant.".to_string(),

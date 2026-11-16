@@ -32,3 +32,4 @@ include!("integration_tests/part_23_coordination.rs");
 include!("integration_tests/part_24_client_gateway.rs");
 include!("integration_tests/part_25_unattempted_work.rs");
 include!("integration_tests/part_26_session_model.rs");
+include!("integration_tests/part_27_project_memory.rs");

@@ -189,6 +189,11 @@ working_memory_cap = 50
 # "ParaphraseMLMiniLML12V2" (multilingual). Changing it re-embeds stored
 # memory once, in the background; lexical recall works meanwhile.
 # embedding_model = "AllMiniLML6V2Q"
+# A conversation placed in a project keeps what it learns about the project
+# in that project's notes (Markdown, one directory per project id), apart
+# from personal memory. false: project conversations remember like any chat.
+# project_memory = true
+# projects_dir = "~/.aidaemon/projects"
 
 # Exact user/assistant recall follows this canonical-event retention window.
 # Set messages_days = 0 for opt-in permanent active-database history.

@@ -416,6 +416,7 @@ fn mandate_tool_ctx<'a>(
     grant: Option<&'a crate::traits::MandateAuthorityGrant>,
 ) -> ToolExecCtx<'a> {
     ToolExecCtx {
+        project: None,
         file_fence: None,
         produced_files: None,
         mcp_tool: None,
@@ -502,6 +503,7 @@ async fn execute_tool_watchdog_times_out_slow_tool() {
             "slow_tool",
             "{}",
             &ToolExecCtx {
+                project: None,
                 file_fence: None,
                 produced_files: None,
                 mcp_tool: None,
@@ -558,6 +560,7 @@ async fn execute_tool_watchdog_skips_cli_agent() {
             "cli_agent",
             "{}",
             &ToolExecCtx {
+                project: None,
                 file_fence: None,
                 produced_files: None,
                 mcp_tool: None,
@@ -603,6 +606,7 @@ async fn execute_tool_watchdog_allows_fast_tool() {
             "system_info",
             "{}",
             &ToolExecCtx {
+                project: None,
                 file_fence: None,
                 produced_files: None,
                 mcp_tool: None,
@@ -650,6 +654,7 @@ async fn execute_tool_watchdog_hands_project_scope_and_causal_tool_call_id() {
             "spawn_agent",
             r#"{"mission":"delegate log analysis","task":"inspect the logs","_project_scope":"/tmp/spoofed"}"#,
             &ToolExecCtx {
+                project: None,
                 file_fence: None,
                 produced_files: None,
                 mcp_tool: None,
@@ -717,6 +722,7 @@ async fn mandate_dispatch_requires_an_exact_fenced_grant_and_rechecks_policy() {
         .call_semantics(arguments);
 
     let base_ctx = |grant| ToolExecCtx {
+        project: None,
         file_fence: None,
         produced_files: None,
         mcp_tool: None,
@@ -1012,6 +1018,7 @@ async fn mandate_pause_resume_cannot_resurrect_a_pre_pause_grant() {
             "http_request",
             arguments,
             &ToolExecCtx {
+                project: None,
                 file_fence: None,
                 produced_files: None,
                 mcp_tool: None,

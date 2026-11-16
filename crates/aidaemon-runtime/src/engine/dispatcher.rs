@@ -627,6 +627,7 @@ pub trait ToolDispatch: TurnHost {
                 .get(ctx.session_id)
                 .cloned(),
             project_scope: ctx.project_scope.map(str::to_string),
+            project: ctx.project.cloned(),
             workspace_collaboration_root: workspace_grant.map(|grant| grant.project_root.clone()),
             ..Default::default()
         };

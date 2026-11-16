@@ -331,6 +331,7 @@ async fn any_memory_system_plugs_in() {
         .memory(
             Arc::new(NotebookMemory),
             MemoryTurn {
+                project: None,
                 session_id: "test:synthetic-user".into(),
                 scope: "owner".into(),
                 read: true,
@@ -495,6 +496,7 @@ async fn with_a_workspace_undeclared_reads_are_refused_but_memory_tools_run() {
         .memory(
             Arc::new(NotebookMemory),
             MemoryTurn {
+                project: None,
                 session_id: "test:synthetic-user".into(),
                 scope: "owner".into(),
                 read: true,
