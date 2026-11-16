@@ -274,7 +274,7 @@ pub const CATALOG: &[CatalogEntry] = &[
         kind: ProviderKind::OpenaiCompatible,
         base_url: "https://openrouter.ai/api/v1",
         models: same("moonshotai/kimi-k2.5"),
-        offered: OfferedModels::Listed(&["moonshotai/kimi-k2.5"]),
+        offered: OfferedModels::ByAddress,
         credential: Credential::ApiKey {
             env: &["OPENROUTER_API_KEY"],
             key_url: "https://openrouter.ai/keys",
@@ -684,9 +684,9 @@ mod tests {
     fn each_hosted_entry_offers_its_own_models_and_servers_offer_none() {
         for entry in CATALOG {
             let offered = entry.offered.models();
-            if entry.models.primary.is_empty() {
-                // Its models depend on the address the owner names.
-                assert_eq!(entry.offered, OfferedModels::ByAddress, "{}", entry.id);
+            if entry.offered == OfferedModels::ByAddress {
+                // The endpoint determines its models; only configured models are pickable.
+                assert!(offered.is_empty(), "{}", entry.id);
                 continue;
             }
             for model in [entry.models.primary, entry.models.fast, entry.models.smart] {
@@ -710,7 +710,12 @@ mod tests {
             find("chatgpt").unwrap().offered.models(),
             crate::CHATGPT_KNOWN_MODELS
         );
-        for id in ["custom_openai_compatible", "cloudflare_gateway", "ollama"] {
+        for id in [
+            "openrouter",
+            "custom_openai_compatible",
+            "cloudflare_gateway",
+            "ollama",
+        ] {
             assert!(find(id).unwrap().offered.models().is_empty(), "{id}");
         }
     }

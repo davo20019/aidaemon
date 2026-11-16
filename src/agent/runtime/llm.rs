@@ -176,7 +176,10 @@ mod tests {
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
 
         // No other model on the hanging provider: the chain is the primary,
@@ -240,7 +243,10 @@ mod tests {
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
 
         let mut telemetry = super::LlmCallTelemetry::default();
@@ -319,7 +325,10 @@ mod tests {
                 crate::config::ProviderKind::Anthropic,
                 "other-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
 
         let started = Instant::now();
@@ -377,7 +386,10 @@ mod tests {
                 crate::config::ProviderKind::OpenaiCompatible,
                 "broke-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
 
         let mut telemetry = super::LlmCallTelemetry::default();
@@ -570,7 +582,10 @@ mod tests {
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
         harness
             .agent
@@ -633,7 +648,10 @@ mod tests {
                     crate::config::ProviderKind::Anthropic,
                     "secondary-model".to_string(),
                 )],
-                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                (
+                    crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                    Vec::new(),
+                ),
             );
             let options = ChatOptions {
                 max_tokens_override: Some(100),
@@ -716,7 +734,10 @@ mod tests {
                 crate::config::ProviderKind::Anthropic,
                 "secondary-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
         let request = |model: &str| aidaemon_core::ModelRequest {
             model: model.into(),

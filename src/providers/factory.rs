@@ -11,6 +11,7 @@ use super::sdk_backed::ModelList;
 pub(crate) struct ProviderRouterBundle {
     pub provider: crate::llm_runtime::ModelBackend,
     pub models: ModelList,
+    pub offered_models: Vec<String>,
     pub primary_model: String,
     pub router: Option<Router>,
     pub provider_kind: ProviderKind,
@@ -101,6 +102,34 @@ fn configured_models(config: &ProviderConfig) -> Vec<String> {
     out.retain(|model| !model.is_empty());
     out.dedup();
     out
+}
+
+fn catalog_models(config: &ProviderConfig) -> Vec<String> {
+    let base = if config.kind == ProviderKind::OpenaiCompatible {
+        config.base_url.trim().trim_end_matches('/')
+    } else {
+        provider_specific_base_url_override(config)
+            .unwrap_or_default()
+            .trim_end_matches('/')
+    };
+    aidaemon_providers::catalog::CATALOG
+        .iter()
+        .find(|entry| {
+            entry.kind == config.kind
+                && (entry.kind == ProviderKind::OpenaiChatgpt
+                    || (!entry.custom_base_url
+                        && ((base.is_empty() && entry.kind != ProviderKind::OpenaiCompatible)
+                            || (!base.is_empty()
+                                && entry
+                                    .base_url
+                                    .trim_end_matches('/')
+                                    .eq_ignore_ascii_case(base)))))
+        })
+        .map(|entry| entry.offered.models())
+        .unwrap_or_default()
+        .iter()
+        .map(|model| model.to_string())
+        .collect()
 }
 
 /// The SDK backend for `config`'s kind (behind a [`aidaemon_core::QuotaGuard`]),
@@ -227,7 +256,8 @@ fn build_provider_target(config: &ProviderConfig) -> anyhow::Result<ProviderRunt
 
     Ok(
         ProviderRuntimeTarget::new(provider, router, config.kind, primary_model)
-            .with_models(models),
+            .with_models(models)
+            .with_offered_models(catalog_models(config)),
     )
 }
 
@@ -277,6 +307,7 @@ pub(crate) fn build_provider_router(config: &AppConfig) -> anyhow::Result<Provid
     Ok(ProviderRouterBundle {
         provider: primary_target.provider(),
         models: primary_target.models().clone(),
+        offered_models: primary_target.offered_models().to_vec(),
         primary_model,
         router: primary_router,
         provider_kind: primary_target.provider_kind(),
@@ -331,5 +362,53 @@ mod keyless_fallback_tests {
             config.gemini_provider_api_key().as_deref(),
             Some("synthetic-gemini-key")
         );
+    }
+
+    #[test]
+    fn catalog_models_follow_the_configured_address() {
+        let openrouter = config(
+            r#"
+            [provider]
+            kind = "openai_compatible"
+            base_url = "https://openrouter.ai/api/v1/"
+            api_key = "synthetic-key"
+            "#,
+        );
+        assert!(catalog_models(&openrouter.provider).is_empty());
+
+        let custom = config(
+            r#"
+            [provider]
+            kind = "openai_compatible"
+            base_url = "https://models.example.test/v1"
+            api_key = "synthetic-key"
+            [provider.models]
+            default = "synthetic-configured"
+            "#,
+        );
+        assert!(catalog_models(&custom.provider).is_empty());
+
+        let anthropic = config(
+            r#"
+            [provider]
+            kind = "anthropic"
+            api_key = "synthetic-key"
+            "#,
+        );
+        assert!(
+            catalog_models(&anthropic.provider)
+                .iter()
+                .any(|model| model == "claude-fable-5-2")
+        );
+
+        let proxy = config(
+            r#"
+            [provider]
+            kind = "anthropic"
+            base_url = "https://synthetic-proxy.example.test/v1"
+            api_key = "synthetic-key"
+            "#,
+        );
+        assert!(catalog_models(&proxy.provider).is_empty());
     }
 }

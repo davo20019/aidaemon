@@ -22,6 +22,7 @@ pub(in crate::agent) async fn reload_provider(
         .swap_provider(aidaemon_runtime::agent::ProviderSwap {
             provider: bundle.provider,
             models: bundle.models,
+            offered_models: bundle.offered_models,
             primary_model: bundle.primary_model,
             router: bundle.router,
             provider_kind: bundle.provider_kind,

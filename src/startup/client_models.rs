@@ -255,13 +255,25 @@ mod tests {
             None,
             ProviderKind::Anthropic,
             "synthetic-claude".into(),
-            vec![ProviderRuntimeTarget::new(
-                backend(),
-                None,
-                ProviderKind::GoogleGenai,
-                "synthetic-gemini".into(),
-            )],
+            vec![
+                ProviderRuntimeTarget::new(
+                    backend(),
+                    None,
+                    ProviderKind::GoogleGenai,
+                    "synthetic-gemini".into(),
+                )
+                .with_offered_models(vec![
+                    "synthetic-gemini".into(),
+                    "synthetic-gemini-catalog".into(),
+                    "synthetic-shared".into(),
+                ]),
+            ],
         )
+        .with_offered_models(vec![
+            "synthetic-claude".into(),
+            "synthetic-claude-catalog".into(),
+            "synthetic-shared".into(),
+        ])
     }
 
     fn pin(provider: &str, model: &str) -> Option<ModelChoice> {
@@ -269,6 +281,27 @@ mod tests {
             provider: provider.into(),
             model: model.into(),
         })
+    }
+
+    #[test]
+    fn options_append_catalog_models_per_provider_and_deduplicate() {
+        let choices = options(&runtime());
+        let ids = |provider: usize| {
+            choices.providers[provider]
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(0),
+            [
+                "synthetic-claude",
+                "synthetic-claude-catalog",
+                "synthetic-shared"
+            ]
+        );
+        assert_eq!(ids(1), ["synthetic-gemini", "synthetic-gemini-catalog"]);
     }
 
     #[tokio::test]
@@ -350,14 +383,14 @@ mod tests {
             &llm,
             "app:synthetic-one",
             "model",
-            "synthetic-gemini",
+            "synthetic-gemini-catalog",
         )
         .await
         .unwrap();
         assert!(selected.contains("Google Gemini"), "{selected}");
         assert_eq!(
             current(settings, &llm, "app:synthetic-one").await.model,
-            pin("failover-0", "synthetic-gemini").unwrap()
+            pin("failover-0", "synthetic-gemini-catalog").unwrap()
         );
         assert_eq!(
             current(settings, &llm, "app:synthetic-two").await.model,
@@ -367,7 +400,7 @@ mod tests {
         let report = slash(settings, &llm, "app:synthetic-one", "model", "")
             .await
             .unwrap();
-        assert!(report.contains("synthetic-gemini"), "{report}");
+        assert!(report.contains("synthetic-gemini-catalog"), "{report}");
 
         let unknown = slash(
             settings,
@@ -379,10 +412,11 @@ mod tests {
         .await
         .unwrap();
         assert!(unknown.contains("Unknown model `synthetic-missing`"));
-        assert!(unknown.contains("synthetic-claude, synthetic-gemini"));
+        assert!(unknown.contains("synthetic-claude-catalog"));
+        assert!(unknown.contains("synthetic-gemini-catalog"));
         assert_eq!(
             current(settings, &llm, "app:synthetic-one").await.model,
-            pin("failover-0", "synthetic-gemini").unwrap(),
+            pin("failover-0", "synthetic-gemini-catalog").unwrap(),
             "an unknown model must not change the existing pin"
         );
         assert_eq!(

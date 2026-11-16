@@ -125,6 +125,7 @@ pub struct AgentParts {
 pub struct ProviderSwap {
     pub provider: crate::llm::ModelBackend,
     pub models: crate::chat_bridge::sdk_backed::ModelList,
+    pub offered_models: Vec<String>,
     pub primary_model: String,
     pub router: Option<aidaemon_providers::routing::Router>,
     pub provider_kind: aidaemon_providers::routing::ProviderKind,
@@ -689,6 +690,7 @@ impl Agent {
         let ProviderSwap {
             provider,
             models,
+            offered_models,
             primary_model: new_primary,
             router,
             provider_kind,
@@ -711,7 +713,7 @@ impl Agent {
             provider_kind,
             new_primary.clone(),
             failover_targets,
-            models,
+            (models, offered_models),
         );
 
         {

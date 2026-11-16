@@ -3,7 +3,7 @@
 //!
 //! Absent (or unreadable): the daemon picks as it does for every chat. A
 //! pin names a provider of the live runtime (`main`, `failover-N`) and one
-//! of its configured models; a pin the runtime no longer has reads as
+//! of its configured or catalog-offered models; a pin the runtime no longer has reads as
 //! automatic, so a config change never strands a conversation.
 
 use aidaemon_providers::routing::ProviderKind;
@@ -104,8 +104,8 @@ pub fn provider_name(kind: ProviderKind) -> &'static str {
 pub struct PickableProvider {
     pub id: String,
     pub kind: ProviderKind,
-    /// Its configured models, each listed under the first provider that
-    /// has it (the one a request for it goes to).
+    /// Its configured models followed by catalog offers, each listed under
+    /// the first provider that has it (the one a request for it goes to).
     pub models: Vec<String>,
 }
 
@@ -116,6 +116,8 @@ pub fn pickable(snapshot: &LlmRuntimeSnapshot) -> Vec<PickableProvider> {
         .map(|router| router.all_models_ordered())
         .filter(|models| !models.is_empty())
         .unwrap_or_else(|| vec![snapshot.primary_model()]);
+    let mut main_models = main_models;
+    main_models.extend(snapshot.offered_models().iter().cloned());
     let mut out = vec![PickableProvider {
         id: MAIN_PROVIDER.to_string(),
         kind: snapshot.provider_kind(),
@@ -125,7 +127,11 @@ pub fn pickable(snapshot: &LlmRuntimeSnapshot) -> Vec<PickableProvider> {
         out.push(PickableProvider {
             id: format!("failover-{index}"),
             kind: target.provider_kind(),
-            models: target.all_models_ordered(),
+            models: target
+                .all_models_ordered()
+                .into_iter()
+                .chain(target.offered_models().iter().cloned())
+                .collect(),
         });
     }
     let mut seen: Vec<String> = Vec::new();

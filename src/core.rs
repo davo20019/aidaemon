@@ -82,6 +82,7 @@ pub async fn run(
         provider_kind,
         failover_targets,
         models,
+        offered_models,
     } = crate::providers::factory::build_provider_router(&config)?;
     let llm_runtime = SharedLlmRuntime::new_with_failovers(
         provider.clone(),
@@ -90,7 +91,8 @@ pub async fn run(
         model.clone(),
         failover_targets,
     )
-    .with_models(models);
+    .with_models(models)
+    .with_offered_models(offered_models);
     // The one door for model calls made outside the agent loop.
     let side_calls = crate::llm_runtime::gateway::SideCallGateway::new(
         llm_runtime.clone(),

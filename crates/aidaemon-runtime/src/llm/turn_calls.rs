@@ -690,6 +690,7 @@ fn owner_of(
                 .all_models_ordered()
                 .iter()
                 .any(|known| known == model)
+                || target.offered_models().iter().any(|known| known == model)
         })
         .map_or(fallback, |target| target.provider())
 }
@@ -752,7 +753,11 @@ pub async fn select_turn_model(
 
 #[cfg(test)]
 mod tests {
-    use super::{QuotaFallback, quota_note_due};
+    use super::{QuotaFallback, owner_of, quota_note_due};
+    use crate::llm::{ModelBackend, ProviderRuntimeTarget, SharedLlmRuntime};
+    use aidaemon_core::testing::ScriptedProvider;
+    use aidaemon_providers::routing::ProviderKind;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     fn fallback(chosen: &str, resets_at: Option<SystemTime>) -> QuotaFallback {
@@ -805,5 +810,29 @@ mod tests {
         let later = now + Duration::from_secs(7200);
         let next = fallback("synthetic-other", Some(later + Duration::from_secs(3600)));
         assert!(quota_note_due(session, &next, later));
+    }
+
+    #[test]
+    fn a_catalog_only_model_is_owned_by_its_configured_provider() {
+        let primary = Arc::new(ScriptedProvider::new([])) as ModelBackend;
+        let failover = Arc::new(ScriptedProvider::new([])) as ModelBackend;
+        let runtime = SharedLlmRuntime::new_with_failovers(
+            primary.clone(),
+            None,
+            ProviderKind::Anthropic,
+            "synthetic-primary".into(),
+            vec![
+                ProviderRuntimeTarget::new(
+                    failover.clone(),
+                    None,
+                    ProviderKind::OpenaiCompatible,
+                    "synthetic-configured".into(),
+                )
+                .with_offered_models(vec!["synthetic-catalog".into()]),
+            ],
+        );
+
+        let owner = owner_of(&runtime.snapshot(), "synthetic-catalog", primary.clone());
+        assert!(Arc::ptr_eq(&owner, &failover));
     }
 }

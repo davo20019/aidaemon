@@ -45,7 +45,10 @@ mod tests {
                 crate::config::ProviderKind::Anthropic,
                 "failover-model".to_string(),
             )],
-            crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+            (
+                crate::providers::sdk_backed::ModelList::Fixed(Vec::new()),
+                Vec::new(),
+            ),
         );
         let verdict = verify_untrusted_call(
             harness.agent.side_calls(),

@@ -19,6 +19,7 @@ pub struct ProviderRuntimeTarget {
     provider_kind: ProviderKind,
     primary_model: String,
     models: ModelList,
+    offered_models: Vec<String>,
 }
 
 impl ProviderRuntimeTarget {
@@ -34,6 +35,7 @@ impl ProviderRuntimeTarget {
             router,
             provider_kind,
             primary_model,
+            offered_models: Vec::new(),
         }
     }
 
@@ -45,6 +47,16 @@ impl ProviderRuntimeTarget {
 
     pub fn models(&self) -> &ModelList {
         &self.models
+    }
+
+    /// Catalog models this configured provider also accepts.
+    pub fn with_offered_models(mut self, models: Vec<String>) -> Self {
+        self.offered_models = models;
+        self
+    }
+
+    pub fn offered_models(&self) -> &[String] {
+        &self.offered_models
     }
 
     pub fn provider(&self) -> ModelBackend {
@@ -122,12 +134,17 @@ pub struct LlmRuntimeSnapshot {
     primary_model: String,
     failover_targets: Vec<ProviderRuntimeTarget>,
     models: ModelList,
+    offered_models: Vec<String>,
 }
 
 impl LlmRuntimeSnapshot {
     /// The primary provider's model listing.
     pub fn models(&self) -> &ModelList {
         &self.models
+    }
+
+    pub fn offered_models(&self) -> &[String] {
+        &self.offered_models
     }
 
     pub fn provider(&self) -> ModelBackend {
@@ -347,6 +364,7 @@ struct LlmRuntimeState {
     primary_model: String,
     failover_targets: Vec<ProviderRuntimeTarget>,
     models: ModelList,
+    offered_models: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -377,12 +395,22 @@ impl SharedLlmRuntime {
             provider_kind,
             primary_model,
             failover_targets,
+            offered_models: Vec::new(),
         })))
     }
 
     /// How the primary provider's models are listed.
     pub fn with_models(self, models: ModelList) -> Self {
         self.0.write().expect("llm runtime lock poisoned").models = models;
+        self
+    }
+
+    /// Catalog models the configured primary provider also accepts.
+    pub fn with_offered_models(self, models: Vec<String>) -> Self {
+        self.0
+            .write()
+            .expect("llm runtime lock poisoned")
+            .offered_models = models;
         self
     }
 
@@ -395,6 +423,7 @@ impl SharedLlmRuntime {
             primary_model: guard.primary_model.clone(),
             failover_targets: guard.failover_targets.clone(),
             models: guard.models.clone(),
+            offered_models: guard.offered_models.clone(),
         }
     }
 
@@ -409,8 +438,9 @@ impl SharedLlmRuntime {
         provider_kind: ProviderKind,
         primary_model: String,
         failover_targets: Vec<ProviderRuntimeTarget>,
-        models: ModelList,
+        model_lists: (ModelList, Vec<String>),
     ) -> LlmRuntimeSnapshot {
+        let (models, offered_models) = model_lists;
         let mut guard = self.0.write().expect("llm runtime lock poisoned");
         let old = LlmRuntimeSnapshot {
             provider: guard.provider.clone(),
@@ -419,6 +449,7 @@ impl SharedLlmRuntime {
             primary_model: guard.primary_model.clone(),
             failover_targets: guard.failover_targets.clone(),
             models: std::mem::replace(&mut guard.models, models),
+            offered_models: std::mem::replace(&mut guard.offered_models, offered_models),
         };
         guard.provider = provider;
         guard.router = router;
