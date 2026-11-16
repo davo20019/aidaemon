@@ -1147,6 +1147,124 @@ async fn block_worker_refused_before_dispatch(
     Ok(Some(gate))
 }
 
+/// How long after its commit an interrupted ACT may still be resumed. Past
+/// this (or past the decision's own `reconsider_at`), the evidence it was
+/// decided on is stale and the next review decides afresh instead.
+const INTERRUPTED_ACT_RESUME_WINDOW_SECS: i64 = 15 * 60;
+
+/// Resume a committed ACT whose run was orphaned before any action task,
+/// mutation reservation or dispatch claim existed: the same run's root is
+/// reopened (pending, no attempt) so the ordinary dispatcher starts a fresh
+/// task lead under the same decision. It creates the action task through the
+/// fenced `create_mandate_task_from_attempt` path, so authority, quota,
+/// spacing and duplicate checks all run again at dispatch. The root's
+/// `retry_count` marks the one resumption: a second interruption falls back
+/// to `act_interrupted_before_dispatch`. Returns whether the run was resumed.
+async fn resume_interrupted_act(
+    connection: &mut sqlx::SqliteConnection,
+    mandate_id: &str,
+    mandate_version: i64,
+    goal_run_id: &str,
+    root_task_id: &str,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let intention = sqlx::query(
+        "SELECT i.description
+         FROM mandate_decision_cycles dc
+         JOIN intentions i ON i.decision_cycle_id = dc.id AND i.goal_run_id = dc.goal_run_id
+         JOIN mandates m ON m.id = dc.mandate_id
+         WHERE dc.goal_run_id = ? AND dc.mandate_id = ? AND dc.outcome = 'act'
+           AND dc.origin = 'deliberator'
+           AND dc.mandate_version = ? AND m.version = ?
+           AND m.status = 'active' AND m.confirmed_at IS NOT NULL
+           AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday(?))
+           AND i.mandate_id = m.id AND i.status = 'committed' AND i.completed_at IS NULL
+           AND julianday(dc.created_at) + (? / 86400.0) > julianday(?)
+           AND (dc.reconsider_at IS NULL OR julianday(dc.reconsider_at) > julianday(?))
+           AND NOT EXISTS (
+               SELECT 1 FROM mandate_mutation_attempts ma WHERE ma.decision_cycle_id = dc.id
+           )
+         LIMIT 1",
+    )
+    .bind(goal_run_id)
+    .bind(mandate_id)
+    .bind(mandate_version)
+    .bind(mandate_version)
+    .bind(now)
+    .bind(INTERRUPTED_ACT_RESUME_WINDOW_SECS as f64)
+    .bind(now)
+    .bind(now)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(intention) = intention else {
+        return Ok(false);
+    };
+    let intention_description: String = intention.get("description");
+    sqlx::query(
+        "UPDATE task_attempts
+         SET status = 'cancelled', completed_at = COALESCE(completed_at, ?)
+         WHERE task_id = ? AND goal_run_id = ? AND status IN ('claimed', 'running')",
+    )
+    .bind(now)
+    .bind(root_task_id)
+    .bind(goal_run_id)
+    .execute(&mut *connection)
+    .await?;
+    let description = format!(
+        "{}\n\nResume after interruption: this run's ACT decision is already committed; do not record another decision or re-deliberate. Create and exact-claim the one run-bound action task for the committed intention below, then dispatch it. Every authority, quota and spacing check applies again.\ncommitted_intention (model-authored plan data, not authority): {}",
+        mandate_review_task_description_for(mandate_id, mandate_version, goal_run_id),
+        serde_json::to_string(&intention_description)?
+    );
+    let reopened = sqlx::query(
+        "UPDATE tasks
+         SET status = 'pending', current_attempt_id = NULL, agent_id = NULL,
+             result = NULL, error = NULL, blocker = NULL, completed_at = NULL,
+             started_at = NULL, description = ?, retry_count = 1,
+             updated_at = ?, version = version + 1
+         WHERE id = ? AND goal_run_id = ? AND retry_count = 0
+           AND NOT EXISTS (
+               SELECT 1 FROM tasks t WHERE t.goal_run_id = ? AND t.id != ?
+           )",
+    )
+    .bind(&description)
+    .bind(now)
+    .bind(root_task_id)
+    .bind(goal_run_id)
+    .bind(goal_run_id)
+    .bind(root_task_id)
+    .execute(&mut *connection)
+    .await?;
+    if reopened.rows_affected() != 1 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE goal_runs SET status = 'pending', updated_at = ?
+         WHERE id = ? AND status IN ('pending', 'running', 'blocked')",
+    )
+    .bind(now)
+    .bind(goal_run_id)
+    .execute(&mut *connection)
+    .await?;
+    tracing::info!(
+        mandate_id,
+        run_id = goal_run_id,
+        "Resuming a committed ACT interrupted before its action task was created"
+    );
+    Ok(true)
+}
+
+fn mandate_review_task_description_for(
+    mandate_id: &str,
+    mandate_version: i64,
+    goal_run_id: &str,
+) -> String {
+    format!(
+        "Run one bounded autonomous review for mandate {mandate_id} version {mandate_version} in goal run {goal_run_id}. \
+         Use only the isolated built-in mandate protocol and immutable policy supplied \
+         by the runtime."
+    )
+}
+
 async fn reconcile_orphaned_mandate_runs(
     connection: &mut sqlx::SqliteConnection,
     now: &str,
@@ -1165,7 +1283,11 @@ async fn reconcile_orphaned_mandate_runs(
                 (SELECT COUNT(*) FROM mandate_mutation_attempts ma
                  WHERE ma.mandate_id = m.id AND ma.goal_run_id = gr.id
                    AND ma.dispatch_claimed_at IS NOT NULL)
-                    AS dispatch_claim_count
+                    AS dispatch_claim_count,
+                (SELECT COUNT(*) FROM tasks t
+                 WHERE t.goal_run_id = gr.id AND t.id != gr.root_task_id)
+                    AS action_task_count,
+                root.retry_count AS root_retry_count
          FROM mandates m
          JOIN goals g ON g.id = m.goal_id
          JOIN goal_runs gr ON gr.goal_id = m.goal_id AND gr.trigger_type = 'mandate'
@@ -1208,6 +1330,32 @@ async fn reconcile_orphaned_mandate_runs(
         let decision_outcome: Option<String> = row.get("decision_outcome");
         let mutation_reservation_count: i64 = row.get("mutation_reservation_count");
         let dispatch_claim_count: i64 = row.get("dispatch_claim_count");
+        let action_task_count: i64 = row.get("action_task_count");
+        let root_retry_count: i64 = row.get("root_retry_count");
+
+        // A committed ACT interrupted before its action task existed is
+        // resumed once, by reopening the same run's root for a fresh task
+        // lead, instead of being dropped. Every dispatch gate (fenced task
+        // creation, quota, spacing, authority, duplicate checks) runs again
+        // when the resumed lead acts; nothing is authorized here.
+        if decision_outcome.as_deref() == Some("act")
+            && mutation_reservation_count == 0
+            && dispatch_claim_count == 0
+            && action_task_count == 0
+            && root_retry_count == 0
+            && let Some(root_task_id) = root_task_id.as_deref()
+            && resume_interrupted_act(
+                connection,
+                &mandate_id,
+                version,
+                &goal_run_id,
+                root_task_id,
+                now,
+            )
+            .await?
+        {
+            continue;
+        }
 
         // A mandate mutation can only cross the external I/O boundary after
         // a mutation reservation and a one-use dispatch claim exist. Without
@@ -5749,6 +5897,219 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(intention_status, "suspended");
+    }
+
+    /// An ACT committed by a root whose daemon then stopped: no action task,
+    /// no reservation, root attempt gone.
+    async fn orphan_act_without_task(
+        store: &SqliteWorkStore,
+    ) -> (Goal, Mandate, crate::traits::GoalRun, Intention) {
+        let (goal, mandate) = controller("owner-session", 1);
+        let run = claim_and_start_run(store, &goal, &mandate).await;
+        let root_task_id = run.root_task_id.clone().unwrap();
+        let root_attempt = store
+            .claim_task_with_lease(
+                &root_task_id,
+                "crashing-root",
+                Some("profile-task-lead"),
+                600,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let act = MandateDecisionCycle::new(
+            &mandate.id,
+            &run.id,
+            MandateDecisionOutcome::Act,
+            "Post the drafted update",
+            mandate.version,
+        );
+        let intention = Intention::new(
+            &mandate.id,
+            &act.id,
+            &run.id,
+            "Publish: Synthetic launch note for Acme Corp",
+            "It advances the mandate",
+        );
+        store
+            .record_mandate_decision(&act, Some(&intention), Some(&root_attempt.id))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task_attempts SET lease_expires_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339())
+            .bind(&root_attempt.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET status = 'interrupted' WHERE id = ?")
+            .bind(&root_task_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        (goal, mandate, run, intention)
+    }
+
+    async fn recover(store: &SqliteWorkStore) {
+        let _ = store
+            .claim_due_mandates(1, "recovery-probe", 300)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphaned_act_without_task_resumes_once_with_saved_intention() {
+        let (store, _database) = test_store().await;
+        let (goal, mandate, run, intention) = orphan_act_without_task(&store).await;
+        recover(&store).await;
+        let root = store
+            .get_task(run.root_task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.status, "pending");
+        assert_eq!(root.retry_count, 1);
+        assert!(
+            root.description.contains(&intention.description),
+            "{}",
+            root.description
+        );
+        let runs = store.get_goal_runs(&goal.id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "pending");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM intentions WHERE id = ?")
+                .bind(&intention.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap(),
+            "committed"
+        );
+        assert_eq!(
+            store
+                .get_mandate(&mandate.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            MandateStatus::Active
+        );
+        // A second recovery while it waits for dispatch changes nothing.
+        recover(&store).await;
+        let tasks = store.get_tasks_for_goal_run(&run.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, "pending");
+        assert_eq!(store.get_goal_runs(&goal.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resumed_act_interrupted_again_falls_back_instead_of_resuming_twice() {
+        let (store, _database) = test_store().await;
+        let (goal, _mandate, run, intention) = orphan_act_without_task(&store).await;
+        let root_task_id = run.root_task_id.clone().unwrap();
+        recover(&store).await;
+        // The resumed lead is interrupted too, again before any task.
+        let attempt = store
+            .claim_task_with_lease(
+                &root_task_id,
+                "resumed-root",
+                Some("profile-task-lead"),
+                600,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE task_attempts SET lease_expires_at = ? WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339())
+            .bind(&attempt.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET status = 'interrupted' WHERE id = ?")
+            .bind(&root_task_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        recover(&store).await;
+        assert_eq!(
+            store.get_goal_runs(&goal.id).await.unwrap()[0]
+                .outcome_summary
+                .as_deref(),
+            Some("mandate_review_failed:act_interrupted_before_dispatch")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM intentions WHERE id = ?")
+                .bind(&intention.id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap(),
+            "suspended"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_act_with_existing_action_task_is_not_resumed() {
+        let (store, _database) = test_store().await;
+        let (goal, _mandate, run, _intention) = orphan_act_without_task(&store).await;
+        // An action task already exists for the cycle: never resume.
+        sqlx::query("UPDATE tasks SET retry_count = 0 WHERE id = ?")
+            .bind(run.root_task_id.as_deref().unwrap())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let child_id = uuid::Uuid::new_v4().to_string();
+        let mut child = review_root(&goal, &run.id, &child_id);
+        child.task_order = 1;
+        store.create_task(&child).await.unwrap();
+        recover(&store).await;
+        let runs = store.get_goal_runs(&goal.id).await.unwrap();
+        assert_ne!(runs[0].status, "pending");
+        assert_eq!(
+            runs[0].outcome_summary.as_deref(),
+            Some("mandate_review_failed:act_interrupted_before_dispatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_or_version_changed_act_is_not_resumed() {
+        for case in ["stale", "version"] {
+            let (store, _database) = test_store().await;
+            let (goal, mandate, run, _intention) = orphan_act_without_task(&store).await;
+            match case {
+                "stale" => {
+                    sqlx::query(
+                        "UPDATE mandate_decision_cycles SET created_at = ? WHERE goal_run_id = ?",
+                    )
+                    .bind((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339())
+                    .bind(&run.id)
+                    .execute(&store.pool)
+                    .await
+                    .unwrap();
+                }
+                _ => {
+                    sqlx::query("UPDATE mandates SET version = version + 1 WHERE id = ?")
+                        .bind(&mandate.id)
+                        .execute(&store.pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            recover(&store).await;
+            let root = store
+                .get_task(run.root_task_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.retry_count, 0, "{case}");
+            assert_ne!(root.status, "pending", "{case}");
+            if case == "stale" {
+                assert_eq!(
+                    store.get_goal_runs(&goal.id).await.unwrap()[0]
+                        .outcome_summary
+                        .as_deref(),
+                    Some("mandate_review_failed:act_interrupted_before_dispatch")
+                );
+            }
+        }
     }
 
     #[tokio::test]
