@@ -1536,7 +1536,16 @@ fn viewer(
                 zoomed.set(e.zoom_scale);
             }
         })
-        .child(picture);
+        // A frame the scroll view's size centers the picture (the web
+        // does not centre a scroll view's content).
+        .child(
+            view()
+                .w(move || px(room.get().0))
+                .h(move || px(room.get().1))
+                .items_center()
+                .justify_center()
+                .child(picture),
+        );
     effect(move || {
         if marking.get() {
             zoomed.set(1.0);

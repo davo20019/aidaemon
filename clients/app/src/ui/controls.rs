@@ -1180,6 +1180,7 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
     // without moving the line.
     let mut dots = view()
         .flex_row()
+        .flex_shrink(0.0)
         .items_center()
         .gap(px(3.0))
         .accessibility_elements_hidden(true);
@@ -1205,6 +1206,10 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
         .child(dots)
         .child(
             text(label)
+                // A long status ends in "…" instead of running under
+                // what follows it on the line.
+                .flex_1()
+                .min_w(px(0.0))
                 .text_size(px(type_scale::SM))
                 // "· 3 tools so far", ticking: the line does not shift.
                 .tabular_nums()

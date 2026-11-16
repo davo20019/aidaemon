@@ -1330,6 +1330,7 @@ fn live(store: Store, session: String) -> View {
                             open,
                         )
                         .accessibility_label("Tools so far")
+                        .flex_shrink(0.0)
                     },
                 )),
         )
