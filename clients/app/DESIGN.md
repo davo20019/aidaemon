@@ -21,7 +21,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 - **Status** (`Tone`): success, warning, danger, info, neutral, accent. Each has a colour and a soft tint, and always comes with a word or glyph, never colour alone.
 - **Radii:** surfaces 12, controls 7, small parts 4. Nested shapes are concentric.
 - **Type:** 11 / 12.5 / 13.5 / 15.5 (reading) / 20 (titles); on touch 13 / 15 / 16 / 22. The OS text size scales all of it (nsh multiplies every font and line height by `font_scale()`, the browser's default size on the web), so controls hold their text with `min_h`, not a fixed height. Digits that change in place (times, ages, counts, elapsed) are tabular (`tabular_nums`). A phone's titles are 22 (`fit::title`), clear of its 16 pt reading text. Two weights per screen: regular and medium or semibold. Monospace only for code, commands, tool names and keys.
-- **Sizes:** sidebar 248, inspector 320, conversation column 760, rows 30, icon slot 16.
+- **Sizes:** sidebar 280, inspector 320, conversation column 760, rows 30, icon slot 16.
 
 ## Components (`src/ui/controls.rs`, `src/ui/kit.rs`)
 

@@ -984,7 +984,7 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
             }
             store.source_tag(&id)
         })
-        .max_w(percentage(0.45))
+        .max_w(percentage(0.4))
         .number_of_lines(1)
         .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
         .text_color(colors::FAINT),

@@ -167,7 +167,7 @@ pub mod size {
     /// A sidebar row.
     pub const ROW: f32 = 30.0;
     /// The sidebar's width.
-    pub const SIDEBAR: f32 = 248.0;
+    pub const SIDEBAR: f32 = 280.0;
     /// The inspector's width.
     pub const INSPECTOR: f32 = 320.0;
     /// The conversation's readable column.
