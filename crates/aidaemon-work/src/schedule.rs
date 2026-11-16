@@ -1247,10 +1247,7 @@ mod following_runs_tests {
         );
         assert_eq!(runs[0].offset().local_minus_utc(), -4 * 3600);
         assert_eq!(runs[1].offset().local_minus_utc(), -5 * 3600);
-        assert_eq!(
-            runs[1].clone() - runs[0].clone(),
-            chrono::Duration::hours(25)
-        );
+        assert_eq!(runs[1] - runs[0], chrono::Duration::hours(25));
     }
 
     #[test]
@@ -1265,10 +1262,7 @@ mod following_runs_tests {
                 "Mon, Mar 9, 8:30 AM ET",
             ]
         );
-        assert_eq!(
-            runs[1].clone() - runs[0].clone(),
-            chrono::Duration::hours(23)
-        );
+        assert_eq!(runs[1] - runs[0], chrono::Duration::hours(23));
     }
 
     #[test]

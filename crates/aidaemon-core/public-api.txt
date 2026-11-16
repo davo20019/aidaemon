@@ -653,6 +653,7 @@ pub fn aidaemon_core::AccessManifest::is_empty(&self) -> bool
 pub struct aidaemon_core::Agent
 impl aidaemon_core::Agent
 pub fn aidaemon_core::Agent::builder(impl core::convert::Into<alloc::string::String>) -> aidaemon_core::AgentBuilder
+pub async fn aidaemon_core::Agent::end_in_flight(&self, aidaemon_core::RunState) -> core::result::Result<aidaemon_core::RunOutcome, aidaemon_core::CoreError>
 pub fn aidaemon_core::Agent::id(&self) -> &str
 pub fn aidaemon_core::Agent::limits(&self) -> &aidaemon_core::Limits
 pub fn aidaemon_core::Agent::redaction_scope(&self) -> &aidaemon_core::redaction::RedactionScope
