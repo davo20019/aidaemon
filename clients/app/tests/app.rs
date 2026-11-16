@@ -498,12 +498,13 @@ fn a_long_day_shows_a_few_and_more_on_request() -> Result<(), String> {
         ),
     ]);
     app.wait_for("Day note 7")?;
-    // Five, then the rest on request; Show less folds them back.
+    // Five, then the whole day in one press; Show fewer, by the heading,
+    // folds it back.
     app.wait_for("Show 2 more")?;
     app.wait_for_gone("Day note 1", std::time::Duration::from_secs(2))?;
     app.press("Show 2 more")?;
     app.wait_for("Day note 1")?;
-    app.press("Show less")?;
+    app.press("Show fewer")?;
     app.wait_for_gone("Day note 1", std::time::Duration::from_secs(5))?;
     Ok(())
 }

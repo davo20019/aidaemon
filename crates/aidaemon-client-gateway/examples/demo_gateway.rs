@@ -224,6 +224,27 @@ impl ClientHost for Host {
             },
         ]
         .into_iter()
+        // A busy day and older days, so the sidebar's long lists show.
+        .chain((1..=12).map(|n| SessionSummary {
+            archived: false,
+            id: format!("app:busy-{n}"),
+            channel: "app".into(),
+            title: Some(format!("Synthetic task {n} for Acme Corp")),
+            last_activity_ms: Some(now_ms() - n * 240_000),
+            writable: true,
+            project_id: None,
+            group: false,
+        }))
+        .chain((3..=8).map(|days| SessionSummary {
+            archived: false,
+            id: format!("app:older-{days}"),
+            channel: "app".into(),
+            title: Some(format!("Notes from {days} days ago")),
+            last_activity_ms: Some(now_ms() - days * 86_400_000),
+            writable: true,
+            project_id: None,
+            group: false,
+        }))
         .map(marked)
         .collect())
     }

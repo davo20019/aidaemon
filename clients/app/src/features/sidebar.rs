@@ -674,25 +674,53 @@ fn by_day(store: Store, ids: Memo<Vec<String>>) -> View {
         .child(day_group(store, "Earlier", part(|d| d > 1), true))
 }
 
-/// How many of a day's conversations show at first, and how many more each
-/// Show more brings.
+/// How many of a day's conversations show at first.
 const DAY_FIRST: usize = 5;
-const DAY_MORE: usize = 10;
 
-/// One day's conversations, the first [`DAY_FIRST`] of them, then Show
-/// more (and Show less once more show).
+/// One day's conversations: the first [`DAY_FIRST`], then "Show N more"
+/// right where the list stops, which shows the whole day in one press.
+/// Shown whole, the day's heading sticks to the top while its rows scroll
+/// by and offers "Show fewer", so folding it back is never a long scroll
+/// away (the App Store's and Music's "See All" beside a heading).
 fn day_group(store: Store, title: &'static str, ids: Memo<Vec<String>>, dated: bool) -> View {
-    let limit = signal(DAY_FIRST);
+    let whole = signal(false);
     let shown = computed(move || {
-        let limit = limit.get();
-        ids.with(|ids| ids.iter().take(limit).cloned().collect::<Vec<_>>())
+        let whole = whole.get();
+        ids.with(|ids| {
+            ids.iter()
+                .take(if whole { usize::MAX } else { DAY_FIRST })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     });
-    let hidden = move || ids.with(Vec::len).saturating_sub(limit.get());
+    let hidden = move || ids.with(Vec::len).saturating_sub(DAY_FIRST);
     view()
         .gap(px(1.0))
         .child(when(
             move || !ids.with(Vec::is_empty),
-            move || section_label(title),
+            move || {
+                view()
+                    .sticky()
+                    .top_0()
+                    .bg(colors::SIDEBAR)
+                    .flex_row()
+                    .items_center()
+                    .child(section_label(title).flex_1())
+                    .child(when(
+                        move || whole.get() && hidden() > 0,
+                        move || {
+                            view().child(
+                                row(|| false, move || whole.set(false))
+                                    .accessibility_label("Show fewer")
+                                    .child(
+                                        text("Show fewer")
+                                            .text_size(px(type_scale::XS))
+                                            .text_color(colors::MUTED),
+                                    ),
+                            )
+                        },
+                    ))
+            },
         ))
         .child(each(
             shown,
@@ -700,31 +728,17 @@ fn day_group(store: Store, title: &'static str, ids: Memo<Vec<String>>, dated: b
             move |id, _| session_row(store, id.get_untracked(), dated),
         ))
         .child(when(
-            move || hidden() > 0 || limit.get() > DAY_FIRST,
+            move || !whole.get() && hidden() > 0,
             move || {
-                view()
-                    .flex_row()
-                    .items_center()
-                    // More where the list goes on; Less at the far end.
-                    .justify_between()
-                    .child(when(
-                        move || hidden() > 0,
-                        move || {
-                            more_row(
-                                move || format!("Show {} more", hidden().min(DAY_MORE)),
-                                move || limit.update(|l| *l += DAY_MORE),
-                            )
-                        },
-                    ))
-                    .child(when(
-                        move || limit.get() > DAY_FIRST,
-                        move || more_row(|| "Show less".to_owned(), move || limit.set(DAY_FIRST)),
-                    ))
+                more_row(
+                    move || format!("Show {} more", hidden()),
+                    move || whole.set(true),
+                )
             },
         ))
 }
 
-/// A quiet press under a list: Show more, Show less.
+/// A quiet press under a list: Show N more.
 fn more_row(label: impl Fn() -> String + Clone + 'static, on_press: impl Fn() + 'static) -> View {
     let name = label.clone();
     view().child(
