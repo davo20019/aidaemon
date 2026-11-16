@@ -319,6 +319,8 @@ pub async fn compile_owner_units(
          A check the owner wants passing (tests, typecheck, lint) is never asks_change: it is a look at the work, and a passing run of it is its result. \
          asks_change is true when the owner wants the world to be different afterwards: something made, installed, set up, changed or removed, \
          a result that does not exist until the work is done. It is false when the owner wants only to know or see something: to look, check, find, measure, report or be shown. \
+         Text the owner wants said or written in this conversation (a message for someone here, a reply, a draft, a translation) is never asks_change: the reply is its result. \
+         Sending it to another chat, person or place is asks_change. \
          Judge what the owner wants done, not what may already exist: asking for something to be made is new work even if something like it exists, \
          and only the owner can say that what exists will do. \
          If the message answers an earlier question, the units are the earlier request as this answer settles it. \

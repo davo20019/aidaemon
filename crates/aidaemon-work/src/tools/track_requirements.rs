@@ -321,7 +321,10 @@ impl Tool for TrackRequirementsTool {
          the answer to an instruction to do the work. \
          Skip this for a request that only looks or reports (finding, listing, counting, reading, \
          checking, however many lookups it takes: answer every part in your reply), a plain \
-         answer or conversation, or when the user forbids it."
+         answer or conversation, or when the user forbids it. \
+         Text the user wants said or written in this conversation (a message for someone \
+         here, a reply, a draft, a translation) is your reply, not a send: skip this for it; \
+         a send is a tool call that delivers to another chat, person or place."
     }
 
     fn schema(&self) -> Value {
