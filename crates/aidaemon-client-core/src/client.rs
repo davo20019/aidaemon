@@ -960,8 +960,10 @@ impl Client {
     }
 
     pub fn setup_step(&mut self, action: SetupAction) {
+        // First run ends on the greeting. The chat step left from Settings
+        // (conversations exist by then) opens nothing.
         if matches!(action, SetupAction::SkipChannel | SetupAction::Finish) {
-            self.open_greeting = true;
+            self.open_greeting = self.state.sessions.is_empty();
         }
         self.setup_error = None;
         let id = self.send(Command::Setup { action });
@@ -2195,6 +2197,29 @@ mod tests {
         frame(&format!(
             r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings","settings":{{"config_path":"/home/synthetic/config.toml","database_path":"","groups":[]}}}}}}"#
         ))
+    }
+
+    #[test]
+    fn leaving_the_chat_step_opens_the_greeting_on_first_run_only() {
+        let created = |id: &str| {
+            frame(&format!(
+                r#"{{"type":"event","seq":1,"at_ms":5,"session_id":"{id}","event":{{"type":"session_created","session":{{"id":"{id}","channel":"app","title":"Welcome","writable":true}}}}}}"#
+            ))
+        };
+        // First run: no conversation yet, so the next one is the greeting.
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.setup_step(SetupAction::SkipChannel);
+        let effects = client.update(created("app:welcome"), &cx(None));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::OpenGreeting(id) if id == "app:welcome"))
+        );
+        // Later, from Settings: conversations exist and none is opened.
+        client.setup_step(SetupAction::SkipChannel);
+        let effects = client.update(created("app:synthetic-9"), &cx(None));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::OpenGreeting(_))));
     }
 
     #[test]

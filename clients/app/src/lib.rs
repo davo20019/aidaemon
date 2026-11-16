@@ -61,12 +61,10 @@ static SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec
 static SETTINGS_SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 static SETUP_SENT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
-/// Every setup step an [`Offline`] root queued, as JSON, oldest first.
-pub fn setup_sent() -> Vec<String> {
-    SETUP_SENT
-        .lock()
-        .map(|s| s.iter().map(|(_, json)| json.clone()).collect())
-        .unwrap_or_default()
+/// Every setup step an [`Offline`] root queued, as its request id and
+/// JSON, oldest first.
+pub fn setup_sent() -> Vec<(String, String)> {
+    SETUP_SENT.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
 /// Every settings change an [`Offline`] root queued, as JSON, oldest first.

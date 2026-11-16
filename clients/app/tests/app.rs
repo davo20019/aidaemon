@@ -355,11 +355,61 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     Ok(())
 }
 
+/// Wait for a setup step naming `what`, sent after the first `before`;
+/// its request id.
+fn wait_setup_sent(before: usize, what: &str) -> Result<String, String> {
+    for _ in 0..150 {
+        if let Some((id, _)) = nsh_app_aidaemon::setup_sent()
+            .into_iter()
+            .skip(before)
+            .find(|(_, step)| step.contains(what))
+        {
+            return Ok(id);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!("no setup step `{what}` was sent"))
+}
+
+#[test]
+fn settings_opens_the_phone_step_and_not_now_leaves_it() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help with?")?;
+    feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent("get_settings")?;
+    let result = SETTINGS;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
+    ))]);
+    app.wait_for("On this device")?;
+    app.press("Connections")?;
+    let before = nsh_app_aidaemon::setup_sent().len();
+    app.press("Reach it from your phone")?;
+    let id = wait_setup_sent(before, "detect")?;
+    // The daemon opens its chat step again.
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"setup","setup":{{"step":"channel","channels":[{{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}}]}}}}}}"#
+    ))]);
+    app.wait_for("Telegram")?;
+    app.press("Telegram")?;
+    app.wait_for("Make a Telegram bot")?;
+    app.press("Not now")?;
+    let id = wait_setup_sent(before, "skip_channel")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"setup","setup":{{"step":"done"}}}}}}"#
+    ))]);
+    app.wait_for_gone("Make a Telegram bot", std::time::Duration::from_secs(5))?;
+    Ok(())
+}
+
 #[test]
 fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -> Result<(), String>
 {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
+    let before = nsh_app_aidaemon::setup_sent().len();
     feed([
         Update::Connected,
         frame(
@@ -403,19 +453,7 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
     if app.shows("Reach it from your phone") {
         return Err("first run asks for a bot token".into());
     }
-    let mut skipped = false;
-    for _ in 0..100 {
-        skipped = nsh_app_aidaemon::setup_sent()
-            .iter()
-            .any(|step| step.contains("skip_channel"));
-        if skipped {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if !skipped {
-        return Err("the chat step was not skipped".into());
-    }
+    wait_setup_sent(before, "skip_channel")?;
     // Done: the greeting's conversation opens, with prompts to press.
     feed([
         frame(

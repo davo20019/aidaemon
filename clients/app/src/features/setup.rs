@@ -57,9 +57,10 @@ fn billing_words(billing: Billing) -> &'static str {
     }
 }
 
-/// The desktop app was opened to run the agent here: start it on the first
-/// look, once per launch, rather than ask (a retry is a button).
-static STARTED_HERE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The desktop app was opened to run the agent here: its first launch on
+/// this device starts it rather than ask. Once only, so an owner who later
+/// removes the service is asked, not overruled.
+const STARTED_HERE_KEY: &str = "aidaemon.started_here";
 
 /// The owner asked for the phone step (from Settings). First run skips it,
 /// so the first conversation comes before any bot token.
@@ -76,10 +77,10 @@ pub fn reach_from_phone(store: Store) {
 pub fn where_page(store: Store) -> View {
     let terminal = idiom() == nsh_core::platform::Idiom::Terminal;
     let auto = link::RUNS_DAEMON && !terminal;
-    if auto
-        && !STARTED_HERE.swap(true, std::sync::atomic::Ordering::Relaxed)
-        && store.starting_daemon().is_none()
-    {
+    let first_launch = nsh_core::storage::Storage::get_item(STARTED_HERE_KEY).is_none();
+    let auto = auto && (first_launch || store.starting_daemon().is_some());
+    if auto && first_launch {
+        let _ = nsh_core::storage::Storage::set_item(STARTED_HERE_KEY, "1");
         spawn(async move { link::install_here(store) });
     }
     let elsewhere = signal(!link::RUNS_DAEMON);
