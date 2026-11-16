@@ -516,7 +516,7 @@ fn welcome(store: Store) -> View {
                 .child(
                     text(move || {
                         if code.get() {
-                            "Which project are we working on?"
+                            "Which project is this for?"
                         } else {
                             "What can I help with?"
                         }

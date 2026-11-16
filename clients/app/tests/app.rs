@@ -491,7 +491,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("What can I help with?")?;
     // Code before any project exists says how to make the first.
     app.press("Code")?;
-    app.wait_for("Which project are we working on?")?;
+    app.wait_for("Which project is this for?")?;
     app.wait_for("New project")?;
     app.press("Chat")?;
     app.wait_for("What can I help with?")?;
@@ -514,7 +514,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Contact form copy")?;
     // Its "+" starts a conversation there: the header names the project.
     app.press("New conversation in this project >> nth=0")?;
-    app.wait_for("Which project are we working on?")?;
+    app.wait_for("Which project is this for?")?;
     app.wait_for("Works in /home/synthetic/acme-site")?;
     // The header's switch says what a new conversation is: Chat leaves
     // the project and brings the question; Code asks which project, in
@@ -522,7 +522,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press("Chat")?;
     app.wait_for("What can I help with?")?;
     app.press("Code")?;
-    app.wait_for("Which project are we working on?")?;
+    app.wait_for("Which project is this for?")?;
     // The project this device last worked in is chosen again.
     app.wait_for("Works in /home/synthetic/acme-site")?;
     // Its "+" opens the form for a new project.
@@ -533,7 +533,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press("Contact form copy >> nth=0")?;
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
     app.press_key("mod+n")?;
-    app.wait_for("Which project are we working on?")?;
+    app.wait_for("Which project is this for?")?;
     // The paperclip offers pictures and files (and the camera, where a
     // phone's browser has one).
     app.press("Attach")?;
