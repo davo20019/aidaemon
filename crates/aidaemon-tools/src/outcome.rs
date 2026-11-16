@@ -104,7 +104,28 @@ pub(crate) fn validate_for_core<T: OutcomeTool + ?Sized>(
             return Err(format!("`{key}` is required"));
         }
     }
+    check_argument_contract(tool, arguments)?;
     tool.validate_call(arguments)
+}
+
+/// The tool's own argument contract (a shell's "run needs a command or a
+/// script"), checked where the kernel checks a call, so a call that cannot
+/// run goes back to the model as invalid before any hook could ask the
+/// owner to approve it.
+pub fn check_argument_contract<T: OutcomeTool + ?Sized>(
+    tool: &T,
+    arguments: &Value,
+) -> Result<(), String> {
+    let describe = |violation: crate::semantics::ToolArgumentContractViolation| match violation
+        .recovery_hint
+    {
+        Some(hint) => format!("{} ({hint})", violation.reason),
+        None => violation.reason,
+    };
+    let canonical = tool
+        .canonicalize_arguments(&arguments.to_string())
+        .map_err(describe)?;
+    tool.validate_arguments(&canonical).map_err(describe)
 }
 
 /// Run an [`OutcomeTool`] for a kernel agent. A failed or rejected call is an

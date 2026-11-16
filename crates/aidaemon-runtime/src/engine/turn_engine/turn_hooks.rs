@@ -110,10 +110,11 @@ impl sdk::Hook for ModelPin {
 }
 
 /// A daemon tool as this turn's kernel agent runs it. Daemon tools check
-/// their own arguments (some accept aliases for schema-required keys) and
-/// report bad ones through the dispatcher; only the goal-actions view of
-/// the memory tool is narrowed here, so the kernel records that refusal in
-/// the run ledger.
+/// their schema's required keys themselves (some accept aliases for them)
+/// and report bad ones through the dispatcher. Their own argument contract
+/// is checked here, before any hook, so the owner is never asked to approve
+/// a call that cannot run; and the goal-actions view of the memory tool is
+/// narrowed here, so the kernel records that refusal in the run ledger.
 pub fn turn_tool(
     spec: sdk::ToolSpec,
     tool: Arc<dyn aidaemon_tools::OutcomeTool>,
@@ -121,10 +122,12 @@ pub fn turn_tool(
     calls: mpsc::Sender<DaemonCall>,
     trust_roots: Arc<Vec<String>>,
 ) -> aidaemon_tools::KernelAdapter<dyn aidaemon_tools::OutcomeTool> {
+    let checked = tool.clone();
     crate::engine::hooks::turn_tool(
         spec,
         tool,
         Arc::new(move |arguments| {
+            aidaemon_tools::outcome::check_argument_contract(checked.as_ref(), arguments)?;
             if goal_actions_only {
                 crate::turn::memory::check_goal_action(arguments)?;
             }
