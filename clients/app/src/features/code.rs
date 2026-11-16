@@ -283,33 +283,6 @@ fn file_diff(
                     set_clipboard(section.get_untracked())
                 })),
         )
-        // Undoing has a row of its own: the header is full on a narrow pane.
-        .child(view().flex_row().px_2().child({
-            let (root, path) = (root.clone(), path.clone());
-            ui::btn("Undo changes", Variant::Danger, Size::Sm, move || {
-                let new = file_status(store, &root, &path)
-                    .is_some_and(|s| matches!(s, FileStatus::Untracked | FileStatus::Added));
-                let (root, path) = (root.clone(), path.clone());
-                ui::confirm(
-                    format!("Undo the changes to {path}?"),
-                    if new {
-                        "It is a new file: undoing deletes it. This cannot be undone here."
-                    } else {
-                        "It goes back to its last commit. The uncommitted changes are lost."
-                    },
-                    if new {
-                        "Delete the file"
-                    } else {
-                        "Undo changes"
-                    },
-                    move || {
-                        store.revert_file(&root, &path);
-                        open.set(None);
-                    },
-                );
-            })
-            .disabled(move || store.reverting())
-        }))
         .child(dynamic(move || {
             let patch = section.get();
             let label = label.clone();
@@ -325,6 +298,44 @@ fn file_diff(
                 }
             }))
         }))
+        // Undoing sits apart, at the foot of the pane, away from the
+        // header's controls; it asks before it changes anything.
+        .child(
+            view()
+                .flex_row()
+                .justify_end()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(colors::LINE)
+                .child({
+                    let (root, path) = (root.clone(), path.clone());
+                    ui::btn("Undo changes…", Variant::Danger, Size::Sm, move || {
+                        let new = file_status(store, &root, &path).is_some_and(|s| {
+                            matches!(s, FileStatus::Untracked | FileStatus::Added)
+                        });
+                        let (root, path) = (root.clone(), path.clone());
+                        ui::confirm(
+                            format!("Undo the changes to {path}?"),
+                            if new {
+                                "It is a new file: undoing deletes it. This cannot be undone here."
+                            } else {
+                                "It goes back to its last commit. The uncommitted changes are lost."
+                            },
+                            if new {
+                                "Delete the file"
+                            } else {
+                                "Undo changes"
+                            },
+                            move || {
+                                store.revert_file(&root, &path);
+                                open.set(None);
+                            },
+                        );
+                    })
+                    .disabled(move || store.reverting())
+                }),
+        )
 }
 
 /// Whether a file's section of a diff has any hunk.

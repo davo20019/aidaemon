@@ -110,7 +110,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Composer | Typing while the agent works | Send (Enter) tells the running work now; Queue (Mod+Enter) sends after it; the hint says "Enter tells it now · ⌘↩ sends after · Esc stops" |
 | Composer | Messages wait | "Waiting to send" above the composer: each marked Now (the running work reads it at its next step) or After (its own turn when the work ends), with Edit and Remove until the agent takes it |
 | Settings, General | On this device: what Enter does while the agent works | "Tells it now (⌘↩ sends after)" or "Sends after it (⌘↩ tells it now)"; the composer's hint and second button (Queue or Now) follow |
-| Changes | Undo a file | "Undo changes" under a file's diff header asks first (a new file is deleted, a changed one goes back to its last commit), then the list comes back read again |
+| Changes | Undo a file | "Undo changes…" at the foot of a file's diff, apart from the header's controls, asks first (a new file is deleted, a changed one goes back to its last commit), then the list comes back read again |
 | Automations | Runs since the last look | "N new" on the Automations row; "New since you last looked" on each card whose last run reported something or failed |
 | Composer | Draft starts with `/` | The daemon's matching commands above the composer; Tab or a press completes the first |
 | Composer | Up on an empty composer | The last message sent here comes back to edit |
