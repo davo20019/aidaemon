@@ -1081,6 +1081,9 @@ fn open_file(url: String) {
     drop(open_url(url));
 }
 
+/// The end of a marked-up picture's name (`Store::attach_marked`).
+const MARKED: &str = "-marked.jpg";
+
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
     view()
         .max_w(percentage(0.8))
@@ -1356,7 +1359,12 @@ fn composer(store: Store, session: Option<String>) -> View {
                             }
                             Connection::Online => {
                                 // The field says what to write here.
-                                let ask = if running.get() {
+                                let files = store.draft_files();
+                                let ask = if files.iter().any(|f| f.name.ends_with(MARKED)) {
+                                    "Say what to do with the marked part"
+                                } else if !files.is_empty() {
+                                    "Say what to do with it, or just send"
+                                } else if running.get() {
                                     "Add to the work or queue what's next"
                                 } else if ongoing {
                                     "Reply"

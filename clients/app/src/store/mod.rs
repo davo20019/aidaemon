@@ -1805,6 +1805,8 @@ impl Store {
                     None => store.say("Couldn't read that picture to mark it up".to_owned()),
                 }
                 store.viewing.set(None);
+                // What comes next is saying what to do with it.
+                store.focus_composer();
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
