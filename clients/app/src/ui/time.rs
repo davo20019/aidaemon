@@ -48,6 +48,19 @@ pub fn clock(at_ms: u64) -> String {
     local(at_ms).map_or_else(String::new, |t| t.format("%-I:%M %p").to_string())
 }
 
+/// A list's date: "Oct 30", "Nov 03"; with the year when not this one
+/// ("Oct 30, 2025").
+pub fn short_date(at_ms: u64, now_ms: u64) -> String {
+    let (Some(at), Some(now)) = (local(at_ms), local(now_ms)) else {
+        return String::new();
+    };
+    if at.year() == now.year() {
+        at.format("%b %d").to_string()
+    } else {
+        at.format("%b %d, %Y").to_string()
+    }
+}
+
 /// "Today", "Yesterday", "Monday", "Mar 3" or "Mar 3, 2025".
 pub fn day_label(at_ms: u64, now_ms: u64) -> String {
     let (Some(at), Some(now)) = (local(at_ms), local(now_ms)) else {

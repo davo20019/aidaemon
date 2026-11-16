@@ -187,7 +187,7 @@ pub fn sidebar(store: Store) -> View {
 
 /// A conversation's row, with its menu on a right click or a long press:
 /// open it, pin or unpin it, stop its work, move it to a project.
-fn session_row(store: Store, id: String) -> View {
+fn session_row(store: Store, id: String, dated: bool) -> View {
     let editing = id.clone();
     let shown = id.clone();
     // Rename shows the name as a field in the row's place.
@@ -196,12 +196,12 @@ fn session_row(store: Store, id: String) -> View {
             move || store.renaming().as_deref() == Some(editing.as_str()),
             move || rename_field(store, id.clone()),
         )
-        .otherwise(move || menu_row(store, shown.clone())),
+        .otherwise(move || menu_row(store, shown.clone(), dated)),
     )
 }
 
 /// The row with its menu.
-fn menu_row(store: Store, id: String) -> View {
+fn menu_row(store: Store, id: String, dated: bool) -> View {
     let (open, pin, stop) = (id.clone(), id.clone(), id.clone());
     let pinned = untracked(|| store.is_pinned(&id));
     let current = untracked(|| store.session_project(&id));
@@ -245,7 +245,7 @@ fn menu_row(store: Store, id: String) -> View {
     }
     let preview = id.clone();
     ui::with_menu(
-        ui::with_preview(session_button(store, id), move || {
+        ui::with_preview(session_button(store, id, dated), move || {
             session_preview(store, preview)
         }),
         actions,
@@ -645,7 +645,8 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
 }
 
 /// Conversations under the day they were last active: Today, Yesterday,
-/// Earlier.
+/// Earlier (each with its date). A long day shows its first few, and Show
+/// more brings the rest a few at a time.
 fn by_day(store: Store, ids: Memo<Vec<String>>) -> View {
     let days_ago = move |id: &String| {
         store
@@ -664,9 +665,73 @@ fn by_day(store: Store, ids: Memo<Vec<String>>) -> View {
     };
     view()
         .gap(px(1.0))
-        .child(group(store, "Today", part(|d| d <= 0)))
-        .child(group(store, "Yesterday", part(|d| d == 1)))
-        .child(group(store, "Earlier", part(|d| d > 1)))
+        .child(day_group(store, "Today", part(|d| d <= 0), false))
+        .child(day_group(store, "Yesterday", part(|d| d == 1), false))
+        .child(day_group(store, "Earlier", part(|d| d > 1), true))
+}
+
+/// How many of a day's conversations show at first, and how many more each
+/// Show more brings.
+const DAY_FIRST: usize = 5;
+const DAY_MORE: usize = 10;
+
+/// One day's conversations, the first [`DAY_FIRST`] of them, then Show
+/// more (and Show less once more show).
+fn day_group(store: Store, title: &'static str, ids: Memo<Vec<String>>, dated: bool) -> View {
+    let limit = signal(DAY_FIRST);
+    let shown = computed(move || {
+        let limit = limit.get();
+        ids.with(|ids| ids.iter().take(limit).cloned().collect::<Vec<_>>())
+    });
+    let hidden = move || ids.with(Vec::len).saturating_sub(limit.get());
+    view()
+        .gap(px(1.0))
+        .child(when(
+            move || !ids.with(Vec::is_empty),
+            move || section_label(title),
+        ))
+        .child(each(
+            shown,
+            |id: &String| id.clone(),
+            move |id, _| session_row(store, id.get_untracked(), dated),
+        ))
+        .child(when(
+            move || hidden() > 0 || limit.get() > DAY_FIRST,
+            move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .child(when(
+                        move || hidden() > 0,
+                        move || {
+                            more_row(
+                                move || format!("Show {} more", hidden().min(DAY_MORE)),
+                                move || limit.update(|l| *l += DAY_MORE),
+                            )
+                        },
+                    ))
+                    .child(when(
+                        move || limit.get() > DAY_FIRST,
+                        move || more_row(|| "Show less".to_owned(), move || limit.set(DAY_FIRST)),
+                    ))
+            },
+        ))
+}
+
+/// A quiet press under a list: Show more, Show less.
+fn more_row(label: impl Fn() -> String + Clone + 'static, on_press: impl Fn() + 'static) -> View {
+    let name = label.clone();
+    view().child(
+        row(|| false, on_press)
+            .accessibility_label(move || Some(SharedString::from(name())))
+            // Lined up with the titles, past the dot's slot.
+            .child(view().w(px(ui::fit::icon_slot())))
+            .child(
+                text(label)
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::MUTED),
+            ),
+    )
 }
 
 /// Where the listed conversations came from, as one filter.
@@ -916,10 +981,11 @@ pub fn short_path(path: &str) -> String {
     }
 }
 
-fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
+fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElement {
     let (a, b, c, d, e) = (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let (f, g, h) = (id.clone(), id.clone(), id.clone());
     let label_id = id.clone();
+    let date_id = id.clone();
     row(
         move || store.selected().as_deref() == Some(a.as_str()),
         move || store.select(Some(b.clone())),
@@ -989,6 +1055,19 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
         .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
         .text_color(colors::FAINT),
     )
+    // Under Earlier: the day it was last active ("Oct 30").
+    .child(when(dated, move || {
+        let at = date_id.clone();
+        text(move || {
+            store
+                .last_activity(&at)
+                .map(|at| ui::time::short_date(at, now_ms()))
+                .unwrap_or_default()
+        })
+        .tabular_nums()
+        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+        .text_color(colors::FAINT)
+    }))
 }
 
 /// Automations, System, Memory and Settings: rows on a desktop; on a phone
@@ -1129,7 +1208,7 @@ fn group(store: Store, title: &'static str, ids: Memo<Vec<String>>) -> View {
         .child(each(
             ids,
             |id: &String| id.clone(),
-            move |id, _| session_row(store, id.get_untracked()),
+            move |id, _| session_row(store, id.get_untracked(), false),
         ))
 }
 
