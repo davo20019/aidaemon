@@ -552,23 +552,11 @@ fn new_project_form(store: Store) {
 /// chosen project's folder (or what to do). With no project yet, New
 /// project in the list's place.
 fn code_start(store: Store) -> View {
-    let projects = computed(move || {
-        store
-            .projects()
-            .into_iter()
-            .map(|p| (p.id, p.name))
-            .collect::<Vec<(String, String)>>()
-    });
-    let note = |words: Box<dyn Fn() -> String>| {
-        text(words)
-            .number_of_lines(1)
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT)
-    };
+    let any = computed(move || !store.projects().is_empty());
     view().w_full().items_center().child(dynamic(move || {
-        let items = projects.get();
+        let any = any.get();
         Some(untracked(move || {
-            if items.is_empty() {
+            if !any {
                 return view()
                     .items_center()
                     .gap_2()
@@ -578,51 +566,139 @@ fn code_start(store: Store) -> View {
                         ui::Size::Sm,
                         move || new_project_form(store),
                     ))
-                    .child(note(Box::new(|| {
-                        "A project is a folder on the daemon's computer".to_owned()
-                    })));
+                    .child(
+                        text("A project is a folder on the daemon's computer")
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
+                    );
             }
-            view()
-                .items_center()
-                .gap_2()
-                // A new one is made with the sidebar's form, as its "+"
-                // does; once made, this conversation starts in it.
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .child(ui::choice(
-                            "Project to work in",
-                            "Choose a project",
-                            items,
-                            move || store.current_project(),
-                            move |chosen| {
-                                if let Some(id) = chosen.filter(|id| !id.is_empty()) {
-                                    store.set_new_project(Some(id));
-                                }
-                            },
-                        ))
-                        .child(ui::icon_btn(
-                            Glyph::Plus,
-                            "Make a new project",
-                            Size::Md,
-                            move || new_project_form(store),
-                        )),
-                )
-                .child(note(Box::new(move || {
-                    match store.current_project().and_then(|id| store.project(&id)) {
-                        Some(p) => match p.path {
-                            Some(path) => {
-                                format!("Works in {}", super::sidebar::short_path(&path))
-                            }
-                            None => "This project has no folder".to_owned(),
-                        },
-                        None => "The agent works in the project's folder".to_owned(),
-                    }
-                })))
+            // One card names the project and its folder; a press opens the
+            // projects (recent first) with New project last.
+            view().w_full().max_w(px(420.0)).child(ui::pick_list(
+                "Choose a project",
+                move || match store.current_project().and_then(|id| store.project(&id)) {
+                    Some(p) => format!("Project: {}, change", p.name),
+                    None => "Choose a project".to_owned(),
+                },
+                project_card(store),
+                move || project_choices(store),
+                move || store.current_project(),
+                move |id| store.set_new_project(Some(id)),
+                Some(ui::PickAction {
+                    label: "New project",
+                    glyph: Glyph::Plus,
+                    run: std::rc::Rc::new(move || new_project_form(store)),
+                }),
+            ))
         }))
     }))
+}
+
+/// What the Code page's card shows: the chosen project and its folder, or
+/// that one is still to be chosen.
+fn project_card(store: Store) -> View {
+    let chosen = computed(move || store.current_project().and_then(|id| store.project(&id)));
+    view()
+        .w_full()
+        .min_h(px(if ui::touch() { 60.0 } else { 52.0 }))
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .rounded(px(ui::radius::CONTROL))
+        .border_1()
+        .border_color(colors::EDGE)
+        .bg(colors::SURFACE)
+        .child(
+            ui::icon(Glyph::Folder)
+                .text_color(colors::MUTED)
+                .accessibility_elements_hidden(true),
+        )
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    text(move || {
+                        chosen.with(|p| {
+                            p.as_ref()
+                                .map_or_else(|| "Choose a project".to_owned(), |p| p.name.clone())
+                        })
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(ui::fit::body()))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(move || {
+                        if chosen.with(Option::is_some) {
+                            colors::TEXT
+                        } else {
+                            colors::MUTED
+                        }
+                    }),
+                )
+                .child(
+                    text(move || {
+                        chosen.with(|p| match p {
+                            Some(p) => match &p.path {
+                                Some(path) => super::sidebar::short_path(path),
+                                None => "No folder".to_owned(),
+                            },
+                            None => "The agent works in its folder".to_owned(),
+                        })
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                ),
+        )
+        .child(
+            ui::icon(Glyph::Down)
+                .text_color(colors::FAINT)
+                .accessibility_elements_hidden(true),
+        )
+}
+
+/// The projects to choose from: past four, the three last worked in under
+/// Recent, then the rest by name under All projects.
+fn project_choices(store: Store) -> Vec<ui::PickItem> {
+    let mut projects = store.projects();
+    projects.sort_by_key(|p| p.name.to_lowercase());
+    let item = |p: &aidaemon_client_protocol::ProjectSummary, group: Option<&str>| ui::PickItem {
+        id: p.id.clone(),
+        title: p.name.clone(),
+        detail: p
+            .path
+            .as_deref()
+            .map_or_else(|| "No folder".to_owned(), super::sidebar::short_path),
+        group: group.map(str::to_owned),
+    };
+    if projects.len() <= 4 {
+        return projects.iter().map(|p| item(p, None)).collect();
+    }
+    let mut recent = Vec::<String>::new();
+    for id in store.session_ids() {
+        if let Some(project) = store.session_project(&id)
+            && !recent.contains(&project)
+        {
+            recent.push(project);
+            if recent.len() == 3 {
+                break;
+            }
+        }
+    }
+    let mut out = recent
+        .iter()
+        .filter_map(|id| projects.iter().find(|p| &p.id == id))
+        .map(|p| item(p, Some("Recent")))
+        .collect::<Vec<_>>();
+    out.extend(
+        projects
+            .iter()
+            .filter(|p| !recent.contains(&p.id))
+            .map(|p| item(p, Some("All projects"))),
+    );
+    out
 }
 
 /// The transcript, and a "Jump to latest" pill while the owner reads back.

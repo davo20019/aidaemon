@@ -7,11 +7,11 @@
 use std::time::Duration;
 
 use nsh_base::{
-    Anchor, SelectEntry, SelectItem, SelectValue, ToastManager, ToastMotion, ToastOptions,
-    ToastStackState, accordion, accordion_header, accordion_item, accordion_panel,
-    accordion_trigger, alert_dialog, context_menu, h_resizable, menu, menu_item, progress,
-    resizable_panel, select, sheet, switch, tab, table, table_body, table_cell, table_head,
-    table_header, table_row, tabs, toast, toast_stack,
+    Anchor, CommandEntry, CommandGroup, CommandItem, SelectEntry, SelectItem, SelectValue,
+    ToastManager, ToastMotion, ToastOptions, ToastStackState, accordion, accordion_header,
+    accordion_item, accordion_panel, accordion_trigger, alert_dialog, command, context_menu,
+    h_resizable, menu, menu_item, popover, progress, resizable_panel, select, sheet, switch, tab,
+    table, table_body, table_cell, table_head, table_header, table_row, tabs, toast, toast_stack,
 };
 use nsh_core::prelude::*;
 use nsh_core::time::now;
@@ -746,4 +746,260 @@ pub fn pane(
 /// The pane of a [`split`] that takes the rest of the room.
 pub fn pane_rest(content: impl IntoElement) -> nsh_base::ResizablePanelElement {
     resizable_panel().child(content)
+}
+
+/// One choice of a [`pick_list`]: what it is, a line under it (a folder),
+/// and the section it shows in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickItem {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub group: Option<String>,
+}
+
+/// A row after the choices that does something else (New project).
+pub struct PickAction {
+    pub label: &'static str,
+    pub glyph: super::Glyph,
+    pub run: std::rc::Rc<dyn Fn()>,
+}
+
+/// One value from a list that names more than a word each (projects and
+/// their folders): `trigger` shows what is chosen (`name` says it); a press opens the
+/// choices under a heading, with a search past six of them, sections, a
+/// check on the chosen one and `action` last. A sheet from the bottom on
+/// touch screens, a popover at the trigger in a window. Built on
+/// `nsh_base`'s Command, so its keys, search and long lists are nsh's.
+pub fn pick_list(
+    title: &'static str,
+    name: impl Fn() -> String + 'static,
+    trigger: impl IntoElement,
+    items: impl Fn() -> Vec<PickItem> + Copy + 'static,
+    chosen: impl Fn() -> Option<String> + Copy + 'static,
+    pick: impl Fn(String) + Clone + 'static,
+    action: Option<PickAction>,
+) -> View {
+    let open = signal(false);
+    let touch = super::touch();
+    let action = action.map(std::rc::Rc::new);
+    let body = move || {
+        let pick = pick.clone();
+        let action = action.clone();
+        view().child(dynamic(move || {
+            if !open.get() {
+                return None;
+            }
+            let pick = pick.clone();
+            let action = action.clone();
+            Some(untracked(move || {
+                pick_body(title, items(), chosen(), pick, action, open, touch)
+            }))
+        }))
+    };
+    let trigger = view()
+        .role(AccessibilityRole::Button)
+        .label(move || SharedString::from(name()))
+        .w_full()
+        .rounded(px(radius::CONTROL))
+        .transition_colors()
+        .duration(motion::FAST)
+        .hover(|s| s.bg(colors::HOVER))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .focus(super::controls::focus_band)
+        .child(trigger);
+    if touch {
+        view()
+            .w_full()
+            .child(trigger.on_press(move || open.set(true)))
+            .child(
+                sheet()
+                    .side(Placement::Bottom)
+                    .open(move || Some(open.get()))
+                    .on_open_change(move |event: &nsh_base::SheetEvent| {
+                        if let nsh_base::SheetEvent::OpenChange(false, _) = event {
+                            open.set(false);
+                        }
+                    })
+                    .popup_style(|s| {
+                        s.w_full()
+                            .max_h(percentage(0.72))
+                            .rounded_t(px(radius::SURFACE))
+                            .bg(colors::SURFACE)
+                            .pb_safe_area()
+                            .shadow_lg()
+                    })
+                    .backdrop_style(|s| s.bg(colors::SCRIM))
+                    .child(body()),
+            )
+    } else {
+        view().w_full().child(
+            popover()
+                .open(move || Some(open.get()))
+                .on_open_change(move |event: &nsh_base::PopoverEvent| {
+                    if let nsh_base::PopoverEvent::OpenChange(now_open, _) = event {
+                        open.set(*now_open);
+                    }
+                })
+                .trigger(trigger)
+                .popup_style(|s| {
+                    s.w(px(380.0))
+                        .bg(colors::SURFACE)
+                        .border_1()
+                        .border_color(colors::EDGE)
+                        .rounded(px(radius::SURFACE))
+                        .shadow_lg()
+                        .transition_all()
+                        .duration(motion::BASE)
+                })
+                .popup_starting_class("opacity-0 scale-95")
+                .popup_ending_class("opacity-0 scale-95")
+                .child(body()),
+        )
+    }
+}
+
+fn pick_body(
+    title: &'static str,
+    items: Vec<PickItem>,
+    chosen: Option<String>,
+    pick: impl Fn(String) + 'static,
+    action: Option<std::rc::Rc<PickAction>>,
+    open: Signal<bool>,
+    touch: bool,
+) -> View {
+    let searchable = items.len() > 6;
+    let rows = items
+        .into_iter()
+        .map(|item| {
+            let checked = chosen.as_deref() == Some(item.id.as_str());
+            let row = CommandItem::new(item.id, item.title)
+                .keywords([item.detail])
+                .checked(checked);
+            match item.group {
+                Some(group) => row.group(group),
+                None => row,
+            }
+        })
+        .collect::<Vec<_>>();
+    let row_h = if touch { 52.0 } else { 40.0 };
+    let mut list = command()
+        .items(rows)
+        .searchable(searchable)
+        .placeholder("Find one")
+        // A phone's keyboard would cover the list it opens over.
+        .auto_focus(searchable && !touch)
+        .accessibility_label(title)
+        .search_accessibility_label(format!("Find in {title}"))
+        .list_style(move |s| s.max_h(px(row_h * 6.5)))
+        .item_class("rounded-md focus:bg-accent")
+        .render_item(move |e: &CommandEntry| {
+            let detail = e.keywords.first().cloned().unwrap_or_default();
+            view()
+                .min_h(px(row_h))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .child(
+                    super::icon(super::Glyph::Folder)
+                        .text_color(colors::MUTED)
+                        .accessibility_elements_hidden(true),
+                )
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(e.label.clone())
+                                .number_of_lines(1)
+                                .text_size(px(fit::body()))
+                                .text_color(colors::TEXT),
+                        )
+                        .child(
+                            text(detail)
+                                .number_of_lines(1)
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                        ),
+                )
+                .child(if e.checked {
+                    super::icon(super::Glyph::Check)
+                        .text_color(colors::ACCENT)
+                        .accessibility_elements_hidden(true)
+                } else {
+                    view()
+                })
+        })
+        .render_group(|g: &CommandGroup| {
+            text(g.heading.clone())
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_size(px(type_scale::XS))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors::FAINT)
+        })
+        .on_cancel(move || open.set(false))
+        .on_select(move |id: &SharedString| {
+            open.set(false);
+            pick(id.to_string());
+        });
+    if let Some(action) = action {
+        let run = action.run.clone();
+        list = list.footer(
+            view()
+                .mt_1()
+                .pt_1()
+                .border_t_1()
+                .border_color(colors::LINE)
+                .child(
+                    super::row(
+                        || false,
+                        move || {
+                            open.set(false);
+                            run()
+                        },
+                    )
+                    .min_h(px(row_h))
+                    .accessibility_label(action.label)
+                    .child(
+                        super::icon(action.glyph)
+                            .text_color(colors::MUTED)
+                            .accessibility_elements_hidden(true),
+                    )
+                    .child(
+                        text(action.label)
+                            .text_size(px(fit::body()))
+                            .text_color(colors::TEXT),
+                    ),
+                ),
+        );
+    }
+    view()
+        .p_2()
+        .gap_1()
+        .child(when(
+            move || touch,
+            || {
+                view().items_center().pb_1().child(
+                    view()
+                        .w(px(36.0))
+                        .h(px(4.0))
+                        .rounded(px(2.0))
+                        .bg(colors::BORDER)
+                        .accessibility_elements_hidden(true),
+                )
+            },
+        ))
+        .child(
+            text(title)
+                .role(AccessibilityRole::Header)
+                .px_2()
+                .py_1()
+                .text_size(px(fit::body()))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors::TEXT),
+        )
+        .child(list)
 }

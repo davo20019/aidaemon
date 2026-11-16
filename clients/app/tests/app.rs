@@ -515,18 +515,24 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     // Its "+" starts a conversation there: the header names the project.
     app.press("New conversation in this project >> nth=0")?;
     app.wait_for("Which project is this for?")?;
-    app.wait_for("Works in /home/synthetic/acme-site")?;
+    app.wait_for("/home/synthetic/acme-site")?;
     // The header's switch says what a new conversation is: Chat leaves
-    // the project and brings the question; Code asks which project, in
-    // one list, and names the chosen one's folder.
+    // the project and brings the question; Code shows the project on a
+    // card, the one this device last worked in.
     app.press("Chat")?;
     app.wait_for("What can I help with?")?;
     app.press("Code")?;
     app.wait_for("Which project is this for?")?;
-    // The project this device last worked in is chosen again.
-    app.wait_for("Works in /home/synthetic/acme-site")?;
-    // Its "+" opens the form for a new project.
-    app.press("Make a new project")?;
+    app.wait_for("/home/synthetic/acme-site")?;
+    // The card opens the projects with New project last; a press picks
+    // one, and the card names it.
+    app.press("Project: Acme site, change")?;
+    app.wait_for("New project")?;
+    app.press("Design notes >> nth=0")?;
+    app.wait_for("Project: Design notes, change")?;
+    // New project opens the form for one.
+    app.press("Project: Design notes, change")?;
+    app.press("New project >> nth=1")?;
     app.wait_for("Project name")?;
     // A new conversation from the keyboard, in a project's conversation,
     // stays in that project.
