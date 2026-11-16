@@ -10,7 +10,7 @@ use nsh_core::prelude::*;
 
 use super::approvals;
 use crate::store::{ActivityMode, DraftFileState, Felt, Store};
-use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type_scale, working};
+use crate::ui::{self, Glyph, Size, Variant, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -974,22 +974,21 @@ fn activity(
     view()
         .gap_1()
         .child(ui::disclosure(summary, open).accessibility_label("Tools this reply used"))
-        .child(when(
-            move || open.get(),
-            move || {
-                let data = data.clone();
-                view().pl(px(4.0)).gap(px(2.0)).child(dynamic(move || {
-                    let (tools, _, calls) = data();
-                    Some(untracked(move || {
-                        let mut list = view().gap(px(2.0));
-                        for (n, tool) in tools.iter().enumerate() {
-                            list = list.child(tool_call(n + 1, tool, call_of(&calls, n, tool)));
-                        }
-                        list
-                    }))
-                }))
-            },
-        ))
+        .child(when(move || open.get(), move || tool_list(data.clone())))
+}
+
+/// Every tool of a turn, in order, each opening to what it did.
+fn tool_list(data: impl Fn() -> (Vec<String>, u64, Vec<ToolCallInfo>) + 'static) -> View {
+    view().pl(px(4.0)).gap(px(2.0)).child(dynamic(move || {
+        let (tools, _, calls) = data();
+        Some(untracked(move || {
+            let mut list = view().gap(px(2.0));
+            for (n, tool) in tools.iter().enumerate() {
+                list = list.child(tool_call(n + 1, tool, call_of(&calls, n, tool)));
+            }
+            list
+        }))
+    }))
 }
 
 /// The details recorded for the `n`th tool, when they are its and say
@@ -1259,7 +1258,6 @@ fn markdown(
 
 /// The turn running now: its streamed text and what it is doing.
 fn live(store: Store, session: String) -> View {
-    let (stop, stopping) = (session.clone(), session.clone());
     let streamed = {
         let session = session.clone();
         computed(move || store.live(&session).map(|l| l.streamed).unwrap_or_default())
@@ -1267,6 +1265,9 @@ fn live(store: Store, session: String) -> View {
     let status = computed({
         let session = session.clone();
         move || {
+            if store.is_stopping(&session) {
+                return "Stopping…".to_string();
+            }
             // Waiting on its owner is the news, not the last tool it ran.
             let waiting = store.approvals_for(&session).len();
             if waiting > 0 {
@@ -1282,8 +1283,8 @@ fn live(store: Store, session: String) -> View {
                 .unwrap_or_else(|| "Working…".into())
         }
     });
-    // The tools so far, a line that opens to each in place (what the
-    // reply keeps once done): the steps without leaving the chat.
+    // The tools so far: a count at the row's end that opens to each, in
+    // place (what the reply keeps once done).
     let so_far = {
         let session = session.clone();
         move || {
@@ -1293,46 +1294,49 @@ fn live(store: Store, session: String) -> View {
                 .unwrap_or_default()
         }
     };
-    let has_tools = {
+    let count = {
         let so_far = so_far.clone();
-        computed(move || !so_far().0.is_empty())
+        computed(move || so_far().0.len())
     };
+    let open = signal(untracked(|| store.activity_mode()) == ActivityMode::Expanded);
     view()
         .gap_2()
-        .child(when(has_tools, move || {
-            activity(store, so_far.clone(), true)
-        }))
         .child(when(
             move || streamed.with(|s| !s.is_empty()),
             move || markdown(move || streamed.get().into(), || true),
         ))
-        // What it is doing, and Stop beside it: where the eye already is.
-        // Once asked, Stop says so until the turn ends.
+        // One row under the reply so far: that it is alive and what it is
+        // doing, then how many tools. Stop is the composer's button.
         .child(
-            // The line, then a quiet Stop at its end.
             view()
                 .flex_row()
                 .items_center()
-                .gap_3()
+                .gap_2()
+                .min_h(px(ui::fit::row() - 8.0))
                 .child(
                     view()
                         .flex_1()
                         .min_w(px(0.0))
                         .child(working(move || status.get())),
                 )
-                .child(
-                    when(
-                        move || store.is_stopping(&stopping),
-                        || ui::status("Stopping…", ui::Tone::Warning),
-                    )
-                    .otherwise(move || {
-                        let stop = stop.clone();
-                        btn_icon(Glyph::Stop, "Stop", Variant::Ghost, Size::Sm, move || {
-                            store.stop(&stop)
-                        })
-                    }),
-                ),
+                .child(when(
+                    move || count.get() > 0,
+                    move || {
+                        ui::count_toggle(
+                            move || match count.get() {
+                                1 => "1 tool".to_owned(),
+                                n => format!("{n} tools"),
+                            },
+                            open,
+                        )
+                        .accessibility_label("Tools so far")
+                    },
+                )),
         )
+        .child(when(
+            move || open.get() && count.get() > 0,
+            move || tool_list(so_far.clone()),
+        ))
 }
 
 fn composer(store: Store, session: Option<String>) -> View {
@@ -1610,17 +1614,14 @@ fn composer(store: Store, session: Option<String>) -> View {
                         ))
                         .child(
                             text(move || match (running.get(), touch) {
-                                (true, true) if store.enter_queues() => {
-                                    "Working · Send sends after · Now tells it now".to_owned()
-                                }
-                                (true, true) => {
-                                    "Working · Send tells it now · Queue sends after".to_owned()
-                                }
+                                // A phone's buttons say it: Stop while the
+                                // box is empty; Send and Queue once typed.
+                                (true, true) => String::new(),
                                 (true, false) => {
                                     let (enter, other) = if store.enter_queues() {
-                                        ("sends after", "tells it now")
+                                        ("after", "now")
                                     } else {
-                                        ("tells it now", "sends after")
+                                        ("now", "after")
                                     };
                                     let stops = if terminal {
                                         format!("Esc or {} stops", key_label("mod+c"))
@@ -1628,7 +1629,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                         "Esc stops".to_owned()
                                     };
                                     format!(
-                                        "Working · Enter {enter} · {} {other} · {stops}",
+                                        "Enter sends {enter} · {} {other} · {stops}",
                                         key_label("mod+enter")
                                     )
                                 }
@@ -1652,7 +1653,8 @@ fn composer(store: Store, session: Option<String>) -> View {
                             .text_color(colors::FAINT),
                         )
                         .child(when(
-                            move || running.get(),
+                            // Once there is something to send.
+                            move || running.get() && can_send(),
                             move || {
                                 // The other way: Queue, or Now when Enter queues.
                                 view().child(dynamic(move || {
@@ -1672,42 +1674,84 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 }))
                             },
                         ))
+                        // While it works and the box is empty, the round
+                        // button stops it (where Send was: where the thumb
+                        // is); typing turns it back into Send.
                         .child(
-                            {
-                                let send = move || {
-                                    // A phone answers the press (nothing elsewhere).
-                                    haptic(nsh_core::Haptic::Impact(nsh_core::HapticImpact::Light));
-                                    if running.get_untracked() {
-                                        store.submit_placed(Some(enter_placement(store)));
-                                    } else {
-                                        store.submit();
+                            when(
+                                {
+                                    let session = session.clone();
+                                    move || {
+                                        running.get()
+                                            && !can_send()
+                                            && session
+                                                .as_deref()
+                                                .is_some_and(|id| !store.is_stopping(id))
                                     }
-                                };
-                                // The arrow alone says Send; a terminal's
-                                // glyph needs the word.
-                                if terminal {
-                                    ui::btn_icon(
-                                        Glyph::Send,
-                                        "Send",
-                                        Variant::Primary,
-                                        ui::Size::Sm,
-                                        send,
-                                    )
-                                } else {
-                                    ui::icon_btn_primary(Glyph::Send, "Send", send)
-                                }
-                            }
-                            .disabled(move || !can_send())
-                            .accessibility_label(move || {
-                                Some(SharedString::from(
-                                    if running.get() && store.enter_queues() {
-                                        "Send after the running work"
-                                    } else if running.get() {
-                                        "Send now: the running work reads it"
+                                },
+                                {
+                                    let session = session.clone();
+                                    move || {
+                                        let id = session.clone().unwrap_or_default();
+                                        let stop = move || {
+                                            haptic(nsh_core::Haptic::Impact(
+                                                nsh_core::HapticImpact::Light,
+                                            ));
+                                            store.stop(&id)
+                                        };
+                                        if terminal {
+                                            ui::btn_icon(
+                                                Glyph::Stop,
+                                                "Stop",
+                                                Variant::Primary,
+                                                ui::Size::Sm,
+                                                stop,
+                                            )
+                                        } else {
+                                            ui::icon_btn_primary(Glyph::Stop, "Stop", stop)
+                                        }
+                                    }
+                                },
+                            )
+                            .otherwise(move || {
+                                {
+                                    let send = move || {
+                                        // A phone answers the press (nothing elsewhere).
+                                        haptic(nsh_core::Haptic::Impact(
+                                            nsh_core::HapticImpact::Light,
+                                        ));
+                                        if running.get_untracked() {
+                                            store.submit_placed(Some(enter_placement(store)));
+                                        } else {
+                                            store.submit();
+                                        }
+                                    };
+                                    // The arrow alone says Send; a terminal's
+                                    // glyph needs the word.
+                                    if terminal {
+                                        ui::btn_icon(
+                                            Glyph::Send,
+                                            "Send",
+                                            Variant::Primary,
+                                            ui::Size::Sm,
+                                            send,
+                                        )
                                     } else {
-                                        "Send"
-                                    },
-                                ))
+                                        ui::icon_btn_primary(Glyph::Send, "Send", send)
+                                    }
+                                }
+                                .disabled(move || !can_send())
+                                .accessibility_label(move || {
+                                    Some(SharedString::from(
+                                        if running.get() && store.enter_queues() {
+                                            "Send after the running work"
+                                        } else if running.get() {
+                                            "Send now: the running work reads it"
+                                        } else {
+                                            "Send"
+                                        },
+                                    ))
+                                })
                             }),
                         ),
                 ),

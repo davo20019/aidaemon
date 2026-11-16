@@ -126,7 +126,8 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
         ),
     ]);
     app.wait_for("Why does it fail on CI?")?;
-    app.wait_for("1 tool so far: terminal")?;
+    app.wait_for("label:Tools so far")?;
+    app.wait_for("1 tool")?;
     app.wait_for("git push origin fix-port")?;
     app.wait_for("Allow once")?;
     // The conversation waits on its owner: it leads the list.
@@ -355,7 +356,7 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
 }
 
 #[test]
-fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), String> {
+fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     feed([
@@ -365,7 +366,15 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
         ),
     ]);
     app.wait_for("Connect a model")?;
-    app.wait_for("ChatGPT sign-in on this computer · uses your plan · has limits")?;
+    // The model found here is one click; the rest wait.
+    app.wait_for("Continue with OpenAI (ChatGPT subscription) · gpt-synthetic")?;
+    app.wait_for(
+        "ChatGPT sign-in on this computer · uses your plan · has limits. It answered a test just now.",
+    )?;
+    if app.shows("pay per token") {
+        return Err("every provider shows before Use something else".into());
+    }
+    app.press("Use something else")?;
     app.wait_for("pay per token")?;
     // A key provider opens its form.
     app.press("Use a key")?;
@@ -378,7 +387,8 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
     // The usual model is chosen in the picker.
     app.wait_for("synthetic/model-1")?;
     app.wait_for("Test and connect")?;
-    // The daemon starts with the model, then asks about a chat.
+    // The daemon starts with the model; the chat step waits for Settings,
+    // so the first conversation opens next.
     feed([frame(
         r#"{"type":"event","at_ms":1,"event":{"type":"setup_updated","setup":{"step":"starting","model":"OpenRouter · synthetic/model-1"}}}"#,
     )]);
@@ -386,15 +396,25 @@ fn first_run_connects_a_model_then_offers_a_chat_and_greets() -> Result<(), Stri
         "OpenRouter · synthetic/model-1 answered its test. AIdaemon is starting with it…",
     )?;
     feed([frame(
-        r#"{"type":"event","at_ms":2,"event":{"type":"setup_updated","setup":{"step":"channel","model":"OpenRouter · synthetic/model-1","channels":[{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}],"channel":{"platform":"telegram","bot":"@synthetic_bot"}}}}"#,
+        r#"{"type":"event","at_ms":2,"event":{"type":"setup_updated","setup":{"step":"channel","model":"OpenRouter · synthetic/model-1","channels":[{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}]}}}"#,
     )]);
-    app.wait_for("Reach it from your phone")?;
-    app.wait_for("Waiting for your first message")?;
-    feed([frame(
-        r#"{"type":"event","at_ms":3,"event":{"type":"setup_updated","setup":{"step":"channel","channel":{"platform":"telegram","bot":"@synthetic_bot","connected":true}}}}"#,
-    )]);
-    app.wait_for("Connected: your agent answered you as @synthetic_bot.")?;
-    app.press("Continue")?;
+    app.wait_for("Opening your first conversation")?;
+    if app.shows("Reach it from your phone") {
+        return Err("first run asks for a bot token".into());
+    }
+    let mut skipped = false;
+    for _ in 0..100 {
+        skipped = nsh_app_aidaemon::setup_sent()
+            .iter()
+            .any(|step| step.contains("skip_channel"));
+        if skipped {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !skipped {
+        return Err("the chat step was not skipped".into());
+    }
     // Done: the greeting's conversation opens, with prompts to press.
     feed([
         frame(
@@ -429,8 +449,11 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     // line over it. The turn is also a running task: Stop alone stops it,
     // no Cancel beside it.
     app.wait_for("text:terminal: find . -name '*.rs'...")?;
-    app.wait_for("2 tools so far: read_file, terminal")?;
-    app.wait_for("Stop")?;
+    // The count of tools ends the line and opens them in place.
+    app.press("label:Tools so far")?;
+    app.wait_for("read_file")?;
+    // Stop is the composer's round button while it is empty.
+    app.wait_for("label:Stop")?;
     assert!(app.press("Cancel").is_err());
     Ok(())
 }

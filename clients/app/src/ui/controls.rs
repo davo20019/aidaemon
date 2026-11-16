@@ -1150,6 +1150,46 @@ pub fn working(label: impl IntoReactive<SharedString>) -> View {
         )
 }
 
+/// A quiet count at a row's end that opens and closes what is under it
+/// ("12 tools ›", the chevron turning down when open): no border, so it
+/// reads as part of the line it ends.
+pub fn count_toggle(
+    label: impl IntoReactive<SharedString>,
+    open: Signal<bool>,
+) -> nsh_base::ButtonElement {
+    button()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .min_h(px(fit::row() - 8.0))
+        .px_2()
+        .rounded(px(radius::CONTROL))
+        .transition_colors()
+        .duration(motion::FAST)
+        .hover(|s| s.bg(colors::HOVER))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .focus(focus_band)
+        .child(
+            text(label)
+                .number_of_lines(1)
+                .tabular_nums()
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+        )
+        .child(
+            icon(Glyph::Chevron)
+                .text_color(colors::FAINT)
+                .rotate(move || deg(if open.get() { 90.0 } else { 0.0 }))
+                .transition_transform()
+                .duration(motion::FAST)
+                .accessibility_elements_hidden(true),
+        )
+        .on_press(move || {
+            motion::next_unfold();
+            open.update(|o| *o = !*o)
+        })
+}
+
 /// A quiet pill that opens and closes what is under it: a chevron that
 /// turns, then its label. The owner of `open` renders the content.
 pub fn disclosure(
