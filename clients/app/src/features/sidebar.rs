@@ -897,6 +897,7 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
     let (f, g, h) = (id.clone(), id.clone(), id.clone());
     let label_id = id.clone();
     let date_id = id.clone();
+    let src_id = id.clone();
     row(
         move || store.selected().as_deref() == Some(a.as_str()),
         move || store.select(Some(b.clone())),
@@ -947,8 +948,10 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             .text_size(px(type_scale::XS))
             .text_color(colors::FAINT),
     )
-    // One faint word where it adds something: its project (outside that
-    // project's page), or the chat it came from when not the app.
+    // One faint mark where it adds something: its project's name (outside
+    // that project's page), or the chat it came from when not the app:
+    // Telegram, Discord and Slack by their icons (a group adds people),
+    // any other by name.
     .child(
         text(move || {
             if let Some(project) = store.session_project(&g).and_then(|p| store.project(&p)) {
@@ -957,13 +960,37 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
                     _ => project.name,
                 };
             }
-            store.source_tag(&id)
+            match source_glyph(store.source(&id)) {
+                Some(_) => String::new(),
+                None => store.source_tag(&id),
+            }
         })
         .max_w(percentage(0.4))
         .number_of_lines(1)
         .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
         .text_color(colors::FAINT),
     )
+    .child(dynamic(move || {
+        let in_project = store
+            .session_project(&src_id)
+            .and_then(|p| store.project(&p))
+            .is_some();
+        let glyph = source_glyph(store.source(&src_id)).filter(|_| !in_project)?;
+        let group = store.is_group(&src_id);
+        let said = store.source_tag(&src_id);
+        Some(untracked(move || {
+            let mut marks = view()
+                .flex_row()
+                .items_center()
+                .role(AccessibilityRole::Image)
+                .label(said)
+                .child(icon(glyph).text_color(colors::FAINT));
+            if group {
+                marks = marks.child(icon(Glyph::Group).text_color(colors::FAINT));
+            }
+            marks
+        }))
+    }))
     // At the end, what it is doing: waiting on the owner ("Needs you",
     // amber), working (a turning ring), else when it last moved ("3h",
     // "Oct 30") where the list shows times.
@@ -993,6 +1020,17 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             })),
         }))
     }))
+}
+
+/// The icon of a chat platform a conversation came from; none for the app
+/// or a platform without one.
+fn source_glyph(source: Source) -> Option<Glyph> {
+    match source {
+        Source::Telegram => Some(Glyph::Telegram),
+        Source::Discord => Some(Glyph::Discord),
+        Source::Slack => Some(Glyph::Slack),
+        _ => None,
+    }
 }
 
 /// What a conversation's row says at its end.
