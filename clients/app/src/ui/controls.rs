@@ -1023,12 +1023,11 @@ pub fn status_dot(
             .w(px(Size::Sm.height()))
             .accessibility_label(move || SharedString::from(label()))
             .on_press(on_press)
+            // The footer's own dot ([`status`]), so the two match.
             .child(
-                view()
-                    .w(px(8.0))
-                    .h(px(8.0))
-                    .rounded_full()
-                    .bg(move || tone().color())
+                text(Glyph::Dot.symbol())
+                    .text_size(px(8.0))
+                    .text_color(move || tone().color())
                     .accessibility_elements_hidden(true),
             ),
     )
