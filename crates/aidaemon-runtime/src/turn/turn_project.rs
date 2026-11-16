@@ -43,6 +43,24 @@ pub async fn resolve_turn_project(
     project_for_folder(&all, Path::new(folder)).and_then(project_ref)
 }
 
+/// Where conversations are placed, as memory recall asks
+/// ([`aidaemon_memory::project::SessionProjects`]).
+pub struct PlacedSessions<S: ?Sized>(pub std::sync::Arc<S>);
+
+#[async_trait::async_trait]
+impl<S> aidaemon_memory::project::SessionProjects for PlacedSessions<S>
+where
+    S: WorkCoordinationStore + ?Sized + 'static,
+{
+    async fn project_of(&self, session_id: &str) -> Option<String> {
+        self.0
+            .get_session_work_project(session_id)
+            .await
+            .ok()
+            .filter(|id| id != DEFAULT_PROJECT_ID)
+    }
+}
+
 fn project_ref(project: &WorkProject) -> Option<ProjectRef> {
     let root = project
         .path

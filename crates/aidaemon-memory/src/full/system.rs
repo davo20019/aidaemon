@@ -478,6 +478,95 @@ mod tests {
         assert!(facts.iter().all(|f| f.key != "db"), "{facts:?}");
     }
 
+    /// With conversations placed in projects, an episode is recalled only on
+    /// turns in its conversation's project: one project's history stays out
+    /// of other projects and of plain chats, and plain chats keep theirs.
+    /// Without placement every episode is recalled, as before.
+    #[tokio::test]
+    async fn episodes_are_recalled_only_in_their_conversations_project() {
+        struct Placed;
+        #[async_trait]
+        impl crate::project::SessionProjects for Placed {
+            async fn project_of(&self, session_id: &str) -> Option<String> {
+                match session_id {
+                    "app:in-a" => Some("project-a".into()),
+                    "app:in-b" => Some("project-b".into()),
+                    _ => None,
+                }
+            }
+        }
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::sqlite::migrate(&pool).await.unwrap();
+        let store = SqliteMemory::new(pool, Arc::new(crate::HashEmbedder::new(384)));
+        for (session, summary) in [
+            ("app:in-a", "Alpha history: deployed the Acme site."),
+            ("app:in-b", "Beta history: tuned the ledger tests."),
+            (
+                "app:plain",
+                "Gamma history: planned a birthday dinner for Mia.",
+            ),
+        ] {
+            let now = chrono::Utc::now();
+            crate::stores::EpisodeStore::record_session_episode(
+                &store,
+                &crate::episodes::SessionEpisode {
+                    session_id: session.into(),
+                    summary: summary.into(),
+                    topics: vec![],
+                    emotional_tone: "neutral".into(),
+                    outcome: "done".into(),
+                    importance: 0.5,
+                    message_count: 4,
+                    start_time: now,
+                    end_time: now,
+                    channel_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let store: Arc<dyn MemoryStores> = Arc::new(store);
+        let settings = RecallSettings {
+            max_facts: 10,
+            assistant_name: None,
+        };
+        let render = |source: Arc<RecallSource>, project: Option<&'static str>| async move {
+            let turn = MemoryTurn {
+                project: project.map(|id| aidaemon_core::ProjectRef::new(id, id, None).unwrap()),
+                ..MemoryTurn::owner("test:synthetic-user")
+            };
+            FullRecall::new(source, Arc::new(NoHost), plain_turn(&turn))
+                .render_block("history")
+                .await
+        };
+
+        let found = store.get_relevant_episodes("history", 12).await.unwrap();
+        assert_eq!(found.len(), 3, "{found:?}");
+        let unplaced = Arc::new(RecallSource::new(store.clone(), settings.clone()));
+        let all = render(unplaced, None).await;
+        assert!(
+            ["Alpha", "Beta", "Gamma"]
+                .iter()
+                .any(|history| all.contains(history)),
+            "{all}"
+        );
+
+        let placed =
+            Arc::new(RecallSource::new(store, settings).with_session_projects(Arc::new(Placed)));
+        let in_a = render(placed.clone(), Some("project-a")).await;
+        assert!(in_a.contains("Alpha"), "{in_a}");
+        assert!(!in_a.contains("Beta") && !in_a.contains("Gamma"), "{in_a}");
+        let in_b = render(placed.clone(), Some("project-b")).await;
+        assert!(in_b.contains("Beta"), "{in_b}");
+        assert!(!in_b.contains("Alpha") && !in_b.contains("Gamma"), "{in_b}");
+        let plain = render(placed, None).await;
+        assert!(plain.contains("Gamma"), "{plain}");
+        assert!(
+            !plain.contains("Alpha") && !plain.contains("Beta"),
+            "{plain}"
+        );
+    }
+
     /// A recall started early renders the same block the model call would
     /// have rendered itself, and the first render takes it.
     /// Counts the decision points recorded through it.

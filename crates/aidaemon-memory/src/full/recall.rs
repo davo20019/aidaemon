@@ -127,7 +127,17 @@ pub struct RecallSource {
     core_profile_ids: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
     /// Project memory, shown on a turn that works in a project.
     project_notes: Option<Arc<crate::project::ProjectNotes>>,
+    /// Where conversations are placed: an episode is recalled only on turns
+    /// in the same project as its conversation (or, for a conversation in
+    /// no project, on turns in none). `None`: every episode, as before.
+    session_projects: Option<Arc<dyn crate::project::SessionProjects>>,
 }
+
+/// Episodes shown per turn.
+const EPISODES_SHOWN: usize = 3;
+/// Episodes read when they are filtered by project, so the filter still
+/// leaves some to show.
+const EPISODES_READ_FOR_PROJECT: usize = 12;
 
 impl RecallSource {
     pub fn new(store: Arc<dyn MemoryStores>, settings: RecallSettings) -> Self {
@@ -136,7 +146,58 @@ impl RecallSource {
             settings,
             core_profile_ids: tokio::sync::RwLock::new(HashMap::new()),
             project_notes: None,
+            session_projects: None,
         }
+    }
+
+    /// Recall an episode only on turns in its conversation's project.
+    pub fn with_session_projects(
+        mut self,
+        projects: Arc<dyn crate::project::SessionProjects>,
+    ) -> Self {
+        self.session_projects = Some(projects);
+        self
+    }
+
+    /// How many episodes to read for a turn.
+    fn episodes_to_read(&self) -> usize {
+        if self.session_projects.is_some() {
+            EPISODES_READ_FOR_PROJECT
+        } else {
+            EPISODES_SHOWN
+        }
+    }
+
+    /// The first [`EPISODES_SHOWN`] of `episodes` whose conversation is in
+    /// the turn's project (both in none counts).
+    async fn episodes_in_turn_project(
+        &self,
+        turn: &RecallTurn,
+        episodes: Vec<crate::records::Episode>,
+    ) -> Vec<crate::records::Episode> {
+        let Some(projects) = &self.session_projects else {
+            return episodes.into_iter().take(EPISODES_SHOWN).collect();
+        };
+        let want = turn.project.as_ref().map(|project| project.id.as_str());
+        let mut placed: HashMap<String, Option<String>> = HashMap::new();
+        let mut kept = Vec::new();
+        for episode in episodes {
+            if kept.len() >= EPISODES_SHOWN {
+                break;
+            }
+            let project = match placed.get(&episode.session_id) {
+                Some(project) => project.clone(),
+                None => {
+                    let project = projects.project_of(&episode.session_id).await;
+                    placed.insert(episode.session_id.clone(), project.clone());
+                    project
+                }
+            };
+            if project.as_deref() == want {
+                kept.push(episode);
+            }
+        }
+        kept
     }
 
     /// Show `notes` on turns that work in a project.
@@ -526,22 +587,25 @@ impl FullRecall {
                 Default::default()
             }
         };
-        // Episodes: channel-scoped for non-DM channels.
+        // Episodes: channel-scoped for non-DM channels, and kept to the
+        // turn's project when conversations are placed in projects.
         let episodes = async {
-            if !allowed {
+            let read = self.source.episodes_to_read();
+            let episodes = if !allowed {
                 vec![]
             } else if inject_personal {
-                or_logged(store.get_relevant_episodes(query, 3).await, "episodes")
+                or_logged(store.get_relevant_episodes(query, read).await, "episodes")
             } else if public_external {
                 vec![]
             } else {
                 or_logged(
                     store
-                        .get_relevant_episodes_for_channel(query, 3, turn.channel_id.as_deref())
+                        .get_relevant_episodes_for_channel(query, read, turn.channel_id.as_deref())
                         .await,
                     "episodes",
                 )
-            }
+            };
+            self.source.episodes_in_turn_project(turn, episodes).await
         };
         // Personal goals/profile remain DM-only. Operational failure patterns
         // are safe more broadly: they encode agent-side recovery guidance, not

@@ -778,6 +778,15 @@ impl ProjectNotesRecall {
     }
 }
 
+/// Which project a conversation is placed in. Recall uses it to keep one
+/// project's conversation history (its episodes) to that project's turns,
+/// and out of other projects' and personal recall.
+#[async_trait::async_trait]
+pub trait SessionProjects: Send + Sync {
+    /// The project `session_id` is placed in; `None` when it is in none.
+    async fn project_of(&self, session_id: &str) -> Option<String>;
+}
+
 #[async_trait::async_trait]
 impl aidaemon_policies::Recall for ProjectNotesRecall {
     async fn recall(&self, _session_id: &str, _query: &str, _limit: usize) -> Vec<String> {

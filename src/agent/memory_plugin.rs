@@ -230,7 +230,11 @@ impl DaemonMemory {
             },
         );
         if let Some(notes) = &project_notes {
-            recall = recall.with_project_notes(notes.clone());
+            recall = recall
+                .with_project_notes(notes.clone())
+                .with_session_projects(Arc::new(
+                    aidaemon_runtime::turn::turn_project::PlacedSessions(state.clone()),
+                ));
         }
         let recall = Arc::new(recall);
         let inner = Arc::new(DaemonMemoryInner {
