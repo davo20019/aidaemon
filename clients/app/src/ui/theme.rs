@@ -204,6 +204,11 @@ pub mod fit {
     pub fn read_code() -> f32 {
         read() * 0.875
     }
+    /// Room inside inline code's background at each end, so the chip
+    /// does not stop at its first and last letter.
+    pub fn read_code_pad() -> f32 {
+        read() * 0.25
+    }
     /// A page's or an empty state's title: on a phone, clearly above the
     /// 16 pt reading text.
     pub fn title() -> f32 {
