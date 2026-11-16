@@ -51,6 +51,8 @@ extern "C" {
         max_dimension: u32,
     ) -> js_sys::Promise;
 
+    #[wasm_bindgen(js_name = pageVisible)]
+    fn page_visible() -> bool;
     #[wasm_bindgen(js_name = onWake)]
     fn on_wake(wake: &Closure<dyn FnMut()>);
 
@@ -242,6 +244,7 @@ pub fn start(store: Store) {
         let url = aidaemon_client_core::machine::socket_url(&base);
         let mut grant = GrantCache::default();
         loop {
+            machine.set_seen(page_visible());
             store.update(Update::Connecting);
             let token = match grant_token(&mut grant, &base, &device).await {
                 Ok(token) => token,
@@ -298,6 +301,7 @@ pub fn start(store: Store) {
                         None
                     }
                     _ = futures::FutureExt::fuse(&mut tick) => {
+                        machine.set_seen(page_visible());
                         match machine.tick(now()) {
                             Tick::Ping(frame) => send(&frame),
                             Tick::Dead(d) => break d,

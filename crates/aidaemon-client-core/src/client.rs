@@ -41,7 +41,65 @@ pub enum Connection {
         reason: String,
         /// When the link tries again, in ms since the epoch.
         retry_at_ms: u64,
+        /// When a working connection was lost, through every failed try
+        /// since; `None` when it never came up.
+        since_ms: Option<u64>,
     },
+}
+
+/// A drop this short is not news: a daemon restart or a phone waking a
+/// page is back by then.
+pub const QUIET_DROP_MS: u64 = 5_000;
+/// After this long, a drop is an outage worth alarm.
+pub const LONG_DROP_MS: u64 = 30_000;
+
+/// The connection as the owner should feel it at a moment: a short drop
+/// reads as still connected, a longer one as reconnecting, and only a
+/// long one (or a refusal) as down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Felt {
+    Online,
+    Connecting,
+    NeedsPairing,
+    NoDaemon,
+    Reconnecting,
+    Down { kind: DropKind, reason: String },
+}
+
+impl Connection {
+    /// How this reads at `now_ms`.
+    pub fn felt(&self, now_ms: u64) -> Felt {
+        match self {
+            Connection::Online => Felt::Online,
+            Connection::Connecting => Felt::Connecting,
+            Connection::NeedsPairing => Felt::NeedsPairing,
+            Connection::NoDaemon => Felt::NoDaemon,
+            Connection::Offline {
+                kind,
+                reason,
+                since_ms,
+                ..
+            } => {
+                let down_for = since_ms.map_or(u64::MAX, |since| now_ms.saturating_sub(since));
+                let refused = matches!(kind, DropKind::Unauthorized | DropKind::VersionUnsupported);
+                if refused || down_for >= LONG_DROP_MS {
+                    Felt::Down {
+                        kind: *kind,
+                        reason: reason.clone(),
+                    }
+                } else if down_for >= QUIET_DROP_MS {
+                    Felt::Reconnecting
+                } else {
+                    Felt::Online
+                }
+            }
+        }
+    }
+
+    /// Whether the connection is down, however briefly.
+    pub fn is_offline(&self) -> bool {
+        matches!(self, Connection::Offline { .. })
+    }
 }
 
 /// Something read from the daemon, as last asked.
@@ -405,10 +463,18 @@ impl Client {
                 // Changes in flight get no answer now.
                 self.settings_changes.clear();
                 let retry = u64::try_from(disconnect.retry_in.as_millis()).unwrap_or(0);
+                // Only a connection that worked drops quietly: one that
+                // never came up is news at once.
+                let since_ms = match self.connection {
+                    Connection::Offline { since_ms, .. } => since_ms,
+                    Connection::Online => Some(cx.now_ms),
+                    _ => None,
+                };
                 self.connection = Connection::Offline {
                     kind: disconnect.kind,
                     reason: disconnect.reason,
                     retry_at_ms: cx.now_ms.saturating_add(retry),
+                    since_ms,
                 };
                 Vec::new()
             }
@@ -2559,6 +2625,60 @@ mod tests {
         assert_eq!(
             client.model_of(Some("app:a")),
             (ModelChoice::Auto, Effort::Auto)
+        );
+    }
+
+    #[test]
+    fn a_short_drop_is_felt_as_connected_and_a_long_one_as_down() {
+        let down = |since: u64| Connection::Offline {
+            kind: DropKind::Dropped,
+            reason: "lost".into(),
+            retry_at_ms: 0,
+            since_ms: Some(since),
+        };
+        assert_eq!(down(1_000).felt(1_000 + QUIET_DROP_MS - 1), Felt::Online);
+        assert_eq!(down(1_000).felt(1_000 + QUIET_DROP_MS), Felt::Reconnecting);
+        assert!(matches!(
+            down(1_000).felt(1_000 + LONG_DROP_MS),
+            Felt::Down { .. }
+        ));
+        let refused = Connection::Offline {
+            kind: DropKind::Unauthorized,
+            reason: "revoked".into(),
+            retry_at_ms: 0,
+            since_ms: None,
+        };
+        assert!(
+            matches!(refused.felt(1), Felt::Down { .. }),
+            "a refusal is news at once"
+        );
+
+        let lost = || {
+            Update::Disconnected(crate::machine::Disconnect {
+                kind: DropKind::DaemonNotRunning,
+                reason: "refused".into(),
+                retry_in: std::time::Duration::from_millis(10),
+            })
+        };
+        let mut client = Client::new();
+        client.update(lost(), &cx(None));
+        assert!(
+            matches!(client.connection.felt(1_000), Felt::Down { .. }),
+            "a daemon that never answered is news at once"
+        );
+        client.update(Update::Connected, &cx(None));
+        client.update(lost(), &cx(None));
+        client.update(Update::Connecting, &cx(None));
+        client.update(lost(), &cx(None));
+        assert_eq!(
+            client.connection.felt(1_000),
+            Felt::Online,
+            "a fresh drop is quiet"
+        );
+        assert_eq!(
+            client.connection.felt(1_000 + QUIET_DROP_MS),
+            Felt::Reconnecting,
+            "counted from the first failure, through every retry"
         );
     }
 }

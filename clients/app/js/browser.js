@@ -94,6 +94,11 @@ export function forgetPairingLink() {
  * Call `wake` when the page is shown again or the network comes back: a
  * phone freezes a background page, and its socket may have died meanwhile.
  */
+/** Whether the owner can see this page now. */
+export function pageVisible() {
+  return document.visibilityState === "visible";
+}
+
 export function onWake(wake) {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") wake();

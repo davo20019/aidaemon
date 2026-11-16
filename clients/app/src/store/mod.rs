@@ -20,8 +20,8 @@ use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
 
 pub use aidaemon_client_core::client::{
-    Activity, ActivityKind, Bot, Connection, DraftFile, DraftFileState, Read, SearchRead, Source,
-    SystemRead, TurnLog, channel_name, platform_name, platform_of,
+    Activity, ActivityKind, Bot, Connection, DraftFile, DraftFileState, Felt, Read, SearchRead,
+    Source, SystemRead, TurnLog, channel_name, platform_name, platform_of,
 };
 
 /// The Automations page's list, as last read.
@@ -1413,14 +1413,17 @@ impl Store {
         self.toast.get()
     }
 
-    /// Read to rerun once a second while work runs.
+    /// Read to rerun once a second while work runs or the link is down.
     pub fn tick(&self) -> u64 {
         self.tick.get()
     }
 
     /// The shell's second hand.
     pub fn advance_tick(&self) {
-        if !self.client.with_untracked(|c| c.state.tasks.is_empty()) {
+        if self
+            .client
+            .with_untracked(|c| !c.state.tasks.is_empty() || c.connection.is_offline())
+        {
             self.tick.update(|t| *t += 1);
         }
     }
@@ -1564,6 +1567,16 @@ impl Store {
 
     pub fn connection(&self) -> Connection {
         self.reads.connection.get()
+    }
+
+    /// The connection as the owner should feel it now: a drop of a few
+    /// seconds reads as connected. Reruns each second while down.
+    pub fn felt(&self) -> aidaemon_client_core::Felt {
+        let connection = self.connection();
+        if connection.is_offline() {
+            self.tick();
+        }
+        connection.felt(now_ms())
     }
 
     /// The connection, read without subscribing (for the link's own loop).

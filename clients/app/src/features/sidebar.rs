@@ -9,7 +9,7 @@
 
 use nsh_core::prelude::*;
 
-use crate::store::{Connection, Page, SearchRead, SidebarView, Source, Store, now_ms};
+use crate::store::{Felt, Page, SearchRead, SidebarView, Source, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
@@ -110,7 +110,7 @@ pub fn sidebar(store: Store) -> View {
         .child(
             view()
                 .style_when(
-                    move || ui::touch() && store.connection() == Connection::Online,
+                    move || ui::touch() && store.felt() == Felt::Online,
                     |s| s.hidden(),
                 )
                 .child(ui::separator())
@@ -1292,13 +1292,15 @@ fn search_hits(store: Store) -> View {
 
 fn connection(store: Store) -> View {
     view().px_4().py_2().child(dynamic(move || {
-        let state = store.connection();
-        Some(untracked(move || match state {
-            Connection::Online => status("Connected to the daemon", Tone::Success),
-            Connection::Connecting => status("Connecting…", Tone::Accent),
-            Connection::NeedsPairing => status("Not paired yet", Tone::Warning),
-            Connection::NoDaemon => status("No daemon yet", Tone::Warning),
-            Connection::Offline { kind, reason, .. } => {
+        let felt = store.felt();
+        Some(untracked(move || match felt {
+            Felt::Online => status("Connected to the daemon", Tone::Success),
+            Felt::Connecting => status("Connecting…", Tone::Accent),
+            Felt::NeedsPairing => status("Not paired yet", Tone::Warning),
+            Felt::NoDaemon => status("No daemon yet", Tone::Warning),
+            // A few seconds in: not alarm yet, the next try is near.
+            Felt::Reconnecting => status("Reconnecting…", Tone::Accent),
+            Felt::Down { kind, reason } => {
                 let headline = match kind {
                     DropKind::DaemonNotRunning => "The daemon is not running",
                     DropKind::Unauthorized => "The daemon refused this app",
@@ -1307,8 +1309,6 @@ fn connection(store: Store) -> View {
                 };
                 // One row: the footer sits under the conversation list and
                 // must not eat its room on a phone.
-                // Not a countdown: this row is drawn once per state, and
-                // the next try comes sooner when the page wakes.
                 let detail = if kind == DropKind::Unauthorized {
                     reason
                 } else {

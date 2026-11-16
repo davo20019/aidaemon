@@ -827,15 +827,19 @@ async fn run_socket(
 
     let (replies_tx, mut replies) = mpsc::channel::<ServerFrame>(64);
     let mut last_heard = tokio::time::Instant::now();
+    let opened = tokio::time::Instant::now();
+    let who = format!("{:?}", client.kind).to_lowercase();
+    let device = client.device.clone().unwrap_or_default();
+    let ended = async {
     loop {
         let idle = tokio::time::sleep_until(last_heard + IDLE_LIMIT);
         tokio::select! {
             incoming = socket.recv() => {
-                let Some(Ok(message)) = incoming else { return Ok(()) };
+                let Some(Ok(message)) = incoming else { return Ok("the client went away") };
                 last_heard = tokio::time::Instant::now();
                 let text = match message {
                     Message::Text(text) => text,
-                    Message::Close(_) => return Ok(()),
+                    Message::Close(_) => return Ok("the client closed it"),
                     _ => continue,
                 };
                 match serde_json::from_str::<ClientFrame>(&text) {
@@ -898,11 +902,11 @@ async fn run_socket(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     sent = replay(&gateway, &mut socket, sent, caller.compact).await?;
                 }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                Err(broadcast::error::RecvError::Closed) => return Ok("the gateway stopped"),
             },
             _ = idle => {
                 let _ = socket.send(Message::Close(None)).await;
-                return Ok(());
+                return Ok("nothing heard for a minute");
             }
             _ = revoked.cancelled() => {
                 send(&mut socket, &ServerFrame::Error {
@@ -910,10 +914,26 @@ async fn run_socket(
                     error: ProtocolError::new(ErrorCode::Unauthorized, "This device was revoked"),
                 }).await?;
                 let _ = socket.send(Message::Close(None)).await;
-                return Ok(());
+                return Ok("the device was revoked");
             }
         }
     }
+    }
+    .await;
+    // Every close, with why and after how long: a client's "connection
+    // lost" is otherwise only guessable.
+    let why = match &ended {
+        Ok(why) => (*why).to_string(),
+        Err(error) => format!("sending failed: {error}"),
+    };
+    info!(
+        client = %who,
+        device = %device,
+        secs = opened.elapsed().as_secs(),
+        reason = %why,
+        "Client socket closed"
+    );
+    ended.map(|_| ())
 }
 
 /// Send every logged event after `sent`; returns the last `seq` sent.

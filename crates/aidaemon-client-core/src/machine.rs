@@ -26,6 +26,9 @@ pub const SILENT_LIMIT: Duration = Duration::from_secs(60);
 pub const RETRY_MIN: Duration = Duration::from_millis(500);
 /// The longest wait between tries.
 pub const RETRY_MAX: Duration = Duration::from_secs(10);
+/// The longest wait while the owner is looking at the app: a daemon
+/// restart should be over in a second or two, not ten.
+pub const RETRY_MAX_SEEN: Duration = Duration::from_secs(2);
 /// A socket quiet this long when the device wakes is asked whether it is
 /// still there.
 pub const WAKE_QUIET: Duration = Duration::from_secs(3);
@@ -106,6 +109,8 @@ pub struct LinkMachine {
     /// When the device woke and asked a quiet socket whether it is alive;
     /// cleared by anything heard.
     asked_ms: Option<u64>,
+    /// The owner is looking at the app (a browser page shown).
+    seen: bool,
     /// The wait before the next try.
     wait: Duration,
 }
@@ -127,6 +132,7 @@ impl LinkMachine {
             last_heard_ms: 0,
             last_ping_ms: 0,
             asked_ms: None,
+            seen: false,
             wait: RETRY_MIN,
         }
     }
@@ -220,8 +226,7 @@ impl LinkMachine {
             self.wait = RETRY_MIN;
             return None;
         }
-        if self.asked_ms.is_some()
-            || now_ms.saturating_sub(self.last_heard_ms) < millis(WAKE_QUIET)
+        if self.asked_ms.is_some() || now_ms.saturating_sub(self.last_heard_ms) < millis(WAKE_QUIET)
         {
             return None;
         }
@@ -295,8 +300,18 @@ impl LinkMachine {
         self.disconnect(kind, reason.into())
     }
 
+    /// Whether the owner is looking at the app now: while they are, a
+    /// retry waits at most [`RETRY_MAX_SEEN`].
+    pub fn set_seen(&mut self, seen: bool) {
+        self.seen = seen;
+    }
+
     fn disconnect(&mut self, kind: DropKind, reason: String) -> Disconnect {
-        let retry_in = self.wait;
+        let retry_in = if self.seen {
+            self.wait.min(RETRY_MAX_SEEN)
+        } else {
+            self.wait
+        };
         self.wait = (self.wait * 2).min(RETRY_MAX);
         Disconnect {
             kind,
@@ -448,6 +463,20 @@ mod tests {
             m.closed("lost").retry_in,
             RETRY_MIN,
             "a working connection resets the wait"
+        );
+    }
+
+    #[test]
+    fn a_seen_app_retries_within_two_seconds() {
+        let mut m = machine();
+        m.set_seen(true);
+        for _ in 0..8 {
+            assert!(m.failed(DropKind::DaemonNotRunning, "x").retry_in <= RETRY_MAX_SEEN);
+        }
+        m.set_seen(false);
+        assert_eq!(
+            m.failed(DropKind::DaemonNotRunning, "x").retry_in,
+            RETRY_MAX
         );
     }
 

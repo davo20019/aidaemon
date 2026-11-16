@@ -9,7 +9,7 @@ use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
 use super::approvals;
-use crate::store::{ActivityMode, Connection, DraftFileState, Store};
+use crate::store::{ActivityMode, DraftFileState, Felt, Store};
 use crate::ui::{self, Glyph, Size, Variant, btn_icon, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
@@ -1420,11 +1420,13 @@ fn composer(store: Store, session: Option<String>) -> View {
                         })
                         // A phone would raise its keyboard over the page.
                         .auto_focus(!touch)
-                        .placeholder(move || match store.connection() {
-                            Connection::Online if store.needs_project() => {
+                        // A drop of a few seconds is not news: the field
+                        // reads as usual, and what is sent goes on reconnect.
+                        .placeholder(move || match store.felt() {
+                            Felt::Online if store.needs_project() => {
                                 "Choose a project first".to_owned()
                             }
-                            Connection::Online => {
+                            Felt::Online => {
                                 // The field says what to write here.
                                 let files = store.draft_files();
                                 let ask = if files.iter().any(|f| f.marked_from.is_some()) {
@@ -1448,10 +1450,13 @@ fn composer(store: Store, session: Option<String>) -> View {
                                     format!("{ask} (/ for commands)")
                                 }
                             }
-                            Connection::Connecting
-                            | Connection::NeedsPairing
-                            | Connection::NoDaemon => "Connecting to the daemon…".to_owned(),
-                            Connection::Offline { .. } => {
+                            Felt::Connecting | Felt::NeedsPairing | Felt::NoDaemon => {
+                                "Connecting to the daemon…".to_owned()
+                            }
+                            Felt::Reconnecting => {
+                                "Reconnecting. Messages send once it is back.".to_owned()
+                            }
+                            Felt::Down { .. } => {
                                 "Offline. Messages send once the daemon is back.".to_owned()
                             }
                         })
