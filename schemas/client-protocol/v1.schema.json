@@ -561,6 +561,11 @@
           "const": "per_token",
           "description": "Billed per token by the provider.",
           "type": "string"
+        },
+        {
+          "const": "local",
+          "description": "Runs on the owner's own machine (Ollama): nothing is billed.",
+          "type": "string"
         }
       ]
     },

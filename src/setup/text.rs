@@ -35,6 +35,7 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
         for option in &state.providers {
             let billing = match option.billing {
                 aidaemon_client_protocol::Billing::Plan => "uses your plan, has limits",
+                aidaemon_client_protocol::Billing::Local => "runs on this machine, free",
                 _ => "pay per token",
             };
             items.push(format!("{} ({billing})", option.name));
@@ -99,11 +100,33 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
                     } else {
                         String::new()
                     };
-                    let key = Password::new()
-                        .with_prompt(format!("{} API key", option.name))
-                        .interact()?;
+                    // A server on this machine takes no key; the owner's
+                    // own endpoint may take none.
+                    let local = option.billing == aidaemon_client_protocol::Billing::Local;
+                    let key = if local {
+                        String::new()
+                    } else if option.needs_base_url {
+                        Password::new()
+                            .with_prompt(format!(
+                                "{} API key (empty if it needs none)",
+                                option.name
+                            ))
+                            .allow_empty_password(true)
+                            .interact()?
+                    } else {
+                        Password::new()
+                            .with_prompt(format!("{} API key", option.name))
+                            .interact()?
+                    };
                     // The account's own models, from the provider.
-                    println!("  Checking the key...");
+                    println!(
+                        "  {}",
+                        if local {
+                            "Looking for its models..."
+                        } else {
+                            "Checking the key..."
+                        }
+                    );
                     let checked = host
                         .step(
                             SetupAction::CheckKey {

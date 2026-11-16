@@ -25,14 +25,35 @@ use aidaemon_providers::catalog::{self, CatalogEntry};
 const CHATGPT: &str = "openai_chatgpt";
 
 /// What setup offers from the SDK's provider catalog: the hosted
-/// providers (the subscription sign-in first, as the catalog orders them),
-/// without the advanced routes (a Cloudflare gateway, Anthropic through
-/// OpenRouter) a Settings change still reaches. Local models are not
-/// offered.
+/// providers (the subscription sign-in first, as the catalog orders them)
+/// and a model server on this machine (Ollama), without the advanced
+/// routes (a Cloudflare gateway, Anthropic through OpenRouter) a Settings
+/// change still reaches.
 fn offered(entry: &CatalogEntry) -> bool {
-    entry.billing != catalog::Billing::Local
-        && !entry.gateway_token
-        && entry.id != "anthropic_openrouter"
+    !entry.gateway_token && entry.id != "anthropic_openrouter"
+}
+
+/// A provider that runs on the owner's machine and takes no key.
+fn local(entry: &CatalogEntry) -> bool {
+    entry.billing == catalog::Billing::Local
+}
+
+/// The key a custom endpoint is called with when the owner gave none: a
+/// self-hosted server (llama.cpp, LM Studio, vLLM) ignores it.
+const NO_KEY: &str = "none";
+
+/// Whether `entry` may be connected with no key: the owner's own endpoint.
+fn key_optional(entry: &CatalogEntry) -> bool {
+    entry.custom_base_url && !entry.gateway_token
+}
+
+/// A local provider's name without its "(local)".
+fn local_name(entry: &CatalogEntry) -> &'static str {
+    entry
+        .display_name
+        .split(" (")
+        .next()
+        .unwrap_or(entry.display_name)
 }
 
 pub(crate) fn preset(id: &str) -> Option<&'static CatalogEntry> {
@@ -42,6 +63,7 @@ pub(crate) fn preset(id: &str) -> Option<&'static CatalogEntry> {
 fn billing(entry: &CatalogEntry) -> Billing {
     match entry.billing {
         catalog::Billing::Plan => Billing::Plan,
+        catalog::Billing::Local => Billing::Local,
         _ => Billing::PerToken,
     }
 }
@@ -133,9 +155,9 @@ db_path = "aidaemon.db"
 "#;
 
 fn switch_call(choice: &ProviderChoice) -> serde_json::Value {
-    // A custom endpoint's preset names placeholder models: the one the
-    // owner named does every job unless they name others.
-    let custom = preset(&choice.preset).is_some_and(|p| p.custom_base_url);
+    // A custom endpoint's preset, or a local server's, names no models:
+    // the one the owner named does every job unless they name others.
+    let custom = preset(&choice.preset).is_some_and(|p| p.models.primary.is_empty());
     let or_primary = |model: &str| {
         if model.is_empty() && custom {
             choice.primary_model.clone()
@@ -250,7 +272,15 @@ pub(crate) async fn check_key(
     } else {
         base_url.trim()
     };
-    if let Some(endpoint) = aidaemon_providers::key_check::KeyEndpoint::new(entry.kind, base) {
+    let keyless = local(entry) || (key_optional(entry) && key.is_empty());
+    let key = if key.is_empty() && key_optional(entry) {
+        NO_KEY
+    } else {
+        key
+    };
+    if !keyless
+        && let Some(endpoint) = aidaemon_providers::key_check::KeyEndpoint::new(entry.kind, base)
+    {
         use aidaemon_providers::key_check::KeyCheck;
         if let KeyCheck::Rejected(detail) =
             aidaemon_providers::key_check::check_key(&endpoint, key).await
@@ -260,7 +290,19 @@ pub(crate) async fn check_key(
     }
     let models = catalog::list_models(entry.kind, base, key)
         .await
-        .map_err(|why| format!("The key works, but its models could not be listed: {why}"))?;
+        .map_err(|why| {
+            if keyless {
+                format!("Nothing answered at {base} ({why}). Is the model server running there?")
+            } else {
+                format!("The key works, but its models could not be listed: {why}")
+            }
+        })?;
+    if keyless && models.is_empty() {
+        return Err(format!(
+            "{} is running but has no models yet. Pull one first.",
+            entry.display_name
+        ));
+    }
     Ok(CheckedKey {
         preset: entry.id.to_string(),
         suggested: catalog::preselect(&models, entry.models.primary),
@@ -442,6 +484,27 @@ impl ModelSetup {
                     key: Some(found.key),
                 },
                 source,
+            ));
+        }
+        // A model server on this machine, with the models it has.
+        for entry in catalog::CATALOG.iter().filter(|e| local(e) && offered(e)) {
+            let Ok(models) = catalog::list_models(entry.kind, entry.base_url, "").await else {
+                continue;
+            };
+            let Some(model) = catalog::preselect(&models, "").or_else(|| models.first().cloned())
+            else {
+                continue;
+            };
+            candidates.push((
+                Candidate {
+                    choice: ProviderChoice {
+                        preset: entry.id.into(),
+                        primary_model: model,
+                        ..ProviderChoice::default()
+                    },
+                    key: None,
+                },
+                format!("{} running on this computer", local_name(entry)),
             ));
         }
         let tests = candidates
@@ -626,7 +689,8 @@ impl ModelSetup {
                 let preset = preset(&provider.preset).ok_or("Unknown provider")?;
                 let key = key
                     .map(|k| k.0.trim().to_string())
-                    .filter(|k| !k.is_empty());
+                    .filter(|k| !k.is_empty())
+                    .or_else(|| key_optional(preset).then(|| NO_KEY.to_string()));
                 if preset.needs_api_key() && key.is_none() {
                     return Err(format!("{} needs an API key", preset.display_name));
                 }
@@ -675,19 +739,49 @@ mod tests {
     use aidaemon_client_gateway::setup::SetupHost;
 
     #[test]
-    fn the_subscription_comes_first_and_local_models_are_not_offered() {
+    fn the_subscription_comes_first_and_a_local_server_is_offered_without_a_key() {
         let options = options();
         assert_eq!(options[0].preset, CHATGPT);
         assert_eq!(options[0].billing, Billing::Plan);
         assert!(!options[0].needs_key);
-        assert!(options.iter().all(|o| o.preset != "ollama"));
+        let ollama = options.iter().find(|o| o.preset == "ollama").unwrap();
+        assert_eq!(ollama.billing, Billing::Local);
+        assert!(!ollama.needs_key);
         assert!(
             options
                 .iter()
-                .filter(|o| o.preset != CHATGPT)
+                .filter(|o| o.preset != CHATGPT && o.preset != "ollama")
                 .all(|o| o.billing == Billing::PerToken)
         );
         assert!(options.iter().any(|o| o.preset == "openai" && o.needs_key));
+    }
+
+    #[tokio::test]
+    async fn a_local_server_and_the_owners_own_endpoint_connect_without_a_key() {
+        // Ollama: no key, and the model named does every job.
+        let ollama = provider_of(&Candidate {
+            choice: ProviderChoice {
+                preset: "ollama".into(),
+                primary_model: "synthetic-local".into(),
+                ..ProviderChoice::default()
+            },
+            key: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(ollama.base_url, "http://localhost:11434/v1");
+        assert_eq!(ollama.models.primary, "synthetic-local");
+        assert_eq!(ollama.models.fast, "synthetic-local");
+        // The owner's endpoint with no key: its models are listed.
+        let base = fake_provider().await;
+        let custom = preset("custom_openai_compatible").unwrap();
+        let checked = check_key(custom, &base, "").await.unwrap();
+        assert!(checked.models.contains(&"synthetic-model".to_string()));
+        // A hosted provider still needs its key.
+        assert!(!key_optional(preset("openai").unwrap()));
+        // Nothing listening: the answer says where it looked.
+        let nothing = check_key(custom, "http://127.0.0.1:9/v1", "").await;
+        assert!(nothing.unwrap_err().contains("Is the model server running"));
     }
 
     /// An OpenAI-compatible endpoint that answers key `sk-synthetic-good`

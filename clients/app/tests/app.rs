@@ -413,7 +413,7 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
     feed([
         Update::Connected,
         frame(
-            r#"{"type":"welcome","version":{"major":1,"minor":5},"owner":{},"latest_seq":0,"setup":{"step":"model","found":[{"preset":"openai_chatgpt","name":"OpenAI (ChatGPT subscription) · gpt-synthetic","source":"ChatGPT sign-in on this computer","billing":"plan","works":true}],"providers":[{"preset":"openrouter","name":"OpenRouter","billing":"per_token","needs_key":true,"model":"synthetic/model-1"}]}}"#,
+            r#"{"type":"welcome","version":{"major":1,"minor":5},"owner":{},"latest_seq":0,"setup":{"step":"model","found":[{"preset":"openai_chatgpt","name":"OpenAI (ChatGPT subscription) · gpt-synthetic","source":"ChatGPT sign-in on this computer","billing":"plan","works":true}],"providers":[{"preset":"openrouter","name":"OpenRouter","billing":"per_token","needs_key":true,"model":"synthetic/model-1"},{"preset":"ollama","name":"Ollama (local)","billing":"local","needs_key":false}]}}"#,
         ),
     ]);
     app.wait_for("Connect a model")?;
@@ -428,6 +428,13 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
     }
     app.press("Use something else")?;
     app.wait_for("pay per token")?;
+    // A model server on this machine takes no key and no sign-in.
+    app.wait_for("runs on your own machine · free")?;
+    app.press("Use it")?;
+    app.wait_for("Find its models")?;
+    if app.shows("label:API key") || app.shows("Paste the key") {
+        return Err("a local server is asked for a key".into());
+    }
     // A key provider opens its form.
     app.press("Use a key")?;
     app.wait_for("Check key")?;

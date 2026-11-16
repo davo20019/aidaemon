@@ -732,6 +732,7 @@ fn credential_words(credential: CredentialState) -> (&'static str, Tone) {
 fn billing_words(billing: Billing) -> &'static str {
     match billing {
         Billing::Plan => "Uses your subscription",
+        Billing::Local => "Runs on your own machine",
         _ => "Billed per use",
     }
 }

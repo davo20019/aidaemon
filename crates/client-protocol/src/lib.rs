@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 25;
+pub const PROTOCOL_MINOR: u16 = 26;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1361,6 +1361,8 @@ pub enum Billing {
     Plan,
     /// Billed per token by the provider.
     PerToken,
+    /// Runs on the owner's own machine (Ollama): nothing is billed.
+    Local,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

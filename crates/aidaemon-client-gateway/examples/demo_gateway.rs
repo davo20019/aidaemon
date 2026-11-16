@@ -223,6 +223,7 @@ fn demo_setup() -> &'static std::sync::Mutex<Option<aidaemon_client_protocol::Se
                     Billing::PerToken,
                     true,
                 ),
+                provider("ollama", "Ollama (local)", Billing::Local, false),
             ],
             ..SetupState::default()
         }))
@@ -275,6 +276,20 @@ impl ClientHost for Host {
                     ..SetupState::default()
                 }
             }
+            // A key or a local server "checks out": its models to pick from.
+            SetupAction::CheckKey { provider, .. } => {
+                let mut state = demo_setup()
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or("The demo is already set up")?;
+                state.checked = Some(aidaemon_client_protocol::CheckedKey {
+                    preset: provider.preset,
+                    models: vec!["synthetic-small:4b".into(), "synthetic-large:70b".into()],
+                    suggested: Some("synthetic-large:70b".into()),
+                });
+                state
+            }
             SetupAction::Detect => demo_channel_step(),
             SetupAction::SkipChannel | SetupAction::Finish => {
                 static GREETED: std::sync::atomic::AtomicBool =
@@ -310,7 +325,7 @@ impl ClientHost for Host {
                     ..SetupState::default()
                 });
             }
-            _ => return Err("The demo takes no keys or tokens".into()),
+            _ => return Err("The demo connects no chat bots".into()),
         };
         Ok(next)
     }

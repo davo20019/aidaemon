@@ -83,6 +83,7 @@ fn frame(content: View) -> View {
 fn billing_words(billing: Billing) -> &'static str {
     match billing {
         Billing::Plan => "uses your plan · has limits",
+        Billing::Local => "runs on your own machine · free",
         _ => "pay per token",
     }
 }
@@ -537,7 +538,10 @@ fn choices(
                 let mut list = view().gap_2();
                 for option in providers {
                     let preset = option.preset.clone();
-                    let sign_in = !option.needs_key;
+                    // A model server on the owner's machine takes no key
+                    // and no sign-in.
+                    let local = option.billing == Billing::Local;
+                    let sign_in = !option.needs_key && !local;
                     let action = move || {
                         if sign_in {
                             store.setup_step(SetupAction::SignIn { paste: false });
@@ -576,7 +580,13 @@ fn choices(
                                     )
                                     .child(
                                         btn(
-                                            if sign_in { "Sign in" } else { "Use a key" },
+                                            if sign_in {
+                                                "Sign in"
+                                            } else if local {
+                                                "Use it"
+                                            } else {
+                                                "Use a key"
+                                            },
                                             if sign_in {
                                                 Variant::Primary
                                             } else {
@@ -634,91 +644,128 @@ fn choices(
                                         .filter(|c| c.preset == preset)
                                 };
                                 let checked_models = checked.clone();
-                                form.child(labeled("API key", secret_field("Paste the key", key)))
-                                    .child(
+                                if needs_base_url || local {
+                                    form = form.child(lead(
+                                        "A model you run yourself costs nothing per message. \
+                                         Small ones chat well but often stumble on tasks with \
+                                         many steps; larger ones do better.",
+                                    ));
+                                }
+                                if needs_base_url {
+                                    form = form.child(labeled(
+                                        "API key (leave empty if your server needs none)",
+                                        secret_field("Paste the key", key),
+                                    ));
+                                } else if !local {
+                                    form = form.child(labeled(
+                                        "API key",
+                                        secret_field("Paste the key", key),
+                                    ));
+                                }
+                                form.child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            btn(
+                                                if local {
+                                                    "Find its models"
+                                                } else if needs_base_url {
+                                                    "Find models"
+                                                } else {
+                                                    "Check key"
+                                                },
+                                                Variant::Secondary,
+                                                Size::Sm,
+                                                check,
+                                            )
+                                            .disabled(
+                                                move || {
+                                                    store.setup_busy()
+                                                        || if needs_base_url {
+                                                            base_url.with(|b| b.trim().is_empty())
+                                                        } else {
+                                                            !local
+                                                                && key.with(|k| k.trim().is_empty())
+                                                        }
+                                                },
+                                            ),
+                                        )
+                                        .child(when(
+                                            move || store.setup_busy(),
+                                            || ui::working("Asking the provider"),
+                                        )),
+                                )
+                                .child(dynamic(move || {
+                                    let found = checked_models()?;
+                                    // Preselect the usual model when the account has it.
+                                    if model.with_untracked(String::is_empty)
+                                        && let Some(suggested) = found.suggested.clone()
+                                    {
+                                        model.set(suggested);
+                                    }
+                                    Some(untracked(move || {
+                                        let options: Vec<(String, String)> = found
+                                            .models
+                                            .iter()
+                                            .map(|m| (m.clone(), m.clone()))
+                                            .collect();
+                                        view()
+                                            .gap_2()
+                                            .child(lead(if local || needs_base_url {
+                                                format!(
+                                                    "It answered. It has {} models.",
+                                                    found.models.len()
+                                                )
+                                            } else {
+                                                format!(
+                                                    "The key works. Its account offers {} \
+                                                         models.",
+                                                    found.models.len()
+                                                )
+                                            }))
+                                            .child(labeled(
+                                                "Model",
+                                                view().flex_row().child(ui::choice(
+                                                    "Model",
+                                                    "Choose a model",
+                                                    options,
+                                                    move || {
+                                                        Some(model.get()).filter(|m| !m.is_empty())
+                                                    },
+                                                    move |next: Option<String>| {
+                                                        model.set(next.unwrap_or_default())
+                                                    },
+                                                )),
+                                            ))
+                                    }))
+                                }))
+                                .child(when(
+                                    move || checked().is_some(),
+                                    move || {
                                         view()
                                             .flex_row()
                                             .items_center()
                                             .gap_3()
                                             .child(
                                                 btn(
-                                                    "Check key",
-                                                    Variant::Secondary,
+                                                    "Test and connect",
+                                                    Variant::Primary,
                                                     Size::Sm,
-                                                    check,
+                                                    connect,
                                                 )
                                                 .disabled(move || {
                                                     store.setup_busy()
-                                                        || key.with(|k| k.trim().is_empty())
+                                                        || model.with(|m| m.trim().is_empty())
                                                 }),
                                             )
                                             .child(when(
                                                 move || store.setup_busy(),
-                                                || ui::working("Asking the provider"),
-                                            )),
-                                    )
-                                    .child(dynamic(move || {
-                                        let found = checked_models()?;
-                                        // Preselect the usual model when the account has it.
-                                        if model.with_untracked(String::is_empty)
-                                            && let Some(suggested) = found.suggested.clone()
-                                        {
-                                            model.set(suggested);
-                                        }
-                                        Some(untracked(move || {
-                                            let options: Vec<(String, String)> = found
-                                                .models
-                                                .iter()
-                                                .map(|m| (m.clone(), m.clone()))
-                                                .collect();
-                                            view()
-                                                .gap_2()
-                                                .child(lead(format!(
-                                                    "The key works. Its account offers {} models.",
-                                                    found.models.len()
-                                                )))
-                                                .child(labeled(
-                                                    "Model",
-                                                    view().flex_row().child(ui::choice(
-                                                        "Model",
-                                                        "Choose a model",
-                                                        options,
-                                                        move || {
-                                                            Some(model.get())
-                                                                .filter(|m| !m.is_empty())
-                                                        },
-                                                        move |next: Option<String>| {
-                                                            model.set(next.unwrap_or_default())
-                                                        },
-                                                    )),
-                                                ))
-                                        }))
-                                    }))
-                                    .child(when(
-                                        move || checked().is_some(),
-                                        move || {
-                                            view()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_3()
-                                                .child(
-                                                    btn(
-                                                        "Test and connect",
-                                                        Variant::Primary,
-                                                        Size::Sm,
-                                                        connect,
-                                                    )
-                                                    .disabled(move || {
-                                                        store.setup_busy()
-                                                            || model.with(|m| m.trim().is_empty())
-                                                    }),
-                                                )
-                                                .child(when(
-                                                    move || store.setup_busy(),
-                                                    || ui::working("Testing"),
-                                                ))
-                                        },
-                                    ))
+                                                || ui::working("Testing"),
+                                            ))
+                                    },
+                                ))
                             }))
                             .child(ui::separator()),
                     );
