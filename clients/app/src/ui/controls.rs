@@ -1036,13 +1036,24 @@ pub fn empty(title: &'static str, detail: impl IntoReactive<SharedString>) -> Vi
 /// Work going on, in a row's end: a small ring that turns (still, with
 /// reduced motion). `label` is what screen readers hear.
 pub fn spinner(label: &'static str) -> View {
+    ring(label, true)
+}
+
+/// Work that was going on when the connection dropped: the same ring,
+/// faint and still, since nobody can say yet whether it has finished.
+pub fn spinner_stale(label: &'static str) -> View {
+    ring(label, false)
+}
+
+fn ring(label: &'static str, live: bool) -> View {
+    let tint = if live { colors::ACCENT } else { colors::FAINT };
     let ring = svg(nsh_core::element::ImageSrc::svg_markup(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-opacity="0.25"/><path d="M8 2a6 6 0 0 1 6 6" stroke="currentColor"/></svg>"#,
     ))
     .w(px(14.0))
     .h(px(14.0))
-    .text_color(colors::ACCENT);
-    let ring = if reduce_motion() {
+    .text_color(tint);
+    let ring = if reduce_motion() || !live {
         ring
     } else {
         ring.animate_spin()
@@ -1055,7 +1066,7 @@ pub fn spinner(label: &'static str) -> View {
         .role(AccessibilityRole::Progressbar)
         .label(label)
         .child(if idiom() == nsh_core::platform::Idiom::Terminal {
-            view().child(text("◌").text_color(colors::ACCENT))
+            view().child(text("◌").text_color(tint))
         } else {
             view().child(ring)
         })

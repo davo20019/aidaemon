@@ -70,7 +70,7 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 
 ## Copy
 
-Say what happened and what to do next, in the owner's words: "The daemon is not running", "Retrying in 3s", "Allow once", "Deny". No internal identifiers in headings. Session channels and tool names show as metadata, in monospace where they are identifiers.
+Say what happened and what to do next, in the owner's words: "Can't reach the daemon", "Retrying in 3s", "Allow once", "Deny". No internal identifiers in headings. Session channels and tool names show as metadata, in monospace where they are identifiers.
 | Conversation | Reading back while replies arrive | "Jump to latest" pill (bottom, centred) when the last row is out of view; follow-end only while at the end |
 | Conversation | Stop pressed | Stop becomes "Stopping…" (warning status) until the turn ends |
 | Sidebar | A reply lands elsewhere | Filled dot and full-strength title until opened; pinned (★) under Pinned |
@@ -87,7 +87,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Composer | Attach | The paperclip opens a menu (a sheet on a phone): Take a picture (a phone's or tablet's browser, which opens the camera), Pictures, Files |
 | All | Home | AIDaemon at the sidebar's top is a button home, as other chat apps' names are: the main list and a new conversation ("AIDaemon, home"; its hint says Home) |
 | All | Connection | A dot after AIDaemon in the sidebar's top line: green connected, amber connecting or reconnecting, red down; its name and tooltip say the state, and a press shows the footer line with its words until pressed again. Otherwise the footer line shows only when it is down, unpaired or has no daemon |
-| All | The connection drops after working | Nothing shows for 5 s (a daemon restart, a phone waking the page); then "Reconnecting…" (accent) and the composer reads "Reconnecting…" (down: "Offline: sends once it's back"); after 30 s, red "Connection lost" or "The daemon is not running". A refusal, or a daemon that never answered, shows at once. A shown page retries within 2 s, and checks its socket the moment it is shown again or the network returns |
+| All | The connection drops after working | Nothing shows for 5 s (a daemon restart, a phone waking the page); then "Reconnecting…" (accent) and the composer reads "Reconnecting…" (down: "Offline: sends once it's back"); after 30 s, red "Connection lost" or "Can't reach the daemon" (a browser cannot tell a stopped daemon from a lost network, so it never claims the daemon stopped). A refusal, or a daemon that never answered, shows at once. A shown page retries within 2 s, and checks its socket the moment it is shown again or the network returns |
 | All | The daemon refuses the sign-in | The connection says so (it signs in again, or reads as refused); no note is left on the page |
 | Details | A conversation works on code (in a project with a folder, wrote a file, or has changes) | It gets the Changes tab and opens on it; on a wide window the details show beside it, and hide beside any other; a turn's first file write moves to Changes once per turn; on a phone the header's "Changes · N" opens them |
 | Changes | Read | The last command run after the last change leads: Passed, Failed (exit N), or "Not checked" when files changed and nothing ran since |
@@ -115,7 +115,7 @@ Say what happened and what to do next, in the owner's words: "The daemon is not 
 | Composer | Draft starts with `/` | The daemon's matching commands above the composer; Tab or a press completes the first |
 | Composer | Up on an empty composer | The last message sent here comes back to edit |
 | Conversation | Last turn failed or was stopped | Retry under it sends the same message again |
-| Sidebar | A conversation waits on an approval, or works | Its row's end says so in place of its time: an amber dot and "Needs you" (and the conversation leads the list under Needs you), or a small accent ring that turns (`ui::spinner`; still with reduced motion) while it works, keeping its place by time. A phone's (or a folded sidebar's) list button carries a corner dot when another conversation needs the owner (amber) or works (accent) |
+| Sidebar | A conversation waits on an approval, or works | Its row's end says so in place of its time: an amber dot and "Needs you" (and the conversation leads the list under Needs you), or a small accent ring that turns (`ui::spinner`; still with reduced motion) while it works, keeping its place by time. While the connection is down the ring goes faint and still (`ui::spinner_stale`, "Was working when the connection dropped"): the work may have finished meanwhile, and the reconnect settles it. A phone's (or a folded sidebar's) list button carries a corner dot when another conversation needs the owner (amber) or works (accent) |
 | Sidebar | Searching | Titles filter at once; the daemon's matches in every conversation follow under "In messages" with a snippet, who said it and when |
 | System | A goal ran in the last day | "While you were away": each run with Done, Running, Failed, Stopped or "No report" (warning: finished without saying what it did); failed and silent runs also go to "Needs a look" |
 | Terminal | Quit | The open conversation prints to the normal scrollback as Markdown |

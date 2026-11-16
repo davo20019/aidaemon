@@ -151,7 +151,45 @@ fn offline_says_why() -> Result<(), String> {
         reason: "refused".into(),
         retry_in: std::time::Duration::from_secs(2),
     })]);
-    app.wait_for("The daemon is not running")?;
+    app.wait_for("Can't reach the daemon")?;
+    Ok(())
+}
+
+#[test]
+fn a_dropped_connection_does_not_keep_a_turn_spinning() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-12","channel":"app","title":"Check the backups","writable":true}]}}"#,
+        ),
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-12","event":{"type":"turn_started","turn_id":"t12","session_id":"app:synthetic-12","origin":"app"}}"#,
+        ),
+    ]);
+    app.wait_for("label:Working")?;
+    // Offline past the quiet few seconds: the app no longer knows.
+    feed([Update::Disconnected(aidaemon_client_core::Disconnect {
+        kind: aidaemon_client_core::DropKind::Dropped,
+        reason: "the socket ended".into(),
+        retry_in: std::time::Duration::from_secs(2),
+    })]);
+    app.wait_for_within(
+        "label:Was working when the connection dropped",
+        std::time::Duration::from_secs(10),
+    )?;
+    // Back, with the finish it missed: the ring goes.
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:synthetic-12","event":{"type":"turn_completed","turn_id":"t12","text":"The backups ran.","state":"completed"}}"#,
+        ),
+    ]);
+    app.wait_for_gone(
+        "label:Was working when the connection dropped",
+        std::time::Duration::from_secs(5),
+    )?;
     Ok(())
 }
 

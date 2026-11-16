@@ -1047,7 +1047,13 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         let state = if store.needs_you(&date_id) {
             RowState::NeedsYou
         } else if store.is_working(&date_id) {
-            RowState::Working
+            // Offline, the app only knows it was working when the link
+            // dropped: the finish may have happened since.
+            if matches!(store.felt(), Felt::Online) {
+                RowState::Working
+            } else {
+                RowState::WasWorking
+            }
         } else {
             RowState::Quiet
         };
@@ -1055,6 +1061,7 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         Some(untracked(move || match state {
             RowState::NeedsYou => ui::badge_dot("Needs you", Tone::Warning),
             RowState::Working => ui::spinner("Working"),
+            RowState::WasWorking => ui::spinner_stale("Was working when the connection dropped"),
             RowState::Quiet => view().child(when(dated, move || {
                 let at = at.clone();
                 text(move || {
@@ -1098,6 +1105,7 @@ fn filter_glyph(source: Source) -> Option<Glyph> {
 enum RowState {
     NeedsYou,
     Working,
+    WasWorking,
     Quiet,
 }
 
@@ -1320,7 +1328,7 @@ fn felt_status(felt: &Felt) -> (Tone, String) {
         Felt::Down { kind, reason } => (
             Tone::Danger,
             match kind {
-                DropKind::DaemonNotRunning => "The daemon is not running".into(),
+                DropKind::DaemonNotRunning => "Can't reach the daemon".into(),
                 DropKind::Unauthorized => format!("The daemon refused this app: {reason}"),
                 DropKind::VersionUnsupported => "The daemon needs a newer app".into(),
                 DropKind::Dropped => "Connection lost".into(),
@@ -1341,7 +1349,7 @@ fn connection(store: Store) -> View {
             Felt::Reconnecting => status("Reconnecting…", Tone::Accent),
             Felt::Down { kind, reason } => {
                 let headline = match kind {
-                    DropKind::DaemonNotRunning => "The daemon is not running",
+                    DropKind::DaemonNotRunning => "Can't reach the daemon",
                     DropKind::Unauthorized => "The daemon refused this app",
                     DropKind::VersionUnsupported => "The daemon needs a newer app",
                     DropKind::Dropped => "Connection lost",
