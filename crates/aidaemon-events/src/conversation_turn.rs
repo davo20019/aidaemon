@@ -210,7 +210,7 @@ pub fn turn_from_event(
             tool_calls: tool_calls_from_assistant_response(data),
             annotations: annotations_from_event_data(data),
             turn_id: turn_id.clone(),
-            attachments: Vec::new(),
+            attachments: attachments_from_event_data(data),
         }),
         "tool_result" => Some(ConversationTurn {
             event_id,
@@ -292,6 +292,44 @@ mod tests {
         assert_eq!(turn.turn_id.as_deref(), Some("turn-9"));
         let msg = turn.into_message();
         assert_eq!(msg.turn_id.as_deref(), Some("turn-9"));
+    }
+
+    #[test]
+    fn a_delivered_file_survives_in_the_transcript() {
+        let data = serde_json::to_value(crate::payloads::AssistantResponseData {
+            message_id: Some("m2".to_string()),
+            content: Some("Delivery note: I sent a picture in chat.".to_string()),
+            tool_calls: None,
+            model: "system".to_string(),
+            input_tokens: None,
+            output_tokens: None,
+            annotations: vec![MessageAnnotation::DeliveredFiles {
+                caption: "The site".to_string(),
+            }],
+            turn_id: Some("turn-1".to_string()),
+            task_id: None,
+            referenced_receipts: Vec::new(),
+            disposition: Default::default(),
+            attachments: vec![MessageAttachment {
+                local_path: "/tmp/synthetic/picture.png".to_string(),
+                filename: "picture.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 42,
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        let msg = turn_from_event(1, "sess", "assistant_response", &data, Utc::now())
+            .unwrap()
+            .into_message();
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].filename, "picture.png");
+        assert!(
+            msg.annotations
+                .contains(&MessageAnnotation::DeliveredFiles {
+                    caption: "The site".to_string()
+                })
+        );
     }
 
     #[test]

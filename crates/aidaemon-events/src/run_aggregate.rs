@@ -3757,6 +3757,7 @@ mod tests {
                 task_id: Some("task-1".to_string()),
                 referenced_receipts: Vec::new(),
                 disposition: crate::AssistantResponseDisposition::Terminal,
+                attachments: Vec::new(),
             },
         )
     }

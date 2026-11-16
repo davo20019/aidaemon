@@ -865,14 +865,27 @@ impl ClientHost for DaemonClientHost {
                 Some(files) if !m.attachments.is_empty() => files.show(&m.attachments),
                 _ => Vec::new(),
             };
-            let text = m.content.unwrap_or_default();
+            // Files the agent sent: shown with the caption the owner saw;
+            // the note's text is for the model.
+            let delivered = m.annotations.iter().find_map(|a| match a {
+                crate::traits::MessageAnnotation::DeliveredFiles { caption } => {
+                    Some(caption.clone())
+                }
+                _ => None,
+            });
+            let text = match &delivered {
+                Some(caption) => caption.clone(),
+                None => m.content.unwrap_or_default(),
+            };
             // A reply reads as it was shown when it arrived.
-            let text = if m.role == "assistant" {
+            let text = if delivered.is_some() {
+                text
+            } else if m.role == "assistant" {
                 aidaemon_channels::presentation::prepare_chat_message(&text)
             } else {
                 text
             };
-            let text = if m.attachments.is_empty() {
+            let text = if m.attachments.is_empty() || delivered.is_some() {
                 text
             } else {
                 aidaemon_channels::attachments::user_authored_text(&text)
@@ -880,14 +893,16 @@ impl ClientHost for DaemonClientHost {
             if text.trim().is_empty() && attachments.is_empty() {
                 continue;
             }
-            let calls: Vec<aidaemon_client_protocol::ToolCallInfo> = if m.role == "assistant" {
-                std::mem::take(&mut pending)
-                    .into_iter()
-                    .map(|c| c.info)
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            // A delivery lands mid-turn: the turn's tools stay for its reply.
+            let calls: Vec<aidaemon_client_protocol::ToolCallInfo> =
+                if m.role == "assistant" && delivered.is_none() {
+                    std::mem::take(&mut pending)
+                        .into_iter()
+                        .map(|c| c.info)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let tools = calls.iter().map(|c| c.name.clone()).collect();
             out.push(HistoryMessage {
                 attachments,

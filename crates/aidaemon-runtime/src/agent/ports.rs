@@ -425,6 +425,19 @@ impl AssistantNoteSink for Agent {
     async fn record_assistant_note(&self, session_id: &str, note: &str) -> anyhow::Result<()> {
         self.record_auxiliary_assistant_note(session_id, note).await
     }
+
+    async fn record_delivered_files(
+        &self,
+        session_id: &str,
+        note: &str,
+        caption: &str,
+        files: Vec<aidaemon_tools::semantics::MessageAttachment>,
+    ) -> anyhow::Result<()> {
+        crate::turn::notes::TurnNotes::record_delivered_files(
+            self, session_id, note, caption, files,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

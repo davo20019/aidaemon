@@ -130,6 +130,10 @@ pub struct AssistantResponseData {
     /// infer this state from response wording.
     #[serde(default)]
     pub disposition: AssistantResponseDisposition,
+    /// Files this message delivered to the owner (a picture or document the
+    /// agent sent), kept so the transcript shows them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2207,6 +2211,7 @@ mod tests {
             task_id: Some("task-1".to_string()),
             referenced_receipts: Vec::new(),
             disposition: AssistantResponseDisposition::Terminal,
+            attachments: Vec::new(),
         };
         let back: AssistantResponseData =
             serde_json::from_value(serde_json::to_value(&ar).unwrap()).unwrap();

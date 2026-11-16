@@ -46,6 +46,13 @@ pub enum MessageAnnotation {
     /// who the owner, the assistant or their family are. Archived
     /// rendering keeps it verbatim. Set after the message was stored.
     IdentityCritical,
+    /// An assistant note recording files delivered to the owner; the
+    /// message's attachments are the files and `caption` is what the owner
+    /// saw with them (the note's text is for the model).
+    DeliveredFiles {
+        #[serde(default)]
+        caption: String,
+    },
 }
 
 pub use aidaemon_tools::semantics::{AttachmentProvenance, MessageAttachment};
@@ -172,7 +179,8 @@ fn annotation_appended_marker(annotation: &MessageAnnotation) -> Option<&'static
         | MessageAnnotation::EntireSystemNotice
         | MessageAnnotation::WrappedUntrustedExternalData { .. }
         | MessageAnnotation::InboundFileAttachment { .. }
-        | MessageAnnotation::IdentityCritical => None,
+        | MessageAnnotation::IdentityCritical
+        | MessageAnnotation::DeliveredFiles { .. } => None,
     }
 }
 

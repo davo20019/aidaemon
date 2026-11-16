@@ -906,6 +906,7 @@ pub trait TurnHistory: TurnHost {
                         task_id: emitter.task_id().map(str::to_string),
                         referenced_receipts,
                         disposition,
+                        attachments: normalized_msg.attachments.clone(),
                     },
                 )
                 .await?;

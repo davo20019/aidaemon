@@ -107,16 +107,44 @@ fn media_file(
 pub(crate) struct MediaToClients {
     pub(crate) publisher: Publisher,
     pub(crate) files: Arc<crate::files::FileStore>,
+    /// The copy [`AppChannel`] kept of what it just sent, by session.
+    pub(crate) kept: Kept,
+}
+
+/// Files the app channel kept as it sent them, by session, until the media
+/// tap hands them to the transcript.
+pub(crate) type Kept =
+    Arc<Mutex<std::collections::HashMap<String, aidaemon_tools::semantics::MessageAttachment>>>;
+
+/// A kept file as a message's attachment, so the transcript shows it again.
+fn kept_attachment(
+    files: &crate::files::FileStore,
+    file: &aidaemon_client_protocol::AttachmentRef,
+) -> Option<aidaemon_tools::semantics::MessageAttachment> {
+    let record = files.get(&file.id)?;
+    Some(aidaemon_tools::semantics::MessageAttachment {
+        local_path: record.path.to_string_lossy().into_owned(),
+        filename: record.name,
+        mime_type: record.mime,
+        size_bytes: record.size_bytes,
+        provenance: aidaemon_tools::semantics::AttachmentProvenance::ToolArtifact,
+        ..Default::default()
+    })
 }
 
 impl aidaemon_channels::hub::MediaTap for MediaToClients {
-    fn delivered(&self, channel: &str, session_id: &str, media: &MediaMessage) {
+    fn delivered(
+        &self,
+        channel: &str,
+        session_id: &str,
+        media: &MediaMessage,
+    ) -> Option<aidaemon_tools::semantics::MessageAttachment> {
         if channel == APP_CHANNEL {
-            return;
+            // The app channel published it already.
+            return self.kept.lock().ok()?.remove(session_id);
         }
-        let Some(file) = media_file(&self.files, media) else {
-            return;
-        };
+        let file = media_file(&self.files, media)?;
+        let kept = kept_attachment(&self.files, &file);
         self.publisher.publish(
             Some(session_id.to_string()),
             Event::AssistantMessage {
@@ -126,6 +154,7 @@ impl aidaemon_channels::hub::MediaTap for MediaToClients {
                 suggestions: Vec::new(),
             },
         );
+        kept
     }
 }
 
@@ -506,6 +535,7 @@ impl TurnSurface for ChatReplySurface {
 pub struct AppChannel {
     pub(crate) publisher: Publisher,
     pub(crate) files: Option<Arc<crate::files::FileStore>>,
+    pub(crate) kept: Kept,
 }
 
 impl AppChannel {
@@ -546,6 +576,11 @@ impl HubChannel for AppChannel {
         if let Some(files) = &self.files {
             let file = media_file(files, media)
                 .ok_or_else(|| anyhow::anyhow!("could not keep the file for the app"))?;
+            if let (Some(attachment), Ok(mut kept)) =
+                (kept_attachment(files, &file), self.kept.lock())
+            {
+                kept.insert(session_id.to_string(), attachment);
+            }
             self.publisher.publish(
                 Some(session_id.to_string()),
                 Event::AssistantMessage {

@@ -500,16 +500,19 @@ impl ClientGateway {
             files: deps.files.clone(),
         }));
         deps.hub.set_approval_tap(approvals.clone());
+        let kept = observer::Kept::default();
         if let Some(files) = deps.files.clone() {
             deps.hub.set_media_tap(Arc::new(observer::MediaToClients {
                 publisher: publisher.clone(),
                 files,
+                kept: kept.clone(),
             }));
         }
         deps.hub
             .register_channel(Arc::new(AppChannel {
                 publisher: publisher.clone(),
                 files: deps.files.clone(),
+                kept,
             }) as Arc<dyn HubChannel>)
             .await;
 

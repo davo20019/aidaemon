@@ -307,6 +307,18 @@ pub trait ChannelAgentRuntime: AgentIngress {
 #[async_trait]
 pub trait AssistantNoteSink: Send + Sync {
     async fn record_assistant_note(&self, session_id: &str, note: &str) -> anyhow::Result<()>;
+
+    /// Files delivered to the owner: `note` is for the model, `caption` what
+    /// the owner saw with `files`, which the transcript keeps.
+    async fn record_delivered_files(
+        &self,
+        session_id: &str,
+        note: &str,
+        _caption: &str,
+        _files: Vec<aidaemon_tools::semantics::MessageAttachment>,
+    ) -> anyhow::Result<()> {
+        self.record_assistant_note(session_id, note).await
+    }
 }
 
 /// Outbound operations shared by the agent runtime, tools, and heartbeat.

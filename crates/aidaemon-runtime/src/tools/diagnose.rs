@@ -2592,6 +2592,7 @@ mod tests {
                 task_id: Some("parent-1".to_string()),
                 referenced_receipts: Vec::new(),
                 disposition: aidaemon_events::payloads::AssistantResponseDisposition::Terminal,
+                attachments: Vec::new(),
             },
             Some("parent-1"),
         )

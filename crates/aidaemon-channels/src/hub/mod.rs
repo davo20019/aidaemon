@@ -90,8 +90,14 @@ pub type TapAnswer = tokio::sync::oneshot::Receiver<(ApprovalResponse, String)>;
 /// Sees the media the hub delivers to a bot (a picture, a document), so the
 /// owner's apps show it too.
 pub trait MediaTap: Send + Sync {
-    /// `media` reached `session_id` on channel `channel`.
-    fn delivered(&self, channel: &str, session_id: &str, media: &MediaMessage);
+    /// `media` reached `session_id` on channel `channel`. Returns the copy
+    /// kept for the owner's apps, if one was, so the transcript records it.
+    fn delivered(
+        &self,
+        channel: &str,
+        session_id: &str,
+        media: &MediaMessage,
+    ) -> Option<aidaemon_tools::semantics::MessageAttachment>;
 }
 
 /// Sees every approval card the hub routes and may answer it from

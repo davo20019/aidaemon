@@ -98,6 +98,41 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
         content: &str,
         turn_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.record_assistant_note_with_files(session_id, content, turn_id, Vec::new(), Vec::new())
+            .await
+    }
+
+    /// Files delivered to the owner (a picture or document the agent sent):
+    /// an assistant note for the model, carrying the files and the caption
+    /// the owner saw, so the transcript shows them again.
+    async fn record_delivered_files(
+        &self,
+        session_id: &str,
+        note: &str,
+        caption: &str,
+        files: Vec<aidaemon_events::conversation::MessageAttachment>,
+    ) -> anyhow::Result<()> {
+        let annotations = if files.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                aidaemon_events::conversation::MessageAnnotation::DeliveredFiles {
+                    caption: caption.trim().to_string(),
+                },
+            ]
+        };
+        self.record_assistant_note_with_files(session_id, note, None, files, annotations)
+            .await
+    }
+
+    async fn record_assistant_note_with_files(
+        &self,
+        session_id: &str,
+        content: &str,
+        turn_id: Option<&str>,
+        attachments: Vec<aidaemon_events::conversation::MessageAttachment>,
+        annotations: Vec<aidaemon_events::conversation::MessageAnnotation>,
+    ) -> anyhow::Result<()> {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return Ok(());
@@ -126,6 +161,8 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
             created_at: Utc::now(),
             importance: 0.2,
             turn_id: Some(turn_id),
+            attachments,
+            annotations,
             ..Message::runtime_defaults()
         };
         self.append_assistant_message_with_event(&emitter, &msg, "system", None, None)

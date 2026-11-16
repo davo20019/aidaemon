@@ -123,15 +123,18 @@ impl ChannelHub {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tap);
     }
 
-    fn media_delivered(&self, channel: &str, session_id: &str, media: &MediaMessage) {
+    fn media_delivered(
+        &self,
+        channel: &str,
+        session_id: &str,
+        media: &MediaMessage,
+    ) -> Option<aidaemon_tools::semantics::MessageAttachment> {
         let tap = self
             .media_tap
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if let Some(tap) = tap {
-            tap.delivered(channel, session_id, media);
-        }
+        tap.and_then(|tap| tap.delivered(channel, session_id, media))
     }
 
     /// Show every approval card to `tap` too, which may answer it.
@@ -274,22 +277,61 @@ impl ChannelHub {
         self
     }
 
-    async fn record_media_delivery_note(&self, session_id: &str, media: &MediaMessage) {
+    /// Record a delivered file in the conversation: a note for the model,
+    /// carrying the file (the copy the owner's apps keep, else the document
+    /// itself) so the transcript shows it again.
+    async fn record_media_delivery_note(
+        &self,
+        session_id: &str,
+        media: &MediaMessage,
+        kept: Option<aidaemon_tools::semantics::MessageAttachment>,
+    ) {
         let Some(sink) = self.delivery_note_sink.as_ref() else {
             return;
         };
-        let MediaKind::Document {
-            file_path,
-            filename,
-        } = &media.kind
-        else {
-            return;
+        let (summary, file) = match &media.kind {
+            MediaKind::Document {
+                file_path,
+                filename,
+            } => {
+                let file = kept.or_else(|| {
+                    let size_bytes = std::fs::metadata(file_path).ok()?.len();
+                    Some(aidaemon_tools::semantics::MessageAttachment {
+                        local_path: file_path.clone(),
+                        filename: filename.clone(),
+                        mime_type: "application/octet-stream".to_string(),
+                        size_bytes,
+                        provenance: aidaemon_tools::semantics::AttachmentProvenance::ToolArtifact,
+                        ..Default::default()
+                    })
+                });
+                (
+                    format!(
+                        "Delivery note: I sent the attachment {} in chat. Local copy: {}",
+                        filename, file_path
+                    ),
+                    file,
+                )
+            }
+            MediaKind::Photo { .. } => {
+                // Only a kept copy has a path to point at.
+                let Some(file) = kept else {
+                    return;
+                };
+                (
+                    format!(
+                        "Delivery note: I sent a picture in chat. Local copy: {}",
+                        file.local_path
+                    ),
+                    Some(file),
+                )
+            }
         };
-        let summary = format!(
-            "Delivery note: I sent the attachment {} in chat. Local copy: {}",
-            filename, file_path
-        );
-        if let Err(err) = sink.record_assistant_note(session_id, &summary).await {
+        let files: Vec<_> = file.into_iter().collect();
+        if let Err(err) = sink
+            .record_delivered_files(session_id, &summary, &media.caption, files)
+            .await
+        {
             warn!(
                 session_id,
                 error = %err,
@@ -790,8 +832,9 @@ impl ChannelHub {
                         delivery_result = Err(e.to_string());
                         warn!("Failed to send media via {}: {}", channel.name(), e);
                     } else {
-                        self.media_delivered(&channel.name(), &routed_session, &msg);
-                        self.record_media_delivery_note(&routed_session, &msg).await;
+                        let kept = self.media_delivered(&channel.name(), &routed_session, &msg);
+                        self.record_media_delivery_note(&routed_session, &msg, kept)
+                            .await;
                     }
                 } else {
                     // Channel doesn't support media — send caption as text
@@ -941,8 +984,8 @@ impl ChannelHub {
                     self.release_media_delivery(&routed_session, media).await;
                     return Err(e);
                 }
-                self.media_delivered(&channel.name(), &routed_session, media);
-                self.record_media_delivery_note(&routed_session, media)
+                let kept = self.media_delivered(&channel.name(), &routed_session, media);
+                self.record_media_delivery_note(&routed_session, media, kept)
                     .await;
                 Ok(())
             } else {
@@ -990,8 +1033,8 @@ impl ChannelHub {
             self.release_media_delivery(&routed_session, media).await;
             return Err(e);
         }
-        self.media_delivered(&channel.name(), &routed_session, media);
-        self.record_media_delivery_note(&routed_session, media)
+        let kept = self.media_delivered(&channel.name(), &routed_session, media);
+        self.record_media_delivery_note(&routed_session, media, kept)
             .await;
         Ok(())
     }
@@ -1116,7 +1159,7 @@ mod tests {
 
     use crate::hub::{ChannelCapabilities, HubChannel};
     use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
-    use aidaemon_tools::semantics::ApprovalResponse;
+    use aidaemon_tools::semantics::{ApprovalResponse, MessageAttachment};
 
     /// A test channel with a configurable name, used to verify routing.
     struct NamedTestChannel {
@@ -1327,6 +1370,85 @@ mod tests {
             2,
             "a different document must still be delivered"
         );
+    }
+
+    /// What the transcript was given.
+    #[derive(Default)]
+    struct RecordedNotes(Mutex<Vec<(String, String, Vec<MessageAttachment>)>>);
+
+    #[async_trait]
+    impl AssistantNoteSink for RecordedNotes {
+        async fn record_assistant_note(&self, _: &str, note: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .await
+                .push((note.to_string(), String::new(), Vec::new()));
+            Ok(())
+        }
+        async fn record_delivered_files(
+            &self,
+            _: &str,
+            note: &str,
+            caption: &str,
+            files: Vec<MessageAttachment>,
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .await
+                .push((note.to_string(), caption.to_string(), files));
+            Ok(())
+        }
+    }
+
+    /// Keeps every picture at one synthetic path.
+    struct KeepingTap;
+
+    impl crate::hub::MediaTap for KeepingTap {
+        fn delivered(&self, _: &str, _: &str, _: &MediaMessage) -> Option<MessageAttachment> {
+            Some(MessageAttachment {
+                local_path: "/synthetic/kept/picture.png".to_string(),
+                filename: "picture.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 3,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// A picture the agent sends stays in the transcript (the copy the apps
+    /// keep, with its caption), so a reload shows it again.
+    #[tokio::test]
+    async fn a_sent_picture_is_recorded_with_its_kept_copy() {
+        let channel = Arc::new(CountingMediaChannel::new());
+        let session_map = empty_session_map();
+        session_map
+            .write()
+            .await
+            .insert("s1".to_string(), "counting_media".to_string());
+        let notes = Arc::new(RecordedNotes::default());
+        let hub = ChannelHub::new(vec![channel as Arc<dyn HubChannel>], session_map)
+            .with_delivery_note_sink(notes.clone());
+        hub.set_media_tap(Arc::new(KeepingTap));
+        hub.send_media_strict(
+            "s1",
+            &MediaMessage {
+                session_id: "s1".to_string(),
+                caption: "The flower site".to_string(),
+                kind: crate::hub::MediaKind::Photo {
+                    data: b"png".to_vec(),
+                },
+                result_tx: None,
+            },
+        )
+        .await
+        .unwrap();
+        let recorded = notes.0.lock().await;
+        assert_eq!(recorded.len(), 1);
+        let (note, caption, files) = &recorded[0];
+        assert!(note.contains("/synthetic/kept/picture.png"));
+        assert_eq!(caption, "The flower site");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "picture.png");
     }
 
     /// A screenshot the browser already put in the chat is not sent again
