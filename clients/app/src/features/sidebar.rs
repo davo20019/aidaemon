@@ -787,12 +787,19 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
         })
     };
     let (name, folder, edit, empty) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let (pin, unpin, pinned, unpinned, gone) =
+        (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let tools = view().flex_row().items_center().child(ui::press_menu(
         Glyph::More,
         "Project options",
-        vec![ui::MenuAction::new("Edit name or folder", move || {
-            store.edit_project(&edit)
-        })],
+        vec![
+            ui::MenuAction::new("Pin to the top", move || store.toggle_project_pin(&pin))
+                .shown_when(move || !store.is_project_pinned(&unpinned)),
+            ui::MenuAction::new("Unpin", move || store.toggle_project_pin(&unpin))
+                .shown_when(move || store.is_project_pinned(&pinned)),
+            ui::MenuAction::new("Edit name or folder", move || store.edit_project(&edit)),
+            ui::MenuAction::new("Delete project…", move || confirm_delete(store, &gone)),
+        ],
     ));
     view()
         .gap(px(1.0))

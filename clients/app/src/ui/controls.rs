@@ -447,7 +447,7 @@ impl Glyph {
             Self::Undo => "↶",
             Self::Compose => "✎",
             Self::Back => "‹",
-            Self::More => "…",
+            Self::More => "⋮",
             Self::Grip => "⠿",
             Self::Telegram => "✈",
             Self::Discord => "◈",
@@ -529,7 +529,7 @@ impl Glyph {
                 r#"<circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/>"#
             }
             Self::More => {
-                r#"<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>"#
+                r#"<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>"#
             }
             Self::External => {
                 r#"<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#
