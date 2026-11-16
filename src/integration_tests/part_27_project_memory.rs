@@ -293,4 +293,71 @@ mod project_memory {
                 .is_some()
         );
     }
+
+    /// A server a project declared and the owner started runs under the
+    /// project's name: its tools are offered on that project's turns, and
+    /// never in a chat outside it or in another project.
+    #[tokio::test]
+    async fn a_project_servers_tools_are_offered_only_in_its_project() {
+        let mut harness = setup_test_agent(MockProvider::with_responses(vec![
+            MockProvider::text_response("In the project."),
+            MockProvider::text_response("Outside it."),
+            MockProvider::text_response("In another project."),
+        ]))
+        .await
+        .unwrap();
+        let in_project = "app:project-mcp-in";
+        let (project, _folder) = place_in_project(&harness, in_project, "Acme Site").await;
+        let (_other, _other_folder) =
+            place_in_project(&harness, "app:project-mcp-other", "Other Site").await;
+        let registry = crate::mcp::McpRegistry::new(
+            harness.state.clone(),
+            crate::config::secret_store().clone(),
+        );
+        let name = aidaemon_mcp::registry::project::registered_name(&project.id, "fake");
+        registry
+            .add_server(
+                &name,
+                crate::config::McpServerConfig {
+                    command: crate::testing::fake_mcp_server_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    read_only_tools: Vec::new(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        harness.agent.set_test_mcp_registry(registry);
+        harness.agent.set_test_tool_filter_enforce(false);
+        let tool = format!("{name}__echo");
+        for session in [in_project, "app:project-mcp-plain", "app:project-mcp-other"] {
+            harness
+                .agent
+                .handle_message(
+                    session,
+                    "Say something short.",
+                    None,
+                    UserRole::Owner,
+                    ChannelContext::private("app"),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let offered: Vec<String> = harness
+            .provider
+            .call_log
+            .lock()
+            .await
+            .iter()
+            .map(|call| serde_json::Value::Array(call.tools.clone()).to_string())
+            .collect();
+        assert_eq!(offered.len(), 3, "one model call per turn");
+        assert!(offered[0].contains(&tool), "the project's own turn: {}", offered[0]);
+        assert!(!offered[1].contains(&tool), "a chat in no project");
+        assert!(!offered[2].contains(&tool), "another project's turn");
+    }
 }
