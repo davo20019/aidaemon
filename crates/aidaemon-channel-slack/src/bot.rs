@@ -335,6 +335,8 @@ pub struct SlackBot {
     owner_user_ids: std::sync::RwLock<Vec<String>>,
     workspace_grants: std::sync::RwLock<Vec<WorkspaceGrant>>,
     use_threads: bool,
+    /// Threads (`channel:thread_ts`) the bot is known to be answering in.
+    bot_threads: std::sync::Mutex<std::collections::HashSet<String>>,
     host: Arc<dyn SlackHost>,
     /// HTTP client for Slack Web API calls.
     http: reqwest::Client,
@@ -426,6 +428,7 @@ impl SlackBot {
             host,
             http: reqwest::Client::new(),
             bot_user_id: Mutex::new(None),
+            bot_threads: std::sync::Mutex::default(),
             team_id: std::sync::RwLock::new(None),
             channel_hub: std::sync::RwLock::new(None),
             user_cache: RwLock::new(HashMap::new()),
@@ -1351,6 +1354,64 @@ impl SlackBot {
         }
     }
 
+    fn remember_bot_thread(&self, channel_id: &str, thread_ts: &str) {
+        let mut threads = self
+            .bot_threads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Bounded: a forgotten thread is asked of Slack again.
+        if threads.len() >= 4096 {
+            threads.clear();
+        }
+        threads.insert(format!("{channel_id}:{thread_ts}"));
+    }
+
+    /// Whether the bot has been brought into this thread: it was mentioned
+    /// there since start, or Slack shows a message of its own in it. A
+    /// failed lookup reads as no, so the bot stays quiet.
+    async fn bot_in_thread(&self, channel_id: &str, thread_ts: &str) -> bool {
+        let known = self
+            .bot_threads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&format!("{channel_id}:{thread_ts}"));
+        if known {
+            return true;
+        }
+        let Some(bot_id) = self.bot_user_id.lock().await.clone() else {
+            return false;
+        };
+        let replies = match self
+            .slack_api_query(
+                "conversations.replies",
+                &[
+                    ("channel", channel_id.to_string()),
+                    ("ts", thread_ts.to_string()),
+                    ("limit", "200".to_string()),
+                ],
+            )
+            .await
+        {
+            Ok(replies) => replies,
+            Err(error) => {
+                debug!(channel_id, thread_ts, %error, "Could not read a Slack thread");
+                return false;
+            }
+        };
+        let joined = replies
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m.get("user").and_then(Value::as_str) == Some(bot_id.as_str()))
+            });
+        if joined {
+            self.remember_bot_thread(channel_id, thread_ts);
+        }
+        joined
+    }
+
     /// Handle an Events API payload (message events, etc.).
     async fn handle_events_api(&self, payload: &Value) {
         let mut event = match payload.get("event").cloned() {
@@ -1514,15 +1575,37 @@ impl SlackBot {
             None => return,
         };
 
-        // In groups, collaborators must address the bot explicitly. This keeps
-        // ordinary participant-to-participant chat from becoming agent input.
-        if user_role == UserRole::Guest && !is_dm && !bot_mentioned {
-            return;
-        }
-        // An authorized owner mentioning another person (but not the bot) is
-        // talking to that person, not issuing an agent request.
-        if user_role == UserRole::Owner && !is_dm && !bot_mentioned && raw_text.contains("<@") {
-            return;
+        // In a channel or group only a message that addresses the bot is for
+        // it: a mention from anyone, or from an owner a typed command or a
+        // reply in a thread the bot is already answering in. Everything else
+        // is people talking to each other, the owner included.
+        let thread_root = event
+            .get("thread_ts")
+            .and_then(|v| v.as_str())
+            .filter(|root| event.get("ts").and_then(|v| v.as_str()) != Some(root));
+        if !is_dm && !bot_mentioned {
+            let continues = user_role == UserRole::Owner
+                // Mentioning another person is talking to that person.
+                && !raw_text.contains("<@")
+                && (raw_text.starts_with('!')
+                    || raw_text.starts_with('/')
+                    || match thread_root {
+                        Some(root) => self.bot_in_thread(&channel_id, root).await,
+                        None => false,
+                    });
+            if !continues {
+                return;
+            }
+        } else if !is_dm {
+            // A mention brings the bot into this thread, or opens one.
+            let root = thread_root.or_else(|| {
+                self.use_threads
+                    .then(|| event.get("ts").and_then(|v| v.as_str()))
+                    .flatten()
+            });
+            if let Some(root) = root {
+                self.remember_bot_thread(&channel_id, root);
+            }
         }
 
         // Strip bot @mention from text before processing

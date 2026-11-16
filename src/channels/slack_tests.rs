@@ -122,6 +122,87 @@ async fn group_chatter_that_does_not_address_the_bot_is_ignored() {
     assert!(!api.requests().iter().any(|r| r.path == "/chat.postMessage"));
 }
 
+fn thread_reply(from: &str, text: &str, ts: &str, thread_ts: &str) -> Value {
+    let mut envelope = message(from, "C0SYNTH", "channel", text, ts);
+    envelope["payload"]["event"]["thread_ts"] = json!(thread_ts);
+    envelope
+}
+
+#[tokio::test]
+async fn an_owner_is_answered_in_a_channel_only_when_they_tag_the_bot() {
+    let api = MockApi::start(respond).await;
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("On it.")]);
+    let (channel, harness) = channel(&api, provider).await;
+
+    channel
+        .handle_envelope(message(
+            OWNER,
+            "C0SYNTH",
+            "channel",
+            "shipping the release notes today",
+            "1700000000.000400",
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(harness.provider.call_count().await, 0);
+    assert!(!api.requests().iter().any(|r| r.path == "/chat.postMessage"));
+
+    channel
+        .handle_envelope(message(
+            OWNER,
+            "C0SYNTH",
+            "channel",
+            &format!("<@{BOT}> draft the release notes"),
+            "1700000000.000500",
+        ))
+        .await;
+    api.wait_for(|r| posted(r, "On it.")).await;
+}
+
+#[tokio::test]
+async fn an_owner_reply_continues_a_thread_the_bot_is_in_and_no_other() {
+    let api = MockApi::start(|request: &Recorded| {
+        if request.path.starts_with("/conversations.replies") {
+            // The bot has answered in the thread rooted at ...0600 only.
+            let user = if request.path.contains("1700000000.000600") {
+                BOT
+            } else {
+                STRANGER
+            };
+            return json!({ "ok": true, "messages": [
+                { "user": OWNER, "ts": "1" },
+                { "user": user, "ts": "2" },
+            ]});
+        }
+        respond(request)
+    })
+    .await;
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("Done.")]);
+    let (channel, harness) = channel(&api, provider).await;
+
+    channel
+        .handle_envelope(thread_reply(
+            OWNER,
+            "sounds good to me",
+            "1700000000.000710",
+            "1700000000.000700",
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(harness.provider.call_count().await, 0);
+
+    channel
+        .handle_envelope(thread_reply(
+            OWNER,
+            "and make it shorter",
+            "1700000000.000610",
+            "1700000000.000600",
+        ))
+        .await;
+    let reply = api.wait_for(|r| posted(r, "Done.")).await;
+    assert_eq!(reply.json()["thread_ts"], "1700000000.000600");
+}
+
 #[tokio::test]
 async fn a_cancel_word_with_nothing_running_says_so() {
     let api = MockApi::start(respond).await;

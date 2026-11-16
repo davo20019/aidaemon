@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Slack answers in a channel only when tagged.** An owner's untagged channel message used to run the agent like anyone's DM; now a channel or group message is answered only when it @mentions the bot, for owners too. An owner's untagged reply still continues a thread the bot is already answering in, and a typed `!command` still works. DMs are unchanged.
 - With no usable keychain (a headless server with no secret service), secrets are kept in the owner-only `.env` beside the database key instead of failing, and setup says so.
 - Widening `[authority]` from an app asks another device only when one exists (another paired device, or a chat); a lone device confirms it on a card that says so.
 - The terminal setup wizard is gone: `aidaemon` with no config runs setup mode, and `aidaemon setup` the model step in a terminal. `aidaemon setup low-latency` is unchanged.
