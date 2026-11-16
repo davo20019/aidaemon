@@ -323,6 +323,12 @@ pub enum Glyph {
     Download,
     /// Open outside the app.
     External,
+    /// Share with another app.
+    Share,
+    /// Draw over a picture.
+    Pen,
+    /// Take back the last one.
+    Undo,
 }
 
 impl Glyph {
@@ -362,6 +368,9 @@ impl Glyph {
             Self::Folder => "▸",
             Self::Download => "⤓",
             Self::External => "↗",
+            Self::Share => "⇪",
+            Self::Pen => "✎",
+            Self::Undo => "↶",
         }
     }
 }
@@ -377,6 +386,11 @@ impl Glyph {
                 r#"<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>"#
             }
             Self::Close => r#"<path d="M18 6 6 18M6 6l12 12"/>"#,
+            Self::Share => {
+                r#"<path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8M16 6l-4-4-4 4M12 2v13"/>"#
+            }
+            Self::Pen => r#"<path d="M12 20h9M16.4 3.6a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4Z"/>"#,
+            Self::Undo => r#"<path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>"#,
             Self::External => {
                 r#"<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#
             }

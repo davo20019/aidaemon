@@ -164,7 +164,10 @@ pub fn shell(store: Store) -> View {
         }))
         .child(when(palette, move || palette_dialog(store, palette)))
         .child(crate::features::sidebar::move_picker(store))
-        .child(crate::ui::picture_viewer(store.viewing(), picture_action()))
+        .child(crate::ui::picture_viewer(
+            store.viewing(),
+            picture_actions(store),
+        ))
         .child(ui::toasts(
             move || store.toast(),
             move || store.dismiss_toast(),
@@ -474,27 +477,44 @@ fn steps_key() -> &'static str {
     }
 }
 
-/// What the picture viewer offers: the browser saves a copy; a window opens
-/// it in the system's browser, where it can be saved.
-fn picture_action() -> crate::ui::ViewerAction {
+/// What the picture viewer offers. The browser saves a copy, shares it
+/// through the system's sheet (where there is one) and draws marks over it
+/// for the message; a window opens it in the system's browser.
+fn picture_actions(store: Store) -> crate::ui::ViewerActions {
+    use crate::ui::{Glyph, Viewed, ViewerAction, ViewerActions};
+    use std::rc::Rc;
     #[cfg(target_arch = "wasm32")]
     {
-        crate::ui::ViewerAction {
-            label: "Download",
-            glyph: crate::ui::Glyph::Download,
-            run: std::rc::Rc::new(|shown: &crate::ui::Viewed| {
-                crate::link::web::download(&shown.url, &shown.name)
+        use crate::link::web;
+        ViewerActions {
+            save: ViewerAction {
+                label: "Download",
+                glyph: Glyph::Download,
+                run: Rc::new(|shown: &Viewed| web::download(&shown.url, &shown.name)),
+            },
+            share: web::can_share().then(|| ViewerAction {
+                label: "Share",
+                glyph: Glyph::Share,
+                run: Rc::new(|shown: &Viewed| web::share_file(&shown.url, &shown.name)),
             }),
+            can_mark_up: Rc::new(move || store.takes_files()),
+            mark_up: Rc::new(move |shown: &Viewed, strokes| store.attach_marked(shown, strokes)),
+            opened: Rc::new(|shown: &Viewed| web::prefetch_share(&shown.url)),
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        crate::ui::ViewerAction {
-            label: "Open in browser",
-            glyph: crate::ui::Glyph::External,
-            run: std::rc::Rc::new(|shown: &crate::ui::Viewed| {
-                drop(nsh_core::prelude::open_url(shown.url.clone()))
-            }),
+        let _ = store;
+        ViewerActions {
+            save: ViewerAction {
+                label: "Open in browser",
+                glyph: Glyph::External,
+                run: Rc::new(|shown: &Viewed| drop(nsh_core::prelude::open_url(shown.url.clone()))),
+            },
+            share: None,
+            can_mark_up: Rc::new(|| false),
+            mark_up: Rc::new(|_: &Viewed, _| {}),
+            opened: Rc::new(|_: &Viewed| {}),
         }
     }
 }

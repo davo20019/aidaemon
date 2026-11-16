@@ -36,6 +36,20 @@ extern "C" {
     fn take_picture_js(max_dimension: u32) -> js_sys::Promise;
     #[wasm_bindgen(js_name = downloadUrl)]
     fn download_url_js(url: &str, name: &str);
+    #[wasm_bindgen(js_name = canShare)]
+    fn can_share_js() -> bool;
+    #[wasm_bindgen(js_name = prefetchShare)]
+    fn prefetch_share_js(url: &str);
+    #[wasm_bindgen(js_name = shareFile)]
+    fn share_file_js(url: &str, name: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = markUp)]
+    fn mark_up_js(
+        url: &str,
+        strokes: &str,
+        width: f32,
+        color: &str,
+        max_dimension: u32,
+    ) -> js_sys::Promise;
 
     type Socket;
     #[wasm_bindgen(constructor)]
@@ -51,6 +65,30 @@ extern "C" {
 /// Save a same-origin file under `name` (the browser's download).
 pub fn download(url: &str, name: &str) {
     download_url_js(url, name);
+}
+
+/// Whether the browser has a share sheet.
+pub fn can_share() -> bool {
+    can_share_js()
+}
+
+/// Fetch a picture ahead, so a tap on Share can open the sheet at once.
+pub fn prefetch_share(url: &str) {
+    prefetch_share_js(url);
+}
+
+/// Share a picture through the system's share sheet (or save it, where
+/// files cannot be shared). Called in the tap: the sheet opens only then.
+pub fn share_file(url: &str, name: &str) {
+    drop(share_file_js(url, name));
+}
+
+/// The picture with `strokes` (JSON) drawn over it, as JPEG bytes.
+pub async fn mark_up(url: &str, strokes: &str, width: f32, color: &str) -> Option<Vec<u8>> {
+    let made = JsFuture::from(mark_up_js(url, strokes, width, color, 2048))
+        .await
+        .ok()?;
+    (!made.is_null() && !made.is_undefined()).then(|| js_sys::Uint8Array::new(&made).to_vec())
 }
 
 pub async fn take_picture(max_dimension: u32) -> Option<Vec<u8>> {

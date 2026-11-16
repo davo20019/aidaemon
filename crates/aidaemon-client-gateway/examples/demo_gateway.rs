@@ -825,8 +825,13 @@ async fn main() -> anyhow::Result<()> {
     let token = aidaemon_client_gateway::token::mint(&token_file)?;
     let token_copy = dir.path().join("client-token");
     std::fs::write(&token_copy, &token)?;
+    // Uploads work, so pictures and their viewer can be tried.
+    let files = aidaemon_client_gateway::files::FileStore::open(
+        dir.path().join("files"),
+        dir.path().join("uploads"),
+    )?;
     let gateway = ClientGateway::start(GatewayDeps {
-        files: None,
+        files: Some(Arc::new(files)),
         turns: TurnDeps {
             agent,
             session_map,

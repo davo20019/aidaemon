@@ -158,3 +158,83 @@ export function downloadUrl(url, name) {
   link.click();
   link.remove();
 }
+
+// Pictures fetched ahead for the share sheet: a browser shares only during
+// the tap, so the file must be ready when it comes.
+const sharing = new Map();
+
+/** Whether the browser has a share sheet. */
+export function canShare() {
+  return typeof navigator.share === "function";
+}
+
+/** Fetch a picture ahead for `shareFile` (kept for the page's life, at most a few). */
+export function prefetchShare(url) {
+  if (!canShare() || sharing.has(url)) return;
+  if (sharing.size > 8) sharing.delete(sharing.keys().next().value);
+  sharing.set(
+    url,
+    fetch(url)
+      .then((r) => (r.ok ? r.blob() : null))
+      .catch(() => null),
+  );
+}
+
+/**
+ * Share a picture as a file through the system's share sheet; where files
+ * cannot be shared, save it instead (its link is private to the daemon).
+ */
+export async function shareFile(url, name) {
+  prefetchShare(url);
+  const blob = await sharing.get(url);
+  if (blob) {
+    const file = new File([blob], name, { type: blob.type });
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: name });
+      } catch {
+        // Cancelled, or the sheet refused: nothing to do.
+      }
+      return;
+    }
+  }
+  downloadUrl(url, name);
+}
+
+/**
+ * The picture at `url` with `strokes` drawn over it (JSON: strokes of
+ * [x, y] from 0 to 1), as JPEG bytes no larger than `maxDimension`; null
+ * when the picture cannot be read.
+ */
+export async function markUp(url, strokes, width, color, maxDimension) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const bitmap = await createImageBitmap(await response.blob(), {
+      imageOrientation: "from-image",
+    });
+    const scale = Math.min(1, maxDimension / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const pen = canvas.getContext("2d");
+    pen.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    pen.strokeStyle = color;
+    pen.lineWidth = Math.max(2, width * Math.max(canvas.width, canvas.height));
+    pen.lineCap = "round";
+    pen.lineJoin = "round";
+    for (const stroke of JSON.parse(strokes)) {
+      if (!stroke.length) continue;
+      pen.beginPath();
+      pen.moveTo(stroke[0][0] * canvas.width, stroke[0][1] * canvas.height);
+      if (stroke.length === 1) pen.lineTo(stroke[0][0] * canvas.width + 0.01, stroke[0][1] * canvas.height);
+      for (const [x, y] of stroke.slice(1)) pen.lineTo(x * canvas.width, y * canvas.height);
+      pen.stroke();
+    }
+    const blob = await new Promise((done) => canvas.toBlob(done, "image/jpeg", 0.9));
+    return blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+  } catch {
+    return null;
+  }
+}

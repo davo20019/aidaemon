@@ -1148,94 +1148,303 @@ pub struct Viewed {
     pub pixels: Option<(u32, u32)>,
 }
 
-/// What the viewer offers besides closing: save a copy (the web) or open
-/// it outside the app (a window).
+/// One button of the viewer: what it says and does.
 pub struct ViewerAction {
     pub label: &'static str,
     pub glyph: Glyph,
     pub run: std::rc::Rc<dyn Fn(&Viewed)>,
 }
 
+/// Marks drawn over a picture: strokes of points, each from 0 to 1 across
+/// the picture's width and height.
+pub type Strokes = Vec<Vec<(f32, f32)>>;
+
+/// A stroke's width, as a share of the picture's longer side (the drawing
+/// and the picture made from it use the same).
+pub const MARK_WIDTH: f32 = 0.012;
+/// The marks' colour: a red that reads on most pictures.
+pub const MARK_COLOR: &str = "#ff3b30";
+
+/// Puts a marked picture on the message.
+pub type MarkUp = std::rc::Rc<dyn Fn(&Viewed, Strokes)>;
+
+/// What the viewer offers besides Close.
+pub struct ViewerActions {
+    /// Save a copy (the web) or open it outside the app (a window).
+    pub save: ViewerAction,
+    /// The system's share sheet, where there is one.
+    pub share: Option<ViewerAction>,
+    /// Draw over the picture and put the result on the message being
+    /// written, where this returns true now; `mark_up` closes the viewer
+    /// when done.
+    pub can_mark_up: std::rc::Rc<dyn Fn() -> bool>,
+    pub mark_up: MarkUp,
+    /// It opened on a picture (the share sheet fetches it ahead).
+    pub opened: std::rc::Rc<dyn Fn(&Viewed)>,
+}
+
 /// The picture viewer: the picture over a dark backdrop, as large as fits,
-/// its name, the action and Close above it. A press on the picture or the
-/// backdrop, Escape or back closes it. Mount once; `viewing` holds what it
+/// its name, Mark up, Share, the save action and Close above it. A press on
+/// the picture or the backdrop, Escape or back closes it. Marking up draws
+/// over the picture with a finger or the mouse; Add to message puts the
+/// marked picture on the message. Mount once; `viewing` holds what it
 /// shows.
-pub fn picture_viewer(viewing: Signal<Option<Viewed>>, action: ViewerAction) -> View {
-    let action = std::rc::Rc::new(action);
+pub fn picture_viewer(viewing: Signal<Option<Viewed>>, actions: ViewerActions) -> View {
+    let actions = std::rc::Rc::new(actions);
     view().child(dynamic(move || {
         let shown = viewing.get()?;
-        let action = action.clone();
-        Some(untracked(move || viewer(shown, &action, viewing)))
+        let actions = actions.clone();
+        (actions.opened)(&shown);
+        Some(untracked(move || viewer(shown, actions, viewing)))
     }))
 }
 
 fn viewer(
     shown: Viewed,
-    action: &std::rc::Rc<ViewerAction>,
+    actions: std::rc::Rc<ViewerActions>,
     viewing: Signal<Option<Viewed>>,
 ) -> View {
     let close = move || viewing.set(None);
+    let marking = signal(false);
+    let strokes: Signal<Strokes> = signal(Vec::new());
+    // The room for the picture, and so the picture's box: as large as fits,
+    // in its own shape (the marks are laid over exactly the picture).
+    let room = signal((0.0f32, 0.0f32));
     let ratio = shown
         .pixels
         .filter(|(w, h)| *w > 0 && *h > 0)
         .map(|(w, h)| w as f32 / h as f32);
-    let picture = image(shown.url.clone())
-        .max_w(percentage(1.0))
-        .max_h(percentage(1.0))
-        .object_fit(ResizeMode::Contain);
-    let picture = match ratio {
-        Some(ratio) => picture.w_full().aspect_ratio(ratio),
-        None => picture.w_full().h_full(),
+    let fitted = move || {
+        let (w, h) = room.get();
+        let ratio = ratio.unwrap_or(1.0);
+        let width = w.min(h * ratio).max(0.0);
+        (width, width / ratio)
     };
-    let run = {
+
+    let pressable = |glyph: Glyph, label: &'static str, run: std::rc::Rc<dyn Fn(&Viewed)>| {
         let shown = shown.clone();
-        let action = action.clone();
-        move || (action.run)(&shown)
+        viewer_btn(glyph, label, move || run(&shown))
     };
+    let mut looking = view().flex_row().items_center().gap_2();
+    if ratio.is_some() {
+        looking = looking.child(when(
+            {
+                let can = actions.can_mark_up.clone();
+                move || can()
+            },
+            move || viewer_btn(Glyph::Pen, "Mark up", move || marking.set(true)),
+        ));
+    }
+    if let Some(share) = &actions.share {
+        looking = looking.child(pressable(share.glyph, share.label, share.run.clone()));
+    }
+    looking = looking
+        .child(pressable(
+            actions.save.glyph,
+            actions.save.label,
+            actions.save.run.clone(),
+        ))
+        .child(viewer_btn(Glyph::Close, "Close", close));
+
+    let add = {
+        let shown = shown.clone();
+        let actions = actions.clone();
+        move || {
+            let marks = strokes.get_untracked();
+            if marks.is_empty() {
+                return;
+            }
+            // It closes the viewer once the picture is on the message (work
+            // spawned here ends with the viewer).
+            (actions.mark_up)(&shown, marks);
+        }
+    };
+    let drawing = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(when(
+            move || strokes.with(|s| !s.is_empty()),
+            move || {
+                viewer_btn(Glyph::Undo, "Undo", move || {
+                    strokes.update(|s| {
+                        s.pop();
+                    })
+                })
+            },
+        ))
+        .child(viewer_text_btn("Cancel", false, move || {
+            strokes.set(Vec::new());
+            marking.set(false);
+        }))
+        .child(when(
+            move || strokes.with(|s| !s.is_empty()),
+            move || viewer_text_btn("Add to message", true, add.clone()),
+        ));
+
     let bar = view()
         .flex_row()
         .items_center()
         .gap_2()
         .px_3()
         .py_2()
+        .min_h(px(if super::touch() { 60.0 } else { 52.0 }))
         .child(
-            text(shown.name.clone())
-                .flex_1()
-                .min_w(px(0.0))
-                .number_of_lines(1)
-                .text_size(px(type_scale::SM))
-                .text_color(colors::ON_LIGHTBOX),
+            text({
+                let name = shown.name.clone();
+                move || {
+                    if marking.get() && super::touch() {
+                        String::new()
+                    } else if marking.get() {
+                        "Draw over what matters".to_owned()
+                    } else {
+                        name.clone()
+                    }
+                }
+            })
+            .flex_1()
+            .min_w(px(0.0))
+            .number_of_lines(1)
+            .text_size(px(type_scale::SM))
+            .text_color(colors::ON_LIGHTBOX),
         )
-        .child(viewer_btn(action.glyph, action.label, run))
-        .child(viewer_btn(Glyph::Close, "Close", close));
+        .child(when(move || !marking.get(), move || looking.clone()))
+        .child(when(move || marking.get(), move || drawing.clone()));
+
+    // The marks as line art over the picture.
+    let marks = svg(move || {
+        let (w, h) = fitted();
+        nsh_core::element::ImageSrc::svg_markup(&marks_svg(&strokes.get(), w, h))
+    })
+    .absolute()
+    .inset_0();
+    // Where a drag draws: an empty layer over all, so a finger's place is
+    // in its own frame.
+    let start = signal((0.0f32, 0.0f32));
+    let pad = view()
+        .absolute()
+        .inset_0()
+        .claim_touches(TouchClaim::on_start().ask(move |request: &ClaimRequest| {
+            if marking.get_untracked() {
+                request.claim();
+            }
+        }))
+        .keep_touches(true)
+        .on_responder_grant(move |e: &ResponderEvent| {
+            let (w, h) = fitted();
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
+            let at = (e.location.x.0 / w, e.location.y.0 / h);
+            start.set(at);
+            strokes.update(|s| s.push(vec![at]));
+        })
+        .on_responder_move(move |e: &ResponderEvent| {
+            let (w, h) = fitted();
+            if w <= 0.0 || h <= 0.0 {
+                return;
+            }
+            let (x0, y0) = start.get_untracked();
+            let at = (
+                (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
+                (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
+            );
+            strokes.update(|s| {
+                if let Some(last) = s.last_mut() {
+                    last.push(at);
+                }
+            });
+        });
+    let picture = view()
+        .relative()
+        .w(move || px(fitted().0))
+        .h(move || px(fitted().1))
+        .child(
+            image(shown.url.clone())
+                .w_full()
+                .h_full()
+                .object_fit(ResizeMode::Contain),
+        )
+        .child(marks)
+        .child(when(move || marking.get(), move || pad.clone()));
+
     view().child(
         dialog()
             .label(format!("Picture: {}", shown.name))
-            .on_cancel(close)
+            .on_cancel(move || {
+                if marking.get_untracked() {
+                    strokes.set(Vec::new());
+                    marking.set(false);
+                } else {
+                    close();
+                }
+            })
+            .bg(colors::LIGHTBOX)
             .child(
                 view()
-                    .absolute()
-                    .inset_0()
-                    .bg(colors::LIGHTBOX)
+                    .flex_1()
+                    .w_full()
+                    .h_full()
                     .flex_col()
                     .pt_safe_area()
                     .pb_safe_area()
                     .test_id("picture-viewer")
                     .child(bar)
                     .child(
-                        // The backdrop: a press here (the picture too) closes.
+                        // The backdrop: a press here (the picture too)
+                        // closes, unless marking up.
                         view()
                             .flex_1()
                             .min_h(px(0.0))
                             .w_full()
-                            .p_4()
                             .items_center()
                             .justify_center()
                             .focusable(false)
-                            .on_press(close)
-                            .child(picture),
+                            .on_press(move || {
+                                if !marking.get_untracked() {
+                                    close();
+                                }
+                            })
+                            .child(
+                                view()
+                                    .w_full()
+                                    .h_full()
+                                    .p_4()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_layout(move |b: &Bounds<Points>| {
+                                        room.set((
+                                            (b.size.width.0 - 32.0).max(0.0),
+                                            (b.size.height.0 - 32.0).max(0.0),
+                                        ))
+                                    })
+                                    .child(picture),
+                            ),
                     ),
             ),
+    )
+}
+
+/// The marks as an SVG of `w` by `h` points.
+fn marks_svg(strokes: &Strokes, w: f32, h: f32) -> String {
+    let width = MARK_WIDTH * w.max(h);
+    let mut paths = String::new();
+    for stroke in strokes {
+        let Some(((x, y), rest)) = stroke.split_first() else {
+            continue;
+        };
+        paths.push_str(&format!("<path d=\"M{:.1} {:.1}", x * w, y * h));
+        if rest.is_empty() {
+            // A tap: a dot.
+            paths.push_str(" l0.01 0");
+        }
+        for (x, y) in rest {
+            paths.push_str(&format!(" L{:.1} {:.1}", x * w, y * h));
+        }
+        paths.push_str("\"/>");
+    }
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.1} {h:.1}" fill="none" stroke="{MARK_COLOR}" stroke-width="{width:.1}" stroke-linecap="round" stroke-linejoin="round">{paths}</svg>"#
     )
 }
 
@@ -1258,6 +1467,37 @@ fn viewer_btn(glyph: Glyph, label: &'static str, on_press: impl Fn() + 'static) 
                 icon(glyph)
                     .text_color(colors::ON_LIGHTBOX)
                     .accessibility_elements_hidden(true),
+            ),
+    )
+}
+
+/// A pill with a word over the viewer's backdrop; `main`: filled.
+fn viewer_text_btn(label: &'static str, main: bool, on_press: impl Fn() + 'static) -> View {
+    let side = if super::touch() { 44.0 } else { 36.0 };
+    view().child(
+        nsh_base::button()
+            .h(px(side))
+            .px_4()
+            .rounded_full()
+            .items_center()
+            .justify_center()
+            .bg(if main {
+                colors::ON_LIGHTBOX
+            } else {
+                colors::LIGHTBOX_CONTROL
+            })
+            .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+            .accessibility_label(label)
+            .on_press(on_press)
+            .child(
+                text(label)
+                    .text_size(px(type_scale::SM))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if main {
+                        colors::LIGHTBOX_INK
+                    } else {
+                        colors::ON_LIGHTBOX
+                    }),
             ),
     )
 }

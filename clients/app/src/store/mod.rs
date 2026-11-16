@@ -1775,6 +1775,45 @@ impl Store {
         }
     }
 
+    /// Put a picture with marks drawn over it on the message being written
+    /// (the browser draws them; the name says it was marked).
+    pub fn attach_marked(&self, shown: &crate::ui::Viewed, strokes: crate::ui::Strokes) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store = *self;
+            let url = shown.url.clone();
+            let stem = shown
+                .name
+                .rsplit_once('.')
+                .map_or(shown.name.as_str(), |(stem, _)| stem)
+                .to_owned();
+            let strokes = serde_json::to_string(&strokes).unwrap_or_default();
+            spawn(async move {
+                match crate::link::web::mark_up(
+                    &url,
+                    &strokes,
+                    crate::ui::MARK_WIDTH,
+                    crate::ui::MARK_COLOR,
+                )
+                .await
+                {
+                    Some(bytes) => store.attach_file(
+                        format!("{stem}-marked.jpg"),
+                        "image/jpeg".to_owned(),
+                        &bytes,
+                    ),
+                    None => store.say("Couldn't read that picture to mark it up".to_owned()),
+                }
+                store.viewing.set(None);
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (shown, strokes);
+            self.viewing.set(None);
+        }
+    }
+
     pub fn remove_draft_file(&self, number: u64) {
         self.act(|c| c.remove_draft_file(number));
     }
