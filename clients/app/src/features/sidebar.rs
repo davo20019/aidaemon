@@ -269,6 +269,10 @@ fn session_preview(store: Store, id: String) -> View {
 /// (a phone's; a window has its own row) and Close (or ⌘K's hint). Open:
 /// the search field across the line, focused, and Cancel, which clears it.
 /// A search left in the field keeps it open.
+/// The name button's own padding, taken from the line's so the name stays
+/// where it was.
+const NAME_INSET: f32 = 4.0;
+
 fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> View {
     let open = signal(!untracked(|| query.get()).trim().is_empty());
     let close = move || {
@@ -279,7 +283,7 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
         .h(px(ui::fit::bar()))
         .flex_row()
         .items_center()
-        .pl_3()
+        .pl(px(12.0 - NAME_INSET))
         .pr_2()
         .gap_1()
         .child(
@@ -306,12 +310,12 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child(
-                        text("AIDaemon")
-                            .role(AccessibilityRole::Header)
-                            .text_size(px(ui::fit::body()))
-                            .font_weight(FontWeight::SEMIBOLD),
-                    )
+                    // The name goes home: the main list and a new
+                    // conversation.
+                    .child(ui::name_btn("AIDaemon", NAME_INSET, move || {
+                        store.show_sidebar_view(SidebarView::Home);
+                        store.select(None);
+                    }))
                     // The connection at a glance; its words come to the
                     // footer only when something is wrong.
                     .child(ui::status_dot(

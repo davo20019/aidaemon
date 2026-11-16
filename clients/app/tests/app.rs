@@ -165,6 +165,24 @@ fn the_name_carries_the_connection_as_a_dot() -> Result<(), String> {
 }
 
 #[test]
+fn the_name_goes_home() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-9","channel":"app","title":"Garden notes","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Garden notes")?;
+    app.press("Garden notes >> nth=0")?;
+    app.wait_for_gone("What can I help with?", std::time::Duration::from_secs(5))?;
+    app.press("AIDaemon, home")?;
+    app.wait_for("What can I help with?")?;
+    Ok(())
+}
+
+#[test]
 fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

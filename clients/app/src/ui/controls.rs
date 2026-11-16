@@ -1008,6 +1008,24 @@ pub fn corner_dot(tone: impl Fn() -> Tone + 'static) -> View {
         .accessibility_elements_hidden(true)
 }
 
+/// The app's name at the top as a button home, as other chat apps do:
+/// `inset` is the padding either side, so a caller lines its text up.
+pub fn name_btn(label: &'static str, inset: f32, on_press: impl Fn() + 'static) -> View {
+    with_hint(
+        "Home",
+        frame(Variant::Ghost, Size::Sm, motion::PRESS_SCALE)
+            .px(px(inset))
+            .accessibility_label(SharedString::from(format!("{label}, home")))
+            .on_press(on_press)
+            .child(
+                text(label)
+                    .text_size(px(fit::body()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .accessibility_elements_hidden(true),
+            ),
+    )
+}
+
 /// A state as one small dot beside a name (the connection beside the
 /// app's): `label` is what screen readers and the tooltip say, and a
 /// press says it too, for a phone with no hover.
