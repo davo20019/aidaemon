@@ -1114,7 +1114,6 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
     let (f, g, h) = (id.clone(), id.clone(), id.clone());
     let label_id = id.clone();
     let date_id = id.clone();
-    let src_id = id.clone();
     row(
         move || store.selected().as_deref() == Some(a.as_str()),
         move || store.select(Some(b.clone())),
@@ -1146,68 +1145,7 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             }
         },
     ))
-    .child(
-        text(move || store.title(&d))
-            .flex_1()
-            .min_w(px(0.0))
-            .number_of_lines(1)
-            .text_size(px(ui::fit::body()))
-            .text_color(move || {
-                if store.is_unread(&h) {
-                    colors::TEXT
-                } else {
-                    colors::MUTED
-                }
-            }),
-    )
-    .child(
-        text(move || if store.is_pinned(&f) { "★" } else { "" })
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT),
-    )
-    // One faint mark where it adds something: its project's name (outside
-    // that project's page), or the chat it came from when not the app:
-    // Telegram, Discord and Slack by their icons (a group adds people),
-    // any other by name.
-    .child(
-        text(move || {
-            if let Some(project) = store.session_project(&g).and_then(|p| store.project(&p)) {
-                return match store.sidebar_view() {
-                    SidebarView::Project(_) => String::new(),
-                    _ => project.name,
-                };
-            }
-            match source_glyph(store.source(&id)) {
-                Some(_) => String::new(),
-                None => store.source_tag(&id),
-            }
-        })
-        .max_w(percentage(0.4))
-        .number_of_lines(1)
-        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-        .text_color(colors::FAINT),
-    )
-    .child(dynamic(move || {
-        let in_project = store
-            .session_project(&src_id)
-            .and_then(|p| store.project(&p))
-            .is_some();
-        let glyph = source_glyph(store.source(&src_id)).filter(|_| !in_project)?;
-        let group = store.is_group(&src_id);
-        let said = store.source_tag(&src_id);
-        Some(untracked(move || {
-            let mut marks = view()
-                .flex_row()
-                .items_center()
-                .role(AccessibilityRole::Image)
-                .label(said)
-                .child(icon(glyph).text_color(colors::FAINT));
-            if group {
-                marks = marks.child(icon(Glyph::Group).text_color(colors::FAINT));
-            }
-            marks
-        }))
-    }))
+    .child(row_names(store, id, d, f, g, h))
     // At the end, what it is doing: waiting on the owner ("Needs you",
     // amber), working (a turning ring), else when it last moved ("3h",
     // "Oct 30") where the list shows times.
@@ -1244,6 +1182,116 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
             })),
         }))
     }))
+}
+
+/// A conversation row's name and where it is from: its project's name
+/// (outside that project's page), or the chat it came from when not the
+/// app (Telegram, Discord and Slack by their icons, a group adding people;
+/// any other by name). A window keeps them on one line, faint after the
+/// name; a phone, whose name has little room, puts them on a second line
+/// under it, and a row with nothing to say stays one line.
+fn row_names(store: Store, id: String, d: String, f: String, g: String, h: String) -> View {
+    let title = text(move || store.title(&d))
+        .flex_1()
+        .min_w(px(0.0))
+        .number_of_lines(1)
+        .text_size(px(ui::fit::body()))
+        .text_color(move || {
+            if store.is_unread(&h) {
+                colors::TEXT
+            } else {
+                colors::MUTED
+            }
+        });
+    let star = text(move || if store.is_pinned(&f) { "★" } else { "" })
+        .text_size(px(type_scale::XS))
+        .text_color(colors::FAINT);
+    let (tag_id, mark_id, any_id) = (g, id.clone(), id);
+    let tag = move || row_tag(store, &tag_id);
+    let tag_text = move || {
+        let tag = tag.clone();
+        text(tag)
+            .number_of_lines(1)
+            .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+            .text_color(colors::FAINT)
+    };
+    let mark = move || {
+        let id = mark_id.clone();
+        dynamic(move || {
+            let glyph = row_glyph(store, &id)?;
+            let group = store.is_group(&id);
+            let said = store.source_tag(&id);
+            Some(untracked(move || {
+                let mut marks = view()
+                    .flex_row()
+                    .items_center()
+                    .role(AccessibilityRole::Image)
+                    .label(said)
+                    .child(icon(glyph).text_color(colors::FAINT));
+                if group {
+                    marks = marks.child(icon(Glyph::Group).text_color(colors::FAINT));
+                }
+                marks
+            }))
+        })
+    };
+    if !ui::touch() {
+        return view()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(title)
+            .child(star)
+            .child(tag_text().max_w(percentage(0.4)))
+            .child(mark());
+    }
+    let said = move || !row_tag(store, &any_id).is_empty() || row_glyph(store, &any_id).is_some();
+    view()
+        .flex_1()
+        .min_w(px(0.0))
+        .gap(px(2.0))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(title)
+                .child(star),
+        )
+        .child(when(said, move || {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(mark())
+                .child(tag_text().flex_1().min_w(px(0.0)))
+        }))
+}
+
+/// The words a conversation row is tagged with: its project's name outside
+/// that project's page, else the chat it came from when it has no icon.
+fn row_tag(store: Store, id: &str) -> String {
+    if let Some(project) = store.session_project(id).and_then(|p| store.project(&p)) {
+        return match store.sidebar_view() {
+            SidebarView::Project(_) => String::new(),
+            _ => project.name,
+        };
+    }
+    match source_glyph(store.source(id)) {
+        Some(_) => String::new(),
+        None => store.source_tag(id),
+    }
+}
+
+/// The chat icon a conversation row shows: none once it is in a project.
+fn row_glyph(store: Store, id: &str) -> Option<Glyph> {
+    let in_project = store
+        .session_project(id)
+        .and_then(|p| store.project(&p))
+        .is_some();
+    source_glyph(store.source(id)).filter(|_| !in_project)
 }
 
 /// The icon of a chat platform a conversation came from; none for the app

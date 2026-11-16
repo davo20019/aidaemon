@@ -627,8 +627,9 @@ pub fn state_dot(
     filled: impl Fn() -> bool + Clone + 'static,
     color: impl Fn() -> AdaptiveColor + Clone + 'static,
 ) -> View {
+    // Narrow on a phone, where the name after it needs the room.
     let slot = view()
-        .w(px(fit::icon_slot()))
+        .w(px(if touch() { 8.0 } else { fit::icon_slot() }))
         .h(px(fit::icon_slot()))
         .items_center()
         .justify_center()
