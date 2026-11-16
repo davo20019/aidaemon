@@ -1298,11 +1298,7 @@ fn connection(store: Store) -> View {
             Connection::Connecting => status("Connecting…", Tone::Accent),
             Connection::NeedsPairing => status("Not paired yet", Tone::Warning),
             Connection::NoDaemon => status("No daemon yet", Tone::Warning),
-            Connection::Offline {
-                kind,
-                reason,
-                retry_at_ms,
-            } => {
+            Connection::Offline { kind, reason, .. } => {
                 let headline = match kind {
                     DropKind::DaemonNotRunning => "The daemon is not running",
                     DropKind::Unauthorized => "The daemon refused this app",
@@ -1311,11 +1307,12 @@ fn connection(store: Store) -> View {
                 };
                 // One row: the footer sits under the conversation list and
                 // must not eat its room on a phone.
+                // Not a countdown: this row is drawn once per state, and
+                // the next try comes sooner when the page wakes.
                 let detail = if kind == DropKind::Unauthorized {
                     reason
                 } else {
-                    let retry = (retry_at_ms.saturating_sub(now_ms()) / 1000).max(1);
-                    format!("retrying in {retry}s")
+                    "Reconnecting…".to_string()
                 };
                 view()
                     .flex_row()

@@ -26,6 +26,11 @@ pub const SILENT_LIMIT: Duration = Duration::from_secs(60);
 pub const RETRY_MIN: Duration = Duration::from_millis(500);
 /// The longest wait between tries.
 pub const RETRY_MAX: Duration = Duration::from_secs(10);
+/// A socket quiet this long when the device wakes is asked whether it is
+/// still there.
+pub const WAKE_QUIET: Duration = Duration::from_secs(3);
+/// How long a socket asked on waking has to answer before it is dropped.
+pub const WAKE_ANSWER: Duration = Duration::from_secs(4);
 
 /// What the client says it is in `hello`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +103,9 @@ pub struct LinkMachine {
     open: bool,
     last_heard_ms: u64,
     last_ping_ms: u64,
+    /// When the device woke and asked a quiet socket whether it is alive;
+    /// cleared by anything heard.
+    asked_ms: Option<u64>,
     /// The wait before the next try.
     wait: Duration,
 }
@@ -118,6 +126,7 @@ impl LinkMachine {
             open: false,
             last_heard_ms: 0,
             last_ping_ms: 0,
+            asked_ms: None,
             wait: RETRY_MIN,
         }
     }
@@ -150,6 +159,7 @@ impl LinkMachine {
         self.refused = None;
         self.last_heard_ms = now_ms;
         self.last_ping_ms = now_ms;
+        self.asked_ms = None;
         let mut frames = vec![ClientFrame::Hello {
             version: ProtocolVersion::CURRENT,
             client: ClientInfo {
@@ -186,7 +196,7 @@ impl LinkMachine {
     /// A text message arrived at `now_ms`: the frame for the app, if it is
     /// one.
     pub fn received(&mut self, text: &str, now_ms: u64) -> Option<ServerFrame> {
-        self.last_heard_ms = now_ms;
+        self.heard(now_ms);
         let frame = serde_json::from_str::<ServerFrame>(text).ok()?;
         self.note(&frame);
         Some(frame)
@@ -196,6 +206,28 @@ impl LinkMachine {
     /// alive.
     pub fn heard(&mut self, now_ms: u64) {
         self.last_heard_ms = now_ms;
+        self.asked_ms = None;
+    }
+
+    /// The device woke (a page shown again, the network back) at `now_ms`.
+    /// A phone freezes a page in the background, and its socket can be
+    /// dead without a close: a quiet open socket is pinged, and dropped by
+    /// [`LinkMachine::tick`] when it does not answer within
+    /// [`WAKE_ANSWER`]. With no socket, the backoff starts over, so the
+    /// next try is now.
+    pub fn woke(&mut self, now_ms: u64) -> Option<ClientFrame> {
+        if !self.open {
+            self.wait = RETRY_MIN;
+            return None;
+        }
+        if self.asked_ms.is_some()
+            || now_ms.saturating_sub(self.last_heard_ms) < millis(WAKE_QUIET)
+        {
+            return None;
+        }
+        self.asked_ms = Some(now_ms);
+        self.last_ping_ms = now_ms;
+        Some(ClientFrame::Ping)
     }
 
     fn note(&mut self, frame: &ServerFrame) {
@@ -229,7 +261,10 @@ impl LinkMachine {
         if !self.open {
             return Tick::Wait;
         }
-        if now_ms.saturating_sub(self.last_heard_ms) > millis(SILENT_LIMIT) {
+        let unanswered = self
+            .asked_ms
+            .is_some_and(|asked| now_ms.saturating_sub(asked) > millis(WAKE_ANSWER));
+        if unanswered || now_ms.saturating_sub(self.last_heard_ms) > millis(SILENT_LIMIT) {
             return Tick::Dead(self.closed("no answer from the gateway"));
         }
         if now_ms.saturating_sub(self.last_ping_ms) >= millis(PING_EVERY) {
@@ -243,6 +278,7 @@ impl LinkMachine {
     /// worked starts the backoff over.
     pub fn closed(&mut self, reason: impl Into<String>) -> Disconnect {
         self.open = false;
+        self.asked_ms = None;
         let (kind, reason) = match self.refused.take() {
             Some(why) => (DropKind::Unauthorized, why),
             None => (DropKind::Dropped, reason.into()),
@@ -413,6 +449,37 @@ mod tests {
             RETRY_MIN,
             "a working connection resets the wait"
         );
+    }
+
+    #[test]
+    fn waking_asks_a_quiet_socket_and_retries_a_closed_one_now() {
+        let mut m = machine();
+        m.failed(DropKind::DaemonNotRunning, "refused");
+        m.failed(DropKind::DaemonNotRunning, "refused");
+        assert_eq!(m.woke(0), None);
+        assert_eq!(
+            m.failed(DropKind::Dropped, "x").retry_in,
+            RETRY_MIN,
+            "waking starts the backoff over"
+        );
+
+        m.opened(0);
+        assert_eq!(m.woke(1_000), None, "just heard: nothing to ask");
+        let woke = millis(PING_EVERY) - 1_000;
+        assert_eq!(m.woke(woke), Some(ClientFrame::Ping));
+        assert_eq!(m.woke(woke + 10), None, "asked once");
+        m.heard(woke + 500);
+        assert_eq!(m.tick(woke + millis(WAKE_ANSWER) + 1), Tick::Wait);
+
+        let woke = woke + 10_000;
+        assert_eq!(m.woke(woke), Some(ClientFrame::Ping));
+        assert!(matches!(
+            m.tick(woke + millis(WAKE_ANSWER) + 1),
+            Tick::Dead(Disconnect {
+                kind: DropKind::Dropped,
+                ..
+            })
+        ));
     }
 
     #[test]

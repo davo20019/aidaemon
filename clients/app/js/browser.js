@@ -90,6 +90,21 @@ export function forgetPairingLink() {
 }
 
 /** A socket to `url`; `event(kind, text)` hears "open", "message", "close". */
+/**
+ * Call `wake` when the page is shown again or the network comes back: a
+ * phone freezes a background page, and its socket may have died meanwhile.
+ */
+export function onWake(wake) {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") wake();
+  });
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) wake();
+  });
+  window.addEventListener("online", () => wake());
+  window.addEventListener("focus", () => wake());
+}
+
 export class Socket {
   constructor(url, event) {
     this.ws = new WebSocket(url);

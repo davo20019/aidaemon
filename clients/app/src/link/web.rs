@@ -51,6 +51,9 @@ extern "C" {
         max_dimension: u32,
     ) -> js_sys::Promise;
 
+    #[wasm_bindgen(js_name = onWake)]
+    fn on_wake(wake: &Closure<dyn FnMut()>);
+
     type Socket;
     #[wasm_bindgen(constructor)]
     fn new(url: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
@@ -227,6 +230,14 @@ pub fn start(store: Store) {
         store.attach(Box::new(move |id, command| {
             let _ = commands_tx.unbounded_send((id, command));
         }));
+        // The page shown again or back online: check the socket now, or
+        // stop waiting out the backoff.
+        let (wake_tx, mut wakes) = mpsc::unbounded::<()>();
+        let wake = Closure::<dyn FnMut()>::new(move || {
+            let _ = wake_tx.unbounded_send(());
+        });
+        on_wake(&wake);
+        wake.forget();
         let base = origin();
         let url = aidaemon_client_core::machine::socket_url(&base);
         let mut grant = GrantCache::default();
@@ -248,7 +259,7 @@ pub fn start(store: Store) {
                         grant.drop_grant();
                     }
                     store.update(Update::Disconnected(d));
-                    timer(wait).await;
+                    wait_or_wake(&mut machine, wait, &mut wakes).await;
                     continue;
                 }
             };
@@ -272,6 +283,12 @@ pub fn start(store: Store) {
                 let mut tick = Box::pin(timer(Duration::from_secs(1)));
                 let event = futures::select! {
                     heard = events.next() => Some(heard),
+                    _ = wakes.next() => {
+                        if let Some(frame) = machine.woke(now()) {
+                            send(&frame);
+                        }
+                        None
+                    }
                     command = commands.next() => {
                         if let Some((id, command)) = command
                             && let Some(frame) = machine.command(id, command)
@@ -336,9 +353,24 @@ pub fn start(store: Store) {
             }
             let wait = disconnect.retry_in;
             store.update(Update::Disconnected(disconnect));
-            timer(wait).await;
+            wait_or_wake(&mut machine, wait, &mut wakes).await;
         }
     });
+}
+
+/// The backoff's wait, cut short when the page wakes.
+async fn wait_or_wake(
+    machine: &mut LinkMachine,
+    wait: Duration,
+    wakes: &mut mpsc::UnboundedReceiver<()>,
+) {
+    let mut wait = Box::pin(futures::FutureExt::fuse(timer(wait)));
+    futures::select! {
+        _ = wait => {}
+        _ = wakes.next() => {
+            machine.woke(now());
+        }
+    }
 }
 
 async fn grant_token(
