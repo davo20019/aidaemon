@@ -1751,8 +1751,11 @@ mod child_runtime_tests {
         assert_eq!(footer, format!("{MEASURED_TIMING_MARK}{card}"));
     }
 
+    /// The measured time of a background helper is the card's to show
+    /// (`daabec92`): the result the owner reads carries the helper's body
+    /// and none of the daemon's timing lines.
     #[tokio::test]
-    async fn a_background_childs_result_says_how_long_it_took() {
+    async fn a_background_childs_result_leaves_its_time_to_the_card() {
         let child = ScriptedChild::new("synthetic report", Duration::from_millis(50));
         let store = notification_store().await;
         let state: Arc<dyn StateStore> = store.clone();
@@ -1763,9 +1766,12 @@ mod child_runtime_tests {
             .unwrap();
         let entry = wait_for_notification(&store).await;
         assert!(
-            entry
-                .message
-                .contains(&format!("\n\n{MEASURED_TIMING_MARK}Took ")),
+            entry.message.contains("synthetic report"),
+            "{}",
+            entry.message
+        );
+        assert!(
+            !entry.message.contains(MEASURED_TIMING_MARK),
             "{}",
             entry.message
         );
@@ -2885,7 +2891,15 @@ mod child_runtime_tests {
                     seen.message
                 );
             }
-            assert!(seen.message.contains("Took "), "{case}: {}", seen.message);
+            // Its measured time is the card's (`daabec92`), never a line
+            // of the result the owner reads.
+            assert!(
+                !seen
+                    .message
+                    .contains(aidaemon_tools::internal_markers::MEASURED_TIMING_MARK),
+                "{case}: {}",
+                seen.message
+            );
             assert!(
                 !seen.message.contains("confirm"),
                 "{case}: {}",

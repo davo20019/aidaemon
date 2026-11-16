@@ -407,6 +407,10 @@ impl TurnEngine<'_> {
             )
             .await
         } else {
+            // A call that breaks the tool's own argument contract is refused
+            // by the kernel before any hook: the same canonical contract
+            // rejection the dispatcher records (blocked, nothing observed).
+            let contract_rejected = receipt.status == sdk::ReceiptStatus::InvalidArguments;
             self.persist_pre_dispatch_outcome_with_kernel_claim(
                 scope.emitter,
                 scope.session_id,
@@ -416,11 +420,13 @@ impl TurnEngine<'_> {
                 reason,
                 if retryable_collision {
                     aidaemon_tools::semantics::ToolOutcomeStatus::FailedRetryable
+                } else if contract_rejected {
+                    aidaemon_tools::semantics::ToolOutcomeStatus::Blocked
                 } else {
                     aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
                 },
                 aidaemon_tools::semantics::ToolInvocationStage::RejectedBeforeDispatch,
-                false,
+                contract_rejected,
                 semantics,
                 None,
                 None,
