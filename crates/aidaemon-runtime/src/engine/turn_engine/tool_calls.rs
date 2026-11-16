@@ -934,12 +934,21 @@ impl TurnEngine<'_> {
                 // model reports it. Work a tool handed to the background ends
                 // the run on the tool's finish.
                 let mut handed_off = false;
+                // A call of another run (the stranded run a restart left in
+                // flight, settled on this turn's dispatcher before the turn
+                // starts) is that run's work: its receipt is recorded, but
+                // it never opens a job, a launch line or a handoff for this
+                // turn, whose reply answers the owner's new message (live
+                // 2026-11-16: a settled `sleep 45` backgrounded and its
+                // launch line replaced the reply to a new message).
+                let own_run = request.run_id == scope.run_id;
                 // The runs this turn leaves running: a call that left one
                 // there names it (a batch, each of its children), and the
                 // turn's launch line names them all.
                 let launched = Some(&outcome.metadata.background_run_labels)
                     .filter(|labels| {
-                        !labels.is_empty()
+                        own_run
+                            && !labels.is_empty()
                             && !outcome.metadata.detached
                             && outcome.metadata.outcome_status
                                 != Some(
@@ -957,7 +966,8 @@ impl TurnEngine<'_> {
                 // Track the jobs this run left running whose result the
                 // daemon will deliver: a notifying, non-detached launch opens
                 // one; a receipt that observed a job's end closes one.
-                if outcome.metadata.background_started
+                if own_run
+                    && outcome.metadata.background_started
                     && outcome.metadata.completion_notifications_enabled
                     && !outcome.metadata.detached
                     && outcome.metadata.outcome_status
@@ -970,7 +980,7 @@ impl TurnEngine<'_> {
                         }));
                     }
                 }
-                if outcome.metadata.background_settled {
+                if own_run && outcome.metadata.background_settled {
                     let jobs = &scope.open_background_jobs;
                     let mut open = jobs.load(Ordering::Relaxed);
                     while open > 0 {
@@ -1014,7 +1024,7 @@ impl TurnEngine<'_> {
                     let mut held: Option<String> = None;
                     // Past the one pass the handoff goes ahead; the items end
                     // "not attempted" only when no continuation follows.
-                    if hands_off {
+                    if hands_off && own_run {
                         let judged = self
                             .sdk_judge_unattempted_work(
                                 scope,
@@ -1040,7 +1050,7 @@ impl TurnEngine<'_> {
                         // The reply is the call's own first line, which names
                         // the run ("Started in the background: …"); the run
                         // itself is on the turn's card.
-                        if outcome.metadata.completion_notifications_enabled {
+                        if own_run && outcome.metadata.completion_notifications_enabled {
                             scope.background_handoff.store(true, Ordering::Relaxed);
                         }
                         let reply = launched.clone().unwrap_or_else(|| {
@@ -1049,7 +1059,7 @@ impl TurnEngine<'_> {
                         // The kernel keeps the batch's first finish; the
                         // turn's reply is the launch line naming every run it
                         // left running, so the latest one is recorded.
-                        if launched.is_some() {
+                        if own_run && launched.is_some() {
                             scope.verdict.record_handoff_reply(reply.clone());
                         }
                         if let Some(finish) = finish.as_mut() {

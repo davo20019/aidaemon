@@ -4567,6 +4567,103 @@ async fn a_turn_settles_the_run_a_restart_left_in_flight() {
     assert_ne!(latest.run_id, stranded.run_id);
 }
 
+/// A stranded run's batch that, settled before the next turn, outlives the
+/// background threshold is the stranded run's job: it never takes over the
+/// new turn, whose reply to the owner's new message ships as the model wrote
+/// it (live 2026-11-16: a settled `sleep 45` went to the background and its
+/// launch line replaced the answer to a new message).
+#[tokio::test]
+async fn work_settled_from_a_stranded_run_never_replaces_the_new_reply() {
+    use crate::runtime_ports::AgentIngress;
+    use crate::testing::{MockProvider, MockTool};
+    use crate::traits::ToolCallMetadata;
+
+    // As `terminal` reports a command it moved to the background.
+    let launcher = MockTool::new(
+        "synthetic_launcher",
+        "Runs a synthetic long command",
+        "Started in the background: synthetic long command.",
+    )
+    .with_metadata(ToolCallMetadata {
+        outcome_status: Some(crate::traits::ToolOutcomeStatus::Backgrounded),
+        background_started: true,
+        background_handoff: true,
+        timed_out: true,
+        completion_notifications_enabled: true,
+        background_run_labels: vec!["synthetic long command".to_string()],
+        ..ToolCallMetadata::default()
+    })
+    .with_finish(
+        crate::traits::ToolCallOutcome::from_output(String::new())
+            .handed_to_background()
+            .finish
+            .unwrap(),
+    );
+    // The new turn's only model call answers the new message.
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response("back")]);
+    let mut harness = crate::testing::setup_test_agent_root_with_extra_tools_and_llm_timeout(
+        provider,
+        vec![std::sync::Arc::new(launcher)],
+        None,
+    )
+    .await
+    .unwrap();
+    let store = std::sync::Arc::new(
+        aidaemon_store_sqlite::SqliteStore::from_pool(harness.state.pool())
+            .await
+            .unwrap(),
+    );
+    harness.agent.set_run_store(store.clone());
+    let session = "telegram:synthetic-user-1";
+
+    // The restart cut the earlier run off mid batch.
+    let call = aidaemon_core::ToolCall::new("c1", "synthetic_launcher", serde_json::json!({}));
+    let mut stranded =
+        aidaemon_core::RunState::new("aidaemon", session, "Run the long command, then reply.");
+    stranded.in_flight = Some(aidaemon_core::InFlight {
+        calls: vec![call],
+        started: Vec::new(),
+        done: Vec::new(),
+    });
+    store.upsert_state(&stranded).await.unwrap();
+
+    let reply = harness
+        .agent
+        .handle_inbound_message(owner_request("Just reply with one word."))
+        .await
+        .unwrap();
+
+    assert_eq!(reply.text.trim(), "back", "{}", reply.text);
+    assert!(
+        !reply.text.contains("Started in the background"),
+        "{}",
+        reply.text
+    );
+    assert_eq!(harness.provider.call_count().await, 1);
+    let latest = store
+        .latest_state_for_session(session)
+        .await
+        .unwrap()
+        .expect("the session has runs");
+    assert!(latest.in_flight.is_none(), "no run stays in flight");
+    assert_ne!(latest.run_id, stranded.run_id);
+    // The new turn hands nothing off: no handoff decision was recorded.
+    let handed_off = harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::DecisionPoint], 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|event| {
+            event
+                .data
+                .to_string()
+                .contains("background_job_running_at_stop")
+        });
+    assert!(!handed_off, "the stranded run's job is not this turn's");
+}
+
 /// A run cut off while waiting on the owner never answers the owner's next
 /// message with its old card: it is declined unasked, costs no model call,
 /// and the reply says what was not done, once.
