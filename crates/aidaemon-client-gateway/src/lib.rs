@@ -486,6 +486,28 @@ impl ClientGateway {
             }
             Err(error) => warn!(%error, "Could not read open turns from the client log"),
         }
+        // Nor do tasks: one whose last update says it runs ends cancelled,
+        // or a client keeps counting it as work and offering Stop.
+        match bus.log().latest_per_ref(OWNER, "task_updated").await {
+            Ok(rows) => {
+                for row in rows {
+                    let Ok(Event::TaskUpdated { mut task }) =
+                        serde_json::from_str::<Event>(&row.payload)
+                    else {
+                        continue;
+                    };
+                    if !matches!(task.state, TaskState::Running | TaskState::Cancelling) {
+                        continue;
+                    }
+                    task.state = TaskState::Cancelled;
+                    task.finished_at_ms = Some(bus::now_ms());
+                    task.error = Some("The daemon restarted before this task finished.".into());
+                    bus.publish(row.session_id, Event::TaskUpdated { task })
+                        .await;
+                }
+            }
+            Err(error) => warn!(%error, "Could not read open tasks from the client log"),
+        }
 
         let active = Arc::new(Mutex::new(HashSet::new()));
         let contexts = observer::Contexts::default();

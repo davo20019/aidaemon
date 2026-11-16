@@ -240,6 +240,28 @@ impl SqliteClientEventLog {
         Ok(rows.iter().map(row).collect())
     }
 
+    /// The newest event of `kind` for each `ref_id`, oldest first: where
+    /// each thing that kind tracks (a task, by its updates) stands now.
+    pub async fn latest_per_ref(
+        &self,
+        owner: &str,
+        kind: &str,
+    ) -> Result<Vec<ClientEventRow>, Error> {
+        let rows = sqlx::query(
+            "SELECT o.seq, o.at_ms, o.session_id, o.kind, o.ref_id, o.payload
+             FROM client_events o
+             WHERE o.owner = ?1 AND o.kind = ?2 AND o.ref_id IS NOT NULL
+               AND o.seq = (SELECT MAX(n.seq) FROM client_events n
+                            WHERE n.owner = ?1 AND n.kind = ?2 AND n.ref_id = o.ref_id)
+             ORDER BY o.seq",
+        )
+        .bind(owner)
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row).collect())
+    }
+
     /// Remove events older than `before_ms`, and beyond the newest
     /// `keep_newest`, but never the owner's newest event. Returns how many
     /// were removed.

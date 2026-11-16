@@ -273,6 +273,7 @@ async fn fixture_after(risk: RiskLevel, earlier: &[(&str, Event)]) -> Fixture {
             Event::TurnStarted { turn_id, .. } | Event::TurnCompleted { turn_id, .. } => {
                 Some(turn_id.as_str())
             }
+            Event::TaskUpdated { task } => Some(task.id.as_str()),
             _ => None,
         };
         log.append(
@@ -459,6 +460,52 @@ async fn a_restart_ends_the_turns_the_previous_process_left_running() {
     assert!(!seen.iter().any(
         |event| matches!(event, Event::TurnCompleted { turn_id, .. } if turn_id == "t-done" )
     ));
+}
+
+/// A task the previous process left running (a background build it
+/// started) is ended at start too: a client counts any running task as
+/// work, so it would keep offering Stop for nothing.
+#[tokio::test]
+async fn a_restart_ends_the_tasks_the_previous_process_left_running() {
+    let task = |id: &str, state: TaskState| Event::TaskUpdated {
+        task: TaskSummary {
+            id: id.into(),
+            session_id: "app:synthetic-1".into(),
+            number: 1,
+            description: "synthetic build".into(),
+            state,
+            started_at_ms: 1,
+            finished_at_ms: None,
+            error: None,
+        },
+    };
+    let f = fixture_after(
+        RiskLevel::Medium,
+        &[
+            ("app:synthetic-1", task("k-done", TaskState::Running)),
+            ("app:synthetic-1", task("k-done", TaskState::Completed)),
+            ("app:synthetic-1", task("k-cut", TaskState::Running)),
+        ],
+    )
+    .await;
+    let mut since = 3;
+    let seen = f
+        .poll_until(
+            &[],
+            &mut since,
+            |event| matches!(event, Event::TaskUpdated { task } if task.id == "k-cut"),
+        )
+        .await;
+    let Some(Event::TaskUpdated { task }) = seen.last() else {
+        unreachable!()
+    };
+    assert_eq!(task.state, TaskState::Cancelled);
+    assert!(task.error.is_some());
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, Event::TaskUpdated { task } if task.id == "k-done"))
+    );
 }
 
 #[tokio::test]
