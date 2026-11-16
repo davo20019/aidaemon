@@ -2053,7 +2053,7 @@ impl Store {
     }
 
     /// Answer the conversation on screen's waiting approval with `key`
-    /// (`y`, `a`, `n`); whether it did.
+    /// (`1`, `2`, `3`); whether it did.
     pub fn answer_by_key(&self, key: &str) -> bool {
         let Some(session) = self.selected_untracked() else {
             return false;

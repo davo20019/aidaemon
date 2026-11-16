@@ -2151,12 +2151,14 @@ impl Client {
 }
 
 /// The keys that answer a waiting approval while the composer is empty,
-/// with what each answers. "Always allow" has no key: it reaches too far
-/// for one stray keystroke.
+/// with what each answers. Digits, as other agents' approval prompts use,
+/// not letters: a message the owner starts typing ("no wait…", "add…")
+/// would otherwise answer the card with its first letter. "Always allow"
+/// has no key: it reaches too far for one stray keystroke.
 pub const APPROVAL_KEYS: [(&str, ApprovalDecision); 3] = [
-    ("y", ApprovalDecision::ApproveOnce),
-    ("a", ApprovalDecision::ApproveSession),
-    ("n", ApprovalDecision::Deny),
+    ("1", ApprovalDecision::ApproveOnce),
+    ("2", ApprovalDecision::ApproveSession),
+    ("3", ApprovalDecision::Deny),
 ];
 
 /// The answer `key` gives a waiting approval.
@@ -2814,7 +2816,7 @@ mod tests {
         client.take_outgoing();
 
         assert!(client.answers_by_key("app:synthetic-1", ""));
-        assert!(!client.answers_by_key("app:synthetic-1", "y"));
+        assert!(!client.answers_by_key("app:synthetic-1", "1"));
         assert!(!client.answers_by_key("app:synthetic-3", ""));
         assert_eq!(
             client.key_approval("app:synthetic-1", "").map(|a| a.id),
@@ -2822,15 +2824,17 @@ mod tests {
         );
 
         // Typing goes on as usual once something is typed.
-        assert!(!client.answer_by_key("app:synthetic-1", "n", "y"));
+        assert!(!client.answer_by_key("app:synthetic-1", "3", "1"));
+        // A letter is typing, never an answer: "no wait…" stays a message.
+        assert!(!client.answer_by_key("app:synthetic-1", "", "n"));
         // A key that answers nothing.
         assert!(!client.answer_by_key("app:synthetic-1", "", "x"));
         assert!(resolutions(&mut client).is_empty());
 
         for (key, decision) in [
-            ("y", ApprovalDecision::ApproveOnce),
-            ("a", ApprovalDecision::ApproveSession),
-            ("n", ApprovalDecision::Deny),
+            ("1", ApprovalDecision::ApproveOnce),
+            ("2", ApprovalDecision::ApproveSession),
+            ("3", ApprovalDecision::Deny),
         ] {
             assert!(client.answer_by_key("app:synthetic-1", "", key));
             assert_eq!(
@@ -2852,9 +2856,9 @@ mod tests {
             r#""approve_once","deny""#,
         );
         client.take_outgoing();
-        assert_eq!(client.key_answer("app:synthetic-1", "", "a"), None);
+        assert_eq!(client.key_answer("app:synthetic-1", "", "2"), None);
         assert_eq!(
-            client.key_answer("app:synthetic-1", "", "n"),
+            client.key_answer("app:synthetic-1", "", "3"),
             Some(("ap1".to_owned(), ApprovalDecision::Deny))
         );
     }
