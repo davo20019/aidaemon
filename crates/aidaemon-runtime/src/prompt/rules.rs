@@ -378,7 +378,13 @@ pub fn channel_rules(
     // Channel member names (for group channels).
     if !channel_ctx.channel_member_names.is_empty() {
         let members = channel_ctx.channel_member_names.join(", ");
-        rules.push_str(&format!("\n[Channel members: {}]", members));
+        // Slack (and channels like it) turn `@Name` in a reply into a real
+        // mention, so this list is how the model notifies someone here.
+        rules.push_str(&format!(
+            "\n[Channel members: {}. To mention or ping one of them so they are notified, \
+             write @ and their name exactly as listed here in your reply.]",
+            members
+        ));
     }
 
     // Identity stability rule — applies to all visibility tiers, while
