@@ -1090,24 +1090,44 @@ pub fn compute_next_run_local(cron_expr: &str) -> anyhow::Result<DateTime<Local>
         .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))
 }
 
-/// Compute a fixed number of occurrences after an already-computed next run.
-pub fn following_runs(
+/// Compute a fixed number of occurrences after an already-computed next run,
+/// in the zone `next` carries (wall-clock times stay put across a
+/// daylight-saving change).
+pub fn following_runs<Tz: TimeZone>(
     cron_expr: &str,
-    next: &DateTime<Local>,
+    next: &DateTime<Tz>,
     count: usize,
-) -> anyhow::Result<Vec<DateTime<Local>>> {
+) -> anyhow::Result<Vec<DateTime<Tz>>> {
     let cron: Cron = cron_expr
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse cron '{}': {}", cron_expr, e))?;
-    let mut cursor = *next;
+    let mut cursor = next.clone();
     let mut runs = Vec::with_capacity(count);
     for _ in 0..count {
         cursor = cron
             .find_next_occurrence(&cursor, false)
             .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))?;
-        runs.push(cursor);
+        runs.push(cursor.clone());
     }
     Ok(runs)
+}
+
+/// The runs an owner confirms before scheduled work is saved: `first` (the
+/// already-computed next run) and, for a recurring schedule, the ones after
+/// it, `count` in all. A one-time schedule has only its single time. A cron
+/// with no later occurrence lists what it has.
+pub fn upcoming_runs<Tz: TimeZone>(
+    cron_expr: &str,
+    first: &DateTime<Tz>,
+    one_shot: bool,
+    count: usize,
+) -> Vec<DateTime<Tz>> {
+    let mut runs = vec![first.clone()];
+    if !one_shot && count > 1 {
+        runs.extend(following_runs(cron_expr, first, count - 1).unwrap_or_default());
+    }
+    runs.truncate(count.max(1));
+    runs
 }
 
 #[cfg(test)]
@@ -1124,6 +1144,161 @@ mod following_runs_tests {
         assert_eq!(runs[0].date_naive().to_string(), "2026-11-23");
         assert_eq!(runs[1].date_naive().to_string(), "2026-11-24");
         assert!(runs.iter().all(|run| run.time() == friday.time()));
+    }
+
+    /// US Eastern time (rules since 2007), test-only, so the daylight-saving
+    /// cases do not depend on the machine's zone and need no zone crate.
+    #[derive(Debug, Clone, Copy)]
+    struct Eastern;
+
+    impl Eastern {
+        fn nth_sunday(year: i32, month: u32, n: u32) -> chrono::NaiveDate {
+            use chrono::Datelike;
+            let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+            let to_sunday = (7 - first.weekday().num_days_from_sunday()) % 7;
+            first + chrono::Duration::days(i64::from(to_sunday + 7 * (n - 1)))
+        }
+
+        fn utc_offset(utc: &chrono::NaiveDateTime) -> chrono::FixedOffset {
+            use chrono::Datelike;
+            // 2:00 AM local both times: 7:00 UTC in March, 6:00 UTC in November.
+            let starts = Self::nth_sunday(utc.year(), 3, 2)
+                .and_hms_opt(7, 0, 0)
+                .unwrap();
+            let ends = Self::nth_sunday(utc.year(), 11, 1)
+                .and_hms_opt(6, 0, 0)
+                .unwrap();
+            let hours = if (starts..ends).contains(utc) { -4 } else { -5 };
+            chrono::FixedOffset::east_opt(hours * 3600).unwrap()
+        }
+    }
+
+    impl TimeZone for Eastern {
+        type Offset = chrono::FixedOffset;
+
+        fn from_offset(_offset: &chrono::FixedOffset) -> Self {
+            Eastern
+        }
+
+        fn offset_from_local_date(
+            &self,
+            local: &chrono::NaiveDate,
+        ) -> chrono::LocalResult<chrono::FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::LocalResult<chrono::FixedOffset> {
+            // Daylight time first, so an ambiguous time lists the earlier instant first.
+            let fits: Vec<chrono::FixedOffset> = [-4, -5]
+                .into_iter()
+                .map(|hours| chrono::FixedOffset::east_opt(hours * 3600).unwrap())
+                .filter(|offset| {
+                    Self::utc_offset(
+                        &(*local - chrono::Duration::seconds(offset.local_minus_utc().into())),
+                    ) == *offset
+                })
+                .collect();
+            match fits.as_slice() {
+                [one] => chrono::LocalResult::Single(*one),
+                [earlier, later] => chrono::LocalResult::Ambiguous(*earlier, *later),
+                _ => chrono::LocalResult::None,
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> chrono::FixedOffset {
+            Self::utc_offset(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> chrono::FixedOffset {
+            Self::utc_offset(utc)
+        }
+    }
+
+    fn et(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Eastern> {
+        Eastern
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .unwrap()
+    }
+
+    /// Formatted as every owner-facing time is, as seen on Mon Nov 16, 2026.
+    fn shown(runs: &[chrono::DateTime<Eastern>]) -> Vec<String> {
+        let now = et(2026, 11, 16, 9, 17).fixed_offset();
+        runs.iter()
+            .map(|run| super::format_owner_time(&run.fixed_offset(), &now, "ET"))
+            .collect()
+    }
+
+    #[test]
+    fn upcoming_runs_keep_the_wall_clock_across_the_fall_back() {
+        // Daylight time ends Sun Nov 1, 2026: 9:00 AM stays 9:00 AM ET, and
+        // that day's run is 25 hours after the last one.
+        let runs = super::upcoming_runs("0 9 * * *", &et(2026, 10, 31, 9, 0), false, 3);
+        assert_eq!(
+            shown(&runs),
+            vec![
+                "Sat, Oct 31, 9:00 AM ET",
+                "Sun, Nov 1, 9:00 AM ET",
+                "Mon, Nov 2, 9:00 AM ET",
+            ]
+        );
+        assert_eq!(runs[0].offset().local_minus_utc(), -4 * 3600);
+        assert_eq!(runs[1].offset().local_minus_utc(), -5 * 3600);
+        assert_eq!(
+            runs[1].clone() - runs[0].clone(),
+            chrono::Duration::hours(25)
+        );
+    }
+
+    #[test]
+    fn upcoming_runs_keep_the_wall_clock_across_the_spring_forward() {
+        // Daylight time starts Sun Mar 8, 2026: that day's run is 23 hours later.
+        let runs = super::upcoming_runs("30 8 * * *", &et(2026, 3, 7, 8, 30), false, 3);
+        assert_eq!(
+            shown(&runs),
+            vec![
+                "Sat, Mar 7, 8:30 AM ET",
+                "Sun, Mar 8, 8:30 AM ET",
+                "Mon, Mar 9, 8:30 AM ET",
+            ]
+        );
+        assert_eq!(
+            runs[1].clone() - runs[0].clone(),
+            chrono::Duration::hours(23)
+        );
+    }
+
+    #[test]
+    fn a_wrong_cadence_shows_in_the_upcoming_runs() {
+        // "Every minute" where "every month" was meant reads as minutes apart.
+        let first = et(2026, 12, 1, 9, 0);
+        assert_eq!(
+            shown(&super::upcoming_runs("* * * * *", &first, false, 3)),
+            vec![
+                "Tue, Dec 1, 9:00 AM ET",
+                "Tue, Dec 1, 9:01 AM ET",
+                "Tue, Dec 1, 9:02 AM ET"
+            ]
+        );
+        assert_eq!(
+            shown(&super::upcoming_runs("0 9 1 * *", &first, false, 3)),
+            vec![
+                "Tue, Dec 1, 9:00 AM ET",
+                "Jan 1, 2027, 9:00 AM ET",
+                "Feb 1, 2027, 9:00 AM ET"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_one_time_schedule_has_its_single_time() {
+        let first = et(2026, 11, 20, 9, 15);
+        let runs = super::upcoming_runs("15 9 20 11 *", &first, true, 3);
+        assert_eq!(shown(&runs), vec!["Fri, Nov 20, 9:15 AM ET"]);
+        assert_eq!(super::upcoming_runs("0 9 * * *", &first, false, 1).len(), 1);
     }
 }
 

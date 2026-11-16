@@ -23,6 +23,9 @@ use crate::tools::traits::{ChannelVisibility, UserRole};
 /// The longest name an automation may carry.
 pub(crate) const MAX_AUTOMATION_NAME_CHARS: usize = 80;
 
+/// How many upcoming runs the approval card lists for recurring work.
+const UPCOMING_RUNS_SHOWN: usize = 3;
+
 /// One request for scheduled work.
 #[derive(Debug, Clone)]
 pub(crate) struct ScheduleRequest {
@@ -118,19 +121,23 @@ impl Plan {
     /// The card the owner confirms the work with: the five lines every
     /// automation card has, then the upcoming runs and name as details.
     fn approval_request(&self) -> aidaemon_core::OwnerApprovalRequest {
+        // The next three runs (one for a one-time schedule), in the owner's
+        // zone and format, so a wrong cadence or zone is caught here.
+        let mut runs = aidaemon_work::schedule::upcoming_runs(
+            &self.cron,
+            &self.next_local,
+            self.is_one_shot,
+            UPCOMING_RUNS_SHOWN,
+        )
+        .iter()
+        .map(aidaemon_work::schedule::owner_time)
+        .collect::<Vec<_>>()
+        .into_iter();
         let spec = aidaemon_work::automations::ScheduleSpec {
             cron: self.cron.clone(),
             one_shot: self.is_one_shot,
-            next: Some(aidaemon_work::schedule::owner_time(&self.next_local)),
-            following: if self.is_one_shot {
-                Vec::new()
-            } else {
-                aidaemon_work::schedule::following_runs(&self.cron, &self.next_local, 2)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(aidaemon_work::schedule::owner_time)
-                    .collect()
-            },
+            next: runs.next(),
+            following: runs.collect(),
         };
         let mut card = aidaemon_work::automations::scheduled_card(
             &self.desc,
