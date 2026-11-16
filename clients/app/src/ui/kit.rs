@@ -1473,6 +1473,63 @@ fn viewer(
         .child(marks)
         .child(when(move || marking.get(), move || pad.clone()));
 
+    // Zoom: pinch, Ctrl + wheel, or a double press (in, then back out).
+    // Marking up starts from the whole picture, so it zooms back out.
+    let zoomer = element_ref();
+    let zoomed = signal(1.0f32);
+    let last_press = signal(None::<nsh_core::time::Instant>);
+    let commanded = signal(None::<nsh_core::time::Instant>);
+    let reports = signal(false);
+    let picture = picture.on_press(move || {
+        let at = now();
+        let double = last_press
+            .get_untracked()
+            .is_some_and(|before| at.duration_since(before) < Duration::from_millis(350));
+        if double {
+            last_press.set(None);
+            let to = if zoomed.get_untracked() > 1.05 {
+                1.0
+            } else {
+                2.5
+            };
+            // Set here: while the zoom animates, the scroll reports pass
+            // through the old scales (ignored for a moment below).
+            zoomed.set(to);
+            commanded.set(Some(at));
+            zoomer.zoom_to(to, None, true);
+        } else {
+            last_press.set(Some(at));
+        }
+    });
+    let zoomable = scroll()
+        .w_full()
+        .h_full()
+        .zoom_range(1.0, 5.0)
+        .zoomable(move || !marking.get())
+        .center_content(true)
+        .scrollbar(false)
+        .element_ref(&zoomer)
+        .on_scroll(move |e: &ScrollEvent| {
+            let settling = commanded
+                .get_untracked()
+                .is_some_and(|at| now().duration_since(at) < Duration::from_millis(700));
+            // The web reports no scale (always 1): trust a report only
+            // once one has shown another scale.
+            if (e.zoom_scale - 1.0).abs() > f32::EPSILON {
+                reports.set(true);
+            }
+            if !settling && reports.get_untracked() {
+                zoomed.set(e.zoom_scale);
+            }
+        })
+        .child(picture);
+    effect(move || {
+        if marking.get() {
+            zoomed.set(1.0);
+            zoomer.zoom_to(1.0, None, false);
+        }
+    });
+
     view().child(
         dialog()
             .label(format!("Picture: {}", shown.name))
@@ -1496,8 +1553,9 @@ fn viewer(
                     .test_id("picture-viewer")
                     .child(bar)
                     .child(
-                        // The backdrop: a press here (the picture too)
-                        // closes, unless marking up.
+                        // The backdrop: a press here closes, unless
+                        // marking up or zoomed in (the picture itself
+                        // takes presses: two zoom).
                         view()
                             .flex_1()
                             .min_h(px(0.0))
@@ -1506,7 +1564,7 @@ fn viewer(
                             .justify_center()
                             .focusable(false)
                             .on_press(move || {
-                                if !marking.get_untracked() {
+                                if !marking.get_untracked() && zoomed.get_untracked() <= 1.05 {
                                     close();
                                 }
                             })
@@ -1523,7 +1581,7 @@ fn viewer(
                                             (b.size.height.0 - 32.0).max(0.0),
                                         ))
                                     })
-                                    .child(picture),
+                                    .child(zoomable),
                             ),
                     ),
             ),
