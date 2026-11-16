@@ -286,6 +286,7 @@ mod tests {
                 false,
                 None,
                 Some("/home/synthetic/acme-site"),
+                None,
             )
             .await
             .expect("build new-task prompt");
@@ -454,6 +455,7 @@ mod tests {
                 false,
                 project_dir.path().to_str(),
                 None,
+                None,
             )
             .await
             .expect("build mandate prompt");
@@ -584,6 +586,7 @@ mod tests {
             None,
             false,
             project_dir.path().to_str(),
+            None,
             None,
         )
         .await

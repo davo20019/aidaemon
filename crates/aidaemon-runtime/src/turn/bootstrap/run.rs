@@ -385,6 +385,7 @@ async fn build_isolated_mandate_bootstrap(
         false,
         None,
         None,
+        None,
     )
     .await?;
     anyhow::ensure!(
@@ -1552,6 +1553,13 @@ pub async fn run_bootstrap(
         preserve_conversation_context,
         project_instruction_scope,
         turn_context.bound_workspace.as_deref(),
+        crate::turn::memory::memory_project(
+            turn_context.project.as_ref(),
+            user_role,
+            &channel_ctx,
+            is_mandate_execution,
+        )
+        .as_ref(),
     )
     .await?;
     let prompt_ms = prompt_started.elapsed().as_millis() as u64;

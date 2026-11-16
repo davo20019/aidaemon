@@ -48,6 +48,7 @@ pub async fn build_system_prompt_for_message(
     preserve_conversation_context: bool,
     project_instruction_scope: Option<&str>,
     workspace: Option<&str>,
+    project: Option<&aidaemon_core::ProjectRef>,
 ) -> anyhow::Result<(
     String,
     String,
@@ -75,7 +76,15 @@ pub async fn build_system_prompt_for_message(
     }
 
     // 2. Build system prompt ONCE before the loop: match skills + inject facts + memory
-    let skills_snapshot = host.skills().get();
+    let mut skills_snapshot = host.skills().get();
+    // The owner's turn in a project also lists the repository's skills
+    // (`.agents/skills`, `.claude/skills`); the host's own win a name clash.
+    if let Some(root) = project.and_then(|project| project.root.as_deref()) {
+        skills_snapshot = aidaemon_skills::with_project_skills(
+            &skills_snapshot,
+            aidaemon_skills::load_project_skills(root),
+        );
+    }
     let active_skills = aidaemon_skills::match_skills(&skills_snapshot, user_text);
     if !active_skills.is_empty() {
         let names: Vec<&str> = active_skills.iter().map(|s| s.name.as_str()).collect();
