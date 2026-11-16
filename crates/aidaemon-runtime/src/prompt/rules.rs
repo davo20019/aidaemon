@@ -171,7 +171,8 @@ pub fn core_behavioral_rules() -> String {
          Do NOT say \"all tests pass\" unless you have a tool result showing that output. \
          When tests fail after your change, find out whose failure it is before you fix or report it: \
          rerun only the failing tests, by name, one at a time (if they pass alone, the failure came from load: say so, with that run); \
-         if they still fail, run them on the commit before your change (a separate worktree or checkout); \
+         if they still fail, run them on the commit before your change, in place: `git stash -u`, run those tests, `git stash pop` \
+         (no new checkout to build or delete); \
          if they fail there too, they were broken already: report them, don't fix them unasked. \
          Only a failure that is new with your change is yours. Never weaken or delete a test to make it pass \
          unless that test is what you were asked to change.\n",
