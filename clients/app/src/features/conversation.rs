@@ -479,26 +479,6 @@ fn header(store: Store, session: Option<String>) -> View {
         ))
 }
 
-/// What a chat can start from: a tap puts the words in the composer to
-/// finish or send as they are.
-const STARTERS: [(&str, &str); 2] = [
-    ("What can you do?", "What can you do on this computer?"),
-    ("Set a reminder", "Remind me "),
-];
-
-/// The same, for code: the agent already works in the project's folder.
-const PROJECT_STARTERS: [(&str, &str); 3] = [
-    (
-        "Explain this project",
-        "Explain how this project is laid out and how to run it.",
-    ),
-    (
-        "What changed?",
-        "Summarize what changed here recently and what is unfinished.",
-    ),
-    ("Fix something", "Fix "),
-];
-
 /// What a new conversation is, in its header: a chat, or work on code in
 /// a project's folder. Said before the first word, so the two never look
 /// like the same thing.
@@ -515,19 +495,6 @@ fn new_kind(store: Store) -> View {
     )
 }
 
-fn starters(store: Store, from: &'static [(&'static str, &'static str)]) -> View {
-    let mut chips = view().flex_row().flex_wrap().justify_center().gap_2();
-    for (label, words) in from.iter().copied() {
-        chips = chips.child(
-            ui::btn(label, Variant::Outline, ui::Size::Sm, move || {
-                store.set_draft(words.to_owned())
-            })
-            .accessibility_label(format!("Start with: {}", words.trim_end())),
-        );
-    }
-    chips
-}
-
 fn heading(words: &'static str) -> Text {
     text(words)
         .role(AccessibilityRole::Header)
@@ -537,11 +504,10 @@ fn heading(words: &'static str) -> Text {
         .text_color(colors::TEXT)
 }
 
-/// A new conversation: what the header's switch chose. A chat asks one
-/// question and offers a few ways to start; code lists the projects to
-/// work in (each a folder), then ways to start there. Together by the
-/// composer on a phone, in the middle of a window. The sidebar already
-/// lists past conversations.
+/// A new conversation: what the header's switch chose, and nothing else.
+/// A chat asks one question; code asks which project (each a folder) to
+/// work in. By the composer on a phone, in the middle of a window. The
+/// sidebar already lists past conversations.
 fn welcome(store: Store) -> View {
     let code = computed(move || store.new_is_code());
     view()
@@ -556,11 +522,7 @@ fn welcome(store: Store) -> View {
                 if code {
                     code_start(store)
                 } else {
-                    view()
-                        .items_center()
-                        .gap_4()
-                        .child(heading("What should we work on?"))
-                        .child(starters(store, &STARTERS))
+                    view().child(heading("What should we work on?"))
                 }
             }))
         })))
@@ -569,15 +531,16 @@ fn welcome(store: Store) -> View {
         .child(view().style_when(!ui::touch(), |s| s.flex_1()))
 }
 
-/// Code: the projects, one chosen, then ways to start in it. With no
-/// project yet, how to make the first.
+/// Code: the project to work in, one list however many there are, with
+/// the chosen one's folder under it. With no project yet, how to make the
+/// first.
 fn code_start(store: Store) -> View {
     let projects = computed(move || {
         store
             .projects()
             .into_iter()
-            .map(|p| (p.id, p.name, p.path))
-            .collect::<Vec<_>>()
+            .map(|p| (p.id, p.name))
+            .collect::<Vec<(String, String)>>()
     });
     view().w_full().items_center().child(dynamic(move || {
         let items = projects.get();
@@ -609,68 +572,37 @@ fn code_start(store: Store) -> View {
                         },
                     ));
             }
-            // Past a few, the list scrolls in place: the starters and the
-            // composer stay where they are.
-            let many = items.len() > 5;
-            let mut list = view().w_full().gap_1();
-            for (id, name, path) in items {
-                let chosen = id.clone();
-                let is = move || store.current_project().as_deref() == Some(chosen.as_str());
-                let marked = is.clone();
-                list = list.child(
-                    ui::row(is, move || store.set_new_project(Some(id.clone())))
-                        .py_1()
-                        .accessibility_label(format!("Work in {name}"))
-                        .child(
-                            ui::icon(Glyph::Folder)
-                                .text_color(colors::MUTED)
-                                .accessibility_elements_hidden(true),
-                        )
-                        .child(
-                            view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .child(
-                                    text(name)
-                                        .number_of_lines(1)
-                                        .text_size(px(ui::fit::body()))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(colors::TEXT),
-                                )
-                                .child(
-                                    text(match path {
-                                        Some(path) => super::sidebar::short_path(&path),
-                                        None => "No folder".to_owned(),
-                                    })
-                                    .number_of_lines(1)
-                                    .text_size(px(type_scale::XS))
-                                    .text_color(colors::FAINT),
-                                ),
-                        )
-                        .child(when(marked, || {
-                            ui::icon(Glyph::Check)
-                                .text_color(colors::ACCENT)
-                                .accessibility_elements_hidden(true)
-                        })),
-                );
-            }
-            let list = if many {
-                scroll()
-                    .w_full()
-                    .max_w(px(420.0))
-                    .h(px(5.5 * (ui::fit::row() + 14.0)))
-                    .child(list)
-                    .into_element()
-            } else {
-                list.max_w(px(420.0)).into_element()
-            };
             view()
                 .w_full()
                 .items_center()
-                .gap_4()
-                .child(heading("Pick a project to work in"))
-                .child(list)
-                .child(starters(store, &PROJECT_STARTERS))
+                .gap_3()
+                .child(heading("Which project?"))
+                .child(ui::choice(
+                    "Project to work in",
+                    "Choose a project",
+                    items,
+                    move || store.current_project(),
+                    move |chosen| {
+                        if let Some(id) = chosen.filter(|id| !id.is_empty()) {
+                            store.set_new_project(Some(id));
+                        }
+                    },
+                ))
+                .child(
+                    text(move || {
+                        let path = store
+                            .current_project()
+                            .and_then(|id| store.project(&id))
+                            .and_then(|p| p.path);
+                        match path {
+                            Some(path) => format!("Works in {}", super::sidebar::short_path(&path)),
+                            None => "This project has no folder".to_owned(),
+                        }
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                )
         }))
     }))
 }

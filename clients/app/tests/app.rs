@@ -514,24 +514,22 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Contact form copy")?;
     // Its "+" starts a conversation there: the header names the project.
     app.press("New conversation in this project >> nth=0")?;
-    app.wait_for("Explain this project")?;
-    app.wait_for("Pick a project to work in")?;
+    app.wait_for("Which project?")?;
+    app.wait_for("Works in /home/synthetic/acme-site")?;
     // The header's switch says what a new conversation is: Chat leaves
-    // the project and brings the question and the everyday starters; Code
-    // lists the projects to work in, and a press picks another.
+    // the project and brings the question; Code asks which project, in
+    // one list, and names the chosen one's folder.
     app.press("Chat")?;
     app.wait_for("What should we work on?")?;
-    app.wait_for("Set a reminder")?;
     app.press("Code")?;
-    app.wait_for("Pick a project to work in")?;
-    app.wait_for("Explain this project")?;
-    app.press("Work in Design notes")?;
+    app.wait_for("Which project?")?;
+    app.wait_for("Works in /home/synthetic/acme-site")?;
     // A new conversation from the keyboard, in a project's conversation,
     // stays in that project.
     app.press("Contact form copy >> nth=0")?;
     app.wait_for("Acme site · /home/synthetic/acme-site")?;
     app.press_key("mod+n")?;
-    app.wait_for("Pick a project to work in")?;
+    app.wait_for("Which project?")?;
     // The paperclip offers pictures and files (and the camera, where a
     // phone's browser has one).
     app.press("Attach")?;
