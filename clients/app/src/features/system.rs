@@ -104,11 +104,6 @@ fn bots(store: Store) -> View {
     if bots.is_empty() {
         return view();
     }
-    let projects: Vec<(String, String)> = store
-        .projects()
-        .into_iter()
-        .map(|p| (p.id, p.name))
-        .collect();
     let mut c = card();
     for bot in bots {
         let channel = bot.channel.clone();
@@ -149,20 +144,60 @@ fn bots(store: Store) -> View {
                                 .text_color(colors::FAINT),
                         ),
                 )
-                .child(
-                    ui::choice(
-                        format!("Project for direct messages to {}", bot.name),
-                        "No project",
-                        std::iter::once((String::new(), "No project".to_owned()))
-                            .chain(projects.iter().cloned())
-                            .collect(),
-                        move || Some(current.get()),
-                        move |picked: Option<String>| {
-                            store.set_bot_project(&channel, picked.filter(|id| !id.is_empty()))
+                .child({
+                    let shown = move || {
+                        store
+                            .project(&current.get())
+                            .map_or_else(|| "No project".to_owned(), |p| p.name)
+                    };
+                    let bot_name = bot.name.clone();
+                    ui::pick_list(
+                        ui::Picker {
+                            title: "Project for its direct messages",
+                            items: move || {
+                                let chosen =
+                                    Some(current.get_untracked()).filter(|id| !id.is_empty());
+                                super::sidebar::project_choices(store, chosen, Some("No project"))
+                            },
+                            pick: move |picked: String| {
+                                store.set_bot_project(
+                                    &channel,
+                                    Some(picked).filter(|id| !id.is_empty()),
+                                )
+                            },
+                            action: None,
                         },
+                        move || format!("Project for direct messages to {bot_name}: {}", shown()),
+                        view()
+                            .min_h(px(ui::fit::row()))
+                            .max_w(px(200.0))
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .rounded(px(ui::radius::CONTROL))
+                            .border_1()
+                            .border_color(colors::EDGE)
+                            .child(
+                                ui::icon(ui::Glyph::Folder)
+                                    .text_color(colors::MUTED)
+                                    .accessibility_elements_hidden(true),
+                            )
+                            .child(
+                                text(shown)
+                                    .min_w(px(0.0))
+                                    .number_of_lines(1)
+                                    .text_size(px(ui::fit::small()))
+                                    .text_color(colors::TEXT),
+                            )
+                            .child(
+                                ui::icon(ui::Glyph::Down)
+                                    .text_color(colors::FAINT)
+                                    .accessibility_elements_hidden(true),
+                            ),
+                        false,
                     )
-                    .w(px(180.0)),
-                ),
+                }),
         );
     }
     section("Chat bots").child(c).child(

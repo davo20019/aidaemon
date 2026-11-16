@@ -10,8 +10,9 @@ use nsh_base::{
     Anchor, CommandEntry, CommandGroup, CommandItem, SelectEntry, SelectItem, SelectValue,
     ToastManager, ToastMotion, ToastOptions, ToastStackState, accordion, accordion_header,
     accordion_item, accordion_panel, accordion_trigger, alert_dialog, command, context_menu,
-    h_resizable, menu, menu_item, popover, progress, resizable_panel, select, sheet, switch, tab,
-    table, table_body, table_cell, table_head, table_header, table_row, tabs, toast, toast_stack,
+    dialog, h_resizable, menu, menu_item, popover, progress, resizable_panel, select, sheet,
+    switch, tab, table, table_body, table_cell, table_head, table_header, table_row, tabs, toast,
+    toast_stack,
 };
 use nsh_core::prelude::*;
 use nsh_core::time::now;
@@ -186,21 +187,33 @@ fn choice_sized(
                         .accessibility_elements_hidden(true),
                 ),
         )
+        // A window's list hangs from its trigger; a phone's is a sheet
+        // over the dimmed page, as the pickers' are.
         .popup_style(|s| {
-            s.bg(colors::SURFACE)
-                .border_1()
-                .border_color(colors::EDGE)
-                .rounded(px(radius::CONTROL))
-                .shadow_lg()
-                .p_1()
-                .max_h(px(320.0))
+            if super::touch() {
+                s.bg(colors::SURFACE)
+                    .rounded_t(px(radius::SURFACE))
+                    .shadow_lg()
+                    .p_2()
+                    .pb_safe_area()
+                    .max_h(percentage(0.72))
+            } else {
+                s.bg(colors::SURFACE)
+                    .border_1()
+                    .border_color(colors::EDGE)
+                    .rounded(px(radius::CONTROL))
+                    .shadow_lg()
+                    .p_1()
+                    .max_h(px(320.0))
+            }
         })
+        .backdrop_style(|s| s.bg(colors::SCRIM))
         .search_class("px-2 py-1.5 mb-1 text-sm border-b border-border")
-        .item_class("rounded-sm focus:bg-accent")
+        .item_class("rounded-md focus:bg-accent selected:bg-accent")
         .render_item(|e: &SelectEntry| {
             text(e.title.clone())
                 .px_2()
-                .py(px(5.0))
+                .py(px(if super::touch() { 14.0 } else { 5.0 }))
                 .number_of_lines(1)
                 .text_size(px(fit::small()))
                 .text_color(colors::TEXT)
@@ -748,14 +761,50 @@ pub fn pane_rest(content: impl IntoElement) -> nsh_base::ResizablePanelElement {
     resizable_panel().child(content)
 }
 
-/// One choice of a [`pick_list`]: what it is, a line under it (a folder),
-/// and the section it shows in.
+/// One choice of a [`pick_list`]: what it is, a line under it (a folder,
+/// a provider; empty for none), the section it shows in, its glyph, and
+/// whether it is the one in effect (one per section).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PickItem {
     pub id: String,
     pub title: String,
     pub detail: String,
     pub group: Option<String>,
+    pub glyph: Option<super::Glyph>,
+    pub checked: bool,
+}
+
+impl PickItem {
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            detail: String::new(),
+            group: None,
+            glyph: None,
+            checked: false,
+        }
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+
+    pub fn group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    pub fn glyph(mut self, glyph: super::Glyph) -> Self {
+        self.glyph = Some(glyph);
+        self
+    }
+
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
 }
 
 /// A row after the choices that does something else (New project).
@@ -765,42 +814,38 @@ pub struct PickAction {
     pub run: std::rc::Rc<dyn Fn()>,
 }
 
-/// One value from a list that names more than a word each (projects and
-/// their folders): `trigger` shows what is chosen (`name` says it); a press opens the
-/// choices under a heading, with a search past six of them, sections, a
-/// check on the chosen one and `action` last. A sheet from the bottom on
-/// touch screens, a popover at the trigger in a window. Built on
-/// `nsh_base`'s Command, so its keys, search and long lists are nsh's.
-pub fn pick_list(
-    title: &'static str,
+/// What a [`pick_list`] or [`pick_dialog`] offers: its heading, its
+/// choices (read when it opens), what a pick does, and an action row.
+pub struct Picker<I, P> {
+    pub title: &'static str,
+    pub items: I,
+    pub pick: P,
+    pub action: Option<PickAction>,
+}
+
+/// One value from a list of named things with a line each (projects and
+/// their folders, models and their providers): `trigger` shows what is
+/// chosen (`name` says it to screen readers); a press opens the choices
+/// under a heading, with a search past six of them, sections, a check on
+/// what is in effect and the action last. A sheet from the bottom on touch
+/// screens, a popover at the trigger in a window. `wide` stretches the
+/// trigger across its row. Built on `nsh_base`'s Command, so its keys,
+/// search and long lists are nsh's.
+pub fn pick_list<I, P>(
+    picker: Picker<I, P>,
     name: impl Fn() -> String + 'static,
     trigger: impl IntoElement,
-    items: impl Fn() -> Vec<PickItem> + Copy + 'static,
-    chosen: impl Fn() -> Option<String> + Copy + 'static,
-    pick: impl Fn(String) + Clone + 'static,
-    action: Option<PickAction>,
-) -> View {
+    wide: bool,
+) -> View
+where
+    I: Fn() -> Vec<PickItem> + Copy + 'static,
+    P: Fn(String) + Clone + 'static,
+{
     let open = signal(false);
-    let touch = super::touch();
-    let action = action.map(std::rc::Rc::new);
-    let body = move || {
-        let pick = pick.clone();
-        let action = action.clone();
-        view().child(dynamic(move || {
-            if !open.get() {
-                return None;
-            }
-            let pick = pick.clone();
-            let action = action.clone();
-            Some(untracked(move || {
-                pick_body(title, items(), chosen(), pick, action, open, touch)
-            }))
-        }))
-    };
     let trigger = view()
         .role(AccessibilityRole::Button)
         .label(move || SharedString::from(name()))
-        .w_full()
+        .style_when(wide, |s| s.w_full())
         .rounded(px(radius::CONTROL))
         .transition_colors()
         .duration(motion::FAST)
@@ -808,32 +853,14 @@ pub fn pick_list(
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
         .focus(super::controls::focus_band)
         .child(trigger);
-    if touch {
+    if super::touch() {
         view()
-            .w_full()
+            .style_when(wide, |s| s.w_full())
             .child(trigger.on_press(move || open.set(true)))
-            .child(
-                sheet()
-                    .side(Placement::Bottom)
-                    .open(move || Some(open.get()))
-                    .on_open_change(move |event: &nsh_base::SheetEvent| {
-                        if let nsh_base::SheetEvent::OpenChange(false, _) = event {
-                            open.set(false);
-                        }
-                    })
-                    .popup_style(|s| {
-                        s.w_full()
-                            .max_h(percentage(0.72))
-                            .rounded_t(px(radius::SURFACE))
-                            .bg(colors::SURFACE)
-                            .pb_safe_area()
-                            .shadow_lg()
-                    })
-                    .backdrop_style(|s| s.bg(colors::SCRIM))
-                    .child(body()),
-            )
+            .child(pick_sheet(picker, open))
     } else {
-        view().w_full().child(
+        let body = pick_content(picker, open, false);
+        view().style_when(wide, |s| s.w_full()).child(
             popover()
                 .open(move || Some(open.get()))
                 .on_open_change(move |event: &nsh_base::PopoverEvent| {
@@ -854,28 +881,130 @@ pub fn pick_list(
                 })
                 .popup_starting_class("opacity-0 scale-95")
                 .popup_ending_class("opacity-0 scale-95")
-                .child(body()),
+                .child(body.build()),
         )
     }
+}
+
+/// The same choices, opened by the app rather than a trigger (a menu's
+/// "Move to project…"): a sheet on touch screens, a centred dialog in a
+/// window. `open` holds whether it shows.
+pub fn pick_dialog<I, P>(picker: Picker<I, P>, open: Signal<bool>) -> View
+where
+    I: Fn() -> Vec<PickItem> + Copy + 'static,
+    P: Fn(String) + Clone + 'static,
+{
+    if super::touch() {
+        return view().child(pick_sheet(picker, open));
+    }
+    let body = pick_content(picker, open, false);
+    view().child(when(
+        move || open.get(),
+        move || {
+            dialog()
+                .on_cancel(move || open.set(false))
+                .items_center()
+                .pt(px(120.0))
+                .child(
+                    view()
+                        .w(px(420.0))
+                        .max_w(percentage(0.92))
+                        .rounded(px(radius::SURFACE))
+                        .border_1()
+                        .border_color(colors::EDGE)
+                        .bg(colors::SURFACE)
+                        .shadow_lg()
+                        .child(body.build()),
+                )
+        },
+    ))
+}
+
+fn pick_sheet<I, P>(picker: Picker<I, P>, open: Signal<bool>) -> nsh_base::SheetElement
+where
+    I: Fn() -> Vec<PickItem> + Copy + 'static,
+    P: Fn(String) + Clone + 'static,
+{
+    sheet()
+        .side(Placement::Bottom)
+        .open(move || Some(open.get()))
+        .on_open_change(move |event: &nsh_base::SheetEvent| {
+            if let nsh_base::SheetEvent::OpenChange(false, _) = event {
+                open.set(false);
+            }
+        })
+        .popup_style(|s| {
+            s.w_full()
+                .max_h(percentage(0.72))
+                .rounded_t(px(radius::SURFACE))
+                .bg(colors::SURFACE)
+                .pb_safe_area()
+                .shadow_lg()
+        })
+        .backdrop_style(|s| s.bg(colors::SCRIM))
+        .child(pick_content(picker, open, true).build())
+}
+
+/// The picker's content, made again each time it opens (so the checks
+/// and recent order are current).
+#[derive(Clone)]
+struct PickContent(std::rc::Rc<dyn Fn() -> View>);
+
+impl PickContent {
+    fn build(&self) -> View {
+        (self.0)()
+    }
+}
+
+fn pick_content<I, P>(picker: Picker<I, P>, open: Signal<bool>, touch: bool) -> PickContent
+where
+    I: Fn() -> Vec<PickItem> + Copy + 'static,
+    P: Fn(String) + Clone + 'static,
+{
+    let Picker {
+        title,
+        items,
+        pick,
+        action,
+    } = picker;
+    let action = action.map(std::rc::Rc::new);
+    PickContent(std::rc::Rc::new(move || {
+        let pick = pick.clone();
+        let action = action.clone();
+        view().child(dynamic(move || {
+            if !open.get() {
+                return None;
+            }
+            let pick = pick.clone();
+            let action = action.clone();
+            Some(untracked(move || {
+                pick_body(title, items(), pick, action, open, touch)
+            }))
+        }))
+    }))
 }
 
 fn pick_body(
     title: &'static str,
     items: Vec<PickItem>,
-    chosen: Option<String>,
     pick: impl Fn(String) + 'static,
     action: Option<std::rc::Rc<PickAction>>,
     open: Signal<bool>,
     touch: bool,
 ) -> View {
     let searchable = items.len() > 6;
+    let glyphs = std::rc::Rc::new(
+        items
+            .iter()
+            .filter_map(|i| i.glyph.map(|g| (i.id.clone(), g)))
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
     let rows = items
         .into_iter()
         .map(|item| {
-            let checked = chosen.as_deref() == Some(item.id.as_str());
             let row = CommandItem::new(item.id, item.title)
                 .keywords([item.detail])
-                .checked(checked);
+                .checked(item.checked);
             match item.group {
                 Some(group) => row.group(group),
                 None => row,
@@ -895,17 +1024,19 @@ fn pick_body(
         .item_class("rounded-md focus:bg-accent")
         .render_item(move |e: &CommandEntry| {
             let detail = e.keywords.first().cloned().unwrap_or_default();
+            let glyph = glyphs.get(e.id.as_ref()).copied();
             view()
                 .min_h(px(row_h))
                 .flex_row()
                 .items_center()
                 .gap_2()
                 .px_2()
-                .child(
-                    super::icon(super::Glyph::Folder)
+                .child(match glyph {
+                    Some(glyph) => super::icon(glyph)
                         .text_color(colors::MUTED)
                         .accessibility_elements_hidden(true),
-                )
+                    None => view(),
+                })
                 .child(
                     view()
                         .flex_1()
@@ -916,12 +1047,15 @@ fn pick_body(
                                 .text_size(px(fit::body()))
                                 .text_color(colors::TEXT),
                         )
-                        .child(
+                        .child(if detail.is_empty() {
+                            view().into_element()
+                        } else {
                             text(detail)
                                 .number_of_lines(1)
                                 .text_size(px(type_scale::XS))
-                                .text_color(colors::FAINT),
-                        ),
+                                .text_color(colors::FAINT)
+                                .into_element()
+                        }),
                 )
                 .child(if e.checked {
                     super::icon(super::Glyph::Check)

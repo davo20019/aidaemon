@@ -534,6 +534,15 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press("Project: Design notes, change")?;
     app.press("New project >> nth=1")?;
     app.wait_for("Project name")?;
+    // A conversation's menu moves it with the same picker; No project
+    // takes it out of one.
+    app.press_key("escape")?;
+    app.long_press("Grocery list >> nth=0")?;
+    let before = sent("set_session_project");
+    app.press("Move to project…")?;
+    app.wait_for("Move to project")?;
+    app.press("Acme site")?;
+    wait_sent_new("set_session_project", before)?;
     // A new conversation from the keyboard, in a project's conversation,
     // stays in that project.
     app.press("Contact form copy >> nth=0")?;
@@ -784,8 +793,7 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
             {{"id":"failover-0","name":"Google Gemini","billing":"per_token","models":[{{"id":"synthetic-gemini"}}]}}
         ]}}}}}}"#
     ))]);
-    app.wait_for("Auto model")?;
-    app.wait_for("Auto effort")?;
+    app.wait_for("Model and effort: Auto")?;
     // The picker's row stays on the screen, beside nothing that wraps it.
     let row = app
         .screen()
@@ -798,11 +806,17 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
         right <= 390.0,
         "the picker ends at {right} pt on a 390 pt screen"
     );
-    // Gemini takes no effort: its choice goes.
-    app.press("Auto model")?;
-    app.press("synthetic-gemini · Google Gemini")?;
-    app.wait_for("synthetic-gemini · Google Gemini")?;
-    app.wait_for_gone("Auto effort", std::time::Duration::from_secs(5))?;
+    // One picker holds the models (their providers under them) and the
+    // efforts of the model in effect.
+    app.press("Model and effort: Auto")?;
+    app.wait_for("Google Gemini")?;
+    app.wait_for("Low effort")?;
+    app.press("synthetic-gemini")?;
+    app.wait_for("Model and effort: synthetic-gemini")?;
+    // Gemini takes no effort: the picker drops the efforts.
+    app.press("Model and effort: synthetic-gemini")?;
+    app.wait_for("Google Gemini")?;
+    app.wait_for_gone("Low effort", std::time::Duration::from_secs(2))?;
     // An existing conversation's pick goes to the daemon at once (in a
     // window, where the list of conversations shows).
     drop(app);
@@ -821,12 +835,14 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
     )]);
     app.wait_for("Pick a model")?;
     app.press("Pick a model >> nth=0")?;
-    app.wait_for("Auto model")?;
-    app.press("Auto model")?;
-    app.press("synthetic-claude · Anthropic")?;
-    app.wait_for("synthetic-claude · Anthropic")?;
+    app.wait_for("Model and effort: Auto")?;
+    app.press("Model and effort: Auto")?;
+    app.press("synthetic-claude")?;
+    app.wait_for("Model and effort: synthetic-claude")?;
     wait_sent_new("set_session_model", None)?;
-    app.wait_for("Auto effort")?;
+    app.press("Model and effort: synthetic-claude")?;
+    app.press("High effort")?;
+    app.wait_for("Model and effort: synthetic-claude · High")?;
     Ok(())
 }
 

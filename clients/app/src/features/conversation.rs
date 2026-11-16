@@ -576,20 +576,24 @@ fn code_start(store: Store) -> View {
             // One card names the project and its folder; a press opens the
             // projects (recent first) with New project last.
             view().w_full().max_w(px(420.0)).child(ui::pick_list(
-                "Choose a project",
+                ui::Picker {
+                    title: "Choose a project",
+                    items: move || {
+                        super::sidebar::project_choices(store, store.current_project(), None)
+                    },
+                    pick: move |id| store.set_new_project(Some(id)),
+                    action: Some(ui::PickAction {
+                        label: "New project",
+                        glyph: Glyph::Plus,
+                        run: std::rc::Rc::new(move || new_project_form(store)),
+                    }),
+                },
                 move || match store.current_project().and_then(|id| store.project(&id)) {
                     Some(p) => format!("Project: {}, change", p.name),
                     None => "Choose a project".to_owned(),
                 },
                 project_card(store),
-                move || project_choices(store),
-                move || store.current_project(),
-                move |id| store.set_new_project(Some(id)),
-                Some(ui::PickAction {
-                    label: "New project",
-                    glyph: Glyph::Plus,
-                    run: std::rc::Rc::new(move || new_project_form(store)),
-                }),
+                true,
             ))
         }))
     }))
@@ -657,48 +661,6 @@ fn project_card(store: Store) -> View {
                 .text_color(colors::FAINT)
                 .accessibility_elements_hidden(true),
         )
-}
-
-/// The projects to choose from: past four, the three last worked in under
-/// Recent, then the rest by name under All projects.
-fn project_choices(store: Store) -> Vec<ui::PickItem> {
-    let mut projects = store.projects();
-    projects.sort_by_key(|p| p.name.to_lowercase());
-    let item = |p: &aidaemon_client_protocol::ProjectSummary, group: Option<&str>| ui::PickItem {
-        id: p.id.clone(),
-        title: p.name.clone(),
-        detail: p
-            .path
-            .as_deref()
-            .map_or_else(|| "No folder".to_owned(), super::sidebar::short_path),
-        group: group.map(str::to_owned),
-    };
-    if projects.len() <= 4 {
-        return projects.iter().map(|p| item(p, None)).collect();
-    }
-    let mut recent = Vec::<String>::new();
-    for id in store.session_ids() {
-        if let Some(project) = store.session_project(&id)
-            && !recent.contains(&project)
-        {
-            recent.push(project);
-            if recent.len() == 3 {
-                break;
-            }
-        }
-    }
-    let mut out = recent
-        .iter()
-        .filter_map(|id| projects.iter().find(|p| &p.id == id))
-        .map(|p| item(p, Some("Recent")))
-        .collect::<Vec<_>>();
-    out.extend(
-        projects
-            .iter()
-            .filter(|p| !recent.contains(&p.id))
-            .map(|p| item(p, Some("All projects"))),
-    );
-    out
 }
 
 /// The transcript, and a "Jump to latest" pill while the owner reads back.

@@ -183,21 +183,18 @@ fn menu_row(store: Store, id: String) -> View {
                 .shown_when(move || store.is_working(&working))
         },
     ];
-    for project in untracked(|| store.projects()) {
-        if current.as_deref() == Some(project.id.as_str()) {
-            continue;
-        }
-        let (session, target) = (id.clone(), project.id.clone());
-        actions.push(ui::MenuAction::new(
-            format!("Move to {}", project.name),
-            move || store.move_to_project(&session, Some(target.clone())),
-        ));
-    }
-    if current.is_some() {
+    // One line however many projects there are: the picker lists them,
+    // with No project first to take it out of one.
+    if untracked(|| !store.projects().is_empty()) {
         let session = id.clone();
-        actions.push(ui::MenuAction::new("Take out of its project", move || {
-            store.move_to_project(&session, None)
-        }));
+        actions.push(ui::MenuAction::new(
+            if current.is_some() {
+                "Move to another project…"
+            } else {
+                "Move to project…"
+            },
+            move || store.start_moving(&session),
+        ));
     }
     {
         let session = id.clone();
@@ -631,6 +628,84 @@ fn project_form(store: Store) -> View {
 
 /// A folder for a row: the home folder as `~`, and only its last parts
 /// when long.
+/// The project picker of a conversation's "Move to project…".
+pub fn move_picker(store: Store) -> View {
+    ui::pick_dialog(
+        ui::Picker {
+            title: "Move to project",
+            items: move || {
+                let current = store.moving().and_then(|id| store.session_project(&id));
+                project_choices(store, current, Some("No project"))
+            },
+            pick: move |project: String| {
+                if let Some(session) = store.moving() {
+                    store.move_to_project(&session, Some(project).filter(|p| !p.is_empty()));
+                }
+            },
+            action: None,
+        },
+        store.moving_open(),
+    )
+}
+
+/// The projects to choose from, `chosen` checked: past four, the three
+/// last worked in under Recent, then the rest by name under All projects.
+/// `none` (a title) adds a first choice of no project, id "".
+pub fn project_choices(
+    store: Store,
+    chosen: Option<String>,
+    none: Option<&str>,
+) -> Vec<ui::PickItem> {
+    let mut projects = store.projects();
+    projects.sort_by_key(|p| p.name.to_lowercase());
+    let item = |p: &aidaemon_client_protocol::ProjectSummary, group: Option<&str>| {
+        let row = ui::PickItem::new(p.id.clone(), p.name.clone())
+            .detail(
+                p.path
+                    .as_deref()
+                    .map_or_else(|| "No folder".to_owned(), short_path),
+            )
+            .glyph(ui::Glyph::Folder)
+            .checked(chosen.as_deref() == Some(p.id.as_str()));
+        match group {
+            Some(group) => row.group(group),
+            None => row,
+        }
+    };
+    let mut out = Vec::new();
+    if let Some(title) = none {
+        out.push(ui::PickItem::new("", title).checked(chosen.is_none()));
+    }
+    if projects.len() <= 4 {
+        out.extend(projects.iter().map(|p| item(p, None)));
+        return out;
+    }
+    let mut recent = Vec::<String>::new();
+    for id in store.session_ids() {
+        if let Some(project) = store.session_project(&id)
+            && !recent.contains(&project)
+        {
+            recent.push(project);
+            if recent.len() == 3 {
+                break;
+            }
+        }
+    }
+    out.extend(
+        recent
+            .iter()
+            .filter_map(|id| projects.iter().find(|p| &p.id == id))
+            .map(|p| item(p, Some("Recent"))),
+    );
+    out.extend(
+        projects
+            .iter()
+            .filter(|p| !recent.contains(&p.id))
+            .map(|p| item(p, Some("All projects"))),
+    );
+    out
+}
+
 pub fn short_path(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let shown = match path.strip_prefix(&home) {

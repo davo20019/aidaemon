@@ -77,6 +77,10 @@ fn model_items(options: &ModelOptions) -> Vec<(String, String)> {
     items
 }
 
+/// One chip in the composer's row: the model (Auto or the one pinned) and
+/// the effort when it is not Auto. A press opens one picker with the
+/// models (their provider under each when there are several) and, for a
+/// model that takes one, the efforts, each with what is in effect checked.
 pub fn model_picker(store: Store, session: Option<String>) -> View {
     if !untracked(|| store.can_pick_model(session.as_deref())) {
         return view();
@@ -100,71 +104,119 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         let session = session.clone();
         computed(move || store.model_of(session.as_deref()))
     };
-    let models = {
-        let session = session.clone();
-        dynamic(move || {
-            let Read::Ready(options) = store.model_options() else {
-                return Some(view());
-            };
-            // Only one model and nothing to choose between: no picker.
-            if options
+    let label = computed(move || {
+        let (model, effort) = current.get();
+        let model = match model {
+            ModelChoice::Pinned { model, .. } => model,
+            _ => "Auto".to_owned(),
+        };
+        match effort {
+            Effort::Auto => model,
+            effort => format!("{model} · {}", effort_word(effort)),
+        }
+    });
+    let shown = computed(move || match store.model_options() {
+        Read::Ready(options) => {
+            options
                 .providers
                 .iter()
                 .map(|p| p.models.len())
                 .sum::<usize>()
-                < 2
-            {
-                return Some(view());
-            }
-            let session = session.clone();
-            Some(untracked(move || {
-                view().child(ui::choice_compact(
-                    "Model",
-                    "Auto model",
-                    model_items(&options),
-                    move || Some(encode(&current.get().0)),
-                    move |chosen| {
-                        let model = chosen.as_deref().map_or(ModelChoice::Auto, decode);
-                        store.set_session_model(session.as_deref(), Some(model), None);
-                    },
-                ))
-            }))
-        })
-    };
-    let efforts = dynamic(move || {
-        let (model, _) = current.get();
-        let efforts = store.efforts_of(&model);
-        if efforts.is_empty() {
-            return Some(view());
+                >= 2
+                || !store.efforts_of(&current.get().0).is_empty()
         }
-        let session = session.clone();
-        Some(untracked(move || {
-            let mut items = vec![("auto".to_owned(), effort_title(Effort::Auto).to_owned())];
-            items.extend(
-                efforts
-                    .into_iter()
-                    .map(|e| (effort_value(e).to_owned(), effort_title(e).to_owned())),
-            );
-            view().child(ui::choice_compact(
-                "Effort",
-                "Auto effort",
-                items,
-                move || Some(effort_value(current.get().1).to_owned()),
-                move |chosen| {
-                    let effort = chosen.as_deref().map_or(Effort::Auto, effort_of);
-                    store.set_session_model(session.as_deref(), None, Some(effort));
-                },
-            ))
-        }))
+        _ => false,
     });
-    view()
-        .test_id("model-picker")
+    let chip = view()
+        .h(px(if ui::touch() { 44.0 } else { 26.0 }))
         .flex_row()
-        .flex_wrap()
         .items_center()
-        .gap_1()
-        .child(models)
-        .child(efforts)
+        .gap(px(4.0))
+        .px(px(8.0))
+        .child(
+            text(move || label.get())
+                .number_of_lines(1)
+                .max_w(px(180.0))
+                .text_size(px(ui::type_scale::XS))
+                .text_color(ui::colors::MUTED),
+        )
+        .child(
+            ui::icon(ui::Glyph::Down)
+                .text_color(ui::colors::FAINT)
+                .accessibility_elements_hidden(true),
+        );
+    let pick_session = session.clone();
+    view().test_id("model-picker").child(when(
+        move || shown.get(),
+        move || {
+            let session = pick_session.clone();
+            ui::pick_list(
+                ui::Picker {
+                    title: "Model and effort",
+                    items: move || choices(store, current.get_untracked()),
+                    pick: move |id: String| {
+                        if let Some(model) = id.strip_prefix("model:") {
+                            store.set_session_model(session.as_deref(), Some(decode(model)), None);
+                        } else if let Some(effort) = id.strip_prefix("effort:") {
+                            store.set_session_model(
+                                session.as_deref(),
+                                None,
+                                Some(effort_of(effort)),
+                            );
+                        }
+                    },
+                    action: None,
+                },
+                move || format!("Model and effort: {}", label.get()),
+                chip.clone(),
+                false,
+            )
+        },
+    ))
+}
+
+fn effort_word(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "Low",
+        Effort::Medium => "Medium",
+        Effort::High => "High",
+        _ => "Auto",
+    }
+}
+
+/// The models, then the efforts the current model takes.
+fn choices(store: Store, (model, effort): (ModelChoice, Effort)) -> Vec<ui::PickItem> {
+    let mut items = Vec::new();
+    if let Read::Ready(options) = untracked(|| store.model_options()) {
+        let current = encode(&model);
+        for (value, title) in model_items(&options) {
+            let (title, detail) = match title.split_once(" · ") {
+                Some((model, provider)) => (model.to_owned(), provider.to_owned()),
+                None if value == "auto" => (
+                    "Auto".to_owned(),
+                    "The daemon picks for each message".to_owned(),
+                ),
+                None => (title, String::new()),
+            };
+            items.push(
+                ui::PickItem::new(format!("model:{value}"), title)
+                    .detail(detail)
+                    .group("Model")
+                    .checked(value == current),
+            );
+        }
+    }
+    let efforts = untracked(|| store.efforts_of(&model));
+    if !efforts.is_empty() {
+        for e in std::iter::once(Effort::Auto).chain(efforts) {
+            items.push(
+                ui::PickItem::new(format!("effort:{}", effort_value(e)), effort_title(e))
+                    .group("Effort")
+                    .checked(e == effort),
+            );
+        }
+    }
+    items
 }
 
 #[cfg(test)]

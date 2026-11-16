@@ -256,6 +256,10 @@ pub struct Store {
     enter_queues: Signal<bool>,
     /// The conversation whose name is being edited in the sidebar.
     renaming: Signal<Option<String>>,
+    /// The conversation whose project is being chosen, and whether the
+    /// project picker for it shows.
+    moving: Signal<Option<String>>,
+    moving_open: Signal<bool>,
     /// When the owner last looked at the automations (this device): runs
     /// after it are news.
     automations_seen: Signal<u64>,
@@ -305,6 +309,8 @@ impl Store {
                 nsh_core::storage::Storage::get_item(ENTER_QUEUES_KEY).as_deref() == Some("1"),
             ),
             renaming: signal(None),
+            moving: signal(None),
+            moving_open: signal(false),
             automations_seen: signal(
                 nsh_core::storage::Storage::get_item(AUTOMATIONS_SEEN_KEY)
                     .and_then(|v| v.parse().ok())
@@ -1783,6 +1789,27 @@ impl Store {
 
     pub fn renaming(&self) -> Option<String> {
         self.renaming.get()
+    }
+
+    /// Choose a project for conversation `id` (its menu's "Move to
+    /// project…"): the picker opens over the page (a phone's list closes
+    /// for it).
+    pub fn start_moving(&self, id: &str) {
+        self.moving.set(Some(id.to_owned()));
+        if self.compact.get_untracked() {
+            self.sidebar.set(false);
+        }
+        self.moving_open.set(true);
+    }
+
+    /// The conversation being moved, if any.
+    pub fn moving(&self) -> Option<String> {
+        self.moving.get()
+    }
+
+    /// Whether the project picker for a move shows.
+    pub fn moving_open(&self) -> Signal<bool> {
+        self.moving_open
     }
 
     /// Start (`Some`) or stop editing a conversation's name.

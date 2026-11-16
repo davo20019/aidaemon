@@ -163,6 +163,7 @@ pub fn shell(store: Store) -> View {
             }))
         }))
         .child(when(palette, move || palette_dialog(store, palette)))
+        .child(crate::features::sidebar::move_picker(store))
         .child(ui::toasts(
             move || store.toast(),
             move || store.dismiss_toast(),
