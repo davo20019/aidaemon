@@ -623,6 +623,13 @@ impl ClientHost for DaemonClientHost {
         super::client_projects::update(self.state.as_ref(), id, name, path, create_folder).await
     }
 
+    async fn delete_project(
+        &self,
+        id: &str,
+    ) -> Result<(), aidaemon_client_protocol::ProtocolError> {
+        super::client_projects::delete(self.state.as_ref(), id).await
+    }
+
     async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
         Ok(super::client_models::named(
             super::client_models::options(&self.llm),

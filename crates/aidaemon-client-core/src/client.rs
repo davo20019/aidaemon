@@ -379,6 +379,8 @@ pub struct Client {
     queue_sends: BTreeSet<String>,
     /// The file undo in flight: its request and the file.
     revert_request: Option<(String, String)>,
+    /// A project delete in flight, and the project's name.
+    delete_project_request: Option<(String, String)>,
     /// Turns that already showed the changes, so the owner's own choice
     /// sticks for the rest of a turn.
     changes_shown: BTreeSet<String>,
@@ -732,6 +734,30 @@ impl Client {
                 self.project_missing_folder = (error.code == ErrorCode::FolderMissing)
                     .then(|| self.project_path.clone())
                     .flatten();
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Projects { .. },
+            } if self
+                .delete_project_request
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id) =>
+            {
+                let (_, name) = self.delete_project_request.take().unwrap_or_default();
+                out.push(Effect::Say(format!("Deleted {name}")));
+                // The reducer keeps the list as it is now.
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self
+                .delete_project_request
+                .as_ref()
+                .is_some_and(|(id, _)| id == request_id) =>
+            {
+                self.delete_project_request = None;
+                out.push(Effect::Say(error.message.clone()));
                 return true;
             }
             ServerFrame::Ack {
@@ -1546,6 +1572,21 @@ impl Client {
 
     pub fn saving_project(&self) -> bool {
         self.project_request.is_some()
+    }
+
+    /// Delete a project: its conversations go to no project and its folder
+    /// stays. The daemon's answer says it, or why not.
+    pub fn delete_project(&mut self, project_id: &str) {
+        let name = self
+            .state
+            .projects
+            .get(project_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "the project".to_owned());
+        let id = self.send(Command::DeleteProject {
+            project_id: project_id.to_owned(),
+        });
+        self.delete_project_request = Some((id, name));
     }
 
     /// Put a conversation in a project, or in none.
@@ -2367,6 +2408,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_deleted_project_leaves_its_conversations_in_none() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.update(
+            frame(r#"{"type":"event","seq":1,"at_ms":1,"event":{"type":"project_updated","project":{"id":"project-acme","name":"Acme site"}}}"#),
+            &cx(None),
+        );
+        client.update(
+            frame(r#"{"type":"event","seq":2,"at_ms":1,"session_id":"app:6c1f","event":{"type":"session_created","session":{"id":"app:6c1f","channel":"app","title":"Fix the footer","last_activity_ms":1,"writable":true,"project_id":"project-acme"}}}"#),
+            &cx(None),
+        );
+        assert_eq!(
+            client.session_project("app:6c1f").as_deref(),
+            Some("project-acme")
+        );
+        client.delete_project("project-acme");
+        let (id, sent) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(sent, Command::DeleteProject { .. }));
+        client.update(
+            frame(r#"{"type":"event","seq":3,"at_ms":1,"event":{"type":"project_deleted","project_id":"project-acme"}}"#),
+            &cx(None),
+        );
+        let said = client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"projects","projects":[]}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(client.projects().is_empty());
+        assert_eq!(client.session_project("app:6c1f"), None);
+        assert!(
+            said.contains(&Effect::Say("Deleted Acme site".to_owned())),
+            "{said:?}"
+        );
     }
 
     #[test]

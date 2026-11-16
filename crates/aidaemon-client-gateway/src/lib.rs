@@ -174,6 +174,16 @@ pub trait ClientHost: Send + Sync {
         ))
     }
 
+    /// Delete a project: its conversations, goals and runs go to no
+    /// project and its bots to none; its folder stays. `Err`: nothing
+    /// changed, and why.
+    async fn delete_project(&self, _id: &str) -> Result<(), ProtocolError> {
+        Err(ProtocolError::new(
+            ErrorCode::Invalid,
+            "This daemon has no projects",
+        ))
+    }
+
     /// The providers and models a conversation can be set to answer with
     /// (protocol 1.16).
     async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
@@ -758,6 +768,7 @@ impl ClientGateway {
             | Command::EditQueued { .. } => Some(Scope::Chat),
             Command::CreateProject { .. }
             | Command::UpdateProject { .. }
+            | Command::DeleteProject { .. }
             | Command::SetSessionProject { .. }
             | Command::SetChannelProject { .. }
             | Command::ChangeAutomation { .. }
@@ -1050,6 +1061,36 @@ impl ClientGateway {
                     },
                 );
                 Ok(CommandResult::Project { project })
+            }
+            Command::DeleteProject { project_id } => {
+                // Its conversations, read before they move, are sent again
+                // in no project.
+                let moved: Vec<String> = match self.host.sessions().await {
+                    Ok(sessions) => sessions
+                        .into_iter()
+                        .filter(|s| s.project_id.as_deref() == Some(project_id.as_str()))
+                        .map(|s| s.id)
+                        .collect(),
+                    Err(e) => {
+                        warn!(error = %e, "Reading sessions before a project delete failed");
+                        Vec::new()
+                    }
+                };
+                self.host.delete_project(&project_id).await?;
+                self.publisher.publish(
+                    None,
+                    Event::ProjectDeleted {
+                        project_id: project_id.clone(),
+                    },
+                );
+                for session in moved {
+                    self.publish_session(&session).await;
+                }
+                let projects = self.host.projects().await.map_err(|e| {
+                    warn!(error = %e, "Listing projects failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not read the projects")
+                })?;
+                Ok(CommandResult::Projects { projects })
             }
             Command::SetSessionProject {
                 session_id,

@@ -500,6 +500,16 @@ impl State {
             Event::ProjectUpdated { project } => {
                 self.projects.insert(project.id.clone(), project);
             }
+            Event::ProjectDeleted { project_id } => {
+                self.projects.remove(&project_id);
+                for view in self.sessions.values_mut() {
+                    if let Some(summary) = view.summary.as_mut()
+                        && summary.project_id.as_deref() == Some(project_id.as_str())
+                    {
+                        summary.project_id = None;
+                    }
+                }
+            }
             Event::TaskUpdated { task } => {
                 if matches!(task.state, TaskState::Running | TaskState::Cancelling) {
                     self.tasks.insert(task.id.clone(), task);

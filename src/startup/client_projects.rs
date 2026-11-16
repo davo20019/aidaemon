@@ -135,6 +135,19 @@ pub(crate) async fn update(
         .ok_or_else(|| refused("There is no such project"))
 }
 
+/// Delete a project; its conversations go to no project and its folder
+/// stays where it is.
+pub(crate) async fn delete(state: &dyn StateStore, id: &str) -> Result<(), ProtocolError> {
+    if id == DEFAULT_PROJECT_ID {
+        return Err(refused("Conversations in no project cannot be deleted"));
+    }
+    match state.delete_work_project(id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(refused("There is no such project")),
+        Err(e) => Err(refused(e.to_string())),
+    }
+}
+
 pub(crate) async fn place(
     state: &dyn StateStore,
     session_id: &str,
@@ -348,6 +361,40 @@ fn make_folder(path: &Path, home: &Path) -> Result<(), ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_deleted_project_leaves_its_folder_and_its_conversations_in_none() {
+        let harness = crate::testing::setup_test_agent(crate::testing::MockProvider::new())
+            .await
+            .unwrap();
+        let state: &dyn StateStore = harness.state.as_ref();
+        let site = tempfile::tempdir().unwrap();
+        let made = create(
+            state,
+            "Acme site",
+            Some(&site.path().to_string_lossy()),
+            false,
+        )
+        .await
+        .unwrap();
+        place(state, "app:synthetic-1", Some(&made.id))
+            .await
+            .unwrap();
+
+        delete(state, &made.id).await.unwrap();
+
+        assert!(projects(state).await.unwrap().is_empty());
+        assert_eq!(
+            state
+                .get_session_work_project("app:synthetic-1")
+                .await
+                .unwrap(),
+            DEFAULT_PROJECT_ID
+        );
+        assert!(site.path().is_dir());
+        assert!(delete(state, &made.id).await.is_err());
+        assert!(delete(state, DEFAULT_PROJECT_ID).await.is_err());
+    }
 
     #[tokio::test]
     async fn a_project_is_made_with_an_existing_folder_and_holds_sessions() {

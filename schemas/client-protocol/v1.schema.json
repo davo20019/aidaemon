@@ -1515,6 +1515,23 @@
           "type": "object"
         },
         {
+          "description": "Delete a project (protocol 1.27): its conversations, goals and\nruns move to no project and its chat bots to none; its folder is\nleft as it is. Answers with `projects`.",
+          "properties": {
+            "project_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "delete_project",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project_id"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Put a session in a project, or take it out of every project\n(`project_id` absent) (protocol 1.10).",
           "properties": {
             "project_id": {
@@ -2175,7 +2192,7 @@
           "type": "object"
         },
         {
-          "description": "`list_projects`.",
+          "description": "`list_projects` and `delete_project`.",
           "properties": {
             "projects": {
               "items": {
@@ -2919,6 +2936,23 @@
           "required": [
             "type",
             "project"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A project was deleted (protocol 1.27); its conversations are in no\nproject now.",
+          "properties": {
+            "project_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "project_deleted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project_id"
           ],
           "type": "object"
         },

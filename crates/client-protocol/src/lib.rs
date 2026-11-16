@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 26;
+pub const PROTOCOL_MINOR: u16 = 27;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -355,6 +355,10 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "is_false")]
         create_folder: bool,
     },
+    /// Delete a project (protocol 1.27): its conversations, goals and
+    /// runs move to no project and its chat bots to none; its folder is
+    /// left as it is. Answers with `projects`.
+    DeleteProject { project_id: String },
     /// Put a session in a project, or take it out of every project
     /// (`project_id` absent) (protocol 1.10).
     SetSessionProject {
@@ -655,7 +659,7 @@ pub enum CommandResult {
     Changes {
         changes: SessionChanges,
     },
-    /// `list_projects`.
+    /// `list_projects` and `delete_project`.
     Projects {
         projects: Vec<ProjectSummary>,
     },
@@ -1600,6 +1604,11 @@ pub enum Event {
     ProjectUpdated {
         project: ProjectSummary,
     },
+    /// A project was deleted (protocol 1.27); its conversations are in no
+    /// project now.
+    ProjectDeleted {
+        project_id: String,
+    },
     /// Only with capability `goals`.
     GoalUpdated {
         goal: GoalSummary,
@@ -1670,6 +1679,7 @@ impl Event {
             Event::ApprovalResolved { .. } => "approval_resolved",
             Event::TaskUpdated { .. } => "task_updated",
             Event::ProjectUpdated { .. } => "project_updated",
+            Event::ProjectDeleted { .. } => "project_deleted",
             Event::GoalUpdated { .. } => "goal_updated",
             Event::ViewAction { .. } => "view_action",
             Event::SettingsUpdated { .. } => "settings_updated",

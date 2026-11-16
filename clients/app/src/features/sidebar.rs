@@ -362,8 +362,8 @@ fn new_here(store: Store) {
     }
 }
 
-/// Home lists every project up to this many; past it, the ones used last
-/// (one fewer) and "All projects" in the last one's place.
+/// Home lists every project up to this many; past it, the pinned and the
+/// ones used last (one fewer) and "All projects" in the last one's place.
 const HOME_PROJECTS: usize = 4;
 
 /// Home: what needs the owner, the pinned, the projects
@@ -386,15 +386,17 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         })
     });
     let all = computed(move || store.projects());
+    // The pinned, then the ones used last; "All projects" takes the last
+    // place when some are left out.
     let shown = computed(move || {
-        let ids = recent_projects(store);
-        let room = if ids.len() > HOME_PROJECTS {
+        let room = if all.with(Vec::len) > HOME_PROJECTS {
             HOME_PROJECTS - 1
         } else {
             HOME_PROJECTS
         };
-        ids.into_iter().take(room).collect::<Vec<_>>()
+        store.home_projects(room)
     });
+    let more = computed(move || all.with(Vec::len) > shown.with(Vec::len));
     view()
         .gap(px(1.0))
         .child(group(store, "Needs you", needs))
@@ -407,27 +409,24 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         .child(each(
             shown,
             |id: &String| id.clone(),
-            move |id, _| project_row(store, id.get_untracked(), false),
+            move |id, _| project_row(store, id.get_untracked(), None),
         ))
         .child(
-            when(
-                move || all.with(Vec::len) > HOME_PROJECTS,
-                move || {
-                    row(
-                        || false,
-                        move || store.show_sidebar_view(SidebarView::Projects),
-                    )
-                    .accessibility_label("All projects")
-                    .child(icon(Glyph::Folder).text_color(colors::FAINT))
-                    .child(
-                        text("All projects")
-                            .flex_1()
-                            .text_size(px(ui::fit::body()))
-                            .text_color(colors::MUTED),
-                    )
-                    .child(icon(Glyph::Chevron).text_color(colors::FAINT))
-                },
-            )
+            when(more, move || {
+                row(
+                    || false,
+                    move || store.show_sidebar_view(SidebarView::Projects),
+                )
+                .accessibility_label("All projects")
+                .child(icon(Glyph::Folder).text_color(colors::FAINT))
+                .child(
+                    text("All projects")
+                        .flex_1()
+                        .text_size(px(ui::fit::body()))
+                        .text_color(colors::MUTED),
+                )
+                .child(icon(Glyph::Chevron).text_color(colors::FAINT))
+            })
             .otherwise(move || new_project_row(store)),
         )
         // Their heading, with where they came from as one filter (only
@@ -455,31 +454,59 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
         ))
 }
 
-/// The projects, the ones with the latest conversations first, then the
-/// rest by name.
-fn recent_projects(store: Store) -> Vec<String> {
-    let mut projects = store.projects();
-    projects.sort_by_key(|p| p.name.to_lowercase());
-    let mut ids: Vec<String> = Vec::new();
-    for session in store.session_ids() {
-        if let Some(project) = store.session_project(&session)
-            && !ids.contains(&project)
-            && projects.iter().any(|p| p.id == project)
-        {
-            ids.push(project);
+/// A drag reordering the projects (the list of every project): which one
+/// and how far it moved, and the list as it stands.
+#[derive(Clone, Copy)]
+struct Reorder {
+    drag: Signal<Option<(String, f32)>>,
+    order: Memo<Vec<String>>,
+}
+
+/// A row of the list of every project, and the gap between two: a drag
+/// moves a row a place each this far.
+fn detailed_row() -> f32 {
+    ui::fit::row() + 14.0
+}
+const ROW_GAP: f32 = 1.0;
+
+impl Reorder {
+    /// Where the dragged row would land: `(from, to)`.
+    fn target(&self) -> Option<(usize, usize)> {
+        let (id, dy) = self.drag.get()?;
+        self.order.with(|ids| {
+            let from = ids.iter().position(|p| *p == id)?;
+            let step = detailed_row() + ROW_GAP;
+            let to = (from as f32 + (dy / step).round()).clamp(0.0, (ids.len() - 1) as f32);
+            Some((from, to as usize))
+        })
+    }
+
+    /// How far row `id` moves while another is dragged: a place, out of
+    /// the dragged one's way; the dragged one follows the pointer.
+    fn offset(&self, id: &str) -> f32 {
+        let Some((dragged, dy)) = self.drag.get() else {
+            return 0.0;
+        };
+        if dragged == id {
+            return dy;
+        }
+        let Some((from, to)) = self.target() else {
+            return 0.0;
+        };
+        let at = self.order.with(|ids| ids.iter().position(|p| p == id));
+        let step = detailed_row() + ROW_GAP;
+        match at {
+            Some(at) if from < to && at > from && at <= to => -step,
+            Some(at) if to < from && at >= to && at < from => step,
+            _ => 0.0,
         }
     }
-    for project in projects {
-        if !ids.contains(&project.id) {
-            ids.push(project.id);
-        }
-    }
-    ids
 }
 
 /// A project's row: its name and how many conversations it has; a press
-/// goes inside it. `detailed` adds its folder (the list of every project).
-fn project_row(store: Store, id: String, detailed: bool) -> View {
+/// goes inside it, its menu pins, moves or deletes it. `reorder` (the list
+/// of every project) adds its folder and a handle to drag it by.
+fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
     let (name, folder, label, open, count_id) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let count = computed(move || {
@@ -492,22 +519,36 @@ fn project_row(store: Store, id: String, detailed: bool) -> View {
             })
             .count()
     });
-    let (start, edit) = (id.clone(), id.clone());
+    let (start, edit, pin, gone) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let (up, can_up, down, can_down) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let pinned_id = id.clone();
+    let pinned = move || store.is_project_pinned(&pinned_id);
+    let pin_label = if untracked(&pinned) {
+        "Unpin"
+    } else {
+        "Pin to the top"
+    };
     let actions = vec![
         ui::MenuAction::new("New conversation here", move || {
             store.new_in_project(Some(start.clone()))
         }),
+        ui::MenuAction::new(pin_label, move || store.toggle_project_pin(&pin)),
+        ui::MenuAction::new("Move up", move || store.move_project_by(&up, -1))
+            .shown_when(move || reorder.is_some() && store.can_move_project(&can_up, -1)),
+        ui::MenuAction::new("Move down", move || store.move_project_by(&down, 1))
+            .shown_when(move || reorder.is_some() && store.can_move_project(&can_down, 1)),
         ui::MenuAction::new("Edit name or folder", move || {
             store.show_sidebar_view(SidebarView::Project(edit.clone()));
             store.edit_project(&edit);
         }),
+        ui::MenuAction::new("Delete project…", move || confirm_delete(store, &gone)),
     ];
     let mut names = view().flex_1().min_w(px(0.0)).child(
         text(move || store.project(&name).map(|p| p.name).unwrap_or_default())
             .number_of_lines(1)
             .text_size(px(ui::fit::body())),
     );
-    if detailed {
+    if reorder.is_some() {
         names = names.child(
             text(move || {
                 store
@@ -521,32 +562,131 @@ fn project_row(store: Store, id: String, detailed: bool) -> View {
             .text_color(colors::FAINT),
         );
     }
-    ui::with_menu(
-        row(
-            || false,
-            move || store.show_sidebar_view(SidebarView::Project(open.clone())),
-        )
-        .accessibility_label(move || {
-            Some(SharedString::from(format!(
-                "Project {}, {} conversations",
-                store.project(&label).map(|p| p.name).unwrap_or_default(),
-                count.get()
-            )))
-        })
-        .child(icon(Glyph::Folder).text_color(colors::MUTED))
-        .child(names)
-        .child(
-            text(move || match count.get() {
-                0 => String::new(),
-                n => n.to_string(),
-            })
-            .tabular_nums()
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT),
-        )
-        .child(icon(Glyph::Chevron).text_color(colors::FAINT)),
-        actions,
+    let star = pinned.clone();
+    let mut line = row(
+        || false,
+        move || store.show_sidebar_view(SidebarView::Project(open.clone())),
     )
+    .accessibility_label(move || {
+        Some(SharedString::from(format!(
+            "Project {}{}, {} conversations",
+            store.project(&label).map(|p| p.name).unwrap_or_default(),
+            if pinned() { ", pinned" } else { "" },
+            count.get()
+        )))
+    })
+    .child(icon(Glyph::Folder).text_color(colors::MUTED))
+    .child(names)
+    .child(when(star, || icon(Glyph::Pinned).text_color(colors::FAINT)))
+    .child(
+        text(move || match count.get() {
+            0 => String::new(),
+            n => n.to_string(),
+        })
+        .tabular_nums()
+        .text_size(px(type_scale::XS))
+        .text_color(colors::FAINT),
+    );
+    let Some(reorder) = reorder else {
+        return ui::with_menu(
+            line.child(icon(Glyph::Chevron).text_color(colors::FAINT)),
+            actions,
+        );
+    };
+    line = line.h(px(detailed_row()));
+    let (moving, offset_id, handle_id) = (id.clone(), id.clone(), id.clone());
+    let lifted = move || {
+        reorder
+            .drag
+            .with(|d| d.as_ref().is_some_and(|(d, _)| *d == moving))
+    };
+    view()
+        .translate_y(move || DefiniteLength::from(px(reorder.offset(&offset_id))))
+        .z_index({
+            let lifted = lifted.clone();
+            move || if lifted() { 1 } else { 0 }
+        })
+        .rounded(px(ui::radius::CONTROL))
+        .style_when(lifted, |s| s.bg(colors::SURFACE).shadow_md())
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(ui::with_menu(line, actions)),
+                )
+                .child(drag_handle(store, reorder, handle_id)),
+        )
+}
+
+/// The handle a project's row is dragged by, up or down the list.
+fn drag_handle(store: Store, reorder: Reorder, id: String) -> View {
+    let (grant, end) = (id.clone(), id.clone());
+    view()
+        .test_id(&format!("drag:{id}"))
+        .w(px(ui::fit::icon_slot() + 8.0))
+        .h(px(detailed_row()))
+        .items_center()
+        .justify_center()
+        // The mouse's and a finger's; the keyboard and a screen reader
+        // have Move up and Move down in the row's menu.
+        .child(icon(Glyph::Grip).text_color(colors::FAINT))
+        .claim_touches(TouchClaim::on_start())
+        .keep_touches(true)
+        .on_responder_grant(move |_: &ResponderEvent| {
+            reorder.drag.set(Some((grant.clone(), 0.0)));
+        })
+        .on_responder_move(move |e: &ResponderEvent| {
+            reorder.drag.update(|d| {
+                if let Some((_, dy)) = d {
+                    *dy = e.gesture.delta.y.0;
+                }
+            });
+        })
+        .on_responder_release(move |_: &ResponderEvent| {
+            let target = untracked(|| reorder.target());
+            reorder.drag.set(None);
+            if let Some((from, to)) = target
+                && from != to
+            {
+                store.move_project(&end, to);
+            }
+        })
+        .on_responder_terminate(move |_: &ResponderEvent| reorder.drag.set(None))
+}
+
+/// Ask, then delete a project: its conversations go to no project, its
+/// folder stays.
+fn confirm_delete(store: Store, id: &str) {
+    let Some(project) = untracked(|| store.project(id)) else {
+        return;
+    };
+    let chats = untracked(|| {
+        store
+            .session_ids()
+            .iter()
+            .filter(|s| store.session_project(s).as_deref() == Some(id))
+            .count()
+    });
+    let moved = match chats {
+        0 => "It has no conversations.".to_owned(),
+        1 => "Its conversation moves to No project.".to_owned(),
+        n => format!("Its {n} conversations move to No project."),
+    };
+    let folder = match project.path {
+        Some(path) => format!(" The folder {} stays as it is.", short_path(&path)),
+        None => String::new(),
+    };
+    let id = id.to_owned();
+    ui::confirm(
+        format!("Delete {}?", project.name),
+        format!("{moved}{folder}"),
+        "Delete",
+        move || store.delete_project(&id),
+    );
 }
 
 /// "New project": opens the form.
@@ -590,17 +730,21 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
         .child(tools)
 }
 
-/// Every project, each with its folder, then New project.
+/// Every project, each with its folder, the pinned first and each dragged
+/// into place by its handle, then New project.
 fn all_projects(store: Store, _ids: Memo<Vec<String>>) -> View {
-    let all = computed(move || recent_projects(store));
+    let reorder = Reorder {
+        drag: signal(None),
+        order: computed(move || store.sorted_projects()),
+    };
     view()
         .gap(px(1.0))
         .child(page_head(store, || "Projects".to_owned(), view()))
-        .child(each(
-            all,
+        .child(view().gap(px(ROW_GAP)).child(each(
+            reorder.order,
             |id: &String| id.clone(),
-            move |id, _| project_row(store, id.get_untracked(), true),
-        ))
+            move |id, _| project_row(store, id.get_untracked(), Some(reorder)),
+        )))
         .child(when(
             move || store.project_form_open(),
             move || project_form(store),

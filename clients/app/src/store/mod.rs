@@ -106,6 +106,10 @@ pub const STEPS_TAB: usize = 1;
 /// Where drafts are kept between runs.
 const DRAFT_KEY: &str = "aidaemon.draft.";
 const PINS_KEY: &str = "aidaemon.pins";
+/// The projects kept at the top of the sidebar, and the order the owner put
+/// the projects in, one id a line.
+const PROJECT_PINS_KEY: &str = "aidaemon.project-pins";
+const PROJECT_ORDER_KEY: &str = "aidaemon.project-order";
 const OPEN_KEY: &str = "aidaemon.open";
 /// The project this device last started work on code in.
 /// What the sidebar shows.
@@ -237,6 +241,11 @@ pub struct Store {
     filter: Signal<String>,
     /// Conversations kept at the top of the list (this device's storage).
     pins: Signal<BTreeSet<String>>,
+    /// Projects kept at the top of the sidebar (this device's storage).
+    project_pins: Signal<BTreeSet<String>>,
+    /// The order the owner dragged the projects into (this device's
+    /// storage); empty until they do, and the ones made since go after.
+    project_order: Signal<Vec<String>>,
     /// Seconds, for elapsed times (advanced by the shell while work runs).
     tick: Signal<u64>,
     activity_mode: Signal<ActivityMode>,
@@ -308,6 +317,8 @@ impl Store {
             page: signal(Page::Conversation),
             filter: signal(String::new()),
             pins: signal(BTreeSet::new()),
+            project_pins: signal(BTreeSet::new()),
+            project_order: signal(Vec::new()),
             tick: signal(0),
             activity_mode: signal(ActivityMode::default()),
             gateway_base: stored(String::new()),
@@ -582,6 +593,9 @@ impl Store {
             .map(str::to_owned)
             .collect();
         self.pins.set(pins);
+        self.project_pins
+            .set(stored_lines(PROJECT_PINS_KEY).into_iter().collect());
+        self.project_order.set(stored_lines(PROJECT_ORDER_KEY));
         if let Some(mode) = nsh_core::storage::Storage::get_item(ACTIVITY_KEY) {
             self.activity_mode.set(ActivityMode::from_key(&mode));
         }
@@ -871,6 +885,151 @@ impl Store {
 
     pub fn projects(&self) -> Vec<ProjectSummary> {
         self.reads.projects.get()
+    }
+
+    /// The projects, the ones with the latest conversations first, then the
+    /// rest by name.
+    pub fn recent_projects(&self) -> Vec<String> {
+        let mut projects = self.projects();
+        projects.sort_by_key(|p| p.name.to_lowercase());
+        let mut ids: Vec<String> = Vec::new();
+        for session in self.session_ids() {
+            if let Some(project) = self.session_project(&session)
+                && !ids.contains(&project)
+                && projects.iter().any(|p| p.id == project)
+            {
+                ids.push(project);
+            }
+        }
+        for project in projects {
+            if !ids.contains(&project.id) {
+                ids.push(project.id);
+            }
+        }
+        ids
+    }
+
+    /// Every project as the owner sorted them: the pinned first, each part
+    /// in the order they dragged it into, the ones never placed by when
+    /// they were used last.
+    pub fn sorted_projects(&self) -> Vec<String> {
+        let recent = self.recent_projects();
+        let mut ids: Vec<String> = self.project_order.with(|order| {
+            order
+                .iter()
+                .filter(|id| recent.contains(id))
+                .cloned()
+                .collect()
+        });
+        for id in recent {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let (mut pinned, rest): (Vec<_>, Vec<_>) =
+            ids.into_iter().partition(|id| self.is_project_pinned(id));
+        pinned.extend(rest);
+        pinned
+    }
+
+    /// Home's projects: every pinned one, then the ones used last, `room`
+    /// in all unless more are pinned.
+    pub fn home_projects(&self, room: usize) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .sorted_projects()
+            .into_iter()
+            .filter(|id| self.is_project_pinned(id))
+            .collect();
+        let fill = room.saturating_sub(ids.len());
+        ids.extend(
+            self.recent_projects()
+                .into_iter()
+                .filter(|id| !self.is_project_pinned(id))
+                .take(fill),
+        );
+        ids
+    }
+
+    pub fn is_project_pinned(&self, id: &str) -> bool {
+        self.project_pins.with(|p| p.contains(id))
+    }
+
+    /// Keep a project at the top of the sidebar, or stop.
+    pub fn toggle_project_pin(&self, id: &str) {
+        self.project_pins.update(|p| {
+            if !p.remove(id) {
+                p.insert(id.to_owned());
+            }
+            store_lines(PROJECT_PINS_KEY, p.iter());
+        });
+    }
+
+    /// Where `id` may go in [`Self::sorted_projects`]: among the pinned if
+    /// it is pinned, after them if not.
+    fn project_place(&self, id: &str) -> Option<(usize, usize, usize, Vec<String>)> {
+        let ids = untracked(|| self.sorted_projects());
+        let at = ids.iter().position(|p| p == id)?;
+        let pinned = ids
+            .iter()
+            .filter(|p| untracked(|| self.is_project_pinned(p)))
+            .count();
+        let (low, high) = if at < pinned {
+            (0, pinned - 1)
+        } else {
+            (pinned, ids.len() - 1)
+        };
+        Some((at, low, high, ids))
+    }
+
+    /// Whether `id` can go `by` places (up: negative) and stay in its part.
+    pub fn can_move_project(&self, id: &str, by: isize) -> bool {
+        self.project_place(id).is_some_and(|(at, low, high, _)| {
+            let to = at as isize + by;
+            to >= low as isize && to <= high as isize
+        })
+    }
+
+    /// Move project `id` to place `to` in [`Self::sorted_projects`], kept
+    /// among the pinned or the rest, whichever it is in.
+    pub fn move_project(&self, id: &str, to: usize) {
+        let Some((at, low, high, mut ids)) = self.project_place(id) else {
+            return;
+        };
+        let to = to.clamp(low, high);
+        if to == at {
+            return;
+        }
+        let moved = ids.remove(at);
+        ids.insert(to, moved);
+        store_lines(PROJECT_ORDER_KEY, ids.iter());
+        self.project_order.set(ids);
+    }
+
+    /// Move project `id` `by` places (up: negative).
+    pub fn move_project_by(&self, id: &str, by: isize) {
+        if let Some((at, ..)) = self.project_place(id) {
+            self.move_project(id, (at as isize + by).max(0) as usize);
+        }
+    }
+
+    /// Delete a project: its conversations go to no project, its folder
+    /// stays. The daemon says when it is done.
+    pub fn delete_project(&self, id: &str) {
+        if self.sidebar_view.get_untracked() == SidebarView::Project(id.to_owned()) {
+            self.show_sidebar_view(SidebarView::Home);
+        }
+        self.project_pins.update(|p| {
+            if p.remove(id) {
+                store_lines(PROJECT_PINS_KEY, p.iter());
+            }
+        });
+        self.project_order.update(|o| {
+            if let Some(at) = o.iter().position(|p| p == id) {
+                o.remove(at);
+                store_lines(PROJECT_ORDER_KEY, o.iter());
+            }
+        });
+        self.act(|c| c.delete_project(id));
     }
 
     pub fn project(&self, id: &str) -> Option<ProjectSummary> {
@@ -2096,4 +2255,19 @@ pub fn now_ms() -> u64 {
 /// The store the root provides.
 pub fn store() -> Store {
     use_context::<Store>().expect("the root provides the store")
+}
+
+/// One id a line, from this device's storage.
+fn stored_lines(key: &str) -> Vec<String> {
+    nsh_core::storage::Storage::get_item(key)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn store_lines<'a>(key: &str, ids: impl Iterator<Item = &'a String>) {
+    let text = ids.cloned().collect::<Vec<_>>().join("\n");
+    let _ = nsh_core::storage::Storage::set_item(key, text);
 }

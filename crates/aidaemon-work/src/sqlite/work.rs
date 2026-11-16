@@ -256,6 +256,43 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
             .find(|project| project.id == id))
     }
 
+    async fn delete_work_project(&self, id: &str) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            id != DEFAULT_PROJECT_ID,
+            "conversations in no project cannot be deleted"
+        );
+        let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
+        for moved in [
+            "UPDATE session_work_projects SET project_id = ?, updated_at = datetime('now') WHERE project_id = ?",
+            "UPDATE goals SET project_id = ? WHERE project_id = ?",
+            "UPDATE goal_runs SET project_id = ? WHERE project_id = ?",
+            "UPDATE task_journal SET project_id = ? WHERE project_id = ?",
+        ] {
+            sqlx::query(moved)
+                .bind(DEFAULT_PROJECT_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for gone in [
+            "DELETE FROM channel_work_projects WHERE project_id = ?",
+            "DELETE FROM worker_profiles WHERE project_id = ?",
+        ] {
+            sqlx::query(gone).bind(id).execute(&mut *tx).await?;
+        }
+        let deleted = sqlx::query("DELETE FROM work_projects WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if deleted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn session_work_projects(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(sqlx::query_as::<_, (String, String)>(
             "SELECT session_id, project_id FROM session_work_projects WHERE project_id != ?",
@@ -2263,6 +2300,44 @@ mod tests {
             next_step: None,
             created_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_project_leaves_its_sessions_and_bots_in_no_project() {
+        let (store, _db) = test_store().await;
+        let project = store.create_work_project("Acme site", None).await.unwrap();
+        let bot = "telegram:synthetic_coding_bot";
+        assert!(
+            store
+                .set_session_work_project("app:a", &project.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_channel_work_project(bot, Some(&project.id))
+                .await
+                .unwrap()
+        );
+
+        assert!(store.delete_work_project(&project.id).await.unwrap());
+
+        assert!(
+            store
+                .list_work_projects()
+                .await
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id)
+        );
+        assert_eq!(
+            store.get_session_work_project("app:a").await.unwrap(),
+            DEFAULT_PROJECT_ID
+        );
+        assert!(store.session_work_projects().await.unwrap().is_empty());
+        assert!(store.channel_work_projects().await.unwrap().is_empty());
+        assert!(!store.delete_work_project(&project.id).await.unwrap());
+        assert!(store.delete_work_project(DEFAULT_PROJECT_ID).await.is_err());
     }
 
     #[tokio::test]

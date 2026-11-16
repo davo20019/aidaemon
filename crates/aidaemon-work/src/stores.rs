@@ -696,6 +696,14 @@ pub trait WorkCoordinationStore: Send + Sync {
         anyhow::bail!("work projects are not supported by this store")
     }
 
+    /// Delete a project: its sessions, goals, runs and journal move to the
+    /// default project, its bots to none, and its worker profiles go with
+    /// it. `false` when there is no such project; the default one cannot
+    /// be deleted.
+    async fn delete_work_project(&self, _id: &str) -> anyhow::Result<bool> {
+        anyhow::bail!("work projects are not supported by this store")
+    }
+
     /// Every session placed in a project other than the default one, with
     /// its project id.
     async fn session_work_projects(&self) -> anyhow::Result<Vec<(String, String)>> {

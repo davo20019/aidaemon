@@ -337,6 +337,8 @@ pub enum Glyph {
     Back,
     /// More to do with it.
     More,
+    /// Drag to reorder.
+    Grip,
     /// Chat platforms, by their marks (Simple Icons, CC0): where a
     /// conversation came from.
     Telegram,
@@ -446,6 +448,7 @@ impl Glyph {
             Self::Compose => "✎",
             Self::Back => "‹",
             Self::More => "…",
+            Self::Grip => "⠿",
             Self::Telegram => "✈",
             Self::Discord => "◈",
             Self::Slack => "#",
@@ -521,6 +524,9 @@ impl Glyph {
             }
             Self::Group => {
                 r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/><circle cx="9" cy="7" r="4"/>"#
+            }
+            Self::Grip => {
+                r#"<circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/>"#
             }
             Self::More => {
                 r#"<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>"#

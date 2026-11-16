@@ -134,6 +134,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListProjects => "list_projects",
         Command::CreateProject { .. } => "create_project",
         Command::UpdateProject { .. } => "update_project",
+        Command::DeleteProject { .. } => "delete_project",
         Command::SetSessionProject { .. } => "set_session_project",
         Command::SetChannelProject { .. } => "set_channel_project",
         Command::ListAutomations => "list_automations",
@@ -358,6 +359,12 @@ fn client_samples() -> Vec<ClientFrame> {
                 name: Some("Acme Corp site".into()),
                 path: None,
                 create_folder: false,
+            },
+        ),
+        command(
+            "5d0c2b1e-0018",
+            Command::DeleteProject {
+                project_id: "project-acme".into(),
             },
         ),
         command(
@@ -604,6 +611,12 @@ fn server_samples() -> Vec<ServerFrame> {
         ),
         event(Some(10), Event::TaskUpdated { task: task() }),
         event(Some(10), Event::ProjectUpdated { project: project() }),
+        event(
+            Some(10),
+            Event::ProjectDeleted {
+                project_id: "project-acme".into(),
+            },
+        ),
         event(
             Some(11),
             Event::GoalUpdated {

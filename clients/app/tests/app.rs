@@ -714,6 +714,97 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     Ok(())
 }
 
+/// Whether `first` comes before `second` among the texts on screen.
+fn above(screen: &nsh_testing::Screen, first: &str, second: &str) -> bool {
+    let texts = screen.texts();
+    let at = |name: &str| texts.iter().position(|t| *t == name);
+    matches!((at(first), at(second)), (Some(a), Some(b)) if a < b)
+}
+
+#[test]
+fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"projects","projects":[{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"},{"id":"project-beta","name":"Beta app"},{"id":"project-charlie","name":"Charlie docs"},{"id":"project-delta","name":"Delta api"},{"id":"project-echo","name":"Echo blog"}]}}"#,
+        ),
+        frame(
+            r#"{"type":"ack","request_id":"r1","result":{"type":"sessions","sessions":[{"id":"app:synthetic-6","channel":"app","title":"Contact form copy","writable":true,"project_id":"project-acme"}]}}"#,
+        ),
+    ]);
+    // Home has room for three and All projects: Echo blog is left out.
+    app.wait_for("Acme site")?;
+    app.wait_for("All projects")?;
+    assert!(!app.screen().shows("Echo blog"));
+    // Pinned from the list of every project, it is first there and on Home.
+    app.press("All projects")?;
+    app.wait_for("Echo blog")?;
+    app.long_press("Project Echo blog, 0 conversations")?;
+    app.press("Pin to the top")?;
+    app.wait_for("label:Project Echo blog, pinned, 0 conversations")?;
+    assert!(above(app.screen(), "Echo blog", "Acme site"));
+    // Its handle drags a project a place up.
+    assert!(above(app.screen(), "Charlie docs", "Delta api"));
+    app.drag(
+        "id:drag:project-delta",
+        nsh_engine::Point {
+            x: Points(0.0),
+            y: Points(-45.0),
+        },
+    )?;
+    app.wait_until(
+        "Delta api above Charlie docs",
+        std::time::Duration::from_secs(5),
+        |s| above(s, "Delta api", "Charlie docs"),
+    )?;
+    // The menu moves one too, for the keyboard.
+    app.long_press("Project Delta api, 0 conversations")?;
+    app.press("Move down")?;
+    app.wait_until(
+        "Charlie docs above Delta api",
+        std::time::Duration::from_secs(5),
+        |s| above(s, "Charlie docs", "Delta api"),
+    )?;
+    app.press("Back to all conversations >> nth=0")?;
+    app.wait_for("label:Project Echo blog, pinned, 0 conversations")?;
+    // Delete asks first and says what happens to its conversations and
+    // folder.
+    app.long_press("Project Acme site, 1 conversations")?;
+    app.answer_dialogs_myself();
+    let before = sent("delete_project");
+    app.press("Delete project…")?;
+    let asked = app
+        .pending_dialog()
+        .map(|d| (d.title.clone(), d.message.clone()));
+    assert_eq!(
+        asked,
+        Some((
+            Some("Delete Acme site?".to_owned()),
+            Some(
+                "Its conversation moves to No project. The folder /home/synthetic/acme-site stays as it is."
+                    .to_owned()
+            )
+        ))
+    );
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Delete".into()))?;
+    let id = wait_sent_new("delete_project", before)?;
+    feed([
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":1,"event":{"type":"project_deleted","project_id":"project-acme"}}"#,
+        ),
+        frame(&format!(
+            r#"{{"type":"ack","request_id":"{id}","result":{{"type":"projects","projects":[{{"id":"project-beta","name":"Beta app"}},{{"id":"project-charlie","name":"Charlie docs"}},{{"id":"project-delta","name":"Delta api"}},{{"id":"project-echo","name":"Echo blog"}}]}}}}"#
+        )),
+    ]);
+    app.wait_for("Deleted Acme site")?;
+    app.wait_for_gone("Acme site", std::time::Duration::from_secs(5))?;
+    app.wait_for("Contact form copy")?;
+    Ok(())
+}
+
 #[test]
 fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
