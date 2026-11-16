@@ -34,6 +34,24 @@ pub enum InternalMarker {
     InboxPath,
 }
 
+/// How a line of the daemon's own timing measurement begins (a run's
+/// start, end and duration). The line stays in the stored reply so a later
+/// turn quotes the measured times instead of guessing; the owner already
+/// reads those times on the turn's card, so [`render_for_owner`] drops it.
+pub const MEASURED_TIMING_MARK: &str = "\u{23f2} Measured: ";
+
+/// `text` without the daemon's timing lines ([`MEASURED_TIMING_MARK`]).
+pub fn without_measured_timing(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(MEASURED_TIMING_MARK) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(MEASURED_TIMING_MARK))
+        .collect();
+    std::borrow::Cow::Owned(kept.join("\n").trim_end().to_string())
+}
+
 /// The fixed-token markers and what the owner reads instead.
 const TOKEN_MARKERS: [(InternalMarker, &str, &str); 4] = [
     (
@@ -159,7 +177,8 @@ fn render_inbox_paths(text: &str) -> Option<String> {
 /// `text` with every internal marker replaced by owner-facing words, and
 /// the kinds that were found (empty when nothing changed).
 pub fn render_for_owner(text: &str) -> (String, Vec<InternalMarker>) {
-    let mut out = text.to_string();
+    // Expected here, not a leak, so not counted as found.
+    let mut out = without_measured_timing(text).into_owned();
     let mut found = Vec::new();
     for (kind, token, words) in TOKEN_MARKERS {
         if out.contains(token) {
@@ -185,6 +204,17 @@ pub fn render_for_owner(text: &str) -> (String, Vec<InternalMarker>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_daemons_timing_lines_are_not_shown_to_the_owner() {
+        let reply = format!(
+            "Both sites are installed.\n\n{MEASURED_TIMING_MARK}Took 59s (6:52:09 PM to 6:53:08 PM ET).\n\n{MEASURED_TIMING_MARK}Answer sent 1m 2s after your request."
+        );
+        let (out, found) = render_for_owner(&reply);
+        assert_eq!(out, "Both sites are installed.");
+        assert!(found.is_empty());
+        assert_eq!(render_for_owner("No timing here.").0, "No timing here.");
+    }
 
     #[test]
     fn each_marker_constant_becomes_plain_words() {

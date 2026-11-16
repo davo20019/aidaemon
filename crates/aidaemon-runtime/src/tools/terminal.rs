@@ -13614,7 +13614,7 @@ mod tests {
         );
         assert!(
             chat.wait_for(Duration::from_secs(20), |text| text.contains("all-done")
-                && text.contains("Measured"))
+                && !text.contains("in the background:"))
                 .await,
             "{:#?}",
             chat.shown().await

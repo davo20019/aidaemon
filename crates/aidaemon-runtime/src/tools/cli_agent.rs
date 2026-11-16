@@ -8153,7 +8153,7 @@ mod tests {
         );
         assert!(
             chat.wait_for(Duration::from_secs(20), |text| text.contains("agent-done")
-                && text.contains("Measured"))
+                && !text.contains("in the background:"))
                 .await,
             "{:#?}",
             chat.shown().await

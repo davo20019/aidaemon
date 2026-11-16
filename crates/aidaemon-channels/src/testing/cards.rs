@@ -190,8 +190,12 @@ impl CardChat {
             "the result never repeats the header: {shown:#?}"
         );
         assert!(
-            results[0].contains("Measured: Took"),
-            "the result carries the measured time: {shown:#?}"
+            !results[0].contains("Measured: "),
+            "the daemon's timing line stays out of the chat: {shown:#?}"
+        );
+        assert!(
+            cards[0].contains("Took "),
+            "the card carries the measured time: {shown:#?}"
         );
         for text in &shown {
             for banned in [

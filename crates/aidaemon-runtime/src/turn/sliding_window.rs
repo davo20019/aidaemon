@@ -16,8 +16,9 @@ const COMMAND_TRUNCATE_CHARS: usize = 80;
 /// works them out. Every summary of an older result keeps them, so a later
 /// turn reports the measured times instead of guessing or calling them
 /// unmeasured (live 2026-11-13: "the tool results didn't include any
-/// durations" about installs the daemon had timed).
-pub const MEASURED_TIMING_MARK: &str = "\u{23f2} Measured: ";
+/// durations" about installs the daemon had timed). The owner does not see
+/// them: outbound text drops them.
+pub use aidaemon_tools::internal_markers::MEASURED_TIMING_MARK;
 
 /// The daemon's timing lines in `text`, in order, each once.
 pub fn measured_timing_lines(text: &str) -> Vec<&str> {

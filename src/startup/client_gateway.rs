@@ -859,6 +859,12 @@ impl ClientHost for DaemonClientHost {
                 _ => Vec::new(),
             };
             let text = m.content.unwrap_or_default();
+            // A reply reads as it was shown when it arrived.
+            let text = if m.role == "assistant" {
+                aidaemon_channels::presentation::prepare_chat_message(&text)
+            } else {
+                text
+            };
             let text = if m.attachments.is_empty() {
                 text
             } else {
