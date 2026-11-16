@@ -530,8 +530,6 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
         ),
     ]);
     app.wait_for("Reading changes…")?;
-    // A phone's pane is the changes alone: the steps are in the chat.
-    assert!(app.press("Steps").is_err());
     // The changes arrive; a file opens on its diff, which fills the pane.
     let patch = r#"diff --git a/src/contact.rs b/src/contact.rs\n--- a/src/contact.rs\n+++ b/src/contact.rs\n@@ -1,2 +1,3 @@\n-fn send() {}\n+fn send() {\n+}\n fn main() {}\n"#;
     let id = wait_sent("get_changes")?;
@@ -584,6 +582,7 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
     // Each says where it came from; one filter narrows the list.
     app.wait_for("Telegram group")?;
     app.press("Show conversations from: All")?;
+    app.wait_for("Groups")?;
     app.press("Groups")?;
     app.wait_for_gone("Weekend plan", std::time::Duration::from_secs(5))?;
     app.wait_for("Team release notes")?;

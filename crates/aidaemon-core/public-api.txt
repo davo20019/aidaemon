@@ -943,6 +943,13 @@ pub fn aidaemon_core::OwnerApprovalRequest::for_tool(&str, &serde_json::value::V
 pub struct aidaemon_core::Pending
 pub aidaemon_core::Pending::child: core::option::Option<alloc::boxed::Box<aidaemon_core::RunState>>
 pub aidaemon_core::Pending::interruption: aidaemon_core::Interruption
+pub struct aidaemon_core::ProjectRef
+pub aidaemon_core::ProjectRef::id: alloc::string::String
+pub aidaemon_core::ProjectRef::name: alloc::string::String
+pub aidaemon_core::ProjectRef::root: core::option::Option<std::path::PathBuf>
+impl aidaemon_core::ProjectRef
+pub fn aidaemon_core::ProjectRef::is_valid_id(&str) -> bool
+pub fn aidaemon_core::ProjectRef::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<std::path::PathBuf>) -> core::option::Option<Self>
 pub struct aidaemon_core::ProviderSwitch
 pub aidaemon_core::ProviderSwitch::from: alloc::string::String
 pub aidaemon_core::ProviderSwitch::reason: aidaemon_core::SwitchReason

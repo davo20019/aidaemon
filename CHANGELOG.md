@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A device that has just been paired can sign in right away: the device is saved before the pairing reads approved, so a quick sign-in is no longer refused.
 - **Pictures and files the agent sends stay in the conversation.** The app showed a screenshot or document the agent sent only until the page reloaded: the transcript kept a text note for documents and nothing for pictures. Now the delivery note carries the file (the copy the app keeps) and the caption the owner saw, so a reload, another device or a later visit shows it again; the note's text stays for the model and the turn's tools stay with its reply. SDK: `AssistantNoteSink::record_delivered_files`, `MediaTap::delivered` returns the kept copy, `AssistantResponseData::attachments`, `MessageAnnotation::DeliveredFiles`.
 - **Background fact extraction stores only what the user stated.** Each extracted fact must carry the user's stance and a verbatim quote from the user's message; a question ("do you know what kind of boat I own?") no longer becomes a stored fact, and facts the agent already saved during the turn are not stored a second time under another key.
 

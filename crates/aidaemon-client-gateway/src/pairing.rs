@@ -399,14 +399,8 @@ impl Pairing {
             let device_id = format!("dv-{}", &random_hex()[..20]);
             let kind = kind_of(row.device_kind.as_deref().unwrap_or_default());
             let ceiling = (kind == ClientKind::Watch).then_some(self.watch_ceiling);
-            if !self
-                .log
-                .decide_offer(offer_id, "approved", Some(&device_id))
-                .await
-                .map_err(internal)?
-            {
-                return Err(ProtocolError::new(ErrorCode::Conflict, "Already settled"));
-            }
+            // The device exists before the offer reads approved, so a
+            // client that sees approved can sign in at once.
             self.log
                 .add_device(&DeviceRow {
                     device_id: device_id.clone(),
@@ -426,6 +420,18 @@ impl Pairing {
                 })
                 .await
                 .map_err(internal)?;
+            if !self
+                .log
+                .decide_offer(offer_id, "approved", Some(&device_id))
+                .await
+                .map_err(internal)?
+            {
+                self.log
+                    .revoke_device(&device_id, now_ms())
+                    .await
+                    .map_err(internal)?;
+                return Err(ProtocolError::new(ErrorCode::Conflict, "Already settled"));
+            }
             info!(device_id, "Paired a client device");
         } else {
             self.log
