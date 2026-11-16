@@ -323,7 +323,7 @@ impl Tool for TrackRequirementsTool {
          checking, however many lookups it takes: answer every part in your reply), a plain \
          answer or conversation, or when the user forbids it. \
          Text the user wants said or written in this conversation (a message for someone \
-         here, a reply, a draft, a translation) is your reply, not a send: skip this for it; \
+         here, a mention or ping of someone here, a reply, a draft, a translation) is your reply, not a send: skip this for it; \
          a send is a tool call that delivers to another chat, person or place."
     }
 

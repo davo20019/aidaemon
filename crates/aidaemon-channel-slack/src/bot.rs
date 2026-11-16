@@ -1014,7 +1014,11 @@ impl SlackBot {
                      the bot needs the `groups:read` scope in addition to `channels:read`"
                 );
             } else {
-                debug!(channel_id, error, "Failed to fetch channel members");
+                // Without the list the model has no names to mention.
+                warn!(
+                    channel_id,
+                    error, "Failed to fetch channel members; replies here cannot mention anyone"
+                );
             }
             return vec![];
         }
@@ -1043,6 +1047,13 @@ impl SlackBot {
                 names.push(name);
             }
         }
+
+        info!(
+            channel_id,
+            members = filtered_ids.len(),
+            named = names.len(),
+            "Slack channel members resolved"
+        );
 
         // Cache the result
         self.channel_members_cache
@@ -2361,6 +2372,15 @@ impl TurnSurface for SlackSurface {
     async fn say(&self, text: &str) -> anyhow::Result<Vec<String>> {
         let mrkdwn = markdown_to_slack_mrkdwn(text);
         let mrkdwn = restore_mentions_from_cache(&mrkdwn, &self.user_cache);
+        let mentions = mrkdwn.matches("<@U").count();
+        if mentions > 0 || text.contains('@') {
+            info!(
+                channel = %self.channel,
+                mentions,
+                known_users = self.user_cache.len(),
+                "Slack reply mentions"
+            );
+        }
         let mut ids = Vec::new();
         let mut failure = None;
         for chunk in split_mrkdwn(&mrkdwn, MAX_MESSAGE_LEN) {
