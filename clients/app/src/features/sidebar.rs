@@ -414,7 +414,7 @@ fn home(
             view()
                 .flex_row()
                 .items_center()
-                .child(section_label("Conversations").flex_1())
+                .child(section_label("Recent").flex_1())
                 .child(when(
                     move || !store.sources().is_empty(),
                     move || source_filter(store),
