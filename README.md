@@ -71,6 +71,8 @@ SQLite-backed persistent memory with local vector embeddings (quantized AllMiniL
 
 **Project memory.** A conversation placed in a project (the app's Code conversations, or a chat moved there with `/project`) keeps what it learns about that project in the project's own notes: plain Markdown files under `~/.aidaemon/projects/<project-id>/memory/` with a generated `MEMORY.md` index. Notes are outside the repository, keyed by the project's id so a rename or a moved folder keeps them, and you can read or edit them by hand. `remember_fact` takes `scope: "project" | "personal"` (default `project` in a project conversation), and background extraction, consolidation and delegated-task learning route the same way. Facts about you and the people around you always stay in personal memory, and nothing a project learns can replace or merge with them. Each project turn shows the project's index after your own memory; `/memory` shows where it lives. Turn it off with `[memory] project_memory = false`, or move it with `[memory] projects_dir`.
 
+A project conversation also gets the repository's own skills (`.agents/skills`, `.claude/skills`) and can start the MCP servers its `.mcp.json` declares with `manage_mcp project_start`, each only after you approve its exact command; those tools stay in that project's conversations.
+
 ### Skills
 Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
 
