@@ -1,12 +1,13 @@
-//! The sidebar: a new conversation, the conversations that need the owner
-//! or are working (from every project), then each project with its
-//! conversations, the conversations in no project (filterable by where
-//! they came from: the app, each chat platform, groups), and the
-//! connection.
+//! The sidebar. Home: search and one New conversation, the conversations
+//! that need the owner or are working, the pinned ones, the projects used
+//! last (one line each; a press goes inside one), then every conversation
+//! by day, tagged with its project or the chat it came from. A project's
+//! page: its folder, its conversations, New conversation there, Edit.
+//! Then the pages and, when something is wrong, the connection.
 
 use nsh_core::prelude::*;
 
-use crate::store::{Connection, Page, SearchRead, Source, Store, now_ms};
+use crate::store::{Connection, Page, SearchRead, SidebarView, Source, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 
@@ -46,84 +47,116 @@ pub fn sidebar(store: Store) -> View {
             store.search_messages(&q);
         });
     });
+    let searching = move || !store.filter().trim().is_empty();
     view()
         .w_full()
         .flex_1()
         .bg(colors::SIDEBAR)
         .border_r_1()
         .border_color(colors::LINE)
-        .child(
+        .child(when(ui::touch(), move || {
+            // A phone: search, one New conversation and Close on one line.
             view()
-                .h(px(ui::fit::bar()))
+                .min_h(px(ui::fit::bar()))
                 .flex_row()
                 .items_center()
-                .px_3()
-                .gap_2()
+                .px_2()
+                .gap_1()
                 .child(
-                    text("AIdaemon")
-                        .flex_1()
-                        .role(AccessibilityRole::Header)
-                        .text_size(px(ui::fit::body()))
-                        .font_weight(FontWeight::SEMIBOLD),
+                    ui::field("Search", query)
+                        .label("Search conversations")
+                        .flex_1(),
                 )
-                // On a phone, New conversation is a button here: the list
-                // keeps the room a full row would take.
-                .child(when(ui::touch(), move || {
-                    ui::icon_btn(Glyph::Plus, "New conversation", ui::Size::Md, move || {
-                        store.select(None)
-                    })
-                }))
-                .child(
-                    when(
-                        move || store.is_compact(),
-                        move || {
-                            ui::icon_btn(ui::Glyph::Close, "Close", ui::Size::Md, move || {
-                                store.close_panes()
-                            })
-                        },
-                    )
-                    .otherwise(|| ui::kbd(key_label("mod+k"))),
-                ),
-        )
-        .child(when(!ui::touch(), move || {
-            view().px_2().child(
-                row(
-                    move || store.selected().is_none(),
-                    move || store.select(None),
-                )
-                .accessibility_label("New conversation")
-                .child(icon(Glyph::Plus).text_color(colors::MUTED))
-                .child(
-                    text("New conversation")
-                        .flex_1()
-                        .text_size(px(type_scale::BASE)),
-                )
-                .child(ui::kbd(key_label("mod+n"))),
-            )
+                .child(ui::icon_btn(
+                    Glyph::Compose,
+                    "New conversation",
+                    ui::Size::Md,
+                    move || new_here(store),
+                ))
+                .child(when(
+                    move || store.is_compact(),
+                    move || {
+                        ui::icon_btn(Glyph::Close, "Close", ui::Size::Md, move || {
+                            store.close_panes()
+                        })
+                    },
+                ))
         }))
-        .child(
-            view().px_2().pt_2().child(
-                ui::field("Search conversations", query)
-                    .label("Search conversations")
-                    .w_full(),
-            ),
-        )
+        .child(when(!ui::touch(), move || {
+            view()
+                .child(
+                    view()
+                        .h(px(ui::fit::bar()))
+                        .flex_row()
+                        .items_center()
+                        .px_3()
+                        .gap_2()
+                        .child(
+                            text("AIdaemon")
+                                .flex_1()
+                                .role(AccessibilityRole::Header)
+                                .text_size(px(ui::fit::body()))
+                                .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            when(
+                                move || store.is_compact(),
+                                move || {
+                                    ui::icon_btn(Glyph::Close, "Close", ui::Size::Md, move || {
+                                        store.close_panes()
+                                    })
+                                },
+                            )
+                            .otherwise(|| ui::kbd(key_label("mod+k"))),
+                        ),
+                )
+                .child(
+                    view().px_2().child(
+                        row(move || store.selected().is_none(), move || new_here(store))
+                            .accessibility_label("New conversation")
+                            .child(icon(Glyph::Compose).text_color(colors::MUTED))
+                            .child(
+                                text("New conversation")
+                                    .flex_1()
+                                    .text_size(px(type_scale::BASE)),
+                            )
+                            .child(ui::kbd(key_label("mod+n"))),
+                    ),
+                )
+                .child(
+                    view().px_2().pt_2().child(
+                        ui::field("Search conversations", query)
+                            .label("Search conversations")
+                            .w_full(),
+                    ),
+                )
+        }))
         .child(
             scroll().flex_1().child(
                 view()
                     .px_2()
                     .pb_2()
                     .gap(px(1.0))
-                    .child(group(store, "Needs you", needs))
-                    .child(group(store, "Working", working))
-                    // Searching lists every match flat; otherwise by project.
-                    .child(
-                        when(
-                            move || store.filter().trim().is_empty(),
-                            move || projects(store, rest),
-                        )
-                        .otherwise(move || group(store, "Conversations", rest)),
-                    )
+                    .child(dynamic(move || {
+                        // Searching lists every match flat, and so do the
+                        // archived; otherwise the view the owner is in.
+                        let flat = searching() || store.showing_archived();
+                        let shown = store.sidebar_view();
+                        Some(untracked(move || {
+                            if flat {
+                                return view()
+                                    .gap(px(1.0))
+                                    .child(group(store, "Needs you", needs))
+                                    .child(group(store, "Working", working))
+                                    .child(group(store, "Conversations", rest));
+                            }
+                            match shown {
+                                SidebarView::Home => home(store, needs, working, rest),
+                                SidebarView::Projects => all_projects(store, ids),
+                                SidebarView::Project(id) => project_page(store, id, ids),
+                            }
+                        }))
+                    }))
                     .child(search_hits(store))
                     .child(archived_toggle(store))
                     .child(when(
@@ -291,68 +324,100 @@ fn session_preview(store: Store, id: String) -> View {
         )
 }
 
-/// The projects, each folded open or shut with its conversations, then
-/// the conversations in no project. `rest`: the conversations not already
-/// listed above (needing the owner, or working).
-fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
-    let all = computed(move || store.projects());
-    let unplaced = computed(move || {
-        let known: Vec<String> = all.with(|all| all.iter().map(|p| p.id.clone()).collect());
+/// New conversation from the sidebar: inside a project's page it starts
+/// there.
+fn new_here(store: Store) {
+    match untracked(|| store.sidebar_view()) {
+        SidebarView::Project(id) => store.new_in_project(Some(id)),
+        _ => store.select(None),
+    }
+}
+
+/// How many projects Home shows before "All projects".
+const HOME_PROJECTS: usize = 3;
+
+/// Home: what needs the owner, what is working, the pinned, the projects
+/// used last, then every other conversation by day.
+fn home(
+    store: Store,
+    needs: Memo<Vec<String>>,
+    working: Memo<Vec<String>>,
+    rest: Memo<Vec<String>>,
+) -> View {
+    let pinned = computed(move || {
         rest.with(|ids| {
             ids.iter()
-                .filter(|id| {
-                    store
-                        .session_project(id)
-                        .is_none_or(|project| !known.contains(&project))
-                        && store.in_source(id)
-                })
+                .filter(|id| store.is_pinned(id))
                 .cloned()
                 .collect::<Vec<_>>()
         })
     });
+    let recent = computed(move || {
+        rest.with(|ids| {
+            ids.iter()
+                .filter(|id| !store.is_pinned(id) && store.in_source(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    let all = computed(move || store.projects());
+    let shown = computed(move || {
+        recent_projects(store)
+            .into_iter()
+            .take(HOME_PROJECTS)
+            .collect::<Vec<_>>()
+    });
     view()
         .gap(px(1.0))
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .child(section_label("Projects").flex_1())
-                .child(ui::icon_btn(
-                    Glyph::Plus,
-                    "New project",
-                    ui::Size::Sm,
-                    move || store.show_project_form(!store.project_form_open()),
-                )),
-        )
+        .child(group(store, "Needs you", needs))
+        .child(group(store, "Working", working))
+        .child(group(store, "Pinned", pinned))
+        .child(section_label("Projects"))
         .child(when(
             move || store.project_form_open(),
             move || project_form(store),
         ))
-        .child(when(
-            move || all.with(Vec::is_empty) && !store.project_form_open(),
-            || {
-                text("Group conversations by folder: a site, a repository, designs.")
-                    .px_2()
-                    .pb_1()
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT)
-            },
-        ))
         .child(each(
-            all,
-            |p| p.id.clone(),
-            move |project, _| {
-                let id = project.with_untracked(|p| p.id.clone());
-                project_group(store, id, rest)
+            shown,
+            |id: &String| id.clone(),
+            move |id, _| project_row(store, id.get_untracked(), false),
+        ))
+        .child(
+            when(
+                move || all.with(Vec::len) > HOME_PROJECTS,
+                move || {
+                    row(
+                        || false,
+                        move || store.show_sidebar_view(SidebarView::Projects),
+                    )
+                    .accessibility_label("All projects")
+                    .child(icon(Glyph::Folder).text_color(colors::FAINT))
+                    .child(
+                        text("All projects")
+                            .flex_1()
+                            .text_size(px(ui::fit::body()))
+                            .text_color(colors::MUTED),
+                    )
+                    .child(icon(Glyph::Chevron).text_color(colors::FAINT))
+                },
+            )
+            .otherwise(move || new_project_row(store)),
+        )
+        // Where they came from, as one filter: only when they came from
+        // more than one place.
+        .child(when(
+            move || !store.sources().is_empty(),
+            move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .child(section_label("Conversations").flex_1())
+                    .child(source_filter(store))
             },
         ))
+        .child(by_day(store, recent))
         .child(when(
-            move || !unplaced.with(Vec::is_empty) || store.source_filter() != Source::All,
-            move || section_label("Conversations"),
-        ))
-        .child(sources(store))
-        .child(when(
-            move || unplaced.with(Vec::is_empty) && store.source_filter() != Source::All,
+            move || recent.with(Vec::is_empty) && store.source_filter() != Source::All,
             || {
                 text("None from here.")
                     .px_2()
@@ -361,39 +426,171 @@ fn projects(store: Store, rest: Memo<Vec<String>>) -> View {
                     .text_color(colors::FAINT)
             },
         ))
+}
+
+/// The projects, the ones with the latest conversations first, then the
+/// rest by name.
+fn recent_projects(store: Store) -> Vec<String> {
+    let mut projects = store.projects();
+    projects.sort_by_key(|p| p.name.to_lowercase());
+    let mut ids: Vec<String> = Vec::new();
+    for session in store.session_ids() {
+        if let Some(project) = store.session_project(&session)
+            && !ids.contains(&project)
+            && projects.iter().any(|p| p.id == project)
+        {
+            ids.push(project);
+        }
+    }
+    for project in projects {
+        if !ids.contains(&project.id) {
+            ids.push(project.id);
+        }
+    }
+    ids
+}
+
+/// A project's row: its name and how many conversations it has; a press
+/// goes inside it. `detailed` adds its folder (the list of every project).
+fn project_row(store: Store, id: String, detailed: bool) -> View {
+    let (name, folder, label, open, count_id) =
+        (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
+    let count = computed(move || {
+        store
+            .session_ids()
+            .iter()
+            .filter(|s| {
+                store.session_project(s).as_deref() == Some(count_id.as_str())
+                    && !store.is_archived(s)
+            })
+            .count()
+    });
+    let (start, edit) = (id.clone(), id.clone());
+    let actions = vec![
+        ui::MenuAction::new("New conversation here", move || {
+            store.new_in_project(Some(start.clone()))
+        }),
+        ui::MenuAction::new("Edit name or folder", move || {
+            store.show_sidebar_view(SidebarView::Project(edit.clone()));
+            store.edit_project(&edit);
+        }),
+    ];
+    let mut names = view().flex_1().min_w(px(0.0)).child(
+        text(move || store.project(&name).map(|p| p.name).unwrap_or_default())
+            .number_of_lines(1)
+            .text_size(px(ui::fit::body())),
+    );
+    if detailed {
+        names = names.child(
+            text(move || {
+                store
+                    .project(&folder)
+                    .and_then(|p| p.path)
+                    .map(|path| short_path(&path))
+                    .unwrap_or_else(|| "No folder".to_owned())
+            })
+            .number_of_lines(1)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+        );
+    }
+    ui::with_menu(
+        row(
+            || false,
+            move || store.show_sidebar_view(SidebarView::Project(open.clone())),
+        )
+        .accessibility_label(move || {
+            Some(SharedString::from(format!(
+                "Project {}, {} conversations",
+                store.project(&label).map(|p| p.name).unwrap_or_default(),
+                count.get()
+            )))
+        })
+        .child(icon(Glyph::Folder).text_color(colors::MUTED))
+        .child(names)
+        .child(
+            text(move || match count.get() {
+                0 => String::new(),
+                n => n.to_string(),
+            })
+            .tabular_nums()
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+        )
+        .child(icon(Glyph::Chevron).text_color(colors::FAINT)),
+        actions,
+    )
+}
+
+/// "New project": opens the form.
+fn new_project_row(store: Store) -> View {
+    view().child(
+        row(|| false, move || store.show_project_form(true))
+            .accessibility_label("New project")
+            .child(icon(Glyph::Plus).text_color(colors::FAINT))
+            .child(
+                text("New project")
+                    .flex_1()
+                    .text_size(px(ui::fit::body()))
+                    .text_color(colors::MUTED),
+            ),
+    )
+}
+
+/// The top of a page inside the sidebar: Back, its title and what it
+/// offers.
+fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .pt_1()
+        .child(ui::icon_btn(
+            Glyph::Back,
+            "Back to all conversations",
+            ui::Size::Md,
+            move || store.show_sidebar_view(SidebarView::Home),
+        ))
+        .child(
+            text(title)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .role(AccessibilityRole::Header)
+                .text_size(px(ui::fit::body()))
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+        .child(tools)
+}
+
+/// Every project, each with its folder, then New project.
+fn all_projects(store: Store, _ids: Memo<Vec<String>>) -> View {
+    let all = computed(move || recent_projects(store));
+    view()
+        .gap(px(1.0))
+        .child(page_head(store, || "Projects".to_owned(), view()))
         .child(each(
-            unplaced,
+            all,
             |id: &String| id.clone(),
-            move |id, _| session_row(store, id.get_untracked()),
+            move |id, _| project_row(store, id.get_untracked(), true),
+        ))
+        .child(when(
+            move || store.project_form_open(),
+            move || project_form(store),
+        ))
+        .child(when(
+            move || !store.project_form_open(),
+            move || new_project_row(store),
         ))
 }
 
-/// Where the conversations came from, as filters: shown only when they
-/// came from more than one place.
-fn sources(store: Store) -> View {
-    view().child(dynamic(move || {
-        let sources = store.sources();
-        Some(untracked(move || {
-            let mut chips = view().flex_row().flex_wrap().gap_1().px_2().pb_1();
-            for source in sources {
-                chips = chips.child(ui::chip(
-                    source.label(),
-                    move || store.source_filter() == source,
-                    move || store.set_source_filter(source),
-                ));
-            }
-            chips
-        }))
-    }))
-}
-
-/// One project: its row (fold, name, folder, New conversation) and, open,
-/// its conversations. Its menu edits it.
-fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
+/// One project: its name and folder, Edit, then its conversations by day
+/// (New conversation, above, starts one here).
+fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
     let mine = {
         let id = id.clone();
         computed(move || {
-            rest.with(|ids| {
+            ids.with(|ids| {
                 ids.iter()
                     .filter(|s| store.session_project(s).as_deref() == Some(id.as_str()))
                     .cloned()
@@ -401,128 +598,127 @@ fn project_group(store: Store, id: String, rest: Memo<Vec<String>>) -> View {
             })
         })
     };
-    let (toggle, open, new, name, folder, label, empty_id) = (
-        id.clone(),
-        id.clone(),
-        id.clone(),
-        id.clone(),
-        id.clone(),
-        id.clone(),
-        id.clone(),
-    );
-    let is_open = computed(move || store.project_open(&open));
-    let (start, edit) = (id.clone(), id.clone());
-    let actions = vec![
-        ui::MenuAction::new("New conversation here", move || {
-            store.new_in_project(Some(start.clone()))
-        }),
-        ui::MenuAction::new("Edit name or folder", move || store.edit_project(&edit)),
-    ];
+    let (name, folder, edit, empty) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let tools = view().flex_row().items_center().child(ui::press_menu(
+        Glyph::More,
+        "Project options",
+        vec![ui::MenuAction::new("Edit name or folder", move || {
+            store.edit_project(&edit)
+        })],
+    ));
     view()
         .gap(px(1.0))
-        .child(ui::with_menu(
-            view()
-                .flex_row()
-                .items_center()
-                .child(
-                    row(
-                        move || {
-                            store.selected().is_none()
-                                && store.current_project().as_deref() == Some(new.as_str())
-                        },
-                        move || store.toggle_project(&toggle),
-                    )
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .accessibility_label(move || {
-                        let project = store.project(&label);
-                        Some(SharedString::from(format!(
-                            "Project {}, {} conversations",
-                            project.map(|p| p.name).unwrap_or_default(),
-                            mine.with(Vec::len)
-                        )))
-                    })
-                    .child(
-                        icon(Glyph::Chevron)
-                            .text_color(colors::FAINT)
-                            .rotate(move || deg(if is_open.get() { 90.0 } else { 0.0 }))
-                            .transition_transform()
-                            .duration(ui::motion::FAST),
-                    )
-                    .child(
-                        view()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .child(
-                                text(move || {
-                                    store.project(&name).map(|p| p.name).unwrap_or_default()
-                                })
-                                .number_of_lines(1)
-                                .text_size(px(ui::fit::body()))
-                                .font_weight(FontWeight::MEDIUM),
-                            )
-                            .child(
-                                text(move || {
-                                    store
-                                        .project(&folder)
-                                        .and_then(|p| p.path)
-                                        .map(|path| short_path(&path))
-                                        .unwrap_or_else(|| "No folder".to_owned())
-                                })
-                                .number_of_lines(1)
-                                .text_size(px(type_scale::XS))
-                                .text_color(colors::FAINT),
-                            ),
-                    )
-                    .child(
-                        text(move || match mine.with(Vec::len) {
-                            0 => String::new(),
-                            n => n.to_string(),
-                        })
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT),
-                    ),
-                )
-                .child(ui::icon_btn(
-                    Glyph::Plus,
-                    "New conversation in this project",
-                    ui::Size::Sm,
-                    {
-                        let id = id.clone();
-                        move || store.new_in_project(Some(id.clone()))
-                    },
-                )),
-            actions,
+        .child(page_head(
+            store,
+            move || store.project(&name).map(|p| p.name).unwrap_or_default(),
+            tools,
+        ))
+        .child(
+            text(move || {
+                store
+                    .project(&folder)
+                    .and_then(|p| p.path)
+                    .unwrap_or_else(|| "No folder".to_owned())
+            })
+            .px_2()
+            .pb_1()
+            .number_of_lines(1)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+        )
+        .child(when(
+            move || store.project_form_open(),
+            move || project_form(store),
         ))
         .child(when(
-            move || is_open.get(),
+            move || mine.with(Vec::is_empty),
             move || {
-                let empty_id = empty_id.clone();
-                view()
-                    .pl_3()
-                    .gap(px(1.0))
-                    .child(when(
-                        move || mine.with(Vec::is_empty),
-                        move || {
-                            let id = empty_id.clone();
-                            row(|| false, move || store.new_in_project(Some(id.clone()))).child(
-                                text("No conversations yet. Start one")
-                                    .text_size(px(type_scale::SM))
-                                    .text_color(colors::FAINT),
-                            )
-                        },
-                    ))
-                    .child(each(
-                        mine,
-                        |id: &String| id.clone(),
-                        move |id, _| session_row(store, id.get_untracked()),
-                    ))
+                let id = empty.clone();
+                row(|| false, move || store.new_in_project(Some(id.clone()))).child(
+                    text("No conversations yet. Start one")
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::FAINT),
+                )
             },
         ))
+        .child(by_day(store, mine))
 }
 
-/// The project form, under the Projects heading: a new project, or the
-/// one being edited.
+/// Conversations under the day they were last active: Today, Yesterday,
+/// Earlier.
+fn by_day(store: Store, ids: Memo<Vec<String>>) -> View {
+    let days_ago = move |id: &String| {
+        store
+            .last_activity(id)
+            .map_or(i64::MAX, |at| ui::time::day(now_ms()) - ui::time::day(at))
+    };
+    let part = move |keep: fn(i64) -> bool| {
+        computed(move || {
+            ids.with(|ids| {
+                ids.iter()
+                    .filter(|id| keep(days_ago(id)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        })
+    };
+    view()
+        .gap(px(1.0))
+        .child(group(store, "Today", part(|d| d <= 0)))
+        .child(group(store, "Yesterday", part(|d| d == 1)))
+        .child(group(store, "Earlier", part(|d| d > 1)))
+}
+
+/// Where the listed conversations came from, as one filter.
+fn source_filter(store: Store) -> View {
+    let shown = move || store.source_filter().label().to_owned();
+    ui::pick_list(
+        ui::Picker {
+            title: "Show conversations from",
+            items: move || {
+                let chosen = store.source_filter();
+                store
+                    .sources()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, source)| {
+                        ui::PickItem::new(at.to_string(), source.label()).checked(source == chosen)
+                    })
+                    .collect()
+            },
+            pick: move |picked: String| {
+                if let Some(source) = picked
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|at| store.sources().into_iter().nth(at))
+                {
+                    store.set_source_filter(source);
+                }
+            },
+            action: None,
+        },
+        move || format!("Show conversations from: {}", shown()),
+        view()
+            .min_h(px(ui::fit::row()))
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .child(
+                text(shown)
+                    .text_size(px(ui::fit::small()))
+                    .text_color(colors::MUTED),
+            )
+            .child(
+                icon(Glyph::Down)
+                    .text_color(colors::FAINT)
+                    .accessibility_elements_hidden(true),
+            ),
+        false,
+    )
+}
+
+/// The project form: a new project, or the one being edited.
 fn project_form(store: Store) -> View {
     let editing = untracked(|| store.project_editing().and_then(|id| store.project(&id)));
     let name = signal(editing.as_ref().map(|p| p.name.clone()).unwrap_or_default());
@@ -743,7 +939,8 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
         }
         Some(SharedString::from(parts.join(", ")))
     })
-    // Working (accent, pulsing), a new reply (filled) or quiet (hollow).
+    // Working (accent, pulsing) or a new reply (filled); nothing while
+    // quiet, in the same slot so the names line up.
     .child(ui::state_dot(
         move || store.is_running(&c) || store.is_unread(&c),
         move || {
@@ -752,55 +949,45 @@ fn session_button(store: Store, id: String) -> nsh_base::ButtonElement {
             } else if store.is_unread(&e) {
                 colors::TEXT
             } else {
-                colors::FAINT
+                colors::TRANSPARENT
             }
         },
     ))
     .child(
-        view()
+        text(move || store.title(&d))
             .flex_1()
             .min_w(px(0.0))
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        text(move || store.title(&d))
-                            .flex_1()
-                            .number_of_lines(1)
-                            .text_size(px(ui::fit::body()))
-                            .text_color(move || {
-                                if store.is_unread(&h) {
-                                    colors::TEXT
-                                } else {
-                                    colors::MUTED
-                                }
-                            }),
-                    )
-                    .child(
-                        text(move || if store.is_pinned(&f) { "★" } else { "" })
-                            .text_size(px(type_scale::XS))
-                            .text_color(colors::FAINT),
-                    )
-                    .child(
-                        text(move || {
-                            store
-                                .last_activity(&g)
-                                .map(|at| ui::time::ago(at, now_ms()))
-                                .unwrap_or_default()
-                        })
-                        .tabular_nums()
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT),
-                    ),
-            )
-            .child(
-                text(move || store.place(&id))
-                    .number_of_lines(1)
-                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                    .text_color(colors::FAINT),
-            ),
+            .number_of_lines(1)
+            .text_size(px(ui::fit::body()))
+            .text_color(move || {
+                if store.is_unread(&h) {
+                    colors::TEXT
+                } else {
+                    colors::MUTED
+                }
+            }),
+    )
+    .child(
+        text(move || if store.is_pinned(&f) { "★" } else { "" })
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+    )
+    // One faint word where it adds something: its project (outside that
+    // project's page), or the chat it came from when not the app.
+    .child(
+        text(move || {
+            if let Some(project) = store.session_project(&g).and_then(|p| store.project(&p)) {
+                return match store.sidebar_view() {
+                    SidebarView::Project(_) => String::new(),
+                    _ => project.name,
+                };
+            }
+            store.source_tag(&id)
+        })
+        .max_w(percentage(0.45))
+        .number_of_lines(1)
+        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+        .text_color(colors::FAINT),
     )
 }
 

@@ -545,6 +545,8 @@ fn new_project_form(store: Store) {
     if !store.sidebar_open() {
         store.open_sidebar();
     }
+    // The form is at the end of the list of projects.
+    store.show_sidebar_view(crate::store::SidebarView::Projects);
     store.show_project_form(true);
 }
 

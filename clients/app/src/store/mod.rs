@@ -108,6 +108,18 @@ const DRAFT_KEY: &str = "aidaemon.draft.";
 const PINS_KEY: &str = "aidaemon.pins";
 const OPEN_KEY: &str = "aidaemon.open";
 /// The project this device last started work on code in.
+/// What the sidebar shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SidebarView {
+    /// What needs the owner, a few projects and every conversation.
+    #[default]
+    Home,
+    /// Every project.
+    Projects,
+    /// One project's conversations.
+    Project(String),
+}
+
 const LAST_PROJECT_KEY: &str = "aidaemon.last_project";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
 const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
@@ -261,6 +273,7 @@ pub struct Store {
     moving: Signal<Option<String>>,
     moving_open: Signal<bool>,
     viewing: Signal<Option<crate::ui::Viewed>>,
+    sidebar_view: Signal<SidebarView>,
     /// When the owner last looked at the automations (this device): runs
     /// after it are news.
     automations_seen: Signal<u64>,
@@ -313,6 +326,7 @@ impl Store {
             moving: signal(None),
             moving_open: signal(false),
             viewing: signal(None),
+            sidebar_view: signal(SidebarView::Home),
             automations_seen: signal(
                 nsh_core::storage::Storage::get_item(AUTOMATIONS_SEEN_KEY)
                     .and_then(|v| v.parse().ok())
@@ -954,6 +968,20 @@ impl Store {
         });
     }
 
+    /// What the sidebar shows: every conversation, the projects, or one
+    /// project's conversations.
+    pub fn sidebar_view(&self) -> SidebarView {
+        self.sidebar_view.get()
+    }
+
+    pub fn show_sidebar_view(&self, view: SidebarView) {
+        // A form left open belongs to the view it was opened in.
+        if self.project_form.get_untracked() {
+            self.show_project_form(false);
+        }
+        self.sidebar_view.set(view);
+    }
+
     pub fn project_form_open(&self) -> bool {
         self.project_form.get()
     }
@@ -1185,6 +1213,16 @@ impl Store {
 
     pub fn sources(&self) -> Vec<Source> {
         self.reads.sources.get()
+    }
+
+    /// Where conversation `id` came from, in a word or two for a list:
+    /// nothing for the app's own, else "Telegram" or "Telegram group".
+    pub fn source_tag(&self, id: &str) -> String {
+        self.read(|c| match c.source(id) {
+            Source::App | Source::All => String::new(),
+            source if c.is_group(id) => format!("{} group", source.label()),
+            source => source.label().to_owned(),
+        })
     }
 
     pub fn in_source(&self, id: &str) -> bool {

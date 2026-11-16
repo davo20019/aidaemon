@@ -118,6 +118,20 @@ pub fn user_authored_text(inbound_text: &str) -> String {
     strip_inbound_file_stubs(inbound_text)
 }
 
+/// What names a message in a list: the words the owner typed, or, for a
+/// file sent with none, the file's name.
+pub fn title_words(inbound_text: &str) -> String {
+    let typed = user_authored_text(inbound_text);
+    if !typed.is_empty() {
+        return typed;
+    }
+    inbound_text
+        .split_once(INBOUND_FILE_STUB_PREFIX)
+        .and_then(|(_, rest)| rest.split_once(" ("))
+        .map(|(name, _)| name.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Build the user-visible text from optional caption/body plus file stubs.
 pub fn build_inbound_text(user_text: &str, attachments: &[MessageAttachment]) -> String {
     let stubs: Vec<String> = attachments
@@ -297,6 +311,21 @@ mod tests {
         let text = build_inbound_text_without_local_paths("what is this part?", &[marked]);
         assert!(text.contains(INBOUND_MARKUP_STUB_PREFIX), "{text}");
         assert!(!text.contains("/tmp/uploads"), "{text}");
+    }
+
+    #[test]
+    fn a_title_is_the_typed_words_or_the_file_name() {
+        let file = message_attachment(
+            PathBuf::from("/tmp/inbox/a_photo.jpg"),
+            "photo.jpg".to_string(),
+            "image/jpeg".to_string(),
+            286 * 1024,
+        );
+        let only_file = build_inbound_text("", std::slice::from_ref(&file));
+        assert_eq!(title_words(&only_file), "photo.jpg");
+        let with_words = build_inbound_text("What is this?", &[file]);
+        assert_eq!(title_words(&with_words), "What is this?");
+        assert_eq!(title_words("Plan the week"), "Plan the week");
     }
 
     #[test]

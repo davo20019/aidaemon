@@ -568,6 +568,9 @@ impl ClientHost for DaemonClientHost {
                 // The owner's own name wins over one taken from what was said.
                 let title = named.or_else(|| {
                     words
+                        // The words typed, not the note about a file sent
+                        // with them.
+                        .map(|text| aidaemon_channels::attachments::title_words(text))
                         .map(|text| aidaemon_channels::presentation::word_preview(text.trim(), 60))
                         .filter(|t| !t.is_empty())
                 });

@@ -467,8 +467,9 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
         ),
     ]);
     app.wait_for("Weekend plan")?;
-    // Where each came from, as filters.
-    app.wait_for("Telegram · synthetic_coding_bot · group")?;
+    // Each says where it came from; one filter narrows the list.
+    app.wait_for("Telegram group")?;
+    app.press("Show conversations from: All")?;
     app.press("Groups")?;
     app.wait_for_gone("Weekend plan", std::time::Duration::from_secs(5))?;
     app.wait_for("Team release notes")?;
@@ -478,6 +479,7 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
     app.press("Post in this group")?;
     app.wait_for("Also posted in Telegram · synthetic_coding_bot · group")?;
     // A direct chat posts there too, and says so.
+    app.press("Show conversations from: Groups")?;
     app.press("All")?;
     app.press("Fix the footer >> nth=0")?;
     app.wait_for("Also posted in Telegram · synthetic_coding_bot")?;
@@ -506,14 +508,16 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     ]);
     app.wait_for("Acme site")?;
     app.wait_for("Design notes")?;
-    // A conversation in no project is listed on its own.
-    app.wait_for("Conversations")?;
+    // Every conversation is listed, one in a project tagged with it.
     app.wait_for("Grocery list")?;
-    // A project opens on its conversations.
-    app.press("Project Acme site, 1 conversations")?;
     app.wait_for("Contact form copy")?;
-    // Its "+" starts a conversation there: the header names the project.
-    app.press("New conversation in this project >> nth=0")?;
+    // A press goes inside a project: its folder and its conversations.
+    app.press("Project Acme site, 1 conversations")?;
+    app.wait_for("Back to all conversations")?;
+    app.wait_for_gone("Grocery list", std::time::Duration::from_secs(5))?;
+    app.wait_for("Contact form copy")?;
+    // New conversation, inside a project, starts one there.
+    app.press("New conversation >> nth=0")?;
     app.wait_for("Which project is this for?")?;
     app.wait_for("/home/synthetic/acme-site")?;
     // The header's switch says what a new conversation is: Chat leaves
@@ -532,11 +536,12 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Project: Design notes, change")?;
     // New project opens the form for one.
     app.press("Project: Design notes, change")?;
-    app.press("New project >> nth=1")?;
+    app.press("New project >> nth=0")?;
     app.wait_for("Project name")?;
     // A conversation's menu moves it with the same picker; No project
     // takes it out of one.
     app.press_key("escape")?;
+    app.press("Back to all conversations >> nth=0")?;
     app.long_press("Grocery list >> nth=0")?;
     let before = sent("set_session_project");
     app.press("Move to project…")?;

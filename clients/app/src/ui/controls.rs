@@ -329,6 +329,12 @@ pub enum Glyph {
     Pen,
     /// Take back the last one.
     Undo,
+    /// Write a new one.
+    Compose,
+    /// Back to where this came from.
+    Back,
+    /// More to do with it.
+    More,
 }
 
 impl Glyph {
@@ -371,6 +377,9 @@ impl Glyph {
             Self::Share => "⇪",
             Self::Pen => "✎",
             Self::Undo => "↶",
+            Self::Compose => "✎",
+            Self::Back => "‹",
+            Self::More => "…",
         }
     }
 }
@@ -391,6 +400,13 @@ impl Glyph {
             }
             Self::Pen => r#"<path d="M12 20h9M16.4 3.6a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4Z"/>"#,
             Self::Undo => r#"<path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>"#,
+            Self::Compose => {
+                r#"<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.4 2.6a2.1 2.1 0 1 1 3 3L12 15l-4 1 1-4Z"/>"#
+            }
+            Self::Back => r#"<path d="m15 18-6-6 6-6"/>"#,
+            Self::More => {
+                r#"<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>"#
+            }
             Self::External => {
                 r#"<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#
             }
