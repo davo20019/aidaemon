@@ -535,10 +535,17 @@ fn project_form(store: Store) -> View {
             .and_then(|p| p.path.clone())
             .unwrap_or_default(),
     );
-    let saving_label = if editing.is_some() {
-        "Save"
+    let (saving_label, folder_label) = if editing.is_some() {
+        ("Save", "Make the folder and save")
     } else {
-        "Create project"
+        ("Create project", "Make the folder and the project")
+    };
+    // The daemon refused only because the folder is missing, and the field
+    // still names that folder: offer to make it.
+    let can_make_folder = move || {
+        store
+            .project_missing_folder()
+            .is_some_and(|missing| path.with(|typed| typed.trim() == missing))
     };
     view()
         .px_2()
@@ -574,12 +581,33 @@ fn project_form(store: Store) -> View {
             view()
                 .flex_row()
                 .gap_2()
-                .child(ui::btn(
-                    saving_label,
-                    ui::Variant::Primary,
-                    ui::Size::Sm,
-                    move || store.save_project(&name.get_untracked(), &path.get_untracked()),
+                .child(when(
+                    move || !can_make_folder(),
+                    move || {
+                        ui::btn(
+                            saving_label,
+                            ui::Variant::Primary,
+                            ui::Size::Sm,
+                            move || {
+                                store.save_project(
+                                    &name.get_untracked(),
+                                    &path.get_untracked(),
+                                    false,
+                                )
+                            },
+                        )
+                    },
                 ))
+                .child(when(can_make_folder, move || {
+                    ui::btn(
+                        folder_label,
+                        ui::Variant::Primary,
+                        ui::Size::Sm,
+                        move || {
+                            store.save_project(&name.get_untracked(), &path.get_untracked(), true)
+                        },
+                    )
+                }))
                 .child(ui::btn(
                     "Cancel",
                     ui::Variant::Ghost,

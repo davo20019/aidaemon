@@ -165,9 +165,19 @@ impl ClientHost for Host {
         &self,
         name: &str,
         path: Option<&str>,
-    ) -> Result<ProjectSummary, String> {
+        create_folder: bool,
+    ) -> Result<ProjectSummary, ProtocolError> {
         if name.trim().is_empty() {
-            return Err("A project needs a name".into());
+            return Err(ProtocolError::new(
+                ErrorCode::Invalid,
+                "A project needs a name",
+            ));
+        }
+        if path == Some("/home/synthetic/new-site") && !create_folder {
+            return Err(ProtocolError::new(
+                ErrorCode::FolderMissing,
+                "There is no folder at /home/synthetic/new-site on this computer",
+            ));
         }
         Ok(ProjectSummary {
             id: "project-acme".into(),
@@ -605,6 +615,7 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
                 Command::CreateProject {
                     name: "Acme site".into(),
                     path: Some("/home/synthetic/acme-site".into()),
+                    create_folder: false,
                 },
             ),
         )
@@ -625,6 +636,7 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
                 Command::CreateProject {
                     name: " ".into(),
                     path: None,
+                    create_folder: false,
                 },
             ),
         )
@@ -633,6 +645,39 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
         matches!(&refused, ServerFrame::Error { error, .. } if error.message == "A project needs a name"),
         "{refused:?}"
     );
+    // A missing folder is a typed refusal; the same command with
+    // `create_folder` goes through.
+    let missing = f
+        .post(
+            &[],
+            &command(
+                "r-3e",
+                Command::CreateProject {
+                    name: "New site".into(),
+                    path: Some("/home/synthetic/new-site".into()),
+                    create_folder: false,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&missing, ServerFrame::Error { error, .. } if error.code == ErrorCode::FolderMissing),
+        "{missing:?}"
+    );
+    let made = f
+        .post(
+            &[],
+            &command(
+                "r-3f",
+                Command::CreateProject {
+                    name: "New site".into(),
+                    path: Some("/home/synthetic/new-site".into()),
+                    create_folder: true,
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(made, ServerFrame::Ack { .. }), "{made:?}");
     let cleared = f
         .post(
             &[],

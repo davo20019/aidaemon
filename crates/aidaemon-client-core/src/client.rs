@@ -288,6 +288,11 @@ pub struct Client {
     pub commands: Vec<SlashCommand>,
     project_request: Option<String>,
     pub project_error: Option<String>,
+    /// The folder the last save named, as typed.
+    project_path: Option<String>,
+    /// The daemon refused the last save only because this folder (as
+    /// typed) is missing: saving again with `create_folder` makes it.
+    pub project_missing_folder: Option<String>,
     setup_request: Option<String>,
     pub setup_error: Option<String>,
     /// Open the next conversation the daemon starts (the greeting).
@@ -645,7 +650,7 @@ impl Client {
                 result: CommandResult::Project { project },
             } if mine(&self.project_request, request_id) => {
                 self.project_request = None;
-                self.project_error = None;
+                self.clear_project_error();
                 out.push(Effect::ProjectSaved(project.clone()));
                 // The reducer keeps the project too.
             }
@@ -655,6 +660,9 @@ impl Client {
             } if mine(&self.project_request, request_id) => {
                 self.project_request = None;
                 self.project_error = Some(error.message.clone());
+                self.project_missing_folder = (error.code == ErrorCode::FolderMissing)
+                    .then(|| self.project_path.clone())
+                    .flatten();
                 return true;
             }
             ServerFrame::Ack {
@@ -1420,27 +1428,44 @@ impl Client {
     }
 
     /// Make a project (`project_id` `None`) or save one's name and folder
-    /// (an empty folder removes it). `false` when it has no name.
-    pub fn save_project(&mut self, project_id: Option<String>, name: &str, path: &str) -> bool {
+    /// (an empty folder removes it); with `create_folder`, the daemon makes
+    /// a missing folder. `false` when it has no name.
+    pub fn save_project(
+        &mut self,
+        project_id: Option<String>,
+        name: &str,
+        path: &str,
+        create_folder: bool,
+    ) -> bool {
         let name = name.trim();
         if name.is_empty() {
+            self.clear_project_error();
             self.project_error = Some("Give the project a name".to_owned());
             return false;
         }
         let path = path.trim();
+        self.project_path = Some(path.to_owned());
         let command = match project_id {
             Some(project_id) => Command::UpdateProject {
                 project_id,
                 name: Some(name.to_owned()),
                 path: Some(path.to_owned()),
+                create_folder,
             },
             None => Command::CreateProject {
                 name: name.to_owned(),
                 path: (!path.is_empty()).then(|| path.to_owned()),
+                create_folder,
             },
         };
         self.project_request = Some(self.send(command));
         true
+    }
+
+    /// Forget the project form's refusal.
+    pub fn clear_project_error(&mut self) {
+        self.project_error = None;
+        self.project_missing_folder = None;
     }
 
     pub fn saving_project(&self) -> bool {
@@ -2111,6 +2136,51 @@ mod tests {
         client.update(settings_ack(&fresh[0]), &cx(None));
         client.refresh_settings();
         assert_eq!(settings_reads(&mut client).len(), 1);
+    }
+
+    #[test]
+    fn a_missing_project_folder_is_offered_to_be_made() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        assert!(client.save_project(None, "Acme site", "~/projects/acme-site", false));
+        let (id, sent) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            sent,
+            Command::CreateProject {
+                create_folder: false,
+                ..
+            }
+        ));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{id}","error":{{"code":"folder_missing","message":"There is no folder at /home/synthetic/projects/acme-site on this computer","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(
+            client.project_missing_folder.as_deref(),
+            Some("~/projects/acme-site")
+        );
+        // Confirmed: the same save asks the daemon to make it.
+        assert!(client.save_project(None, "Acme site", "~/projects/acme-site", true));
+        let (id, sent) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            sent,
+            Command::CreateProject {
+                create_folder: true,
+                ..
+            }
+        ));
+        // Any other refusal offers nothing.
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{id}","error":{{"code":"invalid","message":"There is already a project called Acme site","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(client.project_missing_folder.is_none());
+        assert!(client.project_error.is_some());
     }
 
     #[test]

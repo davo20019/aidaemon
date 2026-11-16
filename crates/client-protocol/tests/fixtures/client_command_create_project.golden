@@ -1,5 +1,6 @@
 {
   "command": {
+    "create_folder": true,
     "name": "Acme site",
     "path": "/home/synthetic/acme-site",
     "type": "create_project"

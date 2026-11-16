@@ -1438,6 +1438,10 @@
         {
           "description": "A new project (protocol 1.10): a name, and the folder its\nconversations work in (any folder; none for a project without one).",
           "properties": {
+            "create_folder": {
+              "description": "Make `path` when it does not exist (protocol 1.24), after the\nowner confirmed it on a `folder_missing` error. Only folders\nunder the daemon's home folder are made.",
+              "type": "boolean"
+            },
             "name": {
               "type": "string"
             },
@@ -1461,6 +1465,10 @@
         {
           "description": "Rename a project or change its folder (protocol 1.10). `name` and\n`path` change only when given; an empty `path` removes the folder.",
           "properties": {
+            "create_folder": {
+              "description": "As `CreateProject`'s (protocol 1.24).",
+              "type": "boolean"
+            },
             "name": {
               "type": [
                 "string",
@@ -2580,6 +2588,11 @@
         {
           "const": "conflict",
           "description": "The state moved on: an approval already resolved (the message names\nthe winning outcome).",
+          "type": "string"
+        },
+        {
+          "const": "folder_missing",
+          "description": "A project's folder does not exist (protocol 1.24). The same command\nwith `create_folder` makes it.",
           "type": "string"
         }
       ]

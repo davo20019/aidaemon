@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 23;
+pub const PROTOCOL_MINOR: u16 = 24;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -332,6 +332,11 @@ pub enum Command {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// Make `path` when it does not exist (protocol 1.24), after the
+        /// owner confirmed it on a `folder_missing` error. Only folders
+        /// under the daemon's home folder are made.
+        #[serde(default, skip_serializing_if = "is_false")]
+        create_folder: bool,
     },
     /// Rename a project or change its folder (protocol 1.10). `name` and
     /// `path` change only when given; an empty `path` removes the folder.
@@ -341,6 +346,9 @@ pub enum Command {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// As `CreateProject`'s (protocol 1.24).
+        #[serde(default, skip_serializing_if = "is_false")]
+        create_folder: bool,
     },
     /// Put a session in a project, or take it out of every project
     /// (`project_id` absent) (protocol 1.10).
@@ -512,6 +520,10 @@ pub enum MidRun {
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_limit() -> u32 {
@@ -2311,6 +2323,9 @@ pub enum ErrorCode {
     RateLimited,
     Invalid,
     Internal,
+    /// A project's folder does not exist (protocol 1.24). The same command
+    /// with `create_folder` makes it.
+    FolderMissing,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

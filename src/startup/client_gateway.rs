@@ -595,8 +595,10 @@ impl ClientHost for DaemonClientHost {
         &self,
         name: &str,
         path: Option<&str>,
-    ) -> Result<aidaemon_client_protocol::ProjectSummary, String> {
-        super::client_projects::create(self.state.as_ref(), name, path).await
+        create_folder: bool,
+    ) -> Result<aidaemon_client_protocol::ProjectSummary, aidaemon_client_protocol::ProtocolError>
+    {
+        super::client_projects::create(self.state.as_ref(), name, path, create_folder).await
     }
 
     async fn update_project(
@@ -604,8 +606,10 @@ impl ClientHost for DaemonClientHost {
         id: &str,
         name: Option<&str>,
         path: Option<&str>,
-    ) -> Result<aidaemon_client_protocol::ProjectSummary, String> {
-        super::client_projects::update(self.state.as_ref(), id, name, path).await
+        create_folder: bool,
+    ) -> Result<aidaemon_client_protocol::ProjectSummary, aidaemon_client_protocol::ProtocolError>
+    {
+        super::client_projects::update(self.state.as_ref(), id, name, path, create_folder).await
     }
 
     async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {

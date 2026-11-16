@@ -140,6 +140,7 @@ struct Reads {
     draft_files: Memo<Vec<DraftFile>>,
     projects: Memo<Vec<ProjectSummary>>,
     project_error: Memo<Option<String>>,
+    project_missing_folder: Memo<Option<String>>,
     saving_project: Memo<bool>,
     sources: Memo<Vec<Source>>,
     bots: Memo<Vec<Bot>>,
@@ -173,6 +174,9 @@ impl Reads {
             draft_files: computed(move || client.with(|c| c.draft_files.clone())),
             projects: computed(move || client.with(Client::projects)),
             project_error: computed(move || client.with(|c| c.project_error.clone())),
+            project_missing_folder: computed(move || {
+                client.with(|c| c.project_missing_folder.clone())
+            }),
             saving_project: computed(move || client.with(Client::saving_project)),
             sources: computed(move || client.with(Client::sources)),
             bots: computed(move || client.with(Client::bots)),
@@ -914,7 +918,7 @@ impl Store {
     pub fn show_project_form(&self, show: bool) {
         crate::ui::motion::next_unfold();
         self.project_form.set(show);
-        self.act(|c| c.project_error = None);
+        self.act(|c| c.clear_project_error());
         self.project_editing.set(None);
     }
 
@@ -922,7 +926,7 @@ impl Store {
     /// folder.
     pub fn edit_project(&self, id: &str) {
         crate::ui::motion::next_unfold();
-        self.act(|c| c.project_error = None);
+        self.act(|c| c.clear_project_error());
         self.project_editing.set(Some(id.to_owned()));
         self.project_form.set(true);
     }
@@ -932,13 +936,20 @@ impl Store {
     }
 
     /// Save the form: a new project, or the edited one's name and folder.
-    pub fn save_project(&self, name: &str, path: &str) {
+    /// With `create_folder`, the daemon makes a missing folder.
+    pub fn save_project(&self, name: &str, path: &str, create_folder: bool) {
         let id = self.project_editing.get_untracked();
-        self.act(|c| c.save_project(id, name, path));
+        self.act(|c| c.save_project(id, name, path, create_folder));
     }
 
     pub fn project_error(&self) -> Option<String> {
         self.reads.project_error.get()
+    }
+
+    /// The folder (as typed) the daemon can make for the form, after it
+    /// refused the save only because that folder is missing.
+    pub fn project_missing_folder(&self) -> Option<String> {
+        self.reads.project_missing_folder.get()
     }
 
     pub fn creating_project(&self) -> bool {
@@ -946,7 +957,7 @@ impl Store {
     }
 
     pub fn create_project(&self, name: &str, path: &str) {
-        self.act(|c| c.save_project(None, name, path));
+        self.act(|c| c.save_project(None, name, path, false));
     }
 
     /// Put a conversation in a project, or in none.

@@ -164,7 +164,9 @@ pub(crate) fn status_of(code: ErrorCode) -> StatusCode {
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
         ErrorCode::Conflict => StatusCode::CONFLICT,
         ErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-        ErrorCode::Invalid | ErrorCode::VersionUnsupported => StatusCode::BAD_REQUEST,
+        ErrorCode::Invalid | ErrorCode::VersionUnsupported | ErrorCode::FolderMissing => {
+            StatusCode::BAD_REQUEST
+        }
         ErrorCode::Internal | ErrorCode::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

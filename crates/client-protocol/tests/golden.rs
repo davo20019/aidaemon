@@ -346,6 +346,7 @@ fn client_samples() -> Vec<ClientFrame> {
             Command::CreateProject {
                 name: "Acme site".into(),
                 path: Some("/home/synthetic/acme-site".into()),
+                create_folder: true,
             },
         ),
         command(
@@ -354,6 +355,7 @@ fn client_samples() -> Vec<ClientFrame> {
                 project_id: "project-acme".into(),
                 name: Some("Acme Corp site".into()),
                 path: None,
+                create_folder: false,
             },
         ),
         command(

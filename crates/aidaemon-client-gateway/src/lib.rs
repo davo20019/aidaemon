@@ -144,13 +144,19 @@ pub trait ClientHost: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Make a project. `Err`: it could not be made, and why, in plain words.
+    /// Make a project; with `create_folder`, make its missing folder too.
+    /// `Err`: it could not be made, and why in plain words
+    /// (`FolderMissing` when only the folder is missing).
     async fn create_project(
         &self,
         _name: &str,
         _path: Option<&str>,
-    ) -> Result<ProjectSummary, String> {
-        Err("This daemon has no projects".to_string())
+        _create_folder: bool,
+    ) -> Result<ProjectSummary, ProtocolError> {
+        Err(ProtocolError::new(
+            ErrorCode::Invalid,
+            "This daemon has no projects",
+        ))
     }
 
     /// Rename a project or change its folder (`Some("")` removes it).
@@ -160,8 +166,12 @@ pub trait ClientHost: Send + Sync {
         _id: &str,
         _name: Option<&str>,
         _path: Option<&str>,
-    ) -> Result<ProjectSummary, String> {
-        Err("This daemon has no projects".to_string())
+        _create_folder: bool,
+    ) -> Result<ProjectSummary, ProtocolError> {
+        Err(ProtocolError::new(
+            ErrorCode::Invalid,
+            "This daemon has no projects",
+        ))
     }
 
     /// The providers and models a conversation can be set to answer with
@@ -976,12 +986,15 @@ impl ClientGateway {
                 })?;
                 Ok(CommandResult::Projects { projects })
             }
-            Command::CreateProject { name, path } => {
+            Command::CreateProject {
+                name,
+                path,
+                create_folder,
+            } => {
                 let project = self
                     .host
-                    .create_project(&name, path.as_deref())
-                    .await
-                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                    .create_project(&name, path.as_deref(), create_folder)
+                    .await?;
                 self.publisher.publish(
                     None,
                     Event::ProjectUpdated {
@@ -994,12 +1007,12 @@ impl ClientGateway {
                 project_id,
                 name,
                 path,
+                create_folder,
             } => {
                 let project = self
                     .host
-                    .update_project(&project_id, name.as_deref(), path.as_deref())
-                    .await
-                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                    .update_project(&project_id, name.as_deref(), path.as_deref(), create_folder)
+                    .await?;
                 self.publisher.publish(
                     None,
                     Event::ProjectUpdated {

@@ -1,12 +1,14 @@
 //! Projects for the app (protocol 1.10): the work-project store's projects,
 //! each with the folder its conversations work in. A folder can be anything
 //! on this computer (a repository, a site, a folder of designs); it must
-//! exist and is stored as an absolute, resolved path. A chat bot can send
-//! its direct-message chats to a project (protocol 1.12).
+//! exist and is stored as an absolute, resolved path. A missing folder is
+//! made only when the owner confirms it (protocol 1.24), and only under the
+//! home folder. A chat bot can send its direct-message chats to a project
+//! (protocol 1.12).
 
 use std::path::{Path, PathBuf};
 
-use aidaemon_client_protocol::ProjectSummary;
+use aidaemon_client_protocol::{ErrorCode, ProjectSummary, ProtocolError};
 use aidaemon_work::traits::{DEFAULT_PROJECT_ID, WorkProject};
 
 use crate::traits::StateStore;
@@ -54,39 +56,45 @@ pub(crate) async fn send_bot(
     }
 }
 
+fn refused(why: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ErrorCode::Invalid, why)
+}
+
 pub(crate) async fn create(
     state: &dyn StateStore,
     name: &str,
     path: Option<&str>,
-) -> Result<ProjectSummary, String> {
+    create_folder: bool,
+) -> Result<ProjectSummary, ProtocolError> {
     let name = name.trim();
     if name.is_empty() {
-        return Err("A project needs a name".to_string());
+        return Err(refused("A project needs a name"));
     }
-    let folder = match path.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(path) => Some(folder(path)?),
-        None => None,
-    };
     let taken = state
         .list_work_projects()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| refused(e.to_string()))?
         .iter()
         .any(|project| project.name.eq_ignore_ascii_case(name));
     if taken {
-        return Err(format!("There is already a project called {name}"));
+        return Err(refused(format!("There is already a project called {name}")));
     }
+    // The name is checked first, so a refused project makes no folder.
+    let folder = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => Some(folder(path, create_folder)?),
+        None => None,
+    };
     let project = state
         .create_work_project(name, None)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| refused(e.to_string()))?;
     match folder {
         Some(folder) => state
             .update_work_project(&project.id, None, Some(Some(&folder)))
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| refused(e.to_string()))?
             .map(|project| summary(project, &[]))
-            .ok_or_else(|| "The project was made but its folder was not saved".to_string()),
+            .ok_or_else(|| refused("The project was made but its folder was not saved")),
         None => Ok(summary(project, &[])),
     }
 }
@@ -96,25 +104,35 @@ pub(crate) async fn update(
     id: &str,
     name: Option<&str>,
     path: Option<&str>,
-) -> Result<ProjectSummary, String> {
+    create_folder: bool,
+) -> Result<ProjectSummary, ProtocolError> {
     if id == DEFAULT_PROJECT_ID {
-        return Err("Conversations in no project cannot be renamed".to_string());
+        return Err(refused("Conversations in no project cannot be renamed"));
+    }
+    let exists = state
+        .list_work_projects()
+        .await
+        .map_err(|e| refused(e.to_string()))?
+        .iter()
+        .any(|project| project.id == id);
+    if !exists {
+        return Err(refused("There is no such project"));
     }
     let path = match path.map(str::trim) {
         Some("") => Some(None),
-        Some(path) => Some(Some(folder(path)?)),
+        Some(path) => Some(Some(folder(path, create_folder)?)),
         None => None,
     };
     let bots = state
         .channel_work_projects()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| refused(e.to_string()))?;
     state
         .update_work_project(id, name, path.as_ref().map(|p| p.as_deref()))
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| refused(e.to_string()))?
         .map(|project| summary(project, &bots))
-        .ok_or_else(|| "There is no such project".to_string())
+        .ok_or_else(|| refused("There is no such project"))
 }
 
 pub(crate) async fn place(
@@ -246,32 +264,85 @@ fn described(project: &ProjectSummary) -> String {
 }
 
 /// The project's folder as stored: `~` expanded, resolved, and existing.
-fn folder(path: &str) -> Result<String, String> {
+/// A missing folder is `FolderMissing`, or with `create` is made (with any
+/// missing parents) when it lies under the home folder.
+fn folder(path: &str, create: bool) -> Result<String, ProtocolError> {
+    let home = || {
+        dirs::home_dir().ok_or_else(|| refused("This computer has no home folder to start from"))
+    };
     let expanded: PathBuf = match path.strip_prefix("~/").or(path.strip_prefix("~")) {
-        Some(rest) => dirs::home_dir()
-            .ok_or_else(|| "This computer has no home folder to start from".to_string())?
-            .join(rest.trim_start_matches('/')),
+        Some(rest) => home()?.join(rest.trim_start_matches('/')),
         None => PathBuf::from(path),
     };
     if !expanded.is_absolute() {
-        return Err(format!(
+        return Err(refused(format!(
             "Give the folder's full path (for example ~/projects/{}), not a relative one",
             Path::new(path)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "acme-site".to_string())
-        ));
+        )));
+    }
+    if !expanded.exists() {
+        if !create {
+            return Err(ProtocolError::new(
+                ErrorCode::FolderMissing,
+                format!(
+                    "There is no folder at {} on this computer",
+                    expanded.display()
+                ),
+            ));
+        }
+        make_folder(&expanded, &home()?)?;
     }
     let resolved = dunce::canonicalize(&expanded).map_err(|_| {
-        format!(
+        refused(format!(
             "There is no folder at {} on this computer",
             expanded.display()
-        )
+        ))
     })?;
     if !resolved.is_dir() {
-        return Err(format!("{} is a file, not a folder", resolved.display()));
+        return Err(refused(format!(
+            "{} is a file, not a folder",
+            resolved.display()
+        )));
     }
     Ok(resolved.to_string_lossy().into_owned())
+}
+
+/// Make `path` and its missing parents, only under `home`: no `..`, and its
+/// nearest existing parent (links resolved) is a folder inside `home`.
+fn make_folder(path: &Path, home: &Path) -> Result<(), ProtocolError> {
+    let outside = || {
+        refused(format!(
+            "Only a folder inside your home folder can be made; make {} yourself",
+            path.display()
+        ))
+    };
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(outside());
+    }
+    let home = dunce::canonicalize(home).map_err(|_| outside())?;
+    let parent = path
+        .ancestors()
+        .skip(1)
+        .find(|p| p.exists())
+        .ok_or_else(outside)?;
+    let parent_resolved = dunce::canonicalize(parent).map_err(|_| outside())?;
+    if !parent_resolved.starts_with(&home) {
+        return Err(outside());
+    }
+    if !parent_resolved.is_dir() {
+        return Err(refused(format!(
+            "{} is a file, not a folder",
+            parent_resolved.display()
+        )));
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|e| refused(format!("Could not make {}: {e}", path.display())))
 }
 
 #[cfg(test)]
@@ -285,31 +356,51 @@ mod tests {
             .unwrap();
         let state: &dyn StateStore = harness.state.as_ref();
         let site = tempfile::tempdir().unwrap();
-        let made = create(state, "Acme site", Some(&site.path().to_string_lossy()))
-            .await
-            .unwrap();
+        let made = create(
+            state,
+            "Acme site",
+            Some(&site.path().to_string_lossy()),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             made.path.as_deref(),
             Some(dunce::canonicalize(site.path()).unwrap().to_str().unwrap())
         );
         // The same name again, a missing folder and a relative one are refused.
-        assert!(create(state, "acme SITE", None).await.is_err());
+        assert!(create(state, "acme SITE", None, false).await.is_err());
+        let missing = create(
+            state,
+            "Gone",
+            Some(&crate::testing::abs_path("/nowhere/synthetic-missing")),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::FolderMissing);
+        assert!(missing.message.contains("no folder"), "{missing:?}");
+        // Outside the home folder, confirming does not make it.
+        let outside = create(
+            state,
+            "Gone",
+            Some(&crate::testing::abs_path("/nowhere/synthetic-missing")),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(outside.code, ErrorCode::Invalid);
+        assert!(projects(state).await.unwrap().len() == 1);
         assert!(
-            create(
-                state,
-                "Gone",
-                Some(&crate::testing::abs_path("/nowhere/synthetic-missing"))
-            )
-            .await
-            .unwrap_err()
-            .contains("no folder")
+            create(state, "Rel", Some("projects/acme"), false)
+                .await
+                .is_err()
         );
-        assert!(create(state, "Rel", Some("projects/acme")).await.is_err());
         // Listed without the default project.
         let listed = projects(state).await.unwrap();
         assert_eq!(listed, vec![made.clone()]);
         // A folder can be removed and the project renamed.
-        let bare = update(state, &made.id, Some("Acme Corp"), Some(""))
+        let bare = update(state, &made.id, Some("Acme Corp"), Some(""), false)
             .await
             .unwrap();
         assert_eq!((bare.name.as_str(), bare.path), ("Acme Corp", None));
@@ -372,5 +463,26 @@ mod tests {
         );
         project_command(state, chat, "none", UserRole::Owner).await;
         assert!(state.session_work_projects().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_folder_is_made_only_inside_home() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path();
+        // Missing parents are made too.
+        let site = home_path.join("projects").join("acme-site");
+        make_folder(&site, home_path).unwrap();
+        assert!(site.is_dir());
+        // `..` and anything outside home are refused.
+        assert!(make_folder(&home_path.join("projects/../../escape"), home_path).is_err());
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("acme-site");
+        assert!(make_folder(&outside, home_path).is_err());
+        assert!(!outside.exists());
+        // A path through a file is refused, and the file is left alone.
+        let file = home_path.join("notes.md");
+        std::fs::write(&file, "synthetic").unwrap();
+        assert!(make_folder(&file.join("acme-site"), home_path).is_err());
+        assert!(file.is_file());
     }
 }
