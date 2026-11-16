@@ -162,9 +162,12 @@ pub async fn install_daemon() -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Err(
-        "AIdaemon did not start within a minute. Its log is in ~/Library/Logs/aidaemon (macOS) \
-         or `journalctl --user -u aidaemon` (Linux)."
-            .to_string(),
-    )
+    let why = if cfg!(target_os = "macos") {
+        "Its log is in ~/Library/Logs/aidaemon."
+    } else if cfg!(target_os = "windows") {
+        "Run `aidaemon` in a terminal to see why it stops."
+    } else {
+        "See why with `journalctl --user -u aidaemon`."
+    };
+    Err(format!("AIdaemon did not start within a minute. {why}"))
 }
