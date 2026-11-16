@@ -568,8 +568,9 @@ fn project_form(store: Store) -> View {
                 .text_size(px(type_scale::XS))
                 .text_color(colors::FAINT),
         )
+        // A missing folder the daemon can make is a question, not an error.
         .child(when(
-            move || store.project_error().is_some(),
+            move || store.project_error().is_some() && !can_make_folder(),
             move || {
                 ui::banner(
                     move || store.project_error().unwrap_or_default(),
@@ -577,6 +578,17 @@ fn project_form(store: Store) -> View {
                 )
             },
         ))
+        .child(when(can_make_folder, move || {
+            ui::banner(
+                move || {
+                    format!(
+                        "{} doesn't exist yet. Make it?",
+                        store.project_missing_folder().unwrap_or_default()
+                    )
+                },
+                Tone::Neutral,
+            )
+        }))
         .child(
             view()
                 .flex_row()
