@@ -1248,6 +1248,7 @@ fn markdown(
         s.text_size(px(ui::fit::read_code()))
             .line_height(px(ui::fit::read_lh()))
             .px(px(ui::fit::read_code_pad()))
+            .pt(px(ui::fit::read_code_pad()))
     }));
     text_view()
         .markdown(move || Some(content()))

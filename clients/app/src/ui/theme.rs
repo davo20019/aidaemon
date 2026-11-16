@@ -205,7 +205,9 @@ pub mod fit {
         read() * 0.875
     }
     /// Room inside inline code's background at each end, so the chip
-    /// does not stop at its first and last letter.
+    /// does not stop at its first and last letter; also its room on top,
+    /// where a monospaced font's box ends at the capitals but reaches
+    /// well below the baseline, which left the chip sitting low.
     pub fn read_code_pad() -> f32 {
         read() * 0.25
     }

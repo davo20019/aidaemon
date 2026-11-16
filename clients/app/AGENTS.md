@@ -1,7 +1,8 @@
 # clients/app: agent guide
 
 The AIdaemon app: one Rust crate on Native Shell (nsh 0.5.1 plus span
-padding, longbridge/nsh#2141, from a fork pinned by `rev`: see the note
+padding, longbridge/nsh#2141, and vertical span padding, from a fork
+pinned by `rev`: see the note
 in `Cargo.toml`; back to crates.io once a release carries it) for desktop, web and terminal. `CLAUDE.md` is a symlink to this file.
 It is its own Cargo workspace; the root workspace excludes it, so the
 root's `cargo test`/clippy never build it. Run its checks here.
