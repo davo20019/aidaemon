@@ -1031,7 +1031,7 @@ pub fn status_dot(
             // name it carries the state by itself.
             .child(
                 text(Glyph::Dot.symbol())
-                    .text_size(px(10.0))
+                    .text_size(px(12.0))
                     .text_color(move || tone().color())
                     .accessibility_elements_hidden(true),
             ),
