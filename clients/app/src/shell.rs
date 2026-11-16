@@ -96,7 +96,31 @@ pub fn shell(store: Store) -> View {
         on_key_with("mod+y", always(), move |_| copy_reply(store));
     }
 
+    // Only install each binding while that answer is offered for the open
+    // conversation and the composer is empty. A focused input otherwise owns
+    // these ordinary letters, rather than a global shortcut swallowing them.
+    let approval_keys = if terminal {
+        Some(
+            view().children(aidaemon_client_core::client::APPROVAL_KEYS.into_iter().map(
+                |(key, _)| {
+                    when(
+                        move || store.key_answer(key),
+                        move || {
+                            on_key_with(key, always(), move |_| {
+                                store.answer_by_key(key);
+                            });
+                            view()
+                        },
+                    )
+                },
+            )),
+        )
+    } else {
+        None
+    };
+
     let main = view()
+        .child(approval_keys)
         .flex_1()
         .flex_row()
         // Clear of the notch, the status bar and the home indicator (a

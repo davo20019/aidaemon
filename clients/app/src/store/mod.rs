@@ -2035,6 +2035,33 @@ impl Store {
         self.act(|c| c.resolve(approval, decision));
     }
 
+    /// The approval of the conversation on screen that single keys answer
+    /// now (its oldest, while the composer is empty): its id.
+    pub fn key_approval(&self) -> Option<String> {
+        let session = self.selected()?;
+        let draft = self.draft();
+        self.read(|c| c.key_approval(&session, &draft).map(|a| a.id))
+    }
+
+    /// Whether `key` can answer the open conversation's approval now.
+    pub fn key_answer(&self, key: &str) -> bool {
+        let Some(session) = self.selected() else {
+            return false;
+        };
+        let draft = self.draft();
+        self.read(|c| c.key_answer(&session, &draft, key).is_some())
+    }
+
+    /// Answer the conversation on screen's waiting approval with `key`
+    /// (`y`, `a`, `n`); whether it did.
+    pub fn answer_by_key(&self, key: &str) -> bool {
+        let Some(session) = self.selected_untracked() else {
+            return false;
+        };
+        let draft = self.draft_untracked();
+        self.act(|c| c.answer_by_key(&session, &draft, key))
+    }
+
     /// The link found no paired key on this device.
     pub fn needs_pairing(&self) {
         self.act(Client::needs_pairing);

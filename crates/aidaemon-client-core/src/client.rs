@@ -2104,6 +2104,75 @@ impl Client {
             decision,
         });
     }
+
+    /// The approval of `session` a single key answers: the oldest waiting
+    /// one, while the composer's `draft` is empty. A key it does not offer
+    /// answers nothing.
+    pub fn key_answer(
+        &self,
+        session: &str,
+        draft: &str,
+        key: &str,
+    ) -> Option<(String, ApprovalDecision)> {
+        let decision = approval_for_key(key)?;
+        self.key_approval(session, draft)
+            .filter(|a| a.options.contains(&decision))
+            .map(|a| (a.id, decision))
+    }
+
+    /// The approval single keys answer in `session` now: its oldest
+    /// waiting one, while the composer's `draft` is empty.
+    pub fn key_approval(&self, session: &str, draft: &str) -> Option<Approval> {
+        if !draft.is_empty() {
+            return None;
+        }
+        self.approvals()
+            .into_iter()
+            .find(|a| a.session_id == session)
+    }
+
+    /// Answer `session`'s waiting approval with `key` (see
+    /// [`Self::key_answer`]); whether it did.
+    pub fn answer_by_key(&mut self, session: &str, draft: &str, key: &str) -> bool {
+        match self.key_answer(session, draft, key) {
+            Some((id, decision)) => {
+                self.resolve(&id, decision);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether single keys answer an approval in `session` now: one waits
+    /// and the composer's `draft` is empty.
+    pub fn answers_by_key(&self, session: &str, draft: &str) -> bool {
+        self.key_approval(session, draft).is_some()
+    }
+}
+
+/// The keys that answer a waiting approval while the composer is empty,
+/// with what each answers. "Always allow" has no key: it reaches too far
+/// for one stray keystroke.
+pub const APPROVAL_KEYS: [(&str, ApprovalDecision); 3] = [
+    ("y", ApprovalDecision::ApproveOnce),
+    ("a", ApprovalDecision::ApproveSession),
+    ("n", ApprovalDecision::Deny),
+];
+
+/// The answer `key` gives a waiting approval.
+pub fn approval_for_key(key: &str) -> Option<ApprovalDecision> {
+    APPROVAL_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, d)| *d)
+}
+
+/// The key that gives `decision`, if one does.
+pub fn key_for_approval(decision: ApprovalDecision) -> Option<&'static str> {
+    APPROVAL_KEYS
+        .iter()
+        .find(|(_, d)| *d == decision)
+        .map(|(k, _)| *k)
 }
 
 /// Whether `run` finished after `seen_ms` with something to read.
@@ -2710,5 +2779,92 @@ mod tests {
             Felt::Reconnecting,
             "counted from the first failure, through every retry"
         );
+    }
+
+    fn waiting(client: &mut Client, id: &str, session: &str, at: u64, options: &str) {
+        client.update(
+            frame(&format!(
+                r#"{{"type":"event","at_ms":{at},"session_id":"{session}","event":{{"type":"approval_requested","approval":{{"id":"{id}","session_id":"{session}","kind":"command","risk":"medium","summary":"Run a command","options":[{options}],"requested_at_ms":{at}}}}}}}"#
+            )),
+            &cx(Some(session)),
+        );
+    }
+
+    fn resolutions(client: &mut Client) -> Vec<(String, ApprovalDecision)> {
+        client
+            .take_outgoing()
+            .into_iter()
+            .filter_map(|(_, c)| match c {
+                Command::ResolveApproval {
+                    approval_id,
+                    decision,
+                } => Some((approval_id, decision)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_keys_answer_the_oldest_waiting_approval_while_the_draft_is_empty() {
+        let mut client = Client::new();
+        let all = r#""approve_once","approve_session","approve_always","deny""#;
+        waiting(&mut client, "ap2", "app:synthetic-1", 9, all);
+        waiting(&mut client, "ap1", "app:synthetic-1", 5, all);
+        waiting(&mut client, "other", "app:synthetic-2", 1, all);
+        client.take_outgoing();
+
+        assert!(client.answers_by_key("app:synthetic-1", ""));
+        assert!(!client.answers_by_key("app:synthetic-1", "y"));
+        assert!(!client.answers_by_key("app:synthetic-3", ""));
+        assert_eq!(
+            client.key_approval("app:synthetic-1", "").map(|a| a.id),
+            Some("ap1".to_owned())
+        );
+
+        // Typing goes on as usual once something is typed.
+        assert!(!client.answer_by_key("app:synthetic-1", "n", "y"));
+        // A key that answers nothing.
+        assert!(!client.answer_by_key("app:synthetic-1", "", "x"));
+        assert!(resolutions(&mut client).is_empty());
+
+        for (key, decision) in [
+            ("y", ApprovalDecision::ApproveOnce),
+            ("a", ApprovalDecision::ApproveSession),
+            ("n", ApprovalDecision::Deny),
+        ] {
+            assert!(client.answer_by_key("app:synthetic-1", "", key));
+            assert_eq!(
+                resolutions(&mut client),
+                vec![("ap1".to_owned(), decision)],
+                "{key} answers the oldest approval of this conversation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_answers_only_with_what_the_approval_offers() {
+        let mut client = Client::new();
+        waiting(
+            &mut client,
+            "ap1",
+            "app:synthetic-1",
+            5,
+            r#""approve_once","deny""#,
+        );
+        client.take_outgoing();
+        assert_eq!(client.key_answer("app:synthetic-1", "", "a"), None);
+        assert_eq!(
+            client.key_answer("app:synthetic-1", "", "n"),
+            Some(("ap1".to_owned(), ApprovalDecision::Deny))
+        );
+    }
+
+    #[test]
+    fn the_keys_name_their_answers_both_ways() {
+        for (key, decision) in APPROVAL_KEYS {
+            assert_eq!(approval_for_key(key), Some(decision));
+            assert_eq!(key_for_approval(decision), Some(key));
+        }
+        assert_eq!(key_for_approval(ApprovalDecision::ApproveAlways), None);
     }
 }

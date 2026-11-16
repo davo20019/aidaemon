@@ -5,6 +5,9 @@
 use aidaemon_client_protocol::{Approval, ApprovalDecision, AskReason, CardAction, Impact, Risk};
 use nsh_core::prelude::*;
 
+use aidaemon_client_core::client::key_for_approval;
+use nsh_core::platform::Idiom;
+
 use crate::store::{Store, now_ms};
 use crate::ui::{self, Glyph, Size, Tone, Variant, badge, btn, code, colors, radius, type_scale};
 
@@ -190,12 +193,30 @@ pub fn card(store: Store, approval: Approval) -> View {
             )
             .text_size(px(type_scale::XS))
             .text_color(colors::FAINT);
+            let terminal = idiom() == Idiom::Terminal;
             let buttons = approval.options.iter().map(|d| {
                 let (label, variant) = decision(*d);
                 let (id, d) = (id.clone(), *d);
                 // What an answer covers, in words and for screen readers.
-                let button = btn(label, variant, Size::Sm, move || store.resolve(&id, d))
-                    .accessibility_label(scope(d));
+                let resolve_id = id.clone();
+                let button = btn(label, variant, Size::Sm, move || {
+                    store.resolve(&resolve_id, d)
+                })
+                .accessibility_label(scope(d));
+                // The terminal answers the card its keys reach with one key
+                // (the composer empty): the key shows beside its answer.
+                let button = match key_for_approval(d).filter(|_| terminal) {
+                    Some(key) => view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(button)
+                        .child(when(
+                            move || store.key_approval().as_deref() == Some(id.as_str()),
+                            move || ui::kbd(key),
+                        )),
+                    None => view().child(button),
+                };
                 (d, button)
             });
             if ui::touch() {
