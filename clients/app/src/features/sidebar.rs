@@ -705,6 +705,8 @@ fn day_group(store: Store, title: &'static str, ids: Memo<Vec<String>>, dated: b
                 view()
                     .flex_row()
                     .items_center()
+                    // More where the list goes on; Less at the far end.
+                    .justify_between()
                     .child(when(
                         move || hidden() > 0,
                         move || {
