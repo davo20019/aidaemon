@@ -133,11 +133,37 @@ fn bots(store: Store) -> View {
                     view()
                         .flex_1()
                         .min_w(px(0.0))
-                        .child(
-                            text(bot.name.clone())
-                                .number_of_lines(1)
-                                .text_size(px(ui::fit::body())),
-                        )
+                        .child({
+                            // The platform by its mark, then the bot.
+                            let glyph = ui::platform_glyph(&bot.channel);
+                            let shown = match glyph {
+                                Some(_) => bot
+                                    .name
+                                    .split_once(" · ")
+                                    .map_or(bot.name.clone(), |(_, bot)| bot.to_owned()),
+                                None => bot.name.clone(),
+                            };
+                            let mut line = view()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .role(AccessibilityRole::Text)
+                                .label(bot.name.clone());
+                            if let Some(glyph) = glyph {
+                                line = line.child(
+                                    ui::icon(glyph)
+                                        .text_color(colors::MUTED)
+                                        .accessibility_elements_hidden(true),
+                                );
+                            }
+                            line.child(
+                                text(shown)
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .number_of_lines(1)
+                                    .text_size(px(ui::fit::body())),
+                            )
+                        })
                         .child(
                             text(chats)
                                 .text_size(px(type_scale::XS))

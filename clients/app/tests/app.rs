@@ -467,6 +467,16 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
         ),
     ]);
     app.wait_for("Weekend plan")?;
+    // Search is an icon until pressed: then the line is the field, and
+    // Cancel clears it and brings the name back.
+    app.wait_for("AIDaemon")?;
+    app.press("Search conversations")?;
+    app.type_text("label:Search conversations", "footer")?;
+    app.wait_for_gone("Weekend plan", std::time::Duration::from_secs(5))?;
+    app.wait_for("Fix the footer")?;
+    app.press("Cancel")?;
+    app.wait_for("Weekend plan")?;
+    app.wait_for("AIDaemon")?;
     // Each says where it came from; one filter narrows the list.
     app.wait_for("Telegram group")?;
     app.press("Show conversations from: All")?;
@@ -477,12 +487,13 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
     app.press("Team release notes >> nth=0")?;
     app.wait_for("Post in this group")?;
     app.press("Post in this group")?;
-    app.wait_for("Also posted in Telegram · synthetic_coding_bot · group")?;
+    app.wait_for("Also posted in synthetic_coding_bot · group")?;
+    app.wait_for("label:Telegram")?;
     // A direct chat posts there too, and says so.
     app.press("Show conversations from: Groups")?;
     app.press("All")?;
     app.press("Fix the footer >> nth=0")?;
-    app.wait_for("Also posted in Telegram · synthetic_coding_bot")?;
+    app.wait_for("Also posted in synthetic_coding_bot")?;
     Ok(())
 }
 

@@ -1651,7 +1651,18 @@ fn bots(store: Store, bots: &[BotInfo]) -> View {
         let name = format!("{} bot {}", bot.platform, bot.id);
         let asked = name.clone();
         rows.push(vec![
-            view().child(text(name).number_of_lines(1)),
+            {
+                // The platform by its mark, then which bot.
+                let mut cell = view().flex_row().items_center().gap_1();
+                if let Some(glyph) = ui::platform_glyph(&bot.platform) {
+                    cell = cell.child(
+                        ui::icon(glyph)
+                            .text_color(colors::MUTED)
+                            .accessibility_elements_hidden(true),
+                    );
+                }
+                cell.child(text(name).number_of_lines(1))
+            },
             view().child(muted(who).number_of_lines(2)),
             view().child(
                 ui::btn("Remove", Variant::Ghost, Size::Sm, move || {

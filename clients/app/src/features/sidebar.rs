@@ -1,4 +1,5 @@
-//! The sidebar. Home: search and one New conversation, the conversations
+//! The sidebar. Home: its name, Search (a field once pressed) and one New
+//! conversation, the conversations
 //! that need the owner or are working, the pinned ones, the projects used
 //! last (one line each; a press goes inside one), then every conversation
 //! newest first, each with its time and tagged with its project or the
@@ -48,82 +49,21 @@ pub fn sidebar(store: Store) -> View {
         .bg(colors::SIDEBAR)
         .border_r_1()
         .border_color(colors::LINE)
-        .child(when(ui::touch(), move || {
-            // A phone: search, one New conversation and Close on one line.
-            view()
-                .min_h(px(ui::fit::bar()))
-                .flex_row()
-                .items_center()
-                .px_2()
-                .gap_1()
-                .child(
-                    ui::field("Search", query)
-                        .label("Search conversations")
-                        .flex_1(),
-                )
-                .child(ui::icon_btn(
-                    Glyph::Compose,
-                    "New conversation",
-                    ui::Size::Md,
-                    move || new_here(store),
-                ))
-                .child(when(
-                    move || store.is_compact(),
-                    move || {
-                        ui::icon_btn(Glyph::Close, "Close", ui::Size::Md, move || {
-                            store.close_panes()
-                        })
-                    },
-                ))
-        }))
+        // The top line: the name, Search, (a phone's) New conversation and
+        // Close; Search turns the line into the field, Cancel turns it back.
+        .child(top_line(store, query))
         .child(when(!ui::touch(), move || {
-            view()
-                .child(
-                    view()
-                        .h(px(ui::fit::bar()))
-                        .flex_row()
-                        .items_center()
-                        .px_3()
-                        .gap_2()
-                        .child(
-                            text("AIdaemon")
-                                .flex_1()
-                                .role(AccessibilityRole::Header)
-                                .text_size(px(ui::fit::body()))
-                                .font_weight(FontWeight::SEMIBOLD),
-                        )
-                        .child(
-                            when(
-                                move || store.is_compact(),
-                                move || {
-                                    ui::icon_btn(Glyph::Close, "Close", ui::Size::Md, move || {
-                                        store.close_panes()
-                                    })
-                                },
-                            )
-                            .otherwise(|| ui::kbd(key_label("mod+k"))),
-                        ),
-                )
-                .child(
-                    view().px_2().child(
-                        row(move || store.selected().is_none(), move || new_here(store))
-                            .accessibility_label("New conversation")
-                            .child(icon(Glyph::Compose).text_color(colors::MUTED))
-                            .child(
-                                text("New conversation")
-                                    .flex_1()
-                                    .text_size(px(type_scale::BASE)),
-                            )
-                            .child(ui::kbd(key_label("mod+n"))),
-                    ),
-                )
-                .child(
-                    view().px_2().pt_2().child(
-                        ui::field("Search conversations", query)
-                            .label("Search conversations")
-                            .w_full(),
-                    ),
-                )
+            view().px_2().child(
+                row(move || store.selected().is_none(), move || new_here(store))
+                    .accessibility_label("New conversation")
+                    .child(icon(Glyph::Compose).text_color(colors::MUTED))
+                    .child(
+                        text("New conversation")
+                            .flex_1()
+                            .text_size(px(type_scale::BASE)),
+                    )
+                    .child(ui::kbd(key_label("mod+n"))),
+            )
         }))
         .child(
             scroll().flex_1().child(
@@ -314,6 +254,83 @@ fn session_preview(store: Store, id: String) -> View {
             .number_of_lines(4)
             .text_size(px(type_scale::XS))
             .text_color(colors::MUTED),
+        )
+}
+
+/// The sidebar's top line. Shut: "AIDaemon", Search, New conversation
+/// (a phone's; a window has its own row) and Close (or ⌘K's hint). Open:
+/// the search field across the line, focused, and Cancel, which clears it.
+/// A search left in the field keeps it open.
+fn top_line(store: Store, query: Signal<String>) -> View {
+    let open = signal(!untracked(|| query.get()).trim().is_empty());
+    let close = move || {
+        query.set(String::new());
+        open.set(false);
+    };
+    view()
+        .h(px(ui::fit::bar()))
+        .flex_row()
+        .items_center()
+        .pl_3()
+        .pr_2()
+        .gap_1()
+        .child(
+            when(
+                move || open.get(),
+                move || {
+                    view()
+                        .flex_1()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            ui::field("Search", query)
+                                .label("Search conversations")
+                                .auto_focus(true)
+                                .flex_1(),
+                        )
+                        .child(ui::btn("Cancel", ui::Variant::Ghost, ui::Size::Sm, close))
+                },
+            )
+            .otherwise(move || {
+                view()
+                    .flex_1()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        text("AIDaemon")
+                            .flex_1()
+                            .role(AccessibilityRole::Header)
+                            .text_size(px(ui::fit::body()))
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(ui::icon_btn(
+                        Glyph::Search,
+                        "Search conversations",
+                        ui::Size::Md,
+                        move || open.set(true),
+                    ))
+                    .child(when(ui::touch(), move || {
+                        ui::icon_btn(
+                            Glyph::Compose,
+                            "New conversation",
+                            ui::Size::Md,
+                            move || new_here(store),
+                        )
+                    }))
+                    .child(
+                        when(
+                            move || store.is_compact(),
+                            move || {
+                                ui::icon_btn(Glyph::Close, "Close", ui::Size::Md, move || {
+                                    store.close_panes()
+                                })
+                            },
+                        )
+                        .otherwise(|| ui::kbd(key_label("mod+k"))),
+                    )
+            }),
         )
 }
 
@@ -658,7 +675,12 @@ fn source_filter(store: Store) -> View {
                     .into_iter()
                     .enumerate()
                     .map(|(at, source)| {
-                        ui::PickItem::new(at.to_string(), source.label()).checked(source == chosen)
+                        let item = ui::PickItem::new(at.to_string(), source.label())
+                            .checked(source == chosen);
+                        match filter_glyph(source) {
+                            Some(glyph) => item.glyph(glyph),
+                            None => item,
+                        }
                     })
                     .collect()
             },
@@ -680,6 +702,14 @@ fn source_filter(store: Store) -> View {
             .items_center()
             .gap_1()
             .px_2()
+            .child(dynamic(move || {
+                let glyph = filter_glyph(store.source_filter())?;
+                Some(untracked(move || {
+                    icon(glyph)
+                        .text_color(colors::MUTED)
+                        .accessibility_elements_hidden(true)
+                }))
+            }))
             .child(
                 text(shown)
                     .text_size(px(ui::fit::small()))
@@ -1030,6 +1060,17 @@ fn source_glyph(source: Source) -> Option<Glyph> {
         Source::Discord => Some(Glyph::Discord),
         Source::Slack => Some(Glyph::Slack),
         _ => None,
+    }
+}
+
+/// A source filter's icon: every inbox for All, the app's chat, the
+/// platform's mark, people for groups.
+fn filter_glyph(source: Source) -> Option<Glyph> {
+    match source {
+        Source::All => Some(Glyph::Inbox),
+        Source::App | Source::Chat => Some(Glyph::Chat),
+        Source::Groups => Some(Glyph::Group),
+        source => source_glyph(source),
     }
 }
 

@@ -344,6 +344,35 @@ pub enum Glyph {
     Group,
 }
 
+/// The mark of the chat platform a `channel` or platform name belongs to
+/// ("telegram:coding_bot", "Telegram", "slack"): Telegram, Discord or
+/// Slack; none for any other.
+pub fn platform_glyph(channel: &str) -> Option<Glyph> {
+    let platform = channel
+        .split([':', ' '])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    match platform.as_str() {
+        "telegram" => Some(Glyph::Telegram),
+        "discord" => Some(Glyph::Discord),
+        "slack" => Some(Glyph::Slack),
+        _ => None,
+    }
+}
+
+impl Glyph {
+    /// A platform mark's name, for screen readers; empty for other glyphs.
+    pub const fn platform_name(self) -> &'static str {
+        match self {
+            Self::Telegram => "Telegram",
+            Self::Discord => "Discord",
+            Self::Slack => "Slack",
+            _ => "",
+        }
+    }
+}
+
 impl Glyph {
     pub const fn symbol(self) -> &'static str {
         match self {

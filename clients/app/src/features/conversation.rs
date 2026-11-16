@@ -390,7 +390,18 @@ fn header(store: Store, session: Option<String>) -> View {
                     },
                     move || {
                         let chat = chat.clone();
-                        text(move || {
+                        // A chat on Telegram, Discord or Slack: its mark, then
+                        // the bot (and "group"), without the platform's name.
+                        let glyph = chat
+                            .as_deref()
+                            .and_then(|id| untracked(|| store.channel(id)))
+                            .and_then(|channel| ui::platform_glyph(&channel));
+                        let mark = glyph.map(|glyph| {
+                            ui::icon(glyph)
+                                .text_color(colors::FAINT)
+                                .accessibility_elements_hidden(true)
+                        });
+                        let line = text(move || {
                             let project = store
                                 .current_project()
                                 .and_then(|id| store.project(&id))
@@ -402,16 +413,31 @@ fn header(store: Store, session: Option<String>) -> View {
                                     ),
                                     None => p.name,
                                 });
-                            let place = chat.as_deref().map(|id| store.place(id));
+                            let place = chat.as_deref().map(|id| {
+                                let place = store.place(id);
+                                match glyph {
+                                    Some(_) => place
+                                        .split_once(" · ")
+                                        .map_or(place.clone(), |(_, rest)| rest.to_owned()),
+                                    None => place,
+                                }
+                            });
                             match (place, project) {
                                 (Some(place), Some(project)) => format!("{place} · {project}"),
                                 (Some(place), None) => place,
                                 (None, project) => project.unwrap_or_default(),
                             }
                         })
+                        .flex_1()
+                        .min_w(px(0.0))
                         .number_of_lines(1)
                         .text_size(px(type_scale::XS))
-                        .text_color(colors::FAINT)
+                        .text_color(colors::FAINT);
+                        let mut row = view().flex_row().items_center().gap_1();
+                        if let Some(mark) = mark {
+                            row = row.child(mark);
+                        }
+                        row.child(line)
                     },
                 )),
         )
@@ -1284,7 +1310,23 @@ fn composer(store: Store, session: Option<String>) -> View {
     let chat_note = session
         .as_deref()
         .filter(|id| untracked(|| store.source(id)) != crate::store::Source::App)
-        .map(|id| format!("Also posted in {}", untracked(|| store.place(id))));
+        .map(|id| untracked(|| store.place(id)));
+    // Telegram, Discord or Slack: its mark leads the note, which names the
+    // bot without the platform.
+    let chat_glyph = session
+        .as_deref()
+        .and_then(|id| untracked(|| store.channel(id)))
+        .and_then(|channel| ui::platform_glyph(&channel))
+        .filter(|_| chat_note.is_some());
+    let chat_note = chat_note.map(|place| match chat_glyph {
+        Some(_) => format!(
+            "Also posted in {}",
+            place
+                .split_once(" · ")
+                .map_or(place.as_str(), |(_, rest)| rest)
+        ),
+        None => format!("Also posted in {place}"),
+    });
     view()
         .items_center()
         .px_4()
@@ -1455,6 +1497,15 @@ fn composer(store: Store, session: Option<String>) -> View {
                             let session = session.clone();
                             move || super::model_picker::model_picker(store, session.clone())
                         }))
+                        .child(when(
+                            move || chat_glyph.is_some() && !running.get() && !terminal,
+                            move || {
+                                ui::icon(chat_glyph.unwrap_or(Glyph::Chat))
+                                    .text_color(colors::FAINT)
+                                    .role(AccessibilityRole::Image)
+                                    .label(chat_glyph.map_or("", |g| g.platform_name()))
+                            },
+                        ))
                         .child(
                             text(move || match (running.get(), touch) {
                                 (true, true) if store.enter_queues() => {
