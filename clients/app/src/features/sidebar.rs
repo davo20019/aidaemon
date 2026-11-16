@@ -333,8 +333,9 @@ fn new_here(store: Store) {
     }
 }
 
-/// How many projects Home shows before "All projects".
-const HOME_PROJECTS: usize = 3;
+/// Home lists every project up to this many; past it, the ones used last
+/// (one fewer) and "All projects" in the last one's place.
+const HOME_PROJECTS: usize = 4;
 
 /// Home: what needs the owner, what is working, the pinned, the projects
 /// used last, then every other conversation by day.
@@ -362,10 +363,13 @@ fn home(
     });
     let all = computed(move || store.projects());
     let shown = computed(move || {
-        recent_projects(store)
-            .into_iter()
-            .take(HOME_PROJECTS)
-            .collect::<Vec<_>>()
+        let ids = recent_projects(store);
+        let room = if ids.len() > HOME_PROJECTS {
+            HOME_PROJECTS - 1
+        } else {
+            HOME_PROJECTS
+        };
+        ids.into_iter().take(room).collect::<Vec<_>>()
     });
     view()
         .gap(px(1.0))
