@@ -11,507 +11,6 @@ use croner::Cron;
 use regex::Regex;
 use std::sync::LazyLock;
 
-static RE_SPACE_COLLAPSE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s+").expect("space collapse regex"));
-#[cfg(test)]
-static RE_SPLIT_NUMBERED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:^|[.;]\s*)\s*\d+[\)\.]\s+").expect("numbered split regex")
-});
-#[cfg(test)]
-static RE_SPLIT_DELIMITER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:[.!?]\s+(?:also|and)\s+|;\s*(?:also|and)\s+|;\s+)")
-        .expect("delimiter split regex")
-});
-static RE_SCHEDULE_IN_TIME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:in|after)\s+\d+\s*(?:w|weeks?|d|days?|h|hrs?|hours?|m|min|mins|minutes?)\b",
-    )
-    .expect("relative schedule regex")
-});
-static RE_SCHEDULE_DAY_AT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:today|tonight|tomorrow)\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+(?:[A-Za-z]{1,8}|[+-]\d{2}:?\d{2}|Z))?\b",
-    )
-    .expect("day schedule regex")
-});
-static RE_SCHEDULE_MONTH_DAY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:on\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b",
-    )
-    .expect("month-day schedule regex")
-});
-static RE_SCHEDULE_EVERY_INTERVAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:every|each)\s+\d+\s*(?:m|min|mins|minutes?|h|hrs?|hours?)\b")
-        .expect("interval schedule regex")
-});
-static RE_SCHEDULE_DAILY_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:daily|every\s+day|everyday|each\s+day)\s+at\s+{}",
-        time_list
-    ))
-    .expect("daily-at schedule regex")
-});
-static RE_SCHEDULE_DAILY_FLEX_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let filler =
-        r"(?:scheduled?|schedule|task|tasks|goal|goals|job|jobs|run|runs|reminder|reminders)";
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:daily|every\s+day|everyday|each\s+day)(?:\s+{filler}){{1,4}}\s+at\s+{time_list}",
-        filler = filler,
-        time_list = time_list
-    ))
-    .expect("daily-flex-at schedule regex")
-});
-static RE_SCHEDULE_WEEKDAYS_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:weekdays?|every\s+weekdays?|every\s+weekday|each\s+weekday)\s+at\s+{}",
-        time_list
-    ))
-    .expect("weekdays-at schedule regex")
-});
-static RE_SCHEDULE_WEEKDAYS_FLEX_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let filler =
-        r"(?:scheduled?|schedule|task|tasks|goal|goals|job|jobs|run|runs|reminder|reminders)";
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:weekdays?|every\s+weekdays?|every\s+weekday|each\s+weekday)(?:\s+{filler}){{1,4}}\s+at\s+{time_list}",
-        filler = filler,
-        time_list = time_list
-    ))
-    .expect("weekdays-flex-at schedule regex")
-});
-static RE_SCHEDULE_WEEKENDS_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:weekends?|every\s+weekends?|every\s+weekend|each\s+weekend)\s+at\s+{}",
-        time_list
-    ))
-    .expect("weekends-at schedule regex")
-});
-static RE_SCHEDULE_WEEKENDS_FLEX_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let filler =
-        r"(?:scheduled?|schedule|task|tasks|goal|goals|job|jobs|run|runs|reminder|reminders)";
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:weekends?|every\s+weekends?|every\s+weekend|each\s+weekend)(?:\s+{filler}){{1,4}}\s+at\s+{time_list}",
-        filler = filler,
-        time_list = time_list
-    ))
-    .expect("weekends-flex-at schedule regex")
-});
-static RE_SCHEDULE_SPECIFIC_DAYS_AT: LazyLock<Regex> = LazyLock::new(|| {
-    let day =
-        r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)";
-    let time = r"(?:noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)";
-    let time_list = format!(
-        r"(?P<times>{time}(?:\s*(?:,|\band\b|&)\s*{time})*)",
-        time = time
-    );
-    Regex::new(&format!(
-        r"(?i)\b(?:every|on)\s+(?P<days>{day}(?:\s*(?:,|\band\b|&)\s*{day})*)\s+at\s+{}",
-        time_list,
-        day = day
-    ))
-    .expect("specific-days schedule regex")
-});
-static RE_PREFIX_NOISE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*(?:\d+[\)\.]\s*|,|;|:|-|and\b|also\b|then\b|to\b|for\b)\s*")
-        .expect("prefix-noise regex")
-});
-static RE_FILLER_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)^\s*(?:please\s+)?(?:remind me to|schedule(?:\s+a)?\s+task\s+to|schedule(?:\s+a)?\s+to|set up(?:\s+a)?\s+task\s+to|set up(?:\s+a)?\s+to|i need you to|can you(?:\s+please)?\s+)\s*",
-    )
-    .expect("filler-prefix regex")
-});
-#[cfg(test)]
-static RE_LEADING_CONNECTOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*(?:also|and|then)\b[:,]?\s*").expect("leading-connector regex")
-});
-
-/// A schedule/task pair extracted from one message segment.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduleSegment {
-    /// Clean task text with schedule/filler language stripped.
-    pub description: String,
-    /// Human-readable schedule phrase.
-    pub schedule_raw: String,
-    /// Whether this schedule is one-time.
-    pub is_one_shot: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ScheduleMatch {
-    schedule_raw: String,
-    is_one_shot: bool,
-    start: usize,
-    end: usize,
-}
-
-/// Extract the first schedule phrase from arbitrary user text.
-///
-/// Returns `(schedule_raw, is_one_shot)` when a schedule is detected.
-#[cfg(test)]
-pub fn extract_schedule_from_text(text: &str) -> Option<(String, bool)> {
-    let schedule_match = extract_schedule_match(text)?;
-    Some((schedule_match.schedule_raw, schedule_match.is_one_shot))
-}
-
-/// Extract all schedule/task segments from a potentially multi-request message.
-#[cfg(test)]
-pub fn extract_schedule_segments(text: &str) -> Vec<ScheduleSegment> {
-    let mut out = Vec::new();
-    for candidate in split_schedule_candidates(text) {
-        if let Some(schedule_match) = extract_schedule_match(&candidate) {
-            let description = clean_task_description_with_match(
-                &candidate,
-                &schedule_match.schedule_raw,
-                Some((schedule_match.start, schedule_match.end)),
-            );
-            if !description.trim().is_empty() {
-                out.push(ScheduleSegment {
-                    description,
-                    schedule_raw: schedule_match.schedule_raw,
-                    is_one_shot: schedule_match.is_one_shot,
-                });
-            }
-        } else if let Some(previous) = out.last_mut() {
-            append_non_schedule_fragment(previous, &candidate);
-        }
-    }
-    out
-}
-
-/// Clean task text by stripping the detected schedule expression and
-/// common filler prefixes.
-pub fn clean_task_description(text: &str, schedule_match: &str) -> String {
-    // Re-run schedule extraction on the text to get the precise match range.
-    // The caller's `schedule_match` may be normalized (e.g. "weekdays at 9am")
-    // which won't match the original text (e.g. "every weekday at 9am").
-    let schedule_range = extract_schedule_match(text).map(|sm| (sm.start, sm.end));
-    clean_task_description_with_match(text, schedule_match, schedule_range)
-}
-
-#[cfg(test)]
-fn split_schedule_candidates(text: &str) -> Vec<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let normalized = trimmed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let normalized = RE_SPACE_COLLAPSE
-        .replace_all(&normalized, " ")
-        .trim()
-        .to_string();
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-
-    let mut parts = vec![normalized];
-    for splitter in [&*RE_SPLIT_NUMBERED, &*RE_SPLIT_DELIMITER] {
-        let mut next_parts = Vec::new();
-        for part in parts {
-            for piece in splitter.split(&part) {
-                let cleaned = piece.trim().trim_matches(['.', '!', '?']).trim();
-                if !cleaned.is_empty() {
-                    next_parts.push(cleaned.to_string());
-                }
-            }
-        }
-        parts = next_parts;
-    }
-
-    if parts.is_empty() {
-        parts.push(trimmed.to_string());
-    }
-    parts
-}
-
-fn extract_schedule_match(text: &str) -> Option<ScheduleMatch> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-
-    // One-shot relative time, e.g. "in 2h", "after 90 minutes".
-    if let Some(m) = RE_SCHEDULE_IN_TIME.find(text) {
-        return Some(ScheduleMatch {
-            schedule_raw: m.as_str().trim().to_string(),
-            is_one_shot: true,
-            start: m.start(),
-            end: m.end(),
-        });
-    }
-
-    // One-shot day+time with optional timezone.
-    if let Some(m) = RE_SCHEDULE_DAY_AT.find(text) {
-        return Some(ScheduleMatch {
-            schedule_raw: m.as_str().trim().to_string(),
-            is_one_shot: true,
-            start: m.start(),
-            end: m.end(),
-        });
-    }
-
-    // One-shot month/day phrases, e.g. "on March 5th at 3pm".
-    if let Some(m) = RE_SCHEDULE_MONTH_DAY.find(text) {
-        return Some(ScheduleMatch {
-            schedule_raw: m.as_str().trim().to_string(),
-            is_one_shot: true,
-            start: m.start(),
-            end: m.end(),
-        });
-    }
-
-    // Recurring intervals: "every 6h", "each 5 minutes".
-    if let Some(m) = RE_SCHEDULE_EVERY_INTERVAL.find(text) {
-        return Some(ScheduleMatch {
-            schedule_raw: m.as_str().trim().to_string(),
-            is_one_shot: false,
-            start: m.start(),
-            end: m.end(),
-        });
-    }
-
-    // Recurring "at" schedules; normalized to canonical phrases.
-    if let Some(caps) = RE_SCHEDULE_DAILY_AT.captures(text) {
-        let m = caps.get(0)?;
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("every day at {}", times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-    if let Some(caps) = RE_SCHEDULE_DAILY_FLEX_AT.captures(text) {
-        let m = caps.get(0)?;
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("every day at {}", times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-
-    if let Some(caps) = RE_SCHEDULE_WEEKDAYS_AT.captures(text) {
-        let m = caps.get(0)?;
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("weekdays at {}", times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-    if let Some(caps) = RE_SCHEDULE_WEEKDAYS_FLEX_AT.captures(text) {
-        let m = caps.get(0)?;
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("weekdays at {}", times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-
-    if let Some(caps) = RE_SCHEDULE_WEEKENDS_AT.captures(text) {
-        let m = caps.get(0)?;
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("weekends at {}", times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-    if let Some(caps) = RE_SCHEDULE_WEEKENDS_FLEX_AT.captures(text) {
-        let m = caps.get(0)?;
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("weekends at {}", times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-
-    // Specific named days: "every Monday and Friday at 9am"
-    if let Some(caps) = RE_SCHEDULE_SPECIFIC_DAYS_AT.captures(text) {
-        let m = caps.get(0)?;
-        let days_str = caps.name("days")?.as_str().trim();
-        let times = caps.name("times")?.as_str().trim();
-        return Some(ScheduleMatch {
-            schedule_raw: format!("{} at {}", normalize_day_names(days_str), times),
-            is_one_shot: false,
-            start: m.start(),
-            end: extend_match_past_trailing_timezone(text, m.end()),
-        });
-    }
-
-    let lower = text.to_ascii_lowercase();
-    for keyword in ["hourly", "daily", "weekly", "monthly"] {
-        if lower == keyword {
-            return Some(ScheduleMatch {
-                schedule_raw: keyword.to_string(),
-                is_one_shot: false,
-                start: 0,
-                end: text.len(),
-            });
-        }
-    }
-
-    None
-}
-
-fn clean_task_description_with_match(
-    text: &str,
-    schedule_match: &str,
-    schedule_range: Option<(usize, usize)>,
-) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let mut cleaned = trimmed.to_string();
-    if let Some((start, end)) = schedule_range {
-        if start < end && end <= cleaned.len() {
-            cleaned.replace_range(start..end, " ");
-        }
-    } else if !schedule_match.trim().is_empty() {
-        let escaped = regex::escape(schedule_match.trim());
-        let remove_schedule_re =
-            Regex::new(&format!(r"(?i){}", escaped)).expect("escaped schedule regex");
-        cleaned = remove_schedule_re.replacen(&cleaned, 1, " ").to_string();
-    }
-
-    loop {
-        let next = RE_PREFIX_NOISE.replace(&cleaned, "").to_string();
-        if next == cleaned {
-            break;
-        }
-        cleaned = next;
-    }
-
-    loop {
-        let next = RE_FILLER_PREFIX.replace(&cleaned, "").to_string();
-        if next == cleaned {
-            break;
-        }
-        cleaned = next;
-    }
-
-    cleaned = RE_SPACE_COLLAPSE.replace_all(&cleaned, " ").to_string();
-
-    cleaned = cleaned
-        .trim()
-        .trim_matches(|c: char| c.is_whitespace() || [',', ';', '.', ':', '-', '|'].contains(&c))
-        .to_string();
-
-    if cleaned.is_empty() {
-        return trimmed.to_string();
-    }
-
-    capitalize_first_ascii(&cleaned)
-}
-
-#[cfg(test)]
-fn append_non_schedule_fragment(previous: &mut ScheduleSegment, fragment: &str) {
-    let mut cleaned_fragment = fragment.trim().to_string();
-    cleaned_fragment = RE_LEADING_CONNECTOR
-        .replace(&cleaned_fragment, "")
-        .to_string();
-    loop {
-        let next = RE_PREFIX_NOISE.replace(&cleaned_fragment, "").to_string();
-        if next == cleaned_fragment {
-            break;
-        }
-        cleaned_fragment = next;
-    }
-    cleaned_fragment = cleaned_fragment
-        .trim()
-        .trim_matches(|c: char| c.is_whitespace() || [',', ';', ':', '-', '|'].contains(&c))
-        .to_string();
-    if cleaned_fragment.is_empty() {
-        return;
-    }
-
-    if !previous.description.is_empty() {
-        previous.description.push(' ');
-    }
-    previous.description.push_str(&cleaned_fragment);
-    previous.description = RE_SPACE_COLLAPSE
-        .replace_all(&previous.description, " ")
-        .trim()
-        .to_string();
-}
-
-/// If the text immediately after `end` starts with a timezone token
-/// (e.g. "EST", "UTC", "+05:30"), extend the boundary to include it so it
-/// gets stripped from the goal description along with the schedule phrase.
-fn extend_match_past_trailing_timezone(text: &str, end: usize) -> usize {
-    static RE_TRAILING_TZ: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)^\s+(?:EST|EDT|CST|CDT|MST|MDT|PST|PDT|UTC|GMT|Z|[+-]\d{2}:?\d{2})\b")
-            .expect("trailing-tz regex")
-    });
-    if end >= text.len() {
-        return end;
-    }
-    if let Some(m) = RE_TRAILING_TZ.find(&text[end..]) {
-        end + m.end()
-    } else {
-        end
-    }
-}
-
-fn capitalize_first_ascii(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => {
-            let mut out = String::with_capacity(text.len());
-            out.push(first.to_ascii_uppercase());
-            out.push_str(chars.as_str());
-            out
-        }
-        None => String::new(),
-    }
-}
-
 /// Parse a human-friendly schedule string into a 5-field cron expression.
 /// Supports natural shortcuts and raw cron pass-through.
 pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
@@ -599,16 +98,18 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
         return cron_for_recurring_times(times, &dow);
     }
 
-    // Dynamic relative one-shot parser:
-    // accepts variants like "in 2h", "after 90 minutes", "in 1 hour 30 minutes".
-    if let Some(duration) = parse_relative_duration(input) {
+    // A relative delay: "in 2h", "after 90 minutes", "in 1 hour 30 minutes".
+    // The whole input must be the delay; anything else is refused rather
+    // than guessed (see `parse_relative_duration`).
+    if let Some(duration) = parse_relative_duration(input)? {
         let target = now_local + duration;
         return Ok(one_shot_cron_from_local(target));
     }
 
-    // "today at 11:09pm EST" / "tonight at 23:10" / "tomorrow at 9am"
-    // Optional timezone token supports common abbreviations and numeric offsets.
-    if let Some(target) = parse_day_time_with_optional_timezone(input, now_local) {
+    // "today at 11:09pm" / "tonight at 23:10" / "tomorrow at 9am -05:00":
+    // the owner's zone unless a numeric offset, UTC or the owner's own IANA
+    // zone name follows.
+    if let Some(target) = parse_day_time_with_optional_timezone(input, now_local)? {
         if target <= now_local {
             anyhow::bail!(
                 "Schedule time '{}' is in the past for system timezone {}.",
@@ -643,7 +144,7 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
     }
 
     anyhow::bail!(
-        "Unrecognized schedule format '{}'. Use natural shortcuts (e.g. 'daily at 9am', 'every 5m', 'in 2h', 'today at 11:09pm EST', 'after 90 minutes', '2026-03-14 09:30') or a 5-field cron expression. Interpreted in system timezone {}.",
+        "Unrecognized schedule format '{}'. Use 'daily at 9am', 'every 5m', 'in 2 hours', 'tomorrow at 9am', an exact time like 2026-03-14T09:30:00-04:00 or '2026-03-14 09:30', or a 5-field cron expression. Interpreted in the owner's timezone {}.",
         input,
         system_timezone_display()
     )
@@ -659,117 +160,138 @@ fn one_shot_cron_from_local(target: DateTime<Local>) -> String {
     )
 }
 
-fn parse_relative_duration(input: &str) -> Option<chrono::Duration> {
-    let lower = input.to_lowercase();
-    if !lower.contains("in ") && !lower.contains("after ") {
-        return None;
+/// A relative delay, only when the whole input is one: `in`/`after`, then one
+/// or more `<whole number> <unit>` terms (optionally joined by `and` or a
+/// comma). Units are a closed set of whole words: minutes, hours, days,
+/// weeks, with their usual short forms (`m`, `min`, `h`, `hr`, `d`, `w`).
+///
+/// `Ok(None)` when the input does not start with `in`/`after` and a number.
+/// When it does but cannot be fully read ("in 2 months", "in 10 days at
+/// 9am"), it is an error asking for a precise time: a guess there fired
+/// "in 2 months" after 2 minutes and dropped the "at 9am".
+fn parse_relative_duration(input: &str) -> anyhow::Result<Option<chrono::Duration>> {
+    static LEAD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^(?:in|after)\s+\d").expect("relative lead regex"));
+    static TERM: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^(\d+)\s*([a-z]+)(?:\s*,\s*|\s+and\s+|\s*)").expect("relative term regex")
+    });
+    if !LEAD.is_match(input) {
+        return Ok(None);
     }
-
-    let re =
-        Regex::new(r"(?i)(\d+)\s*(weeks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|min|m)").ok()?;
+    let refuse = || {
+        anyhow::anyhow!(
+            "'{input}' is not a delay this can read exactly. Give a delay in whole minutes, hours, days or weeks (e.g. 'in 90 minutes', 'in 3 days'), or an exact time like 2026-03-14T09:30:00-04:00."
+        )
+    };
+    let mut rest = input
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or("");
     let mut total = chrono::Duration::zero();
-    let mut matched = false;
-
-    for caps in re.captures_iter(input) {
-        let n: i64 = caps.get(1)?.as_str().parse().ok()?;
-        if n <= 0 {
-            continue;
+    while !rest.is_empty() {
+        let caps = TERM.captures(rest).ok_or_else(refuse)?;
+        let n: i64 = caps[1].parse().map_err(|_| refuse())?;
+        let unit = caps[2].to_ascii_lowercase();
+        let term = match unit.as_str() {
+            "m" | "min" | "mins" | "minute" | "minutes" => chrono::Duration::try_minutes(n),
+            "h" | "hr" | "hrs" | "hour" | "hours" => chrono::Duration::try_hours(n),
+            "d" | "day" | "days" => chrono::Duration::try_days(n),
+            "w" | "wk" | "wks" | "week" | "weeks" => chrono::Duration::try_weeks(n),
+            _ => None,
         }
-        let unit = caps.get(2)?.as_str().to_lowercase();
-        matched = true;
-        if unit.starts_with('w') {
-            total += chrono::Duration::weeks(n);
-        } else if unit.starts_with('d') {
-            total += chrono::Duration::days(n);
-        } else if unit.starts_with('h') {
-            total += chrono::Duration::hours(n);
-        } else {
-            total += chrono::Duration::minutes(n);
-        }
+        .ok_or_else(refuse)?;
+        total += term;
+        rest = &rest[caps.get(0).map_or(rest.len(), |m| m.end())..];
     }
-
-    if matched && total > chrono::Duration::zero() {
-        Some(total)
-    } else {
-        None
+    if total <= chrono::Duration::zero() {
+        return Err(refuse());
     }
+    Ok(Some(total))
 }
 
 fn parse_day_time_with_optional_timezone(
     input: &str,
     now_local: DateTime<Local>,
-) -> Option<DateTime<Local>> {
-    let re = Regex::new(
-        r"(?i)^(today|tonight|tomorrow)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+([A-Za-z]{1,8}|[+-]\d{2}:?\d{2}|Z))?$",
-    )
-    .ok()?;
-    let caps = re.captures(input)?;
-    let day_kw = caps.get(1)?.as_str().to_ascii_lowercase();
-    let (hour, minute) = parse_time_with_offset_captures(&caps, 2, 3, 4)?;
-    let tz_token = caps.get(5).map(|m| m.as_str().trim());
+) -> anyhow::Result<Option<DateTime<Local>>> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)^(today|tonight|tomorrow)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s+(\S+))?$",
+        )
+        .expect("day-time regex")
+    });
+    let Some(caps) = RE.captures(input) else {
+        return Ok(None);
+    };
+    let Some(day_kw) = caps.get(1).map(|m| m.as_str().to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    let Some((hour, minute)) = parse_time_with_offset_captures(&caps, 2, 3, 4) else {
+        return Ok(None);
+    };
+    let offset = match caps.get(5).map(|m| m.as_str().trim()) {
+        Some(token) => parse_timezone_offset(token)?,
+        None => None,
+    };
 
-    if let Some(tz_raw) = tz_token {
-        let offset = parse_timezone_offset(tz_raw)?;
+    if let Some(offset) = offset {
         let now_in_tz = now_local.with_timezone(&offset);
         let base_date = match day_kw.as_str() {
             "tomorrow" => (now_in_tz + chrono::Duration::days(1)).date_naive(),
-            "today" | "tonight" => now_in_tz.date_naive(),
-            _ => return None,
+            _ => now_in_tz.date_naive(),
         };
-        let naive = base_date.and_hms_opt(hour, minute, 0)?;
+        let Some(naive) = base_date.and_hms_opt(hour, minute, 0) else {
+            return Ok(None);
+        };
         let target_in_tz = match offset.from_local_datetime(&naive) {
             LocalResult::Single(dt) => dt,
             LocalResult::Ambiguous(early, _) => early,
-            LocalResult::None => return None,
+            LocalResult::None => return Ok(None),
         };
-        return Some(target_in_tz.with_timezone(&Local));
+        return Ok(Some(target_in_tz.with_timezone(&Local)));
     }
 
     let base_date = match day_kw.as_str() {
         "tomorrow" => (now_local + chrono::Duration::days(1)).date_naive(),
-        "today" | "tonight" => now_local.date_naive(),
-        _ => return None,
+        _ => now_local.date_naive(),
     };
-    let naive = base_date.and_hms_opt(hour, minute, 0)?;
-    resolve_local_naive(naive)
+    Ok(base_date
+        .and_hms_opt(hour, minute, 0)
+        .and_then(resolve_local_naive))
 }
 
-fn parse_timezone_offset(token: &str) -> Option<FixedOffset> {
-    let upper = token.trim().to_ascii_uppercase();
-    let hours_west = match upper.as_str() {
-        "EST" => Some(5),
-        "EDT" => Some(4),
-        "CST" => Some(6),
-        "CDT" => Some(5),
-        "MST" => Some(7),
-        "MDT" => Some(6),
-        "PST" => Some(8),
-        "PDT" => Some(7),
-        "UTC" | "GMT" | "Z" => Some(0),
-        _ => None,
-    };
-    if let Some(h) = hours_west {
-        return if h == 0 {
-            FixedOffset::east_opt(0)
-        } else {
-            FixedOffset::west_opt(h * 3600)
-        };
+/// The zone a time names after it: a numeric offset (`-05:00`, `+0530`),
+/// `UTC`/`GMT`/`Z`, or the owner's own IANA zone name (`Ok(None)`: the
+/// owner's zone, with its daylight-saving rules). An abbreviation such as
+/// EST or PST is refused, not mapped to a fixed offset: "EST" in July is
+/// read as EDT by people and would fire an hour off.
+fn parse_timezone_offset(token: &str) -> anyhow::Result<Option<FixedOffset>> {
+    static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:UTC|GMT)?([+-])(\d{2})(?::?(\d{2}))?$").expect("numeric offset regex")
+    });
+    let token = token.trim();
+    let upper = token.to_ascii_uppercase();
+    if matches!(upper.as_str(), "UTC" | "GMT" | "Z") {
+        return Ok(FixedOffset::east_opt(0));
     }
-
-    let re = Regex::new(r"^([+-])(\d{2})(?::?(\d{2}))$").ok()?;
-    let caps = re.captures(&upper)?;
-    let sign = caps.get(1)?.as_str();
-    let hours: i32 = caps.get(2)?.as_str().parse().ok()?;
-    let minutes: i32 = caps.get(3)?.as_str().parse().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
+    if owner_zone_name().is_some_and(|zone| zone.eq_ignore_ascii_case(token)) {
+        return Ok(None);
     }
-    let seconds = hours * 3600 + minutes * 60;
-    if sign == "+" {
-        FixedOffset::east_opt(seconds)
-    } else {
-        FixedOffset::west_opt(seconds)
+    if let Some(caps) = NUMERIC.captures(&upper) {
+        let hours: i32 = caps[2].parse()?;
+        let minutes: i32 = caps.get(3).map_or(Ok(0), |m| m.as_str().parse())?;
+        if hours <= 23 && minutes <= 59 {
+            let seconds = hours * 3600 + minutes * 60;
+            return Ok(if &caps[1] == "+" {
+                FixedOffset::east_opt(seconds)
+            } else {
+                FixedOffset::west_opt(seconds)
+            });
+        }
     }
+    anyhow::bail!(
+        "Time zone '{token}' is not one this can resolve exactly. Leave it out to use the owner's timezone ({}), or give a numeric offset like -05:00 or UTC.",
+        owner_zone_name().unwrap_or_else(system_timezone_display)
+    )
 }
 
 fn parse_absolute_datetime_local(input: &str) -> Option<DateTime<Local>> {
@@ -997,37 +519,6 @@ fn day_name_to_cron(name: &str) -> Option<u32> {
         "sat" | "saturday" => Some(6),
         _ => None,
     }
-}
-
-/// Normalize a comma/and-separated list of day names into canonical form
-/// for display, e.g. "Monday, Wednesday, Friday".
-fn normalize_day_names(raw: &str) -> String {
-    let and_re = Regex::new(r"(?i)\s+and\s+").expect("and regex");
-    let normalized = and_re.replace_all(raw, ", ").replace('&', ", ");
-    let parts: Vec<&str> = normalized
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
-    let full_names: Vec<&str> = parts
-        .iter()
-        .filter_map(|p| match p.to_ascii_lowercase().as_str() {
-            "sun" | "sunday" => Some("Sunday"),
-            "mon" | "monday" => Some("Monday"),
-            "tue" | "tuesday" => Some("Tuesday"),
-            "wed" | "wednesday" => Some("Wednesday"),
-            "thu" | "thursday" => Some("Thursday"),
-            "fri" | "friday" => Some("Friday"),
-            "sat" | "saturday" => Some("Saturday"),
-            _ => None,
-        })
-        .collect();
-    if full_names.len() <= 1 {
-        return full_names.join("");
-    }
-    let last = full_names[full_names.len() - 1];
-    let rest = &full_names[..full_names.len() - 1];
-    format!("{} and {}", rest.join(", "), last)
 }
 
 /// Parse a comma/and-separated day-name string into sorted cron day numbers.
@@ -1660,28 +1151,40 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_schedule_day_time_with_timezone_abbrev() {
-        let now_est = Local::now().with_timezone(&FixedOffset::west_opt(5 * 3600).unwrap());
-        let target_est = now_est + chrono::Duration::minutes(30);
-        let day_kw = if target_est.date_naive() == now_est.date_naive() {
+    fn test_parse_schedule_day_time_with_numeric_offset() {
+        let offset = FixedOffset::west_opt(5 * 3600).unwrap();
+        let now_there = Local::now().with_timezone(&offset);
+        let target = now_there + chrono::Duration::minutes(30);
+        let day_kw = if target.date_naive() == now_there.date_naive() {
             "today"
         } else {
             "tomorrow"
         };
-        let input = format!("{} at {} EST", day_kw, target_est.format("%I:%M%P"));
+        let input = format!("{} at {} -05:00.", day_kw, target.format("%I:%M%P"));
         let cron = parse_schedule(&input).unwrap();
-        let parts: Vec<&str> = cron.split_whitespace().collect();
-        assert_eq!(parts.len(), 5);
+        let local = target.with_timezone(&Local);
+        assert_eq!(
+            cron,
+            format!(
+                "{} {} {} {} *",
+                local.minute(),
+                local.hour(),
+                local.day(),
+                local.month()
+            )
+        );
     }
 
     #[test]
-    fn test_parse_schedule_tonight_with_trailing_punctuation() {
-        let cron = parse_schedule("tonight at 11:09pm EST.").unwrap_or_else(|_| {
-            // If 11:09pm EST has already passed for today, use tomorrow in same format.
-            parse_schedule("tomorrow at 11:09pm EST.").unwrap()
-        });
-        let parts: Vec<&str> = cron.split_whitespace().collect();
-        assert_eq!(parts.len(), 5);
+    fn a_zone_abbreviation_is_refused_not_mapped_to_a_fixed_offset() {
+        for input in [
+            "tomorrow at 9am EST",
+            "tomorrow at 9am PST",
+            "tomorrow at 9am CET",
+        ] {
+            let error = parse_schedule(input).unwrap_err().to_string();
+            assert!(error.contains("numeric offset"), "{input}: {error}");
+        }
     }
 
     #[test]
@@ -1710,26 +1213,54 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_timezone_offset_abbrev_and_numeric() {
-        assert_eq!(
-            parse_timezone_offset("EST").unwrap().local_minus_utc(),
-            -5 * 3600
-        );
-        assert_eq!(
-            parse_timezone_offset("+05:30").unwrap().local_minus_utc(),
-            5 * 3600 + 30 * 60
-        );
-        assert_eq!(
-            parse_timezone_offset("-0400").unwrap().local_minus_utc(),
-            -4 * 3600
-        );
+    fn test_parse_timezone_offset_numeric_utc_and_owner_zone() {
+        let seconds = |token: &str| {
+            parse_timezone_offset(token)
+                .unwrap()
+                .unwrap()
+                .local_minus_utc()
+        };
+        assert_eq!(seconds("+05:30"), 5 * 3600 + 30 * 60);
+        assert_eq!(seconds("-0400"), -4 * 3600);
+        assert_eq!(seconds("UTC"), 0);
+        assert_eq!(seconds("UTC-03:00"), -3 * 3600);
+        if let Some(zone) = owner_zone_name() {
+            assert_eq!(parse_timezone_offset(&zone).unwrap(), None);
+        }
+        assert!(parse_timezone_offset("EDT").is_err());
     }
 
     #[test]
     fn test_parse_schedule_relative_duration_phrase() {
+        let before = Local::now();
         let cron = parse_schedule("in 1 hour 30 minutes").unwrap();
+        let expected = before + chrono::Duration::minutes(90);
         let parts: Vec<&str> = cron.split_whitespace().collect();
-        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[1], expected.hour().to_string());
+        for input in [
+            "in 2h30m",
+            "after 90 minutes",
+            "in 1 hour, 30 min",
+            "in 1 day and 2 hours",
+            "in 3 weeks",
+        ] {
+            assert!(parse_schedule(input).is_ok(), "{input}");
+        }
+    }
+
+    #[test]
+    fn a_relative_delay_it_cannot_fully_read_is_refused_not_guessed() {
+        // "2 months" once read as 2 minutes ("m"), and "at 9am" was dropped.
+        for input in [
+            "in 2 months",
+            "in 10 days at 9am",
+            "in 1 year",
+            "in 5 minutes or so",
+            "after 0 minutes",
+        ] {
+            let error = parse_schedule(input).unwrap_err().to_string();
+            assert!(error.contains("not a delay"), "{input}: {error}");
+        }
     }
 
     #[test]
@@ -1761,117 +1292,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_schedule_segments_single_task() {
-        let segments =
-            extract_schedule_segments("every day at 9am remind me to check server health");
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].schedule_raw, "every day at 9am");
-        assert_eq!(segments[0].description, "Check server health");
-        assert!(!segments[0].is_one_shot);
-    }
-
-    #[test]
-    fn test_extract_schedule_segments_numbered_multiple_tasks() {
-        let segments = extract_schedule_segments(
-            "1) every day at 9am check server health. 2) in 2 hours send status report",
-        );
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].schedule_raw, "every day at 9am");
-        assert_eq!(segments[0].description, "Check server health");
-        assert_eq!(segments[1].schedule_raw, "in 2 hours");
-        assert_eq!(segments[1].description, "Send status report");
-        assert!(segments[1].is_one_shot);
-    }
-
-    #[test]
-    fn test_extract_schedule_segments_mixed_recurring_and_one_time() {
-        let segments = extract_schedule_segments(
-            "every 6h monitor API health; also on March 5th at 3pm prepare project status report",
-        );
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].schedule_raw, "every 6h");
-        assert_eq!(segments[0].description, "Monitor API health");
-        assert!(!segments[0].is_one_shot);
-        assert_eq!(segments[1].schedule_raw, "on March 5th at 3pm");
-        assert_eq!(segments[1].description, "Prepare project status report");
-        assert!(segments[1].is_one_shot);
-    }
-
-    #[test]
-    fn test_extract_schedule_segments_no_schedule_returns_empty() {
-        let segments = extract_schedule_segments("please check server health now");
-        assert!(segments.is_empty());
-    }
-
-    #[test]
-    fn test_extract_schedule_segments_preserves_trailing_non_schedule_clause() {
-        let segments = extract_schedule_segments(
-            "every day at 9am check server status. Also check the backup logs",
-        );
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].schedule_raw, "every day at 9am");
-        assert_eq!(
-            segments[0].description,
-            "Check server status check the backup logs"
-        );
-    }
-
-    #[test]
-    fn test_clean_task_description_removes_schedule_and_filler() {
-        let cleaned = clean_task_description(
-            "on March 5th at 3pm remind me to prepare project status report",
-            "on March 5th at 3pm",
-        );
-        assert_eq!(cleaned, "Prepare project status report");
-    }
-
-    #[test]
-    fn test_timezone_stripped_from_description_daily() {
-        let cleaned = clean_task_description(
-            "every day at 9am EST check deployment status",
-            "every day at 9am",
-        );
-        assert_eq!(cleaned, "Check deployment status");
-    }
-
-    #[test]
-    fn test_timezone_stripped_from_description_utc() {
-        let cleaned =
-            clean_task_description("every day at 3pm UTC run backup job", "every day at 3pm");
-        assert_eq!(cleaned, "Run backup job");
-    }
-
-    #[test]
-    fn test_extract_schedule_from_text_detects_daily_scheduled_task_phrase() {
-        let detected = extract_schedule_from_text(
-            "Can you set up a daily scheduled task at 6:00 am EST to publish the blog?",
-        );
-        assert_eq!(detected, Some(("every day at 6:00 am".to_string(), false)));
-    }
-
-    #[test]
-    fn test_extract_schedule_segments_strips_flexible_scheduled_task_phrase() {
-        let segments = extract_schedule_segments(
-            "Set up a daily scheduled task at 6:00 am to publish the blog with honest reflections.",
-        );
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].schedule_raw, "every day at 6:00 am");
-        assert_eq!(
-            segments[0].description,
-            "Publish the blog with honest reflections"
-        );
-    }
-
-    #[test]
-    fn test_weekday_description_cleaned_singular() {
-        let cleaned = clean_task_description(
-            "every weekday at 9am check build pipeline",
-            "weekdays at 9am",
-        );
-        assert_eq!(cleaned, "Check build pipeline");
-    }
-
-    #[test]
     fn test_parse_schedule_specific_days() {
         assert_eq!(
             parse_schedule("Monday and Friday at 3pm").unwrap(),
@@ -1884,25 +1304,6 @@ mod tests {
         assert_eq!(
             parse_schedule("every Tuesday, Thursday at 2pm").unwrap(),
             "0 14 * * 2,4"
-        );
-    }
-
-    #[test]
-    fn test_extract_schedule_segments_specific_days() {
-        let segments = extract_schedule_segments("every Monday and Friday at 3pm review PRs");
-        assert_eq!(segments.len(), 1);
-        assert!(!segments[0].is_one_shot);
-        assert_eq!(segments[0].description, "Review PRs");
-    }
-
-    #[test]
-    fn test_extract_schedule_match_timezone_extends_end() {
-        let sm = extract_schedule_match("every day at 9am EST check stuff").unwrap();
-        // The match end should cover "every day at 9am EST" (including timezone)
-        let matched = &"every day at 9am EST check stuff"[sm.start..sm.end];
-        assert!(
-            matched.contains("EST"),
-            "Match should include timezone token"
         );
     }
 }

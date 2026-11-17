@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_one_time_work_and_cleans_the_schedule_from_the_task() {
+    async fn creates_one_time_work_and_keeps_the_task_as_written() {
         let state = setup_state().await;
         let tool = ScheduleTaskTool::new(state.clone());
         let created = call(
@@ -120,10 +120,11 @@ mod tests {
         );
         let goal = state.get_scheduled_goals().await.unwrap().remove(0);
         assert_eq!(goal.goal_type, "finite");
-        assert!(
-            !goal.description.contains("tomorrow"),
-            "{}",
-            goal.description
+        // `when` is its own argument; nothing is cut from the instruction
+        // by guessing which words were the schedule.
+        assert_eq!(
+            goal.description,
+            "Please send the synthetic report tomorrow at 9am"
         );
         let schedules = state.get_schedules_for_goal(&goal.id).await.unwrap();
         assert!(schedules[0].is_one_shot);

@@ -245,12 +245,10 @@ impl ScheduledWork {
             return Ok(Err("Say when: `when` is empty.".to_string()));
         }
 
-        // Remove the schedule phrase and leading filler from the task.
-        let mut desc = aidaemon_work::schedule::clean_task_description(raw_desc, when);
-        desc = aidaemon_work::schedule::clean_task_description(&desc, "");
-        if desc.trim().is_empty() {
-            desc = raw_desc.to_string();
-        }
+        // The task is stored as the model wrote it: `when` is its own
+        // argument, so nothing is cut from the instruction by guessing which
+        // words were the schedule.
+        let desc = raw_desc.to_string();
 
         let cron = match aidaemon_work::schedule::parse_schedule(when) {
             Ok(cron) => cron,
@@ -475,7 +473,7 @@ impl Tool for ScheduleTaskTool {
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "The instruction each run carries out." },
-                    "when": { "type": "string", "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am'" },
+                    "when": { "type": "string", "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am', or an exact time like 2026-03-14T09:30:00-04:00 for anything further out" },
                     "name": { "type": "string", "description": "The short name the user gave it, exactly as given; omit when none." }
                 },
                 "required": ["task", "when"],

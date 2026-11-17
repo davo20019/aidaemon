@@ -69,7 +69,7 @@ impl Tool for SetReminderTool {
                 "type": "object",
                 "properties": {
                     "message": { "type": "string", "description": "Exact text to send, e.g. 'Check the oven.'" },
-                    "when": { "type": "string", "description": "e.g. 'in 2 minutes', 'tomorrow at 9am', 'every weekday at 8am'" },
+                    "when": { "type": "string", "description": "e.g. 'in 2 minutes', 'tomorrow at 9am', 'every weekday at 8am', or an exact time like 2026-03-14T09:30:00-04:00 for anything further out" },
                     "name": { "type": "string", "description": "The short name the user gave it, exactly as given; omit when none." }
                 },
                 "required": ["message", "when"],

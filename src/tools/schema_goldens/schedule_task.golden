@@ -16,7 +16,7 @@
           "type": "string"
         },
         "when": {
-          "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am'",
+          "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am', or an exact time like 2026-03-14T09:30:00-04:00 for anything further out",
           "type": "string"
         }
       },
