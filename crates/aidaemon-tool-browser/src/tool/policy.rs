@@ -15,24 +15,18 @@
 //! | `Administrative` | render_pdf, close, close_tab, set_mode  | Local rendering/lifecycle operations |
 //!
 //! Unknown actions (not in the schema) default to `Mutation` with
-//! `sensitive = false` and `consequential = false`.  This is the *most
+//! `sensitive = false`.  This is the *most
 //! restrictive sane default*: Task 7 will prompt for anything Mutation-or-above,
 //! so an unrecognised action is never silently treated as a free observation.
 //!
-//! ## Consequential signals
+//! ## Point of action
 //!
-//! A consequential flag is set when the action's primary text context (script for
-//! `execute_js`; selector for `click`/`fill`) contains a standalone consequential
-//! keyword (word-boundary match via [`aidaemon_tools::text::contains_keyword_as_words`]).
-//!
-//! The keyword scan on selectors is intentionally low-recall: real selectors are
-//! usually opaque (`#btn-3`, `.checkout-cta`) and rarely contain plain English
-//! verbs.  The primary consequential signals are:
-//! - the action type (`execute_js` → always sensitive), and
-//! - the script text for `execute_js`.
-//!
-//! Do NOT rely on selector keywords as the main guard — they are a bonus signal
-//! only.
+//! Whether a click or fill needs the owner every time is decided from typed
+//! DOM facts about the element it targets ([`ElementFacts`], read from the
+//! live page by a constant script), never from words in the selector, the
+//! script or the page: an opaque selector (`#btn-3`) names nothing. See
+//! [`click_needs_owner`] and [`fill_needs_owner`]; facts that cannot be read
+//! count as point of action.
 
 // `classify` is intentionally public so Task 7 can call it.  It has no callers
 // yet (Task 7 is a separate commit), so `#[allow(dead_code)]` prevents a spurious
@@ -117,17 +111,183 @@ pub struct BrowserActionRisk {
     /// `execute_js` is **always** sensitive because arbitrary JavaScript can
     /// exfiltrate credentials, submit forms, or perform account actions.
     pub sensitive: bool,
-    /// `true` when the action's text context (script or selector) contains a
-    /// consequential keyword (word-boundary match).
-    pub consequential: bool,
 }
 
-// ─── Keyword list ─────────────────────────────────────────────────────────────
+// ─── Element facts ────────────────────────────────────────────────────────────
 
-/// Whether a selector or script names a consequential action: the one list
-/// every UI tool shares ([`aidaemon_tools::consequential`]).
-fn is_consequential(text: &str) -> bool {
-    aidaemon_tools::consequential::names_consequential_action(text)
+/// Typed DOM facts about the element a click or fill targets, read from the
+/// live page by [`ELEMENT_FACTS_FN`]. The facts describe the nearest
+/// interactive element at or above the selector's match (a label resolves to
+/// its control). Text on the page (labels, accessible names) is never part
+/// of the decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub struct ElementFacts {
+    /// Lowercase tag name.
+    pub tag: String,
+    /// The explicit ARIA `role` attribute, lowercased.
+    pub role: Option<String>,
+    /// For an `<input>`, its `type` property, lowercased.
+    pub input_type: Option<String>,
+    /// The `autocomplete` attribute, lowercased (a token list).
+    pub autocomplete: Option<String>,
+    /// Scheme of the nearest `a[href]` ancestor-or-self, if any
+    /// (`https`, `javascript`, ...).
+    pub link_scheme: Option<String>,
+    /// That link carries a `download` attribute.
+    pub link_download: bool,
+    /// The element is a submit control of a form (`button` of type submit,
+    /// `input` of type submit or image).
+    pub submits_form: bool,
+    /// The effective method of the element's form (`formmethod` on the
+    /// submitter, else the form's `method`), lowercased; `None` outside a form.
+    pub form_method: Option<String>,
+    /// The form is marked as a search (`role=search`, a `<search>` ancestor,
+    /// or an `input type=search` inside it).
+    pub search_form: bool,
+    /// A disclosure control: `<summary>`, or `aria-expanded` /
+    /// `aria-haspopup` present.
+    pub disclosure: bool,
+    /// A text-entry target: a text-like `<input>`, a `<textarea>`, or
+    /// contenteditable content.
+    pub editable: bool,
+}
+
+/// Constant JS function bound to the resolved element (`this`) through
+/// `call_js_fn`; the selector is never interpolated into script source. It
+/// returns the JSON shape of [`ElementFacts`].
+pub const ELEMENT_FACTS_FN: &str = r#"function() {
+  const INTERACTIVE = 'a[href],button,input,select,textarea,summary,label,option,'
+    + '[contenteditable=""],[contenteditable="true"],[role="button"],[role="link"],'
+    + '[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],'
+    + '[role="option"],[role="checkbox"],[role="radio"],[role="switch"],[role="treeitem"],'
+    + '[role="combobox"],[role="textbox"],[role="searchbox"]';
+  let el = (this.closest && this.closest(INTERACTIVE)) || this;
+  if (el.tagName === 'LABEL' && el.control) el = el.control;
+  const tag = String(el.tagName || '').toLowerCase();
+  const attr = (name) => {
+    const value = el.getAttribute ? el.getAttribute(name) : null;
+    return value === null ? null : value.trim().toLowerCase();
+  };
+  const link = el.closest ? el.closest('a[href]') : null;
+  let linkScheme = null;
+  if (link) {
+    try { linkScheme = new URL(link.href, document.baseURI).protocol.replace(':', '').toLowerCase(); }
+    catch (_) { linkScheme = 'invalid'; }
+  }
+  const type = typeof el.type === 'string' ? el.type.toLowerCase() : null;
+  const form = el.form || (el.closest ? el.closest('form') : null);
+  const submits = !!form && ((tag === 'button' && type === 'submit')
+    || (tag === 'input' && (type === 'submit' || type === 'image')));
+  let method = null;
+  if (form) {
+    method = ((submits && el.getAttribute('formmethod')) || form.getAttribute('method') || 'get')
+      .trim().toLowerCase();
+  }
+  const search = !!form && ((form.getAttribute('role') || '').toLowerCase() === 'search'
+    || !!form.closest('search,[role="search"]')
+    || !!form.querySelector('input[type="search"]'));
+  const nonText = ['button', 'submit', 'reset', 'image', 'checkbox', 'radio', 'file',
+    'hidden', 'range', 'color'];
+  const editable = !!el.isContentEditable || tag === 'textarea'
+    || (tag === 'input' && !nonText.includes(type));
+  return {
+    tag,
+    role: attr('role'),
+    input_type: tag === 'input' ? type : null,
+    autocomplete: attr('autocomplete'),
+    link_scheme: linkScheme,
+    link_download: !!link && link.hasAttribute('download'),
+    submits_form: submits,
+    form_method: method,
+    search_form: search,
+    disclosure: tag === 'summary' || (el.hasAttribute && (el.hasAttribute('aria-expanded')
+      || el.hasAttribute('aria-haspopup'))),
+    editable,
+  };
+}"#;
+
+/// What reading a target's facts found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetFacts {
+    /// The session has no page yet: the call runs on a fresh blank page,
+    /// where nothing can be submitted.
+    NoPage,
+    /// No element matches the selector.
+    Missing,
+    /// The element's facts.
+    Element(ElementFacts),
+    /// The facts could not be read; treated as point of action.
+    Unreadable,
+}
+
+impl TargetFacts {
+    /// Whether `action` on this target needs the owner for this exact call.
+    /// A missing element or a blank page cannot be acted on, so they do not;
+    /// facts that could not be read do (fail safe).
+    pub fn needs_owner(&self, action: &str) -> bool {
+        match self {
+            Self::NoPage | Self::Missing => false,
+            Self::Unreadable => true,
+            Self::Element(facts) => match action {
+                "click" => click_needs_owner(facts),
+                "fill" => fill_needs_owner(facts),
+                _ => true,
+            },
+        }
+    }
+}
+
+fn role_is(facts: &ElementFacts, roles: &[&str]) -> bool {
+    facts
+        .role
+        .as_deref()
+        .is_some_and(|role| roles.contains(&role))
+}
+
+/// Whether clicking this element needs the owner every time. A click is
+/// ordinary only when its effect is typed as navigation or local page state:
+/// a web link, a search form's (non-POST) submit, a disclosure, a selection
+/// control, or focusing a text field. Submitting any other form, and any
+/// other button or handler-driven element, whose effect the DOM cannot show,
+/// needs the owner.
+pub fn click_needs_owner(facts: &ElementFacts) -> bool {
+    if facts.submits_form {
+        let posts = !matches!(facts.form_method.as_deref(), None | Some("get"));
+        return !facts.search_form || posts;
+    }
+    let web_link = matches!(facts.link_scheme.as_deref(), Some("http" | "https"));
+    if (web_link && !facts.link_download) || role_is(facts, &["link"]) {
+        return false;
+    }
+    if facts.disclosure || facts.tag == "summary" {
+        return false;
+    }
+    let selection = matches!(facts.tag.as_str(), "select" | "option")
+        || matches!(facts.input_type.as_deref(), Some("checkbox" | "radio"))
+        || role_is(facts, &["tab", "option", "treeitem", "combobox"]);
+    // Anything else (a plain or role=button, a handler-driven element) does
+    // what a script decides, which the DOM cannot show.
+    !(selection || facts.editable)
+}
+
+/// Whether filling this element needs the owner every time: a password,
+/// payment or one-time-code field, or a target that is not a text field
+/// (what a fill does to it is unknown). `autocomplete` is a typed token
+/// list (HTML autofill field names), matched exactly per token.
+pub fn fill_needs_owner(facts: &ElementFacts) -> bool {
+    if !facts.editable || facts.input_type.as_deref() == Some("password") {
+        return true;
+    }
+    facts.autocomplete.as_deref().is_some_and(|tokens| {
+        tokens.split_ascii_whitespace().any(|token| {
+            token.starts_with("cc-")
+                || matches!(
+                    token,
+                    "current-password" | "new-password" | "one-time-code" | "transaction-amount"
+                )
+        })
+    })
 }
 
 // ─── Classifier ───────────────────────────────────────────────────────────────
@@ -136,36 +296,29 @@ fn is_consequential(text: &str) -> bool {
 ///
 /// # Parameters
 /// - `action`   — the action string from the tool call (`"click"`, `"navigate"`, …).
-/// - `selector` — CSS selector, if the action accepts one (`click`, `fill`, `get_text`, `wait`).
-/// - `script`   — JavaScript source, if the action accepts one (`execute_js`).
 ///
 /// # Returns
-/// A [`BrowserActionRisk`] that describes the class, sensitivity, and
-/// whether a consequential keyword was found in the relevant context.
-pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> BrowserActionRisk {
+/// A [`BrowserActionRisk`] that describes the class and sensitivity. Whether a
+/// click or fill is point of action comes from its target's [`ElementFacts`].
+pub fn classify(action: &str) -> BrowserActionRisk {
     match action {
         // ── Observation ───────────────────────────────────────────────────────
         "get_text" | "inspect_page" | "screenshot" | "scroll" | "wait" | "list_tabs"
         | "get_console_logs" | "get_network_errors" => BrowserActionRisk {
             class: BrowserRiskClass::Observation,
             sensitive: false,
-            consequential: false,
         },
 
         // ── Navigation ────────────────────────────────────────────────────────
         "navigate" | "new_tab" | "switch_tab" => BrowserActionRisk {
             class: BrowserRiskClass::Navigation,
             sensitive: false,
-            consequential: false,
         },
 
         // ── Mutation: click / fill ────────────────────────────────────────────
         "click" | "fill" => BrowserActionRisk {
             class: BrowserRiskClass::Mutation,
             sensitive: false,
-            // Scan the selector for consequential keywords (low-recall — see
-            // module-level doc comment).
-            consequential: selector.map(is_consequential).unwrap_or(false),
         },
 
         // ── Mutation: execute_js ──────────────────────────────────────────────
@@ -174,16 +327,12 @@ pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> B
             // Always sensitive: arbitrary JS can exfiltrate credentials, submit
             // forms, or perform account actions regardless of script content.
             sensitive: true,
-            // Consequential scan on script text; if no script provided, default
-            // to false — but Task 7 should still prompt because sensitive=true.
-            consequential: script.map(is_consequential).unwrap_or(false),
         },
 
         // ── Administrative ────────────────────────────────────────────────────
         "render_pdf" | "close" | "close_tab" | "set_mode" => BrowserActionRisk {
             class: BrowserRiskClass::Administrative,
             sensitive: false,
-            consequential: false,
         },
 
         // ── Unknown ───────────────────────────────────────────────────────────
@@ -192,7 +341,6 @@ pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> B
         _ => BrowserActionRisk {
             class: BrowserRiskClass::Mutation,
             sensitive: false,
-            consequential: false,
         },
     }
 }
@@ -203,342 +351,185 @@ pub fn classify(action: &str, selector: Option<&str>, script: Option<&str>) -> B
 mod tests {
     use super::*;
 
-    // ── Action-to-class mapping (table-driven) ────────────────────────────────
+    #[test]
+    fn actions_map_to_their_class() {
+        let cases = [
+            ("navigate", BrowserRiskClass::Navigation),
+            ("screenshot", BrowserRiskClass::Observation),
+            ("render_pdf", BrowserRiskClass::Administrative),
+            ("click", BrowserRiskClass::Mutation),
+            ("fill", BrowserRiskClass::Mutation),
+            ("get_text", BrowserRiskClass::Observation),
+            ("inspect_page", BrowserRiskClass::Observation),
+            ("scroll", BrowserRiskClass::Observation),
+            ("execute_js", BrowserRiskClass::Mutation),
+            ("wait", BrowserRiskClass::Observation),
+            ("list_tabs", BrowserRiskClass::Observation),
+            ("get_console_logs", BrowserRiskClass::Observation),
+            ("get_network_errors", BrowserRiskClass::Observation),
+            ("new_tab", BrowserRiskClass::Navigation),
+            ("switch_tab", BrowserRiskClass::Navigation),
+            ("close_tab", BrowserRiskClass::Administrative),
+            ("set_mode", BrowserRiskClass::Administrative),
+            ("close", BrowserRiskClass::Administrative),
+            ("teleport_browser", BrowserRiskClass::Mutation),
+        ];
+        for (action, class) in cases {
+            let risk = classify(action);
+            assert_eq!(risk.class, class, "{action}");
+            assert_eq!(risk.sensitive, action == "execute_js", "{action}");
+        }
+    }
+
+    fn element(tag: &str) -> ElementFacts {
+        ElementFacts {
+            tag: tag.to_string(),
+            ..ElementFacts::default()
+        }
+    }
+
+    fn submit(method: Option<&str>, search: bool) -> ElementFacts {
+        ElementFacts {
+            input_type: None,
+            submits_form: true,
+            form_method: method.map(str::to_string),
+            search_form: search,
+            ..element("button")
+        }
+    }
+
+    /// The selector says nothing: the same opaque selector is ordinary on a
+    /// link and point of action on a form's submit button.
+    #[test]
+    fn opaque_selectors_are_judged_by_their_element() {
+        let link = ElementFacts {
+            link_scheme: Some("https".into()),
+            ..element("a")
+        };
+        assert!(!click_needs_owner(&link));
+        assert!(click_needs_owner(&submit(Some("post"), false)));
+        // A form with no method is GET by default, yet a script may post it.
+        assert!(click_needs_owner(&submit(None, false)));
+        assert!(click_needs_owner(&submit(Some("get"), false)));
+    }
 
     #[test]
-    fn observation_actions_map_correctly() {
-        for action in &[
-            "get_text",
-            "inspect_page",
-            "screenshot",
-            "scroll",
-            "wait",
-            "list_tabs",
-            "get_console_logs",
-            "get_network_errors",
+    fn a_search_forms_get_submit_is_ordinary_but_a_posted_one_is_not() {
+        assert!(!click_needs_owner(&submit(Some("get"), true)));
+        assert!(!click_needs_owner(&submit(None, true)));
+        assert!(click_needs_owner(&submit(Some("post"), true)));
+    }
+
+    /// A plain button's effect is a script the DOM cannot show (a single-page
+    /// app's "place order"), so it needs the owner.
+    #[test]
+    fn a_handler_driven_button_needs_the_owner() {
+        assert!(click_needs_owner(&element("button")));
+        assert!(click_needs_owner(&ElementFacts {
+            role: Some("button".into()),
+            ..element("div")
+        }));
+        assert!(click_needs_owner(&ElementFacts {
+            role: Some("switch".into()),
+            ..element("div")
+        }));
+        assert!(click_needs_owner(&ElementFacts {
+            link_scheme: Some("javascript".into()),
+            ..element("a")
+        }));
+        assert!(click_needs_owner(&ElementFacts {
+            link_scheme: Some("https".into()),
+            link_download: true,
+            ..element("a")
+        }));
+    }
+
+    #[test]
+    fn local_ui_state_clicks_are_ordinary() {
+        let ordinary = [
+            ElementFacts {
+                disclosure: true,
+                ..element("button")
+            },
+            element("summary"),
+            element("select"),
+            ElementFacts {
+                input_type: Some("checkbox".into()),
+                ..element("input")
+            },
+            ElementFacts {
+                role: Some("tab".into()),
+                ..element("div")
+            },
+            ElementFacts {
+                input_type: Some("text".into()),
+                editable: true,
+                ..element("input")
+            },
+        ];
+        for facts in ordinary {
+            assert!(!click_needs_owner(&facts), "{facts:?}");
+        }
+    }
+
+    #[test]
+    fn filling_a_secret_or_payment_field_needs_the_owner() {
+        let text = ElementFacts {
+            input_type: Some("text".into()),
+            editable: true,
+            ..element("input")
+        };
+        assert!(!fill_needs_owner(&text));
+        assert!(fill_needs_owner(&ElementFacts {
+            input_type: Some("password".into()),
+            ..text.clone()
+        }));
+        for autocomplete in [
+            "cc-number",
+            "billing cc-csc",
+            "one-time-code",
+            "new-password",
         ] {
-            let r = classify(action, None, None);
-            assert_eq!(
-                r.class,
-                BrowserRiskClass::Observation,
-                "action={action} should be Observation"
-            );
-            assert!(!r.sensitive, "action={action} should not be sensitive");
             assert!(
-                !r.consequential,
-                "action={action} should not be consequential"
+                fill_needs_owner(&ElementFacts {
+                    autocomplete: Some(autocomplete.into()),
+                    ..text.clone()
+                }),
+                "{autocomplete}"
             );
         }
+        assert!(!fill_needs_owner(&ElementFacts {
+            autocomplete: Some("email".into()),
+            ..text.clone()
+        }));
+        assert!(fill_needs_owner(&element("button")));
     }
 
     #[test]
-    fn navigation_actions_map_correctly() {
-        for action in &["navigate", "new_tab", "switch_tab"] {
-            let r = classify(action, None, None);
-            assert_eq!(
-                r.class,
-                BrowserRiskClass::Navigation,
-                "action={action} should be Navigation"
-            );
-            assert!(!r.sensitive, "action={action} should not be sensitive");
-            assert!(
-                !r.consequential,
-                "action={action} should not be consequential"
-            );
-        }
+    fn unreadable_facts_fail_safe() {
+        assert!(TargetFacts::Unreadable.needs_owner("click"));
+        assert!(TargetFacts::Unreadable.needs_owner("fill"));
+        assert!(!TargetFacts::Missing.needs_owner("click"));
+        assert!(!TargetFacts::NoPage.needs_owner("fill"));
     }
 
     #[test]
-    fn mutation_actions_click_fill_map_correctly() {
-        for action in &["click", "fill"] {
-            let r = classify(action, None, None);
-            assert_eq!(
-                r.class,
-                BrowserRiskClass::Mutation,
-                "action={action} should be Mutation"
-            );
-            assert!(!r.sensitive, "action={action} should not be sensitive");
-            assert!(
-                !r.consequential,
-                "action={action} should not be consequential"
-            );
-        }
-    }
-
-    #[test]
-    fn execute_js_is_always_mutation_and_sensitive() {
-        // Benign script: no consequential keyword, but still sensitive.
-        let r = classify("execute_js", None, Some("1 + 1"));
-        assert_eq!(r.class, BrowserRiskClass::Mutation);
-        assert!(r.sensitive, "execute_js must always be sensitive");
-        assert!(!r.consequential);
-
-        // No script at all: still sensitive.
-        let r2 = classify("execute_js", None, None);
-        assert!(
-            r2.sensitive,
-            "execute_js with no script must still be sensitive"
-        );
-    }
-
-    #[test]
-    fn administrative_actions_map_correctly() {
-        for action in &["render_pdf", "close", "close_tab", "set_mode"] {
-            let r = classify(action, None, None);
-            assert_eq!(
-                r.class,
-                BrowserRiskClass::Administrative,
-                "action={action} should be Administrative"
-            );
-            assert!(!r.sensitive, "action={action} should not be sensitive");
-            assert!(
-                !r.consequential,
-                "action={action} should not be consequential"
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_action_defaults_to_mutation_not_sensitive_not_consequential() {
-        let r = classify("teleport_browser", None, None);
-        assert_eq!(
-            r.class,
-            BrowserRiskClass::Mutation,
-            "unknown actions should default to Mutation (most restrictive sane class)"
-        );
-        assert!(!r.sensitive);
-        assert!(!r.consequential);
-    }
-
-    // ── execute_js is ALWAYS sensitive ───────────────────────────────────────
-
-    #[test]
-    fn execute_js_always_sensitive_even_with_benign_script() {
-        // A clearly benign expression must still be sensitive.
-        let benign_scripts = [
-            "document.title",
-            "1 + 1",
-            "window.location.href",
-            "Array.from(document.querySelectorAll('a')).map(a => a.href)",
-        ];
-        for script in &benign_scripts {
-            let r = classify("execute_js", None, Some(script));
-            assert!(
-                r.sensitive,
-                "execute_js with benign script '{script}' must still be sensitive=true"
-            );
-        }
-    }
-
-    // ── Word-boundary consequential scan ─────────────────────────────────────
-    //
-    // The key contract: derived / compound forms must NOT trigger a false positive.
-    // This exercises the `contains_keyword_as_words` (re-exported as `keyword_match`)
-    // word-boundary guarantee.
-
-    #[test]
-    fn derived_forms_do_not_false_positive() {
-        // "deleted" should NOT match keyword "delete"
-        let r = classify("click", Some("#deleted-items"), None);
-        assert!(
-            !r.consequential,
-            "'deleted' must not match 'delete' (word-boundary check)"
-        );
-
-        // "sender" should NOT match keyword "send"
-        let r2 = classify("click", Some(".sender-info"), None);
-        assert!(
-            !r2.consequential,
-            "'sender' must not match 'send' (word-boundary check)"
-        );
-
-        // "submitted" should NOT match keyword "submit"
-        let r3 = classify("execute_js", None, Some("form.submitted = true;"));
-        assert!(
-            !r3.consequential,
-            "'submitted' must not match 'submit' (word-boundary check)"
-        );
-
-        // "purchasing" should NOT match keyword "purchase"
-        let r4 = classify("execute_js", None, Some("// this is a purchasing flow"));
-        assert!(
-            !r4.consequential,
-            "'purchasing' must not match 'purchase' (word-boundary check)"
-        );
-
-        // "publisher" should NOT match keyword "publish"
-        let r5 = classify("click", Some(".publisher-name"), None);
-        assert!(
-            !r5.consequential,
-            "'publisher' must not match 'publish' (word-boundary check)"
-        );
-    }
-
-    #[test]
-    fn standalone_keyword_in_script_triggers_consequential() {
-        // "submit" as a standalone whitespace-delimited token in a script → consequential.
-        // The word-boundary splitter splits on WHITESPACE then trims edge punctuation.
-        // "submit" (with trailing semicolon stripped) is a standalone token.
-        let r = classify("execute_js", None, Some("// call submit; await result"));
-        assert!(
-            r.consequential,
-            "'submit' as standalone word in script comment should be consequential"
-        );
-
-        // Explicit standalone word: "delete"
-        let r2 = classify("execute_js", None, Some("// delete this record"));
-        assert!(
-            r2.consequential,
-            "'delete' as standalone word should be consequential"
-        );
-
-        // "send" as standalone word in script
-        // "send(message)" is one token; trimming ")" gives "send(message" which still has
-        // inner punctuation → does NOT match "send". Use a comment form instead.
-        let r3 = classify("execute_js", None, Some("// send email to user"));
-        assert!(
-            r3.consequential,
-            "'send' standalone in comment should be consequential"
-        );
-
-        // "purchase" as standalone word
-        let r4 = classify("execute_js", None, Some("initiating purchase flow"));
-        assert!(
-            r4.consequential,
-            "'purchase' standalone should be consequential"
-        );
-
-        // Low-recall: "form.submit()" is a single token "form.submit" after stripping
-        // trailing parens — NOT equal to keyword "submit" — this is INTENTIONAL.
-        // The primary guard is sensitive=true (always set for execute_js), not
-        // consequential detection in method calls.
-        let r_low_recall = classify(
-            "execute_js",
-            None,
-            Some("document.querySelector('form').submit()"),
-        );
-        // We do NOT assert consequential here — the low-recall behavior is documented.
-        // Task 7 still prompts because sensitive=true.
-        assert!(
-            r_low_recall.sensitive,
-            "execute_js is always sensitive even when consequential is false"
-        );
-    }
-
-    #[test]
-    fn opaque_selector_is_not_consequential() {
-        // Typical opaque selectors used in real apps must NOT trigger.
-        let opaque_selectors = [
-            "#btn-3",
-            ".checkout-cta",
-            "[data-id='42']",
-            "#submit-btn-container", // hyphenated — not a standalone word
-            ".pay-later-link",       // hyphenated
-        ];
-        for sel in &opaque_selectors {
-            let r = classify("click", Some(sel), None);
-            assert!(
-                !r.consequential,
-                "opaque selector '{sel}' must not be consequential"
-            );
-        }
-    }
-
-    #[test]
-    fn consequential_click_with_standalone_keyword_in_selector() {
-        // A selector that literally contains a standalone consequential word.
-        // word-boundary split on whitespace: "delete" is a token after trimming.
-        // Note: "#delete" trims punctuation → "delete" → matches.
-        let r = classify("click", Some("#delete"), None);
-        assert!(
-            r.consequential,
-            "selector '#delete' (→ token 'delete') must be consequential"
-        );
-
-        // A selector with bare "submit" after punctuation trim
-        let r2 = classify("click", Some(".submit"), None);
-        assert!(
-            r2.consequential,
-            "selector '.submit' (→ token 'submit') must be consequential"
-        );
-
-        // A selector containing "account" as a standalone token
-        let r3 = classify("fill", Some("#account-email"), None);
-        // "#account-email" is one whitespace token, trimmed to "account-email" — hyphenated,
-        // so it does NOT equal standalone "account". This is the documented low-recall behavior.
-        assert!(
-            !r3.consequential,
-            "'#account-email' is hyphenated → does not match 'account' standalone"
-        );
-    }
-
-    #[test]
-    fn execute_js_consequential_scan_uses_script_not_selector() {
-        // Consequential keyword only in selector: irrelevant for execute_js.
-        let r = classify("execute_js", Some("delete"), Some("1 + 1"));
-        // "1 + 1" has no consequential keyword — should NOT be consequential
-        // (selector is ignored for execute_js per the spec).
-        assert!(
-            !r.consequential,
-            "execute_js consequential scan uses script, not selector"
-        );
-        // But still sensitive.
-        assert!(r.sensitive);
-    }
-
-    #[test]
-    fn all_schema_actions_covered() {
-        // Ensure every action in the browser schema has an explicit classification
-        // (i.e. none fall through to the unknown-action default unexpectedly).
-        let schema_actions = [
-            "navigate",
-            "screenshot",
-            "render_pdf",
-            "click",
-            "fill",
-            "get_text",
-            "inspect_page",
-            "scroll",
-            "execute_js",
-            "wait",
-            "list_tabs",
-            "get_console_logs",
-            "get_network_errors",
-            "new_tab",
-            "switch_tab",
-            "close_tab",
-            "set_mode",
-            "close",
-        ];
-
-        let expected_classes = [
-            BrowserRiskClass::Navigation,     // navigate
-            BrowserRiskClass::Observation,    // screenshot
-            BrowserRiskClass::Administrative, // render_pdf
-            BrowserRiskClass::Mutation,       // click
-            BrowserRiskClass::Mutation,       // fill
-            BrowserRiskClass::Observation,    // get_text
-            BrowserRiskClass::Observation,    // inspect_page
-            BrowserRiskClass::Observation,    // scroll
-            BrowserRiskClass::Mutation,       // execute_js
-            BrowserRiskClass::Observation,    // wait
-            BrowserRiskClass::Observation,    // list_tabs
-            BrowserRiskClass::Observation,    // get_console_logs
-            BrowserRiskClass::Observation,    // get_network_errors
-            BrowserRiskClass::Navigation,     // new_tab
-            BrowserRiskClass::Navigation,     // switch_tab
-            BrowserRiskClass::Administrative, // close_tab
-            BrowserRiskClass::Administrative, // set_mode
-            BrowserRiskClass::Administrative, // close
-        ];
-
-        for (action, expected) in schema_actions.iter().zip(expected_classes.iter()) {
-            let r = classify(action, None, None);
-            assert_eq!(
-                r.class, *expected,
-                "action={action}: expected {expected:?}, got {:?}",
-                r.class
-            );
-        }
+    fn facts_deserialize_from_the_script_shape() {
+        let facts: ElementFacts = serde_json::from_value(serde_json::json!({
+            "tag": "button",
+            "role": null,
+            "input_type": null,
+            "autocomplete": null,
+            "link_scheme": null,
+            "link_download": false,
+            "submits_form": true,
+            "form_method": "post",
+            "search_form": false,
+            "disclosure": false,
+            "editable": false
+        }))
+        .unwrap();
+        assert!(facts.submits_form);
+        assert!(click_needs_owner(&facts));
     }
 }

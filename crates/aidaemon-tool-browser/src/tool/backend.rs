@@ -75,6 +75,16 @@ pub trait PageHandle: Send + Sync {
     /// matches [`Self::is_element_visible`] — no JS interpolation of the selector.
     async fn is_element_enabled(&self, selector: &str) -> Result<bool, String>;
 
+    /// Typed DOM facts about the element matching `selector`
+    /// ([`super::policy::ElementFacts`]), read by the constant
+    /// [`super::policy::ELEMENT_FACTS_FN`] bound to the resolved element (the
+    /// selector is never interpolated into JS). `Ok(None)` when no element
+    /// matches; `Err` when the facts could not be read.
+    async fn element_facts(
+        &self,
+        selector: &str,
+    ) -> Result<Option<super::policy::ElementFacts>, String>;
+
     /// Click the element matching `selector`.
     async fn click(&self, selector: &str) -> Result<(), String>;
 
@@ -1248,6 +1258,26 @@ impl PageHandle for ChromiumoxidePage {
         Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
+    async fn element_facts(
+        &self,
+        selector: &str,
+    ) -> Result<Option<super::policy::ElementFacts>, String> {
+        let Ok(element) = self.page.find_element(selector).await else {
+            return Ok(None);
+        };
+        let ret = element
+            .call_js_fn(super::policy::ELEMENT_FACTS_FN, false)
+            .await
+            .map_err(|e| format!("Failed to read element facts of '{}': {}", selector, e))?;
+        let value = ret
+            .result
+            .value
+            .ok_or_else(|| format!("No element facts returned for '{}'", selector))?;
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| format!("Unreadable element facts for '{}': {}", selector, e))
+    }
+
     async fn click(&self, selector: &str) -> Result<(), String> {
         let element = self
             .page
@@ -1942,6 +1972,19 @@ pub struct MockElementState {
     pub hidden_after: Option<u64>,
     pub text: Option<String>,
     pub text_after: Option<u64>,
+    /// Scripted facts per selector for `element_facts`. A selector not
+    /// listed reads as a neutral target, ordinary for both a click (a web
+    /// link) and a fill (a text field).
+    pub facts: std::collections::HashMap<String, MockFacts>,
+}
+
+/// What `MockPage::element_facts` reports for a scripted selector.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub enum MockFacts {
+    Element(super::policy::ElementFacts),
+    Missing,
+    Unreadable,
 }
 
 #[cfg(test)]
@@ -2076,6 +2119,15 @@ impl MockBackend {
     pub fn with_element_state(mut self, state: MockElementState) -> Self {
         self.element_state = Arc::new(Mutex::new(state));
         self
+    }
+
+    /// Script the facts `element_facts` reports for `selector` from now on.
+    pub async fn set_element_facts(&self, selector: &str, facts: MockFacts) {
+        self.element_state
+            .lock()
+            .await
+            .facts
+            .insert(selector.to_string(), facts);
     }
 
     /// Model a click that triggers a navigation: `wait_for_navigation` resolves
@@ -2293,6 +2345,25 @@ impl PageHandle for MockPage {
         self.record(MockCall::IsEnabled(selector.to_string())).await;
         let mut st = self.element_state.lock().await;
         Ok(MockElementState::tick(&mut st.enabled_after))
+    }
+
+    async fn element_facts(
+        &self,
+        selector: &str,
+    ) -> Result<Option<super::policy::ElementFacts>, String> {
+        let scripted = self.element_state.lock().await.facts.get(selector).cloned();
+        match scripted {
+            Some(MockFacts::Element(facts)) => Ok(Some(facts)),
+            Some(MockFacts::Missing) => Ok(None),
+            Some(MockFacts::Unreadable) => Err("facts unavailable".to_string()),
+            None => Ok(Some(super::policy::ElementFacts {
+                tag: "input".to_string(),
+                input_type: Some("text".to_string()),
+                link_scheme: Some("https".to_string()),
+                editable: true,
+                ..Default::default()
+            })),
+        }
     }
 
     async fn click(&self, selector: &str) -> Result<(), String> {

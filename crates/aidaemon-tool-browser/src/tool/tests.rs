@@ -1131,7 +1131,7 @@ async fn delivered_screenshot_receipt_is_a_delivery_of_the_saved_capture() {
 
     let arguments = json!({ "action": "screenshot", "deliver": true }).to_string();
     assert!(
-        super::browser_call_semantics(Some("screenshot"), "", "", "", "")
+        super::browser_call_semantics(Some("screenshot"), "", "", "")
             .mutation_effects
             .is_empty(),
         "nothing is delivered until the channel confirms it"
@@ -2181,6 +2181,48 @@ fn approving_tool(
     (tool, backend, recorder)
 }
 
+/// A backend whose pages report these typed facts for these selectors.
+fn backend_with_facts(facts: &[(&str, super::backend::MockFacts)]) -> MockBackend {
+    MockBackend::new().with_element_state(super::backend::MockElementState {
+        facts: facts
+            .iter()
+            .map(|(selector, facts)| (selector.to_string(), facts.clone()))
+            .collect(),
+        ..Default::default()
+    })
+}
+
+/// A form's POST submit button: a point of action whatever its selector says.
+fn post_submit() -> super::backend::MockFacts {
+    super::backend::MockFacts::Element(super::policy::ElementFacts {
+        tag: "button".into(),
+        submits_form: true,
+        form_method: Some("post".into()),
+        ..Default::default()
+    })
+}
+
+/// A password field: filling it is a point of action.
+fn password_field() -> super::backend::MockFacts {
+    super::backend::MockFacts::Element(super::policy::ElementFacts {
+        tag: "input".into(),
+        input_type: Some("password".into()),
+        editable: true,
+        ..Default::default()
+    })
+}
+
+/// Open a public page so the session has a page whose facts can be read.
+async fn open_page(tool: &impl std::ops::Deref<Target = BrowserTool>, session: &str) {
+    aidaemon_tools::testing::call_with_facts(
+        &**tool,
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        aidaemon_tools::testing::call_facts(session),
+    )
+    .await
+    .unwrap();
+}
+
 async fn calls_contains(backend: &MockBackend, needle: &MockCall) -> bool {
     backend.calls().lock().await.contains(needle)
 }
@@ -2351,9 +2393,13 @@ async fn approval_deny_blocks_ordinary_mutation_before_backend() {
 /// DENY on a consequential click: the backend click is never recorded.
 #[tokio::test]
 async fn approval_deny_blocks_consequential_click_before_backend() {
-    let (tool, backend, _rec) = approving_tool(MockBackend::new(), ApprovalResponse::Deny);
+    let (tool, backend, _rec) = approving_tool(
+        backend_with_facts(&[("#delete", post_submit())]),
+        ApprovalResponse::Deny,
+    );
+    open_page(&tool, "sess-a").await;
 
-    // "#delete" → consequential (point-of-action), so it always prompts.
+    // A POST submit → point-of-action, so it always prompts.
     let out = tool
         .call_with(
             &json!({ "action": "click", "selector": "#delete"}).to_string(),
@@ -2425,11 +2471,18 @@ async fn approval_timeout_denies_without_backend() {
 #[tokio::test]
 async fn kernel_approval_covers_only_the_exact_call() {
     use aidaemon_tools::semantics::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
-    let backend = Arc::new(MockBackend::new());
+    let backend = Arc::new(backend_with_facts(&[("#submit", password_field())]));
     let (media_tx, _media_rx) = mpsc::channel(8);
     let tool = BrowserTool::with_backend(backend.clone(), media_tx);
     let facts = aidaemon_tools::testing::call_facts("sess-exact");
     assert!(tool.dispatch_facts().keeps_own_grants);
+    aidaemon_tools::testing::call_with_facts(
+        &tool,
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        facts.clone(),
+    )
+    .await
+    .unwrap();
 
     let approved = json!({ "action": "fill", "selector": "#submit", "value": "one" });
     let OwnerApprovalNeed::Ask(request) = tool
@@ -2840,8 +2893,10 @@ async fn execute_js_prompt_uses_origin_cached_after_navigation() {
 /// mutation received session approval.
 #[tokio::test]
 async fn consequential_click_prompts_despite_session_approval() {
-    let (tool, _backend, recorder) =
-        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    let (tool, _backend, recorder) = approving_tool(
+        backend_with_facts(&[("#delete", post_submit())]),
+        ApprovalResponse::AllowSession,
+    );
 
     // Public navigation is read-only and does not prompt or grant mutation
     // authority.
@@ -2862,8 +2917,8 @@ async fn consequential_click_prompts_despite_session_approval() {
     .unwrap();
     assert_eq!(recorder.count().await, 1);
 
-    // A consequential click ("#delete") must still prompt despite the approved
-    // session.
+    // A click on a POST form's submit button must still prompt despite the
+    // approved session.
     tool.call_with(
         &json!({ "action": "click", "selector": "#delete"}).to_string(),
         aidaemon_tools::testing::call_facts("sess-a"),
@@ -2880,11 +2935,13 @@ async fn consequential_click_prompts_despite_session_approval() {
 /// SECRET-SAFE PROMPT: a consequential fill prompt must not leak the typed value.
 #[tokio::test]
 async fn consequential_fill_prompt_hides_value() {
-    let (tool, _backend, recorder) =
-        approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    let (tool, _backend, recorder) = approving_tool(
+        backend_with_facts(&[("#submit", password_field())]),
+        ApprovalResponse::AllowSession,
+    );
+    open_page(&tool, "sess-a").await;
 
-    // "#submit-password" selector is opaque/hyphenated (not consequential), so
-    // force point-of-action via a standalone consequential token in the selector.
+    // The target is a password field: its fill is a point of action.
     let secret_value = "hunter2-super-secret";
     tool.call_with(
         &json!({
@@ -5444,4 +5501,120 @@ async fn a_helpers_declared_screenshot_is_sent_when_its_run_ends() {
         (deliverable.send)().await.unwrap();
     }
     assert_eq!(media.messages.lock().await.len(), 1);
+}
+
+/// An opaque selector on a POST form's submit button asks every time, even
+/// in a session the owner approved: the decision comes from the element's
+/// DOM facts, not from the selector's words.
+#[tokio::test]
+async fn an_opaque_selector_on_a_submit_button_asks_in_an_approved_session() {
+    let (tool, backend, recorder) = approving_tool(
+        backend_with_facts(&[("#btn-3", post_submit())]),
+        ApprovalResponse::AllowSession,
+    );
+    open_page(&tool, "sess-a").await;
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 1);
+    // Ordinary clicks now run without a card.
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recorder.count().await, 1);
+
+    let out = tool
+        .call_with(
+            &json!({ "action": "click", "selector": "#btn-3"}).to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recorder.count().await, 2, "the submit click must ask");
+    assert_eq!(out, "Clicked element '#btn-3'");
+    assert!(calls_contains(&backend, &MockCall::Click("#btn-3".to_string())).await);
+}
+
+/// Facts that cannot be read count as a point of action.
+#[tokio::test]
+async fn unreadable_target_facts_ask_every_time() {
+    use aidaemon_tools::semantics::{ApprovalCall, OwnerApprovalNeed, ToolSemantics};
+    let backend = Arc::new(backend_with_facts(&[(
+        "#btn-9",
+        super::backend::MockFacts::Unreadable,
+    )]));
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let tool = BrowserTool::with_backend(backend.clone(), media_tx);
+    let facts = aidaemon_tools::testing::call_facts("sess-unread");
+    aidaemon_tools::testing::call_with_facts(
+        &tool,
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        facts.clone(),
+    )
+    .await
+    .unwrap();
+    let click = json!({ "action": "click", "selector": "#btn-9" });
+    let OwnerApprovalNeed::Ask(request) = tool
+        .owner_approval_request(&ApprovalCall::as_sent(&click), &facts)
+        .await
+    else {
+        panic!("unreadable facts must ask");
+    };
+    assert!(matches!(
+        tool.approval_card_kind(&request),
+        ApprovalKind::CommandOnce
+    ));
+}
+
+/// A target that becomes a point of action after the call was judged as
+/// ordinary is refused at execution, before the click.
+#[tokio::test]
+async fn a_target_that_changed_after_judgment_is_refused_before_the_click() {
+    let backend = Arc::new(MockBackend::new());
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let tool = BrowserTool::with_backend(backend.clone(), media_tx);
+    let facts = aidaemon_tools::testing::call_facts("sess-swap");
+    aidaemon_tools::testing::call_with_facts(
+        &tool,
+        &json!({ "action": "navigate", "url": "https://a.example/"}).to_string(),
+        facts.clone(),
+    )
+    .await
+    .unwrap();
+    tool.sessions.mark_session_approved("sess-swap").await;
+    let page = tool.sessions.active_target_id("sess-swap").await.unwrap();
+    let page = tool.sessions.tab("sess-swap", &page).await.unwrap().page;
+    // Judged ordinary (the default target is a link) ...
+    assert!(matches!(
+        tool.approval_gate(&super::ActionArgs {
+            action: "click",
+            url: None,
+            selector: Some("#swap"),
+            script: None,
+            tab_id: None,
+            value: None,
+            session_id: "sess-swap",
+            trusted_session: false,
+        })
+        .await,
+        super::GateDecision::Allow { cleared: false }
+    ));
+    // ... then the page swaps a POST submit in under the same selector.
+    backend.set_element_facts("#swap", post_submit()).await;
+    let err = tool
+        .recheck_target(&*page, "click", "#swap", false)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Approval required"), "{err}");
+    assert!(
+        tool.recheck_target(&*page, "click", "#swap", true)
+            .await
+            .is_ok()
+    );
 }

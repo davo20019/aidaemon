@@ -45,9 +45,15 @@ const POINT_OF_ACTION_SENSITIVE: &str = "This can read or access private data on
 /// The extra warning when the owner typed into this tab (a sign-in).
 const OWNER_TYPED_HERE: &str =
     "You typed into this page yourself; a script could read what you entered.";
-/// The warning on a card for a consequential click or fill.
+/// The warning on a card for a click or fill whose target's DOM facts make
+/// it a point of action (see `policy::TargetFacts::needs_owner`).
 const POINT_OF_ACTION_CONSEQUENTIAL: &str =
     "This may submit forms, make purchases, delete data, or send messages.";
+/// The refusal when a click or fill reaches a point-of-action target that was
+/// not approved as one (the page changed after the call was judged).
+const POINT_OF_ACTION_CHANGED: &str = "Approval required: the element this action targets \
+     now needs the owner's approval for this exact action (the page changed after the call \
+     was judged). Nothing was done; retry the action to ask the owner.";
 
 /// Maximum allowed size of a `script` argument for `execute_js`. Generous for
 /// legitimate automation (64 KiB covers virtually any real workflow) while
@@ -219,7 +225,12 @@ fn short_page_name(display_url: &str) -> &str {
 /// backend; `Deny` blocks it with a user-facing reason BEFORE any page/backend
 /// method is touched.
 enum GateDecision {
-    Allow,
+    /// The call may run. `cleared` is true when it may run even at a point
+    /// of action: the owner approved this exact point-of-action call, or the
+    /// call is owner-confirmed scheduled work.
+    Allow {
+        cleared: bool,
+    },
     Deny(String),
 }
 
@@ -788,7 +799,8 @@ impl BrowserTool {
     ///   lifecycle / mode switch, not a consequential web side effect.
     /// - `sensitive` (`execute_js`): point-of-action — ALWAYS ask, every call,
     ///   regardless of scheduled or session authority.
-    /// - Consequential click/fill is point-of-action for interactive sessions,
+    /// - A click/fill whose target's DOM facts make it a point of action
+    ///   (`policy::TargetFacts::needs_owner`) is point-of-action for interactive sessions,
     ///   but an owner-confirmed scheduled run may execute the exact dispatcher-
     ///   issued call without waking the owner.
     /// - Opening a site on this computer: ask once per site, in every kind of
@@ -808,7 +820,7 @@ impl BrowserTool {
             };
         }
 
-        let risk = policy::classify(args.action, args.selector, args.script);
+        let risk = policy::classify(args.action);
 
         // Free actions: never ask. Navigation reaches this point only after
         // its requested URL has passed the shared public-network preflight in
@@ -822,14 +834,21 @@ impl BrowserTool {
             return BrowserApproval::NotNeeded;
         }
 
-        let point_of_action = risk.sensitive || risk.consequential;
-
         // The scheduler already carries durable owner confirmation, and the
         // common dispatcher sets this fact only for the exact call. Arbitrary
         // JS remains sensitive and always requires a live owner decision.
         if args.trusted_session && !risk.sensitive {
             return BrowserApproval::NotNeeded;
         }
+
+        // A click or fill is point of action by its target's typed DOM facts,
+        // never by the words in its selector.
+        let consequential = matches!(args.action, "click" | "fill")
+            && self
+                .target_facts(args.session_id, args.selector)
+                .await
+                .needs_owner(args.action);
+        let point_of_action = risk.sensitive || consequential;
 
         // Session-level fast path: an already-approved session skips the card
         // for ordinary mutation — but NEVER for point-of-action.
@@ -848,7 +867,7 @@ impl BrowserTool {
                 warnings.push(OWNER_TYPED_HERE.to_string());
             }
         }
-        if risk.consequential {
+        if consequential {
             warnings.push(POINT_OF_ACTION_CONSEQUENTIAL.to_string());
         }
         let summary = self.build_prompt(args, &risk).await;
@@ -881,15 +900,71 @@ impl BrowserTool {
         }
     }
 
+    /// The typed facts of the element `selector` targets on the session's
+    /// active page, read without creating a page or taking the action lock.
+    async fn target_facts(&self, session_id: &str, selector: Option<&str>) -> policy::TargetFacts {
+        let Some(selector) = selector else {
+            return policy::TargetFacts::Missing;
+        };
+        let Some(target) = self.sessions.active_target_id(session_id).await else {
+            return policy::TargetFacts::NoPage;
+        };
+        let Some(tab) = self.sessions.tab(session_id, &target).await else {
+            return policy::TargetFacts::NoPage;
+        };
+        self.facts_on(&*tab.page, selector).await
+    }
+
+    /// Read `selector`'s facts on `page`, bounded by the action timeout. A
+    /// read that fails or times out is [`policy::TargetFacts::Unreadable`].
+    async fn facts_on(&self, page: &dyn PageHandle, selector: &str) -> policy::TargetFacts {
+        match tokio::time::timeout(self.action_timeout, page.element_facts(selector)).await {
+            Ok(Ok(Some(facts))) => policy::TargetFacts::Element(facts),
+            Ok(Ok(None)) => policy::TargetFacts::Missing,
+            Ok(Err(_)) | Err(_) => policy::TargetFacts::Unreadable,
+        }
+    }
+
+    /// Re-read the target's facts under the action lock, just before the
+    /// click or fill: a target that is now a point of action runs only when
+    /// the call was cleared as one. Returns the facts the action runs on.
+    async fn recheck_target(
+        &self,
+        page: &dyn PageHandle,
+        action: &str,
+        selector: &str,
+        cleared: bool,
+    ) -> Result<policy::TargetFacts, String> {
+        let facts = self.facts_on(page, selector).await;
+        if facts == policy::TargetFacts::Missing {
+            return Err(format!("Element not found '{selector}'"));
+        }
+        if facts.needs_owner(action) && !cleared {
+            warn!(
+                action,
+                "browser target became a point of action after approval; denying"
+            );
+            return Err(POINT_OF_ACTION_CHANGED.to_string());
+        }
+        Ok(facts)
+    }
+
     /// The approval gate at execution. Returns [`GateDecision::Allow`] only
     /// when the action needs no owner approval or the kernel delivered the
     /// owner's approval of this exact call; it never asks the owner itself.
     async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
         match self.approval_need(args).await {
-            BrowserApproval::NotNeeded => GateDecision::Allow,
-            BrowserApproval::Ask { request, .. } => {
+            BrowserApproval::NotNeeded => GateDecision::Allow {
+                cleared: args.trusted_session,
+            },
+            BrowserApproval::Ask {
+                request,
+                point_of_action,
+            } => {
                 if self.owner_answers.take(args.session_id, &request.subject) {
-                    GateDecision::Allow
+                    GateDecision::Allow {
+                        cleared: point_of_action || args.trusted_session,
+                    }
                 } else {
                     warn!(
                         action = args.action,
@@ -1494,7 +1569,12 @@ impl BrowserTool {
         })
     }
 
-    async fn action_click(&self, args: &Value, session_id: &str) -> Result<String, String> {
+    async fn action_click(
+        &self,
+        args: &Value,
+        session_id: &str,
+        cleared: bool,
+    ) -> Result<DispatchResult, String> {
         let selector = args
             .get("selector")
             .and_then(|v| v.as_str())
@@ -1505,6 +1585,9 @@ impl BrowserTool {
         // browser's live targets BEFORE the click so we can detect a popup
         // (target=_blank / window.open) the click may spawn.
         let (page, _guard) = self.page_for(session_id).await?;
+        let facts = self
+            .recheck_target(&*page, "click", selector, cleared)
+            .await?;
 
         // The clicking session's active target id — the ONLY legitimate opener
         // for a popup we should attribute to this session.
@@ -1567,13 +1650,18 @@ impl BrowserTool {
                 .await;
         }
 
-        match new_tab_id {
-            Some(tab_id) => Ok(format!(
+        let text = match new_tab_id {
+            Some(tab_id) => format!(
                 "Clicked element '{}' (opened new tab: {})",
                 selector, tab_id
-            )),
-            None => Ok(format!("Clicked element '{}'", selector)),
-        }
+            ),
+            None => format!("Clicked element '{}'", selector),
+        };
+        Ok(DispatchResult {
+            text,
+            attachments: Vec::new(),
+            semantics: click_semantics(&facts),
+        })
     }
 
     /// After an action that may spawn a popup, diff the browser's live targets
@@ -1635,7 +1723,12 @@ impl BrowserTool {
         None
     }
 
-    async fn action_fill(&self, args: &Value, session_id: &str) -> Result<String, String> {
+    async fn action_fill(
+        &self,
+        args: &Value,
+        session_id: &str,
+        cleared: bool,
+    ) -> Result<String, String> {
         let selector = args
             .get("selector")
             .and_then(|v| v.as_str())
@@ -1646,6 +1739,8 @@ impl BrowserTool {
             .ok_or_else(|| "Missing required parameter: value".to_string())?;
 
         let (page, _guard) = self.page_for(session_id).await?;
+        self.recheck_target(&*page, "fill", selector, cleared)
+            .await?;
 
         page.replace_text(selector, value).await?;
 
@@ -1919,6 +2014,7 @@ impl BrowserTool {
         args: &Value,
         session_id: &str,
         files: CallFiles<'_>,
+        cleared: bool,
     ) -> Result<DispatchResult, String> {
         match action {
             "navigate" => self
@@ -1927,12 +2023,9 @@ impl BrowserTool {
                 .map(DispatchResult::text_only),
             "screenshot" => self.action_screenshot(args, session_id, files).await,
             "render_pdf" => self.action_render_pdf(args).await,
-            "click" => self
-                .action_click(args, session_id)
-                .await
-                .map(DispatchResult::text_only),
+            "click" => self.action_click(args, session_id, cleared).await,
             "fill" => self
-                .action_fill(args, session_id)
+                .action_fill(args, session_id, cleared)
                 .await
                 .map(DispatchResult::text_only),
             "get_text" => self
@@ -2002,7 +2095,7 @@ impl BrowserTool {
     /// Uses the shared `policy::classify` so the observation-vs-mutation boundary
     /// has a single source of truth.
     fn action_is_safe_to_replay(action: &str) -> bool {
-        let risk = policy::classify(action, None, None);
+        let risk = policy::classify(action);
         matches!(
             risk.class,
             BrowserRiskClass::Observation
@@ -2034,8 +2127,11 @@ impl BrowserTool {
         args: &Value,
         session_id: &str,
         files: CallFiles<'_>,
+        cleared: bool,
     ) -> Result<DispatchResult, String> {
-        let first = self.dispatch_action(action, args, session_id, files).await;
+        let first = self
+            .dispatch_action(action, args, session_id, files, cleared)
+            .await;
         let err = match first {
             Ok(ok) => return Ok(ok),
             Err(e) => e,
@@ -2068,7 +2164,9 @@ impl BrowserTool {
         if Self::action_is_safe_to_replay(action) {
             // Idempotent: retry once against a freshly-minted page.
             info!(action, "retrying idempotent browser action after reconnect");
-            return self.dispatch_action(action, args, session_id, files).await;
+            return self
+                .dispatch_action(action, args, session_id, files, cleared)
+                .await;
         }
 
         // Mutation: NEVER auto-replay. The connection is restored for subsequent
@@ -2362,10 +2460,13 @@ impl BrowserTool {
             session_id,
             trusted_session: facts.trusted_session,
         };
-        if let GateDecision::Deny(reason) = self.approval_gate(&action_args).await {
-            warn!(action, "Browser action blocked by approval gate");
-            return Ok(DispatchResult::text_only(format!("Error: {}", reason)));
-        }
+        let cleared = match self.approval_gate(&action_args).await {
+            GateDecision::Allow { cleared } => cleared,
+            GateDecision::Deny(reason) => {
+                warn!(action, "Browser action blocked by approval gate");
+                return Ok(DispatchResult::text_only(format!("Error: {}", reason)));
+            }
+        };
 
         let fence = aidaemon_tools::semantics::file_fence(facts).cloned();
         let files = CallFiles {
@@ -2373,7 +2474,7 @@ impl BrowserTool {
             produced: aidaemon_tools::semantics::produced_files(facts),
         };
         match self
-            .dispatch_with_recovery(action, &args, session_id, files)
+            .dispatch_with_recovery(action, &args, session_id, files, cleared)
             .await
         {
             Ok(result) => Ok(result),
@@ -2648,11 +2749,6 @@ impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
             .and_then(|value| value.get("url"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let selector = args
-            .as_ref()
-            .and_then(|value| value.get("selector"))
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
         let script = args
             .as_ref()
             .and_then(|value| value.get("script"))
@@ -2664,7 +2760,7 @@ impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
 
-        browser_call_semantics(action.as_deref(), url, selector, script, output_filename)
+        browser_call_semantics(action.as_deref(), url, script, output_filename)
     }
 }
 
@@ -2771,7 +2867,6 @@ fn delivered_screenshot_semantics(local_path: &str) -> ToolCallSemantics {
 fn browser_call_semantics(
     action: Option<&str>,
     url: &str,
-    selector: &str,
     script: &str,
     output_filename: &str,
 ) -> ToolCallSemantics {
@@ -2793,32 +2888,12 @@ fn browser_call_semantics(
         Some("get_console_logs" | "get_network_errors") => ToolCallSemantics::observation()
             .with_verification_mode(ToolVerificationMode::ResultContent),
         Some("new_tab" | "switch_tab") => ToolCallSemantics::observation(),
-        // A browser click usually changes only local navigation/UI state.
-        // Count it as an external mutation only when its target carries a
-        // consequential action signal; otherwise a stale tab selector in a
-        // read-only investigation must not trigger mutation reconciliation.
-        Some("click") => {
-            let risk = policy::classify("click", Some(selector), None);
-            if risk.consequential {
-                let lower = selector.to_ascii_lowercase();
-                let mut effects = ToolMutationEffects::REMOTE_MUTATION;
-                if ["deploy", "release", "go live"]
-                    .iter()
-                    .any(|keyword| lower.contains(keyword))
-                {
-                    effects = effects.union(ToolMutationEffects::REMOTE_DEPLOY);
-                }
-                if ["publish", "post", "tweet", "upload", "send", "submit"]
-                    .iter()
-                    .any(|keyword| lower.contains(keyword))
-                {
-                    effects = effects.union(ToolMutationEffects::EXTERNAL_DELIVERY);
-                }
-                ToolCallSemantics::mutation_with(effects)
-            } else {
-                ToolCallSemantics::observation()
-            }
-        }
+        // A browser click usually changes only local navigation/UI state, and
+        // its arguments cannot say otherwise (a selector is opaque). What a
+        // click did is reported after it runs, from its target's DOM facts
+        // (`click_semantics`); a stale tab selector in a read-only
+        // investigation must not trigger mutation reconciliation.
+        Some("click") => ToolCallSemantics::observation(),
         Some("fill") => ToolCallSemantics::mutation_with(ToolMutationEffects::REMOTE_MUTATION),
         Some("execute_js") => {
             if browser_script_has_mutation_signal(script) {
@@ -2831,6 +2906,24 @@ fn browser_call_semantics(
         Some("close" | "set_mode" | "close_tab") => ToolCallSemantics::administrative(),
         _ => ToolCallSemantics::mutation_with(ToolMutationEffects::UNSPECIFIED),
     }
+}
+
+/// What a click did, from the DOM facts of the target it ran on. A click
+/// that needed the owner changed remote state; submitting a form also
+/// delivered its fields. Nothing is guessed from words: a deploy or a post
+/// done by clicking is not told apart from any other remote change. An
+/// ordinary click keeps its declared (observation) semantics.
+fn click_semantics(facts: &policy::TargetFacts) -> Option<ToolCallSemantics> {
+    if !facts.needs_owner("click") {
+        return None;
+    }
+    let submits = matches!(facts, policy::TargetFacts::Element(element) if element.submits_form);
+    let effects = if submits {
+        ToolMutationEffects::REMOTE_MUTATION.union(ToolMutationEffects::EXTERNAL_DELIVERY)
+    } else {
+        ToolMutationEffects::REMOTE_MUTATION
+    };
+    Some(ToolCallSemantics::mutation_with(effects))
 }
 
 fn browser_script_has_mutation_signal(script: &str) -> bool {
@@ -2871,14 +2964,13 @@ mod prompt_tests {
         policy::BrowserActionRisk {
             class: BrowserRiskClass::Navigation,
             sensitive: false,
-            consequential: false,
         }
     }
 
     #[test]
     fn read_only_dom_extraction_is_observation_semantics() {
         let script = "JSON.stringify([...document.querySelectorAll('button')].map((b,i)=>({i,text:b.innerText})))";
-        let semantics = browser_call_semantics(Some("execute_js"), "", "", script, "");
+        let semantics = browser_call_semantics(Some("execute_js"), "", script, "");
         assert!(semantics.observes_state());
         assert!(!semantics.mutates_state());
         assert!(!browser_script_has_mutation_signal(script));
@@ -2889,11 +2981,39 @@ mod prompt_tests {
         assert!(browser_script_has_mutation_signal(
             "document.querySelector('#publish').click()"
         ));
-        assert!(browser_call_semantics(Some("click"), "", "#publish", "", "").mutates_state());
-        assert!(
-            browser_call_semantics(Some("click"), "", "button:nth-of-type(197)", "", "")
-                .observes_state()
-        );
+        // A click's selector declares nothing either way; what it did comes
+        // from its target's facts once it ran.
+        assert!(browser_call_semantics(Some("click"), "", "", "").observes_state());
+        assert!(!browser_call_semantics(Some("click"), "", "", "").mutates_state());
+    }
+
+    /// Effects come from the target's facts, never from words in a selector.
+    #[test]
+    fn click_effects_come_from_the_targets_facts() {
+        use super::click_semantics;
+        use policy::{ElementFacts, TargetFacts};
+        let link = TargetFacts::Element(ElementFacts {
+            tag: "a".into(),
+            link_scheme: Some("https".into()),
+            ..ElementFacts::default()
+        });
+        assert!(click_semantics(&link).is_none());
+        let submit = TargetFacts::Element(ElementFacts {
+            tag: "button".into(),
+            submits_form: true,
+            form_method: Some("post".into()),
+            ..ElementFacts::default()
+        });
+        let effects = click_semantics(&submit).unwrap().mutation_effects;
+        assert!(effects.contains(ToolMutationEffects::EXTERNAL_DELIVERY));
+        assert!(!effects.contains(ToolMutationEffects::REMOTE_DEPLOY));
+        let button = TargetFacts::Element(ElementFacts {
+            tag: "button".into(),
+            ..ElementFacts::default()
+        });
+        let effects = click_semantics(&button).unwrap().mutation_effects;
+        assert_eq!(effects, ToolMutationEffects::REMOTE_MUTATION);
+        assert!(click_semantics(&TargetFacts::Unreadable).is_some());
     }
 
     #[test]
@@ -2909,8 +3029,7 @@ mod prompt_tests {
 
     #[test]
     fn render_pdf_records_a_local_workspace_write() {
-        let semantics =
-            browser_call_semantics(Some("render_pdf"), "", "", "", "investor-brief.pdf");
+        let semantics = browser_call_semantics(Some("render_pdf"), "", "", "investor-brief.pdf");
         assert!(semantics.mutates_state());
         assert!(
             semantics
