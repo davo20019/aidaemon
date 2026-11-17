@@ -29,6 +29,11 @@ pub mod colors {
     pub const SCRIM: AdaptiveColor = tone(rgb_a(0x000000, 0.32), rgb_a(0x000000, 0.55));
     /// Behind a picture opened over the page: near black in both modes.
     pub const LIGHTBOX: AdaptiveColor = tone(rgb_a(0x000000, 0.96), rgb_a(0x000000, 0.96));
+    /// The live view's backdrop: fully opaque, so the page behind never
+    /// reads as part of the agent's screen.
+    pub const LIVE_BACKDROP: AdaptiveColor = tone(rgb(0x000000), rgb(0x000000));
+    /// The ring that marks where the owner tapped on the live view.
+    pub const TAP_RING: AdaptiveColor = tone(rgb(0x3b82f6), rgb(0x60a5fa));
     /// A round control over [`LIGHTBOX`] and the glyph on it.
     pub const LIGHTBOX_CONTROL: AdaptiveColor = tone(rgb_a(0xffffff, 0.14), rgb_a(0xffffff, 0.14));
     pub const ON_LIGHTBOX: AdaptiveColor = tone(rgb(0xffffff), rgb(0xffffff));

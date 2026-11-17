@@ -1845,6 +1845,21 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
 
     // Point mode: the next tap tells the agent what is there.
     let pointing = signal(false);
+    // Where the owner last tapped, marked until the page answers with a
+    // new picture.
+    let tapped = signal(None::<(f32, f32)>);
+    {
+        let seen = signal(0u64);
+        effect(move || {
+            let changed = frame.with(|f| f.as_ref().map(|f| f.uri.len() as u64));
+            if let Some(len) = changed
+                && len != seen.get_untracked()
+            {
+                seen.set(len);
+                tapped.set(None);
+            }
+        });
+    }
     // Where a finger or the pointer acts: an empty layer over the picture,
     // so its place is in the picture's own frame.
     let start = signal((0.0f32, 0.0f32));
@@ -1879,6 +1894,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 }
                 let at = (e.location.x.0 / w, e.location.y.0 / h);
                 start.set(at);
+                tapped.set(Some(at));
                 if c_down() {
                     down("down", at.0, at.1);
                 }
@@ -1955,6 +1971,22 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     )
             },
         ))
+        .child(dynamic(move || {
+            let (x, y) = tapped.get()?;
+            Some(untracked(move || {
+                let (w, h) = fitted();
+                view()
+                    .absolute()
+                    .left(px(x * w - 14.0))
+                    .top(px(y * h - 14.0))
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(colors::TAP_RING)
+                    .into_element()
+            }))
+        }))
         .child(when(
             {
                 let c = controlling.clone();
@@ -1993,7 +2025,15 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 .min_w(px(0.0))
                 .gap_1()
                 .child(title)
-                .child(status_line),
+                .child(status_line)
+                .child(when(controlling.clone(), || {
+                    text(
+                        "This is the agent's browser, live. Tap a box on the page, type below and \
+                         press Type; Enter submits. The ring shows where you tapped.",
+                    )
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::ON_LIGHTBOX)
+                })),
         )
         .child(viewer_btn(Glyph::Close, "Close", move || close()));
 
@@ -2073,37 +2113,48 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     };
     let key = screen.key.clone();
     let wheel = screen.wheel.clone();
-    let keys = |label: &'static str, glyph: Glyph, code: &'static str, name: &'static str| {
+    let press = |label: &'static str, code: &'static str, name: &'static str| {
         let key = key.clone();
-        viewer_btn(glyph, label, move || key(code, name))
+        viewer_text_btn(label, false, move || key(code, name))
     };
     let typing = view()
-        .flex_row()
-        .items_center()
         .gap_2()
         .px_3()
-        .child(view().flex_1().min_w(px(0.0)).child(
-            super::controls::secret_field("Type into the page", typed).on_submit({
-                let send = send.clone();
-                move |_: &str| send()
-            }),
-        ))
-        .child(viewer_btn(Glyph::Send, "Type it", send))
-        .child(keys("Backspace", Glyph::Back, "Backspace", "Backspace"))
-        .child(keys("Tab", Glyph::Chevron, "Tab", "Tab"))
-        .child(keys("Enter", Glyph::Check, "Enter", "Enter"))
-        .child({
-            let wheel = wheel.clone();
-            viewer_btn(Glyph::Up, "Scroll up", move || wheel(-400.0))
-        })
-        .child(viewer_btn(Glyph::Down, "Scroll down", move || wheel(400.0)));
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(view().flex_1().min_w(px(0.0)).child(
+                    super::controls::secret_field("Text to type into the page", typed).on_submit({
+                        let send = send.clone();
+                        move |_: &str| send()
+                    }),
+                ))
+                .child(viewer_text_btn("Type", true, send)),
+        )
+        .child(
+            view()
+                .flex_row()
+                .flex_wrap()
+                .justify_center()
+                .gap_2()
+                .child(press("Delete", "Backspace", "Backspace"))
+                .child(press("Tab", "Tab", "Tab"))
+                .child(press("Enter", "Enter", "Enter"))
+                .child({
+                    let wheel = wheel.clone();
+                    viewer_text_btn("Scroll up", false, move || wheel(-400.0))
+                })
+                .child(viewer_text_btn("Scroll down", false, move || wheel(400.0))),
+        );
 
     let close = screen.close.clone();
     view().child(
         dialog()
             .label("The agent's screen")
             .on_cancel(move || close())
-            .bg(colors::LIGHTBOX)
+            .bg(colors::LIVE_BACKDROP)
             .child(
                 view()
                     .flex_1()
@@ -2111,6 +2162,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     .h_full()
                     .flex_col()
                     .gap_2()
+                    .bg(colors::LIVE_BACKDROP)
                     .pt_safe_area()
                     .pb_safe_area()
                     .test_id("live-screen")
