@@ -13,7 +13,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 
 ## Tokens (`src/ui/theme.rs`)
 
-- **Surfaces:** `BACKGROUND` (the window), `SIDEBAR` (side panes, one step away), `SURFACE` (cards, popups, the composer), `INSET` (code and tool output inside a surface). Washes: `HOVER` is weaker than `SELECTED`.
+- **Surfaces:** `BACKGROUND` (the window), `SIDEBAR` (side panes, one step away), `SURFACE` (cards, popups), `COMPOSER` (white on the light page, no fill in dark: the edge draws it, so it does not read as a black slab under the conversation), `INSET` (code and tool output inside a surface). Washes: `HOVER` is weaker than `SELECTED`.
 - **Edges:** `BORDER` frames cards and buttons that name themselves; `EDGE` (3:1 or more on the page and on a surface) frames what is typed in or chosen from (fields, selects, the composer) and what floats (popups, menus, the palette): in dark a shadow does not show, the edge does. `theme.rs`'s test holds text at 4.5:1 and edges at 3:1 in both themes.
 - **Text:** `TEXT`, `MUTED` (secondary), `FAINT` (metadata, hints; at least 4.5:1 on the background in both themes). Never smaller than 11 pt.
 - **Toasts:** a card of the surface colour with a border, not an inverted slab; under the top bar on touch (swiped up), clear of the composer; at the bottom with a pointer (swiped right). A title and, under it, what it was about. A finished conversation elsewhere is "Done" with a check and its title, and a press opens it.

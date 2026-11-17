@@ -643,7 +643,7 @@ fn welcome(store: Store) -> View {
                         if code.get() {
                             "Which project is this for?"
                         } else {
-                            "What can I help you with?"
+                            "What can I help with?"
                         }
                     })
                     .role(AccessibilityRole::Header)
@@ -1441,11 +1441,14 @@ fn composer(store: Store, session: Option<String>) -> View {
         ),
         None => format!("Also posted in {place}"),
     });
+    // A phone's composer sits close to the conversation and the screen's
+    // foot: every point it takes is a point of reading gone.
+    let (pad_top, pad_bottom) = if touch { (4.0, 8.0) } else { (8.0, 16.0) };
     view()
         .items_center()
         .px_4()
-        .pb_4()
-        .pt_2()
+        .pb(px(pad_bottom))
+        .pt(px(pad_top))
         .child(when(
             move || slash.with(|m| !m.is_empty()),
             move || slash_list(store, slash),
@@ -1456,10 +1459,14 @@ fn composer(store: Store, session: Option<String>) -> View {
         })
         .child(
             ui::surface()
+                // No fill of its own in dark: a box of the page's colour
+                // drawn by its edge, as the field it is (a filled slab read
+                // as a black block under the conversation).
+                .bg(colors::COMPOSER)
                 .w_full()
                 .max_w(px(size::COLUMN))
-                .p(px(6.0))
-                .gap_1()
+                .p(px(if touch { 4.0 } else { 6.0 }))
+                .gap(px(if touch { 0.0 } else { 4.0 }))
                 .focus_within(|s| s.border_color(colors::ACCENT))
                 // Files dragged from the desktop attach where they are let
                 // go; the border says so while they are over it.
@@ -1578,9 +1585,11 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .on_content_size_change(move |size: &nsh_core::geometry::Size<Points>| {
                             height.set(size.height.0.clamp(ui::fit::read_lh(), 180.0));
                         })
-                        .h(move || px(height.get() + 16.0))
+                        // A phone's line is tall already (25 pt): less
+                        // padding round it keeps an empty box short.
+                        .h(move || px(height.get() + if touch { 8.0 } else { 16.0 }))
                         .px(px(8.0))
-                        .py(px(8.0))
+                        .py(px(if touch { 4.0 } else { 8.0 }))
                         .text_size(px(ui::fit::read()))
                         .line_height(px(ui::fit::read_lh()))
                         .text_color(colors::TEXT)

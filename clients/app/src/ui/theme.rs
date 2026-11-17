@@ -41,8 +41,11 @@ pub mod colors {
     pub const BACKGROUND: AdaptiveColor = tone(rgb(0xf7f7f5), rgb(0x0f1012));
     /// The sidebar and the inspector: a step away from the page.
     pub const SIDEBAR: AdaptiveColor = tone(rgb(0xefefec), rgb(0x141518));
-    /// A card, a popup, the composer.
+    /// A card, a popup.
     pub const SURFACE: AdaptiveColor = tone(rgb(0xffffff), rgb(0x1a1b1f));
+    /// The composer: a white card on the light page; in dark, no fill
+    /// (the page shows through, the edge draws the field).
+    pub const COMPOSER: AdaptiveColor = tone(rgb(0xffffff), rgb_a(0x000000, 0.0));
     /// A surface inside a surface: code, quoted tool output.
     pub const INSET: AdaptiveColor = tone(rgb(0xf1f1ee), rgb(0x0c0d0f));
     /// Hover wash on rows and quiet buttons.
