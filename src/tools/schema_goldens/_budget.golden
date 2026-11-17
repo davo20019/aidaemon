@@ -6,7 +6,7 @@ edit_file 1208 302
 escalate_to_parent 614 154
 generate_image 921 231
 goal_trace 812 203
-hand_over 925 232
+hand_over 995 249
 health_probe 1233 309
 http_request 2463 616
 list_checkpoints 500 125
@@ -46,5 +46,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 78629 19658 (47 tools)
+TOTAL 78699 19675 (47 tools)
 PER_CALL 33632 8408 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 28 deferred)

@@ -1156,7 +1156,7 @@ mod not_redone_tests {
             (Vec::new(), "Something untyped".to_string()),
         ];
         assert_eq!(
-            not_redone(&not_done, &[handoff.clone()]),
+            not_redone(&not_done, std::slice::from_ref(&handoff)),
             vec!["Post the synthetic report", "Something untyped"]
         );
         assert_eq!(not_redone(&not_done, &[]).len(), 3);
