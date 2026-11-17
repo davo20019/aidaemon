@@ -92,6 +92,11 @@ pub enum MediaClientMessage {
     /// Input for the surface. Only the controlling device's input is
     /// applied; anything else is dropped.
     Input { event: SurfaceInput },
+    /// The room this device has for the picture changed (protocol 1.33): a
+    /// phone turned between portrait and landscape. `w` by `h` points, as
+    /// `fit_w`/`fit_h` when the view opened. While this device controls the
+    /// surface, the surface is laid out again for it.
+    Fit { w: u32, h: u32 },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

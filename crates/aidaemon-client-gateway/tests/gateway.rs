@@ -2355,6 +2355,22 @@ async fn a_surface_streams_the_newest_frame_and_takes_input_only_under_control()
         (Some("a text field".into()), Some("Username".into()))
     );
 
+    // The phone turns while in control: the page is laid out for its new
+    // room.
+    media_send(&mut media, &MediaClientMessage::Fit { w: 800, h: 300 }).await;
+    let turned = Some(aidaemon_surfaces::Size { w: 800, h: 300 });
+    for _ in 0..50 {
+        if mock.fits().iter().any(|(room, _)| *room == turned) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        mock.fits().iter().any(|(room, _)| *room == turned),
+        "{:?}",
+        mock.fits()
+    );
+
     // Closing the view ends the stream; nothing typed was kept by the gateway.
     let (result, _) = command_on(
         &mut socket,

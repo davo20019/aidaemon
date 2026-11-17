@@ -344,6 +344,8 @@ pub struct Store {
     live_typing: Signal<Option<aidaemon_client_protocol::media::FocusTyping>>,
     /// Characters sent with the last Type, until the next tap.
     live_typed: Signal<Option<usize>>,
+    /// The room for the picture the daemon last heard (a touch screen's).
+    live_room_sent: Stored<Option<(u32, u32)>>,
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
@@ -410,6 +412,7 @@ impl Store {
             live_focus_rect: signal(None),
             live_typing: signal(None),
             live_typed: signal(None),
+            live_room_sent: stored(None),
             media: stored(None),
             media_epoch: stored(0),
         }
@@ -583,6 +586,7 @@ impl Store {
         // A mouse wants a quicker picture than a finger.
         let fps = if crate::ui::touch() { 10 } else { 20 };
         let fit = crate::ui::live_room();
+        self.live_room_sent.replace(fit);
         let effects = self.act(|c| c.open_surface_at(surface_id, control, Some(fps), fit));
         for effect in effects {
             self.effect(effect);
@@ -698,6 +702,18 @@ impl Store {
                 (link.send)(text);
             }
         });
+    }
+
+    /// The room for the live picture is now `room` (the phone turned):
+    /// the daemon lays the page out again when it changed enough.
+    pub fn live_room_changed(&self, room: (u32, u32)) {
+        let Some(sent) = self.live_room_sent.get() else {
+            return;
+        };
+        if aidaemon_client_core::surfaces::room_turned(sent, room) {
+            self.live_room_sent.replace(Some(room));
+            self.media_send(aidaemon_client_core::surfaces::fit(room.0, room.1));
+        }
     }
 
     fn live_input(&self, input: aidaemon_client_protocol::media::SurfaceInput) {

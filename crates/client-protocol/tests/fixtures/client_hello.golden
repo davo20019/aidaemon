@@ -12,6 +12,6 @@
   "type": "hello",
   "version": {
     "major": 1,
-    "minor": 32
+    "minor": 33
   }
 }

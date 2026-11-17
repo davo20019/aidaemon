@@ -227,6 +227,44 @@ async fn a_page_takes_the_controlling_phones_room_and_is_back_before_the_agent_a
 }
 
 #[tokio::test]
+async fn a_phone_that_turns_lays_the_page_out_again_only_while_it_holds_control() {
+    let (registry, mock) = setup(SurfacesConfig::default());
+    let id = mock.add("s1", "tab-1");
+    registry.refresh().await;
+    let portrait = crate::types::Size { w: 390, h: 560 };
+    let landscape = crate::types::Size { w: 800, h: 300 };
+    let live = registry
+        .open_live(
+            &id,
+            "phone",
+            LiveMode::View,
+            StreamParams {
+                fit: Some(portrait),
+                ..StreamParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Watching: the turn is kept for later, nothing is laid out.
+    registry.refit(&live.live_id, landscape).await.unwrap();
+    assert!(mock.fits().is_empty());
+    registry.take_control(&id, "phone").await.unwrap();
+    assert_eq!(mock.fits(), vec![(Some(landscape), true)]);
+    // In control: each turn lays the page out again; the same room twice
+    // does nothing.
+    registry.refit(&live.live_id, portrait).await.unwrap();
+    registry.refit(&live.live_id, portrait).await.unwrap();
+    assert_eq!(
+        mock.fits(),
+        vec![(Some(landscape), true), (Some(portrait), true)]
+    );
+    assert!(matches!(
+        registry.refit("live_gone", portrait).await,
+        Err(SurfaceError::NotFound)
+    ));
+}
+
+#[tokio::test]
 async fn only_the_holding_device_types_and_the_newest_device_wins() {
     let (registry, mock) = setup(SurfacesConfig::default());
     let id = mock.add("s1", "tab-1");

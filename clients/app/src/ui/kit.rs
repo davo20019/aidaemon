@@ -1811,7 +1811,9 @@ pub fn live_room() -> Option<(u32, u32)> {
     let safe = nsh_core::element::safe_area();
     let w = window.width.0 - 20.0;
     let h = window.height.0 - safe.top.0 - safe.bottom.0 - CHROME;
-    (w >= 200.0 && h >= 200.0).then(|| (w.round() as u32, h.round() as u32))
+    // Held sideways, a phone has little height left for the picture: the
+    // page is still laid out for it (the daemon takes 160 at least).
+    (w >= 200.0 && h >= 120.0).then(|| (w.round() as u32, h.round() as u32))
 }
 
 /// The marks as an SVG of `w` by `h` points.
@@ -1957,6 +1959,9 @@ pub struct LiveScreen {
     pub done: std::rc::Rc<dyn Fn()>,
     pub not_now: std::rc::Rc<dyn Fn()>,
     pub close: std::rc::Rc<dyn Fn()>,
+    /// The room for the picture changed (a phone turned), as
+    /// [`live_room`] gives it.
+    pub room_changed: std::rc::Rc<dyn Fn((u32, u32))>,
 }
 
 /// The live view, over everything while it is open.
@@ -1986,6 +1991,16 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         let c = screen.controlling.clone();
         move || c()
     };
+    // A phone that turns between portrait and landscape: its new room goes
+    // to the daemon, which lays the page out again for it.
+    {
+        let changed = screen.room_changed.clone();
+        effect(move || {
+            if let Some(room) = live_room() {
+                untracked(|| changed(room));
+            }
+        });
+    }
 
     // Pinch to zoom the picture, as a photo: `zoom` times the fitted size,
     // its top-left `pan` points from the box's (never past an edge).

@@ -4157,6 +4157,31 @@
             "event"
           ],
           "type": "object"
+        },
+        {
+          "description": "The room this device has for the picture changed (protocol 1.33): a\nphone turned between portrait and landscape. `w` by `h` points, as\n`fit_w`/`fit_h` when the view opened. While this device controls the\nsurface, the surface is laid out again for it.",
+          "properties": {
+            "h": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "fit",
+              "type": "string"
+            },
+            "w": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "w",
+            "h"
+          ],
+          "type": "object"
         }
       ]
     },

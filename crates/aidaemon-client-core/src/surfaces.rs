@@ -90,6 +90,20 @@ pub fn input(event: SurfaceInput) -> String {
     text(&MediaClientMessage::Input { event })
 }
 
+/// The room this device has for the picture changed (protocol 1.33).
+pub fn fit(w: u32, h: u32) -> String {
+    text(&MediaClientMessage::Fit { w, h })
+}
+
+/// Whether the room for the picture changed enough to lay the page out
+/// again: its width moved by 20 points or more, as when the device turns
+/// between portrait and landscape. A height alone does not count: a
+/// phone's keyboard opening takes height (it can even leave the room wider
+/// than tall), and the page must not change under the field being typed in.
+pub fn room_turned(sent: (u32, u32), now: (u32, u32)) -> bool {
+    sent.0.abs_diff(now.0) >= 20
+}
+
 /// A press, a move or a release at a fraction of the frame.
 pub fn pointer(action: &str, x: f32, y: f32) -> SurfaceInput {
     SurfaceInput::Pointer {
@@ -268,6 +282,18 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_turn_or_a_new_width_lays_the_page_out_again_and_a_keyboard_does_not() {
+        let portrait = (391, 549);
+        assert!(room_turned(portrait, (829, 230)), "turned to landscape");
+        assert!(room_turned((829, 230), portrait), "and back");
+        assert!(room_turned(portrait, (420, 600)), "a wider window");
+        assert!(!room_turned(portrait, (391, 260)), "the keyboard opened");
+        assert!(!room_turned(portrait, (395, 549)), "a few points");
+        assert!(fit(800, 300).contains("\"type\":\"fit\""));
+    }
+
     use super::*;
     use aidaemon_client_protocol::TransportKind;
 

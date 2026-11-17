@@ -586,6 +586,7 @@ fn live_screen(store: Store) -> crate::ui::LiveScreen {
         done: Rc::new(move || store.live_finish(true)),
         not_now: Rc::new(move || store.live_finish(false)),
         close: Rc::new(move || store.hide_live()),
+        room_changed: Rc::new(move |room| store.live_room_changed(room)),
     }
 }
 

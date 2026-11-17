@@ -791,7 +791,45 @@ async fn live_surface_follows_a_real_sign_in() {
     );
 }
 
-/// A phone takes control of a real sign-in page, twice: the page is laid
+/// Taps down the middle of the picture, below a page header's links, until
+/// one focuses `#username`: what each focused.
+async fn tap_down_the_middle(
+    registry: &aidaemon_surfaces::SurfaceRegistry,
+    live_id: &str,
+    surface: &aidaemon_surfaces::SurfaceId,
+) -> Vec<(u32, String)> {
+    use aidaemon_surfaces::{InputEvent, PointerAction, PointerButton};
+    let mut hits = Vec::new();
+    for step in 40..98 {
+        let y = f64::from(step) / 100.0;
+        for action in [PointerAction::Down, PointerAction::Up] {
+            registry
+                .input(
+                    live_id,
+                    &InputEvent::Pointer {
+                        action,
+                        x: 0.5,
+                        y,
+                        button: PointerButton::Left,
+                    },
+                )
+                .await
+                .expect("tap");
+        }
+        let focused = registry.focused(surface).await.ok().flatten();
+        if let Some(selector) = focused.and_then(|f| f.selector) {
+            let found = selector == "#username";
+            hits.push((step, selector));
+            if found {
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// A phone takes control of a real sign-in page, twice, and turns to
+/// landscape the second time: the page is laid
 /// out for the phone's room and its picture comes at that size (Chrome's
 /// screencast stalled on the resize about half the time, so the phone kept
 /// a stale picture and its taps focused nothing), and a tap where the
@@ -799,10 +837,7 @@ async fn live_surface_follows_a_real_sign_in() {
 #[tokio::test]
 #[ignore = "requires local Chrome and the internet; run with --ignored"]
 async fn live_surface_phone_tap_focuses_a_real_field() {
-    use aidaemon_surfaces::{
-        InputEvent, LiveMode, PointerAction, PointerButton, Size, StreamParams, SurfaceRegistry,
-        SurfacesConfig,
-    };
+    use aidaemon_surfaces::{LiveMode, Size, StreamParams, SurfaceRegistry, SurfacesConfig};
     let profile = TempDir::new().expect("temp profile");
     let (media_tx, _media_rx) = mpsc::channel(4);
     let tool = BrowserTool::new(
@@ -848,61 +883,43 @@ async fn live_surface_phone_tap_focuses_a_real_field() {
             )
             .await
             .expect("open live");
-        let frame = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(frame) = live.frames.borrow_and_update().clone()
-                    && frame.w == room.w
-                {
-                    return frame;
-                }
-                live.frames.changed().await.expect("stream open");
-            }
-        })
-        .await
-        .expect("a phone-sized frame within 10 s");
-        if let Some(out) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
-            std::fs::write(
-                format!("{}-{round}", out.to_string_lossy()),
-                &frame.data[..],
-            )
-            .expect("save frame");
+        let mut sizes = vec![room];
+        if round == 1 {
+            // The phone turns to landscape while in control.
+            sizes.push(Size { w: 549, h: 391 });
         }
-        // Down the middle of the picture, below the header's links: some
-        // tap lands in the field.
-        let mut hits = Vec::new();
-        for step in 40..90 {
-            let y = f64::from(step) / 100.0;
-            for action in [PointerAction::Down, PointerAction::Up] {
-                registry
-                    .input(
-                        &live.live_id,
-                        &InputEvent::Pointer {
-                            action,
-                            x: 0.5,
-                            y,
-                            button: PointerButton::Left,
-                        },
-                    )
-                    .await
-                    .expect("tap");
+        for size in sizes {
+            if size != room {
+                registry.refit(&live.live_id, size).await.expect("refit");
             }
-            let focused = registry.focused(&surface.id).await.ok().flatten();
-            if let Some(selector) = focused.and_then(|f| f.selector) {
-                let found = selector == "#username";
-                hits.push((step, selector));
-                if found {
-                    break;
+            let frame = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(frame) = live.frames.borrow_and_update().clone()
+                        && frame.w == size.w
+                    {
+                        return frame;
+                    }
+                    live.frames.changed().await.expect("stream open");
                 }
+            })
+            .await
+            .expect("a frame at the phone's size within 10 s");
+            assert_eq!(frame.h, size.h, "the picture is as tall as the room");
+            if let Some(out) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
+                std::fs::write(
+                    format!("{}-{round}-{}", out.to_string_lossy(), size.w),
+                    &frame.data[..],
+                )
+                .expect("save frame");
             }
+            let hits = tap_down_the_middle(&registry, &live.live_id, &surface.id).await;
+            assert!(
+                hits.iter().any(|(_, s)| s == "#username"),
+                "round {round} at {}x{}: no tap focused the field: {hits:?}",
+                size.w,
+                size.h
+            );
         }
-        eprintln!(
-            "round {round}: frame {}x{}, hits {hits:?}",
-            frame.w, frame.h
-        );
-        assert!(
-            hits.iter().any(|(_, s)| s == "#username"),
-            "round {round}: no tap focused the field: {hits:?}"
-        );
         registry.close_live(&live.live_id);
         registry
             .release_control(&surface.id, "field-phone")

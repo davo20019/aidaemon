@@ -784,6 +784,15 @@ async fn pump_media(
                             tally.waiting_on = None;
                         }
                     }
+                    Ok(MediaClientMessage::Fit { w, h }) => {
+                        // A phone turned: lay the page out for its new room
+                        // (while it holds control; kept for later if not).
+                        let room = aidaemon_surfaces::Size { w, h };
+                        match desk.registry.refit(live_id, room).await {
+                            Ok(()) => info!(surface = %surface_id, w, h, "Viewer's room changed"),
+                            Err(error) => warn!(device = device_id, %error, "Viewer's room refused"),
+                        }
+                    }
                     Ok(MediaClientMessage::Input { event }) => {
                         let now = Instant::now();
                         if now.duration_since(window_start) >= Duration::from_secs(1) {

@@ -174,8 +174,9 @@ struct Live {
     ended: watch::Sender<bool>,
 }
 
-/// The smallest and largest room a surface is laid out for, in points.
-const MIN_FIT: u32 = 240;
+/// The smallest and largest room a surface is laid out for, in points (a
+/// phone held sideways has under 200 points of height for the picture).
+const MIN_FIT: u32 = 160;
 const MAX_FIT: u32 = 2048;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -775,6 +776,34 @@ impl SurfaceRegistry {
             }
             drop(guard);
         });
+    }
+
+    /// The room `live_id`'s device has for the picture changed (a phone
+    /// turned). Kept for the next time that device takes control; while it
+    /// holds control, the surface is laid out again for the new room now.
+    pub async fn refit(&self, live_id: &str, room: crate::types::Size) -> Result<(), SurfaceError> {
+        let room = crate::types::Size {
+            w: room.w.clamp(MIN_FIT, MAX_FIT),
+            h: room.h.clamp(MIN_FIT, MAX_FIT),
+        };
+        let (id, device_id, holds) = {
+            let mut state = lock(&self.shared.state);
+            let live = state.lives.get_mut(live_id).ok_or(SurfaceError::NotFound)?;
+            if live.fit == Some(room) {
+                return Ok(());
+            }
+            live.fit = Some(room);
+            let (id, device_id) = (live.surface.clone(), live.device_id.clone());
+            let holds = state
+                .surfaces
+                .get(&id)
+                .is_some_and(|e| e.controller.owner_device() == Some(device_id.as_str()));
+            (id, device_id, holds)
+        };
+        if holds {
+            self.fit_for(&id, &device_id).await;
+        }
+        Ok(())
     }
 
     /// Give control back to the agent. Only the holding device may.
