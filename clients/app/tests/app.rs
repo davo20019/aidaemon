@@ -1260,7 +1260,9 @@ fn a_handoff_card_opens_the_live_view_and_watching_needs_no_card() -> Result<(),
             r#"{"type":"event","seq":1,"at_ms":2,"session_id":"app:synthetic-live","event":{"type":"approval_requested","approval":{"id":"ap-live","session_id":"app:synthetic-live","kind":"handoff","risk":"low","summary":"Sign in to your Acme account on login.acme.example, then press Done.","options":["approve_once","deny"],"requested_at_ms":2,"card":{"action":{"kind":"take_over","surface_id":"srf_live_1","what":"Sign in to your Acme account","site":"login.acme.example","keeps_sign_in":true}}}}}"#,
         ),
     ]);
-    app.wait_for("Sign in to your Acme account on login.acme.example")?;
+    // The step is the heading; the site and how to do it come under it.
+    app.wait_for("Sign in to your Acme account")?;
+    app.wait_for("On login.acme.example. Do it in the live view or at the computer, then press Done. The agent waits and never sees what you type. A sign-in here is kept for later tasks.")?;
     app.wait_for("Not now")?;
     let before = sent("open_surface");
     app.press("Open the live view")?;

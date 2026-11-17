@@ -89,6 +89,8 @@ pub fn card(store: Store, approval: Approval) -> View {
     for warning in &approval.warnings {
         facts.push((Glyph::Warning, warning.clone(), Tone::Danger));
     }
+    // A take-over's first answer: the live view, where the step is done.
+    let mut live_view: Option<String> = None;
     let (heading, body): (String, Option<View>) = match approval.card.as_ref().map(|c| &c.action) {
         Some(CardAction::Command {
             line,
@@ -121,21 +123,16 @@ pub fn card(store: Store, approval: Approval) -> View {
                 Some(false) => lines.push("A sign-in here lasts only for this task.".into()),
                 None => {}
             }
-            let surface = surface_id.clone();
-            (
-                match site {
-                    Some(site) => format!("{what} on {site}"),
-                    None => what.clone(),
-                },
-                Some(view().gap_2().child(detail_text(lines.join(" "))).child(
-                    view().flex_row().child(btn(
-                        "Open the live view",
-                        Variant::Primary,
-                        Size::Sm,
-                        move || store.watch_surface(&surface, true),
-                    )),
-                )),
-            )
+            live_view = Some(surface_id.clone());
+            // The step is the heading as the agent wrote it; where, and
+            // how, below it.
+            let step = what.trim().trim_end_matches('.').to_string();
+            let mut detail = Vec::new();
+            if let Some(site) = site {
+                detail.push(format!("On {site}."));
+            }
+            detail.extend(lines);
+            (step, Some(detail_text(detail.join(" "))))
         }
         _ => (
             approval.summary.clone(),
@@ -182,7 +179,8 @@ pub fn card(store: Store, approval: Approval) -> View {
                 )
                 .child(badge(risk_label, risk_tone)),
         )
-        .child(when(approval.card.is_some(), {
+        // A take-over says it all in its heading and details.
+        .child(when(approval.card.is_some() && live_view.is_none(), {
             let summary = approval.summary.clone();
             move || detail_text(summary.clone())
         }))
@@ -227,6 +225,14 @@ pub fn card(store: Store, approval: Approval) -> View {
             .text_color(colors::FAINT);
             let terminal = idiom() == Idiom::Terminal;
             let handoff = approval.kind == aidaemon_client_protocol::ApprovalKind::Handoff;
+            let open = live_view.clone().map(|surface| {
+                btn(
+                    "Open the live view",
+                    Variant::Primary,
+                    Size::Sm,
+                    move || store.watch_surface(&surface, true),
+                )
+            });
             let buttons = approval.options.iter().map(move |d| {
                 let (label, variant) = match (handoff, d) {
                     (true, ApprovalDecision::ApproveOnce) => ("Done", Variant::Outline),
@@ -261,6 +267,7 @@ pub fn card(store: Store, approval: Approval) -> View {
                 // first: three side by side would wrap at a thumb's size.
                 view()
                     .gap_2()
+                    .children(open.map(|b| b.w_full()))
                     .children(buttons.map(|(_, b)| b.w_full()))
                     .child(meta)
             } else {
@@ -269,6 +276,7 @@ pub fn card(store: Store, approval: Approval) -> View {
                     .flex_wrap()
                     .items_center()
                     .gap_2()
+                    .children(open)
                     // Pointing at an answer says how far it reaches.
                     .children(buttons.map(|(d, b)| ui::with_hint(scope(d), b)))
                     .child(view().flex_1())

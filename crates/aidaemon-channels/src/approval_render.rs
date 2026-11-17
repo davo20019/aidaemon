@@ -313,9 +313,10 @@ pub fn card_headline(card: &ApprovalCard) -> String {
         } else {
             what
         };
+        // The step stands on its own, as the agent wrote it.
         return match site.as_deref().filter(|site| !site.is_empty()) {
-            Some(site) => format!("{who} needs you to {what} on {site}."),
-            None => format!("{who} needs you to {what}."),
+            Some(site) => format!("{who} needs you on {site}: {what}."),
+            None => format!("{who} needs you: {what}."),
         };
     }
     let what = match &card.action {
@@ -779,7 +780,7 @@ mod tests {
         });
         let text = build_card_markdown(&card, RiskLevel::Safe, &[]);
         assert!(text.contains(
-            "Your assistant needs you to Sign in to your Acme account on login.acme.example."
+            "Your assistant needs you on login.acme.example: Sign in to your Acme account."
         ));
         assert!(text.contains("kept for later tasks"));
         assert!(text.contains("never sees what you type"));

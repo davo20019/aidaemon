@@ -85,6 +85,10 @@ impl HandOverTool {
             .chars()
             .take(MAX_WHAT_CHARS)
             .collect();
+        // A step, not a sentence: the card puts it in its own.
+        let what = what
+            .trim_end_matches(|c: char| c == '.' || c == ',' || c == ';' || c.is_whitespace())
+            .to_string();
         if what.is_empty() {
             "do a step yourself".into()
         } else {
@@ -116,7 +120,7 @@ impl Tool for HandOverTool {
                     },
                     "what": {
                         "type": "string",
-                        "description": "What the owner should do, in a few plain words, e.g. 'Sign in to your Acme account'."
+                        "description": "The step the owner should do, in a few plain words, e.g. 'Sign in to your Acme account'. Only the step: the card adds the site and the Done button itself."
                     }
                 },
                 "required": ["what"],

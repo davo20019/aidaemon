@@ -41,6 +41,7 @@ SHELL = {
     "wizard.rs": "setup wizard",
     "setup": "first run: setup mode's host over the SDK provider catalog, and the terminal setup",
     "updater.rs": "self-update",
+    "share_screen.rs": "the share-screen subcommand: wires client-core's screen sharing to this computer's display",
     "single_instance.rs": "process handling",
     "daemon.rs": "service install and process handling",
     "logging.rs": "log setup",

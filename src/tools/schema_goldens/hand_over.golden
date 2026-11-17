@@ -12,7 +12,7 @@
           "type": "string"
         },
         "what": {
-          "description": "What the owner should do, in a few plain words, e.g. 'Sign in to your Acme account'.",
+          "description": "The step the owner should do, in a few plain words, e.g. 'Sign in to your Acme account'. Only the step: the card adds the site and the Done button itself.",
           "type": "string"
         }
       },
