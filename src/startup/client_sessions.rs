@@ -67,3 +67,27 @@ pub(crate) async fn archive(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::testing::{MockProvider, setup_test_agent};
+    use crate::traits::store_prelude::*;
+
+    #[tokio::test]
+    async fn a_new_message_brings_an_archived_chat_back() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let (state, pool) = (harness.state.clone(), harness.state.pool());
+        let chat = "telegram_bot:synthetic-user-1";
+        state
+            .save_session_channel(chat, "telegram:telegram_bot")
+            .await
+            .unwrap();
+        super::archive(&pool, chat, true).await.unwrap();
+        assert!(super::marks(&pool).await[chat].1);
+        state
+            .chat_seen(chat, "telegram:telegram_bot", false)
+            .await
+            .unwrap();
+        assert!(!super::marks(&pool).await.get(chat).is_some_and(|m| m.1));
+    }
+}

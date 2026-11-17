@@ -1,9 +1,10 @@
 //! Links into the app. A channel's handoff card links to the live view as
 //! `…/client/v1/next/#surface=<id>`: opened in a browser, the app waits until
 //! it is connected, opens that view with control (as the card's own "Open the
-//! live view" does), and takes the part out of its address so a reload does
-//! not open it again. The same link given to the open page (typed, or the
-//! browser's back and forward) does the same.
+//! live view" does), and only then takes the part out of its address, so a
+//! reload before it connects still opens it and one after does not. The
+//! same link given to the open page (typed, or the browser's back and
+//! forward) does the same.
 
 use nsh_core::prelude::*;
 
@@ -14,21 +15,20 @@ const SURFACE: &str = "surface=";
 
 /// Start listening; lives as long as its caller (the shell).
 pub fn surface_links(store: Store) {
-    let wanted = signal(None::<String>);
+    let wanted = signal(None::<(String, String)>);
     spawn(async move {
         let mut url = app_url().await;
         loop {
             if let Some(at) = url.as_deref()
                 && let Some(id) = surface_in(at)
             {
-                let _ = set_app_url(without_surface(at));
-                wanted.set(Some(id));
+                wanted.set(Some((id, at.to_owned())));
             }
             url = Some(next_app_url_change().await.url);
         }
     });
     effect(move || {
-        let Some(id) = wanted.get() else {
+        let Some((id, at)) = wanted.get() else {
             return;
         };
         if !store.is_online() {
@@ -37,6 +37,7 @@ pub fn surface_links(store: Store) {
         untracked(|| {
             wanted.set(None);
             store.watch_surface(&id, true);
+            let _ = set_app_url(without_surface(&at));
         });
     });
 }

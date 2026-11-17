@@ -27,7 +27,10 @@ impl crate::state::types::SessionChannelStore for SqliteStateStore {
         channel_name: &str,
         shared: bool,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE session_channels SET shared = ? WHERE session_id = ?")
+        // The owner writing in a chat they archived brings it back to the
+        // list: a chat runs for months, and an archive was of what was said
+        // before.
+        sqlx::query("UPDATE session_channels SET shared = ?, archived = NULL WHERE session_id = ?")
             .bind(i64::from(shared))
             .bind(session_id)
             .execute(&self.pool)
