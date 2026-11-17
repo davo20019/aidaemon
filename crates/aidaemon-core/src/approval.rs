@@ -489,6 +489,17 @@ pub enum CardAction {
         /// How long a one-time allowance lasts.
         once_minutes: u64,
     },
+    /// Click a button on a web site in the browser (one whose effect the
+    /// page's script decides). Allow Once covers only this click; allowing
+    /// it for the session covers buttons on `site` (an origin) until the
+    /// browser session ends. Forms, passwords and payment fields still ask
+    /// every time.
+    ClickOnSite {
+        site: String,
+        /// The selector the click targets, shown collapsed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Use a tool; `what` completes "wants to …".
     Use {
         what: String,

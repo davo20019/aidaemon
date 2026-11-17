@@ -2033,6 +2033,9 @@ pub struct MockBackend {
     element_state: Arc<Mutex<MockElementState>>,
     diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
     diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
+    /// When set, the URL every page reports from `url()` instead of `url`
+    /// (a page that moved to another site).
+    live_url: Arc<Mutex<Option<String>>>,
     sign_in_store: Arc<std::sync::Mutex<SignInStore>>,
 }
 
@@ -2108,6 +2111,7 @@ impl Default for MockBackend {
             element_state: Arc::new(Mutex::new(MockElementState::default())),
             diagnostic_console: Arc::new(Mutex::new(Vec::new())),
             diagnostic_network: Arc::new(Mutex::new(Vec::new())),
+            live_url: Arc::new(Mutex::new(None)),
             sign_in_store: Arc::new(std::sync::Mutex::new(SignInStore::NotKept)),
         }
     }
@@ -2198,6 +2202,12 @@ impl MockBackend {
     pub fn with_element_state(mut self, state: MockElementState) -> Self {
         self.element_state = Arc::new(Mutex::new(state));
         self
+    }
+
+    /// Make every page report `url` from `url()` from now on (the page moved
+    /// to another site).
+    pub async fn set_page_url(&self, url: &str) {
+        *self.live_url.lock().await = Some(url.to_string());
     }
 
     /// Script the facts `element_facts` reports for `selector` from now on.
@@ -2356,6 +2366,9 @@ struct MockPage {
     diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
     /// Scripted network errors flushed into the diagnostics store on attach.
     diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
+    /// When set, the URL every page reports from `url()` instead of `url`
+    /// (a page that moved to another site).
+    live_url: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(test)]
@@ -2552,6 +2565,9 @@ impl PageHandle for MockPage {
 
     async fn url(&self) -> Option<String> {
         self.record(MockCall::Url).await;
+        if let Some(url) = self.live_url.lock().await.clone() {
+            return Some(url);
+        }
         self.url.clone()
     }
 
@@ -2696,6 +2712,7 @@ impl BrowserBackend for MockBackend {
                 pdf_never_finishes: Arc::clone(&self.pdf_never_finishes),
                 diagnostic_console: Arc::clone(&self.diagnostic_console),
                 diagnostic_network: Arc::clone(&self.diagnostic_network),
+                live_url: Arc::clone(&self.live_url),
             }),
         ))
     }
@@ -2780,6 +2797,7 @@ impl BrowserBackend for MockBackend {
             pdf_never_finishes: Arc::clone(&self.pdf_never_finishes),
             diagnostic_console: Arc::clone(&self.diagnostic_console),
             diagnostic_network: Arc::clone(&self.diagnostic_network),
+            live_url: Arc::clone(&self.live_url),
         }))
     }
 

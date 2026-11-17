@@ -5611,18 +5611,174 @@ async fn a_target_that_changed_after_judgment_is_refused_before_the_click() {
             trusted_session: false,
         })
         .await,
-        super::GateDecision::Allow { cleared: false }
+        super::GateDecision::Allow {
+            clearance: super::Clearance {
+                point_of_action: false,
+                button_site: None
+            }
+        }
     ));
     // ... then the page swaps a POST submit in under the same selector.
     backend.set_element_facts("#swap", post_submit()).await;
     let err = tool
-        .recheck_target(&*page, "click", "#swap", false)
+        .recheck_target(
+            &*page,
+            "sess-swap",
+            "click",
+            "#swap",
+            &super::Clearance::default(),
+        )
         .await
         .unwrap_err();
     assert!(err.contains("Approval required"), "{err}");
+    let cleared = super::Clearance {
+        point_of_action: true,
+        button_site: None,
+    };
     assert!(
-        tool.recheck_target(&*page, "click", "#swap", true)
+        tool.recheck_target(&*page, "sess-swap", "click", "#swap", &cleared)
             .await
             .is_ok()
     );
+}
+
+/// A plain button: what it does is a script, so it is site-scoped.
+fn plain_button() -> super::backend::MockFacts {
+    super::backend::MockFacts::Element(super::policy::ElementFacts {
+        tag: "button".into(),
+        ..Default::default()
+    })
+}
+
+fn site_backend() -> MockBackend {
+    backend_with_facts(&[
+        ("#add-to-cart", plain_button()),
+        ("#next-step", plain_button()),
+        ("#place-order", post_submit()),
+        ("#password", password_field()),
+    ])
+}
+
+/// The first button click on a site asks, with a session choice; the
+/// owner's session approval covers buttons on that site (its origin) for
+/// the browser session, while a form submit, a password fill and another
+/// site still ask.
+#[tokio::test]
+async fn button_clicks_are_approved_once_per_site() {
+    let (tool, backend, recorder) = approving_tool(site_backend(), ApprovalResponse::AllowSession);
+    let facts = || aidaemon_tools::testing::call_facts("sess-site");
+    open_page(&tool, "sess-site").await;
+    let click = |selector: &str| json!({ "action": "click", "selector": selector }).to_string();
+
+    let out = tool
+        .call_with(&click("#add-to-cart"), facts())
+        .await
+        .unwrap();
+    assert_eq!(out, "Clicked element '#add-to-cart'");
+    assert_eq!(recorder.count().await, 1, "the first button on a site asks");
+    assert!(matches!(
+        recorder.kinds().await.as_slice(),
+        [ApprovalKind::Command]
+    ));
+    let summary = &recorder.commands().await[0];
+    assert!(
+        summary.contains("buttons on https://mock.example"),
+        "the card says what the session choice covers: {summary}"
+    );
+
+    // Another button on the same site runs without a card.
+    let out = tool.call_with(&click("#next-step"), facts()).await.unwrap();
+    assert_eq!(out, "Clicked element '#next-step'");
+    assert_eq!(recorder.count().await, 1);
+
+    // A form submit and a password fill still ask every time.
+    tool.call_with(&click("#place-order"), facts())
+        .await
+        .unwrap();
+    assert_eq!(
+        recorder.count().await,
+        2,
+        "a form submit asks after the grant"
+    );
+    assert!(matches!(
+        recorder.kinds().await[1],
+        ApprovalKind::CommandOnce
+    ));
+    tool.call_with(
+        &json!({ "action": "fill", "selector": "#password", "value": "synthetic-secret" })
+            .to_string(),
+        facts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorder.count().await,
+        3,
+        "a password fill asks after the grant"
+    );
+    assert!(matches!(
+        recorder.kinds().await[2],
+        ApprovalKind::CommandOnce
+    ));
+
+    // The same button on another site asks again.
+    backend.set_page_url("https://other.example/checkout").await;
+    tool.call_with(&click("#next-step"), facts()).await.unwrap();
+    assert_eq!(recorder.count().await, 4, "another site asks");
+    assert!(
+        recorder.commands().await[3].contains("https://other.example"),
+        "{:?}",
+        recorder.commands().await
+    );
+}
+
+/// Allow Once on a site-scoped card covers that click only.
+#[tokio::test]
+async fn allow_once_on_a_button_covers_only_that_click() {
+    let (tool, backend, recorder) = approving_tool(site_backend(), ApprovalResponse::AllowOnce);
+    let facts = || aidaemon_tools::testing::call_facts("sess-once");
+    open_page(&tool, "sess-once").await;
+    let click = json!({ "action": "click", "selector": "#add-to-cart" }).to_string();
+    tool.call_with(&click, facts()).await.unwrap();
+    tool.call_with(&click, facts()).await.unwrap();
+    assert_eq!(recorder.count().await, 2);
+    assert!(calls_contains(&backend, &MockCall::Click("#add-to-cart".to_string())).await);
+    assert!(
+        !tool
+            .sessions
+            .is_button_site_approved("sess-once", "https://mock.example")
+            .await
+    );
+}
+
+/// A button approved on one site is refused at execution when the page has
+/// moved to another site since the call was judged.
+#[tokio::test]
+async fn a_button_approval_does_not_follow_the_page_to_another_site() {
+    let backend = Arc::new(site_backend());
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let tool = BrowserTool::with_backend(backend.clone(), media_tx);
+    open_page(&&tool, "sess-moved").await;
+    let page = tool.sessions.active_target_id("sess-moved").await.unwrap();
+    let page = tool.sessions.tab("sess-moved", &page).await.unwrap().page;
+    let once = super::Clearance {
+        point_of_action: false,
+        button_site: Some("https://mock.example".to_string()),
+    };
+    assert!(
+        tool.recheck_target(&*page, "sess-moved", "click", "#add-to-cart", &once)
+            .await
+            .is_ok()
+    );
+    tool.sessions
+        .approve_button_site("sess-moved", "https://mock.example".to_string())
+        .await;
+    backend.set_page_url("https://other.example/").await;
+    for clearance in [once, super::Clearance::default()] {
+        let err = tool
+            .recheck_target(&*page, "sess-moved", "click", "#add-to-cart", &clearance)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not approved buttons"), "{err}");
+    }
 }

@@ -190,7 +190,7 @@ pub fn build_card_markdown(card: &ApprovalCard, risk: RiskLevel, notes: &[String
     let mut text = lines.join("\n");
     let detail = match &card.action {
         CardAction::Command { line, .. } => Some(shorten_middle(line, CARD_COMMAND_CHARS)),
-        CardAction::Use { detail, .. } => detail
+        CardAction::Use { detail, .. } | CardAction::ClickOnSite { target: detail, .. } => detail
             .as_deref()
             .map(|detail| shorten_middle(detail, CARD_COMMAND_CHARS)),
         _ => None,
@@ -246,6 +246,7 @@ pub fn card_as_warnings(ask: &ApprovalAsk<'_>) -> Vec<String> {
             "Details: {}",
             shorten_middle(detail, CARD_COMMAND_CHARS)
         )),
+        CardAction::ClickOnSite { site, .. } => warnings.push(click_on_site_scope(site)),
         _ => {}
     }
     warnings
@@ -345,6 +346,9 @@ pub fn card_headline(card: &ApprovalCard) -> String {
         CardAction::OpenLocalSite { site, .. } => {
             format!("open {site} in the browser, a site on this computer")
         }
+        CardAction::ClickOnSite { site, .. } => {
+            format!("click a button on {site} in the browser")
+        }
         CardAction::Use { what, .. } => what.trim().trim_end_matches('.').to_string(),
         _ => "do something that needs your OK".to_string(),
     };
@@ -404,7 +408,20 @@ fn card_why(card: &ApprovalCard) -> Option<String> {
              the longer choice lasts until this browser session ends."
         ));
     }
+    if let CardAction::ClickOnSite { site, .. } = &card.action {
+        lines.push(click_on_site_scope(site));
+    }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// What allowing a browser button click covers: the one click, or every
+/// button on `site` for the browser session; forms and secrets still ask.
+pub fn click_on_site_scope(site: &str) -> String {
+    format!(
+        "Allow once covers only this click; the longer choice covers buttons on {site} \
+         until this browser session ends. Submitting a form, a password or payment field, \
+         and other sites still ask."
+    )
 }
 
 fn goal_detail_section(detail: &str) -> (&'static str, &str) {
@@ -714,6 +731,24 @@ mod tests {
              Allow only if you asked for it. Allow covers the next 30 minutes; the longer \
              choice lasts until this browser session ends."
         );
+    }
+
+    #[test]
+    fn a_button_card_says_the_session_choice_covers_the_site() {
+        let card = ApprovalCard::new(CardAction::ClickOnSite {
+            site: "https://shop.example.test".to_string(),
+            target: Some("#add-to-cart".to_string()),
+        });
+        let text = ask(&card, RiskLevel::High, &[]);
+        assert!(
+            text.starts_with(
+                "**Your assistant wants to click a button on https://shop.example.test in the \
+                 browser.**\nAllow once covers only this click; the longer choice covers \
+                 buttons on https://shop.example.test until this browser session ends."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("#add-to-cart"), "{text}");
     }
 
     #[test]

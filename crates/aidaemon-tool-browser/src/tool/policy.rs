@@ -221,20 +221,41 @@ pub enum TargetFacts {
     Unreadable,
 }
 
+/// How far the owner's approval of a click or fill reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionScope {
+    /// Navigation or local page state: at most the session's ordinary
+    /// approval.
+    Ordinary,
+    /// A button or handler-driven element: what it does is a script the DOM
+    /// cannot show, but not a form, a secret or a download. The first such
+    /// click on a site asks; the owner's session approval covers that site
+    /// (its origin) for the rest of the browser session.
+    Site,
+    /// Point of action: asks every time, whatever was approved before.
+    PointOfAction,
+}
+
 impl TargetFacts {
-    /// Whether `action` on this target needs the owner for this exact call.
-    /// A missing element or a blank page cannot be acted on, so they do not;
-    /// facts that could not be read do (fail safe).
-    pub fn needs_owner(&self, action: &str) -> bool {
+    /// How far an approval of `action` on this target reaches. A missing
+    /// element or a blank page cannot be acted on, so they are ordinary;
+    /// facts that could not be read are point of action (fail safe).
+    pub fn scope(&self, action: &str) -> ActionScope {
         match self {
-            Self::NoPage | Self::Missing => false,
-            Self::Unreadable => true,
+            Self::NoPage | Self::Missing => ActionScope::Ordinary,
+            Self::Unreadable => ActionScope::PointOfAction,
             Self::Element(facts) => match action {
-                "click" => click_needs_owner(facts),
-                "fill" => fill_needs_owner(facts),
-                _ => true,
+                "click" => click_scope(facts),
+                "fill" if fill_needs_owner(facts) => ActionScope::PointOfAction,
+                "fill" => ActionScope::Ordinary,
+                _ => ActionScope::PointOfAction,
             },
         }
+    }
+
+    /// Whether `action` on this target needs the owner for this exact call.
+    pub fn needs_owner(&self, action: &str) -> bool {
+        self.scope(action) == ActionScope::PointOfAction
     }
 }
 
@@ -245,30 +266,50 @@ fn role_is(facts: &ElementFacts, roles: &[&str]) -> bool {
         .is_some_and(|role| roles.contains(&role))
 }
 
-/// Whether clicking this element needs the owner every time. A click is
-/// ordinary only when its effect is typed as navigation or local page state:
-/// a web link, a search form's (non-POST) submit, a disclosure, a selection
-/// control, or focusing a text field. Submitting any other form, and any
-/// other button or handler-driven element, whose effect the DOM cannot show,
-/// needs the owner.
-pub fn click_needs_owner(facts: &ElementFacts) -> bool {
+/// How far approving a click on this element reaches. Point of action:
+/// submitting a form (except a search form's non-POST submit), a link that
+/// is not a plain web link (a `javascript:` or other scheme, a download).
+/// Ordinary: a web link, a disclosure, a selection control, focusing a text
+/// field. Anything else (a plain or `role=button`, a handler-driven
+/// element) is site-scoped.
+pub fn click_scope(facts: &ElementFacts) -> ActionScope {
     if facts.submits_form {
         let posts = !matches!(facts.form_method.as_deref(), None | Some("get"));
-        return !facts.search_form || posts;
+        return if !facts.search_form || posts {
+            ActionScope::PointOfAction
+        } else {
+            ActionScope::Ordinary
+        };
     }
-    let web_link = matches!(facts.link_scheme.as_deref(), Some("http" | "https"));
-    if (web_link && !facts.link_download) || role_is(facts, &["link"]) {
-        return false;
+    match facts.link_scheme.as_deref() {
+        Some("http" | "https") if !facts.link_download => return ActionScope::Ordinary,
+        Some(_) => return ActionScope::PointOfAction,
+        None => {}
     }
-    if facts.disclosure || facts.tag == "summary" {
-        return false;
+    if role_is(facts, &["link"]) || facts.disclosure || facts.tag == "summary" {
+        return ActionScope::Ordinary;
     }
     let selection = matches!(facts.tag.as_str(), "select" | "option")
         || matches!(facts.input_type.as_deref(), Some("checkbox" | "radio"))
         || role_is(facts, &["tab", "option", "treeitem", "combobox"]);
-    // Anything else (a plain or role=button, a handler-driven element) does
-    // what a script decides, which the DOM cannot show.
-    !(selection || facts.editable)
+    if selection || facts.editable {
+        ActionScope::Ordinary
+    } else {
+        ActionScope::Site
+    }
+}
+
+/// Whether clicking this element needs the owner every time.
+pub fn click_needs_owner(facts: &ElementFacts) -> bool {
+    click_scope(facts) == ActionScope::PointOfAction
+}
+
+/// The origin (`scheme://host[:port]`) of `url`, parsed as a URL: the key
+/// a site-scoped approval covers. `None` for an opaque origin (`about:`,
+/// `data:`, a malformed URL), which no approval can cover.
+pub fn site_origin(url: &str) -> Option<String> {
+    let origin = reqwest::Url::parse(url.trim()).ok()?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
 /// Whether filling this element needs the owner every time: a password,
@@ -420,28 +461,68 @@ mod tests {
         assert!(click_needs_owner(&submit(Some("post"), true)));
     }
 
-    /// A plain button's effect is a script the DOM cannot show (a single-page
-    /// app's "place order"), so it needs the owner.
+    /// A plain button's effect is a script the DOM cannot show, so it is
+    /// site-scoped; a link that is not a plain web link asks every time.
     #[test]
-    fn a_handler_driven_button_needs_the_owner() {
-        assert!(click_needs_owner(&element("button")));
-        assert!(click_needs_owner(&ElementFacts {
-            role: Some("button".into()),
-            ..element("div")
-        }));
-        assert!(click_needs_owner(&ElementFacts {
-            role: Some("switch".into()),
-            ..element("div")
-        }));
-        assert!(click_needs_owner(&ElementFacts {
-            link_scheme: Some("javascript".into()),
-            ..element("a")
-        }));
-        assert!(click_needs_owner(&ElementFacts {
-            link_scheme: Some("https".into()),
-            link_download: true,
-            ..element("a")
-        }));
+    fn handler_driven_buttons_are_site_scoped() {
+        for facts in [
+            element("button"),
+            ElementFacts {
+                role: Some("button".into()),
+                ..element("div")
+            },
+            ElementFacts {
+                role: Some("switch".into()),
+                ..element("div")
+            },
+            element("div"),
+        ] {
+            assert_eq!(click_scope(&facts), ActionScope::Site, "{facts:?}");
+            assert!(!click_needs_owner(&facts), "{facts:?}");
+        }
+        for facts in [
+            ElementFacts {
+                link_scheme: Some("javascript".into()),
+                ..element("a")
+            },
+            ElementFacts {
+                link_scheme: Some("https".into()),
+                link_download: true,
+                ..element("a")
+            },
+            ElementFacts {
+                link_scheme: Some("invalid".into()),
+                ..element("a")
+            },
+        ] {
+            assert_eq!(click_scope(&facts), ActionScope::PointOfAction, "{facts:?}");
+        }
+        assert_eq!(
+            click_scope(&submit(Some("post"), false)),
+            ActionScope::PointOfAction
+        );
+    }
+
+    #[test]
+    fn a_site_is_its_parsed_origin() {
+        assert_eq!(
+            site_origin("https://Shop.Example.test/cart?id=1#x").as_deref(),
+            Some("https://shop.example.test")
+        );
+        assert_eq!(
+            site_origin("https://shop.example.test:443/").as_deref(),
+            Some("https://shop.example.test")
+        );
+        assert_eq!(
+            site_origin("http://shop.example.test:8080/a").as_deref(),
+            Some("http://shop.example.test:8080")
+        );
+        assert_eq!(
+            site_origin("https://user:secret@shop.example.test/").as_deref(),
+            Some("https://shop.example.test")
+        );
+        assert_eq!(site_origin("about:blank"), None);
+        assert_eq!(site_origin("data:text/html,hi"), None);
     }
 
     #[test]
@@ -511,6 +592,10 @@ mod tests {
         assert!(TargetFacts::Unreadable.needs_owner("fill"));
         assert!(!TargetFacts::Missing.needs_owner("click"));
         assert!(!TargetFacts::NoPage.needs_owner("fill"));
+        assert_eq!(
+            TargetFacts::Unreadable.scope("click"),
+            ActionScope::PointOfAction
+        );
     }
 
     #[test]

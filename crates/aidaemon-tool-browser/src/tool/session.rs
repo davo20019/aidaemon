@@ -90,6 +90,9 @@ pub struct BrowserSessionRegistry {
     /// Sites on this computer the owner let each session open, by
     /// `policy::local_site_key`; `None` lasts until the session is evicted.
     local_sites: Mutex<HashMap<String, HashMap<String, Option<Instant>>>>,
+    /// Sites (origins, `policy::site_origin`) on which the owner let each
+    /// session click buttons without asking, until the session is evicted.
+    button_sites: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// The chat whose grants a session's approvals are (a sub-agent's
     /// session maps to its parent chat), set on every call from the
     /// dispatcher's typed `grant_session`.
@@ -132,6 +135,7 @@ impl BrowserSessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             approvals: Mutex::new(HashMap::new()),
             local_sites: Mutex::new(HashMap::new()),
+            button_sites: Mutex::new(HashMap::new()),
             grant_sessions: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -200,6 +204,28 @@ impl BrowserSessionRegistry {
             .entry(grant)
             .or_default()
             .insert(key, expires_at);
+    }
+
+    /// Whether the owner let this session click buttons on the site
+    /// `origin` without asking.
+    pub async fn is_button_site_approved(&self, session_id: &str, origin: &str) -> bool {
+        let grant = self.grant_key(session_id);
+        self.button_sites
+            .lock()
+            .await
+            .get(&grant)
+            .is_some_and(|sites| sites.contains(origin))
+    }
+
+    /// Let this session click buttons on the site `origin` without asking.
+    pub async fn approve_button_site(&self, session_id: &str, origin: String) {
+        let grant = self.grant_key(session_id);
+        self.button_sites
+            .lock()
+            .await
+            .entry(grant)
+            .or_default()
+            .insert(origin);
     }
 
     /// Every tab of every session: `(session_id, tab, is_active)`, for the
@@ -584,6 +610,11 @@ impl BrowserSessionRegistry {
             let mut local_sites = self.local_sites.lock().await;
             for ev in &evicted {
                 local_sites.remove(&ev.session_id);
+            }
+            drop(local_sites);
+            let mut button_sites = self.button_sites.lock().await;
+            for ev in &evicted {
+                button_sites.remove(&ev.session_id);
             }
         }
 

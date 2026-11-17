@@ -355,6 +355,15 @@ fn detail_of(card: &aidaemon_core::ApprovalCard) -> Option<String> {
         aidaemon_core::CardAction::Command { line, .. } => Some(line.clone()),
         aidaemon_core::CardAction::OpenLocalSite { site, .. } => Some(site.clone()),
         aidaemon_core::CardAction::Use { detail, .. } => detail.clone(),
+        // The app has no card for this action yet: the scope goes in the
+        // detail under the headline.
+        aidaemon_core::CardAction::ClickOnSite { site, target } => {
+            let scope = aidaemon_channels::approval_render::click_on_site_scope(site);
+            Some(match target {
+                Some(target) => format!("{target}\n{scope}"),
+                None => scope,
+            })
+        }
         _ => None,
     }
 }

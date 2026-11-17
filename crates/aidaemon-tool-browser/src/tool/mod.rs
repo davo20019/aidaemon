@@ -55,6 +55,13 @@ const POINT_OF_ACTION_CHANGED: &str = "Approval required: the element this actio
      now needs the owner's approval for this exact action (the page changed after the call \
      was judged). Nothing was done; retry the action to ask the owner.";
 
+/// The refusal when a site-scoped click reaches a site the owner has not
+/// approved buttons on (the page moved to another site after the call was
+/// judged).
+const BUTTON_SITE_CHANGED: &str = "Approval required: the button this click targets is on a \
+     site the owner has not approved buttons on (the page changed after the call was judged). \
+     Nothing was done; retry the action to ask the owner.";
+
 /// Maximum allowed size of a `script` argument for `execute_js`. Generous for
 /// legitimate automation (64 KiB covers virtually any real workflow) while
 /// bounding potential abuse via enormous payloads.
@@ -225,13 +232,24 @@ fn short_page_name(display_url: &str) -> &str {
 /// backend; `Deny` blocks it with a user-facing reason BEFORE any page/backend
 /// method is touched.
 enum GateDecision {
-    /// The call may run. `cleared` is true when it may run even at a point
-    /// of action: the owner approved this exact point-of-action call, or the
-    /// call is owner-confirmed scheduled work.
+    /// The call may run, as far as `clearance` reaches.
     Allow {
-        cleared: bool,
+        clearance: Clearance,
     },
     Deny(String),
+}
+
+/// How far the gate's decision reaches when the click or fill re-reads its
+/// target under the action lock.
+#[derive(Debug, Clone, Default)]
+struct Clearance {
+    /// The call may run even at a point of action: the owner approved this
+    /// exact point-of-action call, or the call is owner-confirmed scheduled
+    /// work.
+    point_of_action: bool,
+    /// The site (origin) whose button the owner approved this exact click
+    /// on, once.
+    button_site: Option<String>,
 }
 
 /// The card for letting the browser open a site on this computer. It names
@@ -267,7 +285,39 @@ enum BrowserApproval {
     Ask {
         request: aidaemon_core::OwnerApprovalRequest,
         point_of_action: bool,
+        /// A site-scoped click's site (origin): a session approval of the
+        /// card covers buttons on it; Allow Once only this click.
+        button_site: Option<String>,
     },
+}
+
+/// The card for a click on a site-scoped target (a button whose effect is a
+/// script) on `site`, an origin.
+fn button_site_request(
+    site: &str,
+    selector: Option<&str>,
+    subject: String,
+) -> aidaemon_core::OwnerApprovalRequest {
+    let summary = match selector {
+        Some(selector) => format!("Click \"{selector}\" on {site}"),
+        None => format!("Click on {site}"),
+    };
+    aidaemon_core::OwnerApprovalRequest {
+        card: Some(Box::new(aidaemon_core::ApprovalCard::new(
+            aidaemon_core::CardAction::ClickOnSite {
+                site: site.to_string(),
+                target: selector.map(str::to_string),
+            },
+        ))),
+        effects: Vec::new(),
+        summary: format!(
+            "{summary}? Allow Once covers only this click; Allow Session or Always covers \
+             buttons on {site} until this browser session ends."
+        ),
+        subject,
+        risk: aidaemon_core::ApprovalRisk::High,
+        warnings: Vec::new(),
+    }
 }
 
 /// The parsed, approval-relevant fields of a single browser tool call. Bundled
@@ -803,6 +853,10 @@ impl BrowserTool {
     ///   (`policy::TargetFacts::needs_owner`) is point-of-action for interactive sessions,
     ///   but an owner-confirmed scheduled run may execute the exact dispatcher-
     ///   issued call without waking the owner.
+    /// - A site-scoped click (a button or handler-driven element,
+    ///   `policy::ActionScope::Site`) asks once per site (origin of the page's
+    ///   URL): a session approval of that card covers buttons on the site for
+    ///   the browser session. On a page with no origin it is point of action.
     /// - Opening a site on this computer: ask once per site, in every kind of
     ///   session, unless the owner already let this session open it, the
     ///   work set the site up itself, or the owner's request names it
@@ -817,6 +871,7 @@ impl BrowserTool {
             return BrowserApproval::Ask {
                 request: local_site_request(&key),
                 point_of_action: false,
+                button_site: None,
             };
         }
 
@@ -841,14 +896,44 @@ impl BrowserTool {
             return BrowserApproval::NotNeeded;
         }
 
-        // A click or fill is point of action by its target's typed DOM facts,
-        // never by the words in its selector.
-        let consequential = matches!(args.action, "click" | "fill")
-            && self
-                .target_facts(args.session_id, args.selector)
+        // How far an approval of a click or fill reaches comes from its
+        // target's typed DOM facts, never from the words in its selector.
+        let scope = if matches!(args.action, "click" | "fill") {
+            self.target_facts(args.session_id, args.selector)
                 .await
-                .needs_owner(args.action);
+                .scope(args.action)
+        } else {
+            policy::ActionScope::Ordinary
+        };
+        // A site-scoped click whose site cannot be told (an opaque page)
+        // cannot be covered by a site approval, so it asks every time.
+        let button_site = match scope {
+            policy::ActionScope::Site => self.active_site(args.session_id).await,
+            _ => None,
+        };
+        let consequential = scope == policy::ActionScope::PointOfAction
+            || (scope == policy::ActionScope::Site && button_site.is_none());
         let point_of_action = risk.sensitive || consequential;
+
+        if !point_of_action && let Some(site) = &button_site {
+            if self
+                .sessions
+                .is_button_site_approved(args.session_id, site)
+                .await
+            {
+                return BrowserApproval::NotNeeded;
+            }
+            let summary = self.build_prompt(args, &risk).await;
+            return BrowserApproval::Ask {
+                request: button_site_request(
+                    site,
+                    args.selector,
+                    Self::call_subject(args, &summary),
+                ),
+                point_of_action: false,
+                button_site: Some(site.clone()),
+            };
+        }
 
         // Session-level fast path: an already-approved session skips the card
         // for ordinary mutation — but NEVER for point-of-action.
@@ -871,19 +956,7 @@ impl BrowserTool {
             warnings.push(POINT_OF_ACTION_CONSEQUENTIAL.to_string());
         }
         let summary = self.build_prompt(args, &risk).await;
-        // The subject binds the exact call (the hidden fill value and script
-        // included, by digest only) to what the owner saw.
-        let exact = json!([
-            args.action,
-            args.url,
-            args.selector,
-            args.script,
-            args.tab_id,
-            args.value,
-        ])
-        .to_string();
-        let digest = hex::encode(Sha256::digest(exact.as_bytes()));
-        let subject = format!("{summary} [call {}]", &digest[..16]);
+        let subject = Self::call_subject(args, &summary);
         BrowserApproval::Ask {
             request: aidaemon_core::OwnerApprovalRequest {
                 card: None,
@@ -897,7 +970,43 @@ impl BrowserTool {
                 warnings,
             },
             point_of_action,
+            button_site: None,
         }
+    }
+
+    /// The subject that binds the exact call (the hidden fill value and
+    /// script included, by digest only) to what the owner saw.
+    fn call_subject(args: &ActionArgs<'_>, summary: &str) -> String {
+        let exact = json!([
+            args.action,
+            args.url,
+            args.selector,
+            args.script,
+            args.tab_id,
+            args.value,
+        ])
+        .to_string();
+        let digest = hex::encode(Sha256::digest(exact.as_bytes()));
+        format!("{summary} [call {}]", &digest[..16])
+    }
+
+    /// The site (origin) of the session's active page, from its live URL
+    /// (else the last one recorded); `None` with no page or an opaque origin.
+    async fn active_site(&self, session_id: &str) -> Option<String> {
+        let target = self.sessions.active_target_id(session_id).await?;
+        let tab = self.sessions.tab(session_id, &target).await?;
+        let url = match tab.page.url().await {
+            Some(url) => url,
+            None => {
+                self.sessions
+                    .list_tabs(session_id)
+                    .await
+                    .into_iter()
+                    .find(|view| view.active)?
+                    .url?
+            }
+        };
+        policy::site_origin(&url)
     }
 
     /// The typed facts of the element `selector` targets on the session's
@@ -927,26 +1036,59 @@ impl BrowserTool {
 
     /// Re-read the target's facts under the action lock, just before the
     /// click or fill: a target that is now a point of action runs only when
-    /// the call was cleared as one. Returns the facts the action runs on.
+    /// the call was cleared as one, and a site-scoped one only on a site the
+    /// owner approved buttons on (for the session, or this click once).
+    /// Returns the facts the action runs on.
     async fn recheck_target(
         &self,
         page: &dyn PageHandle,
+        session_id: &str,
         action: &str,
         selector: &str,
-        cleared: bool,
+        clearance: &Clearance,
     ) -> Result<policy::TargetFacts, String> {
         let facts = self.facts_on(page, selector).await;
         if facts == policy::TargetFacts::Missing {
             return Err(format!("Element not found '{selector}'"));
         }
-        if facts.needs_owner(action) && !cleared {
-            warn!(
-                action,
-                "browser target became a point of action after approval; denying"
-            );
-            return Err(POINT_OF_ACTION_CHANGED.to_string());
+        if clearance.point_of_action {
+            return Ok(facts);
         }
-        Ok(facts)
+        match facts.scope(action) {
+            policy::ActionScope::PointOfAction => {
+                warn!(
+                    action,
+                    "browser target became a point of action after approval; denying"
+                );
+                Err(POINT_OF_ACTION_CHANGED.to_string())
+            }
+            policy::ActionScope::Site => {
+                let site = match page.url().await {
+                    Some(url) => policy::site_origin(&url),
+                    None => None,
+                };
+                let approved = match &site {
+                    Some(site) => {
+                        clearance.button_site.as_ref() == Some(site)
+                            || self
+                                .sessions
+                                .is_button_site_approved(session_id, site)
+                                .await
+                    }
+                    None => false,
+                };
+                if approved {
+                    Ok(facts)
+                } else {
+                    warn!(
+                        action,
+                        "browser button is on a site the owner has not approved; denying"
+                    );
+                    Err(BUTTON_SITE_CHANGED.to_string())
+                }
+            }
+            policy::ActionScope::Ordinary => Ok(facts),
+        }
     }
 
     /// The approval gate at execution. Returns [`GateDecision::Allow`] only
@@ -955,15 +1097,22 @@ impl BrowserTool {
     async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
         match self.approval_need(args).await {
             BrowserApproval::NotNeeded => GateDecision::Allow {
-                cleared: args.trusted_session,
+                clearance: Clearance {
+                    point_of_action: args.trusted_session,
+                    button_site: None,
+                },
             },
             BrowserApproval::Ask {
                 request,
                 point_of_action,
+                button_site,
             } => {
                 if self.owner_answers.take(args.session_id, &request.subject) {
                     GateDecision::Allow {
-                        cleared: point_of_action || args.trusted_session,
+                        clearance: Clearance {
+                            point_of_action: point_of_action || args.trusted_session,
+                            button_site,
+                        },
                     }
                 } else {
                     warn!(
@@ -1004,7 +1153,7 @@ impl BrowserTool {
         &self,
         arguments: &Value,
         facts: &ToolCallContext,
-    ) -> Option<(aidaemon_core::OwnerApprovalRequest, bool)> {
+    ) -> Option<(aidaemon_core::OwnerApprovalRequest, bool, Option<String>)> {
         let session_id = facts.session_id.as_str();
         if session_id.is_empty() {
             return None;
@@ -1022,7 +1171,8 @@ impl BrowserTool {
             BrowserApproval::Ask {
                 request,
                 point_of_action,
-            } => Some((request, point_of_action)),
+                button_site,
+            } => Some((request, point_of_action, button_site)),
         }
     }
 
@@ -1574,7 +1724,7 @@ impl BrowserTool {
         &self,
         args: &Value,
         session_id: &str,
-        cleared: bool,
+        clearance: &Clearance,
     ) -> Result<DispatchResult, String> {
         let selector = args
             .get("selector")
@@ -1587,7 +1737,7 @@ impl BrowserTool {
         // (target=_blank / window.open) the click may spawn.
         let (page, _guard) = self.page_for(session_id).await?;
         let facts = self
-            .recheck_target(&*page, "click", selector, cleared)
+            .recheck_target(&*page, session_id, "click", selector, clearance)
             .await?;
 
         // The clicking session's active target id — the ONLY legitimate opener
@@ -1729,7 +1879,7 @@ impl BrowserTool {
         &self,
         args: &Value,
         session_id: &str,
-        cleared: bool,
+        clearance: &Clearance,
     ) -> Result<String, String> {
         let selector = args
             .get("selector")
@@ -1741,7 +1891,7 @@ impl BrowserTool {
             .ok_or_else(|| "Missing required parameter: value".to_string())?;
 
         let (page, _guard) = self.page_for(session_id).await?;
-        self.recheck_target(&*page, "fill", selector, cleared)
+        self.recheck_target(&*page, session_id, "fill", selector, clearance)
             .await?;
 
         page.replace_text(selector, value).await?;
@@ -2018,7 +2168,7 @@ impl BrowserTool {
         args: &Value,
         session_id: &str,
         files: CallFiles<'_>,
-        cleared: bool,
+        clearance: &Clearance,
     ) -> Result<DispatchResult, String> {
         match action {
             "navigate" => self
@@ -2027,9 +2177,9 @@ impl BrowserTool {
                 .map(DispatchResult::text_only),
             "screenshot" => self.action_screenshot(args, session_id, files).await,
             "render_pdf" => self.action_render_pdf(args).await,
-            "click" => self.action_click(args, session_id, cleared).await,
+            "click" => self.action_click(args, session_id, clearance).await,
             "fill" => self
-                .action_fill(args, session_id, cleared)
+                .action_fill(args, session_id, clearance)
                 .await
                 .map(DispatchResult::text_only),
             "get_text" => self
@@ -2138,11 +2288,11 @@ impl BrowserTool {
         args: &Value,
         session_id: &str,
         files: CallFiles<'_>,
-        cleared: bool,
+        clearance: &Clearance,
     ) -> Result<DispatchResult, String> {
         let faults = self.backend.connection_faults();
         let first = self
-            .dispatch_action(action, args, session_id, files, cleared)
+            .dispatch_action(action, args, session_id, files, clearance)
             .await;
         let err = match first {
             Ok(ok) => return Ok(ok),
@@ -2179,7 +2329,7 @@ impl BrowserTool {
             // Idempotent: retry once against a freshly-minted page.
             info!(action, "retrying idempotent browser action after reconnect");
             return self
-                .dispatch_action(action, args, session_id, files, cleared)
+                .dispatch_action(action, args, session_id, files, clearance)
                 .await;
         }
 
@@ -2475,8 +2625,8 @@ impl BrowserTool {
             session_id,
             trusted_session: facts.trusted_session,
         };
-        let cleared = match self.approval_gate(&action_args).await {
-            GateDecision::Allow { cleared } => cleared,
+        let clearance = match self.approval_gate(&action_args).await {
+            GateDecision::Allow { clearance } => clearance,
             GateDecision::Deny(reason) => {
                 warn!(action, "Browser action blocked by approval gate");
                 return Ok(DispatchResult::text_only(format!("Error: {}", reason)));
@@ -2489,7 +2639,7 @@ impl BrowserTool {
             produced: aidaemon_tools::semantics::produced_files(facts),
         };
         match self
-            .dispatch_with_recovery(action, &args, session_id, files, cleared)
+            .dispatch_with_recovery(action, &args, session_id, files, &clearance)
             .await
         {
             Ok(result) => Ok(result),
@@ -2555,14 +2705,23 @@ impl Tool for BrowserTool {
                 .await;
             return;
         }
-        let Some((request, point_of_action)) =
+        let Some((request, point_of_action, button_site)) =
             self.kernel_approval_need(call.arguments, facts).await
         else {
             return;
         };
         let session_id = facts.session_id.as_str();
-        match response {
-            ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways if !point_of_action => {
+        match (response, button_site) {
+            // A site-scoped click's session approval covers buttons on that
+            // site (origin) for the browser session, nothing else.
+            (ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways, Some(site))
+                if !point_of_action =>
+            {
+                self.sessions.approve_button_site(session_id, site).await;
+            }
+            (ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways, None)
+                if !point_of_action =>
+            {
                 self.sessions.mark_session_approved(session_id).await;
             }
             _ => self.owner_answers.approve(session_id, &request.subject),
@@ -2733,7 +2892,7 @@ impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
             return aidaemon_tools::semantics::OwnerApprovalNeed::NotNeeded;
         }
         match self.kernel_approval_need(call.arguments, facts).await {
-            Some((request, _)) => aidaemon_tools::semantics::OwnerApprovalNeed::Ask(request),
+            Some((request, ..)) => aidaemon_tools::semantics::OwnerApprovalNeed::Ask(request),
             None => aidaemon_tools::semantics::OwnerApprovalNeed::Unjudged,
         }
     }
@@ -2929,7 +3088,7 @@ fn browser_call_semantics(
 /// done by clicking is not told apart from any other remote change. An
 /// ordinary click keeps its declared (observation) semantics.
 fn click_semantics(facts: &policy::TargetFacts) -> Option<ToolCallSemantics> {
-    if !facts.needs_owner("click") {
+    if facts.scope("click") == policy::ActionScope::Ordinary {
         return None;
     }
     let submits = matches!(facts, policy::TargetFacts::Element(element) if element.submits_form);
