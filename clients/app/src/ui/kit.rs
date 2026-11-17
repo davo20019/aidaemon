@@ -1796,11 +1796,24 @@ fn viewer(
     )
 }
 
+/// The live screen's column beside the picture on a phone held sideways,
+/// in points: the status, the typing row and the answers.
+const LIVE_SIDE: f32 = 300.0;
+
+/// A touch screen held sideways: the picture takes the full height and the
+/// live screen's lines go in a column beside it, so the page is not
+/// squeezed into a strip between them.
+pub fn live_sideways() -> bool {
+    let window = nsh_core::element::window();
+    super::theme::touch() && window.width.0 > window.height.0
+}
+
 /// The room a touch screen has for the live picture while it controls the
 /// page, in points: the screen less the status lines over the picture and
-/// the typing row and answers under it. The daemon lays the agent's page
-/// out for it, so the page fills the phone instead of a wide strip. `None`
-/// on a pointer screen: a window that size suits the page as it is.
+/// the typing row and answers under it (held sideways, less the column
+/// beside it). The daemon lays the agent's page out for it, so the page
+/// fills the phone instead of a wide strip. `None` on a pointer screen: a
+/// window that size suits the page as it is.
 pub fn live_room() -> Option<(u32, u32)> {
     /// The live screen's own lines, above and below the picture.
     const CHROME: f32 = 210.0;
@@ -1809,10 +1822,20 @@ pub fn live_room() -> Option<(u32, u32)> {
     }
     let window = nsh_core::element::window();
     let safe = nsh_core::element::safe_area();
-    let w = window.width.0 - 20.0;
-    let h = window.height.0 - safe.top.0 - safe.bottom.0 - CHROME;
-    // Held sideways, a phone has little height left for the picture: the
-    // page is still laid out for it (the daemon takes 160 at least).
+    let (w, h) = if live_sideways() {
+        // The picture's box (its padding, the gap to the column) and the
+        // column; the box's own height less its padding.
+        (
+            window.width.0 - safe.left.0 - safe.right.0 - LIVE_SIDE - 24.0,
+            window.height.0 - safe.top.0 - safe.bottom.0 - 16.0,
+        )
+    } else {
+        (
+            window.width.0 - 20.0,
+            window.height.0 - safe.top.0 - safe.bottom.0 - CHROME,
+        )
+    };
+    // The daemon takes 160 at least.
     (w >= 200.0 && h >= 120.0).then(|| (w.round() as u32, h.round() as u32))
 }
 
@@ -2670,6 +2693,9 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     );
 
     let close = screen.close.clone();
+    // Held sideways the status goes in the column beside the picture.
+    let sideways = live_sideways;
+    let top_bar = bar.clone();
     view().child(
         dialog()
             .label("The agent's screen")
@@ -2681,16 +2707,18 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     .w_full()
                     .h_full()
                     .flex_col()
+                    .style_when(sideways, |s| s.flex_row().px_safe_area())
                     .gap_2()
                     .bg(colors::LIVE_BACKDROP)
                     .pt_safe_area()
                     .pb_safe_area()
                     .test_id("live-screen")
-                    .child(bar)
+                    .child(when(move || !sideways(), move || top_bar.clone()))
                     .child(
                         view()
                             .flex_1()
                             .min_h(px(0.0))
+                            .min_w(px(0.0))
                             .w_full()
                             .p_2()
                             .items_center()
@@ -2703,15 +2731,21 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                             })
                             .child(picture),
                     )
-                    .child(when(
-                        {
-                            let c = controlling.clone();
-                            move || c() && !mouse
-                        },
-                        move || typing.clone(),
-                    ))
-                    .child(answers)
-                    .child(view().h(px(8.0))),
+                    .child(
+                        view()
+                            .gap_2()
+                            .style_when(sideways, |s| s.w(px(LIVE_SIDE)).h_full().justify_center())
+                            .child(when(sideways, move || bar.clone()))
+                            .child(when(
+                                {
+                                    let c = controlling.clone();
+                                    move || c() && !mouse
+                                },
+                                move || typing.clone(),
+                            ))
+                            .child(answers)
+                            .child(view().h(px(8.0))),
+                    ),
             ),
     )
 }
