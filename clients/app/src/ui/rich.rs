@@ -238,6 +238,36 @@ pub fn code_editor(
         )
 }
 
+/// A file's text, read-only, filling its parent: highlighted by `file`'s
+/// name (`main.rs`, `Dockerfile`), with line numbers; it can be selected
+/// and copied but not changed. The same editor as [`code_editor`], so a
+/// later quick edit turns `read_only` off rather than swapping the view.
+pub fn code_viewer(text: String, file: String, label: impl Into<SharedString>) -> View {
+    use nsh_base::editor;
+
+    use super::theme::colors;
+
+    let text = SharedString::from(text);
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .bg(colors::INSET)
+        .child(
+            editor()
+                .value(move || text.clone())
+                .language(SharedString::from(file))
+                .read_only(true)
+                .active_line(false)
+                .folding(true)
+                .font_family(SharedString::from(MONO))
+                .font_size(px(type_scale::SM))
+                .line_height(px(20.0))
+                .accessibility_label(label.into())
+                .size_full(),
+        )
+}
+
 /// Two numbers per day (what went in, what came out), as stacked bars,
 /// oldest at the left. `days` are the bars' names, in order; the bar under
 /// the pointer names itself through `hovered`.

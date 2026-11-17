@@ -816,6 +816,15 @@ impl ClientHost for DaemonClientHost {
         super::client_changes::revert_file(&self.system.pool, session_id, root, path).await
     }
 
+    fn is_secret_path(&self, path: &std::path::Path) -> bool {
+        // The daemon's own config and env files too, as the file tools
+        // judge them.
+        let dir = crate::runtime_working_dir();
+        let env_file = crate::resolve_runtime_env_file_path(&dir);
+        crate::tools::DaemonPaths::new(vec![dir.join("config.toml"), env_file, dir.join(".env")])
+            .is_secret(path)
+    }
+
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {
         Some(self.system.status().await)
     }

@@ -194,6 +194,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::RenameSession { .. } => "rename_session",
         Command::ArchiveSession { .. } => "archive_session",
         Command::RevertFile { .. } => "revert_file",
+        Command::ListProjectFiles { .. } => "list_project_files",
+        Command::ReadProjectFile { .. } => "read_project_file",
         Command::ListQueued { .. } => "list_queued",
         Command::EditQueued { .. } => "edit_queued",
         Command::ListSurfaces => "list_surfaces",
@@ -240,6 +242,8 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::SettingsChanged { .. } => "settings_changed",
         CommandResult::Setup { .. } => "setup",
         CommandResult::Changes { .. } => "changes",
+        CommandResult::ProjectDir { .. } => "project_dir",
+        CommandResult::ProjectFile { .. } => "project_file",
         CommandResult::Projects { .. } => "projects",
         CommandResult::Automations { .. } => "automations",
         CommandResult::Project { .. } => "project",
@@ -406,6 +410,21 @@ fn client_samples() -> Vec<ClientFrame> {
             },
         ),
         command("5d0c2b1e-0016", Command::ListProjects),
+        command(
+            "5d0c2b1e-0016a",
+            Command::ListProjectFiles {
+                project_id: "p-acme".into(),
+                path: Some("src".into()),
+                ignored: false,
+            },
+        ),
+        command(
+            "5d0c2b1e-0016b",
+            Command::ReadProjectFile {
+                project_id: "p-acme".into(),
+                path: "src/contact.rs".into(),
+            },
+        ),
         command(
             "5d0c2b1e-0017",
             Command::CreateProject {
@@ -1091,6 +1110,59 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Setup {
             setup: setup_state(),
+        }),
+        ack(CommandResult::ProjectDir {
+            dir: ProjectDir {
+                project_id: "p-acme".into(),
+                path: "src".into(),
+                entries: vec![
+                    ProjectEntry {
+                        name: "forms".into(),
+                        kind: EntryKind::Folder,
+                        size_bytes: None,
+                        modified_ms: Some(1_767_225_600_000),
+                        status: None,
+                        changed: true,
+                        ignored: false,
+                        secret: false,
+                    },
+                    ProjectEntry {
+                        name: "contact.rs".into(),
+                        kind: EntryKind::File,
+                        size_bytes: Some(1_204),
+                        modified_ms: Some(1_767_225_600_000),
+                        status: Some(FileStatus::Modified),
+                        changed: false,
+                        ignored: false,
+                        secret: false,
+                    },
+                    ProjectEntry {
+                        name: ".env".into(),
+                        kind: EntryKind::File,
+                        size_bytes: Some(64),
+                        modified_ms: None,
+                        status: None,
+                        changed: false,
+                        ignored: false,
+                        secret: true,
+                    },
+                ],
+                truncated: false,
+                branch: Some("feature/contact-form".into()),
+            },
+        }),
+        ack(CommandResult::ProjectFile {
+            file: ProjectFile {
+                project_id: "p-acme".into(),
+                path: "src/contact.rs".into(),
+                size_bytes: 26,
+                modified_ms: Some(1_767_225_600_000),
+                version: "sha256:0f1e2d3c".into(),
+                text: Some("fn send() {\n}\nfn main() {}\n".into()),
+                truncated: false,
+                withheld: None,
+                status: Some(FileStatus::Modified),
+            },
         }),
         ack(CommandResult::Changes {
             changes: SessionChanges {

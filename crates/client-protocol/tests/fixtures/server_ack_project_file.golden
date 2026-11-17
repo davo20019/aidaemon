@@ -1,0 +1,16 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "file": {
+      "modified_ms": 1767225600000,
+      "path": "src/contact.rs",
+      "project_id": "p-acme",
+      "size_bytes": 26,
+      "status": "modified",
+      "text": "fn send() {\n}\nfn main() {}\n",
+      "version": "sha256:0f1e2d3c"
+    },
+    "type": "project_file"
+  },
+  "type": "ack"
+}

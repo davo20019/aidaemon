@@ -1846,6 +1846,53 @@
           "type": "object"
         },
         {
+          "description": "One folder of a project's files (protocol 1.32), read-only: what is\nin it, folders first. `path` is relative to the project's folder,\n`/`-separated; absent or empty: the folder itself. Files git ignores\nare left out unless `ignored`; `.git` never shows. Needs scope\n`chat`. Answers with `project_dir`.",
+          "properties": {
+            "ignored": {
+              "type": "boolean"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "list_project_files",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One file of a project (protocol 1.32), read-only; `path` as\n`list_project_files`'s. A file that holds secrets, a binary one or\none too large comes back without its text, and says why. Needs\nscope `chat`. Answers with `project_file`.",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "read_project_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "project_id",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
           "description": "The messages waiting for a session's running work to end (protocol\n1.17). Answers with `queued`.",
           "properties": {
             "session_id": {
@@ -2432,6 +2479,40 @@
           "type": "object"
         },
         {
+          "description": "`list_project_files` (protocol 1.32).",
+          "properties": {
+            "dir": {
+              "$ref": "#/$defs/ProjectDir"
+            },
+            "type": {
+              "const": "project_dir",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "dir"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`read_project_file` (protocol 1.32).",
+          "properties": {
+            "file": {
+              "$ref": "#/$defs/ProjectFile"
+            },
+            "type": {
+              "const": "project_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "file"
+          ],
+          "type": "object"
+        },
+        {
           "description": "`list_projects` and `delete_project`.",
           "properties": {
             "projects": {
@@ -2956,6 +3037,13 @@
           "type": "string"
         }
       ]
+    },
+    "EntryKind": {
+      "enum": [
+        "folder",
+        "file"
+      ],
+      "type": "string"
     },
     "ErrorCode": {
       "description": "The closed set of error codes.",
@@ -4512,6 +4600,163 @@
         "tasks"
       ],
       "type": "string"
+    },
+    "ProjectDir": {
+      "description": "One folder of a project's files.",
+      "properties": {
+        "branch": {
+          "description": "The checked-out branch when the folder is in a git repository.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entries": {
+          "description": "Folders first, then files, each by name.",
+          "items": {
+            "$ref": "#/$defs/ProjectEntry"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "Relative to the project's folder, `/`-separated; empty for the\nfolder itself.",
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "truncated": {
+          "description": "The folder holds more than were sent.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "ProjectEntry": {
+      "description": "A file or folder in a [`ProjectDir`].",
+      "properties": {
+        "changed": {
+          "description": "A folder holding uncommitted changes.",
+          "type": "boolean"
+        },
+        "ignored": {
+          "description": "Git ignores it (sent only when asked for).",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/EntryKind"
+        },
+        "modified_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "secret": {
+          "description": "It holds secrets: its text is never sent.",
+          "type": "boolean"
+        },
+        "size_bytes": {
+          "description": "A file's size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a file differs from git's `HEAD`; `None` when it does not, or\nthe folder is not in a repository."
+        }
+      },
+      "required": [
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ProjectFile": {
+      "description": "One file of a project, as it is now.",
+      "properties": {
+        "modified_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How it differs from git's `HEAD`, as in [`ProjectEntry::status`]."
+        },
+        "text": {
+          "description": "Its text (UTF-8); `None` when `withheld` says why not.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "description": "`text` is only the file's start: the file is longer than is sent.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "A hash of the whole file's bytes (`sha256:<hex>`): what a later\nchange to the file names as the version it was made against, so a\nfile changed meanwhile is not overwritten.",
+          "type": "string"
+        },
+        "withheld": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Withheld"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "project_id",
+        "path",
+        "size_bytes",
+        "version"
+      ],
+      "type": "object"
     },
     "ProjectSummary": {
       "description": "A project: a name, and the folder its conversations work in\n(protocol 1.10).",
@@ -7197,6 +7442,21 @@
             "surface_id"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "Withheld": {
+      "description": "Why a [`ProjectFile`]'s text is not sent.",
+      "oneOf": [
+        {
+          "const": "secret",
+          "description": "Keys, credentials, env files: never shown.",
+          "type": "string"
+        },
+        {
+          "const": "binary",
+          "description": "Not text.",
+          "type": "string"
         }
       ]
     }

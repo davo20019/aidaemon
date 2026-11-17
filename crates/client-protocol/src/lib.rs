@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 31;
+pub const PROTOCOL_MINOR: u16 = 32;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -444,6 +444,23 @@ pub enum Command {
         root: String,
         path: String,
     },
+    /// One folder of a project's files (protocol 1.32), read-only: what is
+    /// in it, folders first. `path` is relative to the project's folder,
+    /// `/`-separated; absent or empty: the folder itself. Files git ignores
+    /// are left out unless `ignored`; `.git` never shows. Needs scope
+    /// `chat`. Answers with `project_dir`.
+    ListProjectFiles {
+        project_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ignored: bool,
+    },
+    /// One file of a project (protocol 1.32), read-only; `path` as
+    /// `list_project_files`'s. A file that holds secrets, a binary one or
+    /// one too large comes back without its text, and says why. Needs
+    /// scope `chat`. Answers with `project_file`.
+    ReadProjectFile { project_id: String, path: String },
     /// The messages waiting for a session's running work to end (protocol
     /// 1.17). Answers with `queued`.
     ListQueued { session_id: String },
@@ -840,6 +857,14 @@ pub enum CommandResult {
     Changes {
         changes: SessionChanges,
     },
+    /// `list_project_files` (protocol 1.32).
+    ProjectDir {
+        dir: ProjectDir,
+    },
+    /// `read_project_file` (protocol 1.32).
+    ProjectFile {
+        file: ProjectFile,
+    },
     /// `list_projects` and `delete_project`.
     Projects {
         projects: Vec<ProjectSummary>,
@@ -1135,6 +1160,102 @@ pub enum FileStatus {
     Renamed,
     /// New, and not yet added to git.
     Untracked,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+// ---------------------------------------------------------------------------
+// Project files (protocol 1.32)
+// ---------------------------------------------------------------------------
+
+/// One folder of a project's files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProjectDir {
+    pub project_id: String,
+    /// Relative to the project's folder, `/`-separated; empty for the
+    /// folder itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// Folders first, then files, each by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ProjectEntry>,
+    /// The folder holds more than were sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// The checked-out branch when the folder is in a git repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// A file or folder in a [`ProjectDir`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProjectEntry {
+    pub name: String,
+    pub kind: EntryKind,
+    /// A file's size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ms: Option<u64>,
+    /// How a file differs from git's `HEAD`; `None` when it does not, or
+    /// the folder is not in a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<FileStatus>,
+    /// A folder holding uncommitted changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changed: bool,
+    /// Git ignores it (sent only when asked for).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
+    /// It holds secrets: its text is never sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Folder,
+    File,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// One file of a project, as it is now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProjectFile {
+    pub project_id: String,
+    pub path: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_ms: Option<u64>,
+    /// A hash of the whole file's bytes (`sha256:<hex>`): what a later
+    /// change to the file names as the version it was made against, so a
+    /// file changed meanwhile is not overwritten.
+    pub version: String,
+    /// Its text (UTF-8); `None` when `withheld` says why not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `text` is only the file's start: the file is longer than is sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<Withheld>,
+    /// How it differs from git's `HEAD`, as in [`ProjectEntry::status`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<FileStatus>,
+}
+
+/// Why a [`ProjectFile`]'s text is not sent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Withheld {
+    /// Keys, credentials, env files: never shown.
+    Secret,
+    /// Not text.
+    Binary,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

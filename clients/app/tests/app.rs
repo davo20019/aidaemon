@@ -604,6 +604,55 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
 }
 
 #[test]
+fn a_project_conversation_browses_its_files_read_only() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"rp","result":{"type":"projects","projects":[{"id":"p-acme","name":"Acme site","path":"/home/synthetic/acme-site"}]}}"#,
+        ),
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-files","channel":"app","title":"Tidy the forms","writable":true,"project_id":"p-acme"}]}}"#,
+        ),
+    ]);
+    app.wait_for("Tidy the forms")?;
+    app.press("Tidy the forms >> nth=0")?;
+    // A conversation in a project with a folder works on code: its details
+    // have Files beside Changes.
+    app.wait_for("label:Files")?;
+    let before = sent("list_project_files");
+    app.press("label:Files")?;
+    let id = wait_sent_new("list_project_files", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_dir","dir":{{"project_id":"p-acme","branch":"main","entries":[{{"name":"src","kind":"folder","changed":true}},{{"name":".env","kind":"file","size_bytes":64,"secret":true}},{{"name":"README.md","kind":"file","size_bytes":1229}}]}}}}}}"#
+    ))]);
+    app.wait_for("README.md")?;
+    app.wait_for("1.2 KB")?;
+    app.wait_for("label:.env, holds secrets")?;
+    // A folder opens in place; the path above goes back.
+    app.press("label:src, folder, has changes")?;
+    let id = wait_sent_new("list_project_files", Some(id))?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_dir","dir":{{"project_id":"p-acme","path":"src","entries":[{{"name":"contact.rs","kind":"file","size_bytes":26,"status":"modified"}}]}}}}}}"#
+    ))]);
+    app.wait_for("contact.rs")?;
+    // A file opens filling the pane, its text read-only.
+    let before = sent("read_project_file");
+    app.press("label:contact.rs, modified")?;
+    let id = wait_sent_new("read_project_file", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_file","file":{{"project_id":"p-acme","path":"src/contact.rs","size_bytes":26,"version":"sha256:00","text":"fn send() {{}}\nfn main() {{}}\n","status":"modified"}}}}}}"#
+    ))]);
+    app.wait_for("src/contact.rs")?;
+    app.wait_for("Copy path")?;
+    app.press("label:src")?;
+    app.wait_for("contact.rs")?;
+    Ok(())
+}
+
+#[test]
 fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

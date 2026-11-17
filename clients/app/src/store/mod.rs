@@ -28,6 +28,10 @@ pub use aidaemon_client_core::client::{
 pub type AutomationsRead = Read<Vec<aidaemon_client_protocol::AutomationSummary>>;
 /// The details pane's Changes: a session's uncommitted changes.
 pub type ChangesRead = Read<SessionChanges>;
+/// The details pane's Files: a folder of the project, as last read.
+pub type FolderRead = Read<aidaemon_client_protocol::ProjectDir>;
+/// The file open in the Files tab.
+pub type FileRead = Read<aidaemon_client_protocol::ProjectFile>;
 /// The Memory page's data.
 pub type MemoryRead = Read<Vec<MemoryItem>>;
 /// The Settings page's data.
@@ -97,11 +101,15 @@ impl ActivityMode {
 
 /// The details pane's tabs for a coding conversation, in order; any other
 /// conversation shows only its steps.
-pub const DETAIL_TABS: [&str; 2] = ["Changes", "Steps"];
+pub const DETAIL_TABS: [&str; 3] = ["Changes", "Files", "Steps"];
+/// A phone's details: the steps are under each reply there.
+pub const COMPACT_DETAIL_TABS: [&str; 2] = ["Changes", "Files"];
 /// The Changes tab's index in [`DETAIL_TABS`].
 pub const CHANGES_TAB: usize = 0;
+/// The Files tab's index: the project's files, read-only.
+pub const FILES_TAB: usize = 1;
 /// The Steps tab's index in [`DETAIL_TABS`].
-pub const STEPS_TAB: usize = 1;
+pub const STEPS_TAB: usize = 2;
 
 /// Where drafts are kept between runs.
 const DRAFT_KEY: &str = "aidaemon.draft.";
@@ -165,6 +173,8 @@ struct Reads {
     settings_waiting: Memo<usize>,
     search: Memo<SearchRead>,
     changes: Memo<ChangesRead>,
+    folder: Memo<FolderRead>,
+    file: Memo<FileRead>,
     draft_files: Memo<Vec<DraftFile>>,
     projects: Memo<Vec<ProjectSummary>>,
     project_error: Memo<Option<String>>,
@@ -202,6 +212,8 @@ impl Reads {
             settings_waiting: computed(move || client.with(|c| c.settings_waiting.len())),
             search: computed(move || client.with(|c| c.search.clone())),
             changes: computed(move || client.with(|c| c.changes.clone())),
+            folder: computed(move || client.with(|c| c.files_dir.clone())),
+            file: computed(move || client.with(|c| c.files_file.clone())),
             draft_files: computed(move || client.with(|c| c.draft_files.clone())),
             projects: computed(move || client.with(Client::projects)),
             project_error: computed(move || client.with(|c| c.project_error.clone())),
@@ -1561,6 +1573,39 @@ impl Store {
 
     pub fn changes(&self) -> ChangesRead {
         self.reads.changes.get()
+    }
+
+    // ----- The details pane: Files ----------------------------------------------
+
+    /// The project of the conversation on screen, when it has a folder:
+    /// the one whose files the Files tab shows.
+    pub fn files_project(&self) -> Option<ProjectSummary> {
+        let selected = self.selected.get()?;
+        let id = self.read(|c| c.session_project(&selected))?;
+        self.reads
+            .projects
+            .with(|all| all.iter().find(|p| p.id == id).cloned())
+            .filter(|p| p.path.as_deref().is_some_and(|f| !f.trim().is_empty()))
+    }
+
+    pub fn folder(&self) -> FolderRead {
+        self.reads.folder.get()
+    }
+
+    pub fn open_file(&self) -> FileRead {
+        self.reads.file.get()
+    }
+
+    pub fn list_project_files(&self, project: &str, path: &str, ignored: bool) {
+        self.act(|c| c.list_project_files(project, path, ignored));
+    }
+
+    pub fn read_project_file(&self, project: &str, path: &str) {
+        self.act(|c| c.read_project_file(project, path));
+    }
+
+    pub fn close_project_file(&self) {
+        self.act(Client::close_project_file);
     }
 
     /// How many files the conversation on screen has changed, once read.

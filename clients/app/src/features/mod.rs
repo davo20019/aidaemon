@@ -4,6 +4,7 @@ pub mod approvals;
 pub mod automations;
 pub mod code;
 pub mod conversation;
+pub mod files;
 pub mod inspector;
 pub mod links;
 pub mod memory;

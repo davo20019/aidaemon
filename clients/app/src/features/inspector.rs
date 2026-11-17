@@ -1,12 +1,15 @@
 //! The details pane beside a conversation: for a coding conversation its
-//! Changes (`features::code`) and Steps, for any other its Steps alone:
+//! Changes (`features::code`), its project's Files (`features::files`)
+//! and Steps, for any other its Steps alone:
 //! the work running for it and what its current turn did, step by step.
 //! What waits on the owner across conversations is the sidebar's Needs
 //! you, not here.
 
 use nsh_core::prelude::*;
 
-use crate::store::{ActivityKind, CHANGES_TAB, DETAIL_TABS, Store};
+use crate::store::{
+    ActivityKind, CHANGES_TAB, COMPACT_DETAIL_TABS, DETAIL_TABS, FILES_TAB, STEPS_TAB, Store,
+};
 use crate::ui::{self, Glyph, Size, Tone, Variant, btn, colors, section_label, type_scale};
 
 pub fn inspector(store: Store) -> View {
@@ -25,26 +28,31 @@ pub fn inspector(store: Store) -> View {
                 .px_4()
                 .child(
                     // Only a coding conversation has this pane. A phone
-                    // shows its changes alone (the steps are under each
+                    // shows its changes and files (the steps are under each
                     // reply, and a pane over the chat hides them as they
                     // run); a desktop has Steps beside them, to watch a
                     // turn's commands and output next to the chat.
                     view().flex_1().child(
                         when(
-                            move || coding.get() && !store.is_compact(),
-                            move || ui::tab_bar(store.inspector_tab(), &DETAIL_TABS),
+                            move || coding.get(),
+                            move || {
+                                view().child(dynamic(move || {
+                                    let compact = store.is_compact();
+                                    Some(untracked(move || {
+                                        if compact {
+                                            ui::tab_bar(store.inspector_tab(), &COMPACT_DETAIL_TABS)
+                                        } else {
+                                            ui::tab_bar(store.inspector_tab(), &DETAIL_TABS)
+                                        }
+                                    }))
+                                }))
+                            },
                         )
                         .otherwise(move || {
-                            text(move || {
-                                if store.is_compact() {
-                                    "Changes"
-                                } else {
-                                    "Steps"
-                                }
-                            })
-                            .role(AccessibilityRole::Header)
-                            .text_size(px(ui::fit::body()))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            text("Steps")
+                                .role(AccessibilityRole::Header)
+                                .text_size(px(ui::fit::body()))
+                                .font_weight(FontWeight::SEMIBOLD)
                         }),
                     ),
                 )
@@ -58,14 +66,16 @@ pub fn inspector(store: Store) -> View {
                 )),
         )
         .child(dynamic(move || {
-            let changes =
-                coding.get() && (store.is_compact() || store.inspector_tab().get() == CHANGES_TAB);
-            Some(untracked(move || {
-                if changes {
-                    super::code::code(store)
-                } else {
-                    steps(store)
-                }
+            // A phone has no Steps tab: there it is the changes.
+            let tab = match store.inspector_tab().get() {
+                STEPS_TAB if store.is_compact() => CHANGES_TAB,
+                tab => tab,
+            };
+            let tab = if coding.get() { tab } else { STEPS_TAB };
+            Some(untracked(move || match tab {
+                CHANGES_TAB => super::code::code(store),
+                FILES_TAB => super::files::files(store),
+                _ => steps(store),
             }))
         }))
 }

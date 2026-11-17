@@ -51,6 +51,7 @@ mod config;
 pub mod files;
 mod observer;
 pub mod pairing;
+pub mod project_files;
 pub mod remote_screens;
 mod server;
 pub mod setup;
@@ -159,6 +160,13 @@ pub trait ClientHost: Send + Sync {
         _path: &str,
     ) -> Result<SessionChanges, String> {
         Err("This daemon does not undo changes".to_string())
+    }
+
+    /// Whether `path` holds secrets (keys, credentials, env files, the
+    /// daemon's own config): a project's Files view shows its name, never
+    /// its text (protocol 1.32).
+    fn is_secret_path(&self, path: &std::path::Path) -> bool {
+        aidaemon_tools::path_class::DaemonPaths::default().is_secret(path)
     }
 
     /// The owner's projects.
@@ -822,6 +830,9 @@ impl ClientGateway {
             | Command::ArchiveSession { .. }
             | Command::RevertFile { .. }
             | Command::EditQueued { .. } => Some(Scope::Chat),
+            // A project's source is more than a watch should read; a device
+            // that may chat could ask the agent for it anyway.
+            Command::ListProjectFiles { .. } | Command::ReadProjectFile { .. } => Some(Scope::Chat),
             Command::CreateProject { .. }
             | Command::UpdateProject { .. }
             | Command::DeleteProject { .. }
@@ -1270,6 +1281,40 @@ impl ClientGateway {
                     note: Some(note),
                     changed,
                 })
+            }
+            Command::ListProjectFiles {
+                project_id,
+                path,
+                ignored,
+            } => {
+                let folder = self.project_folder(&project_id).await?;
+                let host = self.host.clone();
+                let dir = tokio::task::spawn_blocking(move || {
+                    project_files::list(
+                        &folder,
+                        &project_id,
+                        path.as_deref().unwrap_or(""),
+                        ignored,
+                        &|p| host.is_secret_path(p),
+                    )
+                })
+                .await
+                .map_err(|_| {
+                    ProtocolError::new(ErrorCode::Internal, "Could not read the folder")
+                })??;
+                Ok(CommandResult::ProjectDir { dir })
+            }
+            Command::ReadProjectFile { project_id, path } => {
+                let folder = self.project_folder(&project_id).await?;
+                let host = self.host.clone();
+                let file = tokio::task::spawn_blocking(move || {
+                    project_files::read(&folder, &project_id, &path, &|p| host.is_secret_path(p))
+                })
+                .await
+                .map_err(|_| {
+                    ProtocolError::new(ErrorCode::Internal, "Could not read the file")
+                })??;
+                Ok(CommandResult::ProjectFile { file })
             }
             Command::GetChanges { session_id } => {
                 let changes = self.host.changes(&session_id).await.map_err(|e| {
@@ -1801,6 +1846,23 @@ impl ClientGateway {
     /// Tell every client how session `session_id` looks now (after a move
     /// between projects).
     /// `session_id`'s waiting messages, as `queued` gives them.
+    /// Project `id`'s folder, for its Files view.
+    async fn project_folder(&self, id: &str) -> Result<std::path::PathBuf, ProtocolError> {
+        let projects = self.host.projects().await.map_err(|e| {
+            warn!(error = %e, "Listing projects failed");
+            ProtocolError::new(ErrorCode::Internal, "Could not read the projects")
+        })?;
+        let project = projects
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::NotFound, "No such project"))?;
+        project
+            .path
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::Invalid, "This project has no folder"))
+    }
+
     async fn queued(&self, session_id: String) -> CommandResult {
         let messages = self
             .turns

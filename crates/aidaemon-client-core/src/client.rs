@@ -17,10 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_protocol::{
     Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
     AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
-    MidRun, ModelChoice, ModelOptions, ProjectSummary, QueuedMessage, SearchHit, ServerFrame,
-    SessionChanges, SessionModel, Settings, SettingsChange, SettingsOutcome, SetupAction,
-    SetupStep, SlashCommand, StreamAccept, SurfaceController, SurfaceInfo, SurfaceMode,
-    SurfaceTransport, SystemStatus, TaskSummary, TurnStatus,
+    MidRun, ModelChoice, ModelOptions, ProjectDir, ProjectFile, ProjectSummary, QueuedMessage,
+    SearchHit, ServerFrame, SessionChanges, SessionModel, Settings, SettingsChange,
+    SettingsOutcome, SetupAction, SetupStep, SlashCommand, StreamAccept, SurfaceController,
+    SurfaceInfo, SurfaceMode, SurfaceTransport, SystemStatus, TaskSummary, TurnStatus,
 };
 
 use crate::surfaces::LiveView;
@@ -356,6 +356,12 @@ pub struct Client {
     changes_request: Option<String>,
     /// Something changed while a read was in flight: read again after it.
     changes_again: bool,
+    /// A project's Files view (protocol 1.32): the folder open, and the
+    /// file open in it. Only the latest read of each is kept.
+    pub files_dir: Read<ProjectDir>,
+    files_dir_request: Option<String>,
+    pub files_file: Read<ProjectFile>,
+    files_file_request: Option<String>,
     /// The daemon's slash commands.
     pub commands: Vec<SlashCommand>,
     project_request: Option<String>,
@@ -480,6 +486,14 @@ impl Client {
                 // before every change since.
                 self.settings_request = None;
                 self.settings_again = false;
+                // So are a project's files: shown as last read until asked
+                // again.
+                if self.files_dir_request.take().is_some() && !self.files_dir.is_ready() {
+                    self.files_dir = Read::NotYet;
+                }
+                if self.files_file_request.take().is_some() {
+                    self.files_file = Read::NotYet;
+                }
                 if self.settings.is_ready() || cx.settings_open {
                     self.refresh_settings();
                 }
@@ -850,6 +864,38 @@ impl Client {
             }
             ServerFrame::Ack {
                 request_id,
+                result: CommandResult::ProjectDir { dir },
+            } if mine(&self.files_dir_request, request_id) => {
+                self.files_dir_request = None;
+                self.files_dir = Read::Ready(dir.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::ProjectFile { file },
+            } if mine(&self.files_file_request, request_id) => {
+                self.files_file_request = None;
+                self.files_file = Read::Ready(file.clone());
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.files_dir_request, request_id) => {
+                self.files_dir_request = None;
+                self.files_dir = Read::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.files_file_request, request_id) => {
+                self.files_file_request = None;
+                self.files_file = Read::Failed(error.message.clone());
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
                 result: CommandResult::Changes { changes },
             } if mine(&self.changes_request, request_id) => {
                 self.changes_request = None;
@@ -1194,6 +1240,41 @@ impl Client {
         }
         self.search = SearchRead::Loading(query.clone());
         self.search_request = Some(self.send(Command::SearchMessages { query, limit: 30 }));
+    }
+
+    // ----- A project's files ----------------------------------------------------
+
+    /// Read folder `path` (relative, `""` for the folder itself) of project
+    /// `project_id`. What was shown stays until the answer, unless it was
+    /// another project's.
+    pub fn list_project_files(&mut self, project_id: &str, path: &str, ignored: bool) {
+        if self
+            .files_dir
+            .ready()
+            .is_none_or(|dir| dir.project_id != project_id)
+        {
+            self.files_dir = Read::Loading;
+        }
+        self.files_dir_request = Some(self.send(Command::ListProjectFiles {
+            project_id: project_id.to_owned(),
+            path: (!path.is_empty()).then(|| path.to_owned()),
+            ignored,
+        }));
+    }
+
+    /// Read file `path` of project `project_id`.
+    pub fn read_project_file(&mut self, project_id: &str, path: &str) {
+        self.files_file = Read::Loading;
+        self.files_file_request = Some(self.send(Command::ReadProjectFile {
+            project_id: project_id.to_owned(),
+            path: path.to_owned(),
+        }));
+    }
+
+    /// Close the open file; an answer still on its way is dropped.
+    pub fn close_project_file(&mut self) {
+        self.files_file_request = None;
+        self.files_file = Read::NotYet;
     }
 
     // ----- Changes ------------------------------------------------------------
@@ -2749,6 +2830,58 @@ mod tests {
                 )
             })
             .expect("a surface command")
+    }
+
+    #[test]
+    fn a_projects_files_read_keep_only_the_latest_answer() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.list_project_files("p-acme", "", false);
+        client.list_project_files("p-acme", "src", false);
+        let sent = client.take_outgoing();
+        assert!(matches!(
+            &sent[1].1,
+            Command::ListProjectFiles { path: Some(p), .. } if p == "src"
+        ));
+        assert!(matches!(client.files_dir, Read::Loading));
+        // The first folder's answer comes late: it is not the one asked for.
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{}","result":{{"type":"project_dir","dir":{{"project_id":"p-acme"}}}}}}"#,
+                sent[0].0
+            )),
+            &cx(None),
+        );
+        assert!(matches!(client.files_dir, Read::Loading));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{}","result":{{"type":"project_dir","dir":{{"project_id":"p-acme","path":"src","entries":[{{"name":"contact.rs","kind":"file"}}]}}}}}}"#,
+                sent[1].0
+            )),
+            &cx(None),
+        );
+        assert_eq!(client.files_dir.ready().unwrap().entries.len(), 1);
+
+        client.read_project_file("p-acme", "src/contact.rs");
+        let (request, _) = client.take_outgoing().pop().unwrap();
+        client.close_project_file();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"project_file","file":{{"project_id":"p-acme","path":"src/contact.rs","size_bytes":3,"version":"sha256:00","text":"abc"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(matches!(client.files_file, Read::NotYet));
+        client.read_project_file("p-acme", "nope.rs");
+        let (request, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{request}","error":{{"code":"not_found","message":"No such file in this project","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(matches!(&client.files_file, Read::Failed(m) if m.contains("No such file")));
     }
 
     #[test]
