@@ -6,22 +6,34 @@ use aidaemon_core::{Agent, ReceiptStatus, Role, Tool, ToolAnnotations, ToolConte
 use aidaemon_mcp::{McpError, McpOptions, McpServer, McpServerSpec, McpTool, StderrCallback};
 use serde_json::{Value, json};
 
-const FAKE: &str = env!("CARGO_BIN_EXE_fake_mcp_server");
+/// The fake server's path. nextest runs these tests from an archive
+/// unpacked away from where they were built, so the path it gives at run
+/// time comes first; cargo test has only the one baked in at build time.
+static FAKE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("NEXTEST_BIN_EXE_fake_mcp_server")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_fake_mcp_server").to_string())
+});
 
 fn no_env() -> Vec<(String, String)> {
     Vec::new()
 }
 
 async fn spawn() -> McpServer {
-    McpServer::spawn("fake", FAKE, Vec::<String>::new(), no_env())
+    McpServer::spawn("fake", FAKE.as_str(), Vec::<String>::new(), no_env())
         .await
         .expect("fake server starts")
 }
 
 async fn spawn_with(options: McpOptions) -> McpServer {
-    McpServer::spawn_with("fake", FAKE, Vec::<String>::new(), no_env(), options)
-        .await
-        .expect("fake server starts")
+    McpServer::spawn_with(
+        "fake",
+        FAKE.as_str(),
+        Vec::<String>::new(),
+        no_env(),
+        options,
+    )
+    .await
+    .expect("fake server starts")
 }
 
 fn ctx() -> ToolContext {
@@ -51,9 +63,14 @@ async fn handshake_reports_server_info_and_captures_stderr() {
 
 #[tokio::test]
 async fn unsupported_protocol_version_is_refused() {
-    let err = McpServer::spawn("fake", FAKE, ["--protocol", "1999-01-01"], no_env())
-        .await
-        .unwrap_err();
+    let err = McpServer::spawn(
+        "fake",
+        FAKE.as_str(),
+        ["--protocol", "1999-01-01"],
+        no_env(),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(&err, McpError::Protocol { message, .. } if message.contains("1999-01-01")),
         "{err}"
@@ -66,7 +83,7 @@ async fn handshake_times_out() {
         init_timeout: Duration::from_millis(200),
         ..McpOptions::default()
     };
-    let err = McpServer::spawn_with("fake", FAKE, ["--hang-init"], no_env(), options)
+    let err = McpServer::spawn_with("fake", FAKE.as_str(), ["--hang-init"], no_env(), options)
         .await
         .unwrap_err();
     assert!(
@@ -224,7 +241,7 @@ async fn server_requests_and_noise_are_handled() {
 async fn environment_is_scrubbed_but_explicit_env_passes() {
     let server = McpServer::spawn(
         "fake",
-        FAKE,
+        FAKE.as_str(),
         Vec::<String>::new(),
         [("FAKE_MCP_TOKEN", "synthetic-token-123")],
     )
@@ -318,7 +335,7 @@ async fn shutdown_stops_the_server() {
 #[tokio::test]
 async fn respawn_replaces_the_process_and_keeps_the_spec() {
     let old = McpServer::connect(
-        McpServerSpec::new("fake", FAKE).with_env([("FAKE_MCP_TOKEN", "synthetic-first")]),
+        McpServerSpec::new("fake", FAKE.as_str()).with_env([("FAKE_MCP_TOKEN", "synthetic-first")]),
     )
     .await
     .expect("fake server starts");
@@ -348,7 +365,7 @@ async fn respawn_replaces_the_process_and_keeps_the_spec() {
 #[tokio::test]
 async fn respawn_with_env_swaps_only_the_environment() {
     let old = McpServer::connect(
-        McpServerSpec::new("fake", FAKE).with_env([("FAKE_MCP_TOKEN", "synthetic-first")]),
+        McpServerSpec::new("fake", FAKE.as_str()).with_env([("FAKE_MCP_TOKEN", "synthetic-first")]),
     )
     .await
     .expect("fake server starts");
@@ -371,7 +388,8 @@ async fn respawn_with_env_swaps_only_the_environment() {
 
 #[test]
 fn a_spec_never_prints_environment_values() {
-    let spec = McpServerSpec::new("fake", FAKE).with_env([("API_KEY", "synthetic-secret")]);
+    let spec =
+        McpServerSpec::new("fake", FAKE.as_str()).with_env([("API_KEY", "synthetic-secret")]);
     let printed = format!("{spec:?}");
     assert!(printed.contains("API_KEY"), "{printed}");
     assert!(!printed.contains("synthetic-secret"), "{printed}");
