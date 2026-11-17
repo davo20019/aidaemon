@@ -105,6 +105,38 @@ pub fn card(store: Store, approval: Approval) -> View {
         Some(CardAction::Use { what, detail }) => {
             (format!("Use {what}"), detail.clone().map(detail_text))
         }
+        Some(CardAction::TakeOver {
+            surface_id,
+            what,
+            site,
+            keeps_sign_in,
+        }) => {
+            let mut lines = vec![
+                "Do it in the live view or at the computer, then press Done. The agent waits and \
+                 never sees what you type."
+                    .to_string(),
+            ];
+            match keeps_sign_in {
+                Some(true) => lines.push("A sign-in here is kept for later tasks.".into()),
+                Some(false) => lines.push("A sign-in here lasts only for this task.".into()),
+                None => {}
+            }
+            let surface = surface_id.clone();
+            (
+                match site {
+                    Some(site) => format!("{what} on {site}"),
+                    None => what.clone(),
+                },
+                Some(view().gap_2().child(detail_text(lines.join(" "))).child(
+                    view().flex_row().child(btn(
+                        "Open the live view",
+                        Variant::Primary,
+                        Size::Sm,
+                        move || store.watch_surface(&surface, true),
+                    )),
+                )),
+            )
+        }
         _ => (
             approval.summary.clone(),
             approval.detail.clone().map(detail_text),
@@ -194,8 +226,13 @@ pub fn card(store: Store, approval: Approval) -> View {
             .text_size(px(type_scale::XS))
             .text_color(colors::FAINT);
             let terminal = idiom() == Idiom::Terminal;
-            let buttons = approval.options.iter().map(|d| {
-                let (label, variant) = decision(*d);
+            let handoff = approval.kind == aidaemon_client_protocol::ApprovalKind::Handoff;
+            let buttons = approval.options.iter().map(move |d| {
+                let (label, variant) = match (handoff, d) {
+                    (true, ApprovalDecision::ApproveOnce) => ("Done", Variant::Outline),
+                    (true, ApprovalDecision::Deny) => ("Not now", Variant::Outline),
+                    _ => decision(*d),
+                };
                 let (id, d) = (id.clone(), *d);
                 // What an answer covers, in words and for screen readers.
                 let resolve_id = id.clone();

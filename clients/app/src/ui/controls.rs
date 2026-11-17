@@ -1470,7 +1470,10 @@ pub fn call_detail(input: Option<String>, output: String, command: bool) -> View
                 .text_color(colors::FAINT),
         )
     } else if command {
-        part("Output", super::output_panel(move || output.clone(), "Command output"))
+        part(
+            "Output",
+            super::output_panel(move || output.clone(), "Command output"),
+        )
     } else {
         part("Output", well(output))
     });

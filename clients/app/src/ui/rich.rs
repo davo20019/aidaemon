@@ -138,10 +138,7 @@ pub fn output(
 /// Program output on an inset well: its last 8 lines in a terminal, or
 /// 24 with Show more (the terminal scrolls back through the rest), with
 /// Copy. `label` names it for screen readers.
-pub fn output_panel(
-    detail: impl Fn() -> String + Clone + 'static,
-    label: &'static str,
-) -> View {
+pub fn output_panel(detail: impl Fn() -> String + Clone + 'static, label: &'static str) -> View {
     use super::{Size, Variant, btn, colors, radius};
     let all = signal(false);
     let lines = {

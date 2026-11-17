@@ -566,6 +566,41 @@ fn header(store: Store, session: Option<String>) -> View {
                 }
             },
         ))
+        .child({
+            // The agent's browser in this conversation: watch it live (a
+            // dot when it waits for the owner there).
+            let session = session.clone();
+            let screens = move || {
+                session
+                    .as_deref()
+                    .map(|id| store.surfaces_in(id))
+                    .unwrap_or_default()
+            };
+            view().child(dynamic(move || {
+                let first = screens().into_iter().next()?;
+                let waiting = first.handoff_pending;
+                let id = first.id.clone();
+                Some(untracked(move || {
+                    let label = if waiting {
+                        "The agent is waiting for you in its browser"
+                    } else {
+                        "Watch the agent's browser"
+                    };
+                    let button = view().relative().child(ui::icon_btn(
+                        Glyph::External,
+                        label,
+                        Size::Md,
+                        move || store.watch_surface(&id, waiting),
+                    ));
+                    if waiting {
+                        button.child(ui::corner_dot(|| ui::Tone::Warning))
+                    } else {
+                        button
+                    }
+                    .into_element()
+                }))
+            }))
+        })
         .child(when(
             move || store.is_compact(),
             move || {
@@ -927,11 +962,7 @@ fn transcript_list(
                             ))
                             .child(files(store, attached, false))
                             .child(when(
-                                move || {
-                                    row.with(|r| {
-                                        matches!(r, Some(Row::Assistant(.., true)))
-                                    })
-                                },
+                                move || row.with(|r| matches!(r, Some(Row::Assistant(.., true)))),
                                 move || reply_footer(store, content, at),
                             )),
                         9 => column.child(handed_off(content)),

@@ -83,5 +83,13 @@ pub async fn pair_remote(store: Store, link: String, name: String) -> Result<(),
     }
 }
 
+/// Open a live view's frame socket for opening `epoch` (protocol 1.30).
+pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
+    #[cfg(not(target_arch = "wasm32"))]
+    native::open_live(store, epoch, url, ticket);
+    #[cfg(target_arch = "wasm32")]
+    web::open_live(store, epoch, url, ticket);
+}
+
 /// Whether this build can run the daemon on its own computer.
 pub const RUNS_DAEMON: bool = cfg!(not(target_arch = "wasm32"));

@@ -32,7 +32,7 @@ pub fn start(store: Store) {
             version: Some(env!("CARGO_PKG_VERSION").into()),
         },
         device: None,
-        capabilities: vec![Capability::ViewActions],
+        capabilities: vec![Capability::ViewActions, Capability::Surfaces],
     };
     let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel::<Update>();
     spawn(async move {
@@ -78,4 +78,52 @@ pub async fn pair_remote(store: Store, link: String, name: String) -> Result<(),
     store.update(Update::Connecting);
     start(store);
     Ok(())
+}
+
+/// Open a live view's frame socket on the background runtime; its events
+/// come back to the engine thread and into the [`Store`].
+pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
+    use aidaemon_client_core::surfaces::{self, MediaEvent};
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<MediaEvent>();
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Closing drops the only sender: the socket task closes and ends.
+    let sender = std::rc::Rc::new(std::cell::RefCell::new(Some(out_tx)));
+    let send = {
+        let sender = sender.clone();
+        move |text: String| {
+            if let Some(tx) = sender.borrow().as_ref() {
+                let _ = tx.send(text);
+            }
+        }
+    };
+    store.media_attached(
+        epoch,
+        crate::store::MediaLink {
+            send: Box::new(send),
+            close: Box::new(move || {
+                sender.borrow_mut().take();
+            }),
+        },
+    );
+    spawn(async move {
+        let started = background(async move {
+            tokio::spawn(surfaces::run(url, ticket, events_tx, out_rx));
+        })
+        .await;
+        if started.is_err() {
+            store.media_event(
+                epoch,
+                MediaEvent::Closed("could not start the live view".into()),
+            );
+            return;
+        }
+        let mut closed = false;
+        while let Some(event) = events.recv().await {
+            closed |= matches!(event, MediaEvent::Closed(_));
+            store.media_event(epoch, event);
+        }
+        if !closed {
+            store.media_event(epoch, MediaEvent::Closed("the connection dropped".into()));
+        }
+    });
 }

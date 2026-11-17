@@ -192,6 +192,7 @@ pub fn shell(store: Store) -> View {
             store.viewing(),
             picture_actions(store),
         ))
+        .child(crate::ui::live_screen(live_screen(store)))
         .child(ui::toasts(
             move || store.toast(),
             move || store.dismiss_toast(),
@@ -499,6 +500,49 @@ fn steps_key() -> &'static str {
         "mod+o"
     } else {
         "mod+i"
+    }
+}
+
+/// The live view of the agent's browser, read and driven through the store.
+fn live_screen(store: Store) -> crate::ui::LiveScreen {
+    use std::rc::Rc;
+    crate::ui::LiveScreen {
+        open: Rc::new(move || store.live_open()),
+        title: Rc::new(move || {
+            store.live_surface().map_or_else(
+                || "The agent's browser".to_owned(),
+                |s| match s.site {
+                    Some(site) if !s.title.is_empty() => format!("{} · {site}", s.title),
+                    Some(site) => site,
+                    None => s.title,
+                },
+            )
+        }),
+        status: Rc::new(move || {
+            if let Some(why) = store.live_error() {
+                return why;
+            }
+            if store.live_controlling() {
+                "You're in control: the agent waits until you give it back".to_owned()
+            } else if store.live_surface().is_some_and(|s| s.handoff_pending) {
+                "The agent is waiting for you: take control, then press Done".to_owned()
+            } else {
+                "Watching: the agent keeps working".to_owned()
+            }
+        }),
+        frame: store.live_frame(),
+        controlling: Rc::new(move || store.live_controlling()),
+        can_control: Rc::new(move || store.live_surface().is_some_and(|s| s.interactive)),
+        waiting: Rc::new(move || store.live_surface().is_some_and(|s| s.handoff_pending)),
+        pointer: Rc::new(move |action, x, y| store.live_pointer(action, x, y)),
+        wheel: Rc::new(move |dy| store.live_wheel(dy)),
+        text: Rc::new(move |text| store.live_text(text)),
+        key: Rc::new(move |code, key| store.live_key(code, key)),
+        take: Rc::new(move || store.live_take()),
+        give_back: Rc::new(move || store.live_give_back()),
+        done: Rc::new(move || store.live_finish(true)),
+        not_now: Rc::new(move || store.live_finish(false)),
+        close: Rc::new(move || store.close_live()),
     }
 }
 

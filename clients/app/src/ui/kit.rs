@@ -1777,3 +1777,312 @@ fn viewer_text_btn(label: &'static str, main: bool, on_press: impl Fn() + 'stati
             ),
     )
 }
+
+/// One picture of a live view: its `data:` URI and its shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveFrame {
+    pub uri: String,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// What the live view shows and does: the agent's browser tab, watched or
+/// controlled. Every closure reads or acts through the store.
+pub struct LiveScreen {
+    pub open: std::rc::Rc<dyn Fn() -> bool>,
+    pub title: std::rc::Rc<dyn Fn() -> String>,
+    /// "Watching", "You're in control", or why it could not open.
+    pub status: std::rc::Rc<dyn Fn() -> String>,
+    pub frame: Signal<Option<LiveFrame>>,
+    pub controlling: std::rc::Rc<dyn Fn() -> bool>,
+    pub can_control: std::rc::Rc<dyn Fn() -> bool>,
+    /// The agent waits for the owner here (a handoff): Done and Not now.
+    pub waiting: std::rc::Rc<dyn Fn() -> bool>,
+    /// A press, move or release at a fraction of the picture.
+    pub pointer: std::rc::Rc<dyn Fn(&'static str, f32, f32)>,
+    pub wheel: std::rc::Rc<dyn Fn(f32)>,
+    pub text: std::rc::Rc<dyn Fn(String)>,
+    /// A key by its `code` and `key`.
+    pub key: std::rc::Rc<dyn Fn(&'static str, &'static str)>,
+    pub take: std::rc::Rc<dyn Fn()>,
+    pub give_back: std::rc::Rc<dyn Fn()>,
+    pub done: std::rc::Rc<dyn Fn()>,
+    pub not_now: std::rc::Rc<dyn Fn()>,
+    pub close: std::rc::Rc<dyn Fn()>,
+}
+
+/// The live view, over everything while it is open.
+pub fn live_screen(screen: LiveScreen) -> View {
+    let screen = std::rc::Rc::new(screen);
+    view().child(dynamic(move || {
+        if !(screen.open)() {
+            return None;
+        }
+        let screen = screen.clone();
+        Some(untracked(move || live_dialog(screen)))
+    }))
+}
+
+fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
+    let room = signal((0.0f32, 0.0f32));
+    let frame = screen.frame;
+    let fitted = move || {
+        let (w, h) = room.get();
+        let ratio = frame
+            .with(|f| f.as_ref().map(|f| (f.w.max(1), f.h.max(1))))
+            .map_or(16.0 / 10.0, |(w, h)| w as f32 / h as f32);
+        let width = w.min(h * ratio).max(0.0);
+        (width, width / ratio)
+    };
+    let controlling = {
+        let c = screen.controlling.clone();
+        move || c()
+    };
+
+    // Where a finger or the pointer acts: an empty layer over the picture,
+    // so its place is in the picture's own frame.
+    let start = signal((0.0f32, 0.0f32));
+    let pad = {
+        let (down, moved, up, cancel) = (
+            screen.pointer.clone(),
+            screen.pointer.clone(),
+            screen.pointer.clone(),
+            screen.pointer.clone(),
+        );
+        let controlling = controlling.clone();
+        view()
+            .absolute()
+            .inset_0()
+            .claim_touches(TouchClaim::on_start().ask(move |request: &ClaimRequest| {
+                if controlling() {
+                    request.claim();
+                }
+            }))
+            .keep_touches(true)
+            .on_responder_grant(move |e: &ResponderEvent| {
+                let (w, h) = fitted();
+                if w <= 0.0 || h <= 0.0 {
+                    return;
+                }
+                let at = (e.location.x.0 / w, e.location.y.0 / h);
+                start.set(at);
+                down("down", at.0, at.1);
+            })
+            .on_responder_move(move |e: &ResponderEvent| {
+                let (w, h) = fitted();
+                if w <= 0.0 || h <= 0.0 {
+                    return;
+                }
+                let (x0, y0) = start.get_untracked();
+                moved(
+                    "move",
+                    (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
+                    (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
+                );
+            })
+            .on_responder_release(move |e: &ResponderEvent| {
+                let (w, h) = fitted();
+                let (x0, y0) = start.get_untracked();
+                let at = if w > 0.0 && h > 0.0 {
+                    (
+                        (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
+                        (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
+                    )
+                } else {
+                    (x0, y0)
+                };
+                up("up", at.0, at.1);
+            })
+            .on_responder_terminate(move |_: &ResponderEvent| {
+                let (x0, y0) = start.get_untracked();
+                cancel("cancel", x0, y0);
+            })
+    };
+    let picture = view()
+        .relative()
+        .w(move || px(fitted().0))
+        .h(move || px(fitted().1))
+        .child(when(
+            move || frame.with(Option::is_some),
+            move || {
+                image(move || {
+                    nsh_core::element::ImageSrc::from(
+                        frame.with(|f| f.as_ref().map(|f| f.uri.clone()).unwrap_or_default()),
+                    )
+                })
+                .w_full()
+                .h_full()
+                .object_fit(ResizeMode::Contain)
+            },
+        ))
+        .child(when(
+            move || frame.with(Option::is_none),
+            move || {
+                view()
+                    .w_full()
+                    .h_full()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        text("Connecting to the screen…")
+                            .text_size(px(type_scale::SM))
+                            .text_color(colors::ON_LIGHTBOX),
+                    )
+            },
+        ))
+        .child(when(controlling.clone(), move || pad.clone()));
+
+    let status_line = {
+        let status = screen.status.clone();
+        text(move || status())
+            .text_size(px(type_scale::XS))
+            .text_color(colors::ON_LIGHTBOX)
+    };
+    let title = {
+        let title = screen.title.clone();
+        text(move || title())
+            .flex_1()
+            .min_w(px(0.0))
+            .number_of_lines(1)
+            .text_size(px(type_scale::SM))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(colors::ON_LIGHTBOX)
+    };
+    let close = screen.close.clone();
+    let bar = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .min_h(px(if super::touch() { 60.0 } else { 52.0 }))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_1()
+                .child(title)
+                .child(status_line),
+        )
+        .child(viewer_btn(Glyph::Close, "Close", move || close()));
+
+    // Control and the handoff's answers.
+    let take = screen.take.clone();
+    let give = screen.give_back.clone();
+    let done = screen.done.clone();
+    let not_now = screen.not_now.clone();
+    let can_control = screen.can_control.clone();
+    let waiting = screen.waiting.clone();
+    let answers = view()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_3()
+        .child(when(
+            {
+                let (c, can) = (controlling.clone(), can_control.clone());
+                move || !c() && can()
+            },
+            move || {
+                let take = take.clone();
+                viewer_text_btn("Take control", true, move || take())
+            },
+        ))
+        .child(when(controlling.clone(), move || {
+            let give = give.clone();
+            viewer_text_btn("Give back", false, move || give())
+        }))
+        .child(when(
+            {
+                let w = waiting.clone();
+                move || w()
+            },
+            move || {
+                let (done, not_now) = (done.clone(), not_now.clone());
+                view()
+                    .flex_row()
+                    .gap_2()
+                    .child(viewer_text_btn("Done", true, move || done()))
+                    .child(viewer_text_btn("Not now", false, move || not_now()))
+            },
+        ));
+
+    // Typing: a masked field whose text goes to the page, and the keys a
+    // phone keyboard cannot send.
+    let typed = signal(String::new());
+    let send_text = screen.text.clone();
+    let send = move || {
+        let value = typed.get_untracked();
+        if !value.is_empty() {
+            send_text(value);
+            typed.set(String::new());
+        }
+    };
+    let key = screen.key.clone();
+    let wheel = screen.wheel.clone();
+    let keys = |label: &'static str, glyph: Glyph, code: &'static str, name: &'static str| {
+        let key = key.clone();
+        viewer_btn(glyph, label, move || key(code, name))
+    };
+    let typing = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .child(view().flex_1().min_w(px(0.0)).child(
+            super::controls::secret_field("Type into the page", typed).on_submit({
+                let send = send.clone();
+                move |_: &str| send()
+            }),
+        ))
+        .child(viewer_btn(Glyph::Send, "Type it", send))
+        .child(keys("Backspace", Glyph::Back, "Backspace", "Backspace"))
+        .child(keys("Tab", Glyph::Chevron, "Tab", "Tab"))
+        .child(keys("Enter", Glyph::Check, "Enter", "Enter"))
+        .child({
+            let wheel = wheel.clone();
+            viewer_btn(Glyph::Up, "Scroll up", move || wheel(-400.0))
+        })
+        .child(viewer_btn(Glyph::Down, "Scroll down", move || wheel(400.0)));
+
+    let close = screen.close.clone();
+    view().child(
+        dialog()
+            .label("The agent's screen")
+            .on_cancel(move || close())
+            .bg(colors::LIGHTBOX)
+            .child(
+                view()
+                    .flex_1()
+                    .w_full()
+                    .h_full()
+                    .flex_col()
+                    .gap_2()
+                    .pt_safe_area()
+                    .pb_safe_area()
+                    .test_id("live-screen")
+                    .child(bar)
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .w_full()
+                            .p_2()
+                            .items_center()
+                            .justify_center()
+                            .on_layout(move |b: &Bounds<Points>| {
+                                room.set((
+                                    (b.size.width.0 - 16.0).max(0.0),
+                                    (b.size.height.0 - 16.0).max(0.0),
+                                ))
+                            })
+                            .child(picture),
+                    )
+                    .child(answers)
+                    .child(when(controlling, move || typing.clone()))
+                    .child(view().h(px(8.0))),
+            ),
+    )
+}

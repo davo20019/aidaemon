@@ -1238,3 +1238,41 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
     app.wait_for("Compiling 100%\n✅ 漢字 build ok")?;
     Ok(())
 }
+
+#[test]
+fn a_handoff_card_opens_the_live_view_and_watching_needs_no_card() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-live","channel":"app","title":"Book the synthetic table","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Book the synthetic table")?;
+    app.press("Book the synthetic table >> nth=0")?;
+    feed([
+        frame(
+            r#"{"type":"event","at_ms":1,"event":{"type":"surface_updated","surface":{"id":"srf_live_1","kind":"browser_tab","session_id":"app:synthetic-live","title":"Sign in","site":"login.acme.example","width":1280,"height":720,"controller":{"kind":"agent"},"handoff_pending":true,"interactive":true}}}"#,
+        ),
+        frame(
+            r#"{"type":"event","seq":1,"at_ms":2,"session_id":"app:synthetic-live","event":{"type":"approval_requested","approval":{"id":"ap-live","session_id":"app:synthetic-live","kind":"handoff","risk":"low","summary":"Sign in to your Acme account on login.acme.example, then press Done.","options":["approve_once","deny"],"requested_at_ms":2,"card":{"action":{"kind":"take_over","surface_id":"srf_live_1","what":"Sign in to your Acme account","site":"login.acme.example","keeps_sign_in":true}}}}}"#,
+        ),
+    ]);
+    app.wait_for("Sign in to your Acme account on login.acme.example")?;
+    app.wait_for("Not now")?;
+    let before = sent("open_surface");
+    app.press("Open the live view")?;
+    wait_sent_new("open_surface", before)?;
+    app.wait_for("Connecting to the screen…")?;
+    app.wait_for("Done")?;
+    app.press("label:Close")?;
+    // Watching needs no card: the header offers the browser while it is
+    // open in the conversation.
+    let before = sent("open_surface");
+    app.press("label:The agent is waiting for you in its browser")?;
+    wait_sent_new("open_surface", before)?;
+    app.wait_for("Connecting to the screen…")?;
+    Ok(())
+}

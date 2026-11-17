@@ -140,6 +140,13 @@ const NEW: &str = "";
 /// Where commands go: the link of this platform.
 pub type Outbox = Box<dyn Fn(String, Command)>;
 
+/// A live view's frame socket as the platform's link opened it: send a
+/// message to it, or close it.
+pub struct MediaLink {
+    pub send: Box<dyn Fn(String)>,
+    pub close: Box<dyn Fn()>,
+}
+
 /// The client's reads that pages build from, each a memo: a page rebuilds
 /// when its own read changes, not on every frame.
 #[derive(Clone, Copy)]
@@ -296,6 +303,12 @@ pub struct Store {
     /// Starting the daemon on this computer or pairing with one elsewhere,
     /// before any link: what is happening, or why it stopped.
     starting_daemon: Signal<Option<(String, bool)>>,
+    /// The live view's newest picture (beside the client: frames never
+    /// enter its state).
+    live_frame: Signal<Option<crate::ui::LiveFrame>>,
+    /// The live view's frame socket, and which opening it belongs to.
+    media: Stored<Option<MediaLink>>,
+    media_epoch: Stored<u64>,
 }
 
 impl Store {
@@ -349,6 +362,9 @@ impl Store {
             automations_seen_before: signal(0),
             posting: signal(BTreeSet::new()),
             starting_daemon: signal(None),
+            live_frame: signal(None),
+            media: stored(None),
+            media_epoch: stored(0),
         }
     }
 
@@ -461,6 +477,170 @@ impl Store {
                 self.new_in_project(Some(id));
             }
             Effect::View(request) => self.view_request(request),
+            Effect::OpenLive { transport, .. } => {
+                self.close_media();
+                let epoch = self.media_epoch.with(|e| *e) + 1;
+                self.media_epoch.replace(epoch);
+                let base = self.gateway_base.with(|b| b.clone());
+                let url = aidaemon_client_core::surfaces::socket_url(&base, &transport);
+                crate::link::open_live(*self, epoch, url, transport.ticket);
+            }
+            Effect::CloseLive => self.close_media(),
+        }
+    }
+
+    // ----- Live surfaces -------------------------------------------------
+
+    fn close_media(&self) {
+        if let Some(link) = self.media.replace(None) {
+            (link.close)();
+        }
+        self.live_frame.set(None);
+    }
+
+    /// The screens of `session` the owner can watch (tracked).
+    pub fn surfaces_in(&self, session: &str) -> Vec<aidaemon_client_protocol::SurfaceInfo> {
+        self.read(|c| c.surfaces_of(session))
+    }
+
+    /// Open the live view of `surface_id`; with `control`, take control.
+    pub fn watch_surface(&self, surface_id: &str, control: bool) {
+        let effects = self.act(|c| c.open_surface(surface_id, control));
+        for effect in effects {
+            self.effect(effect);
+        }
+    }
+
+    pub fn close_live(&self) {
+        let effects = self.act(Client::close_surface);
+        for effect in effects {
+            self.effect(effect);
+        }
+    }
+
+    /// Whether a live view is open (tracked).
+    pub fn live_open(&self) -> bool {
+        self.read(|c| c.live.is_some())
+    }
+
+    pub fn live_frame(&self) -> Signal<Option<crate::ui::LiveFrame>> {
+        self.live_frame
+    }
+
+    fn live_surface_id(&self) -> Option<String> {
+        self.client
+            .with_untracked(|c| c.live.as_ref().map(|l| l.surface_id.clone()))
+    }
+
+    /// The open view's surface, as the daemon last said (tracked).
+    pub fn live_surface(&self) -> Option<aidaemon_client_protocol::SurfaceInfo> {
+        self.read(|c| {
+            let id = c.live.as_ref()?.surface_id.clone();
+            c.surface(&id).cloned()
+        })
+    }
+
+    /// Why the view could not open or control was refused (tracked).
+    pub fn live_error(&self) -> Option<String> {
+        self.read(|c| {
+            c.live
+                .as_ref()
+                .and_then(|l| l.error.clone())
+                .or_else(|| c.control_error.clone())
+        })
+    }
+
+    pub fn live_controlling(&self) -> bool {
+        self.read(|c| c.live.as_ref().is_some_and(|l| c.controls(&l.surface_id)))
+    }
+
+    pub fn live_take(&self) {
+        if let Some(id) = self.live_surface_id() {
+            self.act(|c| c.take_control(&id));
+        }
+    }
+
+    pub fn live_give_back(&self) {
+        if let Some(id) = self.live_surface_id() {
+            self.act(|c| c.release_control(&id));
+        }
+    }
+
+    /// Answer the take-over card of the open view (Done or Not now), then
+    /// close the view.
+    pub fn live_finish(&self, done: bool) {
+        if let Some(id) = self.live_surface_id() {
+            self.act(|c| c.finish_handoff(&id, done));
+        }
+        self.close_live();
+    }
+
+    fn media_send(&self, text: String) {
+        self.media.with(|link| {
+            if let Some(link) = link {
+                (link.send)(text);
+            }
+        });
+    }
+
+    fn live_input(&self, input: aidaemon_client_protocol::media::SurfaceInput) {
+        self.media_send(aidaemon_client_core::surfaces::input(input));
+    }
+
+    pub fn live_pointer(&self, action: &'static str, x: f32, y: f32) {
+        self.live_input(aidaemon_client_core::surfaces::pointer(action, x, y));
+    }
+
+    pub fn live_wheel(&self, dy: f32) {
+        self.live_input(aidaemon_client_protocol::media::SurfaceInput::Wheel {
+            x: 0.5,
+            y: 0.5,
+            dx: 0.0,
+            dy: f64::from(dy),
+        });
+    }
+
+    pub fn live_text(&self, text: String) {
+        self.live_input(aidaemon_client_protocol::media::SurfaceInput::Text { text });
+    }
+
+    pub fn live_key(&self, code: &str, key: &str) {
+        for input in aidaemon_client_core::surfaces::key_press(code, key) {
+            self.live_input(input);
+        }
+    }
+
+    /// The platform opened the frame socket of opening `epoch`.
+    pub fn media_attached(&self, epoch: u64, link: MediaLink) {
+        if self.media_epoch.with(|e| *e) != epoch {
+            (link.close)();
+            return;
+        }
+        if let Some(old) = self.media.replace(Some(link)) {
+            (old.close)();
+        }
+    }
+
+    /// Something came on the frame socket of opening `epoch`.
+    pub fn media_event(&self, epoch: u64, event: aidaemon_client_core::surfaces::MediaEvent) {
+        use aidaemon_client_core::surfaces::MediaEvent;
+        if self.media_epoch.with(|e| *e) != epoch {
+            return;
+        }
+        match event {
+            MediaEvent::Frame { w, h, uri, .. } => {
+                self.live_frame
+                    .set(Some(crate::ui::LiveFrame { uri, w, h }));
+            }
+            MediaEvent::Closed(why) => {
+                self.media.replace(None);
+                self.live_frame.set(None);
+                if self.client.with_untracked(|c| c.live.is_some()) {
+                    self.say(format!("The live view ended: {why}"));
+                    self.close_live();
+                }
+            }
+            MediaEvent::Ready | MediaEvent::Controller(_) => {}
         }
     }
 
@@ -1491,6 +1671,7 @@ impl Store {
             ViewAction::FocusPane { pane } => format!("the {} pane", pane_name(*pane)),
             ViewAction::NewSession => "a new conversation".into(),
             ViewAction::ShowDevices => "your paired devices".into(),
+            ViewAction::ShowSurface { .. } => "the agent's browser".into(),
             ViewAction::Unknown => "something this version cannot show".into(),
         })
     }
@@ -1545,6 +1726,22 @@ impl Store {
             }
             ViewAction::ShowDevices => {
                 "Paired devices: ask your agent for /devices (not shown in this app yet)".into()
+            }
+            // A view move opens no stream: the conversation comes up with
+            // its browser button, and the owner opens the live view.
+            ViewAction::ShowSurface { surface_id } => {
+                let session = self
+                    .client
+                    .with_untracked(|c| c.surface(&surface_id).and_then(|s| s.session_id.clone()));
+                match session {
+                    Some(session) => {
+                        self.select(Some(session));
+                        "The agent is waiting for you in its browser: open the live view from \
+                         the card or the browser button"
+                            .into()
+                    }
+                    None => format!("Could not show {what}"),
+                }
             }
             ViewAction::Unknown => return,
         };

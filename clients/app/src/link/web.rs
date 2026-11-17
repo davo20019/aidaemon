@@ -58,6 +58,14 @@ extern "C" {
     #[wasm_bindgen(js_name = onWake)]
     fn on_wake(wake: &Closure<dyn FnMut()>);
 
+    type MediaSocket;
+    #[wasm_bindgen(constructor)]
+    fn new(url: &str, ticket: &str, event: &Closure<dyn FnMut(String, String)>) -> MediaSocket;
+    #[wasm_bindgen(method, js_name = send)]
+    fn send_media(this: &MediaSocket, text: &str);
+    #[wasm_bindgen(method, js_name = close)]
+    fn close_media(this: &MediaSocket);
+
     type Socket;
     #[wasm_bindgen(constructor)]
     fn new(url: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
@@ -233,7 +241,7 @@ pub fn start(store: Store) {
                 version: Some(env!("CARGO_PKG_VERSION").into()),
             },
             None,
-            vec![Capability::ViewActions],
+            vec![Capability::ViewActions, Capability::Surfaces],
         );
         let (commands_tx, mut commands) = mpsc::unbounded::<(String, Command)>();
         store.attach(Box::new(move |id, command| {
@@ -402,4 +410,62 @@ async fn grant_token(
             SignInError::Refused(why) => (DropKind::Unauthorized, why),
             SignInError::Failed(why) => (DropKind::Dropped, why),
         })
+}
+
+/// Open a live view's frame socket on the page's own WebSocket (protocol
+/// 1.30). The page turns each frame into a `data:` URI and acks it.
+pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
+    use aidaemon_client_core::surfaces::MediaEvent;
+    use aidaemon_client_protocol::media::MediaHeader;
+    let (events_tx, mut events) = mpsc::unbounded::<(String, String)>();
+    let on_event = Closure::<dyn FnMut(String, String)>::new(move |kind: String, text: String| {
+        let _ = events_tx.unbounded_send((kind, text));
+    });
+    let socket = std::rc::Rc::new(MediaSocket::new(&url, &ticket, &on_event));
+    let keep = std::rc::Rc::new(std::cell::RefCell::new(Some(on_event)));
+    store.media_attached(
+        epoch,
+        crate::store::MediaLink {
+            send: Box::new({
+                let socket = socket.clone();
+                move |text: String| socket.send_media(&text)
+            }),
+            close: Box::new(move || {
+                socket.close_media();
+                keep.borrow_mut().take();
+            }),
+        },
+    );
+    spawn(async move {
+        while let Some((kind, text)) = events.next().await {
+            let event = match kind.as_str() {
+                "frame" => {
+                    let Ok(f) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    let number = |key: &str| f[key].as_u64().unwrap_or(0);
+                    MediaEvent::Frame {
+                        seq: number("seq"),
+                        w: u32::try_from(number("w")).unwrap_or(0),
+                        h: u32::try_from(number("h")).unwrap_or(0),
+                        uri: f["uri"].as_str().unwrap_or_default().to_owned(),
+                    }
+                }
+                "header" => match serde_json::from_str::<MediaHeader>(&text) {
+                    Ok(MediaHeader::Ready { .. }) => MediaEvent::Ready,
+                    Ok(MediaHeader::Controller { controller }) => {
+                        MediaEvent::Controller(controller)
+                    }
+                    Ok(MediaHeader::Closed { reason }) => MediaEvent::Closed(reason),
+                    _ => continue,
+                },
+                _ => MediaEvent::Closed(text),
+            };
+            let ended = matches!(event, MediaEvent::Closed(_));
+            store.media_event(epoch, event);
+            if ended {
+                return;
+            }
+        }
+    });
 }

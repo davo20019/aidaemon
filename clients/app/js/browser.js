@@ -131,6 +131,55 @@ export class Socket {
   }
 }
 
+function b64(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    text += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(text);
+}
+
+/**
+ * A live view's frame socket (protocol 1.30): sends the ticket first, turns
+ * each binary frame into a data: URI for the app and acks it, and passes
+ * the other headers on as JSON. Nothing typed is kept here.
+ */
+export class MediaSocket {
+  constructor(url, ticket, event) {
+    this.ws = new WebSocket(url);
+    this.ws.binaryType = "arraybuffer";
+    this.ws.onopen = () => this.ws.send(JSON.stringify({ type: "auth", ticket }));
+    this.ws.onmessage = (m) => {
+      if (typeof m.data === "string") return;
+      const bytes = new Uint8Array(m.data);
+      if (bytes.length < 4) return;
+      const length = new DataView(m.data).getUint32(0);
+      let header;
+      try {
+        header = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + length)));
+      } catch {
+        return;
+      }
+      if (header.type === "frame") {
+        const mime = header.codec === "png" ? "image/png" : "image/jpeg";
+        const uri = `data:${mime};base64,${b64(bytes.subarray(4 + length))}`;
+        event("frame", JSON.stringify({ seq: header.seq, w: header.w, h: header.h, uri }));
+        this.send(JSON.stringify({ type: "ack", seq: header.seq }));
+      } else {
+        event("header", JSON.stringify(header));
+      }
+    };
+    this.ws.onclose = (c) => event("close", c.reason || "the live view closed");
+    this.ws.onerror = () => {};
+  }
+  send(text) {
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(text);
+  }
+  close() {
+    this.ws.close();
+  }
+}
+
 /**
  * Take a picture with the device's camera (a phone's browser opens it for a
  * file input with `capture`): its JPEG bytes, scaled to fit `maxDimension`
