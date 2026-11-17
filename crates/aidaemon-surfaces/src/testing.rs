@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::types::{
-    Codec, ExclusiveGuard, FrameSink, HandoffPrep, InputEvent, Size, StreamHandle, StreamParams,
-    SurfaceCaps, SurfaceDescriptor, SurfaceError, SurfaceId, SurfaceKind, SurfaceObservation,
+    Codec, ExclusiveGuard, FrameSink, HandoffPrep, InputEvent, PointedAt, Size, StreamHandle,
+    StreamParams, SurfaceCaps, SurfaceDescriptor, SurfaceError, SurfaceId, SurfaceKind,
+    SurfaceObservation,
 };
 use crate::{SurfaceBackend, SurfaceNotifier};
 
@@ -175,6 +176,26 @@ impl SurfaceBackend for MockSurface {
         }
         observation.agent_ref = surface.agent_ref.clone();
         Ok(observation)
+    }
+
+    async fn describe_point(
+        &self,
+        id: &SurfaceId,
+        _x: f64,
+        _y: f64,
+    ) -> Result<PointedAt, SurfaceError> {
+        let state = self.state();
+        let surface = state
+            .surfaces
+            .iter()
+            .find(|s| &s.id == id)
+            .ok_or(SurfaceError::NotFound)?;
+        Ok(PointedAt {
+            what: "a button".into(),
+            text: Some("Sign in".into()),
+            selector: Some("#signin".into()),
+            agent_ref: surface.agent_ref.clone(),
+        })
     }
 
     async fn exclusive(&self, id: &SurfaceId) -> Result<ExclusiveGuard, SurfaceError> {

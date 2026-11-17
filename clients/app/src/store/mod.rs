@@ -611,6 +611,14 @@ impl Store {
         self.media_send(aidaemon_client_core::surfaces::input(input));
     }
 
+    /// Point the agent at a spot of the open view.
+    pub fn live_point(&self, x: f32, y: f32) {
+        if let Some(id) = self.live_surface_id() {
+            self.act(|c| c.point_at(&id, x, y, None));
+            self.say("Pointed the agent at it");
+        }
+    }
+
     pub fn live_pointer(&self, action: &'static str, x: f32, y: f32) {
         self.live_input(aidaemon_client_core::surfaces::pointer(action, x, y));
     }

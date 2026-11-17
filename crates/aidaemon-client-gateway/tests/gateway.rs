@@ -2498,3 +2498,58 @@ async fn only_the_daemons_own_computer_changes_what_a_device_may_do() {
         "{changed:?}"
     );
 }
+
+#[tokio::test]
+async fn pointing_sends_the_agent_what_is_there_as_the_owners_message() {
+    let f = fixture(RiskLevel::Medium).await;
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let mock = MockSurface::new();
+    mock.set_notifier(registry.notifier());
+    registry.add_backend(Arc::new(mock.clone()));
+    f.gateway.attach_surfaces(registry.clone());
+    let mut socket = socket_with(&f, vec![Capability::ViewActions, Capability::Surfaces]).await;
+    let (accepted, _) = command_on(&mut socket, &command("p-0", send("open the site"))).await;
+    let CommandResult::MessageAccepted { session_id, .. } = accepted else {
+        panic!("{accepted:?}");
+    };
+    let surface = mock.add(&session_id, "tab-1");
+    registry.refresh().await;
+    let (pointed, seen) = command_on(
+        &mut socket,
+        &command(
+            "p-1",
+            Command::PointAt {
+                surface_id: surface.to_string(),
+                x: 0.4,
+                y: 0.6,
+                note: Some("Click this one".into()),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        matches!(&pointed, CommandResult::MessageAccepted { session_id: s, .. } if *s == session_id),
+        "{pointed:?}"
+    );
+    let mut said = seen;
+    for _ in 0..20 {
+        if said.iter().any(|f| matches!(f, ServerFrame::Event { event: Event::UserMessage { text, .. }, .. } if text.contains("Click this one"))) {
+            break;
+        }
+        said.push(next(&mut socket).await);
+    }
+    let text = said
+        .iter()
+        .find_map(|f| match f {
+            ServerFrame::Event {
+                event: Event::UserMessage { text, .. },
+                ..
+            } if text.contains("Click this one") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the owner's message");
+    assert!(
+        text.contains("a button “Sign in” on browser tab tab-1 (selector `#signin`)"),
+        "{text}"
+    );
+}

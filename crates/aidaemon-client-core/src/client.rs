@@ -2312,6 +2312,17 @@ impl Client {
         }
     }
 
+    /// Point the agent at `(x, y)` (fractions of the frame) on `surface_id`,
+    /// with an optional note: it arrives as the owner's message.
+    pub fn point_at(&mut self, surface_id: &str, x: f32, y: f32, note: Option<String>) {
+        self.send(Command::PointAt {
+            surface_id: surface_id.to_owned(),
+            x: f64::from(x.clamp(0.0, 1.0)),
+            y: f64::from(y.clamp(0.0, 1.0)),
+            note,
+        });
+    }
+
     // ----- Paired devices (protocol 1.31) ----------------------------------
 
     pub fn refresh_devices(&mut self) {

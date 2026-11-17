@@ -1274,6 +1274,9 @@ fn a_handoff_card_opens_the_live_view_and_watching_needs_no_card() -> Result<(),
     app.press("label:The agent is waiting for you in its browser")?;
     wait_sent_new("open_surface", before)?;
     app.wait_for("Connecting to the screen…")?;
+    // Watching, a tap can point the agent at something.
+    app.press("Point")?;
+    app.wait_for("Tap what you mean")?;
     Ok(())
 }
 

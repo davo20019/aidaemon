@@ -402,6 +402,23 @@ impl SurfaceRegistry {
             .ok_or(SurfaceError::NotFound)
     }
 
+    /// What is at `(x, y)` on `id`, for the owner to point the agent at.
+    pub async fn describe_point(
+        &self,
+        id: &SurfaceId,
+        x: f64,
+        y: f64,
+    ) -> Result<crate::PointedAt, SurfaceError> {
+        let inside = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+        if !(inside(x) && inside(y)) {
+            return Err(SurfaceError::BadInput("point outside the frame"));
+        }
+        if !self.config().enabled {
+            return Err(SurfaceError::Disabled);
+        }
+        self.backend_of(id)?.describe_point(id, x, y).await
+    }
+
     pub async fn observe(&self, id: &SurfaceId) -> Result<SurfaceObservation, SurfaceError> {
         self.backend_of(id)?.observe(id).await
     }

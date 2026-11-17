@@ -33,9 +33,9 @@ pub use registry::{
 };
 pub use types::{
     Codec, Controller, ExclusiveGuard, Frame, FrameSink, HandoffPrep, InputEvent, KeyAction,
-    MAX_TEXT_CHARS, MAX_TITLE_CHARS, Modifier, PointerAction, PointerButton, Size, StreamHandle,
-    StreamParams, SurfaceCaps, SurfaceDescriptor, SurfaceError, SurfaceId, SurfaceInfo,
-    SurfaceKind, SurfaceObservation, clean_title, now_ms,
+    MAX_TEXT_CHARS, MAX_TITLE_CHARS, Modifier, PointedAt, PointerAction, PointerButton, Size,
+    StreamHandle, StreamParams, SurfaceCaps, SurfaceDescriptor, SurfaceError, SurfaceId,
+    SurfaceInfo, SurfaceKind, SurfaceObservation, clean_title, now_ms,
 };
 
 use async_trait::async_trait;
@@ -66,6 +66,19 @@ pub trait SurfaceBackend: Send + Sync {
     /// Keep the agent's own actions on the surface waiting until the guard
     /// is dropped. Waits for an action already running to finish.
     async fn exclusive(&self, id: &SurfaceId) -> Result<ExclusiveGuard, SurfaceError>;
+
+    /// What is at `(x, y)` (fractions of the frame), for the owner to point
+    /// the agent at. Default: this surface cannot say.
+    async fn describe_point(
+        &self,
+        _id: &SurfaceId,
+        _x: f64,
+        _y: f64,
+    ) -> Result<PointedAt, SurfaceError> {
+        Err(SurfaceError::NotSupported(
+            "this screen cannot say what is there",
+        ))
+    }
 
     /// Get the surface ready before the owner is asked to act on it (a
     /// browser moves to a profile that keeps sign-ins). May reopen it under

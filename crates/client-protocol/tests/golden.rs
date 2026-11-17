@@ -201,6 +201,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::CloseSurface { .. } => "close_surface",
         Command::TakeControl { .. } => "take_control",
         Command::ReleaseControl { .. } => "release_control",
+        Command::PointAt { .. } => "point_at",
         Command::ListDevices => "list_devices",
         Command::SetDeviceScopes { .. } => "set_device_scopes",
         Command::Unknown => "unknown",
@@ -540,6 +541,15 @@ fn client_samples() -> Vec<ClientFrame> {
             "5d0c2b1e-002a",
             Command::ReleaseControl {
                 surface_id: "srf_7d1c".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-002d",
+            Command::PointAt {
+                surface_id: "srf_7d1c".into(),
+                x: 0.5,
+                y: 0.25,
+                note: Some("This one".into()),
             },
         ),
         command("5d0c2b1e-002b", Command::ListDevices),

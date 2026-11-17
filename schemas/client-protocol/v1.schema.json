@@ -1981,6 +1981,39 @@
           "type": "object"
         },
         {
+          "description": "Point the agent at what is at `(x, y)` (fractions of the frame) on a\nsurface, with an optional `note` (protocol 1.31; scopes `chat` and\n`control`). The daemon says what is there and sends it, as the\nowner's message, to the surface's conversation. Answers with\n`message_accepted`.",
+          "properties": {
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "surface_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "point_at",
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": "number"
+            },
+            "y": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id",
+            "x",
+            "y"
+          ],
+          "type": "object"
+        },
+        {
           "description": "The paired devices (protocol 1.31). Answers with `devices`.",
           "properties": {
             "type": {

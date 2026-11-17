@@ -475,6 +475,18 @@ pub enum Command {
     /// Give a surface back to the agent (protocol 1.30). Answers with
     /// `surface_control`.
     ReleaseControl { surface_id: String },
+    /// Point the agent at what is at `(x, y)` (fractions of the frame) on a
+    /// surface, with an optional `note` (protocol 1.31; scopes `chat` and
+    /// `control`). The daemon says what is there and sends it, as the
+    /// owner's message, to the surface's conversation. Answers with
+    /// `message_accepted`.
+    PointAt {
+        surface_id: String,
+        x: f64,
+        y: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     /// The paired devices (protocol 1.31). Answers with `devices`.
     ListDevices,
     /// What a paired device may do (protocol 1.31): only from the daemon's

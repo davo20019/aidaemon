@@ -386,6 +386,13 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
             .await
             .expect("enter");
     }
+    let pointed = registry
+        .describe_point(&surface.id, 0.5, 0.2)
+        .await
+        .expect("describe the point");
+    assert_eq!(pointed.what, "a password field");
+    assert_eq!(pointed.selector.as_deref(), Some("#pw"));
+    assert!(pointed.text.is_none(), "a field's value is never described");
     let observed = registry.observe(&surface.id).await.expect("observe");
     assert!(observed.password_field_present);
     registry.close_live(&live.live_id);

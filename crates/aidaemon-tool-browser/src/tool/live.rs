@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aidaemon_surfaces::{
-    Codec, ExclusiveGuard, FrameSink, HandoffPrep, InputEvent, KeyAction, Modifier, PointerAction,
-    PointerButton, Size, StreamHandle, StreamParams, SurfaceBackend, SurfaceCaps,
+    Codec, ExclusiveGuard, FrameSink, HandoffPrep, InputEvent, KeyAction, Modifier, PointedAt,
+    PointerAction, PointerButton, Size, StreamHandle, StreamParams, SurfaceBackend, SurfaceCaps,
     SurfaceDescriptor, SurfaceError, SurfaceId, SurfaceKind, SurfaceNotifier, SurfaceObservation,
     clean_title,
 };
@@ -30,6 +30,47 @@ use super::backend::{
 };
 use super::redact_origin;
 use super::session::BrowserSessionRegistry;
+
+/// What is at a point of the page: its kind, its visible words (never a
+/// field's value) and a selector the browser tool can use. `__X__` and
+/// `__Y__` are the point's fractions, numbers only.
+const POINT_SCRIPT: &str = r#"(() => {
+  const x = __X__ * window.innerWidth, y = __Y__ * window.innerHeight;
+  let el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  el = el.closest('a,button,input,select,textarea,label,[role=button],[role=link],[onclick]') || el;
+  const tag = el.tagName.toLowerCase();
+  const type = (el.getAttribute('type') || '').toLowerCase();
+  const role = el.getAttribute('role') || '';
+  const what = tag === 'a' || role === 'link' ? 'a link'
+    : tag === 'button' || role === 'button' || type === 'submit' || type === 'button' ? 'a button'
+    : tag === 'input' && type === 'password' ? 'a password field'
+    : tag === 'input' || tag === 'textarea' ? 'a text field'
+    : tag === 'select' ? 'a menu'
+    : tag === 'img' ? 'a picture'
+    : 'the ' + tag + ' element';
+  const typed = tag === 'input' || tag === 'textarea' || tag === 'select';
+  const words = (el.getAttribute('aria-label') || el.getAttribute('placeholder')
+    || el.getAttribute('alt') || (typed ? '' : el.innerText) || el.getAttribute('title') || '')
+    .trim().replace(/\s+/g, ' ').slice(0, 80);
+  let selector;
+  if (el.id) selector = '#' + CSS.escape(el.id);
+  else if (el.getAttribute('name')) selector = tag + '[name="' + CSS.escape(el.getAttribute('name')) + '"]';
+  else {
+    const parts = [];
+    let n = el;
+    while (n && n.nodeType === 1 && parts.length < 6) {
+      if (n.id) { parts.unshift('#' + CSS.escape(n.id)); break; }
+      let part = n.tagName.toLowerCase();
+      const same = n.parentElement ? [...n.parentElement.children].filter((c) => c.tagName === n.tagName) : [];
+      if (same.length > 1) part += ':nth-of-type(' + (same.indexOf(n) + 1) + ')';
+      parts.unshift(part);
+      n = n.parentElement;
+    }
+    selector = parts.join(' > ');
+  }
+  return { what, text: words || null, selector };
+})()"#;
 
 /// How long one page read for the surface list may take.
 const READ_WITHIN: Duration = Duration::from_millis(800);
@@ -431,6 +472,46 @@ impl SurfaceBackend for BrowserSurface {
             site: url.as_deref().and_then(site_of),
             title: clean_title(&page.title().await.unwrap_or_default()),
             password_field_present,
+            agent_ref,
+        })
+    }
+
+    async fn describe_point(
+        &self,
+        id: &SurfaceId,
+        x: f64,
+        y: f64,
+    ) -> Result<PointedAt, SurfaceError> {
+        let (session, target, page) = self.page(id).await?;
+        let script = POINT_SCRIPT
+            .replace("__X__", &format!("{:.6}", x.clamp(0.0, 1.0)))
+            .replace("__Y__", &format!("{:.6}", y.clamp(0.0, 1.0)));
+        let found = page
+            .evaluate(&script)
+            .await
+            .map_err(backend_error)?
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| SurfaceError::Refused("Nothing is there.".into()))?;
+        let field = |key: &str| {
+            found
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(clean_title)
+                .filter(|v| !v.is_empty())
+        };
+        let agent_ref = self
+            .sessions
+            .tab(&session, &target)
+            .await
+            .map(|tab| tab.tab_id);
+        Ok(PointedAt {
+            what: field("what").unwrap_or_else(|| "something".into()),
+            text: field("text"),
+            selector: found
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty() && v.len() <= 300)
+                .map(str::to_string),
             agent_ref,
         })
     }

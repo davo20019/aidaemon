@@ -826,6 +826,7 @@ impl ClientGateway {
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
             Command::ListSurfaces | Command::ListDevices => Some(Scope::Observe),
+            Command::PointAt { .. } => Some(Scope::Control),
             Command::SetDeviceScopes { .. } => None,
             Command::OpenSurface { .. }
             | Command::CloseSurface { .. }
@@ -1286,6 +1287,35 @@ impl ClientGateway {
                     },
                 );
                 Ok(CommandResult::Setup { setup })
+            }
+            Command::PointAt {
+                surface_id,
+                x,
+                y,
+                note,
+            } => {
+                // It sends a message too.
+                if !self.pairing.may_now(&caller.principal, Scope::Chat) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "This device may not Chat",
+                    ));
+                }
+                let (session, text) = self
+                    .need_surfaces()?
+                    .point_message(surface_id, x, y, note)
+                    .await?;
+                self.send_message(
+                    request_id,
+                    Some(session),
+                    text,
+                    Vec::new(),
+                    caller.view_connection,
+                    None,
+                    None,
+                    (None, None),
+                )
+                .await
             }
             Command::ListDevices => self.devices_for(caller).await,
             Command::SetDeviceScopes { device_id, scopes } => {

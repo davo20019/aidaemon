@@ -1800,6 +1800,10 @@ pub struct LiveScreen {
     pub waiting: std::rc::Rc<dyn Fn() -> bool>,
     /// A press, move or release at a fraction of the picture.
     pub pointer: std::rc::Rc<dyn Fn(&'static str, f32, f32)>,
+    /// Point the agent at a fraction of the picture (watching, not
+    /// controlling): it gets what is there as the owner's message.
+    pub point: std::rc::Rc<dyn Fn(f32, f32)>,
+    pub can_point: std::rc::Rc<dyn Fn() -> bool>,
     pub wheel: std::rc::Rc<dyn Fn(f32)>,
     pub text: std::rc::Rc<dyn Fn(String)>,
     /// A key by its `code` and `key`.
@@ -1839,6 +1843,8 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         move || c()
     };
 
+    // Point mode: the next tap tells the agent what is there.
+    let pointing = signal(false);
     // Where a finger or the pointer acts: an empty layer over the picture,
     // so its place is in the picture's own frame.
     let start = signal((0.0f32, 0.0f32));
@@ -1849,12 +1855,19 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             screen.pointer.clone(),
             screen.pointer.clone(),
         );
+        let point = screen.point.clone();
         let controlling = controlling.clone();
+        let (c_down, c_move, c_up, c_cancel) = (
+            controlling.clone(),
+            controlling.clone(),
+            controlling.clone(),
+            controlling.clone(),
+        );
         view()
             .absolute()
             .inset_0()
             .claim_touches(TouchClaim::on_start().ask(move |request: &ClaimRequest| {
-                if controlling() {
+                if controlling() || pointing.get_untracked() {
                     request.claim();
                 }
             }))
@@ -1866,11 +1879,16 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 }
                 let at = (e.location.x.0 / w, e.location.y.0 / h);
                 start.set(at);
-                down("down", at.0, at.1);
+                if c_down() {
+                    down("down", at.0, at.1);
+                }
             })
             .on_responder_move(move |e: &ResponderEvent| {
                 let (w, h) = fitted();
                 if w <= 0.0 || h <= 0.0 {
+                    return;
+                }
+                if !c_move() {
                     return;
                 }
                 let (x0, y0) = start.get_untracked();
@@ -1891,11 +1909,18 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 } else {
                     (x0, y0)
                 };
-                up("up", at.0, at.1);
+                if c_up() {
+                    up("up", at.0, at.1);
+                } else if pointing.get_untracked() {
+                    pointing.set(false);
+                    point(at.0, at.1);
+                }
             })
             .on_responder_terminate(move |_: &ResponderEvent| {
-                let (x0, y0) = start.get_untracked();
-                cancel("cancel", x0, y0);
+                if c_cancel() {
+                    let (x0, y0) = start.get_untracked();
+                    cancel("cancel", x0, y0);
+                }
             })
     };
     let picture = view()
@@ -1930,7 +1955,13 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     )
             },
         ))
-        .child(when(controlling.clone(), move || pad.clone()));
+        .child(when(
+            {
+                let c = controlling.clone();
+                move || c() || pointing.get()
+            },
+            move || pad.clone(),
+        ));
 
     let status_line = {
         let status = screen.status.clone();
@@ -1973,6 +2004,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     let not_now = screen.not_now.clone();
     let can_control = screen.can_control.clone();
     let waiting = screen.waiting.clone();
+    let can_point = screen.can_point.clone();
     let answers = view()
         .flex_row()
         .flex_wrap()
@@ -1980,6 +2012,25 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         .justify_center()
         .gap_2()
         .px_3()
+        .child(when(
+            {
+                let c = controlling.clone();
+                move || !c() && can_point()
+            },
+            move || {
+                view().child(dynamic(move || {
+                    let on = pointing.get();
+                    Some(untracked(move || {
+                        viewer_text_btn(
+                            if on { "Tap what you mean" } else { "Point" },
+                            on,
+                            move || pointing.set(!on),
+                        )
+                        .into_element()
+                    }))
+                }))
+            },
+        ))
         .child(when(
             {
                 let (c, can) = (controlling.clone(), can_control.clone());

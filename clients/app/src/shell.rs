@@ -535,6 +535,8 @@ fn live_screen(store: Store) -> crate::ui::LiveScreen {
         can_control: Rc::new(move || store.live_surface().is_some_and(|s| s.interactive)),
         waiting: Rc::new(move || store.live_surface().is_some_and(|s| s.handoff_pending)),
         pointer: Rc::new(move |action, x, y| store.live_pointer(action, x, y)),
+        point: Rc::new(move |x, y| store.live_point(x, y)),
+        can_point: Rc::new(move || store.live_surface().is_some_and(|s| s.session_id.is_some())),
         wheel: Rc::new(move |dy| store.live_wheel(dy)),
         text: Rc::new(move |text| store.live_text(text)),
         key: Rc::new(move |code, key| store.live_key(code, key)),

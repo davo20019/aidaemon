@@ -290,6 +290,54 @@ impl SurfaceDesk {
         })
     }
 
+    /// What the owner pointed at, as their message to the surface's
+    /// conversation: the conversation and the words.
+    pub async fn point_message(
+        &self,
+        surface_id: String,
+        x: f64,
+        y: f64,
+        note: Option<String>,
+    ) -> Result<(String, String), ProtocolError> {
+        let id = SurfaceId::from_string(surface_id);
+        let session = self
+            .registry
+            .get(&id)
+            .and_then(|s| s.session_id)
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::Invalid, "That screen belongs to no conversation")
+            })?;
+        let at = self
+            .registry
+            .describe_point(&id, x, y)
+            .await
+            .map_err(refusal)?;
+        let mut thing = at.what.clone();
+        if let Some(words) = &at.text {
+            thing.push_str(&format!(" “{words}”"));
+        }
+        let tab = at
+            .agent_ref
+            .as_deref()
+            .map(|tab| format!(" on browser tab {tab}"))
+            .unwrap_or_default();
+        let selector = at
+            .selector
+            .as_deref()
+            .map(|selector| format!(" (selector `{selector}`)"))
+            .unwrap_or_default();
+        let note: String = note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.chars().take(2000).collect())
+            .unwrap_or_else(|| "Look here.".to_string());
+        Ok((
+            session,
+            format!("{note}\n\n[I pointed at {thing}{tab}{selector}.]"),
+        ))
+    }
+
     /// Use a ticket: the device it was given to and what revokes it.
     fn redeem(&self, live_id: &str, ticket: &str) -> Option<(String, CancellationToken)> {
         let hash = sha(ticket);

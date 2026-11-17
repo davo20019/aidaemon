@@ -374,6 +374,23 @@ pub struct SurfaceObservation {
     pub agent_ref: Option<String>,
 }
 
+/// What the owner pointed at on a surface: enough for the agent to act on
+/// it with its own tools. Never a field's value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointedAt {
+    /// "a button", "a link", "a text field"...
+    pub what: String,
+    /// Its visible words (or label, placeholder), capped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// A CSS selector the agent's browser tool can use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// The name the agent knows the surface by (a tab id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_ref: Option<String>,
+}
+
 /// A pointer button.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
