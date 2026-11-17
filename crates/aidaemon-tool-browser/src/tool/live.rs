@@ -68,7 +68,10 @@ const POINT_SCRIPT: &str = r#"(() => {
     }
     selector = parts.join(' > ');
   }
-  return { what, text: words || null, selector };
+  const box = el.getBoundingClientRect();
+  const rect = [box.left / window.innerWidth, box.top / window.innerHeight,
+    box.width / window.innerWidth, box.height / window.innerHeight];
+  return { what, text: words || null, selector, rect };
 })()"#;
 
 /// How long one page read for the surface list may take.
@@ -224,6 +227,16 @@ impl BrowserSurface {
                 .filter(|v| !v.is_empty() && v.len() <= 300)
                 .map(str::to_string),
             agent_ref,
+            rect: found.get("rect").and_then(|r| {
+                let parts: Vec<f64> = r.as_array()?.iter().filter_map(|v| v.as_f64()).collect();
+                let [x, y, w, h] = parts.as_slice() else {
+                    return None;
+                };
+                [*x, *y, *w, *h]
+                    .iter()
+                    .all(|v| v.is_finite())
+                    .then_some([*x, *y, *w, *h])
+            }),
         }))
     }
 

@@ -755,6 +755,7 @@ async fn pump_media(
                         {
                             send_header(socket, &MediaHeader::Focus {
                                 what: focused.as_ref().map(|f| f.what.clone()),
+                                rect: focused.as_ref().and_then(|f| f.rect),
                                 label: focused.and_then(|f| f.text),
                             }).await?;
                         }

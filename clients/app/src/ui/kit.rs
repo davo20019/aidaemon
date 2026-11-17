@@ -1798,6 +1798,10 @@ pub struct LiveScreen {
     /// Where typing goes, in words; `Some(None)`: nothing takes typing;
     /// `None`: not known yet.
     pub focus: std::rc::Rc<dyn Fn() -> Option<Option<String>>>,
+    /// The focused field's place, as frame fractions `[x, y, w, h]`.
+    pub focus_rect: std::rc::Rc<dyn Fn() -> Option<[f32; 4]>>,
+    /// Characters the last Type sent.
+    pub typed: std::rc::Rc<dyn Fn() -> Option<usize>>,
     pub can_control: std::rc::Rc<dyn Fn() -> bool>,
     /// The agent waits for the owner here (a handoff): Done and Not now.
     pub waiting: std::rc::Rc<dyn Fn() -> bool>,
@@ -1974,6 +1978,27 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     )
             },
         ))
+        .child({
+            // The field that has the keyboard, outlined by the app itself:
+            // a page in the background may not draw its own focus.
+            let focus_rect = screen.focus_rect.clone();
+            dynamic(move || {
+                let [x, y, w, h] = focus_rect()?;
+                Some(untracked(move || {
+                    let (fw, fh) = fitted();
+                    view()
+                        .absolute()
+                        .left(px(x * fw - 3.0))
+                        .top(px(y * fh - 3.0))
+                        .w(px(w * fw + 6.0))
+                        .h(px(h * fh + 6.0))
+                        .rounded(px(6.0))
+                        .border_2()
+                        .border_color(colors::TAP_RING)
+                        .into_element()
+                }))
+            })
+        })
         .child(dynamic(move || {
             let (x, y) = tapped.get()?;
             Some(untracked(move || {
@@ -2121,10 +2146,18 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         viewer_text_btn(label, false, move || key(code, name))
     };
     let focus = screen.focus.clone();
-    let focus_line = text(move || match focus() {
-        Some(Some(words)) => format!("Typing into: {words}"),
-        Some(None) => "Nothing to type into: tap a box on the page first".to_owned(),
-        None => "Tap a box on the page to type into it".to_owned(),
+    let sent = screen.typed.clone();
+    let focus_line = text(move || match (focus(), sent()) {
+        (Some(Some(words)), Some(count)) => {
+            let what = words.split(',').next().unwrap_or(&words).trim().to_owned();
+            format!(
+                "Typed {count} character{} into {what}",
+                if count == 1 { "" } else { "s" }
+            )
+        }
+        (Some(Some(words)), None) => format!("✓ Ready: typing goes into {words}"),
+        (Some(None), _) => "Nothing to type into: tap a box on the page first".to_owned(),
+        (None, _) => "Tap a box on the page to type into it".to_owned(),
     })
     .text_size(px(type_scale::SM))
     .font_weight(FontWeight::MEDIUM)

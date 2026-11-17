@@ -309,6 +309,10 @@ pub struct Store {
     /// Where the owner's typing goes on the live view, once the daemon
     /// said: `Some(None)` means nothing takes typing.
     live_focus: Signal<Option<Option<String>>>,
+    /// The focused field's place on the live view, as frame fractions.
+    live_focus_rect: Signal<Option<[f32; 4]>>,
+    /// Characters sent with the last Type, until the next tap.
+    live_typed: Signal<Option<usize>>,
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
@@ -367,6 +371,8 @@ impl Store {
             starting_daemon: signal(None),
             live_frame: signal(None),
             live_focus: signal(None),
+            live_focus_rect: signal(None),
+            live_typed: signal(None),
             media: stored(None),
             media_epoch: stored(0),
         }
@@ -501,6 +507,8 @@ impl Store {
         }
         self.live_frame.set(None);
         self.live_focus.set(None);
+        self.live_focus_rect.set(None);
+        self.live_typed.set(None);
     }
 
     /// The screens of `session` the owner can watch (tracked).
@@ -550,6 +558,16 @@ impl Store {
     /// Whether a live view is open (tracked).
     pub fn live_open(&self) -> bool {
         self.read(|c| c.live.is_some())
+    }
+
+    /// The focused field's place on the live view (tracked).
+    pub fn live_focus_rect(&self) -> Option<[f32; 4]> {
+        self.live_focus_rect.get()
+    }
+
+    /// Characters the last Type sent (tracked).
+    pub fn live_typed(&self) -> Option<usize> {
+        self.live_typed.get()
     }
 
     /// Where typing goes on the live view, in words (tracked).
@@ -630,6 +648,9 @@ impl Store {
     }
 
     pub fn live_pointer(&self, action: &'static str, x: f32, y: f32) {
+        if action == "down" {
+            self.live_typed.set(None);
+        }
         self.live_input(aidaemon_client_core::surfaces::pointer(action, x, y));
     }
 
@@ -643,6 +664,7 @@ impl Store {
     }
 
     pub fn live_text(&self, text: String) {
+        self.live_typed.set(Some(text.chars().count()));
         self.live_input(aidaemon_client_protocol::media::SurfaceInput::Text { text });
     }
 
@@ -682,7 +704,13 @@ impl Store {
                     self.close_live();
                 }
             }
-            MediaEvent::Focus(words) => self.live_focus.set(Some(words)),
+            MediaEvent::Focus(words, rect) => {
+                self.live_focus_rect.set(
+                    rect.filter(|_| words.is_some())
+                        .map(|[x, y, w, h]| [x as f32, y as f32, w as f32, h as f32]),
+                );
+                self.live_focus.set(Some(words));
+            }
             MediaEvent::Ready | MediaEvent::Controller(_) => {}
         }
     }

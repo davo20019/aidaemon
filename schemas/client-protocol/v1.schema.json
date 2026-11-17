@@ -4151,6 +4151,19 @@
                 "null"
               ]
             },
+            "rect": {
+              "description": "Where it is, as fractions of the frame: `[x, y, w, h]`.",
+              "items": {
+                "format": "double",
+                "type": "number"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "type": {
               "const": "focus",
               "type": "string"

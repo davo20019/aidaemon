@@ -27,7 +27,7 @@ pub const MEDIA_VERSION: u8 = 1;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 /// The header of one binary message from the server.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaHeader {
     /// A picture of the surface; the payload is its encoded bytes.
@@ -53,6 +53,9 @@ pub enum MediaHeader {
         what: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Where it is, as fractions of the frame: `[x, y, w, h]`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rect: Option<[f64; 4]>,
     },
     /// The session ended; the server closes the socket next.
     Closed { reason: String },

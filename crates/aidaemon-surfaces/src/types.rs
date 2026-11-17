@@ -376,7 +376,7 @@ pub struct SurfaceObservation {
 
 /// What the owner pointed at on a surface: enough for the agent to act on
 /// it with its own tools. Never a field's value.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PointedAt {
     /// "a button", "a link", "a text field"...
     pub what: String,
@@ -389,6 +389,10 @@ pub struct PointedAt {
     /// The name the agent knows the surface by (a tab id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_ref: Option<String>,
+    /// Where it is, as fractions of the frame: `[x, y, w, h]`, so a viewer
+    /// can outline it whatever the surface itself draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<[f64; 4]>,
 }
 
 /// A pointer button.

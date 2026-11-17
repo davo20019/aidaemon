@@ -30,7 +30,7 @@ pub struct LiveView {
 }
 
 /// Something that came on the frame socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MediaEvent {
     /// Authenticated: frames follow.
     Ready,
@@ -44,8 +44,9 @@ pub enum MediaEvent {
     /// Who controls the surface now.
     Controller(SurfaceController),
     /// Where the owner's typing goes now, in words ("Username, a text
-    /// field"); `None`: nothing takes typing.
-    Focus(Option<String>),
+    /// field"; `None`: nothing takes typing) and its place on the frame
+    /// (`[x, y, w, h]` fractions).
+    Focus(Option<String>, Option<[f64; 4]>),
     /// The view ended, and why.
     Closed(String),
 }
@@ -119,7 +120,9 @@ pub fn read(bytes: &[u8]) -> Option<MediaEvent> {
         },
         MediaHeader::Controller { controller } => MediaEvent::Controller(controller),
         MediaHeader::Closed { reason } => MediaEvent::Closed(reason),
-        MediaHeader::Focus { what, label } => MediaEvent::Focus(focus_words(what, label)),
+        MediaHeader::Focus { what, label, rect } => {
+            MediaEvent::Focus(focus_words(what, label), rect)
+        }
         MediaHeader::Unknown => return None,
     })
 }
