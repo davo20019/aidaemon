@@ -250,3 +250,168 @@ html, body { margin: 0; background: #08352d; color: white }
 
     let _ = tool.call(&json!({ "action": "close" }).to_string()).await;
 }
+
+/// Live surfaces on a real headless Chrome: the page streams frames, the
+/// owner's tap focuses a field, their text and Enter reach it, and nothing
+/// typed is readable from the page text the agent gets.
+#[tokio::test]
+#[ignore = "requires local Chrome; run with --ignored"]
+async fn live_surface_smoke_real_chrome() {
+    use aidaemon_surfaces::{
+        InputEvent, KeyAction, LiveMode, PointerAction, PointerButton, StreamParams,
+        SurfaceRegistry, SurfacesConfig,
+    };
+    let profile = TempDir::new().expect("temp profile");
+    let fixture = TempDir::new().expect("temp fixture");
+    let path = fixture.path().join("signin.html");
+    std::fs::write(
+        &path,
+        r#"<!DOCTYPE html><html><body style="margin:0">
+<input id="pw" type="password" style="position:absolute;left:0;top:0;width:100vw;height:50vh;font-size:40px">
+<div id="out">waiting</div>
+<script>
+document.getElementById('pw').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('out').textContent =
+    'submitted ' + document.getElementById('pw').value.length;
+});
+</script></body></html>"#,
+    )
+    .expect("write fixture");
+    let (media_tx, _media_rx) = mpsc::channel(4);
+    let tool = BrowserTool::new(
+        BrowserSettings {
+            headless: true,
+            user_data_dir: Some(profile.path().to_str().unwrap().to_string()),
+            ..BrowserSettings::default()
+        },
+        media_tx,
+        profile.path().join("inbox"),
+        aidaemon_tools::testing::active_execution_backend(),
+    )
+    .expect("construct browser tool");
+    let session = "live-smoke";
+    // Served over local HTTP (the tool opens no file: URLs).
+    let page = std::fs::read(&path).expect("fixture");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let page = page.clone();
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    page.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&page).await;
+            });
+        }
+    });
+    let nav = call_approved(
+        &tool,
+        &json!({"action": "navigate", "url": format!("http://127.0.0.1:{port}/signin")})
+            .to_string(),
+        session,
+    )
+    .await;
+    assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
+
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let surfaces = tool.surface_backend();
+    surfaces.set_notifier(registry.notifier());
+    registry.add_backend(surfaces);
+    let surface = registry
+        .find_for_agent(session, None)
+        .await
+        .expect("the tab is a surface");
+    let mut live = registry
+        .open_live(
+            &surface.id,
+            "smoke-phone",
+            LiveMode::Control,
+            StreamParams::default(),
+        )
+        .await
+        .expect("open live");
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(frame) = live.frames.borrow_and_update().clone() {
+                return frame;
+            }
+            live.frames.changed().await.expect("stream open");
+        }
+    })
+    .await
+    .expect("a frame within 10 s");
+    assert_eq!(&frame.data[..2], &[0xff, 0xd8], "a JPEG");
+    assert!(frame.w > 0 && frame.h > 0);
+
+    for action in [PointerAction::Down, PointerAction::Up] {
+        registry
+            .input(
+                &live.live_id,
+                &InputEvent::Pointer {
+                    action,
+                    x: 0.5,
+                    y: 0.2,
+                    button: PointerButton::Left,
+                },
+            )
+            .await
+            .expect("tap");
+    }
+    registry
+        .input(
+            &live.live_id,
+            &InputEvent::Text {
+                text: "synthetic-pw".into(),
+            },
+        )
+        .await
+        .expect("type");
+    for action in [KeyAction::Down, KeyAction::Up] {
+        registry
+            .input(
+                &live.live_id,
+                &InputEvent::Key {
+                    action,
+                    code: "Enter".into(),
+                    key: "Enter".into(),
+                    mods: vec![],
+                },
+            )
+            .await
+            .expect("enter");
+    }
+    let observed = registry.observe(&surface.id).await.expect("observe");
+    assert!(observed.password_field_present);
+    registry.close_live(&live.live_id);
+    registry
+        .release_control(&surface.id, "smoke-phone")
+        .unwrap();
+
+    let text = tool
+        .call_with(
+            &json!({"action": "get_text", "selector": "body"}).to_string(),
+            aidaemon_tools::testing::call_facts(session),
+        )
+        .await
+        .expect("get_text");
+    assert!(
+        text.contains("submitted 12"),
+        "the typed text and Enter reached the page: {text}"
+    );
+    assert!(
+        !text.contains("synthetic-pw"),
+        "the page text never carries the password"
+    );
+    let _ = tool
+        .call_with(
+            &json!({"action": "close"}).to_string(),
+            aidaemon_tools::testing::call_facts(session),
+        )
+        .await;
+}
