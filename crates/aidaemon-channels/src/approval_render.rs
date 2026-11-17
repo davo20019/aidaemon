@@ -386,7 +386,7 @@ fn card_why(card: &ApprovalCard) -> Option<String> {
     } = &card.action
     {
         lines.push(
-            "Do it in the live view in the AIdaemon app, or at the computer, then press              Done. The agent waits and never sees what you type."
+            "Do it in the live view in the AIdaemon app, or at the computer, then press Done. The agent waits and never sees what you type."
                 .to_string(),
         );
         match keeps_sign_in {

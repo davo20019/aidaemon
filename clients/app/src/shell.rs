@@ -24,6 +24,7 @@ pub fn shell(store: Store) -> View {
     effect(move || store.set_compact(!roomy.get()));
     crate::features::notify::approvals(store);
     crate::features::notify::replies(store);
+    crate::features::links::surface_links(store);
     set_interval(std::time::Duration::from_secs(1), move || {
         store.advance_tick()
     });

@@ -2522,7 +2522,16 @@ impl Client {
                 self.live_request = None;
                 self.live_controller_is_mine = false;
                 if let Some(live) = self.live.as_mut() {
-                    live.error = Some(error.message.clone());
+                    // An old link, or one answered elsewhere: the view is gone.
+                    live.error = Some(
+                        if error.code == aidaemon_client_protocol::ErrorCode::NotFound {
+                            "This live view has ended: the request was answered or the page \
+                             closed. Nothing is waiting here."
+                                .to_owned()
+                        } else {
+                            error.message.clone()
+                        },
+                    );
                 }
                 true
             }
@@ -2839,6 +2848,22 @@ mod tests {
             Command::OpenSurface { accept, .. }
                 if accept.max_fps.is_none() && accept.fit_w.is_none()
         ));
+    }
+
+    #[test]
+    fn a_link_to_an_ended_view_says_it_ended() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.open_surface("srf_gone", true);
+        let (request, _) = surface_command(&mut client);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{request}","error":{{"code":"not_found","message":"no such surface","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        let error = client.live.as_ref().unwrap().error.clone().unwrap();
+        assert!(error.starts_with("This live view has ended"), "{error}");
     }
 
     #[test]

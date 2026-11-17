@@ -5,6 +5,7 @@ pub mod automations;
 pub mod code;
 pub mod conversation;
 pub mod inspector;
+pub mod links;
 pub mod memory;
 pub mod model_picker;
 pub mod notify;
