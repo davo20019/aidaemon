@@ -579,10 +579,13 @@ fn header(store: Store, session: Option<String>) -> View {
             view().child(dynamic(move || {
                 let first = screens().into_iter().next()?;
                 let waiting = first.handoff_pending;
+                let desktop = first.session_id.is_none();
                 let id = first.id.clone();
                 Some(untracked(move || {
                     let label = if waiting {
                         "The agent is waiting for you in its browser"
+                    } else if desktop {
+                        "Watch this computer's screen"
                     } else {
                         "Watch the agent's browser"
                     };

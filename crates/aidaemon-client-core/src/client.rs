@@ -2179,17 +2179,18 @@ impl Client {
 
     // ----- Live surfaces (protocol 1.30) -------------------------------------
 
-    /// The screens of `session` the owner can watch: the one the agent
-    /// waits on first, then the active one.
+    /// The screens the owner can watch from `session`: its own (the one the
+    /// agent waits on first), then the computer's displays, which belong to
+    /// no conversation.
     pub fn surfaces_of(&self, session: &str) -> Vec<SurfaceInfo> {
         let mut found: Vec<SurfaceInfo> = self
             .state
             .surfaces
             .values()
-            .filter(|s| s.session_id.as_deref() == Some(session))
+            .filter(|s| s.session_id.is_none() || s.session_id.as_deref() == Some(session))
             .cloned()
             .collect();
-        found.sort_by_key(|s| (!s.handoff_pending, s.id.clone()));
+        found.sort_by_key(|s| (s.session_id.is_none(), !s.handoff_pending, s.id.clone()));
         found
     }
 
