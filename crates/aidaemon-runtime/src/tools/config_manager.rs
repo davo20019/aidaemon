@@ -50,6 +50,10 @@ const APPROVAL_REQUIRED_KEYS: &[&str] = &[
     // sent with every model request.
     "persona_file",
     "extra_headers",
+    // Where the agent's own stores are read from and written to.
+    "path",
+    "projects_dir",
+    "db_path",
 ];
 
 /// The top-level tables a change may touch without the owner's approval:
@@ -64,6 +68,7 @@ const APPROVAL_FREE_TABLES: &[&str] = &[
     "checkpoints",
     "heartbeat",
     "people",
+    "memory",
     "diagnostics",
 ];
 
@@ -2112,12 +2117,6 @@ impl ConfigManagerTool {
             }
         };
 
-        // Security-sensitive keys need the owner's approval, which the
-        // kernel asked for before this runs.
-        if Self::change_needs_approval(args) {
-            Self::require_kernel_approval(args)?;
-        }
-
         let content = self.config.read().await?;
         let mut doc: toml_edit::DocumentMut = content.parse()?;
         let new_value = (!unset).then(|| config_path::parse_value(&args.value));
@@ -2149,6 +2148,13 @@ impl ConfigManagerTool {
                 "Refused: aidaemon does not read a setting at `{path}`, so it would have no effect. \
                      The config was NOT modified. Check the key name with action 'read'."
             )));
+        }
+
+        // A change that would be written needs the owner's approval unless
+        // it is in a tuning table; the kernel asked before this runs. (A
+        // change refused above writes nothing and needs none.)
+        if Self::change_needs_approval(args) {
+            Self::require_kernel_approval(args)?;
         }
 
         if let Err(e) = self.create_backup().await {
