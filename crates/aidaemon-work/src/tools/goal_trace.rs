@@ -34,7 +34,10 @@ impl GoalTraceTool {
             .list_mandates(None, true)
             .await?
             .into_iter()
-            .filter(|mandate| mandate.id.starts_with(trimmed))
+            .filter(|mandate| {
+                trimmed.chars().count() >= super::goal_ids::SHORT_GOAL_ID_CHARS
+                    && mandate.id.starts_with(trimmed)
+            })
             .collect::<Vec<_>>();
         match mandate_matches.as_slice() {
             [mandate] => return Ok(mandate.goal_id.clone()),

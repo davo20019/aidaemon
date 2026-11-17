@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_id_accepts_a_distinctive_objective_phrase() {
+    async fn goal_id_accepts_an_id_or_the_exact_objective_never_a_phrase() {
         let state = setup_state().await;
         let tool = Runs::new(state.clone());
         let goal = Goal::new_continuous(
@@ -337,10 +337,18 @@ mod tests {
             updated_at: now,
         };
         state.create_goal_schedule(&schedule).await.unwrap();
+        let phrase = tool
+            .resolve_goal_id("manage the synthetic blog")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(phrase.contains(&goal.id[..8]), "{phrase}");
         assert_eq!(
-            tool.resolve_goal_id("manage the synthetic blog")
-                .await
-                .unwrap(),
+            tool.resolve_goal_id(
+                "each day, independently manage the synthetic blog at https://blog.example.test/"
+            )
+            .await
+            .unwrap(),
             goal.id
         );
         assert_eq!(tool.resolve_goal_id(&goal.id[..8]).await.unwrap(), goal.id);

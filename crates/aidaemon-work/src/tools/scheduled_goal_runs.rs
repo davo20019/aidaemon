@@ -277,8 +277,8 @@ impl ScheduledGoalRuns {
         Ok(out)
     }
 
-    /// The scheduled goal a handle names: its id, an id prefix, or a distinctive
-    /// phrase from its objective.
+    /// The scheduled goal a handle names: its id, a unique id prefix of the
+    /// shown length, or its exact objective (`goal_ids::pick_goal`).
     pub async fn resolve_goal_id(&self, input_id: &str) -> anyhow::Result<String> {
         let trimmed = input_id.trim();
         if trimmed.is_empty() {
