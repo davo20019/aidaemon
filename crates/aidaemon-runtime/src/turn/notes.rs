@@ -24,8 +24,6 @@ pub enum ParentDeliveryKind {
     ExecutorResult,
     /// Terminal goal notification (completion or failure summary).
     GoalNotification,
-    /// Reply for a pure-wait short-circuit ("Waited for N seconds.").
-    WaitResult,
     /// Completion/failure message from a backgrounded `spawn_agent`.
     BackgroundSpawnResult,
 }
@@ -35,7 +33,6 @@ impl ParentDeliveryKind {
         match self {
             ParentDeliveryKind::ExecutorResult => "Parent-visible result (executor)",
             ParentDeliveryKind::GoalNotification => "Parent-visible result (goal notification)",
-            ParentDeliveryKind::WaitResult => "Parent-visible result (wait)",
             ParentDeliveryKind::BackgroundSpawnResult => "Parent-visible result (background spawn)",
         }
     }

@@ -29,8 +29,7 @@ use crate::goal_dispatch::{
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
     extract_file_paths_from_text, goal_has_scheduled_provenance, is_group_session,
-    parse_goal_leading_wait, parse_wait_task_seconds, persist_scheduled_run_state,
-    strip_leading_wait, truncate_goal_result_text, user_facing_task_description,
+    persist_scheduled_run_state, truncate_goal_result_text, user_facing_task_description,
 };
 use crate::turn::notes as parent_delivery;
 
@@ -456,7 +455,7 @@ pub async fn execute_auto_dispatch_task(
         &task.description,
     );
     let profile_id = format!("profile-{}", specialist.as_str().replace('_', "-"));
-    let attempt = match state
+    match state
         .claim_task_with_lease(
             &task.id,
             &format!("auto-dispatch-{goal_id}"),
@@ -465,66 +464,9 @@ pub async fn execute_auto_dispatch_task(
         )
         .await
     {
-        Ok(Some(attempt)) => attempt,
+        Ok(Some(_)) => {}
         Ok(None) => return None,
         Err(error) => return Some((task, Err(error))),
-    };
-
-    if let Some(wait_secs) = parse_wait_task_seconds(&task.description) {
-        info!(
-            goal_id = %goal_id,
-            task_id = %task.id,
-            wait_secs,
-            "Executing wait task locally"
-        );
-        let mut remaining = wait_secs;
-        while remaining > 0 {
-            let step = remaining.min(45);
-            tokio::time::sleep(Duration::from_secs(step)).await;
-            remaining = remaining.saturating_sub(step);
-            match state
-                .heartbeat_task_attempt(&attempt.id, &attempt.lease_token, 180)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Some((
-                        task,
-                        Err(anyhow::anyhow!("Wait task lost its execution lease")),
-                    ));
-                }
-                Err(error) => return Some((task, Err(error))),
-            }
-        }
-        let summary = format!("Waited for {} second(s).", wait_secs);
-        let handoff = aidaemon_work::traits::TaskHandoff {
-            id: uuid::Uuid::new_v4().to_string(),
-            task_id: task.id.clone(),
-            attempt_id: attempt.id.clone(),
-            summary: summary.clone(),
-            artifacts: Vec::new(),
-            verification: vec!["Timer elapsed without cancellation.".to_string()],
-            remaining_risk: None,
-            next_step: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let patch = aidaemon_work::traits::TaskAttemptPatch {
-            status: "completed".to_string(),
-            result: Some(summary.clone()),
-            handoff: Some(handoff),
-            ..Default::default()
-        };
-        return match state
-            .patch_task_from_attempt(&attempt.id, &attempt.lease_token, &patch)
-            .await
-        {
-            Ok(true) => Some((task, Ok(summary))),
-            Ok(false) => Some((
-                task,
-                Err(anyhow::anyhow!("Wait task result was rejected as stale")),
-            )),
-            Err(error) => Some((task, Err(error))),
-        };
     }
 
     let task_text = task.description.clone();
@@ -1741,120 +1683,11 @@ pub fn spawn_background_task_lead(
                 surface_id
             });
 
-            // Intercept pure wait/sleep goals to avoid spawning a full LLM task lead
-            // just to orchestrate a timer.  For compound goals ("wait 2 minutes then
-            // check disk space") we sleep first and then let the task lead handle the
-            // remainder — but only if there actually IS a remainder after the wait.
-            let effective_mission;
-            let effective_user_text;
-            if !is_mandate_run {
-                if let Some(wait_secs) = parse_goal_leading_wait(&mission) {
-                    let remainder = strip_leading_wait(&mission);
-                    info!(
-                        goal_id = %goal_id,
-                        wait_secs,
-                        has_remainder = !remainder.is_empty(),
-                        "Intercepted wait prefix in goal — sleeping locally"
-                    );
-                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-
-                    if remainder.is_empty() {
-                        // Pure wait goal with nothing after — mark complete, skip LLM entirely.
-                        let _ = heartbeat_cancel_tx.send(());
-                        let terminal_surface_id = heartbeat_handle.await.ok().flatten();
-                        let _ = keepalive_cancel_tx.send(());
-                        let _ = keepalive_handle.await;
-                        let now = chrono::Utc::now().to_rfc3339();
-                        let msg = format!("Waited for {} second(s).", wait_secs);
-                        if let Ok(Some(mut g)) = state.get_goal(&goal_id).await
-                            && (g.status == "active" || g.status == "pending")
-                        {
-                            g.status = "completed".to_string();
-                            g.completed_at = Some(now.clone());
-                            g.updated_at = now.clone();
-                            let _ = state.update_goal(&g).await;
-                        }
-
-                        // Finalize any non-terminal tasks so we don't leave pending rows behind
-                        // after a local pure-wait short-circuit.
-                        for task in
-                            tasks_for_current_run(&state, &goal_id, goal_run_id.as_deref()).await
-                        {
-                            if task.status != "completed"
-                                && task.status != "failed"
-                                && task.status != "cancelled"
-                            {
-                                if Some(task.id.as_str()) == dispatch_trigger_task_id.as_deref()
-                                    && let Some(attempt) = dispatch_attempt.as_ref()
-                                {
-                                    let handoff = aidaemon_work::traits::TaskHandoff {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        task_id: task.id.clone(),
-                                        attempt_id: attempt.id.clone(),
-                                        summary: msg.clone(),
-                                        artifacts: Vec::new(),
-                                        verification: vec![
-                                            "Timer elapsed without cancellation.".to_string(),
-                                        ],
-                                        remaining_risk: None,
-                                        next_step: None,
-                                        created_at: now.clone(),
-                                    };
-                                    let patch = aidaemon_work::traits::TaskAttemptPatch {
-                                        status: "completed".to_string(),
-                                        result: Some(msg.clone()),
-                                        handoff: Some(handoff),
-                                        ..Default::default()
-                                    };
-                                    let _ = state
-                                        .patch_task_from_attempt(
-                                            &attempt.id,
-                                            &attempt.lease_token,
-                                            &patch,
-                                        )
-                                        .await;
-                                    continue;
-                                }
-                                let mut updated = task.clone();
-                                updated.status = "completed".to_string();
-                                updated.error = None;
-                                updated.result = Some(msg.clone());
-                                updated.completed_at = Some(now.clone());
-                                let _ = state.update_task(&updated).await;
-                            }
-                        }
-                        if let Some(run_id) = goal_run_id.as_deref() {
-                            let _ = state.finish_goal_run(run_id, "completed", Some(&msg)).await;
-                        }
-
-                        if let Err(err) = agent
-                            .deliver_parent_text_result_to_surface(
-                                hub.as_ref(),
-                                &session_id,
-                                terminal_surface_id.as_deref(),
-                                &msg,
-                                parent_delivery::ParentDeliveryKind::WaitResult,
-                            )
-                            .await
-                        {
-                            warn!(
-                                session_id = %session_id,
-                                error = %err,
-                                "Failed to record parent-mediated wait result"
-                            );
-                        }
-                        return;
-                    }
-                    effective_mission = remainder.clone();
-                    effective_user_text = remainder;
-                } else {
-                    effective_mission = mission.clone();
-                    effective_user_text = user_text.clone();
-                }
-            } else {
-                effective_mission = mission.clone();
-                effective_user_text = user_text.clone();
-            }
+            // A goal's delay is typed scheduling state (a one-shot schedule's
+            // fire time), never a leading "in N minutes" read from its prose:
+            // the mission runs exactly as written.
+            let effective_mission = mission.clone();
+            let effective_user_text = user_text.clone();
 
             let mut request = crate::spawn::ChildAgentRequest::new(
                 effective_mission.clone(),

@@ -259,6 +259,8 @@ pub(in crate::agent) use system_directives::SystemDirective;
 #[path = "goal_dispatch.rs"]
 mod goal_dispatch;
 #[cfg(test)]
+pub(in crate::agent) use goal_dispatch::user_facing_task_description;
+#[cfg(test)]
 pub(crate) use goal_dispatch::{
     SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
@@ -266,8 +268,6 @@ pub(crate) use goal_dispatch::{
 pub(crate) use goal_dispatch::{
     build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
 };
-#[cfg(test)]
-pub(in crate::agent) use goal_dispatch::{parse_wait_task_seconds, user_facing_task_description};
 
 // A goal's background task lead lives in `aidaemon_runtime::background_task_lead`.
 #[path = "background_task_lead.rs"]

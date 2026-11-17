@@ -244,19 +244,6 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
 }
 
 #[test]
-fn test_parse_wait_task_seconds_parses_supported_units() {
-    assert_eq!(parse_wait_task_seconds("Wait for 5 minutes."), Some(300));
-    assert_eq!(parse_wait_task_seconds("wait for 45 sec"), Some(45));
-    assert_eq!(parse_wait_task_seconds("WAIT FOR 2 hours"), Some(7200));
-}
-
-#[test]
-fn test_parse_wait_task_seconds_ignores_non_wait_tasks() {
-    assert_eq!(parse_wait_task_seconds("Send the second joke."), None);
-    assert_eq!(parse_wait_task_seconds("Wait until tomorrow."), None);
-}
-
-#[test]
 fn test_sanitize_response_analysis_strips_consultation_heading() {
     let input =
         "I don't have the URL yet.\n\n[Consultation]\nTo find it I'd inspect wrangler.toml.";

@@ -4,9 +4,6 @@
 
 use std::sync::Arc;
 
-use regex::Regex;
-use std::sync::LazyLock as Lazy;
-
 use aidaemon_work::goal_tokens::{GoalRunBudgetStatus, GoalTokenRegistry};
 use aidaemon_work::scheduler::SchedulerStore;
 use aidaemon_work::traits::{Goal, Task};
@@ -74,77 +71,6 @@ pub fn extract_file_paths_from_text(text: &str) -> Vec<String> {
         paths.push(path_str.to_string());
     }
     paths
-}
-
-/// Parse simple wait instructions like "Wait for 5 minutes." into seconds.
-/// Returns None when the task is not a plain wait command.
-pub fn parse_wait_task_seconds(task_description: &str) -> Option<u64> {
-    static WAIT_TASK_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*wait\s+for\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\b",
-        )
-        .expect("wait task regex should compile")
-    });
-
-    let caps = WAIT_TASK_RE.captures(task_description.trim())?;
-    let value: u64 = caps.get(1)?.as_str().parse().ok()?;
-    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
-
-    match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => Some(value),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(value.saturating_mul(60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Some(value.saturating_mul(3600)),
-        _ => None,
-    }
-}
-
-/// Parse a leading wait/delay prefix from a goal description.
-/// Handles patterns like:
-///   - "wait for 2 minutes then check disk space"
-///   - "in 5 minutes check disk space"
-///   - "after 30 seconds run df -h"
-///   - "wait 2 minutes" (pure wait, no remainder)
-///
-/// Returns the wait duration in seconds, or None if no wait prefix is found.
-pub fn parse_goal_leading_wait(description: &str) -> Option<u64> {
-    static LEADING_WAIT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*(?:wait\s+(?:for\s+)?|in\s+|after\s+)(\d+)\s*(seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\b",
-        )
-        .expect("leading wait regex should compile")
-    });
-
-    let caps = LEADING_WAIT_RE.captures(description.trim())?;
-    let value: u64 = caps.get(1)?.as_str().parse().ok()?;
-    let unit = caps.get(2)?.as_str().to_ascii_lowercase();
-
-    match unit.as_str() {
-        "s" | "sec" | "secs" | "second" | "seconds" => Some(value),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(value.saturating_mul(60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Some(value.saturating_mul(3600)),
-        _ => None,
-    }
-}
-
-/// Strip the leading wait/delay prefix from a goal description, returning
-/// the remainder (the actual work to do after the wait).
-/// Returns empty string if there's nothing meaningful after the wait.
-pub fn strip_leading_wait(description: &str) -> String {
-    static STRIP_WAIT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)^\s*(?:wait\s+(?:for\s+)?|in\s+|after\s+)\d+\s*(?:seconds?|secs?|s|minutes?|mins?|min|m|hours?|hrs?|h)\s*[,;]?\s*(?:then\s+|and\s+|,\s*)?",
-        )
-        .expect("strip wait regex should compile")
-    });
-
-    let remainder = STRIP_WAIT_RE.replace(description.trim(), "").to_string();
-    let trimmed = remainder.trim().to_string();
-    // If what's left is too short to be a real instruction, treat as pure wait
-    if trimmed.len() < 3 {
-        String::new()
-    } else {
-        trimmed
-    }
 }
 
 /// Check whether a session ID corresponds to a group/public channel (not a DM).
