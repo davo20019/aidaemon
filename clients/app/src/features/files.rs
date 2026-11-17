@@ -155,7 +155,8 @@ fn folder_view(
 }
 
 /// Where in the project: its name, then each folder down to the open one,
-/// each pressable; Refresh, and whether ignored files show.
+/// each pressable; the git branch checked out, whether git-ignored files
+/// show, and Refresh.
 fn crumbs(
     store: Store,
     id: String,
@@ -221,24 +222,31 @@ fn crumbs(
                         .flex_row()
                         .child(dynamic(move || {
                             let branch = store.folder().ready().and_then(|d| d.branch.clone());
+                            // Named, so the code chip reads as the git
+                            // branch checked out here, not a commit or a name.
                             Some(untracked(move || match branch {
-                                Some(branch) => ui::badge(branch, Tone::Neutral),
+                                Some(branch) => view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .min_w(px(0.0))
+                                    .child(
+                                        text("Branch")
+                                            .text_size(px(type_scale::XS))
+                                            .text_color(colors::MUTED),
+                                    )
+                                    .child(ui::badge(branch, Tone::Neutral)),
                                 None => view(),
                             }))
                         })),
                 )
-                .child(dynamic(move || {
-                    let label = if ignored.get() {
-                        "Hide ignored"
-                    } else {
-                        "Show ignored"
-                    };
-                    Some(untracked(move || {
-                        view().child(ui::btn(label, Variant::Ghost, Size::Sm, move || {
-                            ignored.update(|i| *i = !*i)
-                        }))
-                    }))
-                }))
+                // A switch, not a button whose words flip: it says which
+                // files it adds (the ones .gitignore hides) and shows its state.
+                .child(ui::toggle(
+                    "Git-ignored",
+                    move || ignored.get(),
+                    move |on| ignored.set(on),
+                ))
                 .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Sm, move || {
                     store.list_project_files(&id, &folder.get_untracked(), ignored.get_untracked())
                 })),
