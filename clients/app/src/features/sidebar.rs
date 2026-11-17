@@ -851,48 +851,18 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
             move || store.project(&name).map(|p| p.name).unwrap_or_default(),
             tools,
         ))
-        // Its folder, and at the top whatever the list's length, the way
-        // to its archived conversations (only when it has some).
         .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
-                    text(move || {
-                        store
-                            .project(&folder)
-                            .and_then(|p| p.path)
-                            .unwrap_or_else(|| "No folder".to_owned())
-                    })
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .px_2()
-                    .pb_1()
-                    .number_of_lines(1)
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                )
-                .child(dynamic(move || {
-                    let count = store
-                        .session_ids()
-                        .iter()
-                        .filter(|s| {
-                            store.is_archived(s)
-                                && store.session_project(s).as_deref() == Some(put_away.as_str())
-                        })
-                        .count();
-                    (count > 0).then(|| {
-                        untracked(move || {
-                            ui::btn(
-                                format!("Archived · {count}"),
-                                ui::Variant::Ghost,
-                                ui::Size::Sm,
-                                move || store.show_archived(true),
-                            )
-                        })
-                    })
-                })),
+            text(move || {
+                store
+                    .project(&folder)
+                    .and_then(|p| p.path)
+                    .unwrap_or_else(|| "No folder".to_owned())
+            })
+            .px_2()
+            .pb_1()
+            .number_of_lines(1)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
         )
         .child(when(
             move || store.project_form_open(),
@@ -915,6 +885,36 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                     .number_of_lines(1)
                     .text_size(px(type_scale::BASE)),
                 )
+        }))
+        // Its archived conversations, a row like the one above it, at the
+        // top whatever the list's length (only when it has some).
+        .child(dynamic(move || {
+            let count = store
+                .session_ids()
+                .iter()
+                .filter(|s| {
+                    store.is_archived(s)
+                        && store.session_project(s).as_deref() == Some(put_away.as_str())
+                })
+                .count();
+            (count > 0).then(|| {
+                untracked(move || {
+                    row(|| false, move || store.show_archived(true))
+                        .accessibility_label("Archived conversations in this project")
+                        .child(icon(Glyph::Archive).text_color(colors::MUTED))
+                        .child(
+                            text("Archived")
+                                .flex_1()
+                                .number_of_lines(1)
+                                .text_size(px(type_scale::BASE)),
+                        )
+                        .child(
+                            text(count.to_string())
+                                .text_size(px(type_scale::SM))
+                                .text_color(colors::FAINT),
+                        )
+                })
+            })
         }))
         .child(when(
             move || mine.with(Vec::is_empty),

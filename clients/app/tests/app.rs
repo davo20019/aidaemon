@@ -678,7 +678,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.wait_for("Contact form copy")?;
     // Its archived conversations are a press away at the top of its page,
     // and Back returns to the project.
-    app.press("Archived · 1")?;
+    app.press("Archived conversations in this project")?;
     app.wait_for("Archived in Acme site")?;
     app.wait_for("Old landing page")?;
     app.press("Back to the project")?;
