@@ -789,7 +789,15 @@ async fn pump_media(
                         // (while it holds control; kept for later if not).
                         let room = aidaemon_surfaces::Size { w, h };
                         match desk.registry.refit(live_id, room).await {
-                            Ok(()) => info!(surface = %surface_id, w, h, "Viewer's room changed"),
+                            Ok(()) => {
+                                info!(surface = %surface_id, w, h, "Viewer's room changed");
+                                // The page moved under the field with the
+                                // keyboard: say where it is now, so the
+                                // phone's outline and typing follow it.
+                                if let Ok(focused) = desk.registry.focused(surface_id).await {
+                                    send_header(socket, &focus_header(focused)).await?;
+                                }
+                            }
                             Err(error) => warn!(device = device_id, %error, "Viewer's room refused"),
                         }
                     }
@@ -832,15 +840,7 @@ async fn pump_media(
                                     "After the tap, typing goes into"
                                 );
                             }
-                            send_header(socket, &MediaHeader::Focus {
-                                what: focused.as_ref().map(|f| f.what.clone()),
-                                rect: focused.as_ref().and_then(|f| f.rect),
-                                typing: focused.as_ref().and_then(|f| f.typing).map(|t| match t {
-                                    aidaemon_surfaces::Typing::Secret => media::FocusTyping::Secret,
-                                    aidaemon_surfaces::Typing::Text => media::FocusTyping::Text,
-                                }),
-                                label: focused.and_then(|f| f.text),
-                            }).await?;
+                            send_header(socket, &focus_header(focused)).await?;
                         }
                     }
                     _ => {}
@@ -856,6 +856,19 @@ async fn pump_media(
                 return close_with(socket, "This device was revoked").await;
             }
         }
+    }
+}
+
+/// What has the keyboard on the page, as the live socket says it.
+fn focus_header(focused: Option<aidaemon_surfaces::PointedAt>) -> MediaHeader {
+    MediaHeader::Focus {
+        what: focused.as_ref().map(|f| f.what.clone()),
+        rect: focused.as_ref().and_then(|f| f.rect),
+        typing: focused.as_ref().and_then(|f| f.typing).map(|t| match t {
+            aidaemon_surfaces::Typing::Secret => media::FocusTyping::Secret,
+            aidaemon_surfaces::Typing::Text => media::FocusTyping::Text,
+        }),
+        label: focused.and_then(|f| f.text),
     }
 }
 

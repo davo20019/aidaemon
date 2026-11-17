@@ -926,3 +926,179 @@ async fn live_surface_phone_tap_focuses_a_real_field() {
             .expect("give control back");
     }
 }
+
+/// A phone held sideways signs in on a real page: the next page (a form
+/// sent) is laid out and pictured at the phone's room too, not drawn in a
+/// corner of a picture the size of the browser's window.
+#[tokio::test]
+#[ignore = "needs Chrome and the network"]
+async fn live_surface_phone_keeps_its_room_across_a_sign_in() {
+    use aidaemon_surfaces::{
+        InputEvent, KeyAction, LiveMode, PointerAction, PointerButton, Size, StreamParams,
+        SurfaceRegistry, SurfacesConfig,
+    };
+    let profile = TempDir::new().expect("temp profile");
+    let (media_tx, _media_rx) = mpsc::channel(4);
+    let tool = BrowserTool::new(
+        BrowserSettings {
+            headless: std::env::var_os("AIDAEMON_SMOKE_HEADED").is_none(),
+            user_data_dir: Some(profile.path().to_str().unwrap().to_string()),
+            ..BrowserSettings::default()
+        },
+        media_tx,
+        profile.path().join("inbox"),
+        aidaemon_tools::testing::active_execution_backend(),
+    )
+    .expect("construct browser tool");
+    let session = "live-phone-sign-in";
+    let nav = call_approved(
+        &tool,
+        &json!({"action": "navigate", "url": "https://the-internet.herokuapp.com/login"})
+            .to_string(),
+        session,
+    )
+    .await;
+    assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
+
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let surfaces = tool.surface_backend();
+    surfaces.set_notifier(registry.notifier());
+    registry.add_backend(surfaces);
+    let surface = registry
+        .find_for_agent(session, None)
+        .await
+        .expect("the tab is a surface");
+    let room = Size { w: 528, h: 306 };
+    let mut live = registry
+        .open_live(
+            &surface.id,
+            "sign-in-phone",
+            LiveMode::Control,
+            StreamParams {
+                fit: Some(room),
+                ..StreamParams::default()
+            },
+        )
+        .await
+        .expect("open live");
+    let first_page = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(frame) = live.frames.borrow_and_update().clone()
+                && frame.w == room.w
+            {
+                return frame.page;
+            }
+            live.frames.changed().await.expect("stream open");
+        }
+    })
+    .await
+    .expect("a frame at the phone's size");
+    let hits = tap_down_the_middle(&registry, &live.live_id, &surface.id).await;
+    assert!(hits.iter().any(|(_, s)| s == "#username"), "{hits:?}");
+    let send = |event: InputEvent| {
+        let (registry, live_id) = (&registry, live.live_id.clone());
+        async move { registry.input(&live_id, &event).await.expect("input") }
+    };
+    let key = |name: &str| InputEvent::Key {
+        action: KeyAction::Down,
+        code: name.into(),
+        key: name.into(),
+        mods: Vec::new(),
+    };
+    let key_up = |name: &str| InputEvent::Key {
+        action: KeyAction::Up,
+        code: name.into(),
+        key: name.into(),
+        mods: Vec::new(),
+    };
+    send(InputEvent::Text {
+        text: "tomsmith".into(),
+    })
+    .await;
+    send(key("Tab")).await;
+    send(key_up("Tab")).await;
+    send(InputEvent::Text {
+        text: "SuperSecretPassword!".into(),
+    })
+    .await;
+    send(key("Enter")).await;
+    send(key_up("Enter")).await;
+
+    // The signed-in page: its pictures stay the phone's size, and keep
+    // coming at it.
+    let mut seen = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            live.frames.changed().await.expect("stream open");
+            if let Some(frame) = live.frames.borrow_and_update().clone()
+                && frame.page != first_page
+            {
+                if let Some(out) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
+                    let _ = std::fs::write(
+                        format!("{}-signed-in-{}", out.to_string_lossy(), seen.len()),
+                        &frame.data[..],
+                    );
+                }
+                seen.push((frame.w, frame.h));
+            }
+        }
+    })
+    .await;
+    assert!(!seen.is_empty(), "no picture of the signed-in page");
+    assert!(
+        seen.iter().all(|&size| size == (room.w, room.h)),
+        "the signed-in page's pictures: {seen:?}"
+    );
+    // Held upright again, a tap on Logout signs out: the tap lands where
+    // the picture shows it and the next page's pictures keep coming.
+    let upright = Size { w: 391, h: 549 };
+    registry.refit(&live.live_id, upright).await.expect("refit");
+    let upright_frame = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(frame) = live.frames.borrow_and_update().clone()
+                && frame.w == upright.w
+            {
+                return frame;
+            }
+            live.frames.changed().await.expect("stream open");
+        }
+    })
+    .await
+    .expect("an upright picture of the signed-in page");
+    if let Some(out) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
+        let _ = std::fs::write(
+            format!("{}-upright", out.to_string_lossy()),
+            &upright_frame.data[..],
+        );
+    }
+    let signed_in = Some(upright_frame.page);
+    let mut left = false;
+    'sweep: for step in 30..98 {
+        let y = f64::from(step) / 100.0;
+        for action in [PointerAction::Down, PointerAction::Up] {
+            send(InputEvent::Pointer {
+                action,
+                x: 0.18,
+                y,
+                button: PointerButton::Left,
+            })
+            .await;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        while let Ok(Ok(())) = tokio::time::timeout_at(deadline, live.frames.changed()).await {
+            if let Some(frame) = live.frames.borrow_and_update().clone()
+                && Some(frame.page) != signed_in
+                && frame.w == upright.w
+                && frame.h == upright.h
+            {
+                left = true;
+                break 'sweep;
+            }
+        }
+    }
+    assert!(
+        left,
+        "no tap on the signed-in page signed out at the phone's size"
+    );
+    registry.close_live(&live.live_id);
+}

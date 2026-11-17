@@ -754,6 +754,24 @@ impl ChromiumoxideBackend {
         }
 
         // Otherwise, launch a new Chrome instance.
+        // Chrome's warning that a password was found in a breach is a
+        // window of the browser's own, never in a page's picture: while it
+        // is up, the live view's taps reach nothing and the owner cannot
+        // see why. The browser the daemon launches never shows it.
+        {
+            let dir = self.profile_in_use().map_or_else(
+                || std::env::temp_dir().join("chromiumoxide-runner"),
+                |dir| std::path::PathBuf::from(shellexpand::tilde(&dir).into_owned()),
+            );
+            let profile = if self.profile_in_use().is_some() {
+                self.config.profile.as_deref().unwrap_or("Default")
+            } else {
+                "Default"
+            };
+            if let Err(e) = quiet_breach_warning(&dir.join(profile)) {
+                warn!(error = %e, "Could not turn off Chrome's breached-password warning");
+            }
+        }
         let mut builder = ChromeBrowserConfig::builder();
         let want_headless = self.headless.load(Ordering::Relaxed);
         let use_headless = if !want_headless && !Self::has_display() {
@@ -1085,6 +1103,54 @@ impl BrowserBackend for ChromiumoxideBackend {
     }
 }
 
+/// Turn off the breached-password warning in a Chrome profile's
+/// `Preferences` (kept otherwise as it is), before Chrome starts on it.
+fn quiet_breach_warning(profile_dir: &std::path::Path) -> Result<(), String> {
+    let path = profile_dir.join("Preferences");
+    let mut prefs = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| format!("unreadable Preferences: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.to_string()),
+    };
+    let Some(root) = prefs.as_object_mut() else {
+        return Err("Preferences is not an object".to_string());
+    };
+    let profile = root
+        .entry("profile")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(profile) = profile.as_object_mut() else {
+        return Err("Preferences' profile is not an object".to_string());
+    };
+    if profile.get("password_manager_leak_detection") == Some(&serde_json::Value::Bool(false)) {
+        return Ok(());
+    }
+    profile.insert(
+        "password_manager_leak_detection".to_string(),
+        serde_json::Value::Bool(false),
+    );
+    std::fs::create_dir_all(profile_dir).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&prefs).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
+/// The room each tab is laid out for (`fit`), by target id. Chrome keeps a
+/// device-metrics override across a new document but paints the new one
+/// into a window-sized picture (the page in a corner of it), so the live
+/// view lays the page out again on each navigation; a page handle is made
+/// per lookup, so the room is kept here rather than on one.
+static FITTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u32, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn fitted_room(target: &str) -> Option<(u32, u32)> {
+    FITTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(target)
+        .copied()
+}
+
 /// Page handle wrapping a concrete `chromiumoxide::Page`.
 struct ChromiumoxidePage {
     page: Arc<chromiumoxide::Page>,
@@ -1406,6 +1472,17 @@ impl PageHandle for ChromiumoxidePage {
                 let page = page.clone();
                 mark.store(true, std::sync::atomic::Ordering::Relaxed);
                 async move {
+                    // The new document is laid out for the phone's room
+                    // again, so its picture is that size too.
+                    if let Some((w, h)) = fitted_room(page.target_id().as_ref()) {
+                        let _ = page
+                            .execute(
+                                chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(
+                                    w, h, 2.0, true,
+                                ),
+                            )
+                            .await;
+                    }
                     let again = StartScreencastParams::builder()
                         .format(StartScreencastFormat::Jpeg)
                         .quality(quality)
@@ -1423,9 +1500,29 @@ impl PageHandle for ChromiumoxidePage {
                     None
                 }
             });
+        let painter = self.page.clone();
         let frames = events.filter_map(move |event| {
             let moved = moved.clone();
+            let page = painter.clone();
             async move {
+                // A picture at another size than the room the page is laid
+                // out for (a new document painted at the window's size
+                // before it is laid out again, or the old size just after a
+                // turn) is stale: acknowledge it so the next comes, and
+                // never show it.
+                if let Some((w, h)) = fitted_room(page.target_id().as_ref()) {
+                    let (fw, fh) = (event.metadata.device_width, event.metadata.device_height);
+                    if (fw - f64::from(w)).abs() > 1.0 || (fh - f64::from(h)).abs() > 1.0 {
+                        let _ = page
+                            .execute(
+                                chromiumoxide::cdp::browser_protocol::page::ScreencastFrameAckParams::new(
+                                    event.session_id,
+                                ),
+                            )
+                            .await;
+                        return None;
+                    }
+                }
                 let data = base64::engine::general_purpose::STANDARD
                     .decode(AsRef::<str>::as_ref(&event.data))
                     .ok()?;
@@ -1588,6 +1685,14 @@ impl PageHandle for ChromiumoxidePage {
         use chromiumoxide::cdp::browser_protocol::emulation::{
             ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
         };
+        {
+            let target = self.page.target_id().as_ref().to_owned();
+            let mut fitted = FITTED.lock().unwrap_or_else(|e| e.into_inner());
+            match room {
+                Some(room) => fitted.insert(target, room),
+                None => fitted.remove(&target),
+            };
+        }
         let done = match room {
             // Twice the pixels, so a phone's picture stays sharp.
             Some((w, h)) => self
@@ -2597,5 +2702,32 @@ mod isolation_tests {
                 "construction error should explain the incompatibility: {err}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod breach_warning_tests {
+    use super::quiet_breach_warning;
+
+    #[test]
+    fn the_breach_warning_is_turned_off_and_the_rest_kept() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let profile = dir.path().join("Default");
+        quiet_breach_warning(&profile).expect("fresh profile");
+        let prefs: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(profile.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(prefs["profile"]["password_manager_leak_detection"], false);
+
+        std::fs::write(
+            profile.join("Preferences"),
+            r#"{"profile":{"name":"Agent","password_manager_leak_detection":true},"homepage":"about:blank"}"#,
+        )
+        .unwrap();
+        quiet_breach_warning(&profile).expect("existing profile");
+        let prefs: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(profile.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(prefs["profile"]["password_manager_leak_detection"], false);
+        assert_eq!(prefs["profile"]["name"], "Agent");
+        assert_eq!(prefs["homepage"], "about:blank");
     }
 }

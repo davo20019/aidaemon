@@ -2358,6 +2358,15 @@ async fn a_surface_streams_the_newest_frame_and_takes_input_only_under_control()
     // The phone turns while in control: the page is laid out for its new
     // room.
     media_send(&mut media, &MediaClientMessage::Fit { w: 800, h: 300 }).await;
+    // ...and the field with the keyboard is placed again on the new layout,
+    // so the phone's outline follows it.
+    loop {
+        if let (MediaHeader::Focus { what, rect, .. }, _) = media_next(&mut media).await {
+            assert_eq!(what.as_deref(), Some("a text field"));
+            assert!(rect.is_some(), "the field's new place comes with it");
+            break;
+        }
+    }
     let turned = Some(aidaemon_surfaces::Size { w: 800, h: 300 });
     for _ in 0..50 {
         if mock.fits().iter().any(|(room, _)| *room == turned) {
