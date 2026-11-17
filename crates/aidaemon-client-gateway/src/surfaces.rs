@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::pairing::Principal;
 use crate::views::ViewTargets;
@@ -744,8 +744,13 @@ async fn pump_media(
                                 | InputEvent::Key { .. }
                                 | InputEvent::Text { .. }
                         );
+                        // Where the owner taps (never what they type), so a
+                        // tap that lands wrong can be told from one refused.
+                        if let InputEvent::Pointer { action: PointerAction::Up, x, y, .. } = &event {
+                            info!(surface = %surface_id, x = format!("{x:.3}"), y = format!("{y:.3}"), "Owner tapped");
+                        }
                         if let Err(error) = desk.registry.input(live_id, &event).await {
-                            debug!(device = device_id, %error, "Surface input refused");
+                            warn!(device = device_id, %error, "Surface input refused");
                             continue;
                         }
                         // Say where typing goes now, so the owner knows a
@@ -753,6 +758,14 @@ async fn pump_media(
                         if says_focus
                             && let Ok(focused) = desk.registry.focused(surface_id).await
                         {
+                            if matches!(event, InputEvent::Pointer { .. }) {
+                                info!(
+                                    surface = %surface_id,
+                                    focused = focused.as_ref().map_or("nothing", |f| f.what.as_str()),
+                                    selector = focused.as_ref().and_then(|f| f.selector.as_deref()).unwrap_or(""),
+                                    "After the tap, typing goes into"
+                                );
+                            }
                             send_header(socket, &MediaHeader::Focus {
                                 what: focused.as_ref().map(|f| f.what.clone()),
                                 rect: focused.as_ref().and_then(|f| f.rect),

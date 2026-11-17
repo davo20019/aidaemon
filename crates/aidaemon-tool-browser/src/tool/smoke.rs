@@ -270,6 +270,8 @@ async fn live_surface_smoke_real_chrome() {
 <input id="pw" type="password" style="position:absolute;left:0;top:0;width:100vw;height:50vh;font-size:40px">
 <div id="out">waiting</div>
 <div id="size"></div>
+<input id="user" aria-label="Username" style="position:absolute;left:600px;top:500px;width:100px;height:30px">
+<div style="height:2000px"></div>
 <script>
 document.getElementById('size').textContent = 'width ' + innerWidth;
 document.getElementById('pw').addEventListener('keydown', (e) => {
@@ -350,6 +352,30 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
     .expect("a frame within 10 s");
     assert_eq!(&frame.data[..2], &[0xff, 0xd8], "a JPEG");
     assert!(frame.w > 0 && frame.h > 0);
+
+    // A small field at a known place, tapped where the picture shows it:
+    // the page (with a scroll bar) is the picture, pixel for pixel.
+    let (width, height) = (f64::from(frame.w), f64::from(frame.h));
+    for action in [PointerAction::Down, PointerAction::Up] {
+        registry
+            .input(
+                &live.live_id,
+                &InputEvent::Pointer {
+                    action,
+                    x: 650.0 / width,
+                    y: 515.0 / height,
+                    button: PointerButton::Left,
+                },
+            )
+            .await
+            .expect("tap");
+    }
+    let small = registry
+        .focused(&surface.id)
+        .await
+        .expect("focus")
+        .expect("the small field has the keyboard");
+    assert_eq!(small.selector.as_deref(), Some("#user"), "{small:?}");
 
     for action in [PointerAction::Down, PointerAction::Up] {
         registry
