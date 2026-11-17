@@ -2553,3 +2553,119 @@ async fn pointing_sends_the_agent_what_is_there_as_the_owners_message() {
         "{text}"
     );
 }
+
+/// A fake screen on "another computer": one picture, input recorded.
+struct FakeScreen {
+    inputs: Arc<std::sync::Mutex<Vec<String>>>,
+    controlled: Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl aidaemon_client_core::screen_share::ScreenSource for FakeScreen {
+    fn size(&self) -> (u32, u32) {
+        (1920, 1080)
+    }
+    fn capture(
+        &mut self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<aidaemon_client_core::screen_share::Captured, String> {
+        Ok(aidaemon_client_core::screen_share::Captured {
+            codec: "jpeg",
+            w: 4,
+            h: 2,
+            bytes: b"remote-frame".to_vec(),
+        })
+    }
+    fn input(&mut self, event: SurfaceInput) -> Result<(), String> {
+        let kind = match event {
+            SurfaceInput::Text { text } => format!("text:{text}"),
+            other => format!("{other:?}"),
+        };
+        self.inputs.lock().unwrap().push(kind);
+        Ok(())
+    }
+    fn controlled(&mut self, on: bool) {
+        self.controlled.lock().unwrap().push(on);
+    }
+}
+
+#[tokio::test]
+async fn another_computer_shares_its_screen_and_the_owner_drives_it() {
+    let f = fixture(RiskLevel::Medium).await;
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    registry.start();
+    f.gateway.attach_surfaces(registry.clone());
+    let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let controlled = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let screen = FakeScreen {
+        inputs: inputs.clone(),
+        controlled: controlled.clone(),
+    };
+    let base = format!("http://{}", f.url);
+    let auth = aidaemon_client_core::Auth::LocalToken(f.token.clone());
+    tokio::spawn(async move {
+        let _ = aidaemon_client_core::screen_share::share(
+            &base,
+            &auth,
+            "Synthetic studio Mac",
+            Box::new(screen),
+            |_| {},
+        )
+        .await;
+    });
+    // The shared screen appears as a surface.
+    let mut surface_id = None;
+    for _ in 0..100 {
+        registry.refresh().await;
+        if let Some(found) = registry
+            .list()
+            .into_iter()
+            .find(|s| s.title == "Synthetic studio Mac")
+        {
+            surface_id = Some(found.id.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let surface_id = surface_id.expect("the shared screen is listed");
+
+    let mut socket = socket_with(&f, vec![Capability::ViewActions, Capability::Surfaces]).await;
+    let (result, _) = command_on(
+        &mut socket,
+        &command(
+            "r-1",
+            Command::OpenSurface {
+                surface_id: surface_id.clone(),
+                mode: SurfaceMode::Control,
+                accept: StreamAccept::default(),
+            },
+        ),
+    )
+    .await;
+    let (_, transport) = opened(result);
+    let mut media = media_socket(&f, &transport, &transport.ticket).await;
+    let (_, payload) = media_until_frame(&mut media).await;
+    assert_eq!(payload, b"remote-frame");
+    media_send(
+        &mut media,
+        &MediaClientMessage::Input {
+            event: SurfaceInput::Text {
+                text: "synthetic".into(),
+            },
+        },
+    )
+    .await;
+    for _ in 0..100 {
+        if !inputs.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(inputs.lock().unwrap().as_slice(), ["text:synthetic"]);
+    assert_eq!(
+        controlled.lock().unwrap().first(),
+        Some(&true),
+        "the computer is told"
+    );
+}

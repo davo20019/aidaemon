@@ -281,100 +281,11 @@ impl SurfaceBackend for DesktopSurface {
     async fn input(&self, id: &SurfaceId, event: &InputEvent) -> Result<(), SurfaceError> {
         let display = self.display(id)?;
         let event = event.clone();
-        let pressed = {
-            let mut pressed = lock(&self.pressed);
-            match &event {
-                InputEvent::Pointer {
-                    action: PointerAction::Down,
-                    button,
-                    ..
-                } => {
-                    let button = match button {
-                        PointerButton::Left => Button::Left,
-                        PointerButton::Right => Button::Right,
-                        PointerButton::Middle => Button::Middle,
-                    };
-                    *pressed = Some(button);
-                    Some(button)
-                }
-                InputEvent::Pointer {
-                    action: PointerAction::Up | PointerAction::Cancel,
-                    ..
-                } => pressed.take(),
-                _ => *pressed,
-            }
-        };
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-            let at = |x: f64, y: f64| {
-                (
-                    display.x + (x * f64::from(display.w)).round() as i32,
-                    display.y + (y * f64::from(display.h)).round() as i32,
-                )
-            };
-            match event {
-                InputEvent::Pointer { action, x, y, .. } => {
-                    let (px, py) = at(x, y);
-                    enigo
-                        .move_mouse(px, py, Coordinate::Abs)
-                        .map_err(|e| e.to_string())?;
-                    let direction = match action {
-                        PointerAction::Down => Some(Direction::Press),
-                        PointerAction::Up | PointerAction::Cancel => Some(Direction::Release),
-                        PointerAction::Move => None,
-                    };
-                    if let (Some(direction), Some(button)) = (direction, pressed) {
-                        enigo.button(button, direction).map_err(|e| e.to_string())?;
-                    }
-                }
-                InputEvent::Wheel { x, y, dx, dy } => {
-                    let (px, py) = at(x, y);
-                    enigo
-                        .move_mouse(px, py, Coordinate::Abs)
-                        .map_err(|e| e.to_string())?;
-                    let lines = |d: f64| (d / 40.0).round() as i32;
-                    if lines(dy) != 0 {
-                        enigo
-                            .scroll(lines(dy), Axis::Vertical)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    if lines(dx) != 0 {
-                        enigo
-                            .scroll(lines(dx), Axis::Horizontal)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-                InputEvent::Key {
-                    action,
-                    code,
-                    key,
-                    mods,
-                } => {
-                    let Some(main) = key_of(&code, &key) else {
-                        return Ok(());
-                    };
-                    if action == KeyAction::Down {
-                        for m in &mods {
-                            enigo
-                                .key(modifier_key(*m), Direction::Press)
-                                .map_err(|e| e.to_string())?;
-                        }
-                        let result = enigo.key(main, Direction::Click);
-                        for m in mods.iter().rev() {
-                            let _ = enigo.key(modifier_key(*m), Direction::Release);
-                        }
-                        result.map_err(|e| e.to_string())?;
-                    }
-                }
-                InputEvent::Text { text } => {
-                    enigo.text(&text).map_err(|e| e.to_string())?;
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(backend_error)?
-        .map_err(SurfaceError::Backend)
+        let pressed = press_state(&mut lock(&self.pressed), &event);
+        tokio::task::spawn_blocking(move || drive(display, pressed, event))
+            .await
+            .map_err(backend_error)?
+            .map_err(SurfaceError::Backend)
     }
 
     async fn observe(&self, id: &SurfaceId) -> Result<SurfaceObservation, SurfaceError> {
@@ -392,6 +303,159 @@ impl SurfaceBackend for DesktopSurface {
         OWNER_HOLDS.store(true, Ordering::SeqCst);
         notify_at_the_computer("This computer is being controlled from your paired device.");
         Ok(ExclusiveGuard::new(Hold))
+    }
+}
+
+/// The button held after `event`, for a drag's moves and its release.
+fn press_state(pressed: &mut Option<Button>, event: &InputEvent) -> Option<Button> {
+    match event {
+        InputEvent::Pointer {
+            action: PointerAction::Down,
+            button,
+            ..
+        } => {
+            let button = match button {
+                PointerButton::Left => Button::Left,
+                PointerButton::Right => Button::Right,
+                PointerButton::Middle => Button::Middle,
+            };
+            *pressed = Some(button);
+            Some(button)
+        }
+        InputEvent::Pointer {
+            action: PointerAction::Up | PointerAction::Cancel,
+            ..
+        } => pressed.take(),
+        _ => *pressed,
+    }
+}
+
+/// Apply one input event to `display` (blocking: enigo).
+fn drive(display: Display, pressed: Option<Button>, event: InputEvent) -> Result<(), String> {
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    let at = |x: f64, y: f64| {
+        (
+            display.x + (x * f64::from(display.w)).round() as i32,
+            display.y + (y * f64::from(display.h)).round() as i32,
+        )
+    };
+    match event {
+        InputEvent::Pointer { action, x, y, .. } => {
+            let (px, py) = at(x, y);
+            enigo
+                .move_mouse(px, py, Coordinate::Abs)
+                .map_err(|e| e.to_string())?;
+            let direction = match action {
+                PointerAction::Down => Some(Direction::Press),
+                PointerAction::Up | PointerAction::Cancel => Some(Direction::Release),
+                PointerAction::Move => None,
+            };
+            if let (Some(direction), Some(button)) = (direction, pressed) {
+                enigo.button(button, direction).map_err(|e| e.to_string())?;
+            }
+        }
+        InputEvent::Wheel { x, y, dx, dy } => {
+            let (px, py) = at(x, y);
+            enigo
+                .move_mouse(px, py, Coordinate::Abs)
+                .map_err(|e| e.to_string())?;
+            let lines = |d: f64| (d / 40.0).round() as i32;
+            if lines(dy) != 0 {
+                enigo
+                    .scroll(lines(dy), Axis::Vertical)
+                    .map_err(|e| e.to_string())?;
+            }
+            if lines(dx) != 0 {
+                enigo
+                    .scroll(lines(dx), Axis::Horizontal)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        InputEvent::Key {
+            action,
+            code,
+            key,
+            mods,
+        } => {
+            let Some(main) = key_of(&code, &key) else {
+                return Ok(());
+            };
+            if action == KeyAction::Down {
+                for m in &mods {
+                    enigo
+                        .key(modifier_key(*m), Direction::Press)
+                        .map_err(|e| e.to_string())?;
+                }
+                let result = enigo.key(main, Direction::Click);
+                for m in mods.iter().rev() {
+                    let _ = enigo.key(modifier_key(*m), Direction::Release);
+                }
+                result.map_err(|e| e.to_string())?;
+            }
+        }
+        InputEvent::Text { text } => {
+            enigo.text(&text).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// This computer's main display, to share with a daemon elsewhere
+/// (`aidaemon share-screen`).
+pub struct LocalScreen {
+    display: Display,
+    pressed: Option<Button>,
+}
+
+impl LocalScreen {
+    /// The main display.
+    pub fn primary() -> Result<Self, String> {
+        let monitors = Monitor::all().map_err(|e| e.to_string())?;
+        let monitor = monitors
+            .iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .or_else(|| monitors.first())
+            .ok_or("This computer has no display to share")?;
+        Ok(Self {
+            display: Display {
+                id: monitor.id().map_err(|e| e.to_string())?,
+                x: monitor.x().map_err(|e| e.to_string())?,
+                y: monitor.y().map_err(|e| e.to_string())?,
+                w: monitor.width().map_err(|e| e.to_string())?,
+                h: monitor.height().map_err(|e| e.to_string())?,
+            },
+            pressed: None,
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.display.w, self.display.h)
+    }
+
+    /// A picture: its codec (`jpeg` or `png`), size and bytes.
+    pub fn capture(
+        &self,
+        max_w: u32,
+        max_h: u32,
+        quality: u8,
+    ) -> Result<(&'static str, u32, u32, Vec<u8>), String> {
+        let (codec, w, h, bytes) = capture(self.display.id, max_w, max_h, quality)?;
+        Ok((codec.name(), w, h, bytes))
+    }
+
+    pub fn input(&mut self, event: InputEvent) -> Result<(), String> {
+        event.validate().map_err(|e| e.to_string())?;
+        let pressed = press_state(&mut self.pressed, &event);
+        drive(self.display, pressed, event)
+    }
+
+    /// Tell whoever sits here that the owner drives this screen, or no longer does.
+    pub fn controlled(&self, on: bool) {
+        notify_at_the_computer(if on {
+            "This computer is being controlled from your paired device."
+        } else {
+            "Control of this computer was given back."
+        });
     }
 }
 

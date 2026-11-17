@@ -51,6 +51,7 @@ mod config;
 pub mod files;
 mod observer;
 pub mod pairing;
+pub mod remote_screens;
 mod server;
 pub mod setup;
 pub mod surfaces;
@@ -826,7 +827,7 @@ impl ClientGateway {
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
             Command::ListSurfaces | Command::ListDevices => Some(Scope::Observe),
-            Command::PointAt { .. } => Some(Scope::Control),
+            Command::PointAt { .. } | Command::ShareScreen { .. } => Some(Scope::Control),
             Command::SetDeviceScopes { .. } => None,
             Command::OpenSurface { .. }
             | Command::CloseSurface { .. }
@@ -1317,6 +1318,13 @@ impl ClientGateway {
                 )
                 .await
             }
+            Command::ShareScreen {
+                name,
+                width,
+                height,
+            } => self
+                .need_surfaces()?
+                .share(&caller.principal, name, width, height),
             Command::ListDevices => self.devices_for(caller).await,
             Command::SetDeviceScopes { device_id, scopes } => {
                 // Only the daemon's own computer: a paired device never

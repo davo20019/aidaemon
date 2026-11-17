@@ -580,14 +580,15 @@ fn header(store: Store, session: Option<String>) -> View {
                 let first = screens().into_iter().next()?;
                 let waiting = first.handoff_pending;
                 let desktop = first.session_id.is_none();
+                let screen_name = first.title.clone();
                 let id = first.id.clone();
                 Some(untracked(move || {
                     let label = if waiting {
-                        "The agent is waiting for you in its browser"
+                        "The agent is waiting for you in its browser".to_owned()
                     } else if desktop {
-                        "Watch this computer's screen"
+                        format!("Watch the screen: {screen_name}")
                     } else {
-                        "Watch the agent's browser"
+                        "Watch the agent's browser".to_owned()
                     };
                     let button = view().relative().child(ui::icon_btn(
                         Glyph::External,

@@ -2014,6 +2014,36 @@
           "type": "object"
         },
         {
+          "description": "Offer this device's own screen as a live surface (protocol 1.31;\nscope `control`): another computer the owner paired shares its\ndisplay. Answers with `screen_shared`: where to connect to send\nframes and take input.",
+          "properties": {
+            "height": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "What the owner calls this screen (\"Studio Mac\").",
+              "type": "string"
+            },
+            "type": {
+              "const": "share_screen",
+              "type": "string"
+            },
+            "width": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "width",
+            "height"
+          ],
+          "type": "object"
+        },
+        {
           "description": "The paired devices (protocol 1.31). Answers with `devices`.",
           "properties": {
             "type": {
@@ -2587,6 +2617,31 @@
           "required": [
             "type",
             "surface"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`share_screen` (protocol 1.31): connect to `url` (a path on the\ngateway) and send `ticket` first.",
+          "properties": {
+            "surface_id": {
+              "type": "string"
+            },
+            "ticket": {
+              "type": "string"
+            },
+            "type": {
+              "const": "screen_shared",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id",
+            "url",
+            "ticket"
           ],
           "type": "object"
         },
@@ -4484,6 +4539,96 @@
         "preset"
       ],
       "type": "object"
+    },
+    "ProviderCommand": {
+      "description": "What the daemon tells a device that shares its own screen (protocol\n1.31), as JSON text on its provider socket. The device sends its frames\nback as binary messages ([`encode`] with [`MediaHeader::Frame`]), after\n[`MediaClientMessage::Auth`].",
+      "oneOf": [
+        {
+          "description": "Someone watches: send frames, at most this size and rate.",
+          "properties": {
+            "max_fps": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_h": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_w": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "quality": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "start",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "max_w",
+            "max_h",
+            "max_fps",
+            "quality"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Nobody watches: stop sending.",
+          "properties": {
+            "type": {
+              "const": "stop",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Apply this input from the owner.",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/SurfaceInput"
+            },
+            "type": {
+              "const": "input",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner controls the screen now (`true`) or gave it back: tell\nwhoever sits at it.",
+          "properties": {
+            "on": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "controlled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "on"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "ProviderOption": {
       "description": "A provider the owner may connect.",

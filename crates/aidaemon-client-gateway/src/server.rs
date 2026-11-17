@@ -71,6 +71,10 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
             "/client/v1/surfaces/{live_id}/ws",
             get(crate::surfaces::media_socket),
         )
+        .route(
+            "/client/v1/surfaces/provide/{surface_id}/ws",
+            get(crate::surfaces::provider_socket),
+        )
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
         .route("/client/v1/next", get(app_root))

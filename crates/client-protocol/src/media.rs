@@ -68,6 +68,32 @@ pub enum MediaClientMessage {
     Unknown,
 }
 
+/// What the daemon tells a device that shares its own screen (protocol
+/// 1.31), as JSON text on its provider socket. The device sends its frames
+/// back as binary messages ([`encode`] with [`MediaHeader::Frame`]), after
+/// [`MediaClientMessage::Auth`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderCommand {
+    /// Someone watches: send frames, at most this size and rate.
+    Start {
+        max_w: u32,
+        max_h: u32,
+        max_fps: u32,
+        quality: u8,
+    },
+    /// Nobody watches: stop sending.
+    Stop,
+    /// Apply this input from the owner.
+    Input { event: SurfaceInput },
+    /// The owner controls the screen now (`true`) or gave it back: tell
+    /// whoever sits at it.
+    Controlled { on: bool },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
 /// Input for a surface. Coordinates are fractions of the frame (0 to 1).
 #[derive(Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]

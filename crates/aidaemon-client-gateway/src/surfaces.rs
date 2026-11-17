@@ -65,6 +65,8 @@ struct Ticket {
 /// The gateway's side of live surfaces.
 pub struct SurfaceDesk {
     registry: SurfaceRegistry,
+    /// Screens paired devices share.
+    remote: Arc<crate::remote_screens::RemoteScreens>,
     tickets: Mutex<Vec<Ticket>>,
     /// Device names, for "controlled from …".
     names: Mutex<HashMap<String, String>>,
@@ -92,8 +94,12 @@ fn refusal(error: SurfaceError) -> ProtocolError {
 
 impl SurfaceDesk {
     pub fn new(registry: SurfaceRegistry) -> Arc<Self> {
+        let remote = crate::remote_screens::RemoteScreens::new();
+        remote.set_notifier(registry.notifier());
+        registry.add_backend(remote.clone());
         Arc::new(Self {
             registry,
+            remote,
             tickets: Mutex::new(Vec::new()),
             names: Mutex::new(HashMap::new()),
         })
@@ -338,6 +344,35 @@ impl SurfaceDesk {
         ))
     }
 
+    /// `share_screen`: this device offers its own screen; where it sends
+    /// frames, and the ticket for it.
+    pub fn share(
+        &self,
+        principal: &Principal,
+        name: String,
+        width: u32,
+        height: u32,
+    ) -> Result<CommandResult, ProtocolError> {
+        if !self.enabled() {
+            return Err(refusal(SurfaceError::Disabled));
+        }
+        let device = self.device_of(principal);
+        let id = self.remote.offer(&device, &name, width, height);
+        let ticket = format!("tkt_{}", uuid::Uuid::new_v4().simple());
+        lock(&self.tickets).push(Ticket {
+            hash: sha(&ticket),
+            live_id: provider_key(&id),
+            device_id: device,
+            expires: Instant::now() + TICKET_TTL,
+            revoked: principal.revoked.clone(),
+        });
+        Ok(CommandResult::ScreenShared {
+            url: format!("/client/v1/surfaces/provide/{id}/ws"),
+            surface_id: id.to_string(),
+            ticket,
+        })
+    }
+
     /// Use a ticket: the device it was given to and what revokes it.
     fn redeem(&self, live_id: &str, ticket: &str) -> Option<(String, CancellationToken)> {
         let hash = sha(ticket);
@@ -427,8 +462,53 @@ impl SurfaceDesk {
     }
 }
 
+/// The ticket key of a screen a device provides (tickets otherwise name
+/// live sessions).
+fn provider_key(id: &SurfaceId) -> String {
+    format!("provide:{id}")
+}
+
+/// `GET /client/v1/surfaces/provide/{surface_id}/ws`: a paired device's
+/// own screen.
+pub(crate) async fn provider_socket(
+    State(gateway): State<Arc<ClientGateway>>,
+    Path(surface_id): Path<String>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    upgrade
+        .max_message_size(8 * 1024 * 1024 + 64 * 1024)
+        .on_upgrade(move |mut socket| async move {
+            let Some(desk) = gateway.surface_desk() else {
+                return;
+            };
+            let id = SurfaceId::from_string(surface_id);
+            let auth = match tokio::time::timeout(AUTH_WITHIN, socket.recv()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    serde_json::from_str::<MediaClientMessage>(&text).ok()
+                }
+                _ => None,
+            };
+            let Some(MediaClientMessage::Auth { ticket }) = auth else {
+                let _ = close_with(&mut socket, "Send the ticket first").await;
+                return;
+            };
+            let Some((device, revoked)) = desk.redeem(&provider_key(&id), &ticket) else {
+                let _ = close_with(&mut socket, "That ticket is not valid").await;
+                return;
+            };
+            if desk.remote.device_of(&id).as_deref() != Some(device.as_str()) {
+                let _ = close_with(&mut socket, "That ticket is not valid").await;
+                return;
+            }
+            tokio::select! {
+                _ = desk.remote.serve(id, socket) => {}
+                _ = revoked.cancelled() => {}
+            }
+        })
+}
+
 /// The owner's input as the surfaces crate takes it.
-pub(crate) fn input_of(input: SurfaceInput) -> Result<InputEvent, &'static str> {
+pub fn input_of(input: SurfaceInput) -> Result<InputEvent, &'static str> {
     Ok(match input {
         SurfaceInput::Pointer {
             action,

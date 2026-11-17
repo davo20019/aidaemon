@@ -202,6 +202,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::TakeControl { .. } => "take_control",
         Command::ReleaseControl { .. } => "release_control",
         Command::PointAt { .. } => "point_at",
+        Command::ShareScreen { .. } => "share_screen",
         Command::ListDevices => "list_devices",
         Command::SetDeviceScopes { .. } => "set_device_scopes",
         Command::Unknown => "unknown",
@@ -248,6 +249,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Surfaces { .. } => "surfaces",
         CommandResult::SurfaceOpened { .. } => "surface_opened",
         CommandResult::SurfaceControl { .. } => "surface_control",
+        CommandResult::ScreenShared { .. } => "screen_shared",
         CommandResult::Devices { .. } => "devices",
         CommandResult::Unknown => "unknown",
     }
@@ -550,6 +552,14 @@ fn client_samples() -> Vec<ClientFrame> {
                 x: 0.5,
                 y: 0.25,
                 note: Some("This one".into()),
+            },
+        ),
+        command(
+            "5d0c2b1e-002e",
+            Command::ShareScreen {
+                name: "Synthetic studio Mac".into(),
+                width: 2560,
+                height: 1440,
             },
         ),
         command("5d0c2b1e-002b", Command::ListDevices),
@@ -1220,6 +1230,11 @@ fn server_samples() -> Vec<ServerFrame> {
                 controller: SurfaceController::Agent,
                 ..surface()
             },
+        }),
+        ack(CommandResult::ScreenShared {
+            surface_id: "srf_remote_1".into(),
+            url: "/client/v1/surfaces/provide/srf_remote_1/ws".into(),
+            ticket: "tkt_synthetic_0002".into(),
         }),
         ack(CommandResult::Devices {
             devices: vec![DeviceInfo {

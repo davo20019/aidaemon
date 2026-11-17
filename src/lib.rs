@@ -6,6 +6,7 @@ mod config;
 mod context_budget;
 mod conversation;
 mod core;
+mod share_screen;
 #[cfg(test)]
 use aidaemon_work::schedule as cron_utils;
 mod daemon;
@@ -226,6 +227,7 @@ pub fn run() -> anyhow::Result<()> {
                 println!(
                     "  browser login          Launch Chrome to log into services for the agent"
                 );
+                println!("  share-screen          Share this computer's screen with your AIdaemon");
                 println!("  attach <code>         Attach native terminal to /agent session");
                 println!("  agent attach <code>   Legacy alias for attach");
                 println!("  share [session_id]    Generate a Telegram /agent resume code");
@@ -326,6 +328,9 @@ pub fn run() -> anyhow::Result<()> {
             }
             "pair" => {
                 return handle_pair_command(&args[2..], config_path.as_path(), false);
+            }
+            "share-screen" => {
+                return share_screen::run(&args[2..]);
             }
             "web" => {
                 return handle_pair_command(&args[2..], config_path.as_path(), true);

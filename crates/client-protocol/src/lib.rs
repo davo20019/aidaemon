@@ -487,6 +487,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// Offer this device's own screen as a live surface (protocol 1.31;
+    /// scope `control`): another computer the owner paired shares its
+    /// display. Answers with `screen_shared`: where to connect to send
+    /// frames and take input.
+    ShareScreen {
+        /// What the owner calls this screen ("Studio Mac").
+        name: String,
+        width: u32,
+        height: u32,
+    },
     /// The paired devices (protocol 1.31). Answers with `devices`.
     ListDevices,
     /// What a paired device may do (protocol 1.31): only from the daemon's
@@ -867,6 +877,13 @@ pub enum CommandResult {
     /// as it is after.
     SurfaceControl {
         surface: SurfaceInfo,
+    },
+    /// `share_screen` (protocol 1.31): connect to `url` (a path on the
+    /// gateway) and send `ticket` first.
+    ScreenShared {
+        surface_id: String,
+        url: String,
+        ticket: String,
     },
     /// `list_devices` and `set_device_scopes` (protocol 1.31).
     Devices {
@@ -2830,6 +2847,7 @@ pub fn schema() -> serde_json::Value {
     let _ = generator.subschema_for::<Vec<DeviceInfo>>();
     let _ = generator.subschema_for::<media::MediaHeader>();
     let _ = generator.subschema_for::<media::MediaClientMessage>();
+    let _ = generator.subschema_for::<media::ProviderCommand>();
     let mut defs = serde_json::Value::Object(generator.take_definitions(true));
     drop_empty_alternatives(&mut defs);
     serde_json::json!({

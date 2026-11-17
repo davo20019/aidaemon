@@ -75,6 +75,7 @@ dependencies = [
  "aidaemon-channel-slack",
  "aidaemon-channel-telegram",
  "aidaemon-channels",
+ "aidaemon-client-core",
  "aidaemon-client-gateway",
  "aidaemon-client-protocol",
  "aidaemon-core",
