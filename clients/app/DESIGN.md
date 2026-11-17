@@ -18,6 +18,7 @@ A workbench for working with an agent: quiet, precise and dense, with what the a
 - **Text:** `TEXT`, `MUTED` (secondary), `FAINT` (metadata, hints; at least 4.5:1 on the background in both themes). Never smaller than 11 pt.
 - **Toasts:** a card of the surface colour with a border, not an inverted slab; under the top bar on touch (swiped up), clear of the composer; at the bottom with a pointer (swiped right). A title and, under it, what it was about. A finished conversation elsewhere is "Done" with a check and its title, and a press opens it.
 - **Icons:** `ui::icon(Glyph)`: Lucide line art (ISC) drawn in the text colour in a window and a browser; the plain symbol in a terminal.
+- **Conversation rows:** three levels. The title in `TEXT` (a new reply adds medium weight beside its dot, not brightness); its project or folder in `MUTED`; the chat it came from (Slack, Discord, Telegram, group) as `ui::icon_inline` glyphs in `FAINT`, after the folder on a phone's second line, like the time. Channel icons stay monochrome: colour is for state only.
 - **One accent:** `ACCENT` (teal) means the agent: running work, the focus ring, the caret, links. `PRIMARY` is the one main action's fill (ink on paper, paper on graphite).
 - **Status** (`Tone`): success, warning, danger, info, neutral, accent. Each has a colour and a soft tint, and always comes with a word or glyph, never colour alone.
 - **Radii:** surfaces 12, controls 7, small parts 4. Nested shapes are concentric.

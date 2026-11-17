@@ -684,6 +684,21 @@ pub fn icon(glyph: Glyph) -> View {
     )
 }
 
+/// A glyph sized to the metadata text it sits beside (a row's folder, its
+/// time), so it reads as part of that line, not as a control. In a
+/// terminal it is the plain symbol, like [`icon`].
+pub fn icon_inline(glyph: Glyph) -> View {
+    if idiom() == nsh_core::platform::Idiom::Terminal {
+        return icon(glyph);
+    }
+    let side = px(if touch() { 13.0 } else { type_scale::SM });
+    view().items_center().justify_center().child(
+        svg(nsh_core::element::ImageSrc::svg_markup(&glyph.markup()))
+            .w(side)
+            .h(side),
+    )
+}
+
 /// A one-line text field.
 pub fn field(placeholder: &'static str, value: Signal<String>) -> Input {
     input()

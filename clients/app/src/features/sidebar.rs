@@ -1220,13 +1220,13 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
         .min_w(px(0.0))
         .number_of_lines(1)
         .text_size(px(ui::fit::body()))
-        .text_color(move || {
-            if store.is_unread(&h) {
-                colors::TEXT
-            } else {
-                colors::MUTED
-            }
-        });
+        // The name is what a row is found by: body text always, a new
+        // reply adding weight (beside its dot) rather than brightness.
+        .text_color(colors::TEXT)
+        .style_when(
+            move || store.is_unread(&h),
+            |s| s.font_weight(FontWeight::MEDIUM),
+        );
     let star = text(move || if store.is_pinned(&f) { "★" } else { "" })
         .text_size(px(type_scale::XS))
         .text_color(colors::FAINT);
@@ -1237,7 +1237,7 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
         text(tag)
             .number_of_lines(1)
             .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-            .text_color(colors::FAINT)
+            .text_color(colors::MUTED)
     };
     let mark = move || {
         let id = mark_id.clone();
@@ -1251,9 +1251,10 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
                     .items_center()
                     .role(AccessibilityRole::Image)
                     .label(said)
-                    .child(icon(glyph).text_color(colors::FAINT));
+                    .gap_1()
+                    .child(ui::icon_inline(glyph).text_color(colors::FAINT));
                 if group {
-                    marks = marks.child(icon(Glyph::Group).text_color(colors::FAINT));
+                    marks = marks.child(ui::icon_inline(Glyph::Group).text_color(colors::FAINT));
                 }
                 marks
             }))
@@ -1289,8 +1290,8 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
                 .flex_row()
                 .items_center()
                 .gap_1()
+                .child(tag_text().min_w(px(0.0)))
                 .child(mark())
-                .child(tag_text().flex_1().min_w(px(0.0)))
         }))
 }
 
