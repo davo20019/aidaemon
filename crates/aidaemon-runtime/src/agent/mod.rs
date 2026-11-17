@@ -793,6 +793,15 @@ impl Agent {
         Ok(())
     }
 
+    /// Whether the owner pinned a model with `/model` (a provider reload
+    /// would clear the pin). A lock held too long reads as pinned.
+    pub async fn model_pinned(&self) -> bool {
+        match tokio::time::timeout(Duration::from_secs(2), self.model_override.read()).await {
+            Ok(guard) => *guard,
+            Err(_) => true,
+        }
+    }
+
     /// List available models from the provider.
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         self.llm_runtime.snapshot().models().list().await

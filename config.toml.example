@@ -76,6 +76,11 @@ api_key = "keychain"
 #   text is recovered through truncation recovery instead of failing the call.
 # api_key = "${AIDAEMON_API_KEY}"
 base_url = "https://openrouter.ai/api/v1"
+# auto_upgrade = true   # move to the newest version of the model in use as the
+#   provider releases it (gpt-6-sol -> gpt-6.2-sol): checked daily, tried first,
+#   the old model stays first among the fallbacks, and you are told. With a
+#   pay-per-token key you are only told (a newer model can cost more). Going back
+#   to the old model keeps it. false turns this off.
 # Optional: Cloudflare AI Gateway authenticated mode
 # gateway_token = "keychain"
 # # gateway_token = "${AIDAEMON_GATEWAY_TOKEN}"

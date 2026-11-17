@@ -227,16 +227,18 @@ pub(crate) fn build_provider(
                      the Codex backend accepts no output cap"
                 );
             }
-            models = ModelList::Fixed(
-                backends::CHATGPT_KNOWN_MODELS
+            let backend = Arc::new(chatgpt_backend(
+                base_override,
+                config.reasoning_effort.as_deref(),
+            )?);
+            models = ModelList::ChatGpt {
+                backend: backend.clone(),
+                known: backends::CHATGPT_KNOWN_MODELS
                     .iter()
                     .map(|model| model.to_string())
                     .collect(),
-            );
-            Arc::new(chatgpt_backend(
-                base_override,
-                config.reasoning_effort.as_deref(),
-            )?)
+            };
+            backend
         }
     };
     // One guard per configured account: once the account's quota, credit

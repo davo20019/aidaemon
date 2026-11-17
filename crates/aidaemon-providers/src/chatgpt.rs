@@ -148,6 +148,14 @@ impl ChatGpt {
     }
 }
 
+impl std::fmt::Debug for ChatGpt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatGpt")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ChatGptBuilder {
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         let url = url.into();
@@ -310,6 +318,109 @@ impl Provider for ChatGpt {
             }),
         )
     }
+}
+
+/// The client version the model listing asks for. The backend hides models
+/// that need a newer client than the one named, so this follows the Codex
+/// releases the request format matches.
+pub const CHATGPT_LIST_CLIENT_VERSION: &str = "0.99.0";
+
+/// A model the ChatGPT backend offers the signed-in account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptModel {
+    pub id: String,
+    /// The name the backend shows people, when it gives one.
+    pub display_name: Option<String>,
+    /// The backend's one-line description, when it gives one.
+    pub description: Option<String>,
+    /// Shown in a model picker (the backend can list a model it hides).
+    pub listed: bool,
+}
+
+impl ChatGpt {
+    /// The models the backend offers this account
+    /// (`GET {base}/models?client_version=..`), with a 401 refreshed once.
+    pub async fn list_models(&self) -> Result<Vec<ChatGptModel>, ProviderError> {
+        let auth_error = |error: String| ProviderError::Auth(error);
+        let mut credentials = self.auth.credentials().await.map_err(auth_error)?;
+        let mut response = self.get_models(&credentials).await?;
+        if response.status().as_u16() == 401 {
+            let rejected = credentials.access_token.clone();
+            let _ = response.bytes().await;
+            credentials = self
+                .auth
+                .refresh_after_rejection(&rejected)
+                .await
+                .map_err(auth_error)?;
+            response = self.get_models(&credentials).await?;
+        }
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_status(status, &headers, &body));
+        }
+        let models = parse_model_listing(&body);
+        if models.is_empty() {
+            return Err(ProviderError::NotFound(format!(
+                "model listing had no models: {}",
+                body_excerpt(&body)
+            )));
+        }
+        Ok(models)
+    }
+
+    async fn get_models(
+        &self,
+        credentials: &ChatGptCredentials,
+    ) -> Result<reqwest::Response, ProviderError> {
+        self.client
+            .get(format!(
+                "{}/models?client_version={CHATGPT_LIST_CLIENT_VERSION}",
+                self.base_url
+            ))
+            .timeout(Duration::from_secs(30))
+            .bearer_auth(&credentials.access_token)
+            .header("chatgpt-account-id", &credentials.account_id)
+            .header("originator", &self.originator)
+            .header("User-Agent", &self.user_agent)
+            .send()
+            .await
+            .map_err(map_reqwest_error)
+    }
+}
+
+/// The models in a listing body: `{"models": [{"slug", ..}]}` as the Codex
+/// backend answers, or `{"data": [{"id"}]}` as OpenAI's API does.
+pub fn parse_model_listing(body: &str) -> Vec<ChatGptModel> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let text = |m: &Value, key: &str| {
+        m[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut seen = HashSet::new();
+    value["models"]
+        .as_array()
+        .or_else(|| value["data"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = text(m, "slug").or_else(|| text(m, "id"))?;
+            seen.insert(id.clone()).then(|| ChatGptModel {
+                display_name: text(m, "display_name"),
+                description: text(m, "description"),
+                listed: m["visibility"]
+                    .as_str()
+                    .is_none_or(|v| v.eq_ignore_ascii_case("list")),
+                id,
+            })
+        })
+        .collect()
 }
 
 /// Make an auth rejection legible: the backend's own message is terse, and
@@ -830,6 +941,22 @@ fn parse_usage(completed: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_listing_reads_both_shapes() {
+        let codex = r#"{"models":[
+            {"slug":"gpt-6.2-sol","display_name":"GPT-6.2 Sol","description":"Newest.","visibility":"list"},
+            {"slug":"gpt-6-sol","visibility":"hide"},
+            {"slug":"gpt-6.2-sol"}
+        ]}"#;
+        let models = parse_model_listing(codex);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].display_name.as_deref(), Some("GPT-6.2 Sol"));
+        assert!(models[0].listed && !models[1].listed);
+        let api = r#"{"data":[{"id":"gpt-6-luna"}]}"#;
+        assert_eq!(parse_model_listing(api)[0].id, "gpt-6-luna");
+        assert!(parse_model_listing("not json").is_empty());
+    }
     use aidaemon_core::{Image, RequestOptions};
 
     fn request(messages: Vec<Message>) -> ModelRequest {

@@ -538,6 +538,15 @@ pub async fn run(
         info!(mode = ?config.updates.mode, "Self-updater initialized");
     }
 
+    // 14c. Keep the main provider's models on the newest of their line.
+    crate::model_upgrade::ModelUpgrader::new(
+        config_path.clone(),
+        agent.clone(),
+        hub.clone(),
+        notify_session_ids.clone(),
+    )
+    .spawn();
+
     // 15. Send startup notification to first Telegram bot's allowed users.
     channel_bundle.send_startup_notifications(&config).await;
 

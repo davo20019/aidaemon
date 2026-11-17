@@ -571,6 +571,11 @@ pub struct ProviderConfig {
     /// Opt-in llama.cpp slot routing (`id_slot` pinning). Disabled by default.
     #[serde(default)]
     pub slot_routing: SlotRoutingConfig,
+    /// Keep the main provider's models on the newest version of their line
+    /// (`gpt-6-sol` -> `gpt-6.2-sol`) as the provider releases them; see
+    /// `src/model_upgrade.rs`. On by default.
+    #[serde(default = "default_true")]
+    pub auto_upgrade: bool,
 }
 
 impl fmt::Debug for ProviderConfig {

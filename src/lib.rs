@@ -39,6 +39,7 @@ mod mandates {
 }
 mod mcp;
 mod memory;
+mod model_upgrade;
 pub mod nodes;
 mod oauth;
 #[allow(unused_imports)]

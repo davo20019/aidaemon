@@ -20,6 +20,10 @@ impl DaemonAgentRuntime for Agent {
         super::models::reload_provider(self, config).await
     }
 
+    async fn model_pinned(&self) -> bool {
+        Agent::model_pinned(self).await
+    }
+
     fn tool_activity(
         &self,
         name: &str,

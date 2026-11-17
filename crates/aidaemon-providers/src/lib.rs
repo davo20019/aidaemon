@@ -62,6 +62,7 @@ pub mod chatgpt_login;
 mod errors;
 mod google;
 pub mod key_check;
+pub mod model_upgrade;
 mod openai;
 pub mod routing;
 mod sse;
@@ -73,8 +74,9 @@ pub use anthropic::{
     AnthropicBuilder, THINKING_BLOCKS_KEY,
 };
 pub use chatgpt::{
-    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_REASONING_EFFORTS, ChatGpt,
-    ChatGptAuth, ChatGptBuilder, ChatGptCredentials, StaticChatGptAuth,
+    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_LIST_CLIENT_VERSION,
+    CHATGPT_REASONING_EFFORTS, ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials,
+    ChatGptModel, StaticChatGptAuth,
 };
 pub use errors::{affordable_tokens, context_overflow, error_for_status};
 pub use google::{

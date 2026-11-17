@@ -29,6 +29,8 @@ pub(crate) trait DaemonAgentRuntime: ChannelAgentRuntime {
     /// The daemon's execution environment.
     fn execution_backend(&self) -> crate::execution::SharedExecutionBackend;
     async fn reload_provider(&self, config: &crate::config::AppConfig) -> anyhow::Result<String>;
+    /// Whether the owner pinned a model with `/model`.
+    async fn model_pinned(&self) -> bool;
     /// What kind of work a call of the tool `name` with `arguments` is, as
     /// cards show it; `None` for a tool the agent does not have.
     fn tool_activity(

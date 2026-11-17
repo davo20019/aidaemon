@@ -27,12 +27,28 @@ pub enum ModelList {
         base_url: String,
         api_key: Option<String>,
     },
+    /// The ChatGPT subscription's own listing; `known` when it fails.
+    ChatGpt {
+        backend: std::sync::Arc<aidaemon_providers::ChatGpt>,
+        known: Vec<String>,
+    },
 }
 
 impl ModelList {
     pub async fn list(&self) -> anyhow::Result<Vec<String>> {
         match self {
             ModelList::Fixed(models) => Ok(models.clone()),
+            ModelList::ChatGpt { backend, known } => match backend.list_models().await {
+                Ok(listed) => Ok(listed
+                    .into_iter()
+                    .filter(|m| m.listed)
+                    .map(|m| m.id)
+                    .collect()),
+                Err(error) => {
+                    tracing::warn!(%error, "ChatGPT model listing failed; offering the known models");
+                    Ok(known.clone())
+                }
+            },
             ModelList::OpenAiModels { base_url, api_key } => {
                 let client = super::build_http_client(std::time::Duration::from_secs(30))
                     .map_err(anyhow::Error::msg)?;
