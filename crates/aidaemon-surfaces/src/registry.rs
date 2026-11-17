@@ -419,6 +419,11 @@ impl SurfaceRegistry {
         self.backend_of(id)?.describe_point(id, x, y).await
     }
 
+    /// What has the keyboard on `id` now.
+    pub async fn focused(&self, id: &SurfaceId) -> Result<Option<crate::PointedAt>, SurfaceError> {
+        self.backend_of(id)?.focused(id).await
+    }
+
     pub async fn observe(&self, id: &SurfaceId) -> Result<SurfaceObservation, SurfaceError> {
         self.backend_of(id)?.observe(id).await
     }

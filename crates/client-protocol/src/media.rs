@@ -45,6 +45,15 @@ pub enum MediaHeader {
     Controller { controller: SurfaceController },
     /// The authenticated session is ready; frames follow.
     Ready { surface_id: String },
+    /// What the owner's typing goes to now, after their input (protocol
+    /// 1.31): its kind ("a text field") and label ("Username"); both absent
+    /// when nothing on the surface takes typing. Never a field's value.
+    Focus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        what: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
     /// The session ended; the server closes the socket next.
     Closed { reason: String },
     #[serde(other)]

@@ -80,6 +80,15 @@ pub trait SurfaceBackend: Send + Sync {
         ))
     }
 
+    /// What has the keyboard on the surface now (the field the owner's
+    /// typing goes to), described like a point. `None`: nothing does.
+    /// Default: this surface cannot say.
+    async fn focused(&self, _id: &SurfaceId) -> Result<Option<PointedAt>, SurfaceError> {
+        Err(SurfaceError::NotSupported(
+            "this screen cannot say what has focus",
+        ))
+    }
+
     /// Get the surface ready before the owner is asked to act on it (a
     /// browser moves to a profile that keeps sign-ins). May reopen it under
     /// another id.

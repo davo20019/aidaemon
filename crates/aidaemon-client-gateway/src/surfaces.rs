@@ -738,8 +738,25 @@ async fn pump_media(
                             continue;
                         }
                         let Ok(event) = input_of(event) else { continue };
+                        let says_focus = matches!(
+                            event,
+                            InputEvent::Pointer { action: PointerAction::Up, .. }
+                                | InputEvent::Key { .. }
+                                | InputEvent::Text { .. }
+                        );
                         if let Err(error) = desk.registry.input(live_id, &event).await {
                             debug!(device = device_id, %error, "Surface input refused");
+                            continue;
+                        }
+                        // Say where typing goes now, so the owner knows a
+                        // box has the keyboard before typing into it.
+                        if says_focus
+                            && let Ok(focused) = desk.registry.focused(surface_id).await
+                        {
+                            send_header(socket, &MediaHeader::Focus {
+                                what: focused.as_ref().map(|f| f.what.clone()),
+                                label: focused.and_then(|f| f.text),
+                            }).await?;
                         }
                     }
                     _ => {}

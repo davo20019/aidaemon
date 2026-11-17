@@ -2333,6 +2333,16 @@ async fn a_surface_streams_the_newest_frame_and_takes_input_only_under_control()
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(mock.inputs().len(), 1);
+    // After typing, the view is told where the typing went (never what).
+    let focus = loop {
+        if let (MediaHeader::Focus { what, label }, _) = media_next(&mut media).await {
+            break (what, label);
+        }
+    };
+    assert_eq!(
+        focus,
+        (Some("a text field".into()), Some("Username".into()))
+    );
 
     // Closing the view ends the stream; nothing typed was kept by the gateway.
     let (result, _) = command_on(

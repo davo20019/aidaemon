@@ -35,9 +35,8 @@ use super::session::BrowserSessionRegistry;
 /// field's value) and a selector the browser tool can use. `__X__` and
 /// `__Y__` are the point's fractions, numbers only.
 const POINT_SCRIPT: &str = r#"(() => {
-  const x = __X__ * window.innerWidth, y = __Y__ * window.innerHeight;
-  let el = document.elementFromPoint(x, y);
-  if (!el) return null;
+  let el = __TARGET__;
+  if (!el || el === document.body || el === document.documentElement) return null;
   el = el.closest('a,button,input,select,textarea,label,[role=button],[role=link],[onclick]') || el;
   const tag = el.tagName.toLowerCase();
   const type = (el.getAttribute('type') || '').toLowerCase();
@@ -50,7 +49,7 @@ const POINT_SCRIPT: &str = r#"(() => {
     : tag === 'img' ? 'a picture'
     : 'the ' + tag + ' element';
   const typed = tag === 'input' || tag === 'textarea' || tag === 'select';
-  const words = (el.getAttribute('aria-label') || el.getAttribute('placeholder')
+  const words = (el.getAttribute('aria-label') || (el.labels && el.labels[0] && el.labels[0].innerText) || el.getAttribute('placeholder')
     || el.getAttribute('alt') || (typed ? '' : el.innerText) || el.getAttribute('title') || '')
     .trim().replace(/\s+/g, ' ').slice(0, 80);
   let selector;
@@ -184,6 +183,48 @@ impl BrowserSurface {
             .await
             .ok_or(SurfaceError::NotFound)?;
         Ok((session, target, tab.page))
+    }
+
+    /// Describe the element `target_expr` (a fixed script expression)
+    /// names: its kind, label and a selector; never its value.
+    async fn describe(
+        &self,
+        session: &str,
+        target: &str,
+        page: &Arc<dyn PageHandle>,
+        target_expr: &str,
+    ) -> Result<Option<PointedAt>, SurfaceError> {
+        let script = POINT_SCRIPT.replace("__TARGET__", target_expr);
+        let Some(found) = page
+            .evaluate(&script)
+            .await
+            .map_err(backend_error)?
+            .filter(serde_json::Value::is_object)
+        else {
+            return Ok(None);
+        };
+        let field = |key: &str| {
+            found
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(clean_title)
+                .filter(|v| !v.is_empty())
+        };
+        let agent_ref = self
+            .sessions
+            .tab(session, target)
+            .await
+            .map(|tab| tab.tab_id);
+        Ok(Some(PointedAt {
+            what: field("what").unwrap_or_else(|| "something".into()),
+            text: field("text"),
+            selector: found
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty() && v.len() <= 300)
+                .map(str::to_string),
+            agent_ref,
+        }))
     }
 
     async fn viewport(&self, target: &str, page: &Arc<dyn PageHandle>) -> (f64, f64) {
@@ -483,37 +524,20 @@ impl SurfaceBackend for BrowserSurface {
         y: f64,
     ) -> Result<PointedAt, SurfaceError> {
         let (session, target, page) = self.page(id).await?;
-        let script = POINT_SCRIPT
-            .replace("__X__", &format!("{:.6}", x.clamp(0.0, 1.0)))
-            .replace("__Y__", &format!("{:.6}", y.clamp(0.0, 1.0)));
-        let found = page
-            .evaluate(&script)
+        let target_expr = format!(
+            "document.elementFromPoint({:.6} * window.innerWidth, {:.6} * window.innerHeight)",
+            x.clamp(0.0, 1.0),
+            y.clamp(0.0, 1.0)
+        );
+        self.describe(&session, &target, &page, &target_expr)
+            .await?
+            .ok_or_else(|| SurfaceError::Refused("Nothing is there.".into()))
+    }
+
+    async fn focused(&self, id: &SurfaceId) -> Result<Option<PointedAt>, SurfaceError> {
+        let (session, target, page) = self.page(id).await?;
+        self.describe(&session, &target, &page, "document.activeElement")
             .await
-            .map_err(backend_error)?
-            .filter(serde_json::Value::is_object)
-            .ok_or_else(|| SurfaceError::Refused("Nothing is there.".into()))?;
-        let field = |key: &str| {
-            found
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(clean_title)
-                .filter(|v| !v.is_empty())
-        };
-        let agent_ref = self
-            .sessions
-            .tab(&session, &target)
-            .await
-            .map(|tab| tab.tab_id);
-        Ok(PointedAt {
-            what: field("what").unwrap_or_else(|| "something".into()),
-            text: field("text"),
-            selector: found
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .filter(|v| !v.is_empty() && v.len() <= 300)
-                .map(str::to_string),
-            agent_ref,
-        })
     }
 
     async fn exclusive(&self, id: &SurfaceId) -> Result<ExclusiveGuard, SurfaceError> {
@@ -524,6 +548,10 @@ impl SurfaceBackend for BrowserSurface {
             .await
             .ok_or(SurfaceError::NotFound)?;
         let guard = action_lock.lock_owned().await;
+        // The page draws its caret and focus rings while the owner drives.
+        if let Some(tab) = self.sessions.tab(&session, &self.locate(id)?.1).await {
+            let _ = tab.page.emulate_focus(true).await;
+        }
         lock(&self.live.owner_held).insert(session.clone());
         Ok(ExclusiveGuard::new(OwnerHold {
             _guard: guard,

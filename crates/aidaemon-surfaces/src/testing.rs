@@ -198,6 +198,15 @@ impl SurfaceBackend for MockSurface {
         })
     }
 
+    async fn focused(&self, _id: &SurfaceId) -> Result<Option<PointedAt>, SurfaceError> {
+        Ok(Some(PointedAt {
+            what: "a text field".into(),
+            text: Some("Username".into()),
+            selector: Some("#username".into()),
+            agent_ref: None,
+        }))
+    }
+
     async fn exclusive(&self, id: &SurfaceId) -> Result<ExclusiveGuard, SurfaceError> {
         let lock = self.agent_lock(id);
         Ok(ExclusiveGuard::new(lock.lock_owned().await))

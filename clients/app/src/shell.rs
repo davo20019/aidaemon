@@ -532,6 +532,7 @@ fn live_screen(store: Store) -> crate::ui::LiveScreen {
         }),
         frame: store.live_frame(),
         controlling: Rc::new(move || store.live_controlling()),
+        focus: Rc::new(move || store.live_focus()),
         can_control: Rc::new(move || store.live_surface().is_some_and(|s| s.interactive)),
         waiting: Rc::new(move || store.live_surface().is_some_and(|s| s.handoff_pending)),
         pointer: Rc::new(move |action, x, y| store.live_pointer(action, x, y)),

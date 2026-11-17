@@ -194,6 +194,12 @@ pub trait PageHandle: Send + Sync {
     async fn title(&self) -> Option<String> {
         None
     }
+
+    /// Behave as the focused window (draw the caret and focus rings) even
+    /// in the background, while the owner drives the page.
+    async fn emulate_focus(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// One live frame of a page.
@@ -1464,6 +1470,15 @@ impl PageHandle for ChromiumoxidePage {
 
     async fn title(&self) -> Option<String> {
         self.page.get_title().await.ok().flatten()
+    }
+
+    async fn emulate_focus(&self, on: bool) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetFocusEmulationEnabledParams;
+        self.page
+            .execute(SetFocusEmulationEnabledParams::new(on))
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to show focus: {e}"))
     }
 
     async fn attach_diagnostics(

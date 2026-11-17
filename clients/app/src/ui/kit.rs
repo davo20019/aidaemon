@@ -1795,6 +1795,9 @@ pub struct LiveScreen {
     pub status: std::rc::Rc<dyn Fn() -> String>,
     pub frame: Signal<Option<LiveFrame>>,
     pub controlling: std::rc::Rc<dyn Fn() -> bool>,
+    /// Where typing goes, in words; `Some(None)`: nothing takes typing;
+    /// `None`: not known yet.
+    pub focus: std::rc::Rc<dyn Fn() -> Option<Option<String>>>,
     pub can_control: std::rc::Rc<dyn Fn() -> bool>,
     /// The agent waits for the owner here (a handoff): Done and Not now.
     pub waiting: std::rc::Rc<dyn Fn() -> bool>,
@@ -2117,9 +2120,19 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         let key = key.clone();
         viewer_text_btn(label, false, move || key(code, name))
     };
+    let focus = screen.focus.clone();
+    let focus_line = text(move || match focus() {
+        Some(Some(words)) => format!("Typing into: {words}"),
+        Some(None) => "Nothing to type into: tap a box on the page first".to_owned(),
+        None => "Tap a box on the page to type into it".to_owned(),
+    })
+    .text_size(px(type_scale::SM))
+    .font_weight(FontWeight::MEDIUM)
+    .text_color(colors::ON_LIGHTBOX);
     let typing = view()
         .gap_2()
         .px_3()
+        .child(focus_line)
         .child(
             view()
                 .flex_row()

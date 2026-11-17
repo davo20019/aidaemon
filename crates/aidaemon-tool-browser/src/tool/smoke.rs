@@ -363,6 +363,12 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
             .await
             .expect("tap");
     }
+    let focused = registry
+        .focused(&surface.id)
+        .await
+        .expect("focus")
+        .expect("the tapped field has the keyboard");
+    assert_eq!(focused.what, "a password field");
     registry
         .input(
             &live.live_id,

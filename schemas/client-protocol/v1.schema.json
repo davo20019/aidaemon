@@ -4143,6 +4143,31 @@
           "type": "object"
         },
         {
+          "description": "What the owner's typing goes to now, after their input (protocol\n1.31): its kind (\"a text field\") and label (\"Username\"); both absent\nwhen nothing on the surface takes typing. Never a field's value.",
+          "properties": {
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "focus",
+              "type": "string"
+            },
+            "what": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "The session ended; the server closes the socket next.",
           "properties": {
             "reason": {

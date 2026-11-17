@@ -306,6 +306,9 @@ pub struct Store {
     /// The live view's newest picture (beside the client: frames never
     /// enter its state).
     live_frame: Signal<Option<crate::ui::LiveFrame>>,
+    /// Where the owner's typing goes on the live view, once the daemon
+    /// said: `Some(None)` means nothing takes typing.
+    live_focus: Signal<Option<Option<String>>>,
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
@@ -363,6 +366,7 @@ impl Store {
             posting: signal(BTreeSet::new()),
             starting_daemon: signal(None),
             live_frame: signal(None),
+            live_focus: signal(None),
             media: stored(None),
             media_epoch: stored(0),
         }
@@ -496,6 +500,7 @@ impl Store {
             (link.close)();
         }
         self.live_frame.set(None);
+        self.live_focus.set(None);
     }
 
     /// The screens of `session` the owner can watch (tracked).
@@ -545,6 +550,11 @@ impl Store {
     /// Whether a live view is open (tracked).
     pub fn live_open(&self) -> bool {
         self.read(|c| c.live.is_some())
+    }
+
+    /// Where typing goes on the live view, in words (tracked).
+    pub fn live_focus(&self) -> Option<Option<String>> {
+        self.live_focus.get()
     }
 
     pub fn live_frame(&self) -> Signal<Option<crate::ui::LiveFrame>> {
@@ -672,6 +682,7 @@ impl Store {
                     self.close_live();
                 }
             }
+            MediaEvent::Focus(words) => self.live_focus.set(Some(words)),
             MediaEvent::Ready | MediaEvent::Controller(_) => {}
         }
     }

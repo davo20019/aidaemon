@@ -43,6 +43,9 @@ pub enum MediaEvent {
     },
     /// Who controls the surface now.
     Controller(SurfaceController),
+    /// Where the owner's typing goes now, in words ("Username, a text
+    /// field"); `None`: nothing takes typing.
+    Focus(Option<String>),
     /// The view ended, and why.
     Closed(String),
 }
@@ -116,8 +119,19 @@ pub fn read(bytes: &[u8]) -> Option<MediaEvent> {
         },
         MediaHeader::Controller { controller } => MediaEvent::Controller(controller),
         MediaHeader::Closed { reason } => MediaEvent::Closed(reason),
+        MediaHeader::Focus { what, label } => MediaEvent::Focus(focus_words(what, label)),
         MediaHeader::Unknown => return None,
     })
+}
+
+/// A focus report in words: "Username, a text field", "a button".
+pub fn focus_words(what: Option<String>, label: Option<String>) -> Option<String> {
+    match (label, what) {
+        (Some(label), Some(what)) => Some(format!("{label}, {what}")),
+        (None, Some(what)) => Some(what),
+        (Some(label), None) => Some(label),
+        (None, None) => None,
+    }
 }
 
 /// A frame's bytes as a `data:` URI an image shows.
