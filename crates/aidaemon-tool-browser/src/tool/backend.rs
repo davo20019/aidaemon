@@ -1355,6 +1355,12 @@ impl PageHandle for ChromiumoxidePage {
             .max_width(i64::from(max_w))
             .max_height(i64::from(max_h))
             .build();
+        // A view closed a moment ago may still be stopping its own: one
+        // screencast per page, so stop it first.
+        let _ = self
+            .page
+            .execute(chromiumoxide::cdp::browser_protocol::page::StopScreencastParams::default())
+            .await;
         self.page
             .execute(params)
             .await

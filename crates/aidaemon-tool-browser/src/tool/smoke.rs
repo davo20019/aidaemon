@@ -271,6 +271,9 @@ async fn live_surface_smoke_real_chrome() {
 <div id="out">waiting</div>
 <div id="size"></div>
 <input id="user" aria-label="Username" style="position:absolute;left:600px;top:500px;width:100px;height:30px">
+<a id="go" href="/next" style="position:absolute;left:900px;top:300px;width:120px;height:40px;display:block;background:#0a0">go</a>
+<div style="position:absolute;left:900px;top:360px;width:20px;height:20px;background:#00f;animation:spin 0.5s linear infinite"></div>
+<style>@keyframes spin { to { transform: rotate(360deg); } }</style>
 <div style="height:2000px"></div>
 <script>
 document.getElementById('size').textContent = 'width ' + innerWidth;
@@ -284,7 +287,8 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
     let (media_tx, _media_rx) = mpsc::channel(4);
     let tool = BrowserTool::new(
         BrowserSettings {
-            headless: true,
+            // AIDAEMON_SMOKE_HEADED=1: a visible window, as a desktop daemon runs.
+            headless: std::env::var_os("AIDAEMON_SMOKE_HEADED").is_none(),
             user_data_dir: Some(profile.path().to_str().unwrap().to_string()),
             ..BrowserSettings::default()
         },
@@ -489,6 +493,68 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
         !text.contains("synthetic-pw"),
         "the page text never carries the password"
     );
+    // A click that loads another page: the picture goes on (the page
+    // animates, so a live picture keeps changing).
+    let mut live = registry
+        .open_live(
+            &surface.id,
+            "smoke-phone",
+            LiveMode::Control,
+            StreamParams::default(),
+        )
+        .await
+        .expect("open live again");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let first = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let second = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
+    assert!(
+        second > first,
+        "a view opened again keeps its picture (frame {first} then {second})"
+    );
+    for action in [PointerAction::Down, PointerAction::Up] {
+        registry
+            .input(
+                &live.live_id,
+                &InputEvent::Pointer {
+                    action,
+                    x: 960.0 / width,
+                    y: 320.0 / height,
+                    button: PointerButton::Left,
+                },
+            )
+            .await
+            .expect("tap the link");
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let after = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
+    assert!(
+        after > before,
+        "the picture stopped after the page changed (frame {before} then {after})"
+    );
+    registry.close_live(&live.live_id);
     let _ = tool
         .call_with(
             &json!({"action": "close"}).to_string(),

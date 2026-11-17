@@ -137,6 +137,9 @@ pub struct BrowserSurface {
     /// The last press per tab: when and where, and its click count, to tell
     /// a double or triple click from separate ones.
     last_press: Mutex<HashMap<String, (std::time::Instant, f64, f64, i64)>>,
+    /// Each page's latest stream: a stream that ended stops the page's
+    /// screencast only if no newer one took it over.
+    streams: Arc<Mutex<HashMap<String, u64>>>,
     size: Size,
 }
 
@@ -155,6 +158,7 @@ impl BrowserSurface {
             viewports: Arc::new(Mutex::new(HashMap::new())),
             pressed: Mutex::new(HashMap::new()),
             last_press: Mutex::new(HashMap::new()),
+            streams: Arc::new(Mutex::new(HashMap::new())),
             size,
         }
     }
@@ -426,6 +430,13 @@ impl SurfaceBackend for BrowserSurface {
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let min_gap = Duration::from_millis(1000 / u64::from(params.max_fps.max(1)));
         let viewports = self.viewports.clone();
+        let streams = self.streams.clone();
+        let generation = {
+            let mut streams = lock(&streams);
+            let next = streams.get(&target).map_or(1, |g| g + 1);
+            streams.insert(target.clone(), next);
+            next
+        };
         tokio::spawn(async move {
             loop {
                 let frame = tokio::select! {
@@ -441,11 +452,13 @@ impl SurfaceBackend for BrowserSurface {
                 }
                 // Pace the page: the next frame comes after the ack.
                 tokio::time::sleep(min_gap).await;
-                if page.ack_screencast(frame.session).await.is_err() {
-                    break;
-                }
+                // A frame the page no longer knows (it moved on) cannot
+                // be acked; the next one can.
+                let _ = page.ack_screencast(frame.session).await;
             }
-            let _ = page.stop_screencast().await;
+            if lock(&streams).get(&target) == Some(&generation) {
+                let _ = page.stop_screencast().await;
+            }
             debug!(target = %target, "live view stopped");
         });
         Ok(StreamHandle::new(move || {
