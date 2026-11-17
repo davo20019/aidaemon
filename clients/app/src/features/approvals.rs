@@ -104,8 +104,10 @@ pub fn card(store: Store, approval: Approval) -> View {
             format!("Open {site}"),
             Some(detail_text(format!("For {once_minutes} minutes."))),
         ),
+        // `what` is the whole action ("use send file", "send a request
+        // to …"), as chat cards show it: only its first letter changes.
         Some(CardAction::Use { what, detail }) => {
-            (format!("Use {what}"), detail.clone().map(detail_text))
+            (sentence_case(what), detail.clone().map(detail_text))
         }
         Some(CardAction::TakeOver {
             surface_id,
@@ -310,4 +312,14 @@ fn command_block(line: &str, looks_inside: &[String]) -> View {
             let inside = looks_inside.join(", ");
             move || detail_text(format!("Looks inside: {inside}"))
         }))
+}
+
+/// `text` with its first letter capitalised.
+fn sentence_case(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
