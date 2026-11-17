@@ -304,6 +304,8 @@ pub enum Glyph {
     Pinned,
     System,
     Inbox,
+    /// Conversations put away.
+    Archive,
     Memory,
     /// Attach a file.
     Attach,
@@ -431,6 +433,7 @@ impl Glyph {
             Self::Pinned => "★",
             Self::System => "◫",
             Self::Inbox => "◆",
+            Self::Archive => "▣",
             Self::Memory => "◎",
             Self::Attach => "⊕",
             Self::File => "▭",
@@ -587,6 +590,9 @@ impl Glyph {
             }
             Self::Inbox => {
                 r#"<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>"#
+            }
+            Self::Archive => {
+                r#"<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>"#
             }
             Self::Memory => {
                 r#"<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>"#

@@ -1176,12 +1176,30 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
         ),
     ]);
     app.wait_for("Write the newsletter")?;
-    // An archived conversation is not in the list, only counted under it.
-    app.wait_for("Archived · 1")?;
+    // An archived conversation is not in the list: the filter by Recent
+    // offers the archived, which open as their own page.
     app.wait_for_gone("Old receipts", std::time::Duration::from_secs(2))?;
-    app.press("Archived · 1")?;
+    app.press("Show conversations from: All")?;
+    app.press("Archived")?;
+    app.wait_for("Hold a conversation to bring it back.")?;
     app.wait_for("Old receipts")?;
-    app.press("Back to your conversations")?;
+    app.press("Back to all conversations")?;
+    app.wait_for_gone("Old receipts", std::time::Duration::from_secs(2))?;
+    // A search finds it among the others, and says it was put away.
+    app.press("Search conversations")?;
+    app.type_text("label:Search conversations", "receipts")?;
+    app.wait_for("Old receipts")?;
+    app.wait_for("Archived")?;
+    app.press("Cancel")?;
+    // Archiving says so, and Undo on the note takes it back.
+    app.long_press("Write the newsletter >> nth=0")?;
+    let before = sent("archive_session");
+    app.press("Archive")?;
+    wait_sent_new("archive_session", before)?;
+    app.wait_for("Undo")?;
+    let before = sent("archive_session");
+    app.press("Undo")?;
+    wait_sent_new("archive_session", before)?;
     // A message waiting for the running work shows above the composer.
     app.press("Write the newsletter >> nth=0")?;
     feed([frame(

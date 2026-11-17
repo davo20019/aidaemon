@@ -83,9 +83,13 @@ pub fn sidebar(store: Store) -> View {
                     .child(dynamic(move || {
                         // Searching lists every match flat, and so do the
                         // archived; otherwise the view the owner is in.
-                        let flat = searching() || store.showing_archived();
+                        let flat = searching();
+                        let archived = store.showing_archived();
                         let shown = store.sidebar_view();
                         Some(untracked(move || {
+                            if archived && !flat {
+                                return archived_page(store, ids);
+                            }
                             if flat {
                                 return view()
                                     .gap(px(1.0))
@@ -100,7 +104,6 @@ pub fn sidebar(store: Store) -> View {
                         }))
                     }))
                     .child(search_hits(store))
-                    .child(archived_toggle(store))
                     .child(when(
                         move || ids.with(Vec::is_empty) && !store.filter().trim().is_empty(),
                         || {
@@ -444,15 +447,16 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
             })
             .otherwise(move || new_project_row(store)),
         )
-        // Their heading, with where they came from as one filter (only
-        // when they came from more than one place).
+        // Their heading, with which ones are listed as one filter: where
+        // they came from (when from more than one place) and the archived
+        // (when there are any).
         .child(
             view()
                 .flex_row()
                 .items_center()
                 .child(section_label("Recent").flex_1())
                 .child(when(
-                    move || !store.sources().is_empty(),
+                    move || !store.sources().is_empty() || store.archived_count() > 0,
                     move || source_filter(store),
                 )),
         )
@@ -755,7 +759,12 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
             Glyph::Back,
             "Back to all conversations",
             ui::Size::Md,
-            move || store.show_sidebar_view(SidebarView::Home),
+            move || {
+                if store.showing_archived() {
+                    store.show_archived(false);
+                }
+                store.show_sidebar_view(SidebarView::Home)
+            },
         ))
         .child(
             text(title)
@@ -885,16 +894,22 @@ fn listed(store: Store, ids: Memo<Vec<String>>) -> View {
     ))
 }
 
-/// Where the listed conversations came from, as one filter.
+/// Which conversations are listed, as one filter: where they came from,
+/// and last the archived, which open as their own page.
 fn source_filter(store: Store) -> View {
+    const ARCHIVED: &str = "archived";
     let shown = move || store.source_filter().label().to_owned();
+    // With one place only there is still "All" to be on.
+    let sources = move || match store.sources() {
+        found if found.is_empty() => vec![Source::All],
+        found => found,
+    };
     ui::pick_list(
         ui::Picker {
-            title: "Show conversations from",
+            title: "Show",
             items: move || {
                 let chosen = store.source_filter();
-                store
-                    .sources()
+                let mut items = sources()
                     .into_iter()
                     .enumerate()
                     .map(|(at, source)| {
@@ -905,13 +920,28 @@ fn source_filter(store: Store) -> View {
                             None => item,
                         }
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                match store.archived_count() {
+                    0 => {}
+                    count => items.push(
+                        ui::PickItem::new(ARCHIVED, "Archived")
+                            .detail(if count == 1 {
+                                "1 conversation".to_owned()
+                            } else {
+                                format!("{count} conversations")
+                            })
+                            .glyph(Glyph::Archive),
+                    ),
+                }
+                items
             },
             pick: move |picked: String| {
-                if let Some(source) = picked
+                if picked == ARCHIVED {
+                    store.show_archived(true);
+                } else if let Some(source) = picked
                     .parse::<usize>()
                     .ok()
-                    .and_then(|at| store.sources().into_iter().nth(at))
+                    .and_then(|at| sources().into_iter().nth(at))
                 {
                     store.set_source_filter(source);
                 }
@@ -1310,6 +1340,18 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
 /// The words a conversation row is tagged with: its project's name outside
 /// that project's page, else the chat it came from when it has no icon.
 fn row_tag(store: Store, id: &str) -> String {
+    let tag = row_place(store, id);
+    // Found by a search among the others: it says it was put away.
+    if store.is_archived(id) && !store.showing_archived() {
+        return match tag.as_str() {
+            "" => "Archived".to_owned(),
+            tag => format!("Archived · {tag}"),
+        };
+    }
+    tag
+}
+
+fn row_place(store: Store, id: &str) -> String {
     if let Some(project) = store.session_project(id).and_then(|p| store.project(&p)) {
         return match store.sidebar_view() {
             SidebarView::Project(_) => String::new(),
@@ -1538,6 +1580,11 @@ fn search_hits(store: Store) -> View {
                         "AIdaemon"
                     };
                     let title = store.title(&hit.session_id);
+                    let title = if store.is_archived(&hit.session_id) {
+                        format!("{title} (archived)")
+                    } else {
+                        title
+                    };
                     list = list.child(
                         row(|| false, move || store.select(Some(open.clone())))
                             .accessibility_label(format!("{title}: {}", hit.snippet))
@@ -1630,32 +1677,26 @@ fn connection(store: Store) -> View {
     }))
 }
 
-/// At the end of the list: the archived conversations a press away, and
-/// the way back. Nothing while none is archived.
-fn archived_toggle(store: Store) -> View {
-    view().pt_2().child(dynamic(move || {
-        let count = store.archived_count();
-        let showing = store.showing_archived();
-        Some(untracked(move || {
-            if count == 0 && !showing {
-                return view();
-            }
-            let label = if showing {
-                "Back to your conversations".to_string()
-            } else {
-                format!("Archived · {count}")
-            };
-            view().child(
-                row(|| false, move || store.show_archived(!showing))
-                    .accessibility_label(label.clone())
-                    .child(icon(Glyph::Inbox).text_color(colors::FAINT))
-                    .child(
-                        text(label)
-                            .flex_1()
-                            .text_size(px(type_scale::SM))
-                            .text_color(colors::MUTED),
-                    ),
-            )
-        }))
-    }))
+/// The archived conversations, as a page of the sidebar: Back, how one is
+/// brought back, then the conversations.
+fn archived_page(store: Store, ids: Memo<Vec<String>>) -> View {
+    view()
+        .gap(px(1.0))
+        .child(page_head(store, || "Archived".to_owned(), view()))
+        .child(
+            text(move || {
+                if ids.with(Vec::is_empty) {
+                    "Nothing is archived."
+                } else if ui::touch() {
+                    "Hold a conversation to bring it back."
+                } else {
+                    "Right-click a conversation to bring it back."
+                }
+            })
+            .px_2()
+            .py_1()
+            .text_size(px(type_scale::SM))
+            .text_color(colors::FAINT),
+        )
+        .child(listed(store, ids))
 }

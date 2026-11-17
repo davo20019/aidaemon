@@ -197,6 +197,7 @@ pub fn shell(store: Store) -> View {
             move || store.toast(),
             move || store.dismiss_toast(),
             move |session: &str| store.select(Some(session.to_owned())),
+            move |session: &str| store.undo_archive(session),
         ));
     if terminal {
         view().flex_1().child(main).child(key_line(store))

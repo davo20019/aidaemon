@@ -288,6 +288,9 @@ pub struct Store {
     composer_edit: Signal<u64>,
     /// The sidebar lists archived conversations instead of the others.
     show_archived: Signal<bool>,
+    /// The conversation that was on screen when it was archived: Undo
+    /// opens it again.
+    archived_open: Signal<Option<String>>,
     /// While the agent works, Enter queues (sends after) and ⌘↩ tells it
     /// now, instead of the other way round (this device).
     enter_queues: Signal<bool>,
@@ -362,6 +365,7 @@ impl Store {
             composer_focus: signal(0),
             composer_edit: signal(0),
             show_archived: signal(false),
+            archived_open: signal(None),
             enter_queues: signal(
                 nsh_core::storage::Storage::get_item(ENTER_QUEUES_KEY).as_deref() == Some("1"),
             ),
@@ -1736,14 +1740,16 @@ impl Store {
     }
 
     /// Session ids matching the sidebar's search, pinned first, each part
-    /// newest first.
+    /// newest first. A search looks through the archived too (their rows
+    /// say so): it is how a conversation put away is found again.
     pub fn visible_ids(&self) -> Vec<String> {
         let query = self.filter.get();
         let archived = self.show_archived.get();
+        let everywhere = !query.trim().is_empty();
         let mut ids = self.read(|c| {
             c.session_ids()
                 .into_iter()
-                .filter(|id| c.is_archived(id) == archived && c.matches(id, &query))
+                .filter(|id| (everywhere || c.is_archived(id) == archived) && c.matches(id, &query))
                 .collect::<Vec<_>>()
         });
         ids.sort_by_key(|id| !self.is_pinned(id));
@@ -1954,6 +1960,7 @@ impl Store {
             detail: Some(untracked(|| self.title(session))),
             done: true,
             opens: Some(session.to_owned()),
+            undo: None,
         }));
     }
 
@@ -2474,17 +2481,36 @@ impl Store {
     }
 
     /// Archive conversation `id` or bring it back; archiving the one on
-    /// screen moves to a new conversation.
+    /// screen moves to a new conversation. The note that says it was
+    /// archived takes it back (Undo).
     pub fn archive_session(&self, id: &str, archived: bool) {
+        let title = untracked(|| self.title(id));
         self.act(|c| c.archive_session(id, archived));
-        if archived && self.selected.get_untracked().as_deref() == Some(id) {
+        if !archived {
+            self.say("Back in your conversations");
+            return;
+        }
+        let open = self.selected.get_untracked().as_deref() == Some(id);
+        self.archived_open.set(open.then(|| id.to_owned()));
+        if open {
             self.select(None);
         }
-        self.say(if archived {
-            "Archived: it is under Archived at the bottom of the list"
-        } else {
-            "Back in your conversations"
-        });
+        self.toast.set(Some(crate::ui::Note {
+            title: "Archived".to_owned(),
+            detail: Some(title),
+            undo: Some(id.to_owned()),
+            ..Default::default()
+        }));
+    }
+
+    /// Take back archiving conversation `id`: it is in the list again,
+    /// and on screen if it was when it was archived.
+    pub fn undo_archive(&self, id: &str) {
+        self.act(|c| c.archive_session(id, false));
+        if self.archived_open.get_untracked().as_deref() == Some(id) {
+            self.archived_open.set(None);
+            self.select(Some(id.to_owned()));
+        }
     }
 
     /// How many conversations are archived.

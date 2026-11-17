@@ -706,13 +706,16 @@ pub fn press_menu(
 
 /// A short note for the owner: what happened, and (`detail`) what it was
 /// about. `done`: a finished piece of work, marked with a check. `opens`:
-/// the conversation a press on it opens.
+/// the conversation a press on it opens. `undo`: it says something the
+/// owner just did that an Undo button on it takes back; the words are
+/// handed to the toasts' `undo`.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Note {
     pub title: String,
     pub detail: Option<String>,
     pub done: bool,
     pub opens: Option<String>,
+    pub undo: Option<String>,
 }
 
 impl From<String> for Note {
@@ -730,11 +733,13 @@ impl From<String> for Note {
 /// come in under the top bar and are swiped up, clear of the composer a
 /// thumb is on; with a pointer, at the bottom over the composer, swiped
 /// right. `current` is the note to show, `clear` is called once it is
-/// taken, `open` opens a note's conversation.
+/// taken, `open` opens a note's conversation, `undo` takes back what a
+/// note with Undo said.
 pub fn toasts(
     current: impl Fn() -> Option<Note> + 'static,
     clear: impl Fn() + 'static,
     open: impl Fn(&str) + Clone + 'static,
+    undo: impl Fn(&str) + Clone + 'static,
 ) -> impl IntoElement {
     let manager = stored(ToastManager::<u64, Note>::new(ToastMotion::sonner()));
     let shown = signal(Vec::new());
@@ -767,84 +772,103 @@ pub fn toasts(
             sync();
         }
     });
-    let top = super::touch();
-    // Over the page, not beside it: a layer that takes no presses itself,
-    // so only the toasts do.
-    let layer = view()
-        .absolute()
-        .left(px(0.0))
-        .right(px(0.0))
-        .items_center()
-        .pointer_events(PointerEvents::BoxNone);
-    let layer = if top {
-        layer.top(px(fit::bar() + 8.0)).pt_safe_area()
-    } else {
-        layer.bottom(px(88.0))
-    };
-    layer.child(
-        toast_stack()
-            .placement(if top {
-                Anchor::TopCenter
+    // An overlay of its own, there only while a note shows: it goes over
+    // whatever was already up (a phone's list of conversations, a dialog),
+    // where a note about what was just done there has to be read.
+    view().child(when(
+        move || shown.with(|s: &Vec<_>| !s.is_empty()),
+        move || {
+            let (open, undo) = (open.clone(), undo.clone());
+            let top = super::touch();
+            // Over the page, not beside it: a layer that takes no presses itself,
+            // so only the toasts do.
+            let layer = overlay()
+                .left(px(0.0))
+                .right(px(0.0))
+                .items_center()
+                .pointer_events(PointerEvents::BoxNone);
+            let layer = if top {
+                layer.top(px(fit::bar() + 8.0)).pt_safe_area()
             } else {
-                Anchor::BottomCenter
-            })
-            .state(state)
-            .w(px(380.0))
-            .max_w(percentage(0.92))
-            .child(each(
-                shown,
-                |(id, _, _)| *id,
-                move |item, _| {
-                    let note = item.with_untracked(|(_, n, _)| n.clone());
-                    let id = item.with_untracked(|(id, _, _)| *id);
-                    let said = match &note.detail {
-                        Some(detail) => format!("{}: {detail}", note.title),
-                        None => note.title.clone(),
-                    };
-                    let open = open.clone();
-                    toast()
-                        .transition_status(move || item.get().2)
-                        .accessibility_label(Some(SharedString::from(said)))
-                        .swipe_direction(Some(if top {
-                            nsh_base::SwipeDirection::Up
-                        } else {
-                            nsh_base::SwipeDirection::Right
-                        }))
-                        .on_dismiss_request(move || {
-                            manager.with(|m| m.dismiss(&id, now()));
-                        })
-                        .rounded(px(radius::SURFACE))
-                        .bg(colors::SURFACE)
-                        .border_1()
-                        .border_color(colors::BORDER)
-                        .shadow_lg()
-                        .transition_all()
-                        .duration(motion::ENTER)
-                        .starting_class(if top {
-                            "opacity-0 -translate-y-4"
-                        } else {
-                            "opacity-0 translate-y-4"
-                        })
-                        .ending_class("opacity-0 scale-95")
-                        .child(note_body(
-                            note,
-                            move |session: &str| {
-                                manager.with(|m| m.dismiss(&id, now()));
-                                open(session);
-                            },
-                            move || {
-                                manager.with(|m| m.dismiss(&id, now()));
-                            },
-                        ))
-                },
-            )),
-    )
+                layer.bottom(px(88.0))
+            };
+            layer.child(
+                toast_stack()
+                    .placement(if top {
+                        Anchor::TopCenter
+                    } else {
+                        Anchor::BottomCenter
+                    })
+                    .state(state)
+                    .w(px(380.0))
+                    .max_w(percentage(0.92))
+                    .child(each(
+                        shown,
+                        |(id, _, _)| *id,
+                        move |item, _| {
+                            let note = item.with_untracked(|(_, n, _)| n.clone());
+                            let id = item.with_untracked(|(id, _, _)| *id);
+                            let said = match &note.detail {
+                                Some(detail) => format!("{}: {detail}", note.title),
+                                None => note.title.clone(),
+                            };
+                            let open = open.clone();
+                            let undo = undo.clone();
+                            toast()
+                                .transition_status(move || item.get().2)
+                                .accessibility_label(Some(SharedString::from(said)))
+                                .swipe_direction(Some(if top {
+                                    nsh_base::SwipeDirection::Up
+                                } else {
+                                    nsh_base::SwipeDirection::Right
+                                }))
+                                .on_dismiss_request(move || {
+                                    manager.with(|m| m.dismiss(&id, now()));
+                                })
+                                .rounded(px(radius::SURFACE))
+                                .bg(colors::SURFACE)
+                                .border_1()
+                                .border_color(colors::BORDER)
+                                .shadow_lg()
+                                .transition_all()
+                                .duration(motion::ENTER)
+                                .starting_class(if top {
+                                    "opacity-0 -translate-y-4"
+                                } else {
+                                    "opacity-0 translate-y-4"
+                                })
+                                .ending_class("opacity-0 scale-95")
+                                .child(note_body(
+                                    note,
+                                    move |session: &str| {
+                                        manager.with(|m| m.dismiss(&id, now()));
+                                        open(session);
+                                    },
+                                    move |what: &str| {
+                                        manager.with(|m| m.dismiss(&id, now()));
+                                        undo(what);
+                                    },
+                                    move || {
+                                        manager.with(|m| m.dismiss(&id, now()));
+                                    },
+                                ))
+                        },
+                    )),
+            )
+        },
+    ))
 }
 
 /// A toast's content: the check of finished work, its title and what it
 /// was about (two lines at most); a note that opens a conversation is a
-/// button that does, with a chevron to say so. A close button ends it.
-fn note_body(note: Note, open: impl Fn(&str) + 'static, close: impl Fn() + 'static) -> View {
+/// button that does, with a chevron to say so; one that can be taken back
+/// has Undo. A close button ends it.
+fn note_body(
+    note: Note,
+    open: impl Fn(&str) + 'static,
+    undo: impl Fn(&str) + 'static,
+    close: impl Fn() + 'static,
+) -> View {
     let mut words = view().flex_1().min_w(px(0.0)).gap(px(2.0)).child(
         text(note.title.clone())
             .number_of_lines(2)
@@ -900,7 +924,16 @@ fn note_body(note: Note, open: impl Fn(&str) + 'static, close: impl Fn() + 'stat
         ),
         None => row.flex_1().min_w(px(0.0)),
     };
-    view().flex_row().items_center().child(body).child(close)
+    let mut card = view().flex_row().items_center().child(body);
+    if let Some(what) = note.undo {
+        card = card.child(super::btn(
+            "Undo",
+            super::Variant::Ghost,
+            super::Size::Sm,
+            move || undo(&what),
+        ));
+    }
+    card.child(close)
 }
 
 /// A pane at an edge of a narrow window: it slides in from `side` over the
