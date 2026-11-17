@@ -870,12 +870,16 @@ impl TurnEngine<'_> {
             || scope.closeout_demands.load(Ordering::Relaxed) >= MAX_CLOSEOUT_DEMANDS
         {
             scope.closeout_ended_unmet.store(
-                closeout_ended_unmet(&facts, scope.closeout_demands.load(Ordering::Relaxed)),
+                closeout_ended_unmet(&facts, scope.closeout_demands.load(Ordering::Relaxed))
+                    && !scope.user_spoke_since_demand.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
             return sdk::StopDecision::Accept;
         }
         scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+        scope
+            .user_spoke_since_demand
+            .store(false, Ordering::Relaxed);
         let demands = scope.closeout_demands.fetch_add(1, Ordering::Relaxed) + 1;
         if verification_after_mutation {
             scope.verification_demanded.store(true, Ordering::Relaxed);

@@ -356,6 +356,22 @@ impl TurnObserver for GatewayObserver {
             );
             return;
         }
+        // A message the running turn took in: shown where it was read, as
+        // what the sender said (the turn's opening message comes from
+        // `turn_started`; one sent mid-run had nothing to show it, and left
+        // the waiting list when the turn ended).
+        if let StatusUpdate::MessageTaken { text, origin } = update {
+            self.publisher.publish(
+                session,
+                Event::UserMessage {
+                    session_id: session_id.to_string(),
+                    text: text.clone(),
+                    attachments: Vec::new(),
+                    origin: origin.clone(),
+                },
+            );
+            return;
+        }
         if let StatusUpdate::UserActionRequired { message } = update {
             self.publisher.publish(
                 session,

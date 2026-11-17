@@ -815,9 +815,13 @@ impl TurnRunner {
                 let observer = observer.clone();
                 tokio::spawn(async move {
                     while let Some(update) = run_updates.recv().await {
-                        // Reply text is for app clients: no chat surface,
-                        // card or live state shows it.
-                        if matches!(update, StatusUpdate::ReplyText(_)) {
+                        // Reply text and messages taken mid-run are for app
+                        // clients: no chat surface, card or live state shows
+                        // them.
+                        if matches!(
+                            update,
+                            StatusUpdate::ReplyText(_) | StatusUpdate::MessageTaken { .. }
+                        ) {
                             if let Some(observer) = observer.as_ref() {
                                 observer.turn_status(&session_id, task_id, &update);
                             }
@@ -1226,7 +1230,9 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
     let progress = |text: String| text;
     Some(match update {
         // The working indicator says it; no line of its own.
-        StatusUpdate::Thinking(_) | StatusUpdate::ReplyText(_) => return None,
+        StatusUpdate::Thinking(_)
+        | StatusUpdate::ReplyText(_)
+        | StatusUpdate::MessageTaken { .. } => return None,
         // A generic kind of work ("Checking things") says nothing.
         StatusUpdate::ToolStart { kind, .. } if !kind.says_what() => return None,
         StatusUpdate::ToolStart { kind, .. } => progress(format!("{}…", kind.words())),

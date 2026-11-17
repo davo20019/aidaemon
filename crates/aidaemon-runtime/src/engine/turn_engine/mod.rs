@@ -1327,6 +1327,7 @@ impl TurnEngine<'_> {
             model_calls: AtomicU64::new(0),
             closeout_demands: std::sync::atomic::AtomicU32::new(0),
             closeout_ended_unmet: AtomicBool::new(false),
+            user_spoke_since_demand: AtomicBool::new(false),
             verification_demanded: AtomicBool::new(false),
             recovery_demanded: AtomicBool::new(false),
             unattempted_work_demanded: AtomicBool::new(false),

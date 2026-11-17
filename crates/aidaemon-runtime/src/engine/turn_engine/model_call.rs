@@ -648,6 +648,14 @@ impl TurnEngine<'_> {
                 chars = queued.text.len(),
                 "SDK engine: took a message sent mid-turn into the run"
             );
+            scope.user_spoke_since_demand.store(true, Ordering::Relaxed);
+            scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+            if let Some(tx) = scope.status_tx.as_ref() {
+                let _ = tx.try_send(StatusUpdate::MessageTaken {
+                    text: queued.text.clone(),
+                    origin: queued.channel_ctx.platform.clone(),
+                });
+            }
             messages.push(serde_json::json!({
                 "role": "user",
                 "content": format!("{header}\n{}", queued.text),

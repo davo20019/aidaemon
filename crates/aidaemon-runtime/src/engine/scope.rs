@@ -72,6 +72,13 @@ pub struct TurnScope<'a> {
     /// still held reachable expectations: the reply in hand was written to
     /// the daemon's demand, not to the user.
     pub closeout_ended_unmet: AtomicBool,
+    /// The sender's own message was taken into the run since the
+    /// closeout's latest demand: the reply after it answers them, so a
+    /// demand that ended unmet before it no longer makes that reply one
+    /// written to the daemon (live 2026-11-17: "focus on the AID part",
+    /// taken mid-run, drew a reply the stale flag sent back to be rewritten
+    /// text-only, and the run ended saying the revision was not made).
+    pub user_spoke_since_demand: AtomicBool,
     /// `completed_results` at the last checklist demand (`u64::MAX`: none).
     pub executor_demanded_at: AtomicU64,
     /// Checklist items the model has not finished or set aside, as last

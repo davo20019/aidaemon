@@ -54,6 +54,15 @@ impl AgentIngress for ScriptedAgent {
             for chunk in ["Do", "ne."] {
                 let _ = status.send(StatusUpdate::ReplyText(chunk.into())).await;
             }
+            // The turn takes in a message the owner sent while it ran.
+            if request.user_text.contains("mid-run") {
+                let _ = status
+                    .send(StatusUpdate::MessageTaken {
+                        text: "Make it rounder too".into(),
+                        origin: "app".into(),
+                    })
+                    .await;
+            }
         }
         let text = if request.user_text.contains("approve") {
             let (response_tx, response_rx) = oneshot::channel();
@@ -416,6 +425,35 @@ fn send(text: &str) -> Command {
         model: None,
         effort: None,
     }
+}
+
+/// A message the running turn took in reaches clients as what the owner
+/// said, before the turn's end: the waiting list drops it once the turn
+/// takes it, and nothing else showed it (live 2026-11-17).
+#[tokio::test]
+async fn a_message_taken_into_a_running_turn_is_shown_as_the_owners() {
+    let f = fixture(RiskLevel::Medium).await;
+    f.post(&[], &command("r-mid", send("Draw a mascot (mid-run)")))
+        .await;
+    let mut since = 0;
+    let events = f
+        .poll_until(
+            &[],
+            &mut since,
+            |e| matches!(e, Event::UserMessage { text, .. } if text == "Make it rounder too"),
+        )
+        .await;
+    let said: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UserMessage { text, origin, .. } => {
+                assert_eq!(origin, "app");
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["Draw a mascot (mid-run)", "Make it rounder too"]);
 }
 
 /// A turn the previous process left running is ended at start, so a
