@@ -652,6 +652,7 @@ dependencies = [
  "aidaemon-runtime",
  "aidaemon-secrets",
  "aidaemon-store-sqlite",
+ "aidaemon-surfaces",
  "aidaemon-tools",
  "aidaemon-work",
  "async-trait",
@@ -721,7 +722,10 @@ dependencies = [
 name = "aidaemon-surfaces"
 version = "0.20.0"
 dependencies = [
+ "aidaemon-core",
  "aidaemon-surfaces",
+ "aidaemon-tools",
+ "anyhow",
  "async-trait",
  "proptest",
  "serde",

@@ -27,7 +27,7 @@ encryption = []
 # The `computer_use` tool (desktop apps through accessibility and screenshots).
 computer_use = []
 # Its macOS harness (accessibility, window capture, input).
-computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo", "dep:image"]
+computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo", "dep:image", "dep:aidaemon-surfaces"]
 
 [dependencies]
 dunce = "1.0"
@@ -45,7 +45,7 @@ aidaemon-policies = { version = "0.20.0", path = "../aidaemon-policies" }
 aidaemon-skills = { version = "0.20.0", path = "../aidaemon-skills" }
 aidaemon-providers = { version = "0.20.0", path = "../aidaemon-providers", features = ["chatgpt-login"] }
 aidaemon-store-sqlite = { version = "0.20.0", path = "../aidaemon-store-sqlite" }
-aidaemon-surfaces = { version = "0.20.0", path = "../aidaemon-surfaces" }
+aidaemon-surfaces = { version = "0.20.0", path = "../aidaemon-surfaces", optional = true }
 aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", features = ["oauth"] }
 aidaemon-secrets = { version = "0.20.0", path = "../aidaemon-secrets", default-features = false }
 aidaemon-work = { version = "0.20.0", path = "../aidaemon-work" }
@@ -91,7 +91,6 @@ aidaemon-events = { path = "../aidaemon-events", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }
 aidaemon-work = { path = "../aidaemon-work", features = ["testing"] }
-aidaemon-surfaces = { path = "../aidaemon-surfaces", features = ["testing"] }
 aidaemon-memory = { path = "../aidaemon-memory", features = ["fastembed"] }
 axum = "0.8"
 proptest = "1"

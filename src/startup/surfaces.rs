@@ -59,7 +59,7 @@ pub(crate) async fn forget_sign_ins() -> Result<String, String> {
 
 /// Where the owner's app opens a surface's live view: the gateway's address
 /// a phone can reach (a tunnel or `public_url`), never a loopback one.
-pub(crate) fn live_view_link() -> aidaemon_runtime::tools::hand_over::LiveViewLink {
+pub(crate) fn live_view_link() -> aidaemon_surfaces::tool::LiveViewLink {
     Arc::new(|id| {
         let gateway = crate::startup::client_gateway::running()?;
         let base = gateway.public_base();

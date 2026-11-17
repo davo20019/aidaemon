@@ -23,6 +23,10 @@ mod types;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+/// `hand_over`, the tool an agent asks the owner to act on a surface with.
+#[cfg(feature = "tool")]
+pub mod tool;
+
 pub use registry::{
     LiveMode, LiveReceivers, LiveSession, SurfaceChange, SurfaceNotifier, SurfaceRegistry,
     SurfacesConfig,

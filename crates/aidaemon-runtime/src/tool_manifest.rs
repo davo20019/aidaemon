@@ -170,6 +170,10 @@ pub const TOOL_MANIFEST: &[ToolEntry] = &[
         feature: Some("computer_use"),
         ..optional("computer_use", "computer_use.enabled")
     },
+    ToolEntry {
+        feature: Some("browser"),
+        ..optional("hand_over", "browser.enabled and surfaces.enabled")
+    },
     optional("generate_image", "files.enabled"),
     optional("send_file", "files.enabled"),
     ToolEntry {

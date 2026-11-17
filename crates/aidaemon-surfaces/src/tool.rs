@@ -1,4 +1,4 @@
-//! `hand_over`: the agent asks the owner to do a step themselves on a live
+//! `hand_over` (feature `tool`): the agent asks the owner to do a step themselves on a live
 //! surface (sign in, enter a one-time code, solve a challenge) and waits.
 //!
 //! The ask is an ordinary owner card through the agent kernel, never a wait
@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use aidaemon_surfaces::{SurfaceId, SurfaceRegistry};
+use crate::{SurfaceId, SurfaceRegistry};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -330,8 +330,8 @@ impl ToolSemantics for HandOverTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aidaemon_surfaces::testing::MockSurface;
-    use aidaemon_surfaces::{SurfaceObservation, SurfacesConfig};
+    use crate::testing::MockSurface;
+    use crate::{SurfaceObservation, SurfacesConfig};
 
     fn owner_facts(session: &str) -> ToolCallContext {
         let mut facts = aidaemon_tools::testing::call_facts(session);

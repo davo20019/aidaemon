@@ -195,6 +195,9 @@ pub use aidaemon_events as events;
 #[cfg(feature = "work")]
 pub use aidaemon_work as work;
 
+#[cfg(feature = "surfaces")]
+pub use aidaemon_surfaces as surfaces;
+
 /// Chat channels: the contract, the runner, and the built-in adapters.
 #[cfg(feature = "channels")]
 pub mod channels {

@@ -923,12 +923,10 @@ pub async fn register_optional_tools(
                 if !config.tools.is_enabled("hand_over") {
                     continue;
                 }
-                tools.push(Arc::new(
-                    aidaemon_runtime::tools::hand_over::HandOverTool::new(
-                        crate::startup::surfaces::registry(config),
-                        crate::startup::surfaces::live_view_link(),
-                    ),
-                ));
+                tools.push(Arc::new(aidaemon_surfaces::tool::HandOverTool::new(
+                    crate::startup::surfaces::registry(config),
+                    crate::startup::surfaces::live_view_link(),
+                )));
             }
             OptionalToolId::RequestFeature => {
                 if !config.tools.is_enabled("request_feature") {

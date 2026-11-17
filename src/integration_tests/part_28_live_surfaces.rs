@@ -21,7 +21,7 @@ fn handoff_surfaces() -> (
     registry.add_backend(Arc::new(mock.clone()));
     let id = mock.add(APPROVALS_SESSION, "tab-synthetic-1");
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
-        aidaemon_runtime::tools::hand_over::HandOverTool::new(registry.clone(), Arc::new(|_| None)),
+        aidaemon_surfaces::tool::HandOverTool::new(registry.clone(), Arc::new(|_| None)),
     );
     (registry, mock, id, tool)
 }
@@ -186,7 +186,7 @@ async fn nothing_typed_during_a_takeover_reaches_the_model_or_the_records() {
 async fn a_handoff_with_no_tab_asks_nothing_and_says_why() {
     let registry = aidaemon_surfaces::SurfaceRegistry::new(Default::default());
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
-        aidaemon_runtime::tools::hand_over::HandOverTool::new(registry, Arc::new(|_| None)),
+        aidaemon_surfaces::tool::HandOverTool::new(registry, Arc::new(|_| None)),
     );
     let (harness, approver) = approvals_harness_with(
         vec![hand_over_call(), MockProvider::text_response("No tab.")],
