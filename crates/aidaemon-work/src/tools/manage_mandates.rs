@@ -2229,19 +2229,16 @@ impl Tool for ManageMandatesTool {
         } else {
             (self.run(arguments, &facts).await?, None)
         };
-        let trimmed = output.trim_start();
+        // The outcome is the call's typed situation, never the output's
+        // words (a listed mandate's own text can say anything): a moved
+        // action records nothing, and every other action is refused outside
+        // the owner's verified private channel before it reads or changes
+        // anything. An owner's decline of a confirmation is recorded by the
+        // kernel, which never runs the call.
         let outcome_status = if crate::tools::mandate_review::moved_action(&args.action) {
             ToolOutcomeStatus::FailedPermanent
-        } else if trimmed.starts_with("Mandates can only")
-            || trimmed.starts_with("Mandate authority can only")
-            || trimmed.starts_with("Mandate intentions can only")
-        {
+        } else if !Self::is_private_owner_control(&args) {
             ToolOutcomeStatus::Blocked
-        } else if trimmed.contains("confirmation was declined")
-            || trimmed.starts_with("Mandate update cancelled")
-            || trimmed.contains("pending mandate was cancelled")
-        {
-            ToolOutcomeStatus::CompletedWithNegativeResult
         } else {
             ToolOutcomeStatus::Succeeded
         };

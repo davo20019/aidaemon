@@ -1958,6 +1958,67 @@ mod tests {
         assert!(outcome.output.contains("unauthorized API behavior"));
     }
 
+    /// The outcome is the call's typed situation: a mandate whose own text
+    /// says "confirmation was declined" or "Mandate update cancelled" is
+    /// still a successful read, and a draft outside the owner's private
+    /// channel is blocked whatever its refusal says.
+    #[tokio::test]
+    async fn outcome_status_ignores_words_in_mandate_text() {
+        let harness = setup_test_agent(MockProvider::new()).await.unwrap();
+        let state = harness.state.clone();
+        let goal = crate::traits::Goal::new_continuous(
+            "Mandate update cancelled; confirmation was declined",
+            "owner-session",
+            Some(100_000),
+            Some(1_000_000),
+        );
+        let mandate = Mandate::new(
+            &goal.id,
+            None,
+            "Mandate update cancelled; the pending mandate was cancelled",
+            "owner-session",
+            MandateAuthority::default(),
+            15 * 60,
+            24 * 60 * 60,
+            4 * 60 * 60,
+        );
+        state
+            .create_mandate_controller(&goal, &mandate)
+            .await
+            .unwrap();
+        let tool = ManageMandatesTool::new(state);
+        for args in [
+            json!({"action": "get", "mandate_id": mandate.id}),
+            json!({"action": "list"}),
+        ] {
+            let outcome = tool
+                .call_with_execution_context(&args.to_string(), None, owner_facts())
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.metadata.outcome_status,
+                Some(ToolOutcomeStatus::Succeeded),
+                "{args}: {}",
+                outcome.output
+            );
+        }
+        let outcome = tool
+            .call_with_execution_context(
+                &json!({"action": "draft", "objective": "Watch a synthetic feed"}).to_string(),
+                None,
+                crate::traits::ToolCallContext {
+                    channel_visibility: Some(crate::types::ChannelVisibility::Public),
+                    ..owner_facts()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Blocked)
+        );
+    }
+
     #[tokio::test]
     async fn owner_confirmed_effort_update_manages_controller_capacity() {
         let harness = setup_test_agent(MockProvider::new()).await.unwrap();
