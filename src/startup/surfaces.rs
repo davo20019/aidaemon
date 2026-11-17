@@ -40,6 +40,14 @@ pub(crate) fn add_browser(config: &AppConfig, browser: Arc<crate::tools::Browser
     let _ = BROWSER.set(browser);
 }
 
+/// This computer's displays are surfaces too (`[surfaces] desktop`).
+#[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
+pub(crate) fn add_desktop(config: &AppConfig) {
+    registry(config).add_backend(Arc::new(
+        aidaemon_runtime::tools::computer_use::live_desktop::DesktopSurface::new(),
+    ));
+}
+
 /// Delete the sign-ins the agent's own browser kept.
 pub(crate) async fn forget_sign_ins() -> Result<String, String> {
     #[cfg(feature = "browser")]

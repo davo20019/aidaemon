@@ -824,6 +824,10 @@ pub async fn register_optional_tools(
                 }
                 std::fs::create_dir_all(&inbox_dir)?;
                 let vision = crate::config::VisionConfig::from_files(&config.files);
+                #[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
+                if config.surfaces.enabled && config.surfaces.desktop {
+                    crate::startup::surfaces::add_desktop(config);
+                }
                 tools.push(Arc::new(ComputerUseTool::new(
                     config.computer_use.clone(),
                     vision,

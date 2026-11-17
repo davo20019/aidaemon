@@ -27,7 +27,7 @@ encryption = []
 # The `computer_use` tool (desktop apps through accessibility and screenshots).
 computer_use = []
 # Its macOS harness (accessibility, window capture, input).
-computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo"]
+computer_use-macos = ["computer_use", "dep:axuielement", "dep:xcap", "dep:enigo", "dep:image"]
 
 [dependencies]
 dunce = "1.0"
@@ -81,6 +81,8 @@ uuid = { version = "1", features = ["v4"] }
 axuielement = { version = "0.10", optional = true }
 enigo = { version = "0.6", optional = true }
 xcap = { version = "0.9", optional = true }
+# JPEG frames for the desktop's live view (the same image crate xcap uses).
+image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 
 [dev-dependencies]
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }

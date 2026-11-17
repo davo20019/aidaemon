@@ -1584,6 +1584,10 @@ pub struct SurfacesSettings {
     /// waits for them there (a handoff).
     #[serde(default = "default_true")]
     pub control_anytime: bool,
+    /// Also offer this computer's displays (macOS, with `computer_use`):
+    /// the owner can watch and drive the whole desktop. Off by default.
+    #[serde(default)]
+    pub desktop: bool,
     /// Live views open at once.
     #[serde(default = "default_surface_views")]
     pub max_live_sessions: usize,
@@ -1624,6 +1628,7 @@ impl Default for SurfacesSettings {
             enabled: true,
             allow_control: true,
             control_anytime: true,
+            desktop: false,
             max_live_sessions: default_surface_views(),
             max_fps: default_surface_fps(),
             max_width: default_surface_width(),

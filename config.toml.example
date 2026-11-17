@@ -333,6 +333,7 @@ health_port = 8080
 # enabled = true
 # allow_control = true            # control, not only watch
 # control_anytime = true          # take control without the agent asking; false: only during a handoff
+# desktop = false                 # macOS with [computer_use]: also watch and drive this computer's displays
 # max_live_sessions = 8           # live views open at once
 # max_fps = 10                    # frames per second a view gets at most
 # max_width = 1280                # widest frame a view gets

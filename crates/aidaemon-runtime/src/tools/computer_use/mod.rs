@@ -24,6 +24,8 @@ pub mod capability;
 #[allow(clippy::too_many_arguments)]
 pub mod harness;
 #[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
+pub mod live_desktop;
+#[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
 pub mod macos;
 mod mock;
 pub mod pin_registry;
@@ -1560,6 +1562,10 @@ impl Tool for ComputerUseTool {
         let facts = facts.clone();
 
         let args: Value = serde_json::from_str(arguments)?;
+        // While the owner drives the desktop from a paired app, the agent's
+        // own desktop actions wait for them.
+        #[cfg(all(target_os = "macos", feature = "computer_use-macos"))]
+        live_desktop::wait_for_owner().await;
         self.clear_pending_meta().await;
         let started = std::time::Instant::now();
         let result = self.dispatch(&args, &facts).await;
