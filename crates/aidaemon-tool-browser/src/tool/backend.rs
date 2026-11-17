@@ -171,6 +171,18 @@ pub trait PageHandle: Send + Sync {
         Ok(())
     }
 
+    /// Start a running live picture again (the frames keep coming to the
+    /// stream [`PageHandle::start_screencast`] returned). Default: nothing
+    /// to restart.
+    async fn restart_screencast(
+        &self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// A pointer event at CSS pixel `(x, y)` of the viewport.
     async fn dispatch_mouse(&self, _event: &MouseInput) -> Result<(), String> {
         Err("this browser takes no pointer input".to_string())
@@ -1447,6 +1459,26 @@ impl PageHandle for ChromiumoxidePage {
             .await
             .map(|_| ())
             .map_err(|e| format!("Failed to stop the live view: {e}"))
+    }
+
+    async fn restart_screencast(&self, max_w: u32, max_h: u32, quality: u8) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::page::{
+            StartScreencastFormat, StartScreencastParams, StopScreencastParams,
+        };
+        // Chrome still waits for an ack of a frame painted at the old size,
+        // which it no longer takes: stop, then start.
+        let _ = self.page.execute(StopScreencastParams::default()).await;
+        let params = StartScreencastParams::builder()
+            .format(StartScreencastFormat::Jpeg)
+            .quality(i64::from(quality.clamp(10, 100)))
+            .max_width(i64::from(max_w))
+            .max_height(i64::from(max_h))
+            .build();
+        self.page
+            .execute(params)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to restart the live view: {e}"))
     }
 
     async fn dispatch_mouse(&self, event: &MouseInput) -> Result<(), String> {

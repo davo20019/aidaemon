@@ -144,6 +144,9 @@ pub struct BrowserSurface {
     /// Each page's latest stream: a stream that ended stops the page's
     /// screencast only if no newer one took it over.
     streams: Arc<Mutex<HashMap<String, u64>>>,
+    /// The live picture each target is streaming now (size and quality),
+    /// so a page laid out again can start it again.
+    casting: Arc<Mutex<HashMap<String, Casting>>>,
     size: Size,
 }
 
@@ -163,6 +166,7 @@ impl BrowserSurface {
             pressed: Mutex::new(HashMap::new()),
             last_press: Mutex::new(HashMap::new()),
             streams: Arc::new(Mutex::new(HashMap::new())),
+            casting: Arc::new(Mutex::new(HashMap::new())),
             size,
         }
     }
@@ -270,6 +274,9 @@ impl BrowserSurface {
         }
     }
 }
+
+/// A live picture's largest size and its quality.
+type Casting = (u32, u32, u8);
 
 /// The host of a URL, nothing else.
 fn site_of(url: &str) -> Option<String> {
@@ -440,10 +447,12 @@ impl SurfaceBackend for BrowserSurface {
         let min_gap = Duration::from_millis(1000 / u64::from(params.max_fps.max(1)));
         let viewports = self.viewports.clone();
         let streams = self.streams.clone();
+        let casting = self.casting.clone();
         let generation = {
             let mut streams = lock(&streams);
             let next = streams.get(&target).map_or(1, |g| g + 1);
             streams.insert(target.clone(), next);
+            lock(&casting).insert(target.clone(), (params.max_w, params.max_h, params.quality));
             next
         };
         tokio::spawn(async move {
@@ -474,6 +483,7 @@ impl SurfaceBackend for BrowserSurface {
                 let _ = page.ack_screencast(frame.session).await;
             }
             if lock(&streams).get(&target) == Some(&generation) {
+                lock(&casting).remove(&target);
                 let _ = page.stop_screencast().await;
             }
             tracing::info!(
@@ -668,6 +678,15 @@ impl SurfaceBackend for BrowserSurface {
         page.fit(room.map(|r| (r.w, r.h)))
             .await
             .map_err(backend_error)?;
+        // Chrome's picture stalls when the page changes size under it (the
+        // phone then shows a stale picture, and taps land on what is no
+        // longer there): start it again at the new size.
+        let casting = lock(&self.casting).get(&target).copied();
+        if let Some((max_w, max_h, quality)) = casting {
+            page.restart_screencast(max_w, max_h, quality)
+                .await
+                .map_err(backend_error)?;
+        }
         tracing::info!(?room, "Live view page laid out for the owner's screen");
         Ok(())
     }

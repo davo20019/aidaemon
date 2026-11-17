@@ -790,3 +790,122 @@ async fn live_surface_follows_a_real_sign_in() {
         latest.seq
     );
 }
+
+/// A phone takes control of a real sign-in page, twice: the page is laid
+/// out for the phone's room and its picture comes at that size (Chrome's
+/// screencast stalled on the resize about half the time, so the phone kept
+/// a stale picture and its taps focused nothing), and a tap where the
+/// picture shows the field gives that field the keyboard.
+#[tokio::test]
+#[ignore = "requires local Chrome and the internet; run with --ignored"]
+async fn live_surface_phone_tap_focuses_a_real_field() {
+    use aidaemon_surfaces::{
+        InputEvent, LiveMode, PointerAction, PointerButton, Size, StreamParams, SurfaceRegistry,
+        SurfacesConfig,
+    };
+    let profile = TempDir::new().expect("temp profile");
+    let (media_tx, _media_rx) = mpsc::channel(4);
+    let tool = BrowserTool::new(
+        BrowserSettings {
+            headless: std::env::var_os("AIDAEMON_SMOKE_HEADED").is_none(),
+            user_data_dir: Some(profile.path().to_str().unwrap().to_string()),
+            ..BrowserSettings::default()
+        },
+        media_tx,
+        profile.path().join("inbox"),
+        aidaemon_tools::testing::active_execution_backend(),
+    )
+    .expect("construct browser tool");
+    let session = "live-phone-field";
+    let call = |args: serde_json::Value| {
+        let tool = &tool;
+        async move { call_approved(tool, &args.to_string(), session).await }
+    };
+    let nav =
+        call(json!({"action": "navigate", "url": "https://the-internet.herokuapp.com/login"}))
+            .await;
+    assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
+
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let surfaces = tool.surface_backend();
+    surfaces.set_notifier(registry.notifier());
+    registry.add_backend(surfaces);
+    let surface = registry
+        .find_for_agent(session, None)
+        .await
+        .expect("the tab is a surface");
+    let room = Size { w: 391, h: 549 };
+    for round in 0..2 {
+        let mut live = registry
+            .open_live(
+                &surface.id,
+                "field-phone",
+                LiveMode::Control,
+                StreamParams {
+                    fit: Some(room),
+                    ..StreamParams::default()
+                },
+            )
+            .await
+            .expect("open live");
+        let frame = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(frame) = live.frames.borrow_and_update().clone()
+                    && frame.w == room.w
+                {
+                    return frame;
+                }
+                live.frames.changed().await.expect("stream open");
+            }
+        })
+        .await
+        .expect("a phone-sized frame within 10 s");
+        if let Some(out) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
+            std::fs::write(
+                format!("{}-{round}", out.to_string_lossy()),
+                &frame.data[..],
+            )
+            .expect("save frame");
+        }
+        // Down the middle of the picture, below the header's links: some
+        // tap lands in the field.
+        let mut hits = Vec::new();
+        for step in 40..90 {
+            let y = f64::from(step) / 100.0;
+            for action in [PointerAction::Down, PointerAction::Up] {
+                registry
+                    .input(
+                        &live.live_id,
+                        &InputEvent::Pointer {
+                            action,
+                            x: 0.5,
+                            y,
+                            button: PointerButton::Left,
+                        },
+                    )
+                    .await
+                    .expect("tap");
+            }
+            let focused = registry.focused(&surface.id).await.ok().flatten();
+            if let Some(selector) = focused.and_then(|f| f.selector) {
+                let found = selector == "#username";
+                hits.push((step, selector));
+                if found {
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "round {round}: frame {}x{}, hits {hits:?}",
+            frame.w, frame.h
+        );
+        assert!(
+            hits.iter().any(|(_, s)| s == "#username"),
+            "round {round}: no tap focused the field: {hits:?}"
+        );
+        registry.close_live(&live.live_id);
+        registry
+            .release_control(&surface.id, "field-phone")
+            .expect("give control back");
+    }
+}
