@@ -529,8 +529,10 @@ mod tests {
 }
 
 /// `text` cut to at most `max_chars` characters (the ellipsis included) at
-/// the last whole word, so a preview never ends mid-word. A single word
-/// longer than the limit is cut where it must be.
+/// the last whole word, so a preview never ends mid-word. A long word (a
+/// link, a path) is cut where it must be rather than dropped: backing up
+/// to the space before it would give up more than a third of the room,
+/// leaving "Open…" for "Open https://…".
 pub fn word_preview(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max_chars {
@@ -546,6 +548,7 @@ pub fn word_preview(text: &str, max_chars: usize) -> String {
         head.rfind(char::is_whitespace)
             .map(|at| &head[..at])
             .filter(|kept| !kept.trim().is_empty())
+            .filter(|kept| kept.chars().count() * 3 >= budget * 2)
             .unwrap_or(head.as_str())
     };
     format!("{}…", kept.trim_end())
@@ -646,6 +649,14 @@ mod queued_notice_tests {
         assert_eq!(
             word_preview(&"y".repeat(90), 10),
             format!("{}…", "y".repeat(9))
+        );
+        // A link is cut, not dropped.
+        assert_eq!(
+            word_preview(
+                "Open https://the-synthetic-example-site.example.com/reports/2026/acme and summarize it",
+                60
+            ),
+            "Open https://the-synthetic-example-site.example.com/reports…"
         );
         assert_eq!(
             queued_message_starting(request),
