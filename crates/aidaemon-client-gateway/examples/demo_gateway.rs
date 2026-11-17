@@ -468,7 +468,21 @@ impl ClientHost for Host {
             name: "Acme site".into(),
             path: Some("/home/synthetic/acme-site".into()),
             channels: vec!["telegram:synthetic_coding_bot".into()],
-        }])
+        }]
+        .into_iter()
+        // More than one, to reorder by dragging.
+        .chain(
+            ["Zoe's blog", "Mia's notes"]
+                .iter()
+                .enumerate()
+                .map(|(n, name)| ProjectSummary {
+                    id: format!("project-demo-{n}"),
+                    name: (*name).into(),
+                    path: None,
+                    channels: Vec::new(),
+                }),
+        )
+        .collect())
     }
     async fn history(&self, session_id: &str, _: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         let lines: &[(&str, &str)] = match session_id {
@@ -495,12 +509,18 @@ impl ClientHost for Host {
                 // The plan's reply used many tools, to try a long list.
                 tools: if *role == "assistant" {
                     let n = if session_id == "app:plan" { 18 } else { 3 };
-                    ["read_file", "web_search", "read_file", "terminal", "edit_file"]
-                        .iter()
-                        .cycle()
-                        .take(n)
-                        .map(|t| t.to_string())
-                        .collect()
+                    [
+                        "read_file",
+                        "web_search",
+                        "read_file",
+                        "terminal",
+                        "edit_file",
+                    ]
+                    .iter()
+                    .cycle()
+                    .take(n)
+                    .map(|t| t.to_string())
+                    .collect()
                 } else {
                     Vec::new()
                 },
