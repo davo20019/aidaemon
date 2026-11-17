@@ -167,9 +167,27 @@ fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// One phrase per kind of work, in the order each first came: "ran 3
-/// commands", "changed 2 files". Files count once however often touched.
-fn phrases(tools: &[String], calls: &[ToolCallInfo]) -> Vec<String> {
+/// How much a kind of work says about a turn, most first: what it
+/// changed and ran before what it only looked at.
+fn weight(kind: Option<ToolKind>) -> u8 {
+    match kind {
+        Some(ToolKind::Write) => 0,
+        Some(ToolKind::Run) => 1,
+        Some(ToolKind::Delegate) => 2,
+        Some(ToolKind::Remember) => 3,
+        Some(ToolKind::Remind) => 4,
+        Some(ToolKind::Web) => 5,
+        Some(ToolKind::Search) => 6,
+        Some(ToolKind::Read) => 7,
+        Some(ToolKind::Recall) => 8,
+        _ => 9,
+    }
+}
+
+/// One phrase per kind of work with how many calls it took, weightiest
+/// first ([`weight`]): ("ran 3 commands", 3). Files count once however
+/// often touched. `None`: calls of no kind of their own.
+fn phrases(tools: &[String], calls: &[ToolCallInfo]) -> Vec<(Option<String>, usize)> {
     // (kind, calls, distinct subjects)
     let mut groups: Vec<(Option<ToolKind>, usize, Vec<String>)> = Vec::new();
     for (n, name) in tools.iter().enumerate() {
@@ -190,6 +208,7 @@ fn phrases(tools: &[String], calls: &[ToolCallInfo]) -> Vec<String> {
             group.2.push(subject);
         }
     }
+    groups.sort_by_key(|(kind, ..)| weight(*kind));
     groups
         .into_iter()
         .map(|(kind, calls, subjects)| {
@@ -199,57 +218,59 @@ fn phrases(tools: &[String], calls: &[ToolCallInfo]) -> Vec<String> {
             } else {
                 subjects.len()
             };
-            match kind {
-                Some(ToolKind::Run) => format!("ran {}", count(calls, "command", "commands")),
-                Some(ToolKind::Read) => format!("read {}", count(files, "file", "files")),
-                Some(ToolKind::Write) => format!("changed {}", count(files, "file", "files")),
-                Some(ToolKind::Search) => match calls {
-                    1 => "searched files".into(),
-                    n => format!("searched files {n} times"),
-                },
-                Some(ToolKind::Web) => match calls {
-                    1 => "looked something up".into(),
-                    n => format!("looked up {n} things"),
-                },
-                Some(ToolKind::Delegate) => format!("asked {}", count(calls, "helper", "helpers")),
-                Some(ToolKind::Recall) => "checked memory".into(),
-                Some(ToolKind::Remember) => "updated memory".into(),
-                Some(ToolKind::Remind) => format!("set {}", count(calls, "reminder", "reminders")),
-                _ => count(calls, "other step", "other steps"),
-            }
+            let phrase = match kind {
+                Some(ToolKind::Run) => Some(format!("ran {}", count(calls, "command", "commands"))),
+                Some(ToolKind::Read) => Some(format!("read {}", count(files, "file", "files"))),
+                Some(ToolKind::Write) => Some(format!("changed {}", count(files, "file", "files"))),
+                Some(ToolKind::Search) => {
+                    Some(format!("searched {}", count(calls, "time", "times")))
+                }
+                Some(ToolKind::Web) => {
+                    Some(format!("{} online", count(calls, "lookup", "lookups")))
+                }
+                Some(ToolKind::Delegate) => {
+                    Some(format!("asked {}", count(calls, "helper", "helpers")))
+                }
+                Some(ToolKind::Recall) => Some("checked memory".into()),
+                Some(ToolKind::Remember) => Some("updated memory".into()),
+                Some(ToolKind::Remind) => {
+                    Some(format!("set {}", count(calls, "reminder", "reminders")))
+                }
+                _ => None,
+            };
+            (phrase, calls)
         })
         .collect()
 }
 
-/// "a, b and c".
-fn and_list(parts: &[String]) -> String {
-    match parts {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
-}
-
-/// The whole turn on one line: "Ran 3 commands, changed 2 files · 12s";
-/// while it runs, "Ran 1 command so far". Only other steps (no kind from
-/// an older daemon): "Used 4 tools".
+/// The whole turn on one line: "Changed 2 files, ran 3 commands · 12s";
+/// two kinds of work at most, the rest counted ("and 4 more steps");
+/// while it runs, "… so far". No kinds (an older daemon): "Used 4 tools".
 pub fn summary(tools: &[String], calls: &[ToolCallInfo], secs: u64, live: bool) -> String {
     let phrases = phrases(tools, calls);
-    let only_other = phrases.len() == 1 && phrases[0].ends_with("other step")
-        || phrases.len() == 1 && phrases[0].ends_with("other steps");
-    let mut line = if only_other || phrases.is_empty() {
+    let named: Vec<&String> = phrases
+        .iter()
+        .filter_map(|(p, _)| p.as_ref())
+        .take(2)
+        .collect();
+    let mut line = if named.is_empty() {
         format!("Used {}", count(tools.len(), "tool", "tools"))
     } else {
-        // At most three kinds; the rest are counted as other steps.
-        let shown: Vec<String> = if phrases.len() > 3 {
-            let rest = phrases.len() - 2;
-            let mut first: Vec<String> = phrases[..2].to_vec();
-            first.push(count(rest, "more kind of step", "more kinds of step"));
-            first
-        } else {
-            phrases
-        };
-        let mut text = and_list(&shown);
+        let shown: usize = phrases
+            .iter()
+            .filter(|(p, _)| p.is_some())
+            .take(2)
+            .map(|(_, n)| n)
+            .sum();
+        let rest = tools.len().saturating_sub(shown);
+        let mut text = named
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if rest > 0 {
+            text.push_str(&format!(" and {}", count(rest, "more step", "more steps")));
+        }
         if let Some(first) = text.get(..1) {
             text = format!("{}{}", first.to_uppercase(), &text[1..]);
         }
@@ -349,7 +370,7 @@ mod tests {
         let tools: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             summary(&tools, &calls, 42, false),
-            "Ran 2 commands, changed 2 files and 1 other step · 42s"
+            "Changed 2 files, ran 2 commands and 1 more step · 42s"
         );
         assert_eq!(
             summary(&tools[..1], &calls[..1], 0, true),
@@ -374,7 +395,7 @@ mod tests {
         let tools: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             summary(&tools, &calls, 0, false),
-            "Read 1 file, looked something up and 2 more kinds of step"
+            "Asked 1 helper, 1 lookup online and 2 more steps"
         );
     }
 }

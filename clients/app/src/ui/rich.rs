@@ -135,6 +135,55 @@ pub fn output(
         )
 }
 
+/// Program output on an inset well: its last 8 lines in a terminal, or
+/// 24 with Show more (the terminal scrolls back through the rest), with
+/// Copy. `label` names it for screen readers.
+pub fn output_panel(
+    detail: impl Fn() -> String + Clone + 'static,
+    label: &'static str,
+) -> View {
+    use super::{Size, Variant, btn, colors, radius};
+    let all = signal(false);
+    let lines = {
+        let detail = detail.clone();
+        move || detail().lines().count()
+    };
+    let more = {
+        let lines = lines.clone();
+        move || lines() > 8
+    };
+    let rows = {
+        let lines = lines.clone();
+        move || (lines().max(1) as u32).min(if all.get() { 24 } else { 8 })
+    };
+    let copy = detail.clone();
+    view()
+        .gap_1()
+        .rounded(px(radius::SMALL))
+        .bg(colors::INSET)
+        .px_2()
+        .py_1()
+        .child(output(detail, rows, label))
+        .child(
+            view()
+                .flex_row()
+                .gap_1()
+                .child(when(more, move || {
+                    view().child(dynamic(move || {
+                        let label = if all.get() { "Show less" } else { "Show more" };
+                        Some(untracked(move || {
+                            btn(label, Variant::Ghost, Size::Sm, move || {
+                                all.update(|a| *a = !*a)
+                            })
+                        }))
+                    }))
+                }))
+                .child(btn("Copy", Variant::Ghost, Size::Sm, move || {
+                    set_clipboard(copy())
+                })),
+        )
+}
+
 /// Output for a terminal: lines end in a carriage return and a line feed,
 /// as a program's own terminal would send them.
 fn for_terminal(text: &str) -> String {

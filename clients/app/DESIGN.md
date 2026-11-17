@@ -55,7 +55,7 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | All | A page replaces another (conversation, Settings, Memory, System) | `motion::next_layout`: fade, `BASE` |
 | Phone | Sidebar or inspector opens or closes | `ui::drawer` (nsh-base Sheet): slides in from its own edge (sidebar left, inspector right) over a dimmed page (`SCRIM`), back out on close; a tap on the dimmed page, Escape or back closes it; in place with reduced motion |
 | Desktop | Sidebar or inspector toggles | At once: the resizable group keeps measured widths, so it is not animated |
-| Conversation, Settings | Tools pill, a tool's details, more options, sections unfold | `ui::unfold` / accordion `reveal`: a clipped height springs open and shut, what is below moves with it; nothing fades or overlaps |
+| Conversation, Settings | A reply's tool line, a tool's details, more options, sections unfold | `ui::unfold` / accordion `reveal`: a clipped height springs open and shut, what is below moves with it; nothing fades or overlaps |
 | Sidebar | Row menu opens and closes | Grows from where it was asked for (`opacity-0 scale-95`), `BASE` |
 | All | A short note ("Copied", a setting saved, the view moved) | Toast at the bottom, `ENTER` in, leaves after 6 s, paused while hovered; its close button, Escape or a swipe dismisses |
 | Settings | A change is refused | Danger banner that stays until dismissed or the next change |
@@ -109,7 +109,9 @@ Say what happened and what to do next, in the owner's words: "Can't reach the da
 | Settings | A value is edited | A TOML code editor (highlighted, brackets closed); Another setting suggests the known keys as its key is typed |
 | System | Token use | Stacked bars per day (in grey, out teal), oldest at the left; the day under the pointer is named under the chart |
 | Sidebar | Pointer rests on a conversation (desktop, web) | A card after 600 ms: title, where it is and when it moved, its last message |
-| Conversation | A reply's turn used tools | One quiet disclosure line above the reply ("Used 4 tools: read_file ×2, … · 12s"); ▸ turns ▾ and lists every tool in order. The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
+| Conversation | A reply's turn used tools | One quiet line above the reply, no edge of its own (`ui::quiet_disclosure`): what the turn did in words, by the daemon's typed kind of work ("Ran 3 commands, changed 2 files · 12s"; files count once each; "Used 4 tools" from a daemon that sends no kinds). ▸ turns ▾ and lists every call in order as what it did to what ("Ran `cargo test -q`", "Changed `src/lib.rs`"); a call opens to its input only when that says more than the row, and to its output (a command's in a terminal, 8 lines, Show more, Copy). The palette's "Tool activity" cycles hidden / one line / every tool (kept per device) |
+| Conversation | A turn handed its work to the background | Its reply (marked `handed_off` by the daemon) is one quiet line with the work icon, not a message: no time, no Copy; the work's strip over the composer shows it running. The report comes as its own reply |
+| Conversation | Several replies before the owner speaks again | Time and Copy show once, under the last of them |
 | Conversation | Agent working, tools used | The working line adds "· N tools so far" |
 | Composer | Typing while the agent works | Send (Enter) tells the running work now; Queue (Mod+Enter) sends after it; the hint says "Enter tells it now · ⌘↩ sends after · Esc stops" |
 | Composer | Messages wait | "Waiting to send" above the composer: each marked Now (the running work reads it at its next step) or After (its own turn when the work ends), with Edit and Remove until the agent takes it |

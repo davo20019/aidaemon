@@ -112,7 +112,7 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
             r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:synthetic-1","event":{"type":"turn_started","turn_id":"t1","session_id":"app:synthetic-1","origin":"app"}}"#,
         ),
         frame(
-            r#"{"type":"event","at_ms":3,"session_id":"app:synthetic-1","event":{"type":"turn_status","turn_id":"t1","status":{"kind":"tool_started","name":"terminal","summary":"cargo test -q"}}}"#,
+            r#"{"type":"event","at_ms":3,"session_id":"app:synthetic-1","event":{"type":"turn_status","turn_id":"t1","status":{"kind":"tool_started","name":"terminal","summary":"cargo test -q","activity":"run"}}}"#,
         ),
         // The command's output, its colours a terminal's.
         frame(
@@ -137,8 +137,12 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
     feed([frame(
         r#"{"type":"event","seq":4,"at_ms":6,"session_id":"app:synthetic-1","event":{"type":"turn_completed","turn_id":"t1","text":"It races on the shared port.","state":"completed"}}"#,
     )]);
-    // The reply keeps a line of what its turn did.
-    app.wait_for("Used 1 tool: terminal")?;
+    // The reply keeps a line of what its turn did, in words; opened, each
+    // call reads as what it did to what.
+    app.wait_for("Ran 1 command")?;
+    app.press("Ran 1 command")?;
+    app.wait_for("text:Ran")?;
+    app.wait_for("text:cargo test -q")?;
     Ok(())
 }
 
@@ -539,7 +543,8 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     app.wait_for("text:terminal: find . -name '*.rs'...")?;
     // The count of tools ends the line and opens them in place.
     app.press("label:Tools so far")?;
-    app.wait_for("read_file")?;
+    // A tool the daemon gave no kind for reads as its name in words.
+    app.wait_for("Read file")?;
     // Stop is the composer's round button while it is empty.
     app.wait_for("label:Stop")?;
     assert!(app.press("Cancel").is_err());

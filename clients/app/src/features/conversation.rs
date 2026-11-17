@@ -20,7 +20,10 @@ enum Row {
     /// A day break: "Today", "Yesterday", "Mar 3".
     Day(String),
     User(String, u64, Vec<AttachmentRef>),
-    Assistant(String, u64, Vec<AttachmentRef>),
+    /// A reply: its text, time and files, whether it only says the work
+    /// went on in the background, and whether its time and Copy show
+    /// (the last reply before the owner speaks again).
+    Assistant(String, u64, Vec<AttachmentRef>, bool, bool),
     Note(String),
     /// The reply being written and what the agent is doing.
     Live,
@@ -75,16 +78,33 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
                 text,
                 at_ms,
                 attachments,
-                ..
-            } => Row::Assistant(text, at_ms, attachments),
+                handed_off,
+            } => Row::Assistant(text, at_ms, attachments, handed_off, false),
             Line::Note { text } => Row::Note(text),
             Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
             Line::Activity { tools, secs, calls } => Row::Activity(tools, secs, calls),
         });
     }
+    // A run of replies shows its time and Copy once, under the last; a
+    // launch line never does (its report is the reply that matters).
+    let mut last_of_run = true;
+    for row in rows.iter_mut().rev() {
+        match row {
+            Row::User(..) => last_of_run = true,
+            Row::Assistant(_, _, _, handed_off, footer) if !*handed_off => {
+                *footer = last_of_run;
+                last_of_run = false;
+            }
+            _ => {}
+        }
+    }
     if store.live(session).is_some() {
         rows.push(Row::Live);
-    } else if store.in_background(session) {
+    } else if store.in_background(session)
+        && !matches!(rows.last(), Some(Row::Assistant(_, _, _, true, _)))
+    {
+        // A launch line already says it; the work's own strip over the
+        // composer shows it running, with Cancel.
         rows.push(Row::Background);
     } else if store.can_retry(session) {
         rows.push(Row::Retry);
@@ -846,6 +866,7 @@ fn transcript_list(
                 row.with(|r| {
                     r.as_ref().map(|r| match r {
                         Row::User(..) => 0,
+                        Row::Assistant(_, _, _, true, _) => 9,
                         Row::Assistant(..) => 1,
                         Row::Note(_) => 2,
                         Row::Live => 3,
@@ -876,13 +897,13 @@ fn transcript_list(
                     };
                     let at = move || {
                         row.with(|r| match r.as_ref() {
-                            Some(Row::User(_, at, _) | Row::Assistant(_, at, _)) => *at,
+                            Some(Row::User(_, at, _) | Row::Assistant(_, at, ..)) => *at,
                             _ => 0,
                         })
                     };
                     let attached = move || {
                         row.with(|r| match r {
-                            Some(Row::User(_, _, files) | Row::Assistant(_, _, files)) => {
+                            Some(Row::User(_, _, files) | Row::Assistant(_, _, files, ..)) => {
                                 files.clone()
                             }
                             _ => Vec::new(),
@@ -905,7 +926,15 @@ fn transcript_list(
                                 move || markdown(move || content().into(), || false),
                             ))
                             .child(files(store, attached, false))
-                            .child(reply_footer(store, content, at)),
+                            .child(when(
+                                move || {
+                                    row.with(|r| {
+                                        matches!(r, Some(Row::Assistant(.., true)))
+                                    })
+                                },
+                                move || reply_footer(store, content, at),
+                            )),
+                        9 => column.child(handed_off(content)),
                         2 => column.child(note(content)),
                         5 => column.child(day_break(content)),
                         3 => column.child(live(store, session)),
@@ -974,13 +1003,14 @@ fn activity(
     let summary = {
         let data = data.clone();
         move || {
-            let (tools, secs, _) = data();
-            activity_summary(&tools, secs, live)
+            let (tools, secs, calls) = data();
+            aidaemon_client_core::tools::summary(&tools, &calls, secs, live)
         }
     };
     view()
         .gap_1()
-        .child(ui::disclosure(summary, open).accessibility_label("Tools this reply used"))
+        // Its own words name it: what the turn did.
+        .child(ui::quiet_disclosure(summary, open))
         .child(ui::unfold(open, move || tool_list(data.clone())))
 }
 
@@ -991,7 +1021,7 @@ fn tool_list(data: impl Fn() -> (Vec<String>, u64, Vec<ToolCallInfo>) + 'static)
         Some(untracked(move || {
             let mut list = view().gap(px(2.0));
             for (n, tool) in tools.iter().enumerate() {
-                list = list.child(tool_call(n + 1, tool, call_of(&calls, n, tool)));
+                list = list.child(tool_call(tool, call_of(&calls, n, tool)));
             }
             list
         }))
@@ -1007,54 +1037,47 @@ fn call_of(calls: &[ToolCallInfo], n: usize, tool: &str) -> Option<ToolCallInfo>
         .cloned()
 }
 
-/// One tool of the list: its row, and what it did once opened.
-fn tool_call(number: usize, tool: &str, call: Option<ToolCallInfo>) -> View {
+/// One tool of the list: what it did to what, and once opened what it
+/// was given and gave back.
+fn tool_call(tool: &str, call: Option<ToolCallInfo>) -> View {
     let Some(call) = call else {
-        return ui::tool_row(number, tool.to_owned(), None);
+        // An older daemon's bare name: in words, nothing to open.
+        let step = aidaemon_client_core::tools::step(&ToolCallInfo {
+            name: tool.to_owned(),
+            ..ToolCallInfo::default()
+        });
+        return ui::tool_row(step.verb, step.subject, None);
     };
+    let step = aidaemon_client_core::tools::step(&call);
     let open = signal(false);
+    let input = step.more_input.then(|| call.input.clone());
+    let command = step.command_output;
     view()
-        .child(ui::tool_row(number, tool.to_owned(), Some(open)))
+        .child(ui::tool_row(step.verb, step.subject, Some(open)))
         .child(ui::unfold(open, move || {
-            ui::call_detail(call.input.clone(), call.output.clone())
+            ui::call_detail(input.clone(), call.output.clone(), command)
         }))
 }
 
-/// "Used 4 tools: read_file ×2, web_search, terminal · 12s"; while the
-/// turn runs, "2 tools so far: read_file, terminal".
-fn activity_summary(tools: &[String], secs: u64, live: bool) -> String {
-    let mut counted: Vec<(&str, usize)> = Vec::new();
-    for tool in tools {
-        match counted.iter_mut().find(|(name, _)| name == tool) {
-            Some((_, n)) => *n += 1,
-            None => counted.push((tool, 1)),
-        }
-    }
-    let names = counted
-        .iter()
-        .take(3)
-        .map(|(name, n)| {
-            if *n > 1 {
-                format!("{name} ×{n}")
-            } else {
-                (*name).to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let more = if counted.len() > 3 { ", …" } else { "" };
-    let count = tools.len();
-    let noun = if count == 1 { "tool" } else { "tools" };
-    let took = match secs {
-        0 => String::new(),
-        1..60 => format!(" · {secs}s"),
-        _ => format!(" · {}m {}s", secs / 60, secs % 60),
-    };
-    if live {
-        format!("{count} {noun} so far: {names}{more}")
-    } else {
-        format!("Used {count} {noun}: {names}{more}{took}")
-    }
+/// A reply that only says the work went on in the background: one quiet
+/// line, not a message to read (its report is).
+fn handed_off(content: impl Fn() -> String + 'static) -> View {
+    view()
+        .flex_row()
+        .items_start()
+        .gap_2()
+        .child(
+            ui::icon(Glyph::Work)
+                .text_color(colors::FAINT)
+                .accessibility_elements_hidden(true),
+        )
+        .child(
+            text(content)
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(ui::fit::small()))
+                .text_color(colors::MUTED),
+        )
 }
 
 /// Under a failed or stopped turn: send its message again.

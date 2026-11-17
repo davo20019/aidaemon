@@ -1304,6 +1304,30 @@ pub fn disclosure(
     label: impl IntoReactive<SharedString>,
     open: Signal<bool>,
 ) -> nsh_base::ButtonElement {
+    toggle_line(label, open)
+        .pr_2()
+        .border_1()
+        .border_color(colors::LINE)
+        .hover(|s| s.bg(colors::HOVER).border_color(colors::BORDER))
+}
+
+/// A line of quiet text that opens what is under it, with no edge of its
+/// own: as light as a timestamp, so the reply under it stays what is read
+/// (a reply's "Ran 3 commands, changed 2 files · 12s").
+pub fn quiet_disclosure(
+    label: impl IntoReactive<SharedString>,
+    open: Signal<bool>,
+) -> nsh_base::ButtonElement {
+    toggle_line(label, open)
+        .pr_1()
+        .hover(|s| s.bg(colors::HOVER))
+}
+
+/// A chevron that turns and a one-line label, pressing which flips `open`.
+fn toggle_line(
+    label: impl IntoReactive<SharedString>,
+    open: Signal<bool>,
+) -> nsh_base::ButtonElement {
     button()
         .flex_row()
         .items_center()
@@ -1311,13 +1335,9 @@ pub fn disclosure(
         .self_start()
         .min_h(px(fit::row() - 4.0))
         .pl_1()
-        .pr_2()
         .rounded(px(radius::CONTROL))
-        .border_1()
-        .border_color(colors::LINE)
         .transition_colors()
         .duration(motion::FAST)
-        .hover(|s| s.bg(colors::HOVER).border_color(colors::BORDER))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
         .focus(focus_band)
         .child(
@@ -1341,22 +1361,43 @@ pub fn disclosure(
         .on_press(move || open.update(|o| *o = !*o))
 }
 
-/// One tool of a reply's activity list: its number and name. With details
-/// to show it is a button whose chevron turns as `open` flips; the caller
-/// renders the details under it ([`call_detail`]).
-pub fn tool_row(number: usize, name: String, open: Option<Signal<bool>>) -> View {
-    let label = view()
+/// One tool call of a reply's activity list: what it did ("Ran"), then
+/// what it worked on (a command, a path) in monospace, on one line. With
+/// details to show it is a button whose chevron turns as `open` flips;
+/// the caller renders the details under it ([`call_detail`]).
+pub fn tool_row(verb: String, subject: Option<String>, open: Option<Signal<bool>>) -> View {
+    let spoken = match &subject {
+        Some(subject) => format!("{verb} {subject}"),
+        None => verb.clone(),
+    };
+    let mut label = view()
         .flex_row()
         .items_center()
         .gap_2()
+        .flex_shrink(1.0)
+        .min_w(px(0.0))
         .child(
-            text(format!("{number}."))
-                .text_size(px(type_scale::XS))
+            text(verb)
+                .flex_shrink(0.0)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+        );
+    if let Some(subject) = subject {
+        label = label.child(
+            code(subject)
+                .number_of_lines(1)
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
                 .text_color(colors::FAINT),
-        )
-        .child(code(name.clone()).text_color(colors::MUTED));
+        );
+    }
     let Some(open) = open else {
-        return view().pl(px(18.0)).child(label);
+        return view()
+            .flex_row()
+            .min_h(px(fit::row() - 6.0))
+            .items_center()
+            .pl(px(18.0))
+            .child(label);
     };
     view().child(
         button()
@@ -1364,6 +1405,7 @@ pub fn tool_row(number: usize, name: String, open: Option<Signal<bool>>) -> View
             .items_center()
             .gap_1()
             .self_start()
+            .max_w(percentage(1.0))
             .min_h(px(fit::row() - 6.0))
             .pr_2()
             .rounded(px(radius::CONTROL))
@@ -1372,7 +1414,7 @@ pub fn tool_row(number: usize, name: String, open: Option<Signal<bool>>) -> View
             .hover(|s| s.bg(colors::HOVER))
             .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
             .focus(focus_band)
-            .accessibility_label(format!("{name}: show what it was given and returned"))
+            .accessibility_label(format!("{spoken}: show what it was given and returned"))
             .child(
                 icon(Glyph::Chevron)
                     .text_color(colors::FAINT)
@@ -1387,9 +1429,27 @@ pub fn tool_row(number: usize, name: String, open: Option<Signal<bool>>) -> View
 }
 
 /// What one tool call was given and gave back, under its [`tool_row`]:
-/// each a quiet label over selectable monospace text on an inset well.
-pub fn call_detail(input: String, output: String) -> View {
-    let part = |label: &'static str, body: String| {
+/// the input only when it says more than the row (`input` is `None`
+/// otherwise), and a command's output in a terminal
+/// ([`super::output_panel`]), any other as selectable monospace on an
+/// inset well, at most a few lines until opened.
+pub fn call_detail(input: Option<String>, output: String, command: bool) -> View {
+    let well = |body: String| {
+        view()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded(px(radius::SMALL))
+            .bg(colors::INSET)
+            .child(
+                text(body)
+                    .selectable(true)
+                    .font_family(MONO)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::TEXT),
+            )
+    };
+    let part = |label: &'static str, body: View| {
         view()
             .gap_1()
             .child(
@@ -1397,25 +1457,11 @@ pub fn call_detail(input: String, output: String) -> View {
                     .text_size(px(type_scale::XS))
                     .text_color(colors::FAINT),
             )
-            .child(
-                view()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(radius::SMALL))
-                    .bg(colors::INSET)
-                    .child(
-                        text(body)
-                            .selectable(true)
-                            .font_family(MONO)
-                            .text_size(px(type_scale::XS))
-                            .text_color(colors::TEXT),
-                    ),
-            )
+            .child(body)
     };
     let mut detail = view().pl(px(22.0)).pb_1().gap_2();
-    if !input.is_empty() {
-        detail = detail.child(part("Input", input));
+    if let Some(input) = input.filter(|i| !i.is_empty()) {
+        detail = detail.child(part("Input", well(input)));
     }
     detail = detail.child(if output.is_empty() {
         view().child(
@@ -1423,8 +1469,10 @@ pub fn call_detail(input: String, output: String) -> View {
                 .text_size(px(type_scale::XS))
                 .text_color(colors::FAINT),
         )
+    } else if command {
+        part("Output", super::output_panel(move || output.clone(), "Command output"))
     } else {
-        part("Output", output)
+        part("Output", well(output))
     });
     detail
 }
