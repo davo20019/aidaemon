@@ -78,7 +78,7 @@ pub use redact::{Redactor, labelled_credentials, redact_labelled_credentials, se
 pub use scope::{ScopeGuard, UndeclaredAccess};
 pub use shell::{
     catastrophic_reason, command_segments, contains_shell_operator, credential_path_segment,
-    irreversible_delete_reason, scan_shell,
+    exceeds_program_grant, irreversible_delete_reason, scan_shell,
 };
 pub use tracing_sink::TracingSink;
 pub use untrusted::{UNTRUSTED_PREFIX, UNTRUSTED_SUFFIX, UntrustedOutput, wrap_untrusted};

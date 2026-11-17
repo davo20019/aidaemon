@@ -656,6 +656,102 @@ pub fn scan_shell(cmd: &str) -> ShellScan<'_> {
     }
 }
 
+/// Whether `cmd` does more than run the programs its first words name, so
+/// a grant for a program (an allowed prefix such as `echo`, `find` or `env`)
+/// must not cover it:
+///
+/// - it writes a file by redirection (`echo x >> ~/.profile`);
+/// - a segment starts with a variable assignment (`GIT_SSH_COMMAND=... git`);
+/// - a segment's program is a launcher that runs another (`env sh -c ...`,
+///   `xargs`), or a `find` that runs or deletes (`-exec`, `-delete`).
+///
+/// Such a command is judged like any other the owner never granted.
+pub fn exceeds_program_grant(cmd: &str) -> bool {
+    if writes_by_redirection(cmd) {
+        return true;
+    }
+    scan_shell(cmd).segments.iter().any(|segment| {
+        let Some(first) = segment.split_whitespace().next() else {
+            return false;
+        };
+        if is_assignment(first) {
+            return true;
+        }
+        let run = command_segments(segment);
+        let Some(tokens) = run.first() else {
+            // A bare launcher (`env`) runs nothing.
+            return false;
+        };
+        if tokens.first().map(|t| basename(t)) != Some(basename(first)) {
+            return true;
+        }
+        match basename(first) {
+            "xargs" => true,
+            "find" => tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "-exec"
+                        | "-execdir"
+                        | "-ok"
+                        | "-okdir"
+                        | "-delete"
+                        | "-fprint"
+                        | "-fprint0"
+                        | "-fprintf"
+                        | "-fls"
+                )
+            }),
+            _ => false,
+        }
+    })
+}
+
+/// An unquoted `>` that writes a file: not a descriptor copy (`2>&1`) and
+/// not `/dev/null`.
+fn writes_by_redirection(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let (mut in_single, mut in_double) = (false, false);
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_single {
+            in_single = byte != b'\'';
+        } else if in_double {
+            match byte {
+                b'\\' => i += 1,
+                b'"' => in_double = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'\\' => i += 1,
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'>' => {
+                    let mut rest = &cmd[i + 1..];
+                    rest = rest.strip_prefix('>').unwrap_or(rest);
+                    rest = rest.strip_prefix('|').unwrap_or(rest);
+                    let target = rest.trim_start();
+                    let copy = rest.starts_with('&')
+                        && rest[1..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit() || c == '-');
+                    let null = target.strip_prefix("/dev/null").is_some_and(|after| {
+                        !after.starts_with(|c: char| c == '/' || c.is_alphanumeric())
+                    });
+                    if !copy && !null {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Whether a shell would treat `cmd` as more than one plain command.
 pub fn contains_shell_operator(cmd: &str) -> bool {
     scan_shell(cmd).has_operator
@@ -670,6 +766,37 @@ mod tests {
     }
 
     const WORKSPACE: &str = "/Users/alice/projects/acme";
+
+    #[test]
+    fn a_program_grant_does_not_cover_launchers_writes_or_assignments() {
+        for cmd in [
+            "env sh -c 'id'",
+            "env python3 -c \"print(1)\"",
+            "find /tmp/x -maxdepth 0 -exec sh -c 'id' \\;",
+            "find . -name '*.log' -delete",
+            "echo 'export X=1' >> ~/.zshrc",
+            "echo hi > notes.md",
+            "cat a &> b",
+            "GIT_SSH_COMMAND='sh -c id' git fetch",
+            "ls | xargs rm",
+            "ls && env bash -c 'id'",
+        ] {
+            assert!(exceeds_program_grant(cmd), "{cmd}");
+        }
+        for cmd in [
+            "env",
+            "printenv HOME",
+            "find . -name '*.rs' -newer Cargo.toml",
+            "echo 'a > b'",
+            "echo \"x >> y\"",
+            "ls -la 2>&1",
+            "grep -r todo src 2>/dev/null",
+            "cat a | grep b > /dev/null",
+            "ls && pwd",
+        ] {
+            assert!(!exceeds_program_grant(cmd), "{cmd}");
+        }
+    }
 
     #[test]
     fn command_substitution_counts_inside_double_quotes_only() {

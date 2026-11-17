@@ -3760,6 +3760,12 @@ impl TerminalTool {
             return true;
         }
         let trimmed = command.trim();
+        // A grant names a program. A command that launches another program
+        // through it, writes a file by redirection or sets variables for it
+        // does more than that program does, and is not covered.
+        if aidaemon_policies::exceeds_program_grant(trimmed) {
+            return false;
+        }
         let has_shell_ops = contains_shell_operator(trimmed);
 
         // For chained commands (&&, ||, ;, |), check each segment's binary
