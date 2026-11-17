@@ -653,6 +653,32 @@ fn a_project_conversation_browses_its_files_read_only() -> Result<(), String> {
 }
 
 #[test]
+fn a_projects_files_open_from_its_page_without_a_conversation() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"rp","result":{"type":"projects","projects":[{"id":"p-docs","name":"Docs site","path":"/home/synthetic/docs-site"}]}}"#,
+        ),
+        frame(r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[]}}"#),
+    ]);
+    app.wait_for("Docs site")?;
+    app.press("Project Docs site, 0 conversations")?;
+    app.wait_for("label:This project's files")?;
+    let before = sent("list_project_files");
+    app.press("label:This project's files")?;
+    let id = wait_sent_new("list_project_files", before)?;
+    app.wait_for("Docs site files")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_dir","dir":{{"project_id":"p-docs","branch":"main","entries":[{{"name":"index.md","kind":"file","size_bytes":12}}]}}}}}}"#
+    ))]);
+    app.wait_for("index.md")?;
+    Ok(())
+}
+
+#[test]
 fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

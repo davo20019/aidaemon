@@ -50,6 +50,8 @@ pub enum Page {
     Settings,
     /// What runs on its own: scheduled work, watching, health checks.
     Automations,
+    /// A project's files, opened from its page (no conversation needed).
+    Files,
 }
 
 /// How much of each turn's tool use the transcript shows.
@@ -260,6 +262,8 @@ pub struct Store {
     /// What the app last told the owner.
     toast: Signal<Option<crate::ui::Note>>,
     page: Signal<Page>,
+    /// The project whose files the Files page shows.
+    files_of: Signal<Option<String>>,
     /// The sidebar's search.
     filter: Signal<String>,
     /// Conversations kept at the top of the list (this device's storage).
@@ -358,6 +362,7 @@ impl Store {
             spotlight: signal(None),
             toast: signal(None),
             page: signal(Page::Conversation),
+            files_of: signal(None),
             filter: signal(String::new()),
             pins: signal(BTreeSet::new()),
             project_pins: signal(BTreeSet::new()),
@@ -1020,6 +1025,17 @@ impl Store {
         self.page.set(page);
     }
 
+    /// A project's files as a page of their own, from its sidebar page.
+    pub fn open_project_files(&self, project: &str) {
+        self.files_of.set(Some(project.to_owned()));
+        self.open_page(Page::Files);
+    }
+
+    /// Whether the Files page shows this project's files.
+    pub fn showing_files_of(&self, project: &str) -> bool {
+        self.page.get() == Page::Files && self.files_of.get().as_deref() == Some(project)
+    }
+
     pub fn open_system(&self) {
         self.open_page(Page::System);
         self.refresh_system();
@@ -1579,9 +1595,15 @@ impl Store {
 
     /// The project of the conversation on screen, when it has a folder:
     /// the one whose files the Files tab shows.
+    /// The project whose files show: the Files page's, else the open
+    /// conversation's (the details pane's Files tab).
     pub fn files_project(&self) -> Option<ProjectSummary> {
-        let selected = self.selected.get()?;
-        let id = self.read(|c| c.session_project(&selected))?;
+        let id = if self.page.get() == Page::Files {
+            self.files_of.get()?
+        } else {
+            let selected = self.selected.get()?;
+            self.read(|c| c.session_project(&selected))?
+        };
         self.reads
             .projects
             .with(|all| all.iter().find(|p| p.id == id).cloned())

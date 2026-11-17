@@ -1,4 +1,6 @@
-//! The details pane's Files tab: the folder of the conversation's project,
+//! A project's files, two ways in: the details pane's Files tab (the
+//! conversation's project) and a page of their own from the project's
+//! sidebar page (no conversation needed). Both are this browser: the folder of the conversation's project,
 //! read-only, one folder at a time (a phone has no room for a deep tree).
 //! A path at the top goes back up; a folder opens in place; a file opens
 //! filling the pane, highlighted, with Back to its folder. Files git
@@ -24,6 +26,47 @@ pub fn files(store: Store) -> View {
             )),
         }))
     }))
+}
+
+/// The Files page: a bar like the other pages', then the browser.
+pub fn page(store: Store) -> View {
+    let title = computed(move || {
+        store
+            .files_project()
+            .map(|p| p.name)
+            .unwrap_or_else(|| "Files".to_owned())
+    });
+    view()
+        .flex_1()
+        .min_w(px(0.0))
+        .child(
+            view()
+                .h(px(ui::fit::bar()))
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .border_b_1()
+                .border_color(colors::LINE)
+                .child(when(
+                    move || store.is_compact() || !store.sidebar_open(),
+                    move || {
+                        ui::icon_btn(Glyph::Sidebar, "Conversations", Size::Md, move || {
+                            store.open_sidebar()
+                        })
+                    },
+                ))
+                .child(
+                    text(move || format!("{} files", title.get()))
+                        .flex_1()
+                        .px_2()
+                        .number_of_lines(1)
+                        .role(AccessibilityRole::Header)
+                        .text_size(px(ui::fit::body()))
+                        .font_weight(FontWeight::SEMIBOLD),
+                ),
+        )
+        .child(files(store))
 }
 
 /// One project's files: the folder open, or the file open in it.

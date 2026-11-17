@@ -830,6 +830,7 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
     };
     let (name, folder, edit, empty) = (id.clone(), id.clone(), id.clone(), id.clone());
     let put_away = id.clone();
+    let (browse, browsing, has_folder) = (id.clone(), id.clone(), id.clone());
     let (pin, unpin, pinned, unpinned, gone) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let tools = view().flex_row().items_center().child(ui::press_menu(
@@ -886,6 +887,31 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                     .text_size(px(type_scale::BASE)),
                 )
         }))
+        // Its files, a page of their own (no conversation needed), when it
+        // has a folder.
+        .child(when(
+            move || {
+                store
+                    .project(&has_folder)
+                    .and_then(|p| p.path)
+                    .is_some_and(|f| !f.trim().is_empty())
+            },
+            move || {
+                let (open, on) = (browse.clone(), browsing.clone());
+                row(
+                    move || store.showing_files_of(&on),
+                    move || store.open_project_files(&open),
+                )
+                .accessibility_label("This project's files")
+                .child(icon(Glyph::Folder).text_color(colors::MUTED))
+                .child(
+                    text("Files")
+                        .flex_1()
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::BASE)),
+                )
+            },
+        ))
         // Its archived conversations, a row like the one above it, at the
         // top whatever the list's length (only when it has some).
         .child(dynamic(move || {

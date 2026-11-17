@@ -260,6 +260,11 @@ fn page(store: Store, in_setup: Memo<bool>) -> impl IntoElement {
                     crate::features::automations::page(store).key("automations")
                 }));
             }
+            if store.page() == crate::store::Page::Files {
+                return Some(untracked(|| {
+                    crate::features::files::page(store).key("files")
+                }));
+            }
             if store.page() == crate::store::Page::System {
                 return Some(untracked(|| {
                     crate::features::system::page(store).key("system")
