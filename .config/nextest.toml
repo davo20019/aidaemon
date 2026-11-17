@@ -1,6 +1,14 @@
-# cargo-nextest settings. Only the Windows CI job uses nextest for now: one
-# process per test, so a test that hangs there fails on its own instead of
-# holding the whole run until the job's time limit.
+# cargo-nextest settings. CI runs every suite through nextest archives split
+# into shards: one process per test, so a test that hangs fails on its own
+# instead of holding the whole run until the job's time limit.
+
+[profile.ci]
+fail-fast = false
+# Reported as slow after 60 s, stopped and failed after 5 min.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Each failure as it happens, and again at the end of the run.
+failure-output = "immediate-final"
+
 
 [profile.windows-ci]
 # Report every failure, not just the first.
