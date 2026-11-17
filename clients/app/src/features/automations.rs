@@ -412,16 +412,16 @@ fn card(store: Store, automation: AutomationSummary) -> View {
             ));
         }
     }
-    actions = actions.child(
+    // Details is a chevron at the row's end, so the actions keep one row
+    // on a phone.
+    actions = actions.child(view().flex_1()).child(
         when(showing, move || {
-            ui::btn("Hide details", Variant::Ghost, Size::Sm, move || {
+            ui::icon_btn(Glyph::Up, "Hide details", Size::Sm, move || {
                 showing.set(false)
             })
         })
         .otherwise(move || {
-            ui::btn("Details", Variant::Ghost, Size::Sm, move || {
-                showing.set(true)
-            })
+            ui::icon_btn(Glyph::Down, "Details", Size::Sm, move || showing.set(true))
         }),
     );
     // Cancelling is rare and final: it sits at the foot of Details, and
