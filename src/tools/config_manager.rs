@@ -103,7 +103,7 @@ default = "claude-sonnet-4-20250514"
         assert!(!request.subject.contains("sk-synthetic-test-key"));
 
         for no_card in [
-            json!({"action": "set", "key": "provider.models.default", "value": "\"other\""}),
+            json!({"action": "set", "key": "provider.models.fast", "value": "\"other\""}),
             json!({"action": "read"}),
             json!({"action": "get", "key": "provider.kind"}),
             json!({"action": "list_failover_providers"}),
@@ -158,10 +158,12 @@ fallback = ["old-a", "old-b"]
             ("provider.fallbacks[1].models.fallback", "[\"new-a\"]"),
         ] {
             let args = json!({"action": "set", "key": key, "value": value}).to_string();
-            let outcome = tool
-                .execute(&args, &ToolCallContext::default())
-                .await
-                .unwrap();
+            // A fallback's main model is the owner's call: the kernel approved it.
+            let approved = ToolCallContext {
+                kernel_approved: Some(aidaemon_tools::semantics::ApprovalScope::Call),
+                ..ToolCallContext::default()
+            };
+            let outcome = tool.execute(&args, &approved).await.unwrap();
             assert!(outcome.output.contains("Checked"), "{}", outcome.output);
             assert_eq!(
                 outcome.metadata.outcome_status,
@@ -335,7 +337,7 @@ token_file = "{}"
                 "{call} must ask"
             );
         }
-        let other = json!({"action": "set", "key": "provider.models.primary", "value": "\"m\""});
+        let other = json!({"action": "set", "key": "provider.models.fast", "value": "\"m\""});
         assert!(matches!(
             tool.owner_approval(&other).await,
             OwnerApprovalNeed::NotNeeded
