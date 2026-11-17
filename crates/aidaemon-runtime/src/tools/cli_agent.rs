@@ -203,6 +203,15 @@ tokio::task_local! {
     /// The name of the run this call left in the background, when it
     /// started or moved one there.
     static BACKGROUND_RUN_LABEL: std::cell::RefCell<Option<String>>;
+    /// Set when no agent ever started: every configured agent failed to
+    /// launch (a typed [`CliAgentUnavailableError`]), or the launcher exited
+    /// 127 before the agent wrote anything ([`exited_before_agent_output`]).
+    static NEVER_STARTED: std::cell::Cell<bool>;
+}
+
+/// Record that no agent started for this call.
+fn mark_never_started() {
+    let _ = NEVER_STARTED.try_with(|flag| flag.set(true));
 }
 
 /// Record the run this call left in the background, by its name.
@@ -517,6 +526,9 @@ struct RunningCliAgent {
     process_handle: ProcessHandle,
     /// Set by the stream/wait task after the backend process exits.
     finished: Arc<AtomicBool>,
+    /// Set by the stream/wait task when the run failed to authenticate
+    /// ([`cli_auth_failed`]), before `finished`.
+    auth_failed: Arc<AtomicBool>,
     /// Session ID for filtering cancel_all by session
     session_id: String,
     /// Delegated task ID when this cli_agent run is acting as an executor.
@@ -1056,9 +1068,17 @@ fn format_cli_agent_failure(
     error_msg
 }
 
+/// The exit code in the daemon's own failure header
+/// ([`format_cli_agent_failure`]: `ERROR: CLI agent '<name>' failed (exit
+/// code N).` on the first line). An agent's report that quotes such a line
+/// further down is its content and is never read.
 fn cli_agent_exit_code(output: &str) -> Option<i32> {
+    let header = output.lines().next()?;
+    if !header.starts_with("ERROR: CLI agent '") {
+        return None;
+    }
     let marker = "failed (exit code ";
-    let suffix = output.split_once(marker)?.1;
+    let suffix = header.split_once(marker)?.1;
     let raw = suffix.split_once(')')?.0.trim();
     raw.strip_prefix("Some(")
         .unwrap_or(raw)
@@ -1067,12 +1087,115 @@ fn cli_agent_exit_code(output: &str) -> Option<i32> {
         .ok()
 }
 
-fn failed_before_agent_launch(output: &str, exit_code: Option<i32>) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("could not start")
-        || (exit_code == Some(127)
-            && (lower.contains("[stderr] env:") || lower.contains("[stderr] /usr/bin/env:"))
-            && lower.contains("no such file or directory"))
+/// Whether a run ended before the agent itself started: the program could
+/// not be found or executed (exit 127 from the launcher) and the agent
+/// wrote nothing to stdout. Never read from the output's words.
+fn exited_before_agent_output(exit_code: Option<i32>, stdout: &str) -> bool {
+    exit_code == Some(127) && stdout.trim().is_empty()
+}
+
+/// JSON stream events a CLI agent emits around its task without doing any
+/// of it: startup (`system`/`init`, Codex `thread.started`/`turn.started`)
+/// and its terminal status (`error`, `turn.failed`, `result`).
+const CLI_STATUS_EVENTS: [&str; 7] = [
+    "system",
+    "init",
+    "thread.started",
+    "turn.started",
+    "error",
+    "turn.failed",
+    "result",
+];
+
+/// The phrases a CLI's own authentication error is written in. Read only
+/// from what the CLI itself reported (its stderr and its JSON status
+/// events), only on a non-zero exit, and only when the agent produced no
+/// task output; an agent that writes "forbidden" while fixing a 403
+/// handler has produced task output and is never judged by this.
+const CLI_AUTH_ERROR_PHRASES: [&str; 11] = [
+    "authentication required",
+    "authentication failed",
+    "not authenticated",
+    "not logged in",
+    "login required",
+    "invalid api key",
+    "api key is required",
+    "missing api key",
+    "token expired",
+    "unauthorized",
+    "please run /login",
+];
+
+/// Whether a CLI agent run failed to authenticate, judged from what the
+/// CLI reported about itself, never from its task output:
+/// - Claude Code's stream-json marks a message whose API call was refused
+///   for authentication with the typed `"error": "authentication_failed"`;
+/// - Gemini CLI prints its own auth-help URL (`gemini-cli-auth-docs`) as a
+///   plain line outside its JSON events, even with a zero exit;
+/// - otherwise, on a non-zero exit with no task output at all, the CLI's
+///   stderr or JSON error/result event states an auth error.
+fn cli_auth_failed(stdout: &str, display: &str, exit_code: Option<i32>) -> bool {
+    let events: Vec<Option<Value>> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .filter(Value::is_object)
+        })
+        .collect();
+    if events
+        .iter()
+        .flatten()
+        .any(|event| event.get("error").and_then(Value::as_str) == Some("authentication_failed"))
+    {
+        return true;
+    }
+    let stderr_lines = display
+        .lines()
+        .filter_map(|line| line.strip_prefix("[stderr] "));
+    let plain_stdout = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| serde_json::from_str::<Value>(line).is_err());
+    if stderr_lines
+        .clone()
+        .chain(plain_stdout)
+        .any(|line| line.contains("gemini-cli-auth-docs"))
+    {
+        return true;
+    }
+    if !exit_code.is_some_and(|code| code != 0) {
+        return false;
+    }
+    let status_event = |event: &Value| {
+        event
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| CLI_STATUS_EVENTS.contains(&kind))
+    };
+    let produced_task_output = events
+        .iter()
+        .any(|event| !event.as_ref().is_some_and(status_event));
+    if produced_task_output {
+        return false;
+    }
+    let status_text = events
+        .iter()
+        .flatten()
+        .filter(|event| status_event(event))
+        .map(Value::to_string);
+    stderr_lines
+        .map(str::to_string)
+        .chain(status_text)
+        .any(|text| {
+            let lower = text.to_lowercase();
+            CLI_AUTH_ERROR_PHRASES
+                .iter()
+                .any(|phrase| lower.contains(phrase))
+        })
 }
 
 fn first_cli_failure_detail(output: &str) -> String {
@@ -1181,11 +1304,12 @@ impl CliAgentTool {
     ) -> String {
         let elapsed = agent.started_at.elapsed().as_secs();
         let stdout_output = agent.stdout_buf.lock().await.clone();
-        let display_output = agent.display_buf.lock().await.clone();
-        if let Some(error) = Self::detect_auth_error(&display_output, &agent.tool_name) {
+        if agent.auth_failed.load(Ordering::Acquire) {
             return format!(
                 "CLI agent '{}' failed after {}s.\n\n{}",
-                agent.tool_name, elapsed, error
+                agent.tool_name,
+                elapsed,
+                Self::auth_error_message(&agent.tool_name)
             );
         }
         let result = extract_meaningful_output(&stdout_output, 10000);
@@ -2249,35 +2373,13 @@ impl CliAgentTool {
         )
     }
 
-    /// Detect auth-related errors in output.
-    fn detect_auth_error(output: &str, tool_name: &str) -> Option<String> {
-        let auth_patterns = [
-            "authentication required",
-            "authentication failed",
-            "unauthorized",
-            "not authenticated",
-            "not logged in",
-            "login required",
-            "sign in required",
-            "token expired",
-            "invalid api key",
-            "api key is required",
-            "missing api key",
-            "access denied",
-            "forbidden",
-            "invalid token",
-            "gemini-cli-auth-docs",
-        ];
-        let lower = output.to_lowercase();
-        for pattern in &auth_patterns {
-            if lower.contains(pattern) {
-                return Some(format!(
-                    "ERROR: CLI agent '{}' authentication failed before it produced a task result. It has been disabled for this daemon session; retry with another configured CLI agent, or authenticate '{}' before restarting it.",
-                    tool_name, tool_name,
-                ));
-            }
-        }
-        None
+    /// The run's failure message once [`cli_auth_failed`] judged the run
+    /// an authentication failure.
+    fn auth_error_message(tool_name: &str) -> String {
+        format!(
+            "ERROR: CLI agent '{}' authentication failed before it produced a task result. It has been disabled for this daemon session; retry with another configured CLI agent, or authenticate '{}' before restarting it.",
+            tool_name, tool_name,
+        )
     }
 
     fn quarantine_unavailable_tool(
@@ -2307,7 +2409,8 @@ impl CliAgentTool {
         display_output: &str,
         max_output: usize,
     ) -> CliCompletionResult {
-        if let Some(error) = Self::detect_auth_error(display_output, tool_name) {
+        if cli_auth_failed(stdout, display_output, exit_code) {
+            let error = Self::auth_error_message(tool_name);
             return CliCompletionResult {
                 success: false,
                 authentication_failed: true,
@@ -2810,6 +2913,8 @@ impl CliAgentTool {
         let process_handle_for_task = process_handle.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let finished_for_task = finished.clone();
+        let auth_failed = Arc::new(AtomicBool::new(false));
+        let auth_failed_for_task = auth_failed.clone();
         let invocation_started_at = started_at_instant;
         let max_output_for_log = max_output;
         let notify_session_id = session_id.to_string();
@@ -2867,8 +2972,6 @@ impl CliAgentTool {
             let mut loop_detector = LoopDetector::new();
             let mut loop_detected = false;
             let mut loop_pattern_count: Option<usize> = None;
-            let mut last_output_time = Instant::now();
-            let mut last_non_empty_line = String::new();
 
             loop {
                 if stdout_done && stderr_done {
@@ -2890,11 +2993,6 @@ impl CliAgentTool {
                     line = stdout_reader.next_line(), if !stdout_done => {
                         match line {
                             Ok(Some(text)) => {
-                                last_output_time = Instant::now();
-                                if !text.trim().is_empty() {
-                                    last_non_empty_line = text.clone();
-                                }
-
                                 // Guardrail: kill external coding agents if they attempt to
                                 // manipulate aidaemon's state DB (E2E rabbit-hole).
                                 if looks_like_json(&text) {
@@ -2954,11 +3052,6 @@ impl CliAgentTool {
                     line = stderr_reader.next_line(), if !stderr_done => {
                         match line {
                             Ok(Some(text)) => {
-                                last_output_time = Instant::now();
-                                if !text.trim().is_empty() {
-                                    last_non_empty_line = format!("[stderr] {}", text);
-                                }
-
                                 // Check for infinite loop pattern in stderr too
                                 if loop_detector.add_line(&text) && !loop_detected {
                                     loop_detected = true;
@@ -2973,39 +3066,10 @@ impl CliAgentTool {
                             _ => stderr_done = true,
                         }
                     }
-                    // Check for question patterns when no output for 15s
-                    _ = tokio::time::sleep(Duration::from_secs(15)), if !last_non_empty_line.is_empty() && last_output_time.elapsed() > Duration::from_secs(14) => {
-                        let line = &last_non_empty_line;
-                        let lower = line.to_lowercase();
-                        let is_question = line.ends_with('?')
-                            || lower.contains("y/n")
-                            || lower.contains("yes/no")
-                            || lower.contains("enter")
-                            || lower.contains("confirm")
-                            || lower.contains("choose")
-                            || lower.contains("select")
-                            || lower.contains("which");
-
-                        if is_question {
-                            // stdin is null so we can't answer — kill the process
-                            // and report the question so the orchestrator can handle it
-                            info!(
-                                question = %line,
-                                task = %task_context,
-                                "CLI agent appears stuck waiting for input — killing (stdin is null)"
-                            );
-                            let mut buf = display_buf_writer.lock().await;
-                            append_bounded_line(
-                                &mut buf,
-                                "[killed] CLI agent appears stuck waiting for input: ",
-                                line,
-                                BUFFER_CAP,
-                            );
-                            drop(buf);
-                            kill_process(&backend_for_task, &process_handle_for_task).await;
-                            break;
-                        }
-                    }
+                    // No wording of a silent agent's last line ends the run:
+                    // its stdin is null, so a prompt reads end-of-file at
+                    // once, and a run that stays silent is bounded by the
+                    // run's own limits, never by what its last line says.
                     _ = status_tick.tick() => {}
                 }
 
@@ -3100,9 +3164,12 @@ impl CliAgentTool {
             // reply never decides it.
             let changed_something = tree_receipt(&backend_for_receipt, &watched_for_task).await
                 != receipt_before_for_task;
-            let auth_failed =
-                CliAgentTool::detect_auth_error(&display_buf_writer.lock().await, &tool_name_owned)
-                    .is_some();
+            let auth_failed = cli_auth_failed(
+                &stdout_buf_writer.lock().await,
+                &display_buf_writer.lock().await,
+                exit_code,
+            );
+            auth_failed_for_task.store(auth_failed, Ordering::Release);
             let (run_phase, run_evidence) =
                 crate::helper_run::program_phase(&crate::helper_run::ProgramEnd {
                     exit_code,
@@ -3521,6 +3588,7 @@ impl CliAgentTool {
                 stdout_buf,
                 process_handle: process_handle.clone(),
                 finished: finished.clone(),
+                auth_failed: auth_failed.clone(),
                 session_id: session_id.to_string(),
                 delegated_task_id: delegated_task_id_owned.clone(),
                 working_dir: working_dir_owned,
@@ -3598,7 +3666,9 @@ impl CliAgentTool {
                 // Classify this before emitting ToolComplete so the live
                 // status cannot briefly report a false success.
                 let display_output = display_buf.lock().await.clone();
-                if let Some(auth_msg) = Self::detect_auth_error(&display_output, tool_name) {
+                let stdout_output = stdout_buf.lock().await.clone();
+                if cli_auth_failed(&stdout_output, &display_output, exit_code) {
+                    let auth_msg = Self::auth_error_message(tool_name);
                     if let Some(ref tx) = status_tx {
                         let (label, summary) = aidaemon_tools::sanitize::user_facing_tool_activity(
                             tool_name,
@@ -3670,6 +3740,9 @@ impl CliAgentTool {
                 }
 
                 if exit_code != Some(0) {
+                    if exited_before_agent_output(exit_code, &stdout_output) {
+                        mark_never_started();
+                    }
                     // On error, show the display buffer which includes stderr
                     let error_msg = format_cli_agent_failure(
                         tool_name,
@@ -3762,6 +3835,7 @@ impl CliAgentTool {
                     stdout_buf,
                     process_handle,
                     finished,
+                    auth_failed,
                     session_id: session_id.to_string(),
                     delegated_task_id: delegated_task_id_owned.clone(),
                     working_dir: working_dir_owned,
@@ -4497,9 +4571,13 @@ fn prohibited_cli_agent_command_reason(command: &str) -> Option<&'static str> {
 
     // E2E incidents: external coding agents tried to "fix scheduling" by hacking the
     // SQLCipher DB directly (sqlite/sqlcipher + key hunting). This tool runs in an
-    // auto-approve mode, so we must block obvious state-store manipulation.
+    // auto-approve mode and outside any path sandbox, so no typed filesystem
+    // guard covers the daemon's state database here; the command is checked
+    // for machine formats only: the database's file name (`aidaemon.db`, and
+    // its `-wal`/`-shm` siblings), the SQLCipher tool, and SQLCipher's key
+    // pragmas. A project's own `sqlite3 app.db` is not the daemon's database
+    // and runs.
     if lower.contains("aidaemon.db")
-        || lower.contains("sqlite3")
         || lower.contains("sqlcipher")
         || lower.contains("pragma key")
         || lower.contains("pragma cipher")
@@ -5115,9 +5193,10 @@ fn cli_agent_outcome(
     output: String,
     read_only_run: bool,
     left_in_background: bool,
+    never_started: bool,
 ) -> ToolCallOutcome {
     let exit_code = cli_agent_exit_code(&output);
-    let prelaunch_failure = failed_before_agent_launch(&output, exit_code);
+    let prelaunch_failure = never_started;
     let policy_block = output.trim_start().starts_with("Blocked:");
     let reported_failure = output.trim_start().starts_with("ERROR: CLI agent");
     let metadata = if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
@@ -5193,36 +5272,47 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let (output, left_in_background, settled, changed, run_label) = BACKGROUND_RUN_LABEL
-            .scope(
-                std::cell::RefCell::new(None),
-                RUN_CHANGED_LOCALLY.scope(
+        let (output, left_in_background, settled, changed, run_label, never_started) =
+            NEVER_STARTED
+                .scope(
                     std::cell::Cell::new(false),
-                    BACKGROUND_SETTLED.scope(
-                        std::cell::Cell::new(false),
-                        LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
-                            let output = self
-                                .call_with_status_under_contract(
-                                    arguments,
-                                    status_tx,
-                                    read_only_run,
-                                    enforce_native_access,
-                                    facts,
-                                )
-                                .await?;
-                            anyhow::Ok((
-                                output,
-                                LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
-                                BACKGROUND_SETTLED.with(std::cell::Cell::get),
-                                RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
-                                BACKGROUND_RUN_LABEL.with(|slot| slot.borrow_mut().take()),
-                            ))
-                        }),
+                    BACKGROUND_RUN_LABEL.scope(
+                        std::cell::RefCell::new(None),
+                        RUN_CHANGED_LOCALLY.scope(
+                            std::cell::Cell::new(false),
+                            BACKGROUND_SETTLED.scope(
+                                std::cell::Cell::new(false),
+                                LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
+                                    let output = self
+                                        .call_with_status_under_contract(
+                                            arguments,
+                                            status_tx,
+                                            read_only_run,
+                                            enforce_native_access,
+                                            facts,
+                                        )
+                                        .await?;
+                                    anyhow::Ok((
+                                        output,
+                                        LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                                        BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                                        RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
+                                        BACKGROUND_RUN_LABEL.with(|slot| slot.borrow_mut().take()),
+                                        NEVER_STARTED.with(std::cell::Cell::get),
+                                    ))
+                                }),
+                            ),
+                        ),
                     ),
-                ),
-            )
-            .await?;
-        let mut outcome = cli_agent_outcome(&action, output, read_only_run, left_in_background);
+                )
+                .await?;
+        let mut outcome = cli_agent_outcome(
+            &action,
+            output,
+            read_only_run,
+            left_in_background,
+            never_started,
+        );
         if changed && outcome.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded) {
             outcome.metadata.semantics = changed_locally_semantics(true)
                 .with_verification_mode(ToolVerificationMode::ResultContent);
@@ -5467,6 +5557,7 @@ impl CliAgentTool {
                                     )
                                     .await;
                                 }
+                                mark_never_started();
                                 break Ok(message);
                             };
 
@@ -5766,22 +5857,58 @@ mod tests {
     }
 
     #[test]
-    fn exit_127_env_failure_is_identified_as_prelaunch() {
+    fn exit_127_with_no_agent_output_is_prelaunch() {
         let output = "ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
 ## Failure Details\n[stderr] env: claude: No such file or directory";
-        let exit_code = cli_agent_exit_code(output);
-        assert_eq!(exit_code, Some(127));
-        assert!(failed_before_agent_launch(output, exit_code));
+        assert_eq!(cli_agent_exit_code(output), Some(127));
+        assert!(exited_before_agent_output(Some(127), ""));
+        // The agent started (its stream opened) before a command it ran was
+        // missing: not a launch failure.
+        assert!(!exited_before_agent_output(
+            Some(127),
+            r#"{"type":"system","subtype":"init"}"#
+        ));
+        assert!(!exited_before_agent_output(Some(1), ""));
     }
 
+    /// The words "could not start" or an exit-code line inside an agent's
+    /// own report never type its outcome: only the daemon's header and the
+    /// typed never-started flag do.
     #[test]
-    fn later_command_not_found_is_not_assumed_to_be_prelaunch() {
-        let output = "ERROR: CLI agent 'claude' failed (exit code 127).\n\n\
-## Failure Details\n[stderr] sh: deploy-helper: command not found";
-        assert!(!failed_before_agent_launch(
-            output,
-            cli_agent_exit_code(output)
-        ));
+    fn a_report_quoting_failure_words_is_not_a_failed_launch() {
+        let report = "Fixed it. Before the fix the server could not start and the \
+                      test failed (exit code 1).";
+        assert_eq!(cli_agent_exit_code(report), None);
+        let outcome = cli_agent_outcome("run", report.to_string(), false, false, false);
+        assert_eq!(
+            outcome.metadata.outcome_status,
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        let never = cli_agent_outcome(
+            "run",
+            "ERROR: CLI agent recovery exhausted before task execution.".to_string(),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            never.metadata.outcome_status,
+            Some(ToolOutcomeStatus::FailedPermanent)
+        );
+        assert!(never.metadata.transport_error.is_some());
+    }
+
+    /// The daemon's state database stays guarded by its file name; a
+    /// project's own SQLite database is the agent's to use.
+    #[test]
+    fn only_the_daemons_database_is_a_prohibited_command() {
+        assert!(
+            prohibited_cli_agent_command_reason("sqlite3 ~/.aidaemon/aidaemon.db .tables")
+                .is_some()
+        );
+        assert!(prohibited_cli_agent_command_reason("sqlcipher data.db").is_some());
+        assert!(prohibited_cli_agent_command_reason("sqlite3 app.db 'select 1'").is_none());
+        assert!(prohibited_cli_agent_command_reason("python3 -c 'import sqlite3'").is_none());
     }
 
     #[tokio::test]
@@ -7239,41 +7366,82 @@ mod tests {
     // Auth error detection tests
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_detect_auth_error_patterns() {
-        let cases = vec![
-            ("Error: authentication required", true),
-            ("401 Unauthorized", true),
-            ("Token expired, please re-authenticate", true),
-            ("Login required to continue", true),
-            ("Invalid API key provided", true),
-            ("Access denied: forbidden", true),
-            ("Invalid token for this resource", true),
-            (
-                "See https://goo.gle/gemini-cli-auth-docs#workspace-gca",
-                true,
-            ),
-            ("Normal output: everything is fine", false),
-            ("Compiling project...", false),
-        ];
+    #[test]
+    fn auth_failure_is_read_from_what_the_cli_reported_about_itself() {
+        // Claude Code's typed stream-json error.
+        let claude = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Invalid API key"}]},"error":"authentication_failed"}"#;
+        assert!(cli_auth_failed(claude, claude, Some(1)));
+        // Gemini CLI's own auth-help line, even on a zero exit.
+        let gemini = "See https://goo.gle/gemini-cli-auth-docs#workspace-gca";
+        assert!(cli_auth_failed(gemini, gemini, Some(0)));
+        // A Codex-style error event before any task output, non-zero exit.
+        let codex = r#"{"type":"thread.started"}
+{"type":"error","message":"unexpected status 401 Unauthorized"}"#;
+        assert!(cli_auth_failed(codex, codex, Some(1)));
+        // The CLI's stderr before any task output.
+        assert!(cli_auth_failed(
+            "",
+            "[stderr] Error: authentication required",
+            Some(1)
+        ));
+        assert!(!cli_auth_failed(
+            "",
+            "[stderr] Error: authentication required",
+            Some(0)
+        ));
+    }
 
-        for (output, should_detect) in cases {
-            let result = CliAgentTool::detect_auth_error(output, "test-agent");
-            if should_detect {
-                assert!(
-                    result.is_some(),
-                    "Expected auth error detection for: {}",
-                    output
-                );
-                assert!(result.unwrap().contains("authentication failed"));
-            } else {
-                assert!(
-                    result.is_none(),
-                    "False positive auth detection for: {}",
-                    output
-                );
-            }
-        }
+    /// An agent whose task output mentions auth words (fixing a 403
+    /// handler that returns "forbidden", testing an unauthorized path) is
+    /// not disabled: once it produced task output, its words are its work.
+    #[test]
+    fn an_agent_printing_auth_words_mid_task_is_not_quarantined() {
+        let stdout = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"The handler returns forbidden for guests; the test expects 401 Unauthorized."}]}}
+{"type":"result","is_error":true,"result":"tests failed: unauthorized"}"#;
+        let display = format!("{stdout}\n[stderr] warning: token expired in fixture");
+        assert!(!cli_auth_failed(stdout, &display, Some(1)));
+        // A plain-text agent's own output is its task output too.
+        assert!(!cli_auth_failed(
+            "Fixed the 403: it now returns forbidden.",
+            "Fixed the 403: it now returns forbidden.\n[stderr] not logged in to the demo site",
+            Some(1)
+        ));
+    }
+
+    /// A last line that reads like a question, then silence, does not end
+    /// the run: stdin is null, and no wording decides a run is stuck.
+    #[tokio::test]
+    async fn a_question_like_line_then_silence_does_not_kill_the_agent() {
+        let (tool, _db) = setup_echo_tool().await;
+        tool.tools.write().unwrap().insert(
+            "quiet-agent".to_string(),
+            CliToolEntry {
+                command: "/bin/sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'Selected 12 files. Which one next?\\n'; sleep 16; printf 'all 12 files done\\n'"
+                        .to_string(),
+                ],
+                description: "Quiet test agent".to_string(),
+                timeout: Duration::from_secs(60),
+                max_output_chars: 10_000,
+                is_dynamic: false,
+            },
+        );
+        tool.tool_names
+            .write()
+            .unwrap()
+            .push("quiet-agent".to_string());
+
+        let result = tool
+            .call(r#"{"action":"run","tool":"quiet-agent","prompt":"process the files"}"#)
+            .await
+            .unwrap();
+
+        assert!(result.contains("all 12 files done"), "got: {result}");
+        assert!(!result.contains("stuck waiting for input"), "got: {result}");
     }
 
     #[tokio::test]
@@ -7285,7 +7453,7 @@ mod tests {
                 command: "/bin/sh".to_string(),
                 args: vec![
                     "-c".to_string(),
-                    "printf 'authentication required\\n'; exit 1".to_string(),
+                    "printf 'authentication required\\n' >&2; exit 1".to_string(),
                 ],
                 description: "Unauthenticated test agent".to_string(),
                 timeout: Duration::from_secs(10),
