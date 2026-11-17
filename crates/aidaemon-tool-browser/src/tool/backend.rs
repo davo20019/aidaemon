@@ -738,15 +738,21 @@ impl ChromiumoxideBackend {
         } else {
             want_headless
         };
-        if use_headless {
-            builder = builder.arg("--headless=new");
-        }
+        // chromiumoxide 0.9 writes each flag as `--key[=value]` itself: a
+        // flag passed with its own dashes reaches Chrome as `----key` and is
+        // ignored (the profile then fell back to a temporary one, so nothing
+        // the owner signed in to was kept).
+        builder = if use_headless {
+            builder.new_headless_mode()
+        } else {
+            builder.with_head()
+        };
         // Use existing Chrome profile if configured (inherits cookies/sessions)
         if let Some(ref user_data_dir) = self.profile_in_use() {
-            let expanded = shellexpand::tilde(user_data_dir);
-            builder = builder.arg(format!("--user-data-dir={}", expanded));
+            let expanded = shellexpand::tilde(user_data_dir).into_owned();
+            builder = builder.user_data_dir(&expanded);
             let profile = self.config.profile.as_deref().unwrap_or("Default");
-            builder = builder.arg(format!("--profile-directory={}", profile));
+            builder = builder.arg(("profile-directory", profile));
             info!(
                 user_data_dir = %expanded,
                 profile,
@@ -755,17 +761,14 @@ impl ChromiumoxideBackend {
         }
 
         builder = builder
-            .arg(format!(
-                "--window-size={},{}",
-                self.config.screenshot_width, self.config.screenshot_height
-            ))
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-gpu")
-            .arg("--disable-dev-shm-usage")
+            .window_size(self.config.screenshot_width, self.config.screenshot_height)
+            .arg("no-first-run")
+            .arg("no-default-browser-check")
+            .arg("disable-gpu")
+            .arg("disable-dev-shm-usage")
             // Anti-detection: prevent sites from identifying headless Chrome
-            .arg("--disable-blink-features=AutomationControlled")
-            .arg("--disable-features=AutomationControlled");
+            .arg(("disable-blink-features", "AutomationControlled"))
+            .arg(("disable-features", "AutomationControlled"));
 
         let browser_config = builder.build().map_err(|e| {
             format!(
