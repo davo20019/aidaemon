@@ -744,7 +744,14 @@ impl ClientGateway {
         caller: &Caller,
     ) -> ServerFrame {
         let log = self.bus.log();
-        match log.remembered_reply(OWNER, request_id).await {
+        // Remembered per caller: one device never reads the reply another
+        // got (history, memories, a live-view ticket) by presenting its
+        // request id.
+        let remembered_as = match caller.principal.device_id.as_deref() {
+            Some(device_id) => format!("{device_id}/{request_id}"),
+            None => request_id.to_string(),
+        };
+        match log.remembered_reply(OWNER, &remembered_as).await {
             Ok(Some(reply)) => {
                 if let Ok(frame) = serde_json::from_str::<ServerFrame>(&reply) {
                     return frame;
@@ -767,7 +774,7 @@ impl ClientGateway {
         let keep = !matches!(&reply, ServerFrame::Error { error, .. } if error.retryable);
         if keep && let Ok(text) = serde_json::to_string(&reply) {
             match log
-                .remember_reply(OWNER, request_id, bus::now_ms(), &text)
+                .remember_reply(OWNER, &remembered_as, bus::now_ms(), &text)
                 .await
             {
                 Ok(kept) => {
@@ -826,7 +833,10 @@ impl ClientGateway {
             | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
-            Command::ListSurfaces | Command::ListDevices => Some(Scope::Observe),
+            Command::ListDevices => Some(Scope::Observe),
+            // The agent's screens (their sites and titles) are for a device
+            // that may watch them.
+            Command::ListSurfaces => Some(Scope::Control),
             Command::PointAt { .. } | Command::ShareScreen { .. } => Some(Scope::Control),
             Command::SetDeviceScopes { .. } => None,
             Command::OpenSurface { .. }
@@ -841,6 +851,20 @@ impl ClientGateway {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 format!("This device may not {scope:?}"),
+            ));
+        }
+        // A setup step can connect a chat bot (a new way in, with an owner
+        // of its own) and restarts the daemon: that is for the owner's own
+        // computer or a device that may answer any approval, never one with
+        // only Chat or a risk ceiling.
+        if matches!(command, Command::Setup { .. })
+            && !caller.principal.is_owner()
+            && (!self.pairing.may_now(&caller.principal, Scope::Approve)
+                || caller.principal.ceiling.is_some())
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "This device may not change the daemon's setup",
             ));
         }
         self.host.client_seen();

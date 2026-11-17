@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::DiscordChannel as SdkDiscord;
-use aidaemon_channels::bot::{BotDeps, SharedCommandDispatch, determine_role};
+use aidaemon_channels::bot::{BotDeps, SharedCommandDispatch};
 use aidaemon_channels::context::ChannelContext;
 use aidaemon_channels::hub::{
     ChannelCapabilities, ChannelHub, DynamicBotStore, HubChannel, MediaKind, MediaMessage,
@@ -38,6 +38,11 @@ use tracing::{info, warn};
 
 /// Longest Discord message: the adapter's limit.
 const MAX_MESSAGE_LEN: usize = crate::MAX_MESSAGE_LEN;
+
+/// Discord user ids are snowflakes (milliseconds since 2015 in the high
+/// bits), so every real one is far above this; ids from another platform
+/// (Telegram's, saved for a Discord bot by an old `/connect`) are below it.
+const MIN_DISCORD_USER_ID: u64 = 1 << 50;
 
 /// Commands available in the Discord channel (shared Core only).
 fn discord_commands() -> Vec<CommandDef> {
@@ -410,9 +415,9 @@ impl DiscordBot {
                     warn!(prompt = %answer.prompt_id, "Stale approval callback (no pending request)");
                     return;
                 }
-                // Answering needs an allowed user or owner; being in the
-                // server is not enough.
-                if !self.is_authorized(user_id) && !self.owner_user_ids.contains(&user_id) {
+                // Only an owner answers an approval; being in the server,
+                // or a guest on the allowlist, is not enough.
+                if self.role_of(user_id) != UserRole::Owner {
                     warn!(user_id, "Unauthorized Discord approval button press");
                     return;
                 }
@@ -450,9 +455,17 @@ impl DiscordBot {
             let _ = outlet.say_all("Unauthorized.").await;
             return;
         }
+        // A server member the owner never allowed is heard only when they
+        // address the bot (a mention or a reply to it), and their files are
+        // not kept: otherwise every message in every channel the bot can
+        // see would run a turn and fill the disk.
+        let known = self.is_authorized(user_id) || self.owner_user_ids.contains(&user_id);
+        if !known && !message.addressed {
+            return;
+        }
 
         let mut attachments = Vec::new();
-        if !message.attachments.is_empty() {
+        if !message.attachments.is_empty() && known {
             if !self.deps.files_enabled {
                 if message.text.is_empty() {
                     let _ = outlet.say_all("I can only process text messages.").await;
@@ -472,7 +485,7 @@ impl DiscordBot {
             return;
         }
 
-        let user_role = determine_role(&self.owner_user_ids, user_id);
+        let user_role = self.role_of(user_id);
         let text = if user_role == UserRole::Owner {
             aidaemon_channels::attachments::build_inbound_text(&message.text, &attachments)
         } else {
@@ -573,10 +586,28 @@ impl DiscordBot {
             .contains(&user_id)
     }
 
+    /// A sender's role. With owner ids configured, those are the owners and
+    /// everyone else is a guest. Without them (a dynamic bot) the allowlist
+    /// holds the owners: being in a server with the bot never makes anyone
+    /// an owner.
+    fn role_of(&self, user_id: u64) -> UserRole {
+        let owner = if self.owner_user_ids.is_empty() {
+            self.is_authorized(user_id)
+        } else {
+            self.owner_user_ids.contains(&user_id)
+        };
+        if owner {
+            UserRole::Owner
+        } else {
+            UserRole::Guest
+        }
+    }
+
     /// Auto-claim: a dynamic bot (no owner ids) whose allowlist is empty or
     /// holds only stale ids from another platform (Telegram ids saved for a
     /// Discord bot via /connect) is claimed by the first DM user, and the
-    /// claim is saved. Configured bots, which have owner ids, never are.
+    /// claim is saved. Configured bots, which have owner ids, never are, and
+    /// neither is a bot that already has a Discord user on its allowlist.
     async fn try_auto_claim(&self, user_id: u64) -> bool {
         if !self.owner_user_ids.is_empty() {
             return false;
@@ -588,6 +619,9 @@ impl DiscordBot {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if ids.contains(&user_id) {
                 return true;
+            }
+            if ids.iter().any(|id| *id >= MIN_DISCORD_USER_ID) {
+                return false;
             }
             info!(
                 user_id,
@@ -619,7 +653,7 @@ impl DiscordBot {
             return "Unauthorized.".to_string();
         }
         let session_id = self.session_for(user_id, guild, channel_id);
-        let user_role = determine_role(&self.owner_user_ids, user_id);
+        let user_role = self.role_of(user_id);
         self.dispatch_command(text, &session_id, user_id, user_role)
             .await
     }

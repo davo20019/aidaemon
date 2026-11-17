@@ -2013,6 +2013,9 @@ impl SlackBot {
 
         // Channel-specific commands.
         match cmd {
+            "/restart" if user_role != UserRole::Owner => {
+                "Only the owner can restart the daemon.".to_string()
+            }
             "/restart" => {
                 self.host.restart();
                 "Restart failed. You may need to restart manually.".to_string()

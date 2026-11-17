@@ -41,6 +41,8 @@ const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const ACCESS_PREFIX: &str = "acs_";
 /// Unanswered challenges held at once.
 const MAX_OPEN_CHALLENGES: usize = 1024;
+/// One device signs in a few sockets at once at most.
+const MAX_OPEN_CHALLENGES_PER_DEVICE: usize = 8;
 
 fn ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -191,10 +193,17 @@ fn internal(error: impl std::fmt::Display) -> ProtocolError {
 
 /// A pairing code: eight letters, shown as `XXXX-XXXX`.
 fn new_code() -> String {
-    let bytes = uuid::Uuid::new_v4().into_bytes();
-    let letters: String = bytes[..8]
+    // Two random bytes per letter, so the modulo bias is negligible, taken
+    // from positions that hold none of a UUID's fixed version/variant bits.
+    const RANDOM_BYTES: [usize; 8] = [0, 1, 2, 3, 4, 5, 7, 9];
+    let a = uuid::Uuid::new_v4().into_bytes();
+    let b = uuid::Uuid::new_v4().into_bytes();
+    let letters: String = RANDOM_BYTES
         .iter()
-        .map(|b| CODE_ALPHABET[usize::from(*b) % CODE_ALPHABET.len()] as char)
+        .map(|&i| {
+            let n = usize::from(a[i]) << 8 | usize::from(b[i]);
+            CODE_ALPHABET[n % CODE_ALPHABET.len()] as char
+        })
         .collect();
     format!("{}-{}", &letters[..4], &letters[4..])
 }
@@ -493,7 +502,13 @@ impl Pairing {
         let mut challenges = self.challenges.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_ms();
         challenges.retain(|_, c| c.expires_at_ms > now);
-        if challenges.len() >= MAX_OPEN_CHALLENGES {
+        // Per device too: one device (or anyone who learned its id) asking
+        // over and over must not use up everyone's sign-ins.
+        let own = challenges
+            .values()
+            .filter(|c| c.device_id == device.device_id)
+            .count();
+        if own >= MAX_OPEN_CHALLENGES_PER_DEVICE || challenges.len() >= MAX_OPEN_CHALLENGES {
             return Err(ProtocolError::new(
                 ErrorCode::RateLimited,
                 "Too many sign-ins at once; try again in a minute",
@@ -650,6 +665,7 @@ impl Pairing {
             .await
             .map_err(internal)?;
         if changed {
+            let mut narrowed = false;
             for access in self
                 .access
                 .lock()
@@ -657,7 +673,26 @@ impl Pairing {
                 .values_mut()
                 .filter(|a| a.principal.device_id.as_deref() == Some(device_id))
             {
+                narrowed |= access.principal.scopes.iter().any(|s| !scopes.contains(s));
                 access.principal.scopes = scopes.clone();
+            }
+            // A scope taken away: sockets the device already has open (the
+            // event stream, a live view it watches or controls) were let in
+            // under the old scopes and check them only then, so they close
+            // now. The device signs in again with what it still has.
+            if narrowed {
+                if let Some(token) = self
+                    .revocations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(device_id)
+                {
+                    token.cancel();
+                }
+                self.access
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|_, a| a.principal.device_id.as_deref() != Some(device_id));
             }
         }
         Ok(changed)

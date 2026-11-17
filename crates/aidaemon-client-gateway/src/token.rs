@@ -25,14 +25,7 @@ pub fn mint(path: &Path) -> std::io::Result<String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{}\n", hash(&token)))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
+    write_owner_only_file(path, &format!("{}\n", hash(&token)))?;
     Ok(token)
 }
 
@@ -106,11 +99,21 @@ fn write_owner_only_file(path: &std::path::Path, contents: &str) -> std::io::Res
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
+    // Created owner-only, never widened and narrowed after: another local
+    // user must not be able to open the file between the two.
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
     }
     std::fs::rename(&tmp, path)
 }

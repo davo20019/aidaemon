@@ -612,6 +612,28 @@ impl SharedCommands {
         sender_id: Option<&str>,
         user_role: UserRole,
     ) -> Option<String> {
+        // Everything here but a private aside and the chat's own task list
+        // changes or reveals something of the owner's (the model for every
+        // chat, running work, history, cost, the daemon itself), so it is
+        // the owner's: a guest in a shared chat does not get it.
+        if user_role != UserRole::Owner && !matches!(cmd, "/private" | "/tasks") {
+            let shared = matches!(
+                cmd,
+                "/model"
+                    | "/models"
+                    | "/auto"
+                    | "/cancel"
+                    | "/clear"
+                    | "/new"
+                    | "/status"
+                    | "/wipe"
+                    | "/cost"
+                    | "/context"
+                    | "/readonly"
+                    | "/mode"
+            ) || self.extensions.iter().any(|ext| ext.handles(cmd));
+            return shared.then(|| format!("Only the owner can use {cmd}."));
+        }
         Some(match cmd {
             "/model" => self.handle_model(args).await,
             "/models" => self.handle_models().await,

@@ -760,6 +760,17 @@ impl TelegramBot {
             return;
         }
 
+        // Only an owner answers an approval: a guest on the allowlist who
+        // shares a group with the owner sees the card but may not decide it.
+        if determine_role(&self.owner_user_ids, user_id) != UserRole::Owner {
+            warn!(user_id, "Approval button pressed by a non-owner");
+            let _ = bot
+                .answer_callback_query(q.id)
+                .text("Only the owner can answer this.")
+                .await;
+            return;
+        }
+
         let Some((prompt_id, choice_id)) = self.sdk_transport().approval_choice(&data) else {
             let _ = bot
                 .answer_callback_query(q.id)

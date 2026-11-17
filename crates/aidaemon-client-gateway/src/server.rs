@@ -596,8 +596,12 @@ pub(crate) async fn serve_app_file(
         headers.push((
             axum::http::header::CONTENT_SECURITY_POLICY,
             "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' ws: wss:; \
-             style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:",
+             style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; \
+             frame-ancestors 'none'",
         ));
+        // The app answers approvals: no other page may frame it.
+        headers.push((axum::http::header::X_FRAME_OPTIONS, "DENY"));
+        headers.push((axum::http::header::REFERRER_POLICY, "no-referrer"));
     }
     let mut response = (StatusCode::OK, bytes).into_response();
     for (name, value) in headers {
