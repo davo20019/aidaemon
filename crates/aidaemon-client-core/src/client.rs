@@ -1023,9 +1023,15 @@ impl Client {
             ServerFrame::Event {
                 event, session_id, ..
             } => {
-                // A turn starting or ending takes waiting messages in.
-                if let (Some(session), Event::TurnStarted { .. } | Event::TurnCompleted { .. }) =
-                    (session_id.as_deref(), event)
+                // A turn starting or ending takes waiting messages in, and so
+                // does a running turn that reads one (it arrives as the
+                // owner's message, mid-turn).
+                if let (
+                    Some(session),
+                    Event::TurnStarted { .. }
+                    | Event::TurnCompleted { .. }
+                    | Event::UserMessage { .. },
+                ) = (session_id.as_deref(), event)
                     && self.queued.get(session).is_some_and(|q| !q.is_empty())
                 {
                     self.refresh_queued(session);
@@ -3430,6 +3436,31 @@ mod tests {
         );
         let (_, list) = client.take_outgoing().pop().unwrap();
         assert!(matches!(list, Command::ListQueued { .. }));
+    }
+
+    /// Live 2026-11-17: the running turn read "AID inspired." and showed it
+    /// as the owner's message, while the waiting list kept it until the turn
+    /// ended. The owner's message arriving reads the list afresh.
+    #[test]
+    fn a_message_the_running_turn_reads_leaves_the_waiting_list() {
+        let mut client = Client::new();
+        let here = cx(Some("app:a"));
+        client.update(
+            frame(r#"{"type":"ack","request_id":"q","result":{"type":"queued","session_id":"app:a","messages":[{"id":7,"text":"AID inspired.","queued_at_ms":5}]}}"#),
+            &here,
+        );
+        client.take_outgoing();
+        client.update(
+            frame(r#"{"type":"event","seq":4,"at_ms":6,"session_id":"app:a","event":{"type":"user_message","session_id":"app:a","text":"AID inspired.","origin":"app"}}"#),
+            &here,
+        );
+        let sent = client.take_outgoing();
+        assert!(
+            sent.iter().any(
+                |(_, c)| matches!(c, Command::ListQueued { session_id } if session_id == "app:a")
+            ),
+            "{sent:?}"
+        );
     }
 
     #[test]
