@@ -492,8 +492,15 @@ impl ClientHost for Host {
                 text: text.to_string(),
                 // A minute apart, ending an hour ago.
                 at_ms: now_ms() - 3_600_000 - (count - n as u64) * 60_000,
+                // The plan's reply used many tools, to try a long list.
                 tools: if *role == "assistant" {
-                    vec!["read_file".into(), "web_search".into(), "read_file".into()]
+                    let n = if session_id == "app:plan" { 18 } else { 3 };
+                    ["read_file", "web_search", "read_file", "terminal", "edit_file"]
+                        .iter()
+                        .cycle()
+                        .take(n)
+                        .map(|t| t.to_string())
+                        .collect()
                 } else {
                     Vec::new()
                 },

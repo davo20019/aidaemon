@@ -292,6 +292,97 @@ pub fn sections(open: Signal<Vec<SharedString>>, items: Vec<(String, String, Vie
     view().child(list)
 }
 
+/// What `open` shows under its trigger, unfolding: a region that clips it
+/// grows from nothing to the content's height and back on a spring, what
+/// is below moving with it; nothing fades or overlaps. It opens on a
+/// softer spring than it closes ([`motion::unfold_open`]), and the content
+/// stays until the region has closed. The mechanism is `nsh_base`'s
+/// collapsible reveal (one layout animation of the commit that flips
+/// `open`), whose single spring is too quick to open a long list. With
+/// reduced motion, and in a terminal, it comes and goes at once.
+pub fn unfold<E: IntoElement>(open: Signal<bool>, content: impl Fn() -> E + 'static) -> View {
+    let region = element_ref();
+    let unfolding = use_context::<Unfolding>();
+    let initial = untracked(|| open.get());
+    // The content is in the tree: while open, and while it closes.
+    let mounted = signal(initial);
+    let shown = stored(initial);
+    // Each change of `open` ends what a closing reveal waits for.
+    let generation = stored(0u64);
+    effect(move || {
+        let opening = open.get();
+        untracked(|| {
+            if shown.replace(opening) == opening {
+                return;
+            }
+            let current = generation.get().wrapping_add(1);
+            generation.replace(current);
+            let animated = !reduce_motion() && idiom() != nsh_core::platform::Idiom::Terminal;
+            let transition = if opening {
+                motion::unfold_open()
+            } else {
+                motion::unfold_close()
+            };
+            if animated {
+                region.animate_layout(transition);
+                if let Some(unfolding) = unfolding {
+                    unfolding.hold(transition.run_ms());
+                }
+            }
+            if opening || !animated {
+                mounted.set(opening);
+                return;
+            }
+            // Out once the region has closed: the platform reports no end.
+            set_timeout(
+                Duration::from_millis(transition.run_ms() as u64),
+                move || {
+                    if generation.get() == current {
+                        mounted.set(false);
+                    }
+                },
+            );
+        });
+    });
+    view()
+        .element_ref(&region)
+        .overflow_hidden()
+        .style_with(move |s| if open.get() { s } else { s.h(px(0.0)) })
+        .child(when(move || mounted.get(), content))
+}
+
+/// Whether an [`unfold`] is moving inside a list that follows its end
+/// (the transcript). Such a list jumps straight to the new end when what is
+/// at its end grows, which would yank the view while the region slides
+/// open; while this holds, it keeps its place instead and the content
+/// grows below the fold. The list provides it ([`Unfolding::provide`]) and
+/// reads [`Unfolding::active`]; each unfold below it holds it while it
+/// moves.
+#[derive(Clone, Copy)]
+pub struct Unfolding(Signal<u32>);
+
+impl Unfolding {
+    /// One for the views built after this call to find.
+    pub fn provide() -> Self {
+        let unfolding = Self(signal(0));
+        provide_context(unfolding);
+        unfolding
+    }
+
+    /// Some unfold is moving.
+    pub fn active(self) -> bool {
+        self.0.get() > 0
+    }
+
+    /// Held for `ms`, from now.
+    fn hold(self, ms: f32) {
+        self.0.update(|n| *n += 1);
+        set_timeout(Duration::from_millis(ms as u64), move || {
+            self.0.update(|n| *n = n.saturating_sub(1))
+        });
+    }
+}
+
 /// A row of tabs over one page at a time: `labels` in order, `selected`
 /// the open one's index.
 pub fn tab_bar(selected: Signal<usize>, labels: &[&'static str]) -> View {

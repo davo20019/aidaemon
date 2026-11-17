@@ -796,10 +796,11 @@ fn transcript(store: Store, session: String) -> View {
     let all = computed(move || rows(store, &id));
     let last_seen = signal(usize::MAX);
     let list = element_ref();
+    let unfolding = ui::Unfolding::provide();
     view()
         .flex_1()
         .child(
-            transcript_list(store, session, all, last_seen)
+            transcript_list(store, session, all, last_seen, unfolding)
                 .element_ref(&list)
                 .flex_1(),
         )
@@ -834,6 +835,7 @@ fn transcript_list(
     session: String,
     all: Memo<Vec<Row>>,
     last_seen: Signal<usize>,
+    unfolding: ui::Unfolding,
 ) -> VirtualList {
     let count = all.with_untracked(Vec::len);
     virtual_list(
@@ -951,7 +953,10 @@ fn transcript_list(
     })
     .estimated_item_size(px(96.0))
     .initial_scroll_index(count.saturating_sub(1))
-    .follow_end(px(48.0))
+    // Following the end, except while a section unfolds: the list would
+    // jump to the new end in one step under the sliding region. No
+    // distance is within a negative threshold, so it keeps its place.
+    .follow_end(move || px(if unfolding.active() { -1.0 } else { 48.0 }))
     .content_padding_top(px(12.0))
     .content_padding_bottom(px(12.0))
 }
@@ -976,7 +981,7 @@ fn activity(
     view()
         .gap_1()
         .child(ui::disclosure(summary, open).accessibility_label("Tools this reply used"))
-        .child(when(move || open.get(), move || tool_list(data.clone())))
+        .child(ui::unfold(open, move || tool_list(data.clone())))
 }
 
 /// Every tool of a turn, in order, each opening to what it did.
@@ -1010,10 +1015,9 @@ fn tool_call(number: usize, tool: &str, call: Option<ToolCallInfo>) -> View {
     let open = signal(false);
     view()
         .child(ui::tool_row(number, tool.to_owned(), Some(open)))
-        .child(when(
-            move || open.get(),
-            move || ui::call_detail(call.input.clone(), call.output.clone()),
-        ))
+        .child(ui::unfold(open, move || {
+            ui::call_detail(call.input.clone(), call.output.clone())
+        }))
 }
 
 /// "Used 4 tools: read_file ×2, web_search, terminal · 12s"; while the
@@ -1343,10 +1347,7 @@ fn live(store: Store, session: String) -> View {
                     },
                 )),
         )
-        .child(when(
-            move || open.get() && count.get() > 0,
-            move || tool_list(so_far.clone()),
-        ))
+        .child(ui::unfold(open, move || tool_list(so_far.clone())))
 }
 
 fn composer(store: Store, session: Option<String>) -> View {

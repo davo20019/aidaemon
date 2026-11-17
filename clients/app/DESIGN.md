@@ -54,7 +54,7 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | All | A page replaces another (conversation, Settings, Memory, System) | `motion::next_layout`: fade, `BASE` |
 | Phone | Sidebar or inspector opens or closes | `ui::drawer` (nsh-base Sheet): slides in from its own edge (sidebar left, inspector right) over a dimmed page (`SCRIM`), back out on close; a tap on the dimmed page, Escape or back closes it; in place with reduced motion |
 | Desktop | Sidebar or inspector toggles | At once: the resizable group keeps measured widths, so it is not animated |
-| Conversation, Settings | Tools pill, sections unfold | `motion::next_unfold` (content fades in, what is below moves); sections `reveal` |
+| Conversation, Settings | Tools pill, a tool's details, more options, sections unfold | `ui::unfold` / accordion `reveal`: a clipped height springs open and shut, what is below moves with it; nothing fades or overlaps |
 | Sidebar | Row menu opens and closes | Grows from where it was asked for (`opacity-0 scale-95`), `BASE` |
 | All | A short note ("Copied", a setting saved, the view moved) | Toast at the bottom, `ENTER` in, leaves after 6 s, paused while hovered; its close button, Escape or a swipe dismisses |
 | Settings | A change is refused | Danger banner that stays until dismissed or the next change |

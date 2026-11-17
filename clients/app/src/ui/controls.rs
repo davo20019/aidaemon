@@ -1270,14 +1270,12 @@ pub fn count_toggle(
                 .duration(motion::FAST)
                 .accessibility_elements_hidden(true),
         )
-        .on_press(move || {
-            motion::next_unfold();
-            open.update(|o| *o = !*o)
-        })
+        .on_press(move || open.update(|o| *o = !*o))
 }
 
 /// A quiet pill that opens and closes what is under it: a chevron that
-/// turns, then its label. The owner of `open` renders the content.
+/// turns, then its label. The owner of `open` renders the content, in an
+/// [`super::unfold`].
 pub fn disclosure(
     label: impl IntoReactive<SharedString>,
     open: Signal<bool>,
@@ -1316,10 +1314,7 @@ pub fn disclosure(
         )
         // Never wider than the column: a long label ends in "…".
         .max_w(percentage(1.0))
-        .on_press(move || {
-            motion::next_unfold();
-            open.update(|o| *o = !*o)
-        })
+        .on_press(move || open.update(|o| *o = !*o))
 }
 
 /// One tool of a reply's activity list: its number and name. With details
@@ -1363,10 +1358,7 @@ pub fn tool_row(number: usize, name: String, open: Option<Signal<bool>>) -> View
                     .accessibility_elements_hidden(true),
             )
             .child(label)
-            .on_press(move || {
-                motion::next_unfold();
-                open.update(|o| *o = !*o)
-            }),
+            .on_press(move || open.update(|o| *o = !*o)),
     )
 }
 

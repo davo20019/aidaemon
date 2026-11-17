@@ -1568,36 +1568,33 @@ fn provider_form(
     let needs_base_url = option.needs_base_url;
     body = body
         .child(ui::disclosure(more_label, form.more))
-        .child(when(
-            move || form.more.get(),
-            move || {
-                let mut more = view().gap_2().child(faint(
-                    "Empty fields take the provider's own address and models.",
-                ));
-                if !needs_base_url {
-                    more = more.child(
-                        ui::field("Address", form.base_url)
-                            .label("Base URL")
-                            .w_full(),
-                    );
-                }
-                more.child(
-                    ui::field("Main model", form.primary)
-                        .label("Main model")
+        .child(ui::unfold(form.more, move || {
+            let mut more = view().gap_2().child(faint(
+                "Empty fields take the provider's own address and models.",
+            ));
+            if !needs_base_url {
+                more = more.child(
+                    ui::field("Address", form.base_url)
+                        .label("Base URL")
                         .w_full(),
-                )
-                .child(
-                    ui::field("Fast model", form.fast)
-                        .label("Fast model")
-                        .w_full(),
-                )
-                .child(
-                    ui::field("Smart model", form.smart)
-                        .label("Smart model")
-                        .w_full(),
-                )
-            },
-        ));
+                );
+            }
+            more.child(
+                ui::field("Main model", form.primary)
+                    .label("Main model")
+                    .w_full(),
+            )
+            .child(
+                ui::field("Fast model", form.fast)
+                    .label("Fast model")
+                    .w_full(),
+            )
+            .child(
+                ui::field("Smart model", form.smart)
+                    .label("Smart model")
+                    .w_full(),
+            )
+        }));
     body.child(submit(store, adding, form, ready))
 }
 

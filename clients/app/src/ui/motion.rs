@@ -32,6 +32,17 @@ pub fn next_unfold() {
     animate(nsh_core::element::LayoutAnimation::all(fade()));
 }
 
+/// An [`super::unfold`] opening: a soft spring, so a long list arrives
+/// rather than snaps.
+pub fn unfold_open() -> nsh_core::element::LayoutTransition {
+    nsh_core::element::LayoutTransition::spring(nsh_core::element::Spring::new(ENTER + 60.0))
+}
+
+/// An [`super::unfold`] closing: quicker, out of the way.
+pub fn unfold_close() -> nsh_core::element::LayoutTransition {
+    nsh_core::element::LayoutTransition::spring(nsh_core::element::Spring::new(BASE))
+}
+
 fn fade() -> nsh_core::element::LayoutTransition {
     nsh_core::element::LayoutTransition::new(nsh_core::element::LayoutCurve::EaseInEaseOut, BASE)
 }
