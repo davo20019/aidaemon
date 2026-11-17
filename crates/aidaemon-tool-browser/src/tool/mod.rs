@@ -1159,11 +1159,12 @@ impl BrowserTool {
         // `load` does NOT hard-fail navigate — `wait_for_navigation` returns
         // best-effort on its internal timeout. A genuine connection-class error
         // here propagates so `dispatch_with_recovery` can classify it.
+        let faults = self.backend.connection_faults();
         if let Err(e) = page.wait_for_navigation(self.nav_timeout).await {
             // If the wait itself failed for a connection reason, the recovery
             // wrapper handles it; surface it. The local timeout never reaches
             // here (it returns Ok). See the connection-reset note below.
-            if backend::is_connection_error(&e) {
+            if self.connection_lost_since(faults) {
                 return Err(e);
             }
             warn!(error = %e, "navigation wait reported a non-connection error; proceeding to URL revalidation");
@@ -1610,6 +1611,7 @@ impl BrowserTool {
         // a navigation actually completes, so for a non-navigating click the
         // settle timer wins and we return fast.
         let nav_budget = self.nav_timeout.min(self.action_timeout);
+        let faults = self.backend.connection_faults();
         tokio::select! {
             biased;
             _ = tokio::time::sleep(CLICK_SETTLE) => {
@@ -1620,7 +1622,7 @@ impl BrowserTool {
                 // connection-class error so recovery can classify it; otherwise
                 // proceed to popup detection.
                 if let Err(e) = nav {
-                    if backend::is_connection_error(&e) {
+                    if self.connection_lost_since(faults) {
                         return Err(e);
                     }
                     warn!(error = %e, "click navigation wait reported a non-connection error");
@@ -1905,6 +1907,7 @@ impl BrowserTool {
             // Evaluate the condition once. A connection-class error from a state
             // probe is surfaced so `dispatch_with_recovery` can classify it; a
             // benign "not yet" simply keeps polling.
+            let faults = self.backend.connection_faults();
             match self
                 .evaluate_wait_condition(&page, condition, selector, needle)
                 .await
@@ -1912,7 +1915,7 @@ impl BrowserTool {
                 Ok(true) => return Ok(condition.success_message(selector, needle)),
                 Ok(false) => {}
                 Err(e) => {
-                    if backend::is_connection_error(&e) {
+                    if self.connection_lost_since(faults) {
                         return Err(e);
                     }
                     // Non-connection probe error (e.g. transient) — treat as
@@ -1958,9 +1961,10 @@ impl BrowserTool {
             WaitCondition::TextContains => {
                 let needle = needle.unwrap_or("");
                 // A missing element yields no text → not satisfied yet.
+                let faults = self.backend.connection_faults();
                 match page.inner_text(selector).await {
                     Ok(text) => Ok(text.contains(needle)),
-                    Err(e) if backend::is_connection_error(&e) => Err(e),
+                    Err(e) if self.connection_lost_since(faults) => Err(e),
                     Err(_) => Ok(false),
                 }
             }
@@ -2104,9 +2108,16 @@ impl BrowserTool {
         )
     }
 
+    /// Whether a transport failure was recorded since `faults` was read
+    /// ([`backend::BrowserBackend::connection_faults`]).
+    fn connection_lost_since(&self, faults: u64) -> bool {
+        self.backend.connection_faults() != faults
+    }
+
     /// Run an action with disconnect recovery layered on top of `dispatch_action`.
     ///
-    /// On a CONNECTION-CLASS error (per `backend::is_connection_error`) — the
+    /// On a CONNECTION-CLASS error (a typed transport failure recorded while the
+    /// action ran, `connection_lost_since`) — the
     /// websocket/CDP connection to Chrome died, distinct from an ordinary page
     /// error like "element not found" — recovery splits by idempotency, which is
     /// known HERE (the tool layer) via the action's risk class:
@@ -2129,6 +2140,7 @@ impl BrowserTool {
         files: CallFiles<'_>,
         cleared: bool,
     ) -> Result<DispatchResult, String> {
+        let faults = self.backend.connection_faults();
         let first = self
             .dispatch_action(action, args, session_id, files, cleared)
             .await;
@@ -2137,9 +2149,11 @@ impl BrowserTool {
             Err(e) => e,
         };
 
-        // Only connection-class failures trigger recovery. A normal page error
-        // ("Element not found", "Timeout", ...) is surfaced as-is.
-        if !backend::is_connection_error(&err) {
+        // Only connection-class failures trigger recovery: a typed transport
+        // failure was recorded while the action ran. A normal page error
+        // ("Element not found", a script exception, "Timeout", ...) is
+        // surfaced as-is, whatever its text says.
+        if !self.connection_lost_since(faults) {
             return Err(err);
         }
 
@@ -2290,8 +2304,9 @@ impl BrowserTool {
             // Bounded navigation readiness instead of a fixed 2s sleep (see
             // `action_navigate`). Best-effort: a never-`load` page proceeds to
             // URL revalidation; a connection error propagates.
+            let faults = self.backend.connection_faults();
             if let Err(e) = page.wait_for_navigation(self.nav_timeout).await {
-                if backend::is_connection_error(&e) {
+                if self.connection_lost_since(faults) {
                     return Err(e);
                 }
                 warn!(error = %e, "new_tab navigation wait reported a non-connection error");

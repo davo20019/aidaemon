@@ -327,6 +327,11 @@ pub trait BrowserBackend: Send + Sync {
     /// Ensure a browser is launched or connected and ready for use.
     async fn ensure_ready(&self) -> Result<(), String>;
 
+    /// Transport failures seen so far ([`ConnectionFaults`]). An action
+    /// failed because the connection died when this count moved while it
+    /// ran.
+    fn connection_faults(&self) -> u64;
+
     /// Create a NEW page/tab and return its `(target_id, context_id, handle)`.
     ///
     /// Unlike the old `current_page()` (which grabbed the first existing tab and
@@ -438,49 +443,47 @@ pub enum SignInStore {
     NotKept,
 }
 
-/// Classify a backend/page error string as a transport/connection-class failure
-/// (the connection to Chrome itself is dead) versus an ordinary page-level error
-/// (element not found, navigation failed, timeout, etc.).
-///
-/// This drives the tool layer's recovery decision: connection-class errors
-/// trigger a single reconnect (+ observation retry / mutation non-replay), while
-/// ordinary errors are surfaced verbatim with no reconnect.
-///
-/// The patterns are deliberately CONSERVATIVE — only true transport failures.
-/// chromiumoxide's `CdpError` surfaces transport death through several shapes:
-/// - websocket teardown (`"websocket"`, `"Ws("`, `"connection closed"`,
-///   `"connection reset"`),
-/// - the internal command channel being torn down when the handler task ends
-///   (`"channel closed"`, `"Sender was dropped"`, `"receiver"`/`"sender"` dropped,
-///   `"request did not resolve"`),
-/// - the launched/attached Chrome process going away
-///   (`"chrome process"`, `"the browser was closed"`, `"no response from"`).
-///
-/// A normal `"Element not found"` / `"JavaScript execution failed"` /
-/// `"Timeout"` is NOT a connection error — it must never trigger a reconnect.
-pub fn is_connection_error(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    const CONNECTION_PATTERNS: &[&str] = &[
-        "connection closed",
-        "connection reset",
-        "connection refused",
-        "connection aborted",
-        "websocket",
-        "ws(",
-        "channel closed",
-        "sender was dropped",
-        "sender dropped",
-        "receiver dropped",
-        "channel is closed",
-        "request did not resolve",
-        "no response from",
-        "the browser was closed",
-        "chrome process",
-        "browser process",
-        "transport",
-        "broken pipe",
-    ];
-    CONNECTION_PATTERNS.iter().any(|p| e.contains(p))
+/// Whether a chromiumoxide error means the connection to Chrome itself is
+/// gone, judged from its typed variant: the websocket failed (`Ws`, `Io`),
+/// the handler's command channel is closed (`ChannelSendError`), or the
+/// handler dropped the request unanswered (`NoResponse`). A page error
+/// (`JavascriptException`, `NotFound`, a `Chrome` protocol error, a request
+/// `Timeout`) is not, whatever its text says, so nothing a page throws can
+/// trigger a reconnect.
+pub fn is_transport_error(error: &chromiumoxide::error::CdpError) -> bool {
+    use chromiumoxide::error::CdpError;
+    matches!(
+        error,
+        CdpError::Ws(_) | CdpError::Io(_) | CdpError::ChannelSendError(_) | CdpError::NoResponse
+    )
+}
+
+/// How many transport failures the backend and its pages have seen: typed
+/// state, recorded where a typed chromiumoxide error is still in hand
+/// ([`is_transport_error`]) or when the CDP handler task ends. The tool's
+/// recovery compares the count before and after an action instead of reading
+/// error text ([`BrowserBackend::connection_faults`]).
+#[derive(Clone, Default)]
+pub struct ConnectionFaults(Arc<std::sync::atomic::AtomicU64>);
+
+impl ConnectionFaults {
+    /// Failures seen so far.
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Record a transport failure.
+    pub fn record(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record `error` if it is a transport failure; return `message`.
+    fn noted(&self, error: &chromiumoxide::error::CdpError, message: String) -> String {
+        if is_transport_error(error) {
+            self.record();
+        }
+        message
+    }
 }
 
 // =============================================================================
@@ -498,6 +501,8 @@ pub struct ChromiumoxideBackend {
     /// handler is treated as a dead connection instead of "healthy because
     /// `browser.is_some()`".
     handler_alive: Arc<AtomicBool>,
+    /// Transport failures seen by this backend and its pages.
+    faults: ConnectionFaults,
     /// True when connected to an existing Chrome (don't close it on "close").
     connected_to_existing: Arc<Mutex<bool>>,
     /// Runtime-mutable headless mode (togglable via the tool's set_mode action).
@@ -539,6 +544,7 @@ impl ChromiumoxideBackend {
             browser: Arc::new(Mutex::new(None)),
             browser_handle: Arc::new(Mutex::new(None)),
             handler_alive: Arc::new(AtomicBool::new(false)),
+            faults: ConnectionFaults::default(),
             connected_to_existing: Arc::new(Mutex::new(false)),
             headless,
             session_isolation: std::sync::Mutex::new(session_isolation),
@@ -609,10 +615,10 @@ impl ChromiumoxideBackend {
 
         let (page, context_id) = match self.session_isolation() {
             SessionIsolation::Page => (
-                browser
-                    .new_page("about:blank")
-                    .await
-                    .map_err(|e| format!("Failed to create new page: {}", e))?,
+                browser.new_page("about:blank").await.map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to create new page: {}", e))
+                })?,
                 None,
             ),
             SessionIsolation::BrowserContext => {
@@ -623,7 +629,12 @@ impl ChromiumoxideBackend {
                 let context_id = browser
                     .create_browser_context(Default::default())
                     .await
-                    .map_err(|e| format!("Failed to create isolated browser context: {}", e))?;
+                    .map_err(|e| {
+                        self.faults.noted(
+                            &e,
+                            format!("Failed to create isolated browser context: {}", e),
+                        )
+                    })?;
                 debug!("Created isolated browser context for session");
                 let context_id_str = context_id.as_ref().to_string();
                 let params = CreateTargetParams::builder()
@@ -631,10 +642,10 @@ impl ChromiumoxideBackend {
                     .browser_context_id(context_id)
                     .build()
                     .map_err(|e| format!("Failed to build isolated page parameters: {}", e))?;
-                let page = browser
-                    .new_page(params)
-                    .await
-                    .map_err(|e| format!("Failed to create new isolated page: {}", e))?;
+                let page = browser.new_page(params).await.map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to create new isolated page: {}", e))
+                })?;
                 (page, Some(context_id_str))
             }
         };
@@ -717,12 +728,15 @@ impl ChromiumoxideBackend {
         H: futures::Stream + Send + Unpin + 'static,
     {
         let alive = Arc::clone(&self.handler_alive);
+        let faults = self.faults.clone();
         alive.store(true, Ordering::SeqCst);
         tokio::spawn(async move {
             while handler.next().await.is_some() {}
             // The handler stream ended: the CDP connection is gone. Record it so
-            // ensure_ready/is_connected stop treating this browser as healthy.
+            // ensure_ready/is_connected stop treating this browser as healthy,
+            // and so an action failing now is recovered as a dead connection.
             alive.store(false, Ordering::SeqCst);
+            faults.record();
             warn!("browser CDP handler exited — connection is no longer healthy");
         })
     }
@@ -855,6 +869,10 @@ impl ChromiumoxideBackend {
 
 #[async_trait]
 impl BrowserBackend for ChromiumoxideBackend {
+    fn connection_faults(&self) -> u64 {
+        self.faults.count()
+    }
+
     async fn ensure_ready(&self) -> Result<(), String> {
         let mut guard = self.browser.lock().await;
 
@@ -883,7 +901,14 @@ impl BrowserBackend for ChromiumoxideBackend {
 
     async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String> {
         let (target_id, context_id, page) = self.new_blank_page().await?;
-        Ok((target_id, context_id, Arc::new(ChromiumoxidePage { page })))
+        Ok((
+            target_id,
+            context_id,
+            Arc::new(ChromiumoxidePage {
+                page,
+                faults: self.faults.clone(),
+            }),
+        ))
     }
 
     async fn shutdown(&self) -> Result<String, String> {
@@ -974,7 +999,10 @@ impl BrowserBackend for ChromiumoxideBackend {
         let returns = browser
             .execute(GetTargetsParams::builder().build())
             .await
-            .map_err(|e| format!("Failed to list browser tabs: {}", e))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to list browser tabs: {}", e))
+            })?;
         let infos = returns
             .result
             .target_infos
@@ -1003,9 +1031,13 @@ impl BrowserBackend for ChromiumoxideBackend {
         let page = browser
             .get_page(TargetId::new(target_id.to_string()))
             .await
-            .map_err(|e| format!("Tab '{}' not found: {}", target_id, e))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Tab '{}' not found: {}", target_id, e))
+            })?;
         Ok(Arc::new(ChromiumoxidePage {
             page: Arc::new(page),
+            faults: self.faults.clone(),
         }))
     }
 
@@ -1017,7 +1049,10 @@ impl BrowserBackend for ChromiumoxideBackend {
         browser
             .execute(CloseTargetParams::new(TargetId::new(target_id.to_string())))
             .await
-            .map_err(|e| format!("Failed to close tab '{}': {}", target_id, e))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to close tab '{}': {}", target_id, e))
+            })?;
         Ok(())
     }
 
@@ -1164,23 +1199,24 @@ fn fitted_room(target: &str) -> Option<(u32, u32)> {
 /// Page handle wrapping a concrete `chromiumoxide::Page`.
 struct ChromiumoxidePage {
     page: Arc<chromiumoxide::Page>,
+    faults: ConnectionFaults,
 }
 
 #[async_trait]
 impl PageHandle for ChromiumoxidePage {
     async fn goto(&self, url: &str) -> Result<(), String> {
-        self.page
-            .goto(url)
-            .await
-            .map_err(|e| format!("Failed to navigate to {}: {}", url, e))?;
+        self.page.goto(url).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to navigate to {}: {}", url, e))
+        })?;
         Ok(())
     }
 
     async fn find_element(&self, selector: &str) -> Result<(), String> {
-        self.page
-            .find_element(selector)
-            .await
-            .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+        self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
         Ok(())
     }
 
@@ -1239,7 +1275,7 @@ impl PageHandle for ChromiumoxidePage {
                 false,
             )
             .await
-            .map_err(|e| format!("Failed to check visibility of '{}': {}", selector, e))?;
+            .map_err(|e| self.faults.noted(&e, format!("Failed to check visibility of '{}': {}", selector, e)))?;
         Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
@@ -1254,7 +1290,12 @@ impl PageHandle for ChromiumoxidePage {
         let ret = element
             .call_js_fn("function() { return !this.disabled; }", false)
             .await
-            .map_err(|e| format!("Failed to check enabled state of '{}': {}", selector, e))?;
+            .map_err(|e| {
+                self.faults.noted(
+                    &e,
+                    format!("Failed to check enabled state of '{}': {}", selector, e),
+                )
+            })?;
         Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
@@ -1268,7 +1309,12 @@ impl PageHandle for ChromiumoxidePage {
         let ret = element
             .call_js_fn(super::policy::ELEMENT_FACTS_FN, false)
             .await
-            .map_err(|e| format!("Failed to read element facts of '{}': {}", selector, e))?;
+            .map_err(|e| {
+                self.faults.noted(
+                    &e,
+                    format!("Failed to read element facts of '{}': {}", selector, e),
+                )
+            })?;
         let value = ret
             .result
             .value
@@ -1279,47 +1325,44 @@ impl PageHandle for ChromiumoxidePage {
     }
 
     async fn click(&self, selector: &str) -> Result<(), String> {
-        let element = self
-            .page
-            .find_element(selector)
-            .await
-            .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
-        element
-            .click()
-            .await
-            .map_err(|e| format!("Failed to click '{}': {}", selector, e))?;
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+        element.click().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to click '{}': {}", selector, e))
+        })?;
         Ok(())
     }
 
     async fn type_text(&self, selector: &str, value: &str) -> Result<(), String> {
-        let element = self
-            .page
-            .find_element(selector)
-            .await
-            .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
-        element
-            .click()
-            .await
-            .map_err(|e| format!("Failed to focus '{}': {}", selector, e))?;
-        element
-            .type_str(value)
-            .await
-            .map_err(|e| format!("Failed to type into '{}': {}", selector, e))?;
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+        element.click().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to focus '{}': {}", selector, e))
+        })?;
+        element.type_str(value).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to type into '{}': {}", selector, e))
+        })?;
         Ok(())
     }
 
     async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String> {
-        let element = self
-            .page
-            .find_element(selector)
-            .await
-            .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
 
         // Focus the element.
-        element
-            .focus()
-            .await
-            .map_err(|e| format!("Failed to focus '{}': {}", selector, e))?;
+        element.focus().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to focus '{}': {}", selector, e))
+        })?;
 
         // Clear the field via a bound JS function — the empty-string literal `''`
         // is a compile-time constant, NOT user data; no interpolation occurs.
@@ -1332,13 +1375,16 @@ impl PageHandle for ChromiumoxidePage {
                 false,
             )
             .await
-            .map_err(|e| format!("Failed to clear '{}': {}", selector, e))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to clear '{}': {}", selector, e))
+            })?;
 
         // Type the new value with real key events (never enters a JS string).
-        element
-            .type_str(value)
-            .await
-            .map_err(|e| format!("Failed to type into '{}': {}", selector, e))?;
+        element.type_str(value).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to type into '{}': {}", selector, e))
+        })?;
 
         // Fire a final `change` event (some frameworks rely on it to commit).
         element
@@ -1349,17 +1395,21 @@ impl PageHandle for ChromiumoxidePage {
                 false,
             )
             .await
-            .map_err(|e| format!("Failed to dispatch change on '{}': {}", selector, e))?;
+            .map_err(|e| {
+                self.faults.noted(
+                    &e,
+                    format!("Failed to dispatch change on '{}': {}", selector, e),
+                )
+            })?;
 
         Ok(())
     }
 
     async fn evaluate(&self, script: &str) -> Result<Option<serde_json::Value>, String> {
-        let result = self
-            .page
-            .evaluate(script)
-            .await
-            .map_err(|e| format!("JavaScript execution failed: {}", e))?;
+        let result = self.page.evaluate(script).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("JavaScript execution failed: {}", e))
+        })?;
         Ok(result.into_value::<serde_json::Value>().ok())
     }
 
@@ -1378,16 +1428,18 @@ impl PageHandle for ChromiumoxidePage {
         // Real-Chrome adversarial-selector coverage is deferred to the Task 18
         // smoke suite; the mock-level dispatch contract (selector passed through
         // unchanged, no Evaluate call recorded) is locked down in Task 14 tests.
-        let element = self
-            .page
-            .find_element(selector)
-            .await
-            .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
 
         Ok(element
             .inner_text()
             .await
-            .map_err(|e| format!("Failed to get text from '{}': {}", selector, e))?
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to get text from '{}': {}", selector, e))
+            })?
             .unwrap_or_else(|| "(could not extract text)".to_string()))
     }
 
@@ -1396,7 +1448,10 @@ impl PageHandle for ChromiumoxidePage {
             .page
             .evaluate("document.body.innerText")
             .await
-            .map_err(|e| format!("Failed to get page text: {}", e))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to get page text: {}", e))
+            })?;
 
         Ok(result
             .into_value::<String>()
@@ -1407,7 +1462,10 @@ impl PageHandle for ChromiumoxidePage {
         self.page
             .evaluate(format!("window.scrollBy(0, {delta_y})"))
             .await
-            .map_err(|e| format!("Failed to scroll page: {}", e))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to scroll page: {}", e))
+            })?;
         Ok(())
     }
 
@@ -1415,15 +1473,17 @@ impl PageHandle for ChromiumoxidePage {
         if let Some(selector) = selector {
             // Element capture: the element's bounds define the image; full_page
             // does not apply.
-            let element = self
-                .page
-                .find_element(selector)
-                .await
-                .map_err(|e| format!("Element not found '{}': {}", selector, e))?;
+            let element = self.page.find_element(selector).await.map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Element not found '{}': {}", selector, e))
+            })?;
             element
                 .screenshot(CaptureScreenshotFormat::Png)
                 .await
-                .map_err(|e| format!("Failed to screenshot element: {}", e))
+                .map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to screenshot element: {}", e))
+                })
         } else {
             // full_page=false (default) captures only the current viewport, which
             // is inherently bounded by the configured window size; full_page=true
@@ -1431,7 +1491,10 @@ impl PageHandle for ChromiumoxidePage {
             self.page
                 .screenshot(ScreenshotParams::builder().full_page(full_page).build())
                 .await
-                .map_err(|e| format!("Failed to take screenshot: {}", e))
+                .map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to take screenshot: {}", e))
+                })
         }
     }
 
@@ -1441,10 +1504,10 @@ impl PageHandle for ChromiumoxidePage {
             .print_background(true)
             .prefer_css_page_size(true)
             .build();
-        self.page
-            .pdf(params)
-            .await
-            .map_err(|e| format!("Failed to render PDF with Chromium: {}", e))
+        self.page.pdf(params).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to render PDF with Chromium: {}", e))
+        })
     }
 
     async fn url(&self) -> Option<String> {
@@ -1465,7 +1528,10 @@ impl PageHandle for ChromiumoxidePage {
             .page
             .event_listener::<EventScreencastFrame>()
             .await
-            .map_err(|e| format!("Failed to listen for frames: {e}"))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to listen for frames: {e}"))
+            })?;
         let params = StartScreencastParams::builder()
             .format(StartScreencastFormat::Jpeg)
             .quality(i64::from(quality.clamp(10, 100)))
@@ -1478,10 +1544,10 @@ impl PageHandle for ChromiumoxidePage {
             .page
             .execute(chromiumoxide::cdp::browser_protocol::page::StopScreencastParams::default())
             .await;
-        self.page
-            .execute(params)
-            .await
-            .map_err(|e| format!("Failed to start the live view: {e}"))?;
+        self.page.execute(params).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to start the live view: {e}"))
+        })?;
         // A new document in the tab (a link, a form sent, a redirect)
         // stalls Chrome's screencast on the old one: start it again, so the
         // picture follows the page.
@@ -1489,7 +1555,10 @@ impl PageHandle for ChromiumoxidePage {
             .page
             .event_listener::<chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated>()
             .await
-            .map_err(|e| format!("Failed to follow the page: {e}"))?;
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to follow the page: {e}"))
+            })?;
         let page = self.page.clone();
         // The next frame after a restart is the new document's.
         let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1576,7 +1645,7 @@ impl PageHandle for ChromiumoxidePage {
             .execute(ScreencastFrameAckParams::new(session))
             .await
             .map(|_| ())
-            .map_err(|e| format!("Failed to ack a frame: {e}"))
+            .map_err(|e| self.faults.noted(&e, format!("Failed to ack a frame: {e}")))
     }
 
     async fn stop_screencast(&self) -> Result<(), String> {
@@ -1585,7 +1654,10 @@ impl PageHandle for ChromiumoxidePage {
             .execute(StopScreencastParams::default())
             .await
             .map(|_| ())
-            .map_err(|e| format!("Failed to stop the live view: {e}"))
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to stop the live view: {e}"))
+            })
     }
 
     async fn restart_screencast(&self, max_w: u32, max_h: u32, quality: u8) -> Result<(), String> {
@@ -1601,11 +1673,10 @@ impl PageHandle for ChromiumoxidePage {
             .max_width(i64::from(max_w))
             .max_height(i64::from(max_h))
             .build();
-        self.page
-            .execute(params)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("Failed to restart the live view: {e}"))
+        self.page.execute(params).await.map(|_| ()).map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to restart the live view: {e}"))
+        })
     }
 
     async fn dispatch_mouse(&self, event: &MouseInput) -> Result<(), String> {
@@ -1639,11 +1710,10 @@ impl PageHandle for ChromiumoxidePage {
         let params = params
             .build()
             .map_err(|e| format!("Bad pointer event: {e}"))?;
-        self.page
-            .execute(params)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("Failed to send a pointer event: {e}"))
+        self.page.execute(params).await.map(|_| ()).map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to send a pointer event: {e}"))
+        })
     }
 
     async fn dispatch_key(&self, event: &KeyInput) -> Result<(), String> {
@@ -1676,7 +1746,7 @@ impl PageHandle for ChromiumoxidePage {
             .execute(params)
             .await
             .map(|_| ())
-            .map_err(|e| format!("Failed to send a key: {e}"))
+            .map_err(|e| self.faults.noted(&e, format!("Failed to send a key: {e}")))
     }
 
     async fn insert_text(&self, text: &str) -> Result<(), String> {
@@ -1685,15 +1755,14 @@ impl PageHandle for ChromiumoxidePage {
             .execute(InsertTextParams::new(text))
             .await
             .map(|_| ())
-            .map_err(|e| format!("Failed to type: {e}"))
+            .map_err(|e| self.faults.noted(&e, format!("Failed to type: {e}")))
     }
 
     async fn viewport(&self) -> Result<(f64, f64), String> {
-        let metrics = self
-            .page
-            .layout_metrics()
-            .await
-            .map_err(|e| format!("Failed to read the viewport: {e}"))?;
+        let metrics = self.page.layout_metrics().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to read the viewport: {e}"))
+        })?;
         let viewport = metrics.css_visual_viewport;
         Ok((viewport.client_width, viewport.client_height))
     }
@@ -1708,7 +1777,7 @@ impl PageHandle for ChromiumoxidePage {
             .execute(SetFocusEmulationEnabledParams::new(on))
             .await
             .map(|_| ())
-            .map_err(|e| format!("Failed to show focus: {e}"))
+            .map_err(|e| self.faults.noted(&e, format!("Failed to show focus: {e}")))
     }
 
     async fn fit(&self, room: Option<(u32, u32)>) -> Result<(), String> {
@@ -1736,7 +1805,10 @@ impl PageHandle for ChromiumoxidePage {
                 .await
                 .map(|_| ()),
         };
-        done.map_err(|e| format!("Failed to size the page: {e}"))
+        done.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to size the page: {e}"))
+        })
     }
 
     async fn attach_diagnostics(
@@ -1912,6 +1984,11 @@ pub struct MockBackend {
     /// runs, it returns the connection error and clears the slot, so the retry
     /// (against a fresh page after reconnect) succeeds. Shared with `MockPage`.
     pending_fail: Arc<Mutex<Option<FailOp>>>,
+    /// Transport failures the mock reported (each scripted connection error
+    /// records one, as the real adapter does from a typed `CdpError`).
+    faults: ConnectionFaults,
+    /// A scripted one-shot page error: `(op, text)`.
+    pending_page_error: Arc<Mutex<Option<(FailOp, String)>>>,
     /// When `true`, `create_page` hands back a synthetic browser-context id (one
     /// per page), modeling `browser_context` isolation. When `false`, context
     /// ids are `None` (the `page`-isolation default).
@@ -2019,6 +2096,8 @@ impl Default for MockBackend {
             pending_popup: Arc::new(Mutex::new(None)),
             handler_alive: Arc::new(AtomicBool::new(true)),
             pending_fail: Arc::new(Mutex::new(None)),
+            faults: ConnectionFaults::default(),
+            pending_page_error: Arc::new(Mutex::new(None)),
             isolate_contexts: false,
             attached: false,
             graceful_fails: false,
@@ -2214,6 +2293,13 @@ impl MockBackend {
         *self.pending_fail.lock().await = Some(op);
     }
 
+    /// Script a one-shot PAGE error on the next invocation of `op`: it fails
+    /// with `text` (whatever it says) and records no transport failure, as a
+    /// script exception or a missing element does.
+    pub async fn fail_once_with_page_error_on(&self, op: FailOp, text: &str) {
+        *self.pending_page_error.lock().await = Some((op, text.to_string()));
+    }
+
     /// Count of `Reconnect` calls recorded so far.
     pub async fn reconnect_count(&self) -> usize {
         self.calls
@@ -2229,8 +2315,9 @@ impl MockBackend {
     }
 }
 
-/// The connection-class error string a scripted mock op returns. Matches
-/// `is_connection_error` so the tool layer routes it through recovery.
+/// The error text a scripted mock connection failure returns. The tool
+/// recovers because the failure is recorded in `faults`, not because of
+/// this text.
 #[cfg(test)]
 const MOCK_CONNECTION_ERROR: &str = "WebSocket connection closed: Sender was dropped";
 
@@ -2251,6 +2338,10 @@ struct MockPage {
     pending_popup: Arc<Mutex<Option<TargetInfo>>>,
     /// Shared one-shot connection-error script (see `MockBackend::pending_fail`).
     pending_fail: Arc<Mutex<Option<FailOp>>>,
+    /// Shared with the backend (`MockBackend::faults`).
+    faults: ConnectionFaults,
+    /// Shared with the backend (`MockBackend::pending_page_error`).
+    pending_page_error: Arc<Mutex<Option<(FailOp, String)>>>,
     /// Shared scripted element state for the `wait`-condition tests.
     element_state: Arc<Mutex<MockElementState>>,
     /// Shared click-navigation flag for the click nav-race tests.
@@ -2279,7 +2370,15 @@ impl MockPage {
         let mut slot = self.pending_fail.lock().await;
         if *slot == Some(op) {
             *slot = None;
+            self.faults.record();
             return Some(MOCK_CONNECTION_ERROR.to_string());
+        }
+        let mut page_error = self.pending_page_error.lock().await;
+        if page_error
+            .as_ref()
+            .is_some_and(|(failing, _)| *failing == op)
+        {
+            return page_error.take().map(|(_, text)| text);
         }
         None
     }
@@ -2541,6 +2640,10 @@ impl PageHandle for MockPage {
 #[cfg(test)]
 #[async_trait]
 impl BrowserBackend for MockBackend {
+    fn connection_faults(&self) -> u64 {
+        self.faults.count()
+    }
+
     async fn ensure_ready(&self) -> Result<(), String> {
         self.record(MockCall::EnsureReady).await;
         // Model the production health check: a (re)launch revives the handler and
@@ -2585,6 +2688,8 @@ impl BrowserBackend for MockBackend {
                 targets: Arc::clone(&self.targets),
                 pending_popup: Arc::clone(&self.pending_popup),
                 pending_fail: Arc::clone(&self.pending_fail),
+                faults: self.faults.clone(),
+                pending_page_error: Arc::clone(&self.pending_page_error),
                 element_state: Arc::clone(&self.element_state),
                 click_navigates: Arc::clone(&self.click_navigates),
                 nav_never_settles: Arc::clone(&self.nav_never_settles),
@@ -2667,6 +2772,8 @@ impl BrowserBackend for MockBackend {
             targets: Arc::clone(&self.targets),
             pending_popup: Arc::clone(&self.pending_popup),
             pending_fail: Arc::clone(&self.pending_fail),
+            faults: self.faults.clone(),
+            pending_page_error: Arc::clone(&self.pending_page_error),
             element_state: Arc::clone(&self.element_state),
             click_navigates: Arc::clone(&self.click_navigates),
             nav_never_settles: Arc::clone(&self.nav_never_settles),

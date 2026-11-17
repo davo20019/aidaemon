@@ -3859,42 +3859,50 @@ async fn denied_execute_js_not_evaluated() {
 // Task 10: handler-health monitoring + disconnect recovery
 // ============================================================================
 
-use super::backend::{BrowserBackend, FailOp, is_connection_error};
+use super::backend::{BrowserBackend, FailOp, is_transport_error};
 
-/// `is_connection_error` recognizes transport/connection-death patterns but NOT
-/// ordinary page errors. This is the classifier that gates ALL recovery.
+/// Recovery is decided from chromiumoxide's typed error variant, never its
+/// text: a page message that reads like a dead connection is a page error.
 #[test]
-fn connection_error_classifier_only_matches_transport_failures() {
-    // Transport/connection-class failures → true.
-    for e in &[
-        "WebSocket connection closed: Sender was dropped",
-        "connection reset by peer",
-        "Ws(connection aborted)",
-        "the channel closed unexpectedly",
-        "request did not resolve",
-        "no response from the browser",
-        "the browser was closed",
-        "Transport error",
+fn transport_errors_are_classified_by_variant() {
+    use chromiumoxide::error::{CdpError, ChannelError};
+    for transport in [
+        CdpError::NoResponse,
+        CdpError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        CdpError::ChannelSendError(ChannelError::Canceled(futures::channel::oneshot::Canceled)),
     ] {
-        assert!(
-            is_connection_error(e),
-            "should be classified as a connection error: {e}"
-        );
+        assert!(is_transport_error(&transport), "{transport:?}");
     }
+    for page in [
+        CdpError::ChromeMessage("WebSocket connection closed: Sender was dropped".into()),
+        CdpError::NotFound,
+        CdpError::Timeout,
+        CdpError::msg("the browser was closed"),
+    ] {
+        assert!(!is_transport_error(&page), "{page:?}");
+    }
+}
 
-    // Ordinary page-level errors → false (must NOT trigger a reconnect).
-    for e in &[
-        "Element not found '#missing': node not found",
-        "JavaScript execution failed: ReferenceError: x is not defined",
-        "Timeout: element '#foo' not found after 10s",
-        "Failed to navigate to https://x.test: net::ERR_NAME_NOT_RESOLVED",
-        "Navigation blocked: target is a loopback address",
-    ] {
-        assert!(
-            !is_connection_error(e),
-            "ordinary page error must NOT be a connection error: {e}"
-        );
-    }
+/// A page error whose text reads like a dead connection (a script can throw
+/// any message) never triggers a reconnect.
+#[tokio::test]
+async fn a_page_error_that_reads_like_a_dead_connection_does_not_reconnect() {
+    let (tool, backend, _rx) = mock_tool_with(MockBackend::new());
+    backend
+        .fail_once_with_page_error_on(
+            FailOp::BodyText,
+            "WebSocket connection closed: Sender was dropped",
+        )
+        .await;
+    let out = tool
+        .call_with(
+            &json!({ "action": "get_text"}).to_string(),
+            aidaemon_tools::testing::call_facts("sess-a"),
+        )
+        .await
+        .unwrap();
+    assert!(out.contains("Sender was dropped"), "{out}");
+    assert_eq!(backend.reconnect_count().await, 0);
 }
 
 /// HANDLER-EXIT DETECTION: when the mock reports its handler dead, `ensure_ready`
