@@ -4,6 +4,11 @@
 //! Android, Segoe on Windows): there the app brings Inter, so it reads
 //! the same on every screen. Five weights, cut to Latin, about 115 KB
 //! (`assets/fonts`, SIL Open Font License in `OFL.txt`).
+//!
+//! Code there is in JetBrains Mono (one weight, cut to Latin, about 35 KB;
+//! `JetBrainsMono-OFL.txt`) rather than the device's `monospace`: Android's
+//! Droid Sans Mono sat about 1.5 px under the line's baseline beside
+//! Inter, and a font of the app's own reads the same on every screen.
 
 #[cfg(target_arch = "wasm32")]
 use nsh_core::prelude::*;
@@ -17,7 +22,10 @@ const FACES: [&[u8]; 5] = [
     include_bytes!("../../assets/fonts/Inter-700Bold.woff2"),
 ];
 
-/// Brings Inter where the system's font is not Apple's: registers its
+#[cfg(target_arch = "wasm32")]
+const MONO: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-400Regular.woff2");
+
+/// Brings Inter (and JetBrains Mono for code) where the system's font is not Apple's: registers its
 /// faces, then makes it the app's sans. Until then (a moment) text is in
 /// the system's.
 pub fn load() {
@@ -30,9 +38,15 @@ pub fn load() {
                     family = Some(name);
                 }
             }
-            if let Some(family) = family {
+            let mono = register_font(MONO.to_vec()).await.ok();
+            if family.is_some() || mono.is_some() {
                 let mut tokens = (*tokens()).clone();
-                tokens.set_font(nsh_core::element::FONT_SANS, family);
+                if let Some(family) = family {
+                    tokens.set_font(nsh_core::element::FONT_SANS, family);
+                }
+                if let Some(mono) = mono {
+                    tokens.set_font(nsh_core::element::FONT_MONO, mono);
+                }
                 set_tokens(tokens);
             }
         });
