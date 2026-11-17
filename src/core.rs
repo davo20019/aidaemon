@@ -323,6 +323,18 @@ pub async fn run(
     // Close the deferred Agent ↔ SpawnAgentTool + agent self-reference cycles.
     crate::startup::wiring::wire_agent_cycles(&agent, spawn_tool.as_ref()).await?;
 
+    // This boot's mark, taken before anything this process runs can
+    // checkpoint a run: turns cut off after the previous mark are continued
+    // once channels are up.
+    let resume_store = aidaemon_store_sqlite::SqliteStore::from_pool(pool.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!("kernel run store: {error}"))?;
+    let previous_boot = crate::startup::resume_turns::mark_boot(
+        &resume_store,
+        &*(state.clone() as Arc<dyn crate::traits::StateStore>),
+    )
+    .await;
+
     // 8. Event bus for triggers
     let (event_tx, event_rx) = triggers::event_bus(queue_policy.trigger_event_capacity);
     // 9. Triggers
@@ -382,6 +394,7 @@ pub async fn run(
         state.clone() as Arc<dyn crate::traits::SessionChannelStore>
     )
     .await;
+    let resume_sessions = session_map.clone();
 
     // 10b. Task registry for tracking background agent work
     let task_registry = Arc::new(TaskRegistry::new(50));
@@ -555,6 +568,21 @@ pub async fn run(
     info!("Starting aidaemon v{}", env!("CARGO_PKG_VERSION"));
     let startup_recipients = channel_bundle.startup_recipients(&config);
     channel_bundle.spawn_all(shutdown.clone());
+    {
+        let hub: Arc<dyn aidaemon_channels::ports::OutboundRouter> = hub.clone();
+        let deps = crate::startup::resume_turns::ResumeDeps {
+            store: resume_store,
+            state: state.clone() as Arc<dyn crate::traits::StateStore>,
+            event_store: event_store.clone(),
+            sessions: resume_sessions,
+            hub: Arc::downgrade(&hub),
+            agent: agent.clone(),
+        };
+        tokio::spawn(crate::startup::resume_turns::resume_cut_off_turns(
+            deps,
+            previous_boot,
+        ));
+    }
     {
         // Failover into a dead key is only discovered during an outage.
         let provider = config.provider.clone();

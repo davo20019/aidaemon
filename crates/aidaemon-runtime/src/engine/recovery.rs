@@ -70,6 +70,47 @@ pub fn not_done_note(not_done: &[String]) -> Option<String> {
     ))
 }
 
+/// The internal message that continues a turn the last process stop cut
+/// off before it replied ([`sdk::RunState`] as last checkpointed). It names,
+/// from the run's own record, each call that was running and whose effect is
+/// unknown, and an approval that was waiting; the turn start then settles the
+/// old run without running any of them again.
+pub fn resume_note(state: &sdk::RunState) -> String {
+    let mut note = String::from(
+        "The daemon restarted while you were working on the owner's latest request, \
+         before you replied. Continue that request from where it stopped and give the \
+         owner the reply it is still owed. Work already done in this conversation stands \
+         (tool results above, files you made): use it instead of doing it again.",
+    );
+    if let Some(in_flight) = &state.in_flight {
+        let unknown: Vec<String> = in_flight
+            .calls
+            .iter()
+            .filter(|call| {
+                in_flight.started.contains(&call.id) && !in_flight.done.contains(&call.id)
+            })
+            .map(|call| format!("`{}`", call.name))
+            .collect();
+        if !unknown.is_empty() {
+            note.push_str(&format!(
+                " These calls were running at the restart and may or may not have taken \
+                 effect: {}. Check their effect before repeating any of them.",
+                unknown.join(", ")
+            ));
+        }
+    }
+    if let Some(pending) = &state.pending
+        && let sdk::InterruptKind::OwnerApproval(request) = &pending.interruption.kind
+    {
+        note.push_str(&format!(
+            " An approval was waiting for the owner and was lost in the restart, so it was \
+             not done: {}. Ask for it again if the request still needs it.",
+            request.summary.trim()
+        ));
+    }
+    note
+}
+
 /// Runs whose turn was dropped (a cancel, the inactivity watchdog) and whose
 /// end is still being written to the journal.
 static ENDING: LazyLock<Mutex<HashSet<sdk::RunId>>> = LazyLock::new(Mutex::default);
@@ -321,5 +362,27 @@ mod tests {
         EndIfDropped::new(Some(store.clone()), state.run_id).disarm();
         tokio::task::yield_now().await;
         assert!(!store.run_ended(state.run_id).await.unwrap());
+    }
+
+    #[test]
+    fn the_resume_note_names_calls_with_unknown_effect_only() {
+        let mut state = sdk::RunState::new("aidaemon", "app:synthetic-1", "Draw a logo.");
+        let mut in_flight = sdk::InFlight::default();
+        in_flight.calls = vec![
+            sdk::ToolCall::new("c1", "generate_image", serde_json::json!({})),
+            sdk::ToolCall::new("c2", "send_file", serde_json::json!({})),
+            sdk::ToolCall::new("c3", "browser", serde_json::json!({})),
+        ];
+        in_flight.started = vec!["c1".into(), "c2".into()];
+        in_flight.done = vec!["c1".into()];
+        state.in_flight = Some(in_flight);
+        let note = resume_note(&state);
+        assert!(note.contains("`send_file`"), "{note}");
+        assert!(!note.contains("`generate_image`"), "done: {note}");
+        assert!(!note.contains("`browser`"), "never started: {note}");
+
+        let plain = resume_note(&sdk::RunState::new("aidaemon", "s", "Hi."));
+        assert!(!plain.contains("may or may not"), "{plain}");
+        assert!(plain.contains("reply it is still owed"), "{plain}");
     }
 }

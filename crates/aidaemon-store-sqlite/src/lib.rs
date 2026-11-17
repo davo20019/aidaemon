@@ -341,6 +341,57 @@ impl SqliteStore {
         .await
     }
 
+    /// The store's clock, in the format its checkpoints are stamped with:
+    /// a mark to compare later checkpoints against
+    /// ([`SqliteStore::unfinished_runs_since`]).
+    pub async fn clock(&self) -> Result<String, Error> {
+        let now: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {NOW}")))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(now)
+    }
+
+    /// Top-level runs that never ended and were last checkpointed at or
+    /// after `since` (a [`SqliteStore::clock`] mark), each still the latest
+    /// run of its session: the turns a process stop cut off. A run paused
+    /// for an answer is listed too; a child run is not (its parent holds it).
+    pub async fn unfinished_runs_since(&self, since: &str) -> Result<Vec<RunState>, Error> {
+        let candidates = self
+            .states_where_since(
+                "json_extract(state, '$.parent_run') IS NULL AND updated_at >= ?",
+                since,
+            )
+            .await?;
+        let mut unfinished = Vec::new();
+        for state in candidates {
+            if self.run_ended(state.run_id).await? {
+                continue;
+            }
+            let latest = self.latest_state_for_session(&state.session_id).await?;
+            if latest.is_some_and(|latest| latest.run_id == state.run_id) {
+                unfinished.push(state);
+            }
+        }
+        Ok(unfinished)
+    }
+
+    async fn states_where_since(
+        &self,
+        predicate: &str,
+        since: &str,
+    ) -> Result<Vec<RunState>, Error> {
+        // `predicate` is a crate-internal constant, never caller input.
+        let sql =
+            format!("SELECT state FROM run_states WHERE {predicate} ORDER BY updated_at, rowid");
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(&*sql))
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|s| serde_json::from_str(s).map_err(Error::from))
+            .collect()
+    }
+
     async fn states_where(
         &self,
         predicate: &str,

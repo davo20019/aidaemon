@@ -514,3 +514,47 @@ async fn a_run_paused_for_an_answer_has_not_ended() {
         "a pause is not an end: a restart must still find the run"
     );
 }
+
+#[tokio::test]
+async fn unfinished_runs_since_lists_only_cut_off_latest_top_level_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(db_path(&dir)).await.unwrap();
+    let before = aidaemon_core::RunState::new("aidaemon", "s-before", "older request");
+    store.upsert_state(&before).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let mark = store.clock().await.unwrap();
+
+    let cut_off = aidaemon_core::RunState::new("aidaemon", "s-cut", "draw a logo");
+    store.upsert_state(&cut_off).await.unwrap();
+    let ended = aidaemon_core::RunState::new("aidaemon", "s-ended", "done request");
+    store.upsert_state(&ended).await.unwrap();
+    store
+        .append(
+            ended.run_id,
+            &Event::Finished {
+                status: RunStatus::Completed,
+                usage: Default::default(),
+                turns: 1,
+                elapsed_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let mut child = aidaemon_core::RunState::new("aidaemon", "s-child", "helper work");
+    child.parent_run = Some(cut_off.run_id);
+    store.upsert_state(&child).await.unwrap();
+    let superseded = aidaemon_core::RunState::new("aidaemon", "s-later", "first");
+    store.upsert_state(&superseded).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let later = aidaemon_core::RunState::new("aidaemon", "s-later", "second");
+    store.upsert_state(&later).await.unwrap();
+
+    let listed: Vec<_> = store
+        .unfinished_runs_since(&mark)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|state| state.run_id)
+        .collect();
+    assert_eq!(listed, vec![cut_off.run_id, later.run_id]);
+}
