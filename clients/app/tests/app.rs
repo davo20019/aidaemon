@@ -1276,3 +1276,28 @@ fn a_handoff_card_opens_the_live_view_and_watching_needs_no_card() -> Result<(),
     app.wait_for("Connecting to the screen…")?;
     Ok(())
 }
+
+/// A scheduled run waiting on a sign-in says so on its automation's card,
+/// with the way to do it.
+#[test]
+fn an_automation_waiting_on_a_sign_in_says_so_on_its_card() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"event","at_ms":1,"event":{"type":"surface_updated","surface":{"id":"srf_auto_1","kind":"browser_tab","session_id":"telegram:synthetic-user-1","title":"Sign in","site":"bank.acme.example","width":1280,"height":720,"controller":{"kind":"agent"},"handoff_pending":true,"interactive":true}}}"#,
+        ),
+    ]);
+    app.press("Automations: what runs on its own")?;
+    app.wait_for("Reading your automations…")?;
+    feed([frame(
+        r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-7","kind":"scheduled","name":"Statement download","what":"Download the synthetic statement","how_often":"Every month on the 1st","status":"active","session_id":"telegram:synthetic-user-1","recent_runs":[{"started_ms":1767002400000,"outcome":"running"}]}]}}"#,
+    )]);
+    app.wait_for("Waiting for you on bank.acme.example")?;
+    let before = sent("open_surface");
+    app.press("Open the live view")?;
+    wait_sent_new("open_surface", before)?;
+    Ok(())
+}

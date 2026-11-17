@@ -239,6 +239,7 @@ fn ready(
         2 => {
             return page
                 .child(bots(store, &settings.bots))
+                .child(devices(store))
                 .child(mcp_servers(store, &settings.mcp_servers));
         }
         _ => {}
@@ -1691,6 +1692,77 @@ fn bots(store: Store, bots: &[BotInfo]) -> View {
         rows,
     ));
     section
+}
+
+/// The paired devices, each with whether it may watch and control the
+/// agent's screens. Only the daemon's own computer changes it: a phone
+/// never widens what it may do itself.
+fn devices(store: Store) -> View {
+    store.refresh_devices();
+    view()
+        .gap_2()
+        .child(section_label("Paired devices"))
+        .child(dynamic(move || {
+            let read = store.devices();
+            Some(untracked(move || match read {
+                aidaemon_client_core::Read::Ready((devices, can_change)) => {
+                    let devices: Vec<_> = devices.into_iter().filter(|d| !d.revoked).collect();
+                    if devices.is_empty() {
+                        return muted("No paired devices.").into_element();
+                    }
+                    let mut list = view().gap_2();
+                    if !can_change {
+                        list = list.child(muted(
+                            "Change what a device may do in the app on the computer AIdaemon \
+                             runs on.",
+                        ));
+                    }
+                    for device in devices {
+                        let on = device
+                            .scopes
+                            .contains(&aidaemon_client_protocol::Scope::Control);
+                        let id = device.device_id.clone();
+                        let name = device.name.clone();
+                        let control: View = if can_change {
+                            view().child(
+                                ui::toggle(
+                                    "Can watch and control the agent's screens",
+                                    move || on,
+                                    move |next: bool| store.set_device_control(&id, next),
+                                )
+                                .accessibility_label(format!(
+                                    "Let {name} watch and control the agent's screens"
+                                )),
+                            )
+                        } else {
+                            view().child(ui::badge(
+                                if on {
+                                    "Can watch and control screens"
+                                } else {
+                                    "Cannot watch screens"
+                                },
+                                if on { Tone::Info } else { Tone::Neutral },
+                            ))
+                        };
+                        list = list.child(
+                            ui::inset()
+                                .gap_1()
+                                .child(text(device.name.clone()).font_weight(FontWeight::MEDIUM))
+                                .child(control),
+                        );
+                    }
+                    list.into_element()
+                }
+                aidaemon_client_core::Read::Failed(why) => muted(why).into_element(),
+                _ => muted("Reading the devices…").into_element(),
+            }))
+        }))
+        .child(dynamic(move || {
+            let why = store.devices_error()?;
+            Some(untracked(move || {
+                ui::banner(why, Tone::Danger).into_element()
+            }))
+        }))
 }
 
 fn mcp_servers(store: Store, servers: &[McpServerInfo]) -> View {

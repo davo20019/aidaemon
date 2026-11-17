@@ -536,6 +536,13 @@
           },
           "type": "array"
         },
+        "session_id": {
+          "description": "The conversation its runs work in (protocol 1.31): a run waiting for\nthe owner on a live surface shows there.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "description": "`active`, `paused`, `failed`, `awaiting_input`, `pending_confirmation`...",
           "type": "string"
@@ -1972,6 +1979,43 @@
             "surface_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "The paired devices (protocol 1.31). Answers with `devices`.",
+          "properties": {
+            "type": {
+              "const": "list_devices",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "What a paired device may do (protocol 1.31): only from the daemon's\nown computer (its local token), so a device never widens its own\nreach. Answers with `devices`, as they are after.",
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "scopes": {
+              "items": {
+                "$ref": "#/$defs/Scope"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "set_device_scopes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "device_id",
+            "scopes"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2510,6 +2554,31 @@
           "required": [
             "type",
             "surface"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_devices` and `set_device_scopes` (protocol 1.31).",
+          "properties": {
+            "can_change": {
+              "default": false,
+              "description": "This client may change what devices may do (it is on the\ndaemon's own computer).",
+              "type": "boolean"
+            },
+            "devices": {
+              "items": {
+                "$ref": "#/$defs/DeviceInfo"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "devices",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "devices"
           ],
           "type": "object"
         }

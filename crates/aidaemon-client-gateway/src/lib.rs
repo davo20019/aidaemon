@@ -825,7 +825,8 @@ impl ClientGateway {
             | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
-            Command::ListSurfaces => Some(Scope::Observe),
+            Command::ListSurfaces | Command::ListDevices => Some(Scope::Observe),
+            Command::SetDeviceScopes { .. } => None,
             Command::OpenSurface { .. }
             | Command::CloseSurface { .. }
             | Command::TakeControl { .. }
@@ -1286,6 +1287,21 @@ impl ClientGateway {
                 );
                 Ok(CommandResult::Setup { setup })
             }
+            Command::ListDevices => self.devices_for(caller).await,
+            Command::SetDeviceScopes { device_id, scopes } => {
+                // Only the daemon's own computer: a paired device never
+                // changes what it, or another device, may do.
+                if caller.principal.device_id.is_some() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        "Change what devices may do on the computer AIdaemon runs on",
+                    ));
+                }
+                if !self.pairing.set_scopes(&device_id, &scopes).await? {
+                    return Err(ProtocolError::new(ErrorCode::NotFound, "No such device"));
+                }
+                self.devices_for(caller).await
+            }
             Command::ListSurfaces => Ok(CommandResult::Surfaces {
                 surfaces: self
                     .surface_desk()
@@ -1317,6 +1333,13 @@ impl ClientGateway {
                 "Unknown command for this gateway version",
             )),
         }
+    }
+
+    async fn devices_for(&self, caller: &Caller) -> Result<CommandResult, ProtocolError> {
+        Ok(CommandResult::Devices {
+            devices: self.pairing.devices().await?,
+            can_change: caller.principal.device_id.is_none(),
+        })
     }
 
     fn need_surfaces(&self) -> Result<Arc<surfaces::SurfaceDesk>, ProtocolError> {

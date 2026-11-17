@@ -332,6 +332,9 @@ pub struct AutomationEntry {
     pub details: Vec<String>,
     /// What a client may change in place.
     pub edit: Option<Editable>,
+    /// The conversation its runs work in (a goal's session), when it has
+    /// one: where a run waits for the owner.
+    pub session_id: Option<String>,
 }
 
 /// One run of an automation, as its records left it.
@@ -600,7 +603,9 @@ impl ManageAutomationsTool {
             .chain(automation.card.details.iter().cloned())
             .filter(|line| !line.trim_end().ends_with(':'))
             .collect();
+            let session_id = self.session_of(automation.kind, &automation.id).await;
             entries.push(AutomationEntry {
+                session_id,
                 kind: automation.kind,
                 id: automation.id,
                 name: automation.name,
@@ -614,6 +619,17 @@ impl ManageAutomationsTool {
             });
         }
         Ok(entries)
+    }
+
+    /// The conversation automation `id` runs in: its goal's session.
+    async fn session_of(&self, kind: AutomationKind, id: &str) -> Option<String> {
+        let goal_id = match kind {
+            AutomationKind::Scheduled => id.to_string(),
+            AutomationKind::Watching => self.state.get_mandate(id).await.ok()??.goal_id,
+            AutomationKind::Probe => return None,
+        };
+        let goal = self.state.get_goal(&goal_id).await.ok()??;
+        (!goal.session_id.is_empty()).then_some(goal.session_id)
     }
 
     /// The latest runs of automation `id`, newest first: a scheduled goal's

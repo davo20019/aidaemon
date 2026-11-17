@@ -503,6 +503,30 @@ impl Store {
         self.read(|c| c.surfaces_of(session))
     }
 
+    pub fn refresh_devices(&self) {
+        self.act(Client::refresh_devices);
+    }
+
+    /// The paired devices and whether this app may change them (tracked).
+    pub fn devices(
+        &self,
+    ) -> aidaemon_client_core::Read<(Vec<aidaemon_client_protocol::DeviceInfo>, bool)> {
+        self.read(|c| c.devices.clone())
+    }
+
+    pub fn devices_error(&self) -> Option<String> {
+        self.read(|c| c.devices_error.clone())
+    }
+
+    pub fn set_device_control(&self, device_id: &str, on: bool) {
+        self.act(|c| c.set_device_control(device_id, on));
+    }
+
+    /// The tab of `session` where a run waits for the owner (tracked).
+    pub fn waiting_surface(&self, session: &str) -> Option<aidaemon_client_protocol::SurfaceInfo> {
+        self.read(|c| c.waiting_surface(session))
+    }
+
     /// Open the live view of `surface_id`; with `control`, take control.
     pub fn watch_surface(&self, surface_id: &str, control: bool) {
         let effects = self.act(|c| c.open_surface(surface_id, control));

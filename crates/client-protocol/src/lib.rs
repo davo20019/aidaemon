@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 30;
+pub const PROTOCOL_MINOR: u16 = 31;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -475,6 +475,15 @@ pub enum Command {
     /// Give a surface back to the agent (protocol 1.30). Answers with
     /// `surface_control`.
     ReleaseControl { surface_id: String },
+    /// The paired devices (protocol 1.31). Answers with `devices`.
+    ListDevices,
+    /// What a paired device may do (protocol 1.31): only from the daemon's
+    /// own computer (its local token), so a device never widens its own
+    /// reach. Answers with `devices`, as they are after.
+    SetDeviceScopes {
+        device_id: String,
+        scopes: Vec<Scope>,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -847,6 +856,14 @@ pub enum CommandResult {
     SurfaceControl {
         surface: SurfaceInfo,
     },
+    /// `list_devices` and `set_device_scopes` (protocol 1.31).
+    Devices {
+        devices: Vec<DeviceInfo>,
+        /// This client may change what devices may do (it is on the
+        /// daemon's own computer).
+        #[serde(default)]
+        can_change: bool,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -931,6 +948,10 @@ pub struct AutomationSummary {
     /// by asking in a conversation (protocol 1.15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<AutomationEdit>,
+    /// The conversation its runs work in (protocol 1.31): a run waiting for
+    /// the owner on a live surface shows there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// An automation's changeable fields as they are now (protocol 1.15).

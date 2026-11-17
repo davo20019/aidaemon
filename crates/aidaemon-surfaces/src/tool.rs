@@ -59,6 +59,9 @@ pub struct HandOverTool {
     asking: Mutex<HashMap<String, SurfaceId>>,
     /// The surface the owner said Done on, per session, until its call runs.
     done: Mutex<HashMap<String, SurfaceId>>,
+    /// The site another handoff already asks about, per session whose call
+    /// was not put to the owner for it.
+    already_asked: Mutex<HashMap<String, String>>,
 }
 
 impl HandOverTool {
@@ -69,6 +72,7 @@ impl HandOverTool {
             owner_answers: OwnerAnsweredCalls::default(),
             asking: Mutex::new(HashMap::new()),
             done: Mutex::new(HashMap::new()),
+            already_asked: Mutex::new(HashMap::new()),
         }
     }
 
@@ -168,6 +172,11 @@ impl Tool for HandOverTool {
             .session()
             .context("hand_over needs a conversation")?
             .to_string();
+        if let Some(site) = lock(&self.already_asked).remove(&session) {
+            anyhow::bail!(
+                "The owner is already asked to do a step on {site} for another task. Wait for that to finish, then look at the page again before asking."
+            );
+        }
         if !self.owner_answers.take(&session, SUBJECT) {
             let found = self
                 .registry
@@ -260,6 +269,18 @@ impl ToolSemantics for HandOverTool {
         else {
             return OwnerApprovalNeed::NotNeeded;
         };
+        // One ask per site at a time: a later run (an automation's next
+        // occurrence) does not stack a second card on the owner.
+        if let Some(site) = surface.site.clone()
+            && self.registry.list().iter().any(|other| {
+                other.id != surface.id
+                    && other.handoff_pending
+                    && other.site.as_ref() == Some(&site)
+            })
+        {
+            lock(&self.already_asked).insert(session.to_string(), site);
+            return OwnerApprovalNeed::NotNeeded;
+        }
         let prep = match self.registry.prepare_handoff(&surface.id).await {
             Ok(prep) => prep,
             Err(error) => {
@@ -440,6 +461,31 @@ mod tests {
             tool.owner_approval_request(&call, &guest).await,
             OwnerApprovalNeed::NotNeeded
         ));
+    }
+
+    #[tokio::test]
+    async fn a_second_ask_for_a_site_already_waiting_is_not_put_to_the_owner() {
+        let (tool, mock, _registry) = setup();
+        mock.add("app:first", "tab-1");
+        mock.add("app:second", "tab-1");
+        let args = args();
+        let call = ApprovalCall::as_sent(&args);
+        assert!(matches!(
+            tool.owner_approval_request(&call, &owner_facts("app:first"))
+                .await,
+            OwnerApprovalNeed::Ask(_)
+        ));
+        assert!(matches!(
+            tool.owner_approval_request(&call, &owner_facts("app:second"))
+                .await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+        let error = tool
+            .execute(&args.to_string(), &owner_facts("app:second"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already asked"), "{error}");
     }
 
     #[test]

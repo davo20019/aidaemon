@@ -2467,3 +2467,34 @@ async fn a_handoff_brings_the_surface_forward_and_control_waits_for_it_when_off(
         .await;
     assert!(matches!(allowed, ServerFrame::Ack { .. }), "{allowed:?}");
 }
+
+#[tokio::test]
+async fn only_the_daemons_own_computer_changes_what_a_device_may_do() {
+    let f = fixture(RiskLevel::Medium).await;
+    let phone = f.pair(Vec::new()).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let listed = f
+        .post_as(&grant.access_token, &command("d-1", Command::ListDevices))
+        .await;
+    assert!(
+        matches!(&listed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: false }, .. } if devices.len() == 1),
+        "{listed:?}"
+    );
+    let narrow = Command::SetDeviceScopes {
+        device_id: phone.device_id.clone(),
+        scopes: vec![Scope::Observe, Scope::Chat, Scope::Approve],
+    };
+    let refused = f
+        .post_as(&grant.access_token, &command("d-2", narrow.clone()))
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    let changed = f.post(&[], &command("d-3", narrow)).await;
+    assert!(
+        matches!(&changed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: true }, .. }
+            if !devices[0].scopes.contains(&Scope::Control)),
+        "{changed:?}"
+    );
+}

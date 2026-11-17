@@ -201,6 +201,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::CloseSurface { .. } => "close_surface",
         Command::TakeControl { .. } => "take_control",
         Command::ReleaseControl { .. } => "release_control",
+        Command::ListDevices => "list_devices",
+        Command::SetDeviceScopes { .. } => "set_device_scopes",
         Command::Unknown => "unknown",
     }
 }
@@ -245,6 +247,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Surfaces { .. } => "surfaces",
         CommandResult::SurfaceOpened { .. } => "surface_opened",
         CommandResult::SurfaceControl { .. } => "surface_control",
+        CommandResult::Devices { .. } => "devices",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -537,6 +540,14 @@ fn client_samples() -> Vec<ClientFrame> {
             "5d0c2b1e-002a",
             Command::ReleaseControl {
                 surface_id: "srf_7d1c".into(),
+            },
+        ),
+        command("5d0c2b1e-002b", Command::ListDevices),
+        command(
+            "5d0c2b1e-002c",
+            Command::SetDeviceScopes {
+                device_id: "dev-phone-1".into(),
+                scopes: vec![Scope::Observe, Scope::Chat, Scope::Approve],
             },
         ),
         command("5d0c2b1e-000b", Command::Unknown),
@@ -1093,6 +1104,7 @@ fn server_samples() -> Vec<ServerFrame> {
         }),
         ack(CommandResult::Automations {
             automations: vec![AutomationSummary {
+                session_id: Some("telegram:synthetic-user-1".into()),
                 id: "goal-7f3e".into(),
                 kind: AutomationKind::Scheduled,
                 name: Some("Inbox digest".into()),
@@ -1198,6 +1210,19 @@ fn server_samples() -> Vec<ServerFrame> {
                 controller: SurfaceController::Agent,
                 ..surface()
             },
+        }),
+        ack(CommandResult::Devices {
+            devices: vec![DeviceInfo {
+                device_id: "dev-phone-1".into(),
+                name: "Synthetic phone".into(),
+                kind: ClientKind::Mobile,
+                scopes: ALL_SCOPES.to_vec(),
+                risk_ceiling: None,
+                created_at_ms: 1_767_225_600_000,
+                last_seen_ms: Some(1_767_225_900_000),
+                revoked: false,
+            }],
+            can_change: true,
         }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {

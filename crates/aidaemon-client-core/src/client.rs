@@ -405,6 +405,12 @@ pub struct Client {
     /// This device asked for control and has not given it back: the
     /// surface's owner controller is this device.
     live_controller_is_mine: bool,
+    /// The paired devices (protocol 1.31), and whether this client may
+    /// change what they may do.
+    pub devices: Read<(Vec<aidaemon_client_protocol::DeviceInfo>, bool)>,
+    devices_request: Option<String>,
+    /// Why the last device change was refused.
+    pub devices_error: Option<String>,
 }
 
 impl Client {
@@ -2194,6 +2200,15 @@ impl Client {
         found
     }
 
+    /// The tab of `session` where a run waits for the owner (a handoff).
+    pub fn waiting_surface(&self, session: &str) -> Option<SurfaceInfo> {
+        self.state
+            .surfaces
+            .values()
+            .find(|s| s.handoff_pending && s.session_id.as_deref() == Some(session))
+            .cloned()
+    }
+
     pub fn surface(&self, id: &str) -> Option<&SurfaceInfo> {
         self.state.surfaces.get(id)
     }
@@ -2297,9 +2312,65 @@ impl Client {
         }
     }
 
+    // ----- Paired devices (protocol 1.31) ----------------------------------
+
+    pub fn refresh_devices(&mut self) {
+        if !self.devices.is_ready() {
+            self.devices = Read::Loading;
+        }
+        self.devices_request = Some(self.send(Command::ListDevices));
+    }
+
+    /// Let `device_id` watch and control screens, or not.
+    pub fn set_device_control(&mut self, device_id: &str, on: bool) {
+        let Some((devices, _)) = self.devices.ready() else {
+            return;
+        };
+        let Some(device) = devices.iter().find(|d| d.device_id == device_id) else {
+            return;
+        };
+        let mut scopes: Vec<aidaemon_client_protocol::Scope> = device
+            .scopes
+            .iter()
+            .copied()
+            .filter(|s| *s != aidaemon_client_protocol::Scope::Control)
+            .collect();
+        if on {
+            scopes.push(aidaemon_client_protocol::Scope::Control);
+        }
+        self.devices_error = None;
+        self.devices_request = Some(self.send(Command::SetDeviceScopes {
+            device_id: device_id.to_owned(),
+            scopes,
+        }));
+    }
+
     /// Answers to the live view's own commands.
     fn live_answer(&mut self, frame: &ServerFrame, out: &mut Vec<Effect>) -> bool {
         match frame {
+            ServerFrame::Ack {
+                request_id,
+                result:
+                    CommandResult::Devices {
+                        devices,
+                        can_change,
+                    },
+            } if self.devices_request.as_deref() == Some(request_id) => {
+                self.devices_request = None;
+                self.devices = Read::Ready((devices.clone(), *can_change));
+                true
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.devices_request.as_deref() == Some(request_id) => {
+                self.devices_request = None;
+                self.devices_error = Some(error.message.clone());
+                if !self.devices.is_ready() {
+                    self.devices = Read::Failed(error.message.clone());
+                }
+                true
+            }
             ServerFrame::Ack {
                 request_id,
                 result:
@@ -2622,6 +2693,38 @@ mod tests {
         );
         assert_eq!(client.close_surface(), vec![Effect::CloseLive]);
         assert!(client.live.is_none());
+    }
+
+    #[test]
+    fn the_control_switch_keeps_a_devices_other_scopes() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.refresh_devices();
+        let (request, _) = client
+            .take_outgoing()
+            .into_iter()
+            .rfind(|(_, c)| matches!(c, Command::ListDevices))
+            .unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"devices","devices":[{{"device_id":"d1","name":"Synthetic phone","kind":"mobile","scopes":["observe","chat","approve","control"],"created_at_ms":1}}],"can_change":true}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(matches!(&client.devices, Read::Ready((d, true)) if d.len() == 1));
+        client.set_device_control("d1", false);
+        let (_, command) = client.take_outgoing().pop().unwrap();
+        assert_eq!(
+            command,
+            Command::SetDeviceScopes {
+                device_id: "d1".into(),
+                scopes: vec![
+                    aidaemon_client_protocol::Scope::Observe,
+                    aidaemon_client_protocol::Scope::Chat,
+                    aidaemon_client_protocol::Scope::Approve
+                ]
+            }
+        );
     }
 
     #[test]

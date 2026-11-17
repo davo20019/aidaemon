@@ -1,0 +1,24 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "can_change": true,
+    "devices": [
+      {
+        "created_at_ms": 1767225600000,
+        "device_id": "dev-phone-1",
+        "kind": "mobile",
+        "last_seen_ms": 1767225900000,
+        "name": "Synthetic phone",
+        "revoked": false,
+        "scopes": [
+          "observe",
+          "chat",
+          "approve",
+          "control"
+        ]
+      }
+    ],
+    "type": "devices"
+  },
+  "type": "ack"
+}

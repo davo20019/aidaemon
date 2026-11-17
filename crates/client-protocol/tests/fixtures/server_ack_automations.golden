@@ -36,6 +36,7 @@
             "summary": "3 new messages, 1 needs a reply."
           }
         ],
+        "session_id": "telegram:synthetic-user-1",
         "status": "paused",
         "what": "Summarize the synthetic inbox"
       }

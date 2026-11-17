@@ -412,6 +412,7 @@ impl ClientHost for Host {
         use aidaemon_client_protocol::{AutomationKind, AutomationSummary};
         Ok(vec![
             AutomationSummary {
+                session_id: None,
                 id: "goal-digest".into(),
                 kind: AutomationKind::Scheduled,
                 name: Some("Inbox digest".into()),
@@ -430,6 +431,7 @@ impl ClientHost for Host {
                 }),
             },
             AutomationSummary {
+                session_id: None,
                 id: "mandate-status".into(),
                 kind: AutomationKind::Watching,
                 name: Some("Status watch".into()),
@@ -442,6 +444,7 @@ impl ClientHost for Host {
                 edit: None,
             },
             AutomationSummary {
+                session_id: None,
                 id: "probe-site".into(),
                 kind: AutomationKind::Probe,
                 name: Some("Acme site up".into()),

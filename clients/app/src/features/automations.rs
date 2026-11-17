@@ -290,6 +290,30 @@ fn card(store: Store, automation: AutomationSummary) -> View {
                 .text_color(colors::MUTED),
         );
     let mut c = ui::surface().p_4().gap_2().child(heading).child(meta);
+    // A run waiting for the owner on a page (a sign-in, a code): say so on
+    // its card, with the way to do it.
+    if let Some(session) = automation.session_id.clone() {
+        c = c.child(dynamic(move || {
+            let surface = store.waiting_surface(&session)?;
+            Some(untracked(move || {
+                let what = match surface.site.as_deref() {
+                    Some(site) => format!("Waiting for you on {site}"),
+                    None => "Waiting for you in its browser".to_owned(),
+                };
+                let id = surface.id.clone();
+                view()
+                    .gap_2()
+                    .child(ui::banner(what, Tone::Warning))
+                    .child(view().flex_row().child(ui::btn(
+                        "Open the live view",
+                        Variant::Primary,
+                        Size::Sm,
+                        move || store.watch_surface(&id, true),
+                    )))
+                    .into_element()
+            }))
+        }));
+    }
     if automation.name.is_some() {
         c = c.child(
             text(automation.what.clone())

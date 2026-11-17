@@ -735,6 +735,7 @@ impl ClientHost for DaemonClientHost {
                     })
                     .collect(),
                 details: entry.details,
+                session_id: entry.session_id,
                 edit: entry
                     .edit
                     .map(|edit| aidaemon_client_protocol::AutomationEdit {
