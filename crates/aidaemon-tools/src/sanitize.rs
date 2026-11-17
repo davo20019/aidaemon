@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     fn test_output_sanitize_file_paths() {
-        let input = "The config is at /Users/david/projects/secret/config.toml";
+        let input = "The config is at /Users/alice/projects/secret/config.toml";
         let (result, redacted) = sanitize_output(input);
         assert!(redacted);
         assert!(result.contains("[REDACTED]"));

@@ -6516,7 +6516,7 @@ mod tests {
             RuntimeBot {
                 channel_type: "telegram".to_string(),
                 bot_token: "dynamic-user-token".to_string(),
-                allowed_user_ids: vec!["301753035".to_string()],
+                allowed_user_ids: vec!["555000111".to_string()],
             },
             RuntimeBot {
                 channel_type: "telegram".to_string(),
@@ -6526,7 +6526,7 @@ mod tests {
             RuntimeBot {
                 channel_type: "slack".to_string(),
                 bot_token: "xoxb-not-telegram".to_string(),
-                allowed_user_ids: vec!["301753035".to_string()],
+                allowed_user_ids: vec!["555000111".to_string()],
             },
         ];
 
@@ -6536,7 +6536,7 @@ mod tests {
                 "dynamic-user-token".to_string(),
             ],
             &dynamic_bots,
-            "301753035",
+            "555000111",
         );
 
         assert_eq!(

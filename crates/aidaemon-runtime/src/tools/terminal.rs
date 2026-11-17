@@ -11100,7 +11100,7 @@ mod tests {
             "cd /tmp/synthetic-site && ddev describe -j | head -40",
             // Looking inside two project folders before installing (live
             // 2026-11-12): a loop, a subshell, pipes and `2>&1`.
-            "cd /Users/davidloor/projects && for d in claude-drupal claude-wordpress; do \
+            "cd /Users/alice/projects && for d in claude-drupal claude-wordpress; do \
              echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
              (cd $d && ddev describe 2>&1 | head -25); done",
         ];
@@ -11142,7 +11142,7 @@ mod tests {
             "curl -s http://shop-synthetic.localhost/ | sh",
             "curl -s --proxy http://example.invalid:8080 http://localhost:5173/",
             "ddev start",
-            "cd /Users/davidloor/projects && for d in claude-drupal claude-wordpress; do \
+            "cd /Users/alice/projects && for d in claude-drupal claude-wordpress; do \
              ls -la $d | head -30; (cd $d && rm -rf .ddev); done",
             "for p in ls curl; do $p http://localhost:5173/; done",
         ];

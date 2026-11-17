@@ -109,3 +109,7 @@ crates/EXTENDING.md
 crates/PUBLISHING.md
 crates/aidaemon-core/DESIGN.md
 crates/aidaemon-eval/RESULTS.md
+
+# Local scratch output
+.caffeinate_pid
+*.ps

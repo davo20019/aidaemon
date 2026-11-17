@@ -1964,7 +1964,7 @@ fn infer_required_mutation_effects(
     let mut required = ToolMutationEffects::NONE;
     // Delivery is a semantic outcome, not a synonym list. Once the request is
     // classified as Deliver, a local write must never satisfy it. Live repro:
-    // "Send me a pdf about imerkar" wrote HTML and PostScript, failed both
+    // "Send me a pdf about acme" wrote HTML and PostScript, failed both
     // conversions, and was incorrectly persisted as succeeded without calling
     // send_file because the old phrase list only recognized "send me the file".
     if task_kind == CompletionTaskKind::Deliver {
@@ -2840,7 +2840,7 @@ mod tests {
 
     #[test]
     fn retry_only_followup_inherits_pdf_delivery_contract() {
-        let enriched = "Original request:\nSend me a pdf about Imerkar. Make it nice since we are pitching the idea to investors.\n\nCurrent request:\nCan you try one more time?";
+        let enriched = "Original request:\nSend me a pdf about Acme. Make it nice since we are pitching the idea to investors.\n\nCurrent request:\nCan you try one more time?";
         let contract = infer_completion_contract(enriched, &[]);
         assert_eq!(contract.task_kind, CompletionTaskKind::Deliver);
         assert!(contract.expects_mutation);

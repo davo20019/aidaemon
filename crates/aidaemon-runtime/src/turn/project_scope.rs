@@ -916,10 +916,10 @@ mod tests {
     }
     #[test]
     fn unify_scopes_single_entry_returns_it() {
-        let scopes = vec!["/Users/david/projects/blog".to_string()];
+        let scopes = vec!["/Users/alice/projects/blog".to_string()];
         assert_eq!(
             unify_current_turn_scopes(&scopes),
-            Some("/Users/david/projects/blog".to_string())
+            Some("/Users/alice/projects/blog".to_string())
         );
     }
     #[test]
@@ -932,24 +932,24 @@ mod tests {
         // User mentions ~/projects/blog/posts/file.md and ~/projects/blog/tweets.md
         // which normalize to /blog/posts and /blog respectively
         let scopes = vec![
-            "/Users/david/projects/blog/posts".to_string(),
-            "/Users/david/projects/blog".to_string(),
+            "/Users/alice/projects/blog/posts".to_string(),
+            "/Users/alice/projects/blog".to_string(),
         ];
         assert_eq!(
             unify_current_turn_scopes(&scopes),
-            Some("/Users/david/projects/blog".to_string())
+            Some("/Users/alice/projects/blog".to_string())
         );
     }
     #[test]
     fn unify_scopes_siblings_returns_common_ancestor() {
         // User mentions ~/projects/blog/posts/file.md and ~/projects/blog/output/index.html
         let scopes = vec![
-            "/Users/david/projects/blog/posts".to_string(),
-            "/Users/david/projects/blog/output".to_string(),
+            "/Users/alice/projects/blog/posts".to_string(),
+            "/Users/alice/projects/blog/output".to_string(),
         ];
         assert_eq!(
             unify_current_turn_scopes(&scopes),
-            Some("/Users/david/projects/blog".to_string())
+            Some("/Users/alice/projects/blog".to_string())
         );
     }
     #[test]
@@ -965,24 +965,24 @@ mod tests {
     #[test]
     fn legitimate_multiple_projects_are_not_arbitrarily_reduced_to_first() {
         let scopes = vec![
-            "/Users/david/projects/blog".to_string(),
-            "/Users/david/projects/daemon".to_string(),
+            "/Users/alice/projects/blog".to_string(),
+            "/Users/alice/projects/daemon".to_string(),
         ];
         assert_eq!(
             unify_current_turn_scopes(&scopes),
-            Some("/Users/david/projects".to_string())
+            Some("/Users/alice/projects".to_string())
         );
     }
     #[test]
     fn unify_scopes_three_paths_same_project() {
         let scopes = vec![
-            "/Users/david/projects/blog/posts".to_string(),
-            "/Users/david/projects/blog/output".to_string(),
-            "/Users/david/projects/blog/scripts".to_string(),
+            "/Users/alice/projects/blog/posts".to_string(),
+            "/Users/alice/projects/blog/output".to_string(),
+            "/Users/alice/projects/blog/scripts".to_string(),
         ];
         assert_eq!(
             unify_current_turn_scopes(&scopes),
-            Some("/Users/david/projects/blog".to_string())
+            Some("/Users/alice/projects/blog".to_string())
         );
     }
     #[test]

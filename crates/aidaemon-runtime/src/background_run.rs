@@ -114,11 +114,11 @@ pub const LABEL_CHARS: usize = 60;
 /// The name the owner reads for a run: the title its call gave the work,
 /// in plain words, when it is one short line; a path in it reads as the
 /// folder or file it names (live 2026-11-13: "Install a Drupal site in
-/// /Users/davidloor/projects/claude-drupal-7" was shown as "codex coding
+/// /Users/alice/projects/claude-drupal-7" was shown as "codex coding
 /// agent"). Else `fallback` (what the work is: "a shell loop", "Codex
 /// coding agent"). A title is never cut, so a label never ends mid-word or
 /// mid-path (live 2026-11-13: "Install a fresh Drupal site … in exactly
-/// /Users/davidloor/projects/cla").
+/// /Users/alice/projects/cla").
 pub fn plain_label(title: Option<&str>, fallback: &str) -> String {
     let title = title
         .map(|title| {

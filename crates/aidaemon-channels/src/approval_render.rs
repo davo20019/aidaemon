@@ -565,7 +565,7 @@ mod tests {
         assert!(final_msg.contains("❌ Denied"));
     }
 
-    const INSPECT: &str = "cd /Users/davidloor/projects && for d in claude-drupal \
+    const INSPECT: &str = "cd /Users/alice/projects && for d in claude-drupal \
         claude-wordpress; do echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
         (cd $d && ddev describe 2>&1 | head -25); done";
 

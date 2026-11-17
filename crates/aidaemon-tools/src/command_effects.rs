@@ -4273,7 +4273,7 @@ mod tests {
     /// reports a local project, so it is local work that reaches nothing
     /// beyond this computer; the same loop deleting, or writing a file,
     /// is not read-only.
-    const INSPECT_SITES: &str = "cd /Users/davidloor/projects && for d in claude-drupal \
+    const INSPECT_SITES: &str = "cd /Users/alice/projects && for d in claude-drupal \
         claude-wordpress; do echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
         (cd $d && ddev describe 2>&1 | head -25); done";
 

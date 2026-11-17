@@ -29,7 +29,11 @@ curl -sSfL https://get.aidaemon.ai | bash
 
 ### macOS download
 
-Get `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIdaemon to Applications and open it. No terminal needed.
+Get `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIdaemon to Applications and open it. No terminal needed. Until the download is notarized, macOS asks once: open it, then **System Settings → Privacy & Security → Open Anyway**.
+
+### Windows download
+
+Get `aidaemon-windows-x86_64.zip` from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), extract it to a folder you keep (for example `%LOCALAPPDATA%\AIdaemon`) and open `aidaemon-app.exe`. Windows SmartScreen may warn about an unrecognized app: **More info → Run anyway**.
 
 ### Homebrew
 
@@ -40,7 +44,7 @@ brew install davo20019/tap/aidaemon
 ### Cargo
 
 ```bash
-cargo install aidaemon
+cargo install --locked --git https://github.com/davo20019/aidaemon aidaemon
 ```
 
 Then open the AIdaemon app (`aidaemon app`, or `aidaemon-app` from a release). The first time it opens, the desktop app starts the daemon on this computer right away, now and at login, with no administrator password (**Run it on another machine instead** pairs with a server; `aidaemon service uninstall` stops it, and the app then asks before starting it again). It finds a model already on the computer (a ChatGPT sign-in, a provider key in the environment, Ollama or llama.cpp running locally) and offers it in one click, or connects one you pick; each is tested before anything is saved, and each provider says whether it uses your plan, bills per token or runs on your own machine. Self-hosted models need no key: pick **Ollama (local)** or **llama.cpp (local)**, or **Another OpenAI-compatible service** with your server's address (LM Studio, vLLM) and the key left empty. `llama-server` and this daemon's health check both default to port 8080: start one of them elsewhere (`llama-server --port 8081`, or `[daemon] health_port`) and give llama.cpp's address in its form. Your first conversation opens next. To talk to your agent from Telegram, Slack or Discord later, use **Settings → Reach it from your phone**.

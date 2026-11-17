@@ -905,7 +905,7 @@ pub fn child_status_label(mission: &str) -> String {
     }
     // Whole words up to the limit, stopping before a path: a label never
     // ends mid-word or mid-path (live 2026-11-13: "… in exactly
-    // /Users/davidloor/projects/cla").
+    // /Users/alice/projects/cla").
     let mut label = String::new();
     for word in line.split_whitespace() {
         let longer = label.chars().count() + usize::from(!label.is_empty()) + word.chars().count();

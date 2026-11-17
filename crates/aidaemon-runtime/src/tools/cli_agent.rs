@@ -2790,7 +2790,7 @@ impl CliAgentTool {
 
         // What it was sent to do, as the owner and the parent read it: its
         // label, never a cut prompt (live 2026-11-13: "Delegated step: …
-        // /Users/davidloor/projects/claude-wordpre" made the verifier judge
+        // /Users/alice/projects/claude-wordpre" made the verifier judge
         // the next call against a folder that does not exist).
         let run_label = spec.label(&format!("{tool_name} coding agent"));
         let task_context = run_label.clone();

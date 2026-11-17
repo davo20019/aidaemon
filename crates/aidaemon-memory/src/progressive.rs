@@ -974,8 +974,8 @@ mod tests {
         assert!(identity_fact_lacks_user_evidence(
             "user",
             "name",
-            "Edison Mendez",
-            "Tell me about the beca applicant and their nationality"
+            "Jordan Lee",
+            "Tell me about the grant applicant and their nationality"
         ));
     }
 

@@ -197,6 +197,64 @@ jobs:
             AIdaemon-${{ matrix.name }}.dmg
             AIdaemon-${{ matrix.name }}.dmg.sha256
 
+  # The Windows download: aidaemon.exe and aidaemon-app.exe side by side in a
+  # zip. The app finds the daemon beside it and "Run it here" installs it as
+  # a logon task. Built like ci.yml's Windows jobs (vcpkg's static OpenSSL
+  # for SQLCipher).
+  build-windows:
+    name: Build windows-x86_64
+    needs: [quality-gate]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - uses: actions/cache@v4
+        id: openssl
+        with:
+          path: C:\vcpkg\installed\x64-windows-static-md
+          key: vcpkg-openssl-x64-windows-static-md-v1
+
+      - name: Install OpenSSL
+        if: steps.openssl.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: vcpkg install openssl:x64-windows-static-md
+
+      - name: Point the build at OpenSSL
+        shell: pwsh
+        run: |
+          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build daemon
+        run: cargo build --release --locked --features "browser"
+
+      - name: Build app
+        run: cargo build --release --locked --manifest-path clients/app/Cargo.toml
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\aidaemon-windows"
+          Copy-Item target\release\aidaemon.exe $stage
+          Copy-Item clients\app\target\release\aidaemon-app.exe $stage
+          Copy-Item LICENSE $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath aidaemon-windows-x86_64.zip
+          $hash = (Get-FileHash aidaemon-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  aidaemon-windows-x86_64.zip" | Out-File -Encoding ascii -NoNewline aidaemon-windows-x86_64.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aidaemon-windows-x86_64
+          path: |
+            aidaemon-windows-x86_64.zip
+            aidaemon-windows-x86_64.zip.sha256
+
   # The app's web build, once: the daemon's gateway serves it from
   # ~/.aidaemon/app-web at /client/v1/next/ (install.sh puts it there).
   web-app:
@@ -263,7 +321,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build, web-app]
+    needs: [build, build-windows, web-app]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -285,6 +343,7 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.dmg
+            artifacts/*.zip
             artifacts/*.sha256
 
   publish-crates:

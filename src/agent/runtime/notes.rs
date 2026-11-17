@@ -70,7 +70,7 @@ mod tests {
         let harness = setup_test_agent(MockProvider::new())
             .await
             .expect("setup harness");
-        let session_id = "telegram:test_bot:301753035";
+        let session_id = "telegram:test_bot:555000111";
         let delivered = "Goal completed:\n\nCreated ~/morning_ai_job_preparation_tips_report.md";
 
         let outcome = harness
@@ -198,7 +198,7 @@ mod tests {
         let harness = setup_test_agent(MockProvider::new())
             .await
             .expect("setup harness");
-        let session_id = "telegram:test_bot:301753036";
+        let session_id = "telegram:test_bot:555000112";
         let delivered = "Result that should not be recorded when hub is dropped";
 
         // Build a Weak that cannot upgrade by dropping the strong Arc first.

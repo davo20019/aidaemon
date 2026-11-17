@@ -201,12 +201,12 @@ mod tests {
     #[test]
     fn alert_destination_dedupes_legacy_and_namespaced_telegram_sessions() {
         assert!(budget::same_alert_destination(
-            "301753035",
-            "aidaemon_coding_bot:301753035"
+            "555000111",
+            "synthetic_coding_bot:555000111"
         ));
         assert!(!budget::same_alert_destination(
             "slack:U018EAFV5QR",
-            "aidaemon_coding_bot:301753035"
+            "synthetic_coding_bot:555000111"
         ));
     }
 

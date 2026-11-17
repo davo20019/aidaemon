@@ -1404,7 +1404,7 @@ mod tests {
     /// no high-risk card, and names the folders; a sub-agent's card names it.
     #[test]
     fn a_refused_read_only_look_is_not_rated_high_and_names_its_folders() {
-        let command = "cd /Users/davidloor/projects && for d in claude-drupal claude-wordpress; \
+        let command = "cd /Users/alice/projects && for d in claude-drupal claude-wordpress; \
             do echo \"== $d\"; ls -la $d | head -30; ls $d/.ddev 2>&1 | head; \
             (cd $d && ddev describe 2>&1 | head -25); done";
         let request =

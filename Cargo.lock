@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "aidaemon"
-version = "0.12.9"
+version = "0.20.0"
 dependencies = [
  "aidaemon-agents",
  "aidaemon-channel-discord",

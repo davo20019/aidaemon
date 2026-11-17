@@ -117,12 +117,12 @@ mod tests {
     fn terminal_tenant_bot_bootstrap_signature_is_stable() {
         let sig = sign_terminal_tenant_bot_bootstrap_proof(
             "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd",
-            301753035,
+            555000111,
             1_700_000_000,
             "deadbeefcafebabe",
         )
         .unwrap();
-        assert_eq!(sig, "wdb3Oj1hWbvz373tj4nBZrudZKP_nFsmf8LZvWMwvOo");
+        assert_eq!(sig, "DNHQfgDo52xR8KGA-L1vu9mMg6iiffAc5jsmBiHvPJc");
     }
 
     #[test]
