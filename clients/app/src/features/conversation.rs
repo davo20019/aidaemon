@@ -643,7 +643,7 @@ fn welcome(store: Store) -> View {
                         if code.get() {
                             "Which project is this for?"
                         } else {
-                            "What can I help with?"
+                            "What can I help you with?"
                         }
                     })
                     .role(AccessibilityRole::Header)
