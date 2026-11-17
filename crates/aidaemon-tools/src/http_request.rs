@@ -287,6 +287,20 @@ impl HttpRequestTool {
         }
     }
 
+    /// The arguments after the recovery `execute` applies: tool parameters
+    /// found in the URL's query are moved into the arguments. `None` when
+    /// they cannot be read that way.
+    fn arguments_as_run(arguments: &str) -> Option<Value> {
+        let mut args = serde_json::from_str::<Value>(arguments).ok()?;
+        if let Some(mut url) = args["url"]
+            .as_str()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+        {
+            Self::recover_embedded_tool_params_from_url(&mut args, &mut url).ok()?;
+        }
+        Some(args)
+    }
+
     fn recover_embedded_tool_params_from_url(
         args: &mut Value,
         url: &mut reqwest::Url,
@@ -2497,9 +2511,10 @@ impl crate::semantics::ToolSemantics for HttpRequestTool {
     /// (query parameters, headers, a body) is text the model wrote.
     fn call_outbound(&self, arguments: &str) -> aidaemon_core::Outbound {
         const URL_ONLY: &[&str] = &["url", "method", "timeout_secs", "follow_redirects"];
-        let Some(args) = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
+        // Judged as it runs: a credential profile named inside the URL is
+        // recovered into the arguments, which makes the call more than a
+        // plain read of that URL.
+        let Some(args) = Self::arguments_as_run(arguments).and_then(|v| v.as_object().cloned())
         else {
             return aidaemon_core::Outbound::Composed;
         };
@@ -2561,15 +2576,15 @@ impl crate::semantics::ToolSemantics for HttpRequestTool {
             self.capabilities(),
             &self.call_semantics(arguments),
         );
-        let credentialed = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .is_some_and(|args| {
-                ["auth_profile", "account_id"].iter().any(|key| {
-                    args.get(*key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.trim().is_empty())
-                })
-            });
+        // As the request runs: a profile named inside the URL (which a page
+        // can write) is recovered and attaches the credential all the same.
+        let credentialed = Self::arguments_as_run(arguments).is_some_and(|args| {
+            ["auth_profile", "account_id"].iter().any(|key| {
+                args.get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        });
         if credentialed {
             annotations.egress = true;
         }
@@ -4385,6 +4400,23 @@ mod tests {
             .expect_err("recovered call should reach normal auth-profile validation");
 
         assert!(err.to_string().contains("Unknown auth profile: 'twitter'"));
+    }
+
+    #[test]
+    fn a_profile_named_inside_the_url_is_judged_as_a_credentialed_call() {
+        let tool = HttpRequestTool::new(Arc::new(RwLock::new(HashMap::new())));
+        let arguments = json!({
+            "method": "GET",
+            "url": "https://mail.example.invalid/v1/messages?auth_profile=mail"
+        })
+        .to_string();
+        assert_eq!(
+            tool.call_outbound(&arguments),
+            aidaemon_core::Outbound::Composed
+        );
+        let no_roots: [String; 0] = [];
+        let roots = crate::semantics::TrustRoots::new(&no_roots);
+        assert!(tool.call_annotations_in(&arguments, &roots).egress);
     }
 
     #[tokio::test]
