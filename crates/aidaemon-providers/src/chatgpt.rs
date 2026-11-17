@@ -636,10 +636,27 @@ fn build_tools(tools: &[ToolSpec]) -> Vec<Value> {
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.parameters,
+                "parameters": tool_parameters(&tool.parameters),
             })
         })
         .collect()
+}
+
+/// A tool's parameters in the schema subset the backend compiles. Newer
+/// models compile every tool schema strictly and refuse the whole request
+/// over `uniqueItems` (HTTP 400, "Unimplemented keys"); the tool still
+/// checks its own arguments, so dropping the keyword loses nothing.
+fn tool_parameters(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "uniqueItems")
+                .map(|(key, value)| (key.clone(), tool_parameters(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(tool_parameters).collect()),
+        other => other.clone(),
+    }
 }
 
 fn build_tool_choice(choice: &ToolChoice) -> Value {
@@ -1326,5 +1343,23 @@ mod tests {
         ));
         // Reported inside an answer already started: not proof of no spend.
         assert!(!capped.unwrap_err().proves_nothing_spent());
+    }
+
+    #[test]
+    fn tool_schemas_drop_unique_items_at_any_depth() {
+        let mut req = request(vec![Message::user("hi")]);
+        req.tools = vec![ToolSpec {
+            name: "generate_image".into(),
+            description: "Draw".into(),
+            parameters: json!({"type": "object", "properties": {"ids": {
+                "type": "array", "uniqueItems": true, "maxItems": 4,
+                "items": {"type": "array", "uniqueItems": true}
+            }}}),
+        }];
+        let body = build_body(&req, None);
+        let ids = &body["tools"][0]["parameters"]["properties"]["ids"];
+        assert!(ids.get("uniqueItems").is_none());
+        assert!(ids["items"].get("uniqueItems").is_none());
+        assert_eq!(ids["maxItems"], 4);
     }
 }
