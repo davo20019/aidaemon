@@ -469,7 +469,11 @@ impl ClientHost for Host {
         Ok(vec![ProjectSummary {
             id: "project-acme".into(),
             name: "Acme site".into(),
-            path: Some("/home/synthetic/acme-site".into()),
+            // A real folder for the Files view: `AIDAEMON_DEMO_PROJECT_DIR`.
+            path: Some(
+                std::env::var("AIDAEMON_DEMO_PROJECT_DIR")
+                    .unwrap_or_else(|_| "/home/synthetic/acme-site".into()),
+            ),
             channels: vec!["telegram:synthetic_coding_bot".into()],
         }]
         .into_iter()

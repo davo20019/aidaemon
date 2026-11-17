@@ -3386,7 +3386,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "chrono",
  "html5ever",
@@ -3416,7 +3416,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -3457,7 +3457,7 @@ dependencies = [
 [[package]]
 name = "nsh-dev"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -3470,7 +3470,7 @@ dependencies = [
 [[package]]
 name = "nsh-engine"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "block2",
  "crossbeam-channel",
@@ -3497,12 +3497,12 @@ dependencies = [
 [[package]]
 name = "nsh-i18n"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 
 [[package]]
 name = "nsh-js"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -3525,7 +3525,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -3538,7 +3538,7 @@ dependencies = [
 [[package]]
 name = "nsh-package"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3553,7 +3553,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-apple"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "block2",
  "cc",
@@ -3572,7 +3572,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-linux"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "crossbeam-channel",
  "gstreamer",
@@ -3594,7 +3594,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-macos"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "block2",
  "crossbeam-channel",
@@ -3622,7 +3622,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-tui"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -3642,7 +3642,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-windows"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "crossbeam-channel",
  "image",
@@ -3663,7 +3663,7 @@ dependencies = [
 [[package]]
 name = "nsh-testing"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -3680,7 +3680,7 @@ dependencies = [
 [[package]]
 name = "nsh-tui-host"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -3698,7 +3698,7 @@ dependencies = [
 [[package]]
 name = "nsh-updater"
 version = "0.5.1"
-source = "git+https://github.com/davo20019/nsh?rev=91c263722a731511476419f25decc701765b493c#91c263722a731511476419f25decc701765b493c"
+source = "git+https://github.com/davo20019/nsh?rev=d3dc59bb467118a1ddd355f5e5883609e135936d#d3dc59bb467118a1ddd355f5e5883609e135936d"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
