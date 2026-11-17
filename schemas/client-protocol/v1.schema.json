@@ -4719,6 +4719,17 @@
     "ProjectFile": {
       "description": "One file of a project, as it is now.",
       "properties": {
+        "link": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where to fetch the file itself, for one that is not text but can be\nshown (a picture, a PDF): a signed link, as a message's files have."
+        },
         "modified_ms": {
           "format": "uint64",
           "minimum": 0,

@@ -8,7 +8,10 @@
 //! name only. Read when the tab opens, on another conversation's project,
 //! and on Refresh.
 
-use aidaemon_client_protocol::{EntryKind, FileStatus, ProjectEntry, ProjectSummary, Withheld};
+use aidaemon_client_protocol::{
+    AttachmentRef, EntryKind, FileStatus, ProjectEntry, ProjectSummary, Withheld,
+};
+use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
 use crate::store::{FileRead, FolderRead, Store};
@@ -429,7 +432,7 @@ fn file_view(
         )
         .child(dynamic(move || {
             let read = store.open_file();
-            Some(untracked(move || file_body(read)))
+            Some(untracked(move || file_body(store, read)))
         }))
 }
 
@@ -453,14 +456,14 @@ fn full_screen(store: Store, id: String, path: String, in_page: bool) -> View {
     ))
 }
 
-fn file_body(read: FileRead) -> View {
+fn file_body(store: Store, read: FileRead) -> View {
     match read {
         FileRead::NotYet | FileRead::Loading => {
             view().p_3().child(ui::working("Reading the file…"))
         }
         FileRead::Failed(reason) => view().p_3().child(ui::banner(reason, Tone::Danger)),
-        FileRead::Ready(file) => match (file.text, file.withheld) {
-            (Some(text), _) => {
+        FileRead::Ready(file) => match (file.text, file.withheld, file.link) {
+            (Some(text), _, _) => {
                 let name = file
                     .path
                     .rsplit('/')
@@ -479,12 +482,13 @@ fn file_body(read: FileRead) -> View {
                 }
                 body.child(ui::code_viewer(text, name.clone(), name))
             }
-            (None, Some(Withheld::Secret)) => view().child(ui::empty(
+            (None, Some(Withheld::Secret), _) => view().child(ui::empty(
                 "Not shown",
                 "This file holds secrets (keys, credentials or settings), so its text \
                  never leaves the computer it is on.",
             )),
-            (None, _) => view().child(ui::empty(
+            (None, Some(Withheld::Binary), Some(link)) => shown_file(store, link, file.size_bytes),
+            (None, _, _) => view().child(ui::empty(
                 "Not a text file",
                 format!(
                     "{}; open it on the computer it is on.",
@@ -493,6 +497,46 @@ fn file_body(read: FileRead) -> View {
             )),
         },
     }
+}
+
+/// A picture shown in place (tap for the viewer); a PDF, or a picture in
+/// the terminal, opened outside the app by its link.
+fn shown_file(store: Store, link: AttachmentRef, size_bytes: u64) -> View {
+    let Some(url) = store.file_url(&link) else {
+        return view().child(ui::empty("Not a text file", size_words(size_bytes)));
+    };
+    if link.is_image() && idiom() != Idiom::Terminal {
+        let pixels = link.width.zip(link.height);
+        let viewed = ui::Viewed {
+            id: link.id.clone(),
+            url: url.clone(),
+            name: link.name.clone(),
+            pixels,
+        };
+        return view().flex_1().items_center().p_4().child(ui::picture(
+            url,
+            format!("Picture: {}", link.name),
+            pixels,
+            move || store.view_picture(viewed.clone()),
+        ));
+    }
+    let what = if link.is_image() {
+        "A picture"
+    } else {
+        "A PDF"
+    };
+    view()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(ui::empty(
+            if link.is_image() { "Picture" } else { "PDF" },
+            format!("{what}, {}.", size_words(size_bytes)),
+        ))
+        .child(ui::btn("Open", Variant::Secondary, Size::Md, move || {
+            drop(open_url(url.clone()));
+        }))
 }
 
 fn status_letter(status: FileStatus) -> (&'static str, Tone) {

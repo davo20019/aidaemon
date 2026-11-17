@@ -1307,8 +1307,28 @@ impl ClientGateway {
             Command::ReadProjectFile { project_id, path } => {
                 let folder = self.project_folder(&project_id).await?;
                 let host = self.host.clone();
+                let files = self.files.clone();
                 let file = tokio::task::spawn_blocking(move || {
-                    project_files::read(&folder, &project_id, &path, &|p| host.is_secret_path(p))
+                    project_files::read_linked(
+                        &folder,
+                        &project_id,
+                        &path,
+                        &|p| host.is_secret_path(p),
+                        &|shown| {
+                            let mut link = files
+                                .as_ref()?
+                                .register(shown.path, shown.name, shown.mime, shown.size_bytes)
+                                .map_err(|e| warn!(error = %e, "Could not link a project file"))
+                                .ok()?;
+                            // A new version is a new address, so no cached
+                            // copy of the old one shows.
+                            let version = shown.version.trim_start_matches("sha256:");
+                            link.url = link.url.map(|url| {
+                                format!("{url}?v={}", &version[..version.len().min(16)])
+                            });
+                            Some(link)
+                        },
+                    )
                 })
                 .await
                 .map_err(|_| {

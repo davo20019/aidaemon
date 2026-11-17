@@ -1162,6 +1162,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 truncated: false,
                 withheld: None,
                 status: Some(FileStatus::Modified),
+                link: None,
             },
         }),
         ack(CommandResult::Changes {

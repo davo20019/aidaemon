@@ -1246,6 +1246,10 @@ pub struct ProjectFile {
     /// How it differs from git's `HEAD`, as in [`ProjectEntry::status`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<FileStatus>,
+    /// Where to fetch the file itself, for one that is not text but can be
+    /// shown (a picture, a PDF): a signed link, as a message's files have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<AttachmentRef>,
 }
 
 /// Why a [`ProjectFile`]'s text is not sent.

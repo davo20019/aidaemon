@@ -19,8 +19,8 @@ use std::process::Command as Process;
 use std::time::UNIX_EPOCH;
 
 use aidaemon_client_protocol::{
-    EntryKind, ErrorCode, FileStatus, ProjectDir, ProjectEntry, ProjectFile, ProtocolError,
-    Withheld,
+    AttachmentRef, EntryKind, ErrorCode, FileStatus, ProjectDir, ProjectEntry, ProjectFile,
+    ProtocolError, Withheld,
 };
 use sha2::{Digest, Sha256};
 
@@ -177,6 +177,41 @@ pub fn read(
     rel: &str,
     secret: &dyn Fn(&Path) -> bool,
 ) -> Result<ProjectFile, ProtocolError> {
+    read_linked(folder, project_id, rel, secret, &|_| None)
+}
+
+/// The largest picture or PDF given a link: the link serves the whole
+/// file in one reply.
+pub const MAX_LINKED_BYTES: u64 = 25 * 1024 * 1024;
+
+/// A file to give a link to: where it is, its name and type, and its size.
+pub struct Shown<'a> {
+    pub path: &'a Path,
+    pub name: &'a str,
+    pub mime: &'static str,
+    pub size_bytes: u64,
+    /// The file's version, as in [`ProjectFile::version`]: a changed file
+    /// is a new link, so a cached copy is never shown for it.
+    pub version: &'a str,
+}
+
+/// What a file that is not text can be shown as, read from its first
+/// bytes: a picture a page shows in place, or a PDF.
+fn shown_mime(head: &[u8]) -> Option<&'static str> {
+    aidaemon_tools::sniff_image_mime(head)
+        .filter(|m| matches!(*m, "image/png" | "image/jpeg" | "image/gif" | "image/webp"))
+        .or_else(|| head.starts_with(b"%PDF-").then_some("application/pdf"))
+}
+
+/// [`read`], with `link` asked for a link to a picture or PDF (never to a
+/// file holding secrets, nor to one over [`MAX_LINKED_BYTES`]).
+pub fn read_linked(
+    folder: &Path,
+    project_id: &str,
+    rel: &str,
+    secret: &dyn Fn(&Path) -> bool,
+    link: &dyn Fn(Shown<'_>) -> Option<AttachmentRef>,
+) -> Result<ProjectFile, ProtocolError> {
     let root = root_of(folder)?;
     let (target, rel) = resolve(&root, rel)?;
     if rel.is_empty() || target.is_dir() {
@@ -208,7 +243,21 @@ pub fn read(
             file.truncated = meta.len() as usize > text.len();
             file.text = Some(text);
         }
-        None => file.withheld = Some(Withheld::Binary),
+        None => {
+            file.withheld = Some(Withheld::Binary);
+            if meta.len() <= MAX_LINKED_BYTES
+                && let Some(mime) = shown_mime(&head)
+            {
+                let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+                file.link = link(Shown {
+                    path: &target,
+                    name,
+                    mime,
+                    size_bytes: meta.len(),
+                    version: &file.version,
+                });
+            }
+        }
     }
     Ok(file)
 }
@@ -473,6 +522,50 @@ mod tests {
         let bin = read(dir.path(), "p", "logo.bin", &no_secrets).unwrap();
         assert_eq!(bin.withheld, Some(Withheld::Binary));
         assert!(read(dir.path(), "p", "src", &no_secrets).is_err());
+    }
+
+    #[test]
+    fn pictures_and_pdfs_get_a_link_other_binaries_and_secrets_do_not() {
+        let dir = project();
+        let root = dir.path();
+        std::fs::write(root.join("mascot.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0").unwrap();
+        std::fs::write(root.join("guide.pdf"), b"%PDF-1.7\n\0\x01").unwrap();
+        std::fs::write(root.join("key.png"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0").unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let link = |shown: Shown<'_>| {
+            asked.borrow_mut().push((shown.name.to_owned(), shown.mime));
+            assert!(shown.version.starts_with("sha256:"));
+            Some(AttachmentRef {
+                id: "0".repeat(24),
+                name: shown.name.to_owned(),
+                url: Some(format!("/files/{}", shown.name)),
+                mime: Some(shown.mime.to_owned()),
+                size_bytes: Some(shown.size_bytes),
+                width: None,
+                height: None,
+                marked_from: None,
+            })
+        };
+        let key_is_secret = |p: &Path| p.file_name().is_some_and(|n| n == "key.png");
+        let read = |rel| read_linked(root, "p", rel, &key_is_secret, &link).unwrap();
+
+        let png = read("mascot.png");
+        assert_eq!(png.withheld, Some(Withheld::Binary));
+        assert_eq!(
+            png.link.and_then(|l| l.url).as_deref(),
+            Some("/files/mascot.png")
+        );
+        assert!(read("guide.pdf").link.is_some());
+        assert!(read("logo.bin").link.is_none());
+        assert!(read("key.png").link.is_none());
+        assert!(read("src/contact.rs").link.is_none());
+        assert_eq!(
+            asked.into_inner(),
+            [
+                ("mascot.png".to_owned(), "image/png"),
+                ("guide.pdf".to_owned(), "application/pdf")
+            ]
+        );
     }
 
     #[test]
