@@ -1165,53 +1165,13 @@ pub fn failure_of_error(error: &anyhow::Error) -> crate::run_state::RunFailure {
     }
 }
 
-pub fn sqlite_busy_code(value: &str) -> bool {
-    value
-        .parse::<i32>()
-        .ok()
-        .is_some_and(|code| code & 0xff == 5)
-}
-
-pub fn message_has_sqlite_busy_code(message: &str) -> bool {
-    message.split("code:").skip(1).any(|suffix| {
-        let code = suffix
-            .trim_start()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>();
-        sqlite_busy_code(&code)
-    })
-}
-
+/// SQLite contention, from the driver's typed error code only.
 pub fn is_sqlite_busy(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>()
-            && database.code().is_some_and(|code| sqlite_busy_code(&code))
-        {
-            return true;
-        }
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("database is locked")
-            || message.contains("database table is locked")
-            || message.contains("sqlite_busy")
-            || message_has_sqlite_busy_code(&message)
-    })
+    aidaemon_work::scheduler::is_sqlite_busy_error(error)
 }
 
 pub fn worker_profile_id(kind: SpecialistKind) -> String {
     format!("profile-{}", kind.as_str().replace('_', "-"))
-}
-
-pub fn task_references_parent_context(task: &str) -> bool {
-    let normalized = task.to_ascii_lowercase();
-    [
-        "completed task results",
-        "prior knowledge",
-        "parent context",
-        "prompt context",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
 }
 
 /// Returns the task-lead execution-mode prose for the given `is_scheduled` flag.
@@ -2516,19 +2476,13 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_busy_retry_classifier_is_narrow() {
-        assert!(is_sqlite_busy(&anyhow::anyhow!(
+    fn sqlite_busy_retry_never_reads_the_message() {
+        // Contention is the driver's typed code (covered in
+        // aidaemon_work::scheduler); words alone are not.
+        assert!(!is_sqlite_busy(&anyhow::anyhow!(
             "error returned from database: (code: 5) database is locked"
         )));
-        assert!(is_sqlite_busy(&anyhow::anyhow!("SQLITE_BUSY")));
-        for code in [261, 517, 773] {
-            assert!(is_sqlite_busy(&anyhow::anyhow!(
-                "error returned from database: (code: {code}) database is locked"
-            )));
-        }
-        assert!(!is_sqlite_busy(&anyhow::anyhow!(
-            "error returned from database: (code: 516) unrelated failure"
-        )));
+        assert!(!is_sqlite_busy(&anyhow::anyhow!("SQLITE_BUSY")));
         assert!(!is_sqlite_busy(&anyhow::anyhow!("executor lease was lost")));
     }
 

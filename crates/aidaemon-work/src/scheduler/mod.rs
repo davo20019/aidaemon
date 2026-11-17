@@ -188,32 +188,22 @@ pub fn mandate_transient_retry_at(mandate: &Mandate, now: chrono::DateTime<Utc>)
     retry_at.to_rfc3339()
 }
 
-pub fn sqlite_busy_code(value: &str) -> bool {
-    value
-        .parse::<i32>()
-        .ok()
-        .is_some_and(|code| code & 0xff == 5)
-}
-
+/// Whether an error is SQLite contention (`SQLITE_BUSY` or `SQLITE_LOCKED`,
+/// including their extended codes), read from the driver's typed database
+/// error anywhere in the chain. The message is never read: an error that was
+/// flattened to text, or merely mentions "database is locked", is not
+/// retried as contention.
 pub fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
+    const SQLITE_BUSY: i32 = 5;
+    const SQLITE_LOCKED: i32 = 6;
     error.chain().any(|cause| {
-        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>()
-            && database.code().is_some_and(|code| sqlite_busy_code(&code))
-        {
-            return true;
-        }
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("database is locked")
-            || message.contains("database table is locked")
-            || message.contains("sqlite_busy")
-            || message.split("code:").skip(1).any(|suffix| {
-                let code = suffix
-                    .trim_start()
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>();
-                sqlite_busy_code(&code)
-            })
+        let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() else {
+            return false;
+        };
+        database
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, SQLITE_BUSY | SQLITE_LOCKED))
     })
 }
 
@@ -351,21 +341,46 @@ pub fn task_inactivity_secs(
     }
 }
 
-pub fn task_is_blocked_by_terminal_dependency(task: &crate::traits::Task) -> bool {
+/// A task status that ends it without success: work depending on it can
+/// never run.
+pub fn task_status_is_terminal_failure(status: &str) -> bool {
+    matches!(
+        status,
+        "failed" | "blocked" | "interrupted" | "cancelled" | "abandoned"
+    )
+}
+
+/// Whether a blocked task is blocked because a task it depends on ended
+/// without success, judged from the dependency graph (`depends_on` and the
+/// dependencies' statuses among `run_tasks`), never from the blocker's
+/// wording: a blocker text that merely reads like a dependency message does
+/// not count.
+pub fn task_is_blocked_by_terminal_dependency(
+    task: &crate::traits::Task,
+    run_tasks: &[crate::traits::Task],
+) -> bool {
     task.status == "blocked"
-        && task.blocker.as_deref().is_some_and(|blocker| {
-            blocker.starts_with("Dependency ") && blocker.contains(" ended with status ")
+        && task.dependency_ids().is_ok_and(|dependencies| {
+            dependencies.iter().any(|dependency| {
+                run_tasks.iter().any(|other| {
+                    other.id == *dependency && task_status_is_terminal_failure(&other.status)
+                })
+            })
         })
 }
 
-pub fn task_blocks_schedule_fire(task: &crate::traits::Task) -> bool {
+pub fn task_blocks_schedule_fire(
+    task: &crate::traits::Task,
+    run_tasks: &[crate::traits::Task],
+) -> bool {
     matches!(task.status.as_str(), "pending" | "claimed" | "running")
-        || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task))
+        || (task.status == "blocked" && !task_is_blocked_by_terminal_dependency(task, run_tasks))
 }
 
 pub fn task_blocks_later_schedule_fire(
     run: &crate::traits::GoalRun,
     task: &crate::traits::Task,
+    run_tasks: &[crate::traits::Task],
 ) -> bool {
     // Backpressure belongs to one active occurrence. Historical task rows are
     // audit records after their parent run reaches a terminal state and can no
@@ -378,7 +393,7 @@ pub fn task_blocks_later_schedule_fire(
     // resumable is useful for explicit recovery, but it must not suppress
     // every later occurrence of a recurring schedule. Blockers inside a
     // still-running occurrence remain open.
-    run.status != "blocked" && task_blocks_schedule_fire(task)
+    run.status != "blocked" && task_blocks_schedule_fire(task, run_tasks)
 }
 
 pub fn task_is_terminal_schedule_failure(task: &crate::traits::Task) -> bool {
@@ -762,5 +777,51 @@ impl Service for GoalCycleService {
             .tick()
             .await
             .map_err(|e| ServiceError::new(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod sqlite_busy_tests {
+    use super::is_sqlite_busy_error;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn contention_is_read_from_the_typed_driver_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let url = format!("sqlite://{}", file.path().display());
+        let options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .busy_timeout(std::time::Duration::ZERO);
+        let mut holder = options.connect().await.unwrap();
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let mut writer = options.connect().await.unwrap();
+        let busy = sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&mut writer)
+            .await
+            .unwrap_err();
+        let busy = anyhow::Error::from(busy).context("claiming the task");
+        assert!(is_sqlite_busy_error(&busy), "{busy:#}");
+
+        // Text that only reads like contention is not contention.
+        assert!(!is_sqlite_busy_error(&anyhow::anyhow!(
+            "error returned from database: (code: 5) database is locked"
+        )));
+        assert!(!is_sqlite_busy_error(&anyhow::anyhow!("SQLITE_BUSY")));
+        holder.close().await.unwrap();
+        let missing = sqlx::query("SELECT * FROM missing_table")
+            .execute(&mut writer)
+            .await
+            .unwrap_err();
+        assert!(!is_sqlite_busy_error(&anyhow::Error::from(missing)));
+        writer.close().await.unwrap();
     }
 }

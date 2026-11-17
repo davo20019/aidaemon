@@ -825,7 +825,7 @@ impl ScheduledGoalRuns {
             .zip(tasks_by_run.iter())
             .flat_map(|(run, tasks)| {
                 tasks.iter().filter(move |task| {
-                    crate::scheduler::task_blocks_later_schedule_fire(run, task)
+                    crate::scheduler::task_blocks_later_schedule_fire(run, task, tasks)
                 })
             })
             .collect::<Vec<_>>();

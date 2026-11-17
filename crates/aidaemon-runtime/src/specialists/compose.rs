@@ -658,13 +658,9 @@ pub mod legacy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spawn::task_references_parent_context;
 
     #[test]
-    fn executor_parent_context_reference_gets_bounded_recent_results() {
-        assert!(task_references_parent_context(
-            "Review Completed Task Results and select one event"
-        ));
+    fn executor_goal_context_gets_bounded_recent_results() {
         let ctx = serde_json::json!({
             "task_results": (0..12).map(|i| format!("result-{i}")).collect::<Vec<_>>()
         });

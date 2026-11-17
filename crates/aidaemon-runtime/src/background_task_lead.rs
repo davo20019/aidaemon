@@ -201,34 +201,7 @@ pub fn resolve_dispatch_project_scope(
     scopes.into_iter().next()
 }
 
-pub fn sqlite_busy_code(value: &str) -> bool {
-    value
-        .parse::<i32>()
-        .ok()
-        .is_some_and(|code| code & 0xff == 5)
-}
-
-pub fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>()
-            && database.code().is_some_and(|code| sqlite_busy_code(&code))
-        {
-            return true;
-        }
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("database is locked")
-            || message.contains("database table is locked")
-            || message.contains("sqlite_busy")
-            || message.split("code:").skip(1).any(|suffix| {
-                let code = suffix
-                    .trim_start()
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>();
-                sqlite_busy_code(&code)
-            })
-    })
-}
+pub use aidaemon_work::scheduler::is_sqlite_busy_error;
 
 pub async fn promote_dispatch_trigger_attempt(
     state: &Arc<dyn SchedulerStore>,
@@ -3376,17 +3349,6 @@ mod tests {
             &*aidaemon_tools::testing::active_execution_backend(),
             configured,
         )
-    }
-
-    #[test]
-    fn task_lead_sqlite_busy_classifier_is_narrow() {
-        assert!(is_sqlite_busy_error(&anyhow::anyhow!(
-            "error returned from database: (code: 517) database is locked"
-        )));
-        assert!(is_sqlite_busy_error(&anyhow::anyhow!("SQLITE_BUSY")));
-        assert!(!is_sqlite_busy_error(&anyhow::anyhow!(
-            "task execution lease was lost"
-        )));
     }
 
     #[test]

@@ -63,12 +63,7 @@ impl GoalCycle {
         };
 
         let now = chrono::Utc::now().to_rfc3339();
-        let terminal_failed = |status: &str| {
-            matches!(
-                status,
-                "failed" | "blocked" | "interrupted" | "cancelled" | "abandoned"
-            )
-        };
+        let terminal_failed = super::task_status_is_terminal_failure;
 
         for goal in &goals {
             let tasks = match self.state.get_tasks_for_goal(&goal.id).await {

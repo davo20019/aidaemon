@@ -439,12 +439,10 @@ impl GoalCycle {
             .await?;
         let mut open_count = 0;
         for run in &open_runs {
-            open_count += self
-                .state
-                .get_tasks_for_goal_run(&run.id)
-                .await?
+            let run_tasks = self.state.get_tasks_for_goal_run(&run.id).await?;
+            open_count += run_tasks
                 .iter()
-                .filter(|task| task_blocks_later_schedule_fire(run, task))
+                .filter(|task| task_blocks_later_schedule_fire(run, task, &run_tasks))
                 .count();
         }
 
@@ -611,7 +609,7 @@ impl GoalCycle {
             if !run_tasks.is_empty() {
                 let active_or_human_blocked = run_tasks
                     .iter()
-                    .any(|task| task_blocks_later_schedule_fire(&open_run, task));
+                    .any(|task| task_blocks_later_schedule_fire(&open_run, task, &run_tasks));
                 if active_or_human_blocked {
                     warn!(
                         goal_id = %goal.id,

@@ -75,7 +75,7 @@ fn terminal_run_tasks_never_apply_schedule_backpressure() {
     let mut task = synthetic_task("child", "blocked");
     task.blocker = Some("Historical unresolved child".to_string());
 
-    assert!(!task_blocks_later_schedule_fire(&run, &task));
+    assert!(!task_blocks_later_schedule_fire(&run, &task, &[]));
 }
 
 #[test]
@@ -128,24 +128,34 @@ fn scheduled_blocker_only_retires_the_prior_scheduled_occurrence() {
     let mut manual_run = crate::traits::GoalRun::new("goal-1", "default", "manual");
     manual_run.status = "blocked".to_string();
 
-    assert!(!task_blocks_later_schedule_fire(&scheduled_run, &blocked,));
+    assert!(!task_blocks_later_schedule_fire(
+        &scheduled_run,
+        &blocked,
+        &[]
+    ));
     // A blocked manual or recovery occurrence is equally terminal for
     // backpressure: it must never suppress the recurring schedule forever.
-    assert!(!task_blocks_later_schedule_fire(&manual_run, &blocked));
+    assert!(!task_blocks_later_schedule_fire(&manual_run, &blocked, &[]));
     let mut recovery_run = crate::traits::GoalRun::new("goal-1", "default", "recovery");
     recovery_run.status = "blocked".to_string();
-    assert!(!task_blocks_later_schedule_fire(&recovery_run, &blocked));
+    assert!(!task_blocks_later_schedule_fire(
+        &recovery_run,
+        &blocked,
+        &[]
+    ));
     assert!(!task_blocks_later_schedule_fire(
         &scheduled_run,
         &provider_blocked,
+        &[]
     ));
     assert!(!task_blocks_later_schedule_fire(
         &manual_run,
         &provider_blocked,
+        &[]
     ));
     // A still-running manual occurrence keeps its backpressure.
     manual_run.status = "running".to_string();
-    assert!(task_blocks_later_schedule_fire(&manual_run, &blocked));
+    assert!(task_blocks_later_schedule_fire(&manual_run, &blocked, &[]));
     assert_eq!(
         scheduled_run_reconciliation_status(
             &manual_run,
@@ -153,12 +163,61 @@ fn scheduled_blocker_only_retires_the_prior_scheduled_occurrence() {
         ),
         Some("completed")
     );
-    assert!(!task_blocks_later_schedule_fire(&scheduled_run, &pending,));
+    assert!(!task_blocks_later_schedule_fire(
+        &scheduled_run,
+        &pending,
+        &[]
+    ));
 
     scheduled_run.status = "running".to_string();
-    assert!(task_blocks_later_schedule_fire(&scheduled_run, &blocked));
-    assert!(task_blocks_later_schedule_fire(&scheduled_run, &pending));
+    assert!(task_blocks_later_schedule_fire(
+        &scheduled_run,
+        &blocked,
+        &[]
+    ));
+    assert!(task_blocks_later_schedule_fire(
+        &scheduled_run,
+        &pending,
+        &[]
+    ));
     assert!(task_is_terminal_schedule_failure(&blocked));
+}
+
+/// Only the dependency graph says a blocked task waits on a dependency that
+/// ended badly; a blocker whose text mimics the dependency message does not
+/// release the schedule.
+#[test]
+fn a_dependency_blocker_is_read_from_the_graph_not_its_text() {
+    let mut run = crate::traits::GoalRun::new("goal-1", "default", "scheduled");
+    run.status = "running".to_string();
+    let mut failed_dependency = synthetic_task("fetch synthetic data", "failed");
+    failed_dependency.id = "dep-1".to_string();
+
+    let mut mimic = synthetic_task("waits on the owner", "blocked");
+    mimic.blocker =
+        Some("Dependency dep-9 ended with status failed before this task could run.".to_string());
+    assert!(task_blocks_later_schedule_fire(
+        &run,
+        &mimic,
+        std::slice::from_ref(&failed_dependency),
+    ));
+
+    let mut dependent = synthetic_task("summarize synthetic data", "blocked");
+    dependent.depends_on = Some(serde_json::json!(["dep-1"]).to_string());
+    dependent.blocker = Some("Waiting.".to_string());
+    let run_tasks = vec![failed_dependency.clone(), dependent.clone()];
+    assert!(!task_blocks_later_schedule_fire(
+        &run, &dependent, &run_tasks
+    ));
+
+    // The same dependency succeeding leaves the blocked task blocking.
+    let mut done_dependency = failed_dependency;
+    done_dependency.status = "completed".to_string();
+    assert!(task_blocks_later_schedule_fire(
+        &run,
+        &dependent,
+        &[done_dependency, dependent.clone()],
+    ));
 }
 
 fn due_mandate_controller(session_id: &str) -> (Goal, Mandate) {
@@ -604,9 +663,6 @@ fn daily_budget_only_blocks_on_current_day_usage() {
 
 #[test]
 fn mandate_sqlite_contention_uses_a_short_expiry_bounded_retry() {
-    assert!(is_sqlite_busy_error(&anyhow::anyhow!(
-        "error returned from database: (code: 5) database is locked"
-    )));
     assert!(!is_sqlite_busy_error(&anyhow::anyhow!(
         "controller goal is missing"
     )));

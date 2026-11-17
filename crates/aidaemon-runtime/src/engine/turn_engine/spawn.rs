@@ -1300,12 +1300,13 @@ impl TurnEngine<'_> {
                             }
                         }
                     }
-                    // Normally the Task Lead must inline prerequisite evidence in
-                    // the delegated task. Keep a bounded compatibility path for
-                    // explicit references to parent-only context so an executor
-                    // cannot be assigned to inspect a section it never received.
-                    if mandate.is_none() && task_references_parent_context(task) {
-                        let referenced_context = match goal_id {
+                    // The Task Lead should inline prerequisite evidence in the
+                    // delegated task, but an executor of a goal task always
+                    // gets a bounded excerpt of the goal's completed results,
+                    // whatever the task's wording: whether the task "refers to
+                    // parent context" is not something its words can decide.
+                    if mandate.is_none() {
+                        let completed_results = match goal_id {
                             Some(gid) => self
                                 .work()
                                 .get_goal(gid)
@@ -1318,11 +1319,11 @@ impl TurnEngine<'_> {
                                 }),
                             None => None,
                         };
-                        if let Some(context) = referenced_context {
+                        if let Some(context) = completed_results {
                             prompt.push_str(
-                                "\n\n## Referenced Parent Context\n\
-                                 The delegated task explicitly refers to parent context. Use this \
-                                 bounded excerpt as evidence:\n",
+                                "\n\n## Completed Results In This Goal\n\
+                                 Recent results of this goal's finished tasks, as evidence \
+                                 the delegated task may build on:\n",
                             );
                             prompt.push_str(&context);
                         }
