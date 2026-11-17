@@ -1861,6 +1861,51 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         move || c()
     };
 
+    // Pinch to zoom the picture, as a photo: `zoom` times the fitted size,
+    // its top-left `pan` points from the box's (never past an edge).
+    let zoom = signal(1.0f32);
+    let pan = signal((0.0f32, 0.0f32));
+    let shown = move || {
+        let (w, h) = fitted();
+        let z = zoom.get();
+        (w * z, h * z)
+    };
+    let clamp_pan = move |(x, y): (f32, f32), z: f32| {
+        let (w, h) = fitted();
+        (x.clamp(w - w * z, 0.0), y.clamp(h - h * z, 0.0))
+    };
+    // A place in the box as a fraction of the page.
+    let to_page = move |x: f32, y: f32| {
+        let (w, h) = fitted();
+        let z = zoom.get_untracked();
+        let (px_, py_) = pan.get_untracked();
+        if w <= 0.0 || h <= 0.0 {
+            return (0.0, 0.0);
+        }
+        (
+            ((x - px_) / (w * z)).clamp(0.0, 1.0),
+            ((y - py_) / (h * z)).clamp(0.0, 1.0),
+        )
+    };
+    // A two-finger touch: its spread, zoom and the page spot under its
+    // middle when it began; once seen, the touch neither clicks nor scrolls.
+    let pinch = signal(None::<(f32, f32, (f32, f32))>);
+    let pinched = signal(false);
+    // Fingers down, by id: where each is in the box.
+    let fingers = signal(Vec::<(u32, f32, f32)>::new());
+
+    // The phone's own keyboard: a tap focuses an unseen field laid over the
+    // spot (then over the page's field once the page says which), so the
+    // keyboard opens and what is typed shows in the page itself.
+    let keys = element_ref();
+    let keys_at = signal(None::<[f32; 4]>);
+    let keys_open = signal(false);
+    // What the unseen field holds: one space to start, so a Backspace on
+    // the keyboard is a change too (it deletes in the page).
+    const KEEP: &str = " ";
+    let typed = signal(KEEP.to_owned());
+    let sent_text = signal(KEEP.to_owned());
+
     // Point mode: the next tap tells the agent what is there.
     let pointing = signal(false);
     // Where the owner last tapped, marked until the page answers with a
@@ -1902,24 +1947,68 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             .absolute()
             .inset_0()
             .claim_touches(TouchClaim::on_start().ask(move |request: &ClaimRequest| {
-                if controlling() || pointing.get_untracked() {
-                    request.claim();
-                }
+                let _ = &controlling;
+                request.claim();
             }))
             .keep_touches(true)
+            .on_touch(move |e: &nsh_core::TouchEvent| {
+                // Two fingers zoom about their middle and pan as they move.
+                let mut down = fingers.get_untracked();
+                for p in &e.points {
+                    let at = (p.id, p.location.x.0, p.location.y.0);
+                    match e.phase {
+                        nsh_core::TouchPhase::End | nsh_core::TouchPhase::Cancel if p.changed => {
+                            down.retain(|f| f.0 != p.id);
+                        }
+                        _ => match down.iter_mut().find(|f| f.0 == p.id) {
+                            Some(f) => *f = at,
+                            None if !matches!(
+                                e.phase,
+                                nsh_core::TouchPhase::End | nsh_core::TouchPhase::Cancel
+                            ) =>
+                            {
+                                down.push(at);
+                            }
+                            None => {}
+                        },
+                    }
+                }
+                fingers.set(down.clone());
+                if down.len() < 2 {
+                    pinch.set(None);
+                    return;
+                }
+                let (a, b) = (down[0], down[1]);
+                let spread = (a.1 - b.1).hypot(a.2 - b.2).max(1.0);
+                let middle = ((a.1 + b.1) / 2.0, (a.2 + b.2) / 2.0);
+                pinched.set(true);
+                let Some((spread0, zoom0, spot)) = pinch.get_untracked() else {
+                    let z = zoom.get_untracked();
+                    let (px_, py_) = pan.get_untracked();
+                    pinch.set(Some((
+                        spread,
+                        z,
+                        ((middle.0 - px_) / z, (middle.1 - py_) / z),
+                    )));
+                    return;
+                };
+                let z = (zoom0 * spread / spread0).clamp(1.0, 4.0);
+                zoom.set(z);
+                pan.set(clamp_pan((middle.0 - spot.0 * z, middle.1 - spot.1 * z), z));
+            })
             .on_responder_grant(move |e: &ResponderEvent| {
                 let (w, h) = fitted();
                 if w <= 0.0 || h <= 0.0 {
                     return;
                 }
-                let at = (e.location.x.0 / w, e.location.y.0 / h);
-                start.set(at);
+                start.set(to_page(e.location.x.0, e.location.y.0));
                 dragging.set(false);
+                pinched.set(false);
                 scrolled.set((0.0, 0.0));
             })
             .on_responder_move(move |e: &ResponderEvent| {
                 let (w, h) = fitted();
-                if w <= 0.0 || h <= 0.0 || !c_move() {
+                if w <= 0.0 || h <= 0.0 || pinched.get_untracked() {
                     return;
                 }
                 let (dx, dy) = (e.gesture.delta.x.0, e.gesture.delta.y.0);
@@ -1927,24 +2016,43 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     return;
                 }
                 dragging.set(true);
-                // Scroll by what the finger moved since the last report,
-                // in the page's pixels; the page follows the finger.
-                let (pw, ph) = page_size();
                 let (sx, sy) = scrolled.get_untracked();
                 let (step_x, step_y) = (dx - sx, dy - sy);
                 scrolled.set((dx, dy));
+                // Zoomed in, the finger first moves the picture, as a
+                // phone's browser does; what is left scrolls the page.
+                let z = zoom.get_untracked();
+                let (px_, py_) = pan.get_untracked();
+                let moved = clamp_pan((px_ + step_x, py_ + step_y), z);
+                pan.set(moved);
+                let (left_x, left_y) = (step_x - (moved.0 - px_), step_y - (moved.1 - py_));
+                if !c_move() || left_x.hypot(left_y) < 0.5 {
+                    return;
+                }
+                // Scroll by the rest, in the page's pixels; the page follows
+                // the finger.
+                let (pw, ph) = page_size();
                 let (x0, y0) = start.get_untracked();
-                wheel(x0, y0, -step_x / w * pw, -step_y / h * ph);
+                wheel(x0, y0, -left_x / (w * z) * pw, -left_y / (h * z) * ph);
             })
             .on_responder_release(move |_: &ResponderEvent| {
-                if dragging.get_untracked() {
+                if dragging.get_untracked() || pinched.get_untracked() {
                     return;
                 }
                 let at = start.get_untracked();
-                tapped.set(Some(at));
+                if c_up() || pointing.get_untracked() {
+                    tapped.set(Some(at));
+                }
                 if c_up() {
                     pointer("down", at.0, at.1);
                     pointer("up", at.0, at.1);
+                    // Open the keyboard now, inside the tap (a phone opens
+                    // it for nothing later); the page's answer closes it
+                    // when the spot takes no typing.
+                    typed.set(KEEP.to_owned());
+                    sent_text.set(KEEP.to_owned());
+                    keys_at.set(Some([at.0 - 0.02, at.1 - 0.02, 0.04, 0.04]));
+                    keys.focus();
                 } else if pointing.get_untracked() {
                     pointing.set(false);
                     point(at.0, at.1);
@@ -2058,11 +2166,91 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         }
     }
 
+    // Typing goes straight into the page as you type: each change of the
+    // unseen field sends what was added, and deletes what was removed.
+    let send_text = screen.text.clone();
+    let delete_key = screen.key.clone();
+    let on_typed = move |now: &str| {
+        let before = sent_text.get_untracked();
+        let common = before
+            .chars()
+            .zip(now.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        for _ in 0..before.chars().count().saturating_sub(common) {
+            delete_key("Backspace", "Backspace");
+        }
+        let added: String = now.chars().skip(common).collect();
+        if !added.is_empty() {
+            send_text(added);
+        }
+        // Emptied: start again from the kept space, so the next Backspace
+        // is a change too.
+        let now = if now.is_empty() { KEEP } else { now };
+        sent_text.set(now.to_owned());
+        typed.set(now.to_owned());
+    };
+    // The page's answer: the field it focused takes the unseen field's
+    // place; nothing to type into closes the keyboard.
+    {
+        let focus = screen.focus.clone();
+        let focus_rect = screen.focus_rect.clone();
+        effect(move || match focus() {
+            Some(Some(_)) => {
+                if let Some(rect) = focus_rect() {
+                    keys_at.set(Some(rect));
+                }
+            }
+            Some(None) if keys_open.get_untracked() => {
+                keys.blur();
+                keys_at.set(None);
+            }
+            _ => {}
+        });
+    }
+    let password = {
+        let focus = screen.focus.clone();
+        move || {
+            focus()
+                .flatten()
+                .is_some_and(|words| words.contains("password"))
+        }
+    };
+    let unseen = {
+        let key = screen.key.clone();
+        nsh_base::input()
+            .element_ref(&keys)
+            .value(move || typed.get())
+            .on_change(on_typed)
+            .masked(password)
+            .auto_correct(false)
+            .auto_capitalize(AutoCapitalize::None)
+            .auto_fill(nsh_core::element::AutoFill::Off)
+            .on_submit(move |_: &str| key("Enter", "Enter"))
+            .on_focus(move || keys_open.set(true))
+            .on_blur(move || keys_open.set(false))
+            .absolute()
+            .left(move || px(keys_at.get().map_or(0.0, |r| r[0] * shown().0)))
+            .top(move || px(keys_at.get().map_or(0.0, |r| r[1] * shown().1)))
+            .w(move || px(keys_at.get().map_or(1.0, |r| (r[2] * shown().0).max(1.0))))
+            .h(move || px(keys_at.get().map_or(1.0, |r| (r[3] * shown().1).max(1.0))))
+            // 16: a phone's browser zooms into a smaller field.
+            .text_size(px(16.0))
+            .text_color(colors::TRANSPARENT)
+            .caret_color(|| color(colors::TRANSPARENT))
+            .selection_color(|| color(colors::TRANSPARENT))
+            .bg(colors::TRANSPARENT)
+            .border_color(colors::TRANSPARENT)
+            .p_0()
+    };
     let point_pad = pad.clone();
-    let picture = view()
-        .relative()
-        .w(move || px(fitted().0))
-        .h(move || px(fitted().1))
+    let content = view()
+        .child(unseen)
+        .absolute()
+        .left(move || px(pan.get().0))
+        .top(move || px(pan.get().1))
+        .w(move || px(shown().0))
+        .h(move || px(shown().1))
         .child(when(
             move || frame.with(Option::is_some),
             move || {
@@ -2098,7 +2286,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             dynamic(move || {
                 let [x, y, w, h] = focus_rect()?;
                 Some(untracked(move || {
-                    let (fw, fh) = fitted();
+                    let (fw, fh) = shown();
                     view()
                         .absolute()
                         .left(px(x * fw - 3.0))
@@ -2115,7 +2303,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         .child(dynamic(move || {
             let (x, y) = tapped.get()?;
             Some(untracked(move || {
-                let (w, h) = fitted();
+                let (w, h) = shown();
                 view()
                     .absolute()
                     .left(px(x * w - 14.0))
@@ -2127,11 +2315,18 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     .border_color(colors::TAP_RING)
                     .into_element()
             }))
-        }))
+        }));
+    let picture = view()
+        .relative()
+        .overflow_hidden()
+        .w(move || px(fitted().0))
+        .h(move || px(fitted().1))
+        .child(content)
         .child(when(
             {
                 let c = controlling.clone();
-                move || !mouse && (c() || pointing.get())
+                let _ = c;
+                move || !mouse
             },
             move || pad.clone(),
         ))
@@ -2202,8 +2397,8 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     },
                     || {
                         text(
-                        "This is the agent's browser, live. Tap to click, drag to scroll. Tap a \
-                         box, then type below: it goes straight in.",
+                        "This is the agent's browser, live. Tap to click, drag to scroll, pinch \
+                         to zoom. Tap a box and your keyboard types into it.",
                     )
                     .text_size(px(type_scale::XS))
                     .text_color(colors::ON_LIGHTBOX)
@@ -2275,97 +2470,42 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             },
         ));
 
-    // Typing goes straight into the page as you type: each change of the
-    // field sends what was added, and deletes what was removed. The field
-    // is masked only while a password box has the keyboard.
-    let typed = signal(String::new());
-    let sent_text = signal(String::new());
-    let send_text = screen.text.clone();
-    let delete_key = screen.key.clone();
-    let on_typed = move |now: &str| {
-        let before = sent_text.get_untracked();
-        let common = before
-            .chars()
-            .zip(now.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-        for _ in 0..before.chars().count().saturating_sub(common) {
-            delete_key("Backspace", "Backspace");
-        }
-        let added: String = now.chars().skip(common).collect();
-        if !added.is_empty() {
-            send_text(added);
-        }
-        sent_text.set(now.to_owned());
-        typed.set(now.to_owned());
-    };
-    // A new tap is a new target: the field starts empty again.
-    effect(move || {
-        if tapped.get().is_some() {
-            typed.set(String::new());
-            sent_text.set(String::new());
-        }
-    });
     let key = screen.key.clone();
-    let wheel = screen.wheel.clone();
     let press = |label: &'static str, code: &'static str, name: &'static str| {
         let key = key.clone();
         viewer_text_btn(label, false, move || key(code, name))
     };
-    let password = {
-        let focus = screen.focus.clone();
-        move || {
-            focus()
-                .flatten()
-                .is_some_and(|words| words.contains("password"))
-        }
-    };
     let focus = screen.focus.clone();
     let sent = screen.typed.clone();
-    let focus_line = text(move || match (focus(), sent()) {
-        (Some(Some(words)), Some(_)) => format!("Typing into {words}"),
-        (Some(Some(words)), None) => format!("✓ Ready: typing goes into {words}"),
-        (Some(None), _) => "Nothing to type into: tap a box on the page first".to_owned(),
-        (None, _) => "Tap a box on the page to type into it".to_owned(),
+    let focus_line = text(move || match (focus(), sent(), keys_open.get()) {
+        (Some(Some(words)), _, false) => {
+            format!("{words} has the keyboard: tap Keyboard to type")
+        }
+        (Some(Some(words)), Some(_), true) => format!("Typing into {words}"),
+        (Some(Some(words)), None, true) => format!("✓ Your keyboard types into {words}"),
+        (Some(None), ..) => "Nothing to type into here: tap a box on the page".to_owned(),
+        (None, ..) => "Tap a box on the page and your keyboard opens".to_owned(),
     })
     .text_size(px(type_scale::SM))
     .font_weight(FontWeight::MEDIUM)
     .text_color(colors::ON_LIGHTBOX);
-    let typing = view()
-        .gap_2()
-        .px_3()
-        .child(focus_line)
-        .child(
-            view().flex_row().items_center().gap_2().child(
-                view().flex_1().min_w(px(0.0)).child(
-                    super::controls::field("Type here: it goes straight into the page", typed)
-                        .on_change(on_typed)
-                        .masked(password)
-                        .auto_correct(false)
-                        .on_submit({
-                            let key = key.clone();
-                            move |_: &str| key("Enter", "Enter")
-                        }),
-                ),
-            ),
-        )
-        .child(
-            view()
-                .flex_row()
-                .flex_wrap()
-                .justify_center()
-                .gap_2()
-                .child(press("Delete", "Backspace", "Backspace"))
-                .child(press("Tab", "Tab", "Tab"))
-                .child(press("Enter", "Enter", "Enter"))
-                .child({
-                    let wheel = wheel.clone();
-                    viewer_text_btn("Scroll up", false, move || wheel(0.5, 0.5, 0.0, -400.0))
-                })
-                .child(viewer_text_btn("Scroll down", false, move || {
-                    wheel(0.5, 0.5, 0.0, 400.0)
-                })),
-        );
+    let typing = view().gap_2().px_3().child(focus_line).child(
+        view()
+            .flex_row()
+            .flex_wrap()
+            .justify_center()
+            .gap_2()
+            .child(when(
+                {
+                    let focus = screen.focus.clone();
+                    move || !keys_open.get() && matches!(focus(), Some(Some(_)))
+                },
+                // A press is a gesture, so the keyboard may open again.
+                move || viewer_text_btn("Keyboard", true, move || keys.focus()),
+            ))
+            .child(press("Tab", "Tab", "Tab"))
+            .child(press("Delete", "Backspace", "Backspace")),
+    );
 
     let close = screen.close.clone();
     view().child(
@@ -2401,7 +2541,8 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                             })
                             .child(picture),
                     )
-                    .child(answers)
+                    // The keyboard takes room: the answers wait below it.
+                    .child(when(move || !keys_open.get(), move || answers.clone()))
                     .child(when(
                         {
                             let c = controlling.clone();
