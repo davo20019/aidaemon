@@ -89,6 +89,13 @@ pub trait SurfaceBackend: Send + Sync {
         ))
     }
 
+    /// Lay the surface out for the controlling viewer's room (`Some`), or
+    /// back at its own size (`None`) before the agent acts again. Default:
+    /// this surface keeps its size.
+    async fn fit(&self, _id: &SurfaceId, _room: Option<Size>) -> Result<(), SurfaceError> {
+        Ok(())
+    }
+
     /// Get the surface ready before the owner is asked to act on it (a
     /// browser moves to a profile that keeps sign-ins). May reopen it under
     /// another id.

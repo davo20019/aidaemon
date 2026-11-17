@@ -6269,6 +6269,23 @@
           },
           "type": "array"
         },
+        "fit_h": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fit_w": {
+          "description": "The room the viewer has for the picture, in its points (a phone's\nscreen less the controls). While this device holds control, a\nsurface that can lay itself out (a browser page) takes this size,\nso the picture fills the screen; it goes back to its own size when\ncontrol goes back. Both or neither.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_fps": {
           "format": "uint32",
           "minimum": 0,

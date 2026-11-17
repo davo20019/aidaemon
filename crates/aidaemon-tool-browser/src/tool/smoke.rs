@@ -567,6 +567,129 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
         .await;
 }
 
+/// A phone that takes control gets the page laid out for its screen (the
+/// site's mobile layout, a picture as tall as the phone's room), taps land
+/// where it shows them, and the agent finds the page at its own size again.
+#[tokio::test]
+#[ignore = "requires local Chrome; run with --ignored"]
+async fn live_surface_fits_the_controlling_phone() {
+    use aidaemon_surfaces::{
+        InputEvent, LiveMode, PointerAction, PointerButton, Size, StreamParams, SurfaceRegistry,
+        SurfacesConfig,
+    };
+    let profile = TempDir::new().expect("temp profile");
+    let (media_tx, _media_rx) = mpsc::channel(4);
+    let tool = BrowserTool::new(
+        BrowserSettings {
+            headless: std::env::var_os("AIDAEMON_SMOKE_HEADED").is_none(),
+            user_data_dir: Some(profile.path().to_str().unwrap().to_string()),
+            ..BrowserSettings::default()
+        },
+        media_tx,
+        profile.path().join("inbox"),
+        aidaemon_tools::testing::active_execution_backend(),
+    )
+    .expect("construct browser tool");
+    let page: &'static [u8] = br#"<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0">
+<button id="go" style="position:fixed;left:0;top:0;width:100vw;height:20vh">Go</button>
+<div id="out" style="margin-top:25vh">waiting</div>
+<script>
+document.getElementById('go').addEventListener('click', () => {
+  document.getElementById('out').textContent = 'tapped at ' + window.innerWidth;
+});
+</script></body></html>"#;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    page.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(page).await;
+            });
+        }
+    });
+    let session = "live-fit";
+    let call = |args: serde_json::Value| {
+        let tool = &tool;
+        async move { call_approved(tool, &args.to_string(), session).await }
+    };
+    let nav = call(json!({"action": "navigate", "url": format!("http://127.0.0.1:{port}/")})).await;
+    assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
+
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let surfaces = tool.surface_backend();
+    surfaces.set_notifier(registry.notifier());
+    registry.add_backend(surfaces);
+    let surface = registry
+        .find_for_agent(session, None)
+        .await
+        .expect("the tab is a surface");
+    let mut live = registry
+        .open_live(
+            &surface.id,
+            "fit-phone",
+            LiveMode::Control,
+            StreamParams {
+                fit: Some(Size { w: 390, h: 560 }),
+                ..StreamParams::default()
+            },
+        )
+        .await
+        .expect("open live");
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(frame) = live.frames.borrow_and_update().clone()
+                && frame.w == 390
+            {
+                return frame;
+            }
+            live.frames.changed().await.expect("stream open");
+        }
+    })
+    .await
+    .expect("a phone-sized frame within 10 s");
+    assert_eq!(frame.h, 560, "the picture is as tall as the phone's room");
+    if let Some(out) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
+        std::fs::write(out, &frame.data[..]).expect("save frame");
+    }
+    for action in [PointerAction::Down, PointerAction::Up] {
+        registry
+            .input(
+                &live.live_id,
+                &InputEvent::Pointer {
+                    action,
+                    x: 0.5,
+                    y: 0.1,
+                    button: PointerButton::Left,
+                },
+            )
+            .await
+            .expect("tap");
+    }
+    registry.close_live(&live.live_id);
+    registry.release_control(&surface.id, "fit-phone").unwrap();
+
+    let text = call(json!({"action": "get_text", "selector": "body"})).await;
+    assert!(
+        text.contains("tapped at 390"),
+        "the tap landed on the phone layout: {text}"
+    );
+    let width = call(json!({"action": "execute_js", "script": "String(window.innerWidth)"})).await;
+    assert!(
+        width.contains(&BrowserSettings::default().screenshot_width.to_string()),
+        "the agent finds the page at its own size: {width}"
+    );
+}
+
 /// A real sign-in page on the internet (a form posted, a redirect, a new
 /// page): the owner's picture follows the page to where the form leads.
 #[tokio::test]

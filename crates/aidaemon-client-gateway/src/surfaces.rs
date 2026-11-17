@@ -200,6 +200,10 @@ impl SurfaceDesk {
             max_h: accept.max_h.unwrap_or(defaults.max_h),
             max_fps: accept.max_fps.unwrap_or(defaults.max_fps),
             quality: accept.quality.unwrap_or(defaults.quality),
+            fit: accept
+                .fit_w
+                .zip(accept.fit_h)
+                .map(|(w, h)| aidaemon_surfaces::Size { w, h }),
         };
         let id = SurfaceId::from_string(surface_id);
         let live = self

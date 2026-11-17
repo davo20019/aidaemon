@@ -2313,16 +2313,19 @@ impl Client {
     /// Open a live view of `surface_id` (closing any other first); with
     /// `control`, take control too.
     pub fn open_surface(&mut self, surface_id: &str, control: bool) -> Vec<Effect> {
-        self.open_surface_at(surface_id, control, None)
+        self.open_surface_at(surface_id, control, None, None)
     }
 
     /// [`Self::open_surface`] asking for up to `max_fps` frames a second
-    /// (a mouse wants a quicker picture than a finger; the daemon caps it).
+    /// (a mouse wants a quicker picture than a finger; the daemon caps it),
+    /// and with `fit`, the room this screen has for the picture: while it
+    /// holds control, a page lays itself out for that room.
     pub fn open_surface_at(
         &mut self,
         surface_id: &str,
         control: bool,
         max_fps: Option<u32>,
+        fit: Option<(u32, u32)>,
     ) -> Vec<Effect> {
         let mut effects = self.close_surface();
         self.control_error = None;
@@ -2343,6 +2346,8 @@ impl Client {
             accept: StreamAccept {
                 codecs: vec!["jpeg".into()],
                 max_fps,
+                fit_w: fit.map(|(w, _)| w),
+                fit_h: fit.map(|(_, h)| h),
                 ..StreamAccept::default()
             },
         }));
@@ -2815,20 +2820,24 @@ mod tests {
     }
 
     #[test]
-    fn a_view_asks_for_the_frame_rate_its_device_wants() {
+    fn a_view_asks_for_the_frame_rate_and_room_its_device_has() {
         let mut client = Client::new();
         client.update(Update::Connected, &cx(None));
-        client.open_surface_at("srf_1", true, Some(20));
+        client.open_surface_at("srf_1", true, Some(20), Some((390, 560)));
         let (_, command) = surface_command(&mut client);
         assert!(matches!(
             command,
-            Command::OpenSurface { accept, .. } if accept.max_fps == Some(20)
+            Command::OpenSurface { accept, .. }
+                if accept.max_fps == Some(20)
+                    && accept.fit_w == Some(390)
+                    && accept.fit_h == Some(560)
         ));
         client.open_surface("srf_1", false);
         let (_, command) = surface_command(&mut client);
         assert!(matches!(
             command,
-            Command::OpenSurface { accept, .. } if accept.max_fps.is_none()
+            Command::OpenSurface { accept, .. }
+                if accept.max_fps.is_none() && accept.fit_w.is_none()
         ));
     }
 

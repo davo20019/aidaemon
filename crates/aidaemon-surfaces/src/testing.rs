@@ -23,6 +23,7 @@ struct MockState {
     locks: HashMap<SurfaceId, Arc<tokio::sync::Mutex<()>>>,
     observation: SurfaceObservation,
     reopen_on_handoff: bool,
+    fits: Vec<(Option<Size>, bool)>,
 }
 
 /// A backend whose surfaces and frames a test controls.
@@ -109,6 +110,11 @@ impl MockSurface {
 
     pub fn inputs(&self) -> Vec<(SurfaceId, InputEvent)> {
         self.state().inputs.clone()
+    }
+
+    /// Each layout asked for, and whether the agent was still held then.
+    pub fn fits(&self) -> Vec<(Option<Size>, bool)> {
+        self.state().fits.clone()
     }
 
     pub fn set_observation(&self, observation: SurfaceObservation) {
@@ -214,6 +220,12 @@ impl SurfaceBackend for MockSurface {
     async fn exclusive(&self, id: &SurfaceId) -> Result<ExclusiveGuard, SurfaceError> {
         let lock = self.agent_lock(id);
         Ok(ExclusiveGuard::new(lock.lock_owned().await))
+    }
+
+    async fn fit(&self, id: &SurfaceId, room: Option<Size>) -> Result<(), SurfaceError> {
+        let held = self.agent_lock(id).try_lock().is_err();
+        self.state().fits.push((room, held));
+        Ok(())
     }
 
     async fn prepare_handoff(&self, id: &SurfaceId) -> Result<HandoffPrep, SurfaceError> {

@@ -141,6 +141,8 @@ struct Entry {
     exclusive: Option<ExclusiveGuard>,
     last_input: Instant,
     holder_left_at: Option<Instant>,
+    /// Laid out for the controlling viewer's room, not its own size.
+    fitted: bool,
 }
 
 impl Entry {
@@ -166,8 +168,15 @@ struct Stream {
 struct Live {
     surface: SurfaceId,
     device_id: String,
+    /// The viewer's room for the picture, for laying the surface out while
+    /// its device holds control.
+    fit: Option<crate::types::Size>,
     ended: watch::Sender<bool>,
 }
+
+/// The smallest and largest room a surface is laid out for, in points.
+const MIN_FIT: u32 = 240;
+const MAX_FIT: u32 = 2048;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -321,6 +330,7 @@ impl SurfaceRegistry {
                                 exclusive: None,
                                 last_input: Instant::now(),
                                 holder_left_at: None,
+                                fitted: false,
                             };
                             changes.push(SurfaceChange::Updated(entry.info()));
                             state.surfaces.insert(entry.descriptor.id.clone(), entry);
@@ -526,6 +536,10 @@ impl SurfaceRegistry {
             max_h: want.max_h.clamp(160, config.stream_cap.max_h),
             max_fps: want.max_fps.clamp(1, config.stream_cap.max_fps),
             quality: want.quality.clamp(10, config.stream_cap.quality.max(10)),
+            fit: want.fit.map(|room| crate::types::Size {
+                w: room.w.clamp(MIN_FIT, MAX_FIT),
+                h: room.h.clamp(MIN_FIT, MAX_FIT),
+            }),
         };
         let backend = self.backend_of(id)?;
         let frames = {
@@ -569,6 +583,7 @@ impl SurfaceRegistry {
                 Live {
                     surface: id.clone(),
                     device_id: device_id.to_string(),
+                    fit: params.fit,
                     ended: ended_tx,
                 },
             );
@@ -676,6 +691,7 @@ impl SurfaceRegistry {
             }
         };
         if let Some(info) = already {
+            self.fit_for(id, device_id).await;
             let controller = info.controller.clone();
             self.emit(SurfaceChange::Updated(info));
             return Ok(controller);
@@ -699,14 +715,71 @@ impl SurfaceRegistry {
             entry.info()
         };
         info!(surface = %id, device = device_id, "owner took control");
+        self.fit_for(id, device_id).await;
         let controller = info.controller.clone();
         self.emit(SurfaceChange::Updated(info));
         Ok(controller)
     }
 
+    /// Lay `id` out for the room of `device_id`'s newest viewer (its own
+    /// size when that viewer said none). Best effort: a surface that could
+    /// not still works, its picture only has more margin.
+    async fn fit_for(&self, id: &SurfaceId, device_id: &str) {
+        let (room, fitted) = {
+            let state = lock(&self.shared.state);
+            let room = state
+                .lives
+                .values()
+                .filter(|l| &l.surface == id && l.device_id == device_id)
+                .find_map(|l| l.fit);
+            let fitted = state.surfaces.get(id).is_some_and(|e| e.fitted);
+            (room, fitted)
+        };
+        if room.is_none() && !fitted {
+            return;
+        }
+        let Ok(backend) = self.backend_of(id) else {
+            return;
+        };
+        match backend.fit(id, room).await {
+            Ok(()) => {
+                if let Some(entry) = lock(&self.shared.state).surfaces.get_mut(id) {
+                    entry.fitted = room.is_some();
+                }
+            }
+            Err(e) => {
+                warn!(surface = %id, error = %e, "could not lay the surface out for the owner's screen")
+            }
+        }
+    }
+
+    /// Let the agent act again (drop its hold). A surface laid out for the
+    /// owner's screen goes back to its own size first, so the agent never
+    /// sees the owner's layout.
+    fn unfit_then_release(&self, id: &SurfaceId, guard: Option<ExclusiveGuard>, fitted: bool) {
+        let Some(guard) = guard else { return };
+        if !fitted {
+            drop(guard);
+            return;
+        }
+        let (Ok(backend), Ok(runtime)) =
+            (self.backend_of(id), tokio::runtime::Handle::try_current())
+        else {
+            drop(guard);
+            return;
+        };
+        let id = id.clone();
+        runtime.spawn(async move {
+            if let Err(e) = backend.fit(&id, None).await {
+                warn!(surface = %id, error = %e, "could not put the surface back at its own size");
+            }
+            drop(guard);
+        });
+    }
+
     /// Give control back to the agent. Only the holding device may.
     pub fn release_control(&self, id: &SurfaceId, device_id: &str) -> Result<(), SurfaceError> {
-        let (info, guard) = {
+        let (info, guard, fitted) = {
             let mut state = lock(&self.shared.state);
             let entry = state.surfaces.get_mut(id).ok_or(SurfaceError::NotFound)?;
             if entry.controller.owner_device() != Some(device_id) {
@@ -714,9 +787,10 @@ impl SurfaceRegistry {
             }
             entry.controller = Controller::Agent;
             entry.holder_left_at = None;
-            (entry.info(), entry.exclusive.take())
+            let fitted = std::mem::take(&mut entry.fitted);
+            (entry.info(), entry.exclusive.take(), fitted)
         };
-        drop(guard);
+        self.unfit_then_release(id, guard, fitted);
         info!(surface = %id, device = device_id, "owner gave control back");
         self.emit(SurfaceChange::Updated(info));
         Ok(())
@@ -781,12 +855,13 @@ impl SurfaceRegistry {
                 if left_too_long || quiet_too_long {
                     entry.controller = Controller::Agent;
                     entry.holder_left_at = None;
-                    released.push((entry.info(), entry.exclusive.take(), device));
+                    let fitted = std::mem::take(&mut entry.fitted);
+                    released.push((entry.info(), entry.exclusive.take(), device, fitted));
                 }
             }
         }
-        for (info, guard, device) in released {
-            drop(guard);
+        for (info, guard, device, fitted) in released {
+            self.unfit_then_release(&info.id, guard, fitted);
             warn!(surface = %info.id, device, "control went back to the agent: the owner's device left or went quiet");
             self.emit(SurfaceChange::Updated(info));
         }

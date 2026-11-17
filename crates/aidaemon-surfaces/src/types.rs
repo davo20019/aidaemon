@@ -252,6 +252,9 @@ pub struct StreamParams {
     pub max_fps: u32,
     /// 1 to 100.
     pub quality: u8,
+    /// The room the viewer has for the picture: while its device holds
+    /// control, a surface that can lay itself out takes this size.
+    pub fit: Option<Size>,
 }
 
 impl Default for StreamParams {
@@ -261,6 +264,7 @@ impl Default for StreamParams {
             max_h: 1280,
             max_fps: 10,
             quality: 70,
+            fit: None,
         }
     }
 }

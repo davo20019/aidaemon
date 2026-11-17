@@ -524,6 +524,8 @@ fn client_samples() -> Vec<ClientFrame> {
                     max_h: None,
                     max_fps: Some(8),
                     quality: Some(60),
+                    fit_w: Some(390),
+                    fit_h: Some(560),
                 },
             },
         ),

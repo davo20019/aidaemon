@@ -661,6 +661,17 @@ impl SurfaceBackend for BrowserSurface {
         }))
     }
 
+    async fn fit(&self, id: &SurfaceId, room: Option<Size>) -> Result<(), SurfaceError> {
+        let (_, target, page) = self.page(id).await?;
+        // Taps map through the size the next frame reports, not the old one.
+        lock(&self.viewports).remove(&target);
+        page.fit(room.map(|r| (r.w, r.h)))
+            .await
+            .map_err(backend_error)?;
+        tracing::info!(?room, "Live view page laid out for the owner's screen");
+        Ok(())
+    }
+
     async fn prepare_handoff(&self, id: &SurfaceId) -> Result<HandoffPrep, SurfaceError> {
         match self.backend.sign_in_store().await {
             SignInStore::Kept => {

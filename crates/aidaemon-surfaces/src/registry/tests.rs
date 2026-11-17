@@ -193,6 +193,40 @@ async fn control_waits_for_the_agents_running_action_and_holds_the_next() {
 }
 
 #[tokio::test]
+async fn a_page_takes_the_controlling_phones_room_and_is_back_before_the_agent_acts() {
+    let (registry, mock) = setup(SurfacesConfig::default());
+    let id = mock.add("s1", "tab-1");
+    registry.refresh().await;
+    let room = crate::types::Size { w: 390, h: 560 };
+    let phone = StreamParams {
+        fit: Some(room),
+        ..StreamParams::default()
+    };
+    // Watching lays nothing out; a laptop with no room changes nothing.
+    let _watch = registry
+        .open_live(&id, "phone", LiveMode::View, phone)
+        .await
+        .unwrap();
+    let _laptop = registry
+        .open_live(&id, "laptop", LiveMode::View, StreamParams::default())
+        .await
+        .unwrap();
+    registry.take_control(&id, "laptop").await.unwrap();
+    assert!(mock.fits().is_empty());
+    // The phone takes over: the page takes its room.
+    registry.take_control(&id, "phone").await.unwrap();
+    assert_eq!(mock.fits(), vec![(Some(room), true)]);
+    // Given back: its own size again while the agent still waits, then the
+    // agent may act.
+    let agent_lock = mock.agent_lock(&id);
+    registry.release_control(&id, "phone").unwrap();
+    let _acting = tokio::time::timeout(Duration::from_secs(5), agent_lock.lock())
+        .await
+        .expect("the agent acts again");
+    assert_eq!(mock.fits(), vec![(Some(room), true), (None, true)]);
+}
+
+#[tokio::test]
 async fn only_the_holding_device_types_and_the_newest_device_wins() {
     let (registry, mock) = setup(SurfacesConfig::default());
     let id = mock.add("s1", "tab-1");

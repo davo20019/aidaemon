@@ -4,6 +4,8 @@
       "codecs": [
         "jpeg"
       ],
+      "fit_h": 560,
+      "fit_w": 390,
       "max_fps": 8,
       "max_w": 1080,
       "quality": 60

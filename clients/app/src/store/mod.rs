@@ -559,7 +559,8 @@ impl Store {
     pub fn watch_surface(&self, surface_id: &str, control: bool) {
         // A mouse wants a quicker picture than a finger.
         let fps = if crate::ui::touch() { 10 } else { 20 };
-        let effects = self.act(|c| c.open_surface_at(surface_id, control, Some(fps)));
+        let fit = crate::ui::live_room();
+        let effects = self.act(|c| c.open_surface_at(surface_id, control, Some(fps), fit));
         for effect in effects {
             self.effect(effect);
         }

@@ -1796,6 +1796,24 @@ fn viewer(
     )
 }
 
+/// The room a touch screen has for the live picture while it controls the
+/// page, in points: the screen less the status lines over the picture and
+/// the typing row and answers under it. The daemon lays the agent's page
+/// out for it, so the page fills the phone instead of a wide strip. `None`
+/// on a pointer screen: a window that size suits the page as it is.
+pub fn live_room() -> Option<(u32, u32)> {
+    /// The live screen's own lines, above and below the picture.
+    const CHROME: f32 = 210.0;
+    if !super::theme::touch() {
+        return None;
+    }
+    let window = nsh_core::element::window();
+    let safe = nsh_core::element::safe_area();
+    let w = window.width.0 - 20.0;
+    let h = window.height.0 - safe.top.0 - safe.bottom.0 - CHROME;
+    (w >= 200.0 && h >= 200.0).then(|| (w.round() as u32, h.round() as u32))
+}
+
 /// The marks as an SVG of `w` by `h` points.
 fn marks_svg(strokes: &Strokes, w: f32, h: f32) -> String {
     let width = MARK_WIDTH * w.max(h);

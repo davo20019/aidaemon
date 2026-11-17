@@ -200,6 +200,13 @@ pub trait PageHandle: Send + Sync {
     async fn emulate_focus(&self, _on: bool) -> Result<(), String> {
         Ok(())
     }
+
+    /// Lay the page out as a phone of `room` CSS pixels would (its mobile
+    /// layout), or back at the window's own size (`None`). Default: the
+    /// page keeps its size.
+    async fn fit(&self, _room: Option<(u32, u32)>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// One live frame of a page.
@@ -1545,6 +1552,26 @@ impl PageHandle for ChromiumoxidePage {
             .map_err(|e| format!("Failed to show focus: {e}"))
     }
 
+    async fn fit(&self, room: Option<(u32, u32)>) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::emulation::{
+            ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
+        };
+        let done = match room {
+            // Twice the pixels, so a phone's picture stays sharp.
+            Some((w, h)) => self
+                .page
+                .execute(SetDeviceMetricsOverrideParams::new(w, h, 2.0, true))
+                .await
+                .map(|_| ()),
+            None => self
+                .page
+                .execute(ClearDeviceMetricsOverrideParams::default())
+                .await
+                .map(|_| ()),
+        };
+        done.map_err(|e| format!("Failed to size the page: {e}"))
+    }
+
     async fn attach_diagnostics(
         &self,
         session_id: &str,
@@ -1665,6 +1692,9 @@ pub enum MockCall {
     Key(bool, String, bool),
     /// Recorded by `insert_text`: the number of characters only.
     InsertText(usize),
+    /// Recorded by `fit`: the room the page was laid out for (`None`: back
+    /// at its own size).
+    Fit(Option<(u32, u32)>),
     /// Recorded when the browser moves onto a profile that keeps sign-ins.
     KeepSignIns,
 }
@@ -2270,6 +2300,11 @@ impl PageHandle for MockPage {
 
     async fn viewport(&self) -> Result<(f64, f64), String> {
         Ok((1280.0, 720.0))
+    }
+
+    async fn fit(&self, room: Option<(u32, u32)>) -> Result<(), String> {
+        self.record(MockCall::Fit(room)).await;
+        Ok(())
     }
 
     async fn title(&self) -> Option<String> {

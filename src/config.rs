@@ -1651,6 +1651,7 @@ impl SurfacesSettings {
                 max_h: self.max_width.clamp(320, 3840),
                 max_fps: self.max_fps.clamp(1, 30),
                 quality: 70,
+                fit: None,
             },
             disconnect_grace: std::time::Duration::from_secs(
                 self.disconnect_grace_secs.clamp(5, 3600),

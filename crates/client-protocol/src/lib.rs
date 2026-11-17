@@ -541,6 +541,15 @@ pub struct StreamAccept {
     /// 10 to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<u8>,
+    /// The room the viewer has for the picture, in its points (a phone's
+    /// screen less the controls). While this device holds control, a
+    /// surface that can lay itself out (a browser page) takes this size,
+    /// so the picture fills the screen; it goes back to its own size when
+    /// control goes back. Both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_h: Option<u32>,
 }
 
 /// A screen the agent works on that the owner can watch and control
