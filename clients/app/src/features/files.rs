@@ -242,11 +242,18 @@ fn crumbs(
                 )
                 // A switch, not a button whose words flip: it says which
                 // files it adds (the ones .gitignore hides) and shows its state.
-                .child(ui::toggle(
-                    "Git-ignored",
-                    move || ignored.get(),
-                    move |on| ignored.set(on),
-                ))
+                // Rebuilt on each change, as every toggle here is: the
+                // switch's track and thumb styles are drawn once.
+                .child(dynamic(move || {
+                    let on = ignored.get();
+                    Some(untracked(move || {
+                        view().child(ui::toggle(
+                            "Git-ignored",
+                            move || on,
+                            move |next| ignored.set(next),
+                        ))
+                    }))
+                }))
                 .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Sm, move || {
                     store.list_project_files(&id, &folder.get_untracked(), ignored.get_untracked())
                 })),
