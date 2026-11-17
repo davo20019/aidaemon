@@ -73,73 +73,96 @@ impl SnapshotCache {
         Ok(&cached.snapshot)
     }
 
-    /// Resolve an interactive element by descriptor (role and/or title, both
-    /// matched case-insensitively as substrings) against the current snapshot,
-    /// returning its index. `occurrence` is 1-based and selects among repeated
-    /// matches (e.g. the 2nd "Like" button). This lets a caller target a control
-    /// by a stable label instead of a positional index that renumbers whenever
-    /// the screen re-renders.
+    /// Resolve an interactive element by descriptor against the current
+    /// snapshot, returning its index. The title must equal the element's
+    /// title exactly, compared case-insensitively with whitespace collapsed;
+    /// the role must name the element's AX role (`button` or `AXButton` for
+    /// `AXButton`). Nothing is matched by substring or synonym: a request for
+    /// "share" never lands on "Repost". `occurrence` (1-based) picks among
+    /// repeated exact matches; several matches without it, or none, is an
+    /// error that lists the candidates so the model chooses by
+    /// `element_index`.
     pub fn resolve_descriptor(
         &self,
         key: &SnapshotKey,
         generation: u64,
         role: Option<&str>,
         title: Option<&str>,
-        occurrence: usize,
+        occurrence: Option<usize>,
     ) -> Result<u32, String> {
         let snapshot = self.validate_generation(key, generation)?;
-        let role_l = role.map(|r| r.to_ascii_lowercase());
-        let title_l = title.map(|t| t.to_ascii_lowercase());
-        let occ = occurrence.max(1);
-
-        // Collect candidate indices in tree order. `use_synonyms=false` requires a
-        // DIRECT title substring; `true` allows the action-verb synonym groups.
-        let collect = |use_synonyms: bool| -> Vec<u32> {
-            snapshot
-                .elements
-                .iter()
-                .filter(|e| e.interactive)
-                .filter(|e| {
-                    role_l
-                        .as_deref()
-                        .is_none_or(|r| e.role.to_ascii_lowercase().contains(r))
-                })
-                .filter(|e| match title_l.as_deref() {
-                    None => true,
-                    Some(t) => {
-                        let title = e.title.to_ascii_lowercase();
-                        if use_synonyms {
-                            title_matches(&title, t)
-                        } else {
-                            title.contains(t)
-                        }
-                    }
-                })
-                .map(|e| e.index)
-                .collect()
-        };
-
-        // Prefer direct substring matches so a specific accessible name (e.g.
-        // "Reaction button state: no reaction") resolves precisely. Only fall
-        // back to synonym expansion when the query matched NOTHING directly (a
-        // generic verb like "like"), so synonyms never pull in unrelated
-        // lookalikes such as a "362 reactions" count link.
-        let mut candidates = collect(false);
-        if candidates.is_empty() && title_l.is_some() {
-            candidates = collect(true);
-        }
-
-        candidates.get(occ - 1).copied().ok_or_else(|| {
+        let wanted_title = title.map(normalize_title);
+        let role_matches =
+            |element: &IndexedElement| role.is_none_or(|r| role_equals(&element.role, r));
+        let matches: Vec<&IndexedElement> = snapshot
+            .elements
+            .iter()
+            .filter(|e| e.interactive && role_matches(e))
+            .filter(|e| {
+                wanted_title
+                    .as_deref()
+                    .is_none_or(|t| normalize_title(&e.title) == t)
+            })
+            .collect();
+        let describe = || {
             format!(
-                "No interactive element matching {}{}(occurrence {occ}) in snapshot generation {} \
-                 ({} candidate(s) matched). Call get_app_state and target an element_index from the \
-                 listed elements.",
-                role.map(|r| format!("role~='{r}' ")).unwrap_or_default(),
-                title.map(|t| format!("title~='{t}' ")).unwrap_or_default(),
-                snapshot.generation,
-                candidates.len(),
+                "{}{}",
+                role.map(|r| format!("role='{r}' ")).unwrap_or_default(),
+                title.map(|t| format!("title='{t}' ")).unwrap_or_default(),
             )
-        })
+        };
+        match (matches.len(), occurrence) {
+            (0, _) => {
+                // Shown to the model to choose from, never matched on.
+                let near: Vec<String> = wanted_title
+                    .as_deref()
+                    .map(|t| {
+                        snapshot
+                            .elements
+                            .iter()
+                            .filter(|e| e.interactive && normalize_title(&e.title).contains(t))
+                            .take(8)
+                            .map(|e| format!("[{}] {} '{}'", e.index, e.role, e.title))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let near = if near.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Elements whose title contains it: {}.", near.join(", "))
+                };
+                Err(format!(
+                    "No interactive element matching {}exactly in snapshot generation {}.{near} \
+                     Call get_app_state and target an element_index from the listed elements, \
+                     or pass the exact title shown there.",
+                    describe(),
+                    snapshot.generation,
+                ))
+            }
+            (1, None) => Ok(matches[0].index),
+            (count, None) => Err(format!(
+                "{count} interactive elements match {}in snapshot generation {}: {}. Pass \
+                 occurrence (1-based) or an element_index to choose one.",
+                describe(),
+                snapshot.generation,
+                matches
+                    .iter()
+                    .map(|e| format!("[{}]", e.index))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+            (count, Some(occurrence)) => matches
+                .get(occurrence.max(1) - 1)
+                .map(|e| e.index)
+                .ok_or_else(|| {
+                    format!(
+                        "occurrence {occurrence} is out of range: {count} interactive element(s) \
+                         match {}in snapshot generation {}.",
+                        describe(),
+                        snapshot.generation,
+                    )
+                }),
+        }
     }
 
     pub fn element_by_index(
@@ -170,29 +193,26 @@ impl SnapshotCache {
     }
 }
 
-/// Whether an element's (already-lowercased) title matches a descriptor query.
-/// Beyond a plain substring, common web/social action verbs are treated as
-/// synonyms, because apps label the same control differently — e.g. LinkedIn's
-/// Like button is named "Reaction button state: no reaction", so a search for
-/// "like" should still find it without the model having to discover the exact
-/// accessible name.
-fn title_matches(element_title_lower: &str, query_lower: &str) -> bool {
-    if element_title_lower.contains(query_lower) {
-        return true;
-    }
-    const SYNONYM_GROUPS: &[&[&str]] = &[
-        &["like", "react", "reaction"],
-        &["comment", "reply"],
-        &["share", "repost"],
-    ];
-    for group in SYNONYM_GROUPS {
-        if group.iter().any(|w| query_lower.contains(w))
-            && group.iter().any(|w| element_title_lower.contains(w))
-        {
-            return true;
-        }
-    }
-    false
+/// A title compared for equality: case-folded, whitespace collapsed.
+fn normalize_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Whether `query` names AX role `role` (`button` or `AXButton` for
+/// `AXButton`), compared case-insensitively. Roles are a machine format.
+fn role_equals(role: &str, query: &str) -> bool {
+    let bare = |value: &str| {
+        let lower = value.trim().to_ascii_lowercase();
+        lower
+            .strip_prefix("ax")
+            .map(str::to_string)
+            .unwrap_or(lower)
+    };
+    bare(role) == bare(query)
 }
 
 fn hash_snapshot(snapshot: &AppSnapshot) -> u64 {
@@ -240,6 +260,7 @@ mod tests {
                 bounds: None,
                 subrole: None,
                 interactive: true,
+                ..Default::default()
             }],
             truncated: false,
             png: vec![1, 2, 3],
@@ -275,11 +296,12 @@ mod tests {
             bounds: None,
             subrole: None,
             interactive: true,
+            ..Default::default()
         }
     }
 
     #[test]
-    fn resolve_descriptor_by_title_role_and_occurrence() {
+    fn resolve_descriptor_by_exact_title_role_and_occurrence() {
         let mut cache = SnapshotCache::default();
         let mut snap = sample_snapshot();
         snap.elements = vec![
@@ -289,111 +311,74 @@ mod tests {
         ];
         let g = cache.store(key(), snap).generation;
 
-        // Title substring (case-insensitive).
+        // Exact title, case-insensitive and whitespace-normalized.
         assert_eq!(
             cache
-                .resolve_descriptor(&key(), g, None, Some("address"), 1)
+                .resolve_descriptor(&key(), g, None, Some("  address AND search bar "), None)
                 .unwrap(),
             2
         );
-        // Role substring.
+        // Role names the AX role, with or without the prefix.
         assert_eq!(
             cache
-                .resolve_descriptor(&key(), g, Some("textfield"), None, 1)
+                .resolve_descriptor(&key(), g, Some("textfield"), None, None)
                 .unwrap(),
             2
         );
-        // Occurrence selects the 2nd "Like".
         assert_eq!(
             cache
-                .resolve_descriptor(&key(), g, None, Some("like"), 2)
+                .resolve_descriptor(&key(), g, Some("AXTextField"), None, None)
+                .unwrap(),
+            2
+        );
+        // Occurrence selects the 2nd "Like"; 0 is treated as 1.
+        assert_eq!(
+            cache
+                .resolve_descriptor(&key(), g, None, Some("like"), Some(2))
                 .unwrap(),
             3
         );
-        // occurrence 0 is treated as 1.
         assert_eq!(
             cache
-                .resolve_descriptor(&key(), g, None, Some("like"), 0)
+                .resolve_descriptor(&key(), g, None, Some("like"), Some(0))
                 .unwrap(),
             1
         );
-        // No match is an actionable error.
+        // Several matches without an occurrence: the model chooses.
         let err = cache
-            .resolve_descriptor(&key(), g, None, Some("nope"), 1)
+            .resolve_descriptor(&key(), g, None, Some("like"), None)
+            .unwrap_err();
+        assert!(err.contains("[1], [3]"), "{err}");
+        // A substring is not a match, but is listed to choose from.
+        let err = cache
+            .resolve_descriptor(&key(), g, None, Some("address"), None)
             .unwrap_err();
         assert!(err.contains("No interactive element matching"), "{err}");
+        assert!(err.contains("[2]"), "{err}");
     }
 
+    /// A requested verb never resolves to a different one.
     #[test]
-    fn descriptor_matches_action_synonyms() {
-        // LinkedIn labels the Like button "Reaction button state: no reaction";
-        // a search for "Like" should still resolve it.
+    fn descriptor_never_maps_to_a_different_verb() {
         let mut cache = SnapshotCache::default();
         let mut snap = sample_snapshot();
         snap.elements = vec![
-            elem(1, "AXButton", "Reaction button state: no reaction"),
-            elem(2, "AXButton", "Comment"),
+            elem(1, "AXButton", "Repost"),
+            elem(2, "AXButton", "Reaction button state: no reaction"),
+            elem(3, "AXButton", "Reply"),
         ];
         let g = cache.store(key(), snap).generation;
+        for query in ["share", "like", "comment"] {
+            let err = cache
+                .resolve_descriptor(&key(), g, None, Some(query), None)
+                .unwrap_err();
+            assert!(err.contains("No interactive element matching"), "{err}");
+        }
         assert_eq!(
             cache
-                .resolve_descriptor(&key(), g, None, Some("Like"), 1)
+                .resolve_descriptor(&key(), g, None, Some("Repost"), None)
                 .unwrap(),
             1
-        );
-        // Plain substring still works and doesn't over-match across groups.
-        assert_eq!(
-            cache
-                .resolve_descriptor(&key(), g, None, Some("comment"), 1)
-                .unwrap(),
-            2
-        );
-        assert!(
-            cache
-                .resolve_descriptor(&key(), g, None, Some("like"), 1)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn exact_react_button_not_shadowed_by_reaction_count_link() {
-        // Real LinkedIn-feed shape: each post has a react BUTTON plus a
-        // "N reactions" count LINK. The model targets the exact button name with
-        // occurrence=3 for the third post. The synonym group must NOT let the
-        // count links ("362 reactions") absorb occurrence slots, or occurrence=3
-        // lands on a count link instead of the third post's button.
-        let mut cache = SnapshotCache::default();
-        let mut snap = sample_snapshot();
-        snap.elements = vec![
-            elem(10, "AXButton", "Reaction button state: no reaction"),
-            elem(11, "AXLink", "362 reactions"),
-            elem(20, "AXButton", "Reaction button state: no reaction"),
-            elem(21, "AXLink", "45 reactions"),
-            elem(30, "AXButton", "Reaction button state: no reaction"),
-            elem(31, "AXLink", "12 reactions"),
-        ];
-        let g = cache.store(key(), snap).generation;
-        // Exact name + occurrence=3 must resolve to the THIRD button (index 30),
-        // not a count link.
-        assert_eq!(
-            cache
-                .resolve_descriptor(
-                    &key(),
-                    g,
-                    None,
-                    Some("Reaction button state: no reaction"),
-                    3
-                )
-                .unwrap(),
-            30
-        );
-        // A generic "like" still works via synonyms (direct substring is empty),
-        // and resolves to a button (first react element), never a count link.
-        assert_eq!(
-            cache
-                .resolve_descriptor(&key(), g, None, Some("like"), 1)
-                .unwrap(),
-            10
         );
     }
 }

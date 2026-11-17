@@ -161,19 +161,42 @@ async fn coordinate_click_flags_unverified_and_observation_clears_it() {
         .unwrap();
     assert!(!reg.has_unverified_coordinate_click(task).await);
 
-    // A coordinate click: flags the result unverified and marks the task.
+    // A coordinate click: its target is unknown, so it is consequential and
+    // runs only with the owner's approval of this exact click.
     let click = json!({
         "action": "click", "app": "Calculator",
         "snapshot_generation": 1, "x": 500.0, "y": 500.0
     });
-    let outcome = tool
+    let refused = tool
         .call_with_execution_context(&click.to_string(), None, cu_facts(task))
         .await
         .unwrap();
     assert!(
-        outcome.output.contains("[UNVERIFIED]"),
+        refused.output.contains("through the agent kernel"),
+        "an unapproved coordinate click must be refused: {}",
+        refused.output
+    );
+    let run = aidaemon_tools::testing::call_through_kernel(
+        &tool,
+        &click.to_string(),
+        cu_facts(task),
+        Some(aidaemon_tools::semantics::ApprovalResponse::AllowOnce),
+    )
+    .await
+    .unwrap();
+    let asked = run.asked.expect("a coordinate click must ask the owner");
+    assert!(
+        matches!(
+            tool.approval_card_kind(&asked),
+            aidaemon_tools::semantics::ApprovalKind::CommandOnce
+        ),
+        "{asked:?}"
+    );
+    // The approved click flags the result unverified and marks the task.
+    assert!(
+        run.output.contains("[UNVERIFIED]"),
         "coordinate click must carry the unverified notice: {}",
-        outcome.output
+        run.output
     );
     assert!(
         reg.has_unverified_coordinate_click(task).await,

@@ -38,6 +38,7 @@ impl MockHarness {
                     }),
                     subrole: None,
                     interactive: true,
+                    ..Default::default()
                 },
                 IndexedElement {
                     index: 2,
@@ -47,6 +48,7 @@ impl MockHarness {
                     bounds: None,
                     subrole: None,
                     interactive: true,
+                    ..Default::default()
                 },
             ],
             truncated: false,

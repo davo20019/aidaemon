@@ -88,6 +88,13 @@ fn match_app<'a>(apps: &'a [types::AppInfo], app: &str) -> Option<&'a types::App
 
 /// The one-call subject of a consequential action: the app, the label the
 /// owner saw, and a digest of the exact call (its target, text and value).
+/// The owner's label for a click at a point: no element names its target.
+fn coordinate_click_label(args: &Value) -> String {
+    let x = args.get("x").and_then(Value::as_f64).unwrap_or_default();
+    let y = args.get("y").and_then(Value::as_f64).unwrap_or_default();
+    format!("Click at ({x}, {y}), on a target the accessibility tree does not name")
+}
+
 fn consequential_subject(bundle_id: &str, label: &str, args: &Value) -> String {
     use sha2::{Digest, Sha256};
     let exact: Vec<Value> = [
@@ -188,8 +195,8 @@ fn bounds_match(a: Option<ElementBounds>, b: Option<ElementBounds>) -> bool {
 /// comment via edit_file (and grepping saved result files) instead of emitting
 /// the actual call — this reminds it that only a computer_use call does anything.
 const GUI_TASK_ANCHOR: &str = "\n[NEXT] You are operating an app through computer_use. Do the next \
-step by emitting a computer_use tool call NOW — prefer targeting by element_title (with occurrence \
-for repeats), e.g. click element_title=\"Like\". Do NOT write/edit files, run terminal or grep on \
+step by emitting a computer_use tool call NOW — prefer targeting by the exact element_title shown \
+in get_app_state (with occurrence for repeats). Do NOT write/edit files, run terminal or grep on \
 saved results, or describe the action in a comment: only a computer_use call changes anything on \
 screen.";
 
@@ -738,13 +745,17 @@ impl ComputerUseTool {
                     before_target =
                         Some((element.role.clone(), element.title.clone(), element.bounds));
                     self.set_element_target(Some(&element), Some(index)).await;
-                    action_class = classify_target(action, Some(&element), None);
+                    action_class = classify_target(action, Some(&element));
                     if action_class == ActionClass::Prohibited {
                         return Err("Target element is prohibited".to_string());
                     }
                     if action_class == ActionClass::Consequential {
                         summary = Some(format!("Click '{}'", element.title));
                     }
+                } else if is_coordinate_click {
+                    // No element: what the click lands on is unknown.
+                    action_class = classify_target(action, None);
+                    summary = Some(coordinate_click_label(args));
                 }
                 self.ensure_action_approvals(
                     &ctx,
@@ -834,7 +845,7 @@ impl ComputerUseTool {
                 let generation = required_generation(args)?;
                 let text = required_str(args, "text")?;
                 let resolved = self.resolve_app(&app).await?;
-                let class = classify_target(action, None, Some(&text));
+                let class = classify_target(action, None);
                 if class == ActionClass::Prohibited {
                     return Err("Typed content is prohibited".to_string());
                 }
@@ -953,7 +964,7 @@ impl ComputerUseTool {
                     .clone();
                 self.set_element_target(Some(&element), Some(element_index))
                     .await;
-                let class = classify_target(action, Some(&element), Some(&value));
+                let class = classify_target(action, Some(&element));
                 if class == ActionClass::Prohibited {
                     return Err("Target element or value is prohibited".to_string());
                 }
@@ -1062,13 +1073,16 @@ impl ComputerUseTool {
                 let cache = self.cache.lock().await;
                 let index = match resolve_target_index(args, &cache, &key, generation) {
                     Ok(Some(index)) => index,
+                    Ok(None) if is_coordinate_click => {
+                        return TargetClass::Consequential(coordinate_click_label(args));
+                    }
                     Ok(None) => return TargetClass::Other,
                     Err(_) => return TargetClass::NoAsk,
                 };
                 let Ok(element) = cache.element_by_index(&key, generation, index) else {
                     return TargetClass::NoAsk;
                 };
-                match classify_target(action, Some(element), None) {
+                match classify_target(action, Some(element)) {
                     ActionClass::Prohibited => TargetClass::NoAsk,
                     ActionClass::Consequential => {
                         TargetClass::Consequential(format!("Click '{}'", element.title))
@@ -1080,24 +1094,19 @@ impl ComputerUseTool {
                 if required_generation(args).is_err() {
                     return TargetClass::NoAsk;
                 }
-                let Ok(text) = required_str(args, "text") else {
+                if required_str(args, "text").is_err() {
                     return TargetClass::NoAsk;
-                };
-                match classify_target(action, None, Some(&text)) {
-                    ActionClass::Prohibited => TargetClass::NoAsk,
-                    ActionClass::Consequential => {
-                        TargetClass::Consequential(format!("Type text into {}", app.name))
-                    }
-                    _ => TargetClass::Other,
                 }
+                // Typed text is data: it never decides the class.
+                TargetClass::Other
             }
             ComputerActionKind::SetValue => {
                 let Ok(generation) = required_generation(args) else {
                     return TargetClass::NoAsk;
                 };
-                let Ok(value) = required_str(args, "value") else {
+                if required_str(args, "value").is_err() {
                     return TargetClass::NoAsk;
-                };
+                }
                 let cache = self.cache.lock().await;
                 let Ok(Some(index)) = resolve_target_index(args, &cache, &key, generation) else {
                     return TargetClass::NoAsk;
@@ -1105,7 +1114,7 @@ impl ComputerUseTool {
                 let Ok(element) = cache.element_by_index(&key, generation, index) else {
                     return TargetClass::NoAsk;
                 };
-                match classify_target(action, Some(element), Some(&value)) {
+                match classify_target(action, Some(element)) {
                     ActionClass::Prohibited => TargetClass::NoAsk,
                     ActionClass::Consequential => {
                         TargetClass::Consequential(format!("Set value on '{}'", element.title))
@@ -1389,8 +1398,7 @@ fn resolve_target_index(
     let occurrence = args
         .get("occurrence")
         .and_then(|v| v.as_u64())
-        .map(|n| n.max(1) as usize)
-        .unwrap_or(1);
+        .map(|n| n.max(1) as usize);
     snapshot_cache
         .resolve_descriptor(key, generation, role, title, occurrence)
         .map(Some)
@@ -1526,15 +1534,15 @@ impl Tool for ComputerUseTool {
                     },
                     "element_title": {
                         "type": "string",
-                        "description": "Target an element by its visible title/label (case-insensitive substring), resolved against the latest snapshot. More robust than element_index because it survives re-renders. E.g. 'Address and search bar', 'Like', 'Send'. Combine with occurrence to disambiguate repeats."
+                        "description": "Target an element by its exact title/label as get_app_state lists it (case-insensitive, whitespace-normalized; no partial or synonym matching), resolved against the latest snapshot. More robust than element_index because it survives re-renders. Combine with occurrence to disambiguate repeats."
                     },
                     "element_role": {
                         "type": "string",
-                        "description": "Target an element by accessibility role (case-insensitive substring), e.g. 'button', 'textfield'. Use with or instead of element_title to disambiguate."
+                        "description": "Target an element by its accessibility role, e.g. 'button' or 'AXButton', 'textfield'. Use with or instead of element_title to disambiguate."
                     },
                     "occurrence": {
                         "type": "integer",
-                        "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Default 1."
+                        "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Required when several elements match."
                     },
                     "x": { "type": "number", "description": "Coordinate-click X in NORMALIZED image space 0-1000 (0=left edge, 1000=right edge of the screenshot you were shown). Use this with y to click by pointing at the screenshot when the element list is empty or the target has no stable title/role (common for web pages in a browser). No snapshot_generation needed for a coordinate click." },
                     "y": { "type": "number", "description": "Coordinate-click Y in NORMALIZED image space 0-1000 (0=top edge, 1000=bottom edge of the screenshot). Pair with x." },

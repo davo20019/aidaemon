@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use axuielement::AXUIElement;
 use axuielement::ax_action::AX_PRESS_ACTION;
 use axuielement::ax_attribute::attributes::{
-    AX_DESCRIPTION_ATTRIBUTE, AX_ENABLED_ATTRIBUTE, AX_FOCUSED_ATTRIBUTE, AX_MAIN_ATTRIBUTE,
-    AX_POSITION_ATTRIBUTE, AX_ROLE_ATTRIBUTE, AX_SIZE_ATTRIBUTE, AX_SUBROLE_ATTRIBUTE,
-    AX_TITLE_ATTRIBUTE, AX_VALUE_ATTRIBUTE, AX_WINDOWS_ATTRIBUTE,
+    AX_CANCEL_BUTTON_ATTRIBUTE, AX_DEFAULT_BUTTON_ATTRIBUTE, AX_DESCRIPTION_ATTRIBUTE,
+    AX_ENABLED_ATTRIBUTE, AX_FOCUSED_ATTRIBUTE, AX_MAIN_ATTRIBUTE, AX_POSITION_ATTRIBUTE,
+    AX_ROLE_ATTRIBUTE, AX_SIZE_ATTRIBUTE, AX_SUBROLE_ATTRIBUTE, AX_TITLE_ATTRIBUTE,
+    AX_VALUE_ATTRIBUTE, AX_WINDOWS_ATTRIBUTE,
 };
 use axuielement::{is_process_trusted, is_process_trusted_with_prompt};
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -759,6 +760,11 @@ struct WalkState {
     limits: AxWalkLimits,
     elements: Vec<IndexedElement>,
     max_depth_seen: u32,
+    /// Bounds of the default and cancel buttons of every window and sheet
+    /// walked so far. `AXUIElement` has no equality, so a walked element is
+    /// identified with them by its exact on-screen rect.
+    default_buttons: Vec<ElementBounds>,
+    cancel_buttons: Vec<ElementBounds>,
 }
 
 fn walk_tree(root: &AXUIElement, limits: AxWalkLimits) -> (Vec<IndexedElement>, bool) {
@@ -771,8 +777,10 @@ fn walk_tree(root: &AXUIElement, limits: AxWalkLimits) -> (Vec<IndexedElement>, 
         limits,
         elements: Vec::new(),
         max_depth_seen: 0,
+        default_buttons: Vec::new(),
+        cancel_buttons: Vec::new(),
     };
-    walk_node(root, 0, &mut state);
+    walk_node(root, 0, false, &mut state);
     if state.truncated && state.elements.is_empty() {
         // No interactive controls before the limit. The root role distinguishes
         // the real failure modes: a degraded/no-access tree shows the app
@@ -789,7 +797,7 @@ fn walk_tree(root: &AXUIElement, limits: AxWalkLimits) -> (Vec<IndexedElement>, 
     (state.elements, state.truncated)
 }
 
-fn walk_node(element: &AXUIElement, depth: u32, state: &mut WalkState) {
+fn walk_node(element: &AXUIElement, depth: u32, in_dialog: bool, state: &mut WalkState) {
     state.max_depth_seen = state.max_depth_seen.max(depth);
     if state.started.elapsed() > state.limits.max_duration
         || state.nodes >= state.limits.max_nodes
@@ -804,6 +812,29 @@ fn walk_node(element: &AXUIElement, depth: u32, state: &mut WalkState) {
     let enabled = optional_bool_attr(element, AX_ENABLED_ATTRIBUTE).unwrap_or(true);
     let subrole = optional_string_attr(element, AX_SUBROLE_ATTRIBUTE);
     let bounds = element_bounds(element);
+    // A window or sheet names its default and cancel buttons (typed AX
+    // attributes); a sheet or a dialog window marks everything inside it.
+    let container = role == "AXWindow" || role == "AXSheet";
+    let in_dialog = in_dialog
+        || role == "AXSheet"
+        || (role == "AXWindow"
+            && matches!(subrole.as_deref(), Some("AXDialog" | "AXSystemDialog")));
+    if container {
+        for (attribute, found) in [
+            (AX_DEFAULT_BUTTON_ATTRIBUTE, &mut state.default_buttons),
+            (AX_CANCEL_BUTTON_ATTRIBUTE, &mut state.cancel_buttons),
+        ] {
+            if let Some(rect) = element
+                .attribute(attribute)
+                .ok()
+                .flatten()
+                .and_then(|value| value.as_element())
+                .and_then(|button| element_bounds(&button))
+            {
+                found.push(rect);
+            }
+        }
+    }
 
     let interactive = is_interactive_role(&role);
     let context = !title.is_empty() && is_context_role(&role);
@@ -825,6 +856,9 @@ fn walk_node(element: &AXUIElement, depth: u32, state: &mut WalkState) {
             bounds,
             subrole,
             interactive,
+            default_button: bounds.is_some_and(|b| state.default_buttons.contains(&b)),
+            cancel_button: bounds.is_some_and(|b| state.cancel_buttons.contains(&b)),
+            in_dialog,
         });
         state.nodes = state.nodes.saturating_add(1);
     }
@@ -834,7 +868,7 @@ fn walk_node(element: &AXUIElement, depth: u32, state: &mut WalkState) {
         Err(_) => return,
     };
     for child in children {
-        walk_node(&child, depth.saturating_add(1), state);
+        walk_node(&child, depth.saturating_add(1), in_dialog, state);
         if state.truncated {
             return;
         }

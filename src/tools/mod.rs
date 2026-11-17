@@ -6,8 +6,6 @@ pub(crate) use aidaemon_runtime::tools::cli_agent;
 #[cfg(feature = "computer_use")]
 pub use aidaemon_runtime::tools::computer_use;
 pub(crate) mod config_manager;
-#[allow(unused_imports)]
-pub(crate) use aidaemon_tools::consequential;
 mod diagnose;
 /// SDK tools as daemon tools (no SDK tool is wrapped yet; 8.4 moves them).
 #[allow(dead_code)]

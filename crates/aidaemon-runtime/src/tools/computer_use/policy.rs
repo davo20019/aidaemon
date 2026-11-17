@@ -131,32 +131,39 @@ pub fn is_secure_element(element: &IndexedElement) -> bool {
     role.contains("securetextfield") || subrole.contains("secure") || subrole.contains("password")
 }
 
+/// The class of `action` on `element`, from typed accessibility facts only
+/// (role, subrole, enabled, default/cancel button, dialog membership); the
+/// element's title and any typed text are never read. A secure text field is
+/// prohibited. A click is consequential when it confirms a window or sheet
+/// (its `AXDefaultButton`), presses any other button of a sheet or dialog
+/// except its cancel button, or has a target whose facts are unknown: a
+/// coordinate click (no element) or an element with no role. Other clicks,
+/// and typing or setting a value (data, not an action), are local.
 pub fn classify_target(
     action: ComputerActionKind,
     element: Option<&IndexedElement>,
-    typed_text: Option<&str>,
 ) -> ActionClass {
-    if let Some(el) = element {
-        if is_secure_element(el) {
-            return ActionClass::Prohibited;
-        }
-        let label = format!(
-            "{} {} {}",
-            el.title,
-            el.role,
-            el.subrole.as_deref().unwrap_or("")
-        )
-        .to_ascii_lowercase();
-        if aidaemon_tools::consequential::names_consequential_action(&label) {
-            return ActionClass::Consequential;
-        }
+    if element.is_some_and(is_secure_element) {
+        return ActionClass::Prohibited;
     }
-    if let Some(text) = typed_text
-        && aidaemon_tools::consequential::names_consequential_action(text)
-    {
+    match (action, element) {
+        (ComputerActionKind::Click, None) => ActionClass::Consequential,
+        (ComputerActionKind::Click, Some(el)) => click_class(el),
+        _ => action.base_class(),
+    }
+}
+
+fn click_class(el: &IndexedElement) -> ActionClass {
+    if el.role.trim().is_empty() {
         return ActionClass::Consequential;
     }
-    action.base_class()
+    if !el.enabled || el.cancel_button {
+        return ActionClass::LocalMutation;
+    }
+    if el.default_button || (el.in_dialog && el.role == "AXButton") {
+        return ActionClass::Consequential;
+    }
+    ActionClass::LocalMutation
 }
 
 #[cfg(test)]
@@ -173,27 +180,90 @@ mod tests {
             bounds: None,
             subrole: Some("AXSecureTextField".to_string()),
             interactive: true,
+            ..Default::default()
         };
         assert_eq!(
-            classify_target(ComputerActionKind::TypeText, Some(&el), None),
+            classify_target(ComputerActionKind::TypeText, Some(&el)),
             ActionClass::Prohibited
         );
     }
 
-    #[test]
-    fn send_button_is_consequential() {
-        let el = IndexedElement {
+    fn button(title: &str) -> IndexedElement {
+        IndexedElement {
             index: 2,
             role: "AXButton".to_string(),
-            title: "Send Message".to_string(),
+            title: title.to_string(),
             enabled: true,
-            bounds: None,
-            subrole: None,
             interactive: true,
+            ..Default::default()
+        }
+    }
+
+    /// The title says nothing either way: a "Send Message" toolbar button is
+    /// a local click, an unlabeled default button confirms.
+    #[test]
+    fn titles_do_not_decide_the_class() {
+        assert_eq!(
+            classify_target(ComputerActionKind::Click, Some(&button("Send Message"))),
+            ActionClass::LocalMutation
+        );
+        let confirm = IndexedElement {
+            default_button: true,
+            ..button("")
         };
         assert_eq!(
-            classify_target(ComputerActionKind::Click, Some(&el), None),
+            classify_target(ComputerActionKind::Click, Some(&confirm)),
             ActionClass::Consequential
+        );
+    }
+
+    #[test]
+    fn dialog_buttons_are_consequential_except_cancel() {
+        let in_sheet = IndexedElement {
+            in_dialog: true,
+            ..button("7")
+        };
+        assert_eq!(
+            classify_target(ComputerActionKind::Click, Some(&in_sheet)),
+            ActionClass::Consequential
+        );
+        let cancel = IndexedElement {
+            cancel_button: true,
+            ..in_sheet.clone()
+        };
+        assert_eq!(
+            classify_target(ComputerActionKind::Click, Some(&cancel)),
+            ActionClass::LocalMutation
+        );
+        let checkbox = IndexedElement {
+            role: "AXCheckBox".to_string(),
+            ..in_sheet
+        };
+        assert_eq!(
+            classify_target(ComputerActionKind::Click, Some(&checkbox)),
+            ActionClass::LocalMutation
+        );
+    }
+
+    /// A target whose facts are unknown is consequential (fail safe).
+    #[test]
+    fn unknown_targets_are_consequential() {
+        assert_eq!(
+            classify_target(ComputerActionKind::Click, None),
+            ActionClass::Consequential
+        );
+        let no_role = IndexedElement {
+            role: String::new(),
+            ..button("OK")
+        };
+        assert_eq!(
+            classify_target(ComputerActionKind::Click, Some(&no_role)),
+            ActionClass::Consequential
+        );
+        // Typed text is data, never a decision.
+        assert_eq!(
+            classify_target(ComputerActionKind::TypeText, None),
+            ActionClass::LocalMutation
         );
     }
 
@@ -212,6 +282,7 @@ mod tests {
             bounds: None,
             subrole: None,
             interactive: true,
+            ..Default::default()
         };
         assert!(is_text_input_element(&field));
 
@@ -223,6 +294,7 @@ mod tests {
             bounds: None,
             subrole: None,
             interactive: true,
+            ..Default::default()
         };
         assert!(!is_text_input_element(&button));
     }

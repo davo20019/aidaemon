@@ -59,7 +59,7 @@ pub fn normalized_to_global_point(nx: f64, ny: f64, frame: WindowFrame) -> (f64,
 /// value displays) carry `index == 0` and `interactive == false`: they are shown
 /// to the model for context but never consume a number, so adding/removing a
 /// label (e.g. a calculator's result display) can't shift the buttons' indices.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct IndexedElement {
     pub index: u32,
     pub role: String,
@@ -68,6 +68,14 @@ pub struct IndexedElement {
     pub bounds: Option<ElementBounds>,
     pub subrole: Option<String>,
     pub interactive: bool,
+    /// The element is its window's or sheet's `AXDefaultButton` (the
+    /// confirming action Return triggers).
+    pub default_button: bool,
+    /// The element is its window's or sheet's `AXCancelButton`.
+    pub cancel_button: bool,
+    /// The element sits in a sheet (`AXSheet`) or a dialog window
+    /// (`AXDialog` / `AXSystemDialog` subrole).
+    pub in_dialog: bool,
 }
 
 /// Window + tree metadata for a captured app state.
@@ -350,6 +358,7 @@ mod tests {
                     bounds: None,
                     subrole: None,
                     interactive: true,
+                    ..Default::default()
                 },
                 IndexedElement {
                     index: 2,
@@ -359,6 +368,7 @@ mod tests {
                     bounds: None,
                     subrole: None,
                     interactive: true,
+                    ..Default::default()
                 },
             ],
             truncated: false,
