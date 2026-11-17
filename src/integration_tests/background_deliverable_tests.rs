@@ -23,6 +23,13 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 /// A media-capable test channel that records every `send_media` Document
 /// delivery and every text message, so the test can assert on real file
 /// delivery (not a text-only fallback).
+
+/// How many 200 ms polls a test waits for a background command to finish
+/// and its result to arrive: a minute. The commands start Python, which a
+/// loaded Windows runner took over 16 s to run and report (CI 2026-11-17);
+/// the wait ends as soon as the result is there.
+const DELIVERY_POLLS: usize = 300;
+
 #[derive(Default)]
 struct MediaCaptureChannel {
     documents: Mutex<Vec<(String /*filename*/, String /*caption*/)>>,
@@ -190,7 +197,7 @@ async fn empty_stdout_background_command_delivers_result_file() {
 
     // Wait for completion + deliverable delivery.
     let mut delivered = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         if channel.document_count().await >= 1 {
             delivered = true;
             break;
@@ -350,7 +357,7 @@ async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
     );
 
     let mut got_ambiguity = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         let texts = channel.texts().await;
         if texts.iter().any(|t| t.to_lowercase().contains("multiple") && t.to_lowercase().contains("output")) {
             got_ambiguity = true;
@@ -403,7 +410,7 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     assert!(response.contains("Moved to background (pid="));
 
     let mut got_failure = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         let texts = channel.texts().await;
         if texts.iter().any(|t| t.to_lowercase().contains("couldn't deliver")) {
             got_failure = true;
@@ -419,7 +426,7 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     assert!(response.contains("Moved to background (pid="));
 
     let mut delivered = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         if channel.document_count().await == 1 {
             delivered = true;
             break;
@@ -475,7 +482,7 @@ async fn nonzero_background_command_with_file_reports_failure_without_autosend()
     );
 
     let mut got_failure = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         let texts = channel.texts().await;
         if texts.iter().any(|t| t.to_lowercase().contains("exit code 7") && t.to_lowercase().contains("not sending")) {
             got_failure = true;

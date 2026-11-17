@@ -1453,42 +1453,74 @@ mod coordination_tests {
         ]
     }
 
-    /// Every seeded conflict, several times over: the same seed is settled
+    /// One seeded conflict, several times over: the same seed is settled
     /// the same way each run, the coordinator is asked only about informed
     /// changes to a sibling's lines, and no file tool ever replaces a
     /// sibling's change without a ruling, a rule or an answer behind it.
-    /// Run with `--nocapture` for the table.
-    #[tokio::test]
-    async fn seeded_conflicts_are_settled_the_same_way_every_run() {
+    /// Each scenario is its own test: together they took over two minutes
+    /// on a Windows runner, past nextest's limit (`.config/nextest.toml`).
+    /// Run with `--nocapture` for each scenario's row.
+    async fn settles_the_same_way_every_run(name: &str) {
         const RUNS: usize = 3;
-        let mut asked_total = 0usize;
-        let mut conflicts = 0usize;
-        println!("scenario | asked | stale refused | settled unasked | shell overwrites | unlanded | undecided overwrites | agreement");
-        for seeded in seeded_conflicts() {
-            let mut runs = Vec::new();
-            for _ in 0..RUNS {
-                runs.push(run_seeded(&seeded).await);
-            }
-            let first = runs[0].clone();
-            let agreeing = runs.iter().filter(|run| **run == first).count();
-            println!(
-                "{} | {:?} | {} | {} | {} | {} | {} | {agreeing}/{RUNS}",
-                seeded.name,
-                first.asked,
-                first.stale_refusals,
-                first.settled_without_asking,
-                first.shell_overwrites,
-                first.unlanded,
-                first.undecided_overwrites,
-            );
-            assert_eq!(agreeing, RUNS, "{}: {runs:?}", seeded.name);
-            assert_eq!(first.end, seeded.end, "{}", seeded.name);
-            assert_eq!(first.asked, seeded.asked, "{}", seeded.name);
-            assert_eq!(first.undecided_overwrites, 0, "{}", seeded.name);
-            asked_total += first.asked.len();
-            conflicts += 1;
+        let seeded = seeded_conflicts()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no seeded conflict named {name}"));
+        let mut runs = Vec::new();
+        for _ in 0..RUNS {
+            runs.push(run_seeded(&seeded).await);
         }
-        println!("coordinator calls per seeded conflict: {asked_total}/{conflicts}");
-        assert_eq!(asked_total, 3, "only the three informed contests with no rule");
+        let first = runs[0].clone();
+        let agreeing = runs.iter().filter(|run| **run == first).count();
+        println!("scenario | asked | stale refused | settled unasked | shell overwrites | unlanded | undecided overwrites | agreement");
+        println!(
+            "{} | {:?} | {} | {} | {} | {} | {} | {agreeing}/{RUNS}",
+            seeded.name,
+            first.asked,
+            first.stale_refusals,
+            first.settled_without_asking,
+            first.shell_overwrites,
+            first.unlanded,
+            first.undecided_overwrites,
+        );
+        assert_eq!(agreeing, RUNS, "{}: {runs:?}", seeded.name);
+        assert_eq!(first.end, seeded.end, "{}", seeded.name);
+        assert_eq!(first.asked, seeded.asked, "{}", seeded.name);
+        assert_eq!(first.undecided_overwrites, 0, "{}", seeded.name);
     }
+
+    /// One test per seeded conflict, named after it.
+    macro_rules! seeded_conflict_tests {
+        ($($name:ident),* $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    settles_the_same_way_every_run(stringify!($name)).await;
+                }
+            )*
+
+            /// Every seeded conflict has its test above, and only the three
+            /// informed contests with no rule ask the coordinator.
+            #[test]
+            fn every_seeded_conflict_is_tested_and_three_ask() {
+                let tested = [$(stringify!($name)),*];
+                let seeded = seeded_conflicts();
+                let names: Vec<&str> = seeded.iter().map(|s| s.name).collect();
+                assert_eq!(names, tested, "a seeded conflict without its test");
+                let asked: usize = seeded.iter().map(|s| s.asked.len()).sum();
+                assert_eq!(asked, 3, "only the three informed contests with no rule");
+            }
+        };
+    }
+
+    seeded_conflict_tests!(
+        non_overlapping_edits,
+        same_line_edits,
+        edit_after_reread_onto_a_siblings_line,
+        full_overwrite,
+        shell_write_over_a_siblings_line,
+        target_text_gone,
+        rule_resolved_contest,
+        unruled_contest,
+    );
 }
