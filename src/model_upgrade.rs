@@ -16,8 +16,9 @@
 //! - on a pay-per-token provider only tells the owner once: a newer model
 //!   can cost more, and the daemon does not know prices.
 //!
-//! The owner hears it twice: a message in each owner chat through the
-//! notification queue (so it is kept in that conversation's history and a
+//! The owner hears it twice: a message through the notification queue in
+//! each owner chat, or, for an owner with no chat bot, in the app
+//! conversation they used last (kept in that conversation's history, so a
 //! reply such as "switch back" is understood), and a line on the Settings
 //! page for a week ([`notices`]).
 //!
@@ -500,6 +501,9 @@ pub(crate) struct ModelUpgrader {
     agent: Arc<dyn DaemonAgentRuntime>,
     state: Arc<dyn StateStore>,
     notify_session_ids: Vec<String>,
+    /// The database, when the Client Gateway serves apps: an owner with no
+    /// chat bot is told in their latest app conversation.
+    app_pool: Option<sqlx::SqlitePool>,
 }
 
 impl ModelUpgrader {
@@ -508,12 +512,29 @@ impl ModelUpgrader {
         agent: Arc<dyn DaemonAgentRuntime>,
         state: Arc<dyn StateStore>,
         notify_session_ids: Vec<String>,
+        app_pool: Option<sqlx::SqlitePool>,
     ) -> Self {
         Self {
             config_path,
             agent,
             state,
             notify_session_ids,
+            app_pool,
+        }
+    }
+
+    /// Where the owner is told: their chats, or else (only the app) the
+    /// app conversation they used last.
+    async fn owner_sessions(&self) -> Vec<String> {
+        if !self.notify_session_ids.is_empty() {
+            return self.notify_session_ids.clone();
+        }
+        match &self.app_pool {
+            Some(pool) => crate::startup::client_sessions::latest_app_session(pool)
+                .await
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -596,13 +617,15 @@ impl ModelUpgrader {
         Ok(())
     }
 
-    /// Queue `message` for each owner chat: delivered there and kept in
-    /// that conversation's history.
+    /// Queue `message` for the owner (their chats, or their latest app
+    /// conversation): delivered there and kept in that conversation's
+    /// history, so a reply to it is understood.
     async fn tell_owner(&self, message: &str) {
-        if self.notify_session_ids.is_empty() {
-            info!("No owner chat to tell about a model upgrade; Settings shows it");
+        let sessions = self.owner_sessions().await;
+        if sessions.is_empty() {
+            info!("No owner conversation to tell about a model upgrade; Settings shows it");
         }
-        for session_id in &self.notify_session_ids {
+        for session_id in &sessions {
             let entry = crate::traits::NotificationEntry::new(
                 NOTIFICATION_TYPE,
                 session_id,

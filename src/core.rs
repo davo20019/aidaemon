@@ -544,6 +544,7 @@ pub async fn run(
         agent.clone(),
         state.clone(),
         notify_session_ids.clone(),
+        config.client_gateway.enabled.then(|| pool.clone()),
     )
     .spawn();
 
