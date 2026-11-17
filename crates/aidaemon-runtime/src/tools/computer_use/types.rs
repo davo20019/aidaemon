@@ -78,6 +78,18 @@ pub struct IndexedElement {
     pub in_dialog: bool,
 }
 
+/// What a coordinate click would land on, read from accessibility facts at
+/// the point before the click (the window and its title are never read).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointTarget {
+    /// The point lands in a window of the app the call names, on `element`:
+    /// the nearest interactive element at or above the hit, with its
+    /// default/cancel button and dialog facts.
+    InApp(IndexedElement),
+    /// No element could be read at the point, or it belongs to another app.
+    Unidentified,
+}
+
 /// Window + tree metadata for a captured app state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSnapshot {

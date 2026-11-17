@@ -92,7 +92,7 @@ fn match_app<'a>(apps: &'a [types::AppInfo], app: &str) -> Option<&'a types::App
 fn coordinate_click_label(args: &Value) -> String {
     let x = args.get("x").and_then(Value::as_f64).unwrap_or_default();
     let y = args.get("y").and_then(Value::as_f64).unwrap_or_default();
-    format!("Click at ({x}, {y}), on a target the accessibility tree does not name")
+    format!("Click at ({x}, {y}), where the app under the point cannot be identified")
 }
 
 fn consequential_subject(bundle_id: &str, label: &str, args: &Value) -> String {
@@ -753,9 +753,12 @@ impl ComputerUseTool {
                         summary = Some(format!("Click '{}'", element.title));
                     }
                 } else if is_coordinate_click {
-                    // No element: what the click lands on is unknown.
-                    action_class = classify_target(action, None);
-                    summary = Some(coordinate_click_label(args));
+                    // Judged by what lies under the point, read again here
+                    // just before the click.
+                    (action_class, summary) = self.point_click(&bundle_id, args).await;
+                    if action_class == ActionClass::Prohibited {
+                        return Err("Target element is prohibited".to_string());
+                    }
                 }
                 self.ensure_action_approvals(
                     &ctx,
@@ -1043,6 +1046,29 @@ impl ComputerUseTool {
         Ok(self.resolve_app(app).await?.bundle_id)
     }
 
+    /// The class of a coordinate click in `app` (a bundle id) from what lies
+    /// under its point, and the label the owner sees when it asks: a point
+    /// in the app is covered by the app's approval unless it lands on a
+    /// confirming button; a point whose app cannot be identified asks
+    /// every time.
+    async fn point_click(&self, app: &str, args: &Value) -> (ActionClass, Option<String>) {
+        let (Some(x), Some(y)) = (optional_f64(args, "x"), optional_f64(args, "y")) else {
+            return (
+                ActionClass::Consequential,
+                Some(coordinate_click_label(args)),
+            );
+        };
+        let target = self.harness.point_target(app, x, y).await;
+        let class = policy::classify_point_click(&target);
+        let label = (class == ActionClass::Consequential).then(|| match &target {
+            types::PointTarget::InApp(element) => {
+                format!("Click '{}' at ({x}, {y})", element.title)
+            }
+            types::PointTarget::Unidentified => coordinate_click_label(args),
+        });
+        (class, label)
+    }
+
     /// What a call's target means for the owner's card, read from the same
     /// snapshot cache `dispatch` reads, without changing anything.
     async fn target_class(
@@ -1074,7 +1100,14 @@ impl ComputerUseTool {
                 let index = match resolve_target_index(args, &cache, &key, generation) {
                     Ok(Some(index)) => index,
                     Ok(None) if is_coordinate_click => {
-                        return TargetClass::Consequential(coordinate_click_label(args));
+                        drop(cache);
+                        return match self.point_click(&app.bundle_id, args).await {
+                            (ActionClass::Prohibited, _) => TargetClass::NoAsk,
+                            (ActionClass::Consequential, label) => TargetClass::Consequential(
+                                label.unwrap_or_else(|| coordinate_click_label(args)),
+                            ),
+                            _ => TargetClass::Other,
+                        };
                     }
                     Ok(None) => return TargetClass::Other,
                     Err(_) => return TargetClass::NoAsk,

@@ -4,7 +4,7 @@ use crate::settings::ComputerUseConfig;
 
 use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};
-use super::types::{AppInfo, AppSnapshot, AxWalkLimits, IndexedElement};
+use super::types::{AppInfo, AppSnapshot, AxWalkLimits, IndexedElement, PointTarget};
 
 /// Deterministic harness for Linux CI and unit tests.
 pub struct MockHarness {
@@ -137,6 +137,33 @@ impl ComputerHarness for MockHarness {
         let mut snap = self.calculator_snapshot(generation.unwrap_or(0));
         snap.window_title = "Calculator (active)".to_string();
         Ok(cache.store(key, snap))
+    }
+
+    /// The scripted Calculator window: a floating panel of another app
+    /// covers its top-left corner (x and y under 100), a sheet's default
+    /// button sits along its bottom (y from 900), and everything else is an
+    /// unnamed group inside the window.
+    async fn point_target(&self, app: &str, x: f64, y: f64) -> PointTarget {
+        let calculator = app.eq_ignore_ascii_case("calculator")
+            || app.eq_ignore_ascii_case("com.apple.calculator");
+        if !calculator || (x < 100.0 && y < 100.0) {
+            return PointTarget::Unidentified;
+        }
+        if y >= 900.0 {
+            return PointTarget::InApp(IndexedElement {
+                role: "AXButton".to_string(),
+                enabled: true,
+                interactive: true,
+                default_button: true,
+                in_dialog: true,
+                ..Default::default()
+            });
+        }
+        PointTarget::InApp(IndexedElement {
+            role: "AXGroup".to_string(),
+            enabled: true,
+            ..Default::default()
+        })
     }
 
     async fn click(

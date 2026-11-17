@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::cache::SnapshotCache;
-use super::types::{AppInfo, AppSnapshot};
+use super::types::{AppInfo, AppSnapshot, PointTarget};
 
 #[derive(Debug, Clone)]
 pub struct HarnessRequestContext {
@@ -57,6 +57,14 @@ pub trait ComputerHarness: Send + Sync {
         ctx: &HarnessRequestContext,
         cache: &mut SnapshotCache,
     ) -> Result<AppSnapshot, String>;
+
+    /// What a coordinate click at the normalized point (`x`, `y`) over the
+    /// app's window would land on, read without clicking. A harness that
+    /// cannot tell says [`PointTarget::Unidentified`], so the click asks the
+    /// owner every time.
+    async fn point_target(&self, _app: &str, _x: f64, _y: f64) -> PointTarget {
+        PointTarget::Unidentified
+    }
 
     async fn click(
         &self,

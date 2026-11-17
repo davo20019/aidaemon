@@ -10,9 +10,9 @@ use axuielement::AXUIElement;
 use axuielement::ax_action::AX_PRESS_ACTION;
 use axuielement::ax_attribute::attributes::{
     AX_CANCEL_BUTTON_ATTRIBUTE, AX_DEFAULT_BUTTON_ATTRIBUTE, AX_DESCRIPTION_ATTRIBUTE,
-    AX_ENABLED_ATTRIBUTE, AX_FOCUSED_ATTRIBUTE, AX_MAIN_ATTRIBUTE, AX_POSITION_ATTRIBUTE,
-    AX_ROLE_ATTRIBUTE, AX_SIZE_ATTRIBUTE, AX_SUBROLE_ATTRIBUTE, AX_TITLE_ATTRIBUTE,
-    AX_VALUE_ATTRIBUTE, AX_WINDOWS_ATTRIBUTE,
+    AX_ENABLED_ATTRIBUTE, AX_FOCUSED_ATTRIBUTE, AX_MAIN_ATTRIBUTE, AX_PARENT_ATTRIBUTE,
+    AX_POSITION_ATTRIBUTE, AX_ROLE_ATTRIBUTE, AX_SIZE_ATTRIBUTE, AX_SUBROLE_ATTRIBUTE,
+    AX_TITLE_ATTRIBUTE, AX_VALUE_ATTRIBUTE, AX_WINDOWS_ATTRIBUTE,
 };
 use axuielement::{is_process_trusted, is_process_trusted_with_prompt};
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -26,7 +26,7 @@ use super::cache::{SnapshotCache, SnapshotKey};
 use super::harness::{ComputerHarness, HarnessRequestContext};
 use super::policy::{is_prohibited_bundle, is_text_input_element};
 use super::types::{
-    AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement, WindowFrame,
+    AppInfo, AppSnapshot, AxWalkLimits, ElementBounds, IndexedElement, PointTarget, WindowFrame,
     is_browser_bundle, normalized_to_global_point,
 };
 
@@ -220,6 +220,20 @@ impl ComputerHarness for MacOsHarness {
             }
             wait_for_accessible_window(&resolved, self.config.action_timeout())?;
             capture_app(resolved, &self.config, cache, ctx)
+        })
+    }
+
+    async fn point_target(&self, app: &str, x: f64, y: f64) -> PointTarget {
+        blocking(|| {
+            let Ok(resolved) = resolve_app(app) else {
+                return PointTarget::Unidentified;
+            };
+            let Some(frame) = window_frame(resolved.pid, &resolved.name) else {
+                return PointTarget::Unidentified;
+            };
+            let (px, py) = normalized_to_global_point(x, y, frame);
+            element_at_point(resolved.pid, px, py)
+                .map_or(PointTarget::Unidentified, PointTarget::InApp)
         })
     }
 
@@ -873,6 +887,87 @@ fn walk_node(element: &AXUIElement, depth: u32, in_dialog: bool, state: &mut Wal
             return;
         }
     }
+}
+
+/// How many ancestors of a hit-tested element are read, looking for the
+/// interactive element it belongs to and the window or sheet around it.
+const POINT_ANCESTRY_LIMIT: usize = 24;
+
+/// The element of the app `pid` at the global point (`x`, `y`), from the
+/// system-wide accessibility hit test: the nearest interactive element at
+/// or above the hit (else the hit itself), with whether it is its window's
+/// or sheet's default or cancel button and whether it sits in a sheet or
+/// dialog. `None` when nothing can be read there or it belongs to another
+/// process.
+fn element_at_point(pid: i32, x: f64, y: f64) -> Option<IndexedElement> {
+    let hit = AXUIElement::system_wide()?
+        .element_at_position(x as f32, y as f32)
+        .ok()??;
+    if hit.pid().ok()? != pid {
+        return None;
+    }
+    let mut chain = vec![hit];
+    while chain.len() < POINT_ANCESTRY_LIMIT {
+        let Some(parent) = chain
+            .last()
+            .and_then(|element| element.attribute(AX_PARENT_ATTRIBUTE).ok().flatten())
+            .and_then(|value| value.as_element())
+        else {
+            break;
+        };
+        chain.push(parent);
+    }
+    let roles: Vec<String> = chain
+        .iter()
+        .map(|element| optional_string_attr(element, AX_ROLE_ATTRIBUTE).unwrap_or_default())
+        .collect();
+    let target = roles
+        .iter()
+        .position(|role| is_interactive_role(role))
+        .unwrap_or(0);
+    let element = &chain[target];
+    let bounds = element_bounds(element);
+    // The nearest window or sheet above the target names its default and
+    // cancel buttons; any sheet or dialog window above it marks it in one.
+    let mut in_dialog = false;
+    let mut default_button = false;
+    let mut cancel_button = false;
+    let mut container_seen = false;
+    for (ancestor, role) in chain.iter().zip(&roles).skip(target + 1) {
+        if role != "AXWindow" && role != "AXSheet" {
+            continue;
+        }
+        let subrole = optional_string_attr(ancestor, AX_SUBROLE_ATTRIBUTE);
+        in_dialog |=
+            role == "AXSheet" || matches!(subrole.as_deref(), Some("AXDialog" | "AXSystemDialog"));
+        if !container_seen {
+            container_seen = true;
+            let button_bounds = |attribute: &str| {
+                ancestor
+                    .attribute(attribute)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| value.as_element())
+                    .and_then(|button| element_bounds(&button))
+            };
+            default_button =
+                bounds.is_some() && button_bounds(AX_DEFAULT_BUTTON_ATTRIBUTE) == bounds;
+            cancel_button = bounds.is_some() && button_bounds(AX_CANCEL_BUTTON_ATTRIBUTE) == bounds;
+        }
+    }
+    let role = roles[target].clone();
+    Some(IndexedElement {
+        index: 0,
+        interactive: is_interactive_role(&role),
+        role,
+        title: pick_label(element),
+        enabled: optional_bool_attr(element, AX_ENABLED_ATTRIBUTE).unwrap_or(true),
+        bounds,
+        subrole: optional_string_attr(element, AX_SUBROLE_ATTRIBUTE),
+        default_button,
+        cancel_button,
+        in_dialog,
+    })
 }
 
 fn collapse_passthrough(parent: &AXUIElement, children: Vec<AXUIElement>) -> Vec<AXUIElement> {

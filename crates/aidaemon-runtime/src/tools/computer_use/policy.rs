@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use super::types::IndexedElement;
+use super::types::{IndexedElement, PointTarget};
 
 /// Action risk class for computer-use policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,9 +136,11 @@ pub fn is_secure_element(element: &IndexedElement) -> bool {
 /// element's title and any typed text are never read. A secure text field is
 /// prohibited. A click is consequential when it confirms a window or sheet
 /// (its `AXDefaultButton`), presses any other button of a sheet or dialog
-/// except its cancel button, or has a target whose facts are unknown: a
-/// coordinate click (no element) or an element with no role. Other clicks,
-/// and typing or setting a value (data, not an action), are local.
+/// except its cancel button, or has a target whose facts are unknown: no
+/// element (a coordinate click is judged by [`classify_point_click`]
+/// instead) or an element with no role. Other clicks, and typing or setting
+/// a value (data, not an action), are local: the per-app approval covers
+/// them.
 pub fn classify_target(
     action: ComputerActionKind,
     element: Option<&IndexedElement>,
@@ -150,6 +152,19 @@ pub fn classify_target(
         (ComputerActionKind::Click, None) => ActionClass::Consequential,
         (ComputerActionKind::Click, Some(el)) => click_class(el),
         _ => action.base_class(),
+    }
+}
+
+/// The class of a coordinate click from what lies under the point. A point
+/// whose app cannot be identified is consequential (asks every time); a
+/// point in the named app is judged by the element there like an element
+/// click, except that an element with no role is an ordinary click in that
+/// app (the app is known, and its approval covers it).
+pub fn classify_point_click(target: &PointTarget) -> ActionClass {
+    match target {
+        PointTarget::Unidentified => ActionClass::Consequential,
+        PointTarget::InApp(element) if element.role.trim().is_empty() => ActionClass::LocalMutation,
+        PointTarget::InApp(element) => classify_target(ComputerActionKind::Click, Some(element)),
     }
 }
 
@@ -264,6 +279,38 @@ mod tests {
         assert_eq!(
             classify_target(ComputerActionKind::TypeText, None),
             ActionClass::LocalMutation
+        );
+    }
+
+    /// A point in the named app is app-scoped unless it lands on a
+    /// confirming button; a point whose app is unknown always asks.
+    #[test]
+    fn point_clicks_are_judged_by_what_lies_under_them() {
+        assert_eq!(
+            classify_point_click(&PointTarget::Unidentified),
+            ActionClass::Consequential
+        );
+        let group = IndexedElement {
+            role: "AXGroup".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_point_click(&PointTarget::InApp(group)),
+            ActionClass::LocalMutation
+        );
+        assert_eq!(
+            classify_point_click(&PointTarget::InApp(IndexedElement::default())),
+            ActionClass::LocalMutation
+        );
+        let confirm = IndexedElement {
+            default_button: true,
+            in_dialog: true,
+            ..button("")
+        };
+        assert_eq!(
+            classify_point_click(&PointTarget::InApp(confirm)),
+            ActionClass::Consequential
         );
     }
 

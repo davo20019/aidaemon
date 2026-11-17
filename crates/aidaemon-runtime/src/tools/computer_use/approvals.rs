@@ -18,7 +18,7 @@ use super::telemetry::MutationBudget;
 /// The warnings on a per-app card.
 pub const APP_WARNINGS: [&str; 2] = [
     "Captures screenshots (may expose private content) and can click/type in this app.",
-    "Send/delete/purchase-style actions will still ask for confirmation each time.",
+    "Confirming a dialog or sheet, and clicks where the app cannot be identified, still ask each time.",
 ];
 
 /// The warning that marks a consequential action's card (once-only).

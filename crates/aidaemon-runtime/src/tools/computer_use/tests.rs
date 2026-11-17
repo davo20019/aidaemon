@@ -161,11 +161,12 @@ async fn coordinate_click_flags_unverified_and_observation_clears_it() {
         .unwrap();
     assert!(!reg.has_unverified_coordinate_click(task).await);
 
-    // A coordinate click: its target is unknown, so it is consequential and
-    // runs only with the owner's approval of this exact click.
+    // A coordinate click where the app under the point cannot be identified
+    // (the scripted window's top-left corner) runs only with the owner's
+    // approval of this exact click.
     let click = json!({
         "action": "click", "app": "Calculator",
-        "snapshot_generation": 1, "x": 500.0, "y": 500.0
+        "snapshot_generation": 1, "x": 50.0, "y": 50.0
     });
     let refused = tool
         .call_with_execution_context(&click.to_string(), None, cu_facts(task))
@@ -184,7 +185,9 @@ async fn coordinate_click_flags_unverified_and_observation_clears_it() {
     )
     .await
     .unwrap();
-    let asked = run.asked.expect("a coordinate click must ask the owner");
+    let asked = run
+        .asked
+        .expect("a click where the app cannot be identified must ask the owner");
     assert!(
         matches!(
             tool.approval_card_kind(&asked),
@@ -387,6 +390,85 @@ async fn app_control_is_asked_through_the_kernel() {
         "{}",
         run.output
     );
+}
+
+/// A click in an app is covered by the app's approval: the first asks, the
+/// session approval covers the next one, while a dialog's default button
+/// and a point whose app cannot be identified ask every time.
+#[tokio::test]
+async fn clicks_in_an_approved_app_run_without_a_card() {
+    use aidaemon_tools::semantics::{ApprovalKind, ApprovalResponse};
+
+    let dir = TempDir::new().unwrap();
+    let tool = test_tool(
+        ComputerUseConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        dir.path().to_path_buf(),
+    )
+    .await;
+    // `test_tool` approves Calculator for telegram:1 only.
+    let facts = crate::tools::traits::ToolCallContext {
+        session_id: "telegram:synthetic-app-scope".into(),
+        ..cu_facts("task-app-scope")
+    };
+    let click = |x: f64, y: f64| {
+        json!({
+            "action": "click", "app": "Calculator",
+            "snapshot_generation": 1, "x": x, "y": y
+        })
+        .to_string()
+    };
+    let through_kernel = |raw: String, response| {
+        let tool = &tool;
+        let facts = facts.clone();
+        async move {
+            aidaemon_tools::testing::call_through_kernel(tool, &raw, facts, Some(response))
+                .await
+                .unwrap()
+        }
+    };
+
+    // The first click in the app asks for the app, with a session choice.
+    let run = through_kernel(click(500.0, 500.0), ApprovalResponse::AllowSession).await;
+    let asked = run.asked.expect("the first click in an app must ask");
+    assert!(matches!(
+        tool.approval_card_kind(&asked),
+        ApprovalKind::Command
+    ));
+    assert!(
+        !run.output.contains("through the agent kernel"),
+        "{}",
+        run.output
+    );
+
+    // The session approval covers the next click in the app.
+    let run = through_kernel(click(400.0, 300.0), ApprovalResponse::Deny).await;
+    assert!(run.asked.is_none(), "an approved app needs no card");
+    assert!(
+        !run.output.contains("through the agent kernel") && !run.output.contains("Denied"),
+        "{}",
+        run.output
+    );
+
+    // A sheet's default button in the same app still asks, once.
+    let run = through_kernel(click(500.0, 950.0), ApprovalResponse::AllowOnce).await;
+    let asked = run.asked.expect("a dialog's default button must ask");
+    assert!(matches!(
+        tool.approval_card_kind(&asked),
+        ApprovalKind::CommandOnce
+    ));
+    let run = through_kernel(click(500.0, 950.0), ApprovalResponse::Deny).await;
+    assert!(run.asked.is_some(), "a default button asks every time");
+
+    // A point whose app cannot be identified asks every time.
+    let run = through_kernel(click(50.0, 50.0), ApprovalResponse::Deny).await;
+    let asked = run.asked.expect("an unidentified app must ask");
+    assert!(matches!(
+        tool.approval_card_kind(&asked),
+        ApprovalKind::CommandOnce
+    ));
 }
 
 #[tokio::test]
