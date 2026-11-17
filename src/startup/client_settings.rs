@@ -505,7 +505,10 @@ impl SettingsHost {
             mcp_servers,
             reload_pending,
             restart_pending,
-            notices: settings_upkeep::notices(&self.config_path),
+            notices: settings_upkeep::notices(&self.config_path)
+                .into_iter()
+                .chain(crate::model_upgrade::notices(&self.config_path))
+                .collect(),
             providers: crate::setup::model::options(),
             database_path: crate::startup::db_security::resolve_db_path(
                 &self.config_path,

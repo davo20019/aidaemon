@@ -74,7 +74,7 @@ pub use anthropic::{
     AnthropicBuilder, THINKING_BLOCKS_KEY,
 };
 pub use chatgpt::{
-    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_LIST_CLIENT_VERSION,
+    CHATGPT_DEFAULT_BASE_URL, CHATGPT_KNOWN_MODELS, CHATGPT_LIST_CLIENT_VERSIONS,
     CHATGPT_REASONING_EFFORTS, ChatGpt, ChatGptAuth, ChatGptBuilder, ChatGptCredentials,
     ChatGptModel, StaticChatGptAuth,
 };

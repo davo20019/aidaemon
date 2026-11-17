@@ -20,7 +20,7 @@ pub(crate) struct ProviderRouterBundle {
 
 use aidaemon_providers::OPENAI_DEFAULT_BASE_URL;
 
-fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> {
+pub(crate) fn provider_specific_base_url_override(config: &ProviderConfig) -> Option<&str> {
     let trimmed = config.base_url.trim();
     if trimmed.is_empty() || trimmed == OPENAI_DEFAULT_BASE_URL {
         None

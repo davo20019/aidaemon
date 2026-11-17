@@ -2236,6 +2236,12 @@ impl ConfigManagerTool {
         // agent talks and thinks: an allowlist of free tables, so a table
         // that grants access or sends data somewhere is never free because
         // nobody listed it.
+        // Which model a provider runs on is the owner's call: the agent
+        // asks before moving it (say, back from an automatic upgrade), so a
+        // misread request never switches it.
+        if is_provider_model_key(&args.key) {
+            return true;
+        }
         let table = args.key.split(['.', '[']).next().map(str::trim);
         if !table.is_some_and(|table| APPROVAL_FREE_TABLES.contains(&table)) {
             return true;
@@ -2255,6 +2261,18 @@ impl ConfigManagerTool {
             config_path::plain_value(&config_path::parse_value(&args.value)).as_ref(),
         )
     }
+}
+
+/// `provider.models.default` (or legacy `primary`), on the main provider
+/// or a fallback (`provider.fallbacks[1].models.default`).
+fn is_provider_model_key(key: &str) -> bool {
+    let key: String = key
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    key.starts_with("provider")
+        && (key.ends_with("models.default") || key.ends_with("models.primary"))
 }
 
 fn plain_holds_approval_key(value: Option<&toml::Value>) -> bool {
@@ -2443,6 +2461,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn moving_a_provider_s_model_asks_the_owner() {
+        for key in [
+            "provider.models.default",
+            "provider.models.primary",
+            "provider.fallbacks[1].models.default",
+        ] {
+            assert!(ConfigManagerTool::is_guarded_key(key), "{key}");
+            assert!(ConfigManagerTool::change_needs_approval(
+                &ConfigArgs::change("set", key, "\"gpt-6-sol\"")
+            ));
+        }
+        // Other model settings stay free.
+        assert!(!ConfigManagerTool::change_needs_approval(
+            &ConfigArgs::change("set", "provider.models.fast", "\"gpt-6-luna\"")
+        ));
+    }
 
     /// The tool over `path`, checked like a host whose config has the
     /// exposure rules, with secrets in memory.

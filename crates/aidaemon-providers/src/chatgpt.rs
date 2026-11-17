@@ -320,10 +320,12 @@ impl Provider for ChatGpt {
     }
 }
 
-/// The client version the model listing asks for. The backend hides models
-/// that need a newer client than the one named, so this follows the Codex
-/// releases the request format matches.
-pub const CHATGPT_LIST_CLIENT_VERSION: &str = "0.99.0";
+/// The client versions the model listing asks as, in turn. The backend
+/// hides models that need a newer client than the one named (0.99 saw only
+/// an internal model; 0.166 saw the GPT-6 family), so a far-future version
+/// comes first, and a version known to answer follows in case the backend
+/// refuses it.
+pub const CHATGPT_LIST_CLIENT_VERSIONS: &[&str] = &["999.0.0", "0.166.0"];
 
 /// A model the ChatGPT backend offers the signed-in account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,9 +343,31 @@ impl ChatGpt {
     /// The models the backend offers this account
     /// (`GET {base}/models?client_version=..`), with a 401 refreshed once.
     pub async fn list_models(&self) -> Result<Vec<ChatGptModel>, ProviderError> {
+        let mut last_error = None;
+        for version in CHATGPT_LIST_CLIENT_VERSIONS {
+            match self.list_models_as(version).await {
+                Ok(models) if models.iter().any(|m| m.listed) => return Ok(models),
+                Ok(models) => {
+                    last_error = Some(ProviderError::NotFound(format!(
+                        "model listing as client {version} showed no models to pick ({})",
+                        models
+                            .iter()
+                            .map(|m| m.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )))
+                }
+                Err(error @ ProviderError::Auth(_)) => return Err(error),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| ProviderError::NotFound("no model listing".into())))
+    }
+
+    async fn list_models_as(&self, version: &str) -> Result<Vec<ChatGptModel>, ProviderError> {
         let auth_error = |error: String| ProviderError::Auth(error);
         let mut credentials = self.auth.credentials().await.map_err(auth_error)?;
-        let mut response = self.get_models(&credentials).await?;
+        let mut response = self.get_models(&credentials, version).await?;
         if response.status().as_u16() == 401 {
             let rejected = credentials.access_token.clone();
             let _ = response.bytes().await;
@@ -352,7 +376,7 @@ impl ChatGpt {
                 .refresh_after_rejection(&rejected)
                 .await
                 .map_err(auth_error)?;
-            response = self.get_models(&credentials).await?;
+            response = self.get_models(&credentials, version).await?;
         }
         let status = response.status();
         let headers = response.headers().clone();
@@ -360,25 +384,16 @@ impl ChatGpt {
         if !status.is_success() {
             return Err(map_status(status, &headers, &body));
         }
-        let models = parse_model_listing(&body);
-        if models.is_empty() {
-            return Err(ProviderError::NotFound(format!(
-                "model listing had no models: {}",
-                body_excerpt(&body)
-            )));
-        }
-        Ok(models)
+        Ok(parse_model_listing(&body))
     }
 
     async fn get_models(
         &self,
         credentials: &ChatGptCredentials,
+        version: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         self.client
-            .get(format!(
-                "{}/models?client_version={CHATGPT_LIST_CLIENT_VERSION}",
-                self.base_url
-            ))
+            .get(format!("{}/models?client_version={version}", self.base_url))
             .timeout(Duration::from_secs(30))
             .bearer_auth(&credentials.access_token)
             .header("chatgpt-account-id", &credentials.account_id)

@@ -2,22 +2,28 @@
 //!
 //! Providers release new versions every few weeks, and an owner who does
 //! not follow launches keeps running an old one. Once a day this job reads
-//! the main provider's model listing and, for each configured model with a
-//! newer version of its line ([`aidaemon_providers::model_upgrade`]):
+//! the model listing of every configured provider (the main one and each
+//! fallback) and, for each model written in its `models` table with a newer
+//! version of its line ([`aidaemon_providers::model_upgrade`]):
 //!
 //! - skips it when the harness would treat the new model worse (another
 //!   trust tier, no vision where the old one had it, a smaller known
 //!   window), or when the owner went back from it before;
 //! - on a subscription (the ChatGPT sign-in, no per-call price) proves it
 //!   with one real tool call, writes it to the config with the old model
-//!   first among the fallbacks (a failing new model falls back to the old
-//!   one on every call), reloads the provider and tells the owner;
+//!   first among that provider's fallbacks (a failing new model falls back
+//!   to the old one on every call), reloads the provider and tells the owner;
 //! - on a pay-per-token provider only tells the owner once: a newer model
 //!   can cost more, and the daemon does not know prices.
 //!
+//! The owner hears it twice: a message in each owner chat through the
+//! notification queue (so it is kept in that conversation's history and a
+//! reply such as "switch back" is understood), and a line on the Settings
+//! page for a week ([`notices`]).
+//!
 //! `provider.auto_upgrade = false` turns it off; a `/model` pin postpones
 //! it. An owner who puts the old model back (in Settings or by asking)
-//! keeps it: the switch is recorded, and a default that went back to what
+//! keeps it: each switch is recorded, and a default that went back to what
 //! it replaced declines that model for good.
 
 use std::collections::BTreeMap;
@@ -34,14 +40,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::channels::ChannelHub;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ProviderConfig};
 use crate::runtime_ports::DaemonAgentRuntime;
+use crate::traits::StateStore;
 
 /// The first check waits for channels to connect.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(120);
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 const TRIAL_WITHIN: Duration = Duration::from_secs(90);
+/// How long the Settings page mentions a switch or a suggestion.
+const NOTICE_FOR_MS: u64 = 7 * 24 * 3600 * 1000;
+/// The notification type of the messages this job queues.
+const NOTIFICATION_TYPE: &str = "model_upgrade";
+
+/// A provider entry of the config: the main one or a fallback by index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Slot {
+    Main,
+    Fallback(usize),
+}
+
+impl Slot {
+    fn label(self, kind: ProviderKind) -> String {
+        match self {
+            Slot::Main => "main model".to_string(),
+            Slot::Fallback(_) => format!("backup on {}", maker(kind)),
+        }
+    }
+}
 
 /// What the job remembers between checks, beside the config file.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,16 +76,34 @@ struct UpgradeState {
     /// Models the owner went back from: never offered again.
     #[serde(default)]
     declined: Vec<String>,
-    /// The last switch, to notice the owner undoing it.
+    /// Switches made, newest last, to notice an undo and for Settings.
     #[serde(default)]
-    last: Option<Switch>,
-    /// Models already suggested on a pay-per-token provider.
+    switches: Vec<Switch>,
+    /// Newer models told about on a pay-per-token provider.
     #[serde(default)]
-    suggested: Vec<String>,
+    suggestions: Vec<Suggestion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Switch {
+    slot: Slot,
+    kind_name: String,
+    from: String,
+    to: String,
+    at_ms: u64,
+    /// Still the model in use (an undo or a later choice ends it).
+    #[serde(default = "yes")]
+    current: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Suggestion {
+    slot: Slot,
+    kind_name: String,
     from: String,
     to: String,
     at_ms: u64,
@@ -97,6 +142,49 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn day_of(at_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms as i64)
+        .map(|at| {
+            at.with_timezone(&chrono::Local)
+                .format("%b %-d")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// What the Settings page says about model upgrades of the last week.
+pub(crate) fn notices(config_path: &Path) -> Vec<String> {
+    let state = load_state(config_path);
+    let since = now_ms().saturating_sub(NOTICE_FOR_MS);
+    let mut notices = Vec::new();
+    for switch in state
+        .switches
+        .iter()
+        .filter(|s| s.at_ms >= since && s.current)
+    {
+        notices.push(format!(
+            "On {}, the {} moved to {}, a newer version of {}. Choose {} again to go back; \
+             provider.auto_upgrade = false stops these switches.",
+            day_of(switch.at_ms),
+            match switch.slot {
+                Slot::Main => "main model".to_string(),
+                Slot::Fallback(_) => format!("{} backup", switch.kind_name),
+            },
+            switch.to,
+            switch.from,
+            switch.from
+        ));
+    }
+    for suggestion in state.suggestions.iter().filter(|s| s.at_ms >= since) {
+        notices.push(format!(
+            "A newer {} model is out: {} (in use: {}). It may cost more per message; \
+             choose it to switch.",
+            suggestion.kind_name, suggestion.to, suggestion.from
+        ));
+    }
+    notices
+}
+
 /// A model the provider offers, as the job reads it.
 #[derive(Debug, Clone, PartialEq)]
 struct Offered {
@@ -105,8 +193,8 @@ struct Offered {
     description: Option<String>,
 }
 
-/// The `[provider.models]` entries as written in the file: only these are
-/// moved (a model the file leaves to the catalog follows the release).
+/// A slot's `models` entries as written in the file: only these are moved
+/// (a model the file leaves to the catalog follows the release).
 #[derive(Debug, Default, Clone, PartialEq)]
 struct WrittenModels {
     default: Option<String>,
@@ -115,11 +203,27 @@ struct WrittenModels {
     fallback: Vec<String>,
 }
 
-fn written_models(doc: &toml_edit::DocumentMut) -> WrittenModels {
-    let table = doc
-        .get("provider")
-        .and_then(|p| p.get("models"))
-        .and_then(toml_edit::Item::as_table_like);
+fn fallback_models_table(
+    doc: &toml_edit::DocumentMut,
+    index: usize,
+) -> Option<&dyn toml_edit::TableLike> {
+    doc.get("provider")?
+        .get("fallbacks")?
+        .as_array_of_tables()?
+        .get(index)?
+        .get("models")?
+        .as_table_like()
+}
+
+fn slot_table(doc: &toml_edit::DocumentMut, slot: Slot) -> Option<&dyn toml_edit::TableLike> {
+    match slot {
+        Slot::Main => doc.get("provider")?.get("models")?.as_table_like(),
+        Slot::Fallback(i) => fallback_models_table(doc, i),
+    }
+}
+
+fn written_models(doc: &toml_edit::DocumentMut, slot: Slot) -> WrittenModels {
+    let table = slot_table(doc, slot);
     let text = |key: &str| {
         table
             .and_then(|t| t.get(key))
@@ -195,18 +299,34 @@ fn plan(
     moves
 }
 
-/// The config text with `moves` applied, and the old default first among
-/// the fallbacks.
-fn apply(text: &str, moves: &BTreeMap<String, String>) -> anyhow::Result<String> {
-    let mut doc: toml_edit::DocumentMut = text.parse()?;
-    let written = written_models(&doc);
-    let models = doc["provider"]
+fn slot_table_mut(
+    doc: &mut toml_edit::DocumentMut,
+    slot: Slot,
+) -> anyhow::Result<&mut toml_edit::Table> {
+    let provider = doc["provider"]
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("no [provider] table"))?
+        .ok_or_else(|| anyhow::anyhow!("no [provider] table"))?;
+    let entry = match slot {
+        Slot::Main => provider,
+        Slot::Fallback(i) => provider
+            .get_mut("fallbacks")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .and_then(|tables| tables.get_mut(i))
+            .ok_or_else(|| anyhow::anyhow!("no provider.fallbacks[{i}]"))?,
+    };
+    entry
         .entry("models")
         .or_insert_with(toml_edit::table)
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("provider.models is not a table"))?;
+        .ok_or_else(|| anyhow::anyhow!("the models entry is not a table"))
+}
+
+/// The config text with `moves` applied to `slot`, and the old default
+/// first among that slot's fallbacks.
+fn apply(text: &str, slot: Slot, moves: &BTreeMap<String, String>) -> anyhow::Result<String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()?;
+    let written = written_models(&doc, slot);
+    let models = slot_table_mut(&mut doc, slot)?;
     let moved = |model: &str| {
         moves
             .get(model)
@@ -221,53 +341,72 @@ fn apply(text: &str, moves: &BTreeMap<String, String>) -> anyhow::Result<String>
             }
         }
     }
+    let mut fallback: Vec<String> = Vec::new();
+    let new_default = written.default.as_deref().map(moved);
     if let Some(old_default) = &written.default
         && moves.contains_key(old_default)
     {
-        let new_default = moved(old_default);
-        let mut fallback = vec![old_default.clone()];
-        for model in &written.fallback {
-            let model = moved(model);
-            if model != new_default && !fallback.contains(&model) {
-                fallback.push(model);
-            }
+        fallback.push(old_default.clone());
+    }
+    for model in &written.fallback {
+        let model = moved(model);
+        if Some(&model) != new_default.as_ref() && !fallback.contains(&model) {
+            fallback.push(model);
         }
+    }
+    if !fallback.is_empty() || !written.fallback.is_empty() {
         let mut array = toml_edit::Array::new();
         for model in fallback {
             array.push(model);
-        }
-        models["fallback"] = toml_edit::value(array);
-    } else if !written.fallback.is_empty() {
-        let mut array = toml_edit::Array::new();
-        for model in &written.fallback {
-            array.push(moved(model));
         }
         models["fallback"] = toml_edit::value(array);
     }
     Ok(doc.to_string())
 }
 
-/// When the owner put back what the last switch replaced, that model is
-/// declined and the switch forgotten. `true` when the state changed.
-fn note_undo(state: &mut UpgradeState, written: &WrittenModels) -> bool {
-    let Some(last) = &state.last else {
-        return false;
-    };
-    match written.default.as_deref() {
-        Some(default) if default == last.from => {
-            info!(model = %last.to, "The owner went back from an upgraded model; it is not offered again");
-            if !state.declined.contains(&last.to) {
-                state.declined.push(last.to.clone());
+/// Each slot's default as the file now has it.
+fn defaults_by_slot(doc: &toml_edit::DocumentMut, slots: &[Slot]) -> Vec<(Slot, Option<String>)> {
+    slots
+        .iter()
+        .map(|&slot| (slot, written_models(doc, slot).default))
+        .collect()
+}
+
+/// When the owner put back what a switch replaced, that model is declined;
+/// a switch whose model is no longer in use is no longer current. `true`
+/// when the state changed.
+fn note_undo(state: &mut UpgradeState, defaults: &[(Slot, Option<String>)]) -> bool {
+    let mut changed = false;
+    for switch in state.switches.iter_mut().filter(|s| s.current) {
+        let Some((_, default)) = defaults.iter().find(|(slot, _)| *slot == switch.slot) else {
+            continue;
+        };
+        match default.as_deref() {
+            Some(model) if model == switch.to => {}
+            Some(model) if model == switch.from => {
+                info!(model = %switch.to, "The owner went back from an upgraded model; it is not offered again");
+                if !state.declined.contains(&switch.to) {
+                    state.declined.push(switch.to.clone());
+                }
+                switch.current = false;
+                changed = true;
             }
-            state.last = None;
-            true
+            _ => {
+                switch.current = false;
+                changed = true;
+            }
         }
-        Some(default) if default != last.to => {
-            // The owner chose some other model: the switch is history.
-            state.last = None;
-            true
-        }
-        _ => false,
+    }
+    changed
+}
+
+fn maker(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::OpenaiChatgpt => "OpenAI",
+        ProviderKind::OpenaiCompatible => "your OpenAI-compatible provider",
+        ProviderKind::Anthropic => "Anthropic",
+        ProviderKind::GoogleGenai => "Google",
+        ProviderKind::XaiNative => "xAI",
     }
 }
 
@@ -280,57 +419,67 @@ fn name_of(id: &str, offered: &[Offered]) -> String {
 }
 
 fn switched_message(
+    slot: Slot,
+    kind: ProviderKind,
     moves: &BTreeMap<String, String>,
     default: Option<&str>,
     offered: &[Offered],
-    kind: ProviderKind,
 ) -> String {
-    let maker = match kind {
-        ProviderKind::OpenaiChatgpt | ProviderKind::OpenaiCompatible => "OpenAI",
-        ProviderKind::Anthropic => "Anthropic",
-        ProviderKind::GoogleGenai => "Google",
-        ProviderKind::XaiNative => "xAI",
-    };
     let mut lines = Vec::new();
-    if let Some((from, to)) = default.and_then(|d| moves.get_key_value(d)) {
-        lines.push(format!(
-            "{maker} released a newer model, so I've switched to it: {} (it replaces {}).",
-            name_of(to, offered),
-            name_of(from, offered)
-        ));
-        if let Some(about) = offered
-            .iter()
-            .find(|m| &m.id == to)
-            .and_then(|m| m.description.as_deref())
-        {
-            lines.push(about.to_string());
+    match default.and_then(|d| moves.get_key_value(d)) {
+        Some((from, to)) => {
+            lines.push(format!(
+                "Model upgrade: {} released a newer model, so I switched my {} from {} to {}.",
+                maker(kind),
+                slot.label(kind),
+                name_of(from, offered),
+                name_of(to, offered)
+            ));
+            if let Some(about) = offered
+                .iter()
+                .find(|m| &m.id == to)
+                .and_then(|m| m.description.as_deref())
+            {
+                lines.push(about.to_string());
+            }
         }
+        None => lines.push(format!(
+            "Model upgrade: {} released newer models, so I switched to them.",
+            maker(kind)
+        )),
     }
     for (from, to) in moves {
         if Some(from.as_str()) != default {
             lines.push(format!(
-                "{} also moves to {}.",
+                "{} also moved to {}.",
                 name_of(from, offered),
                 name_of(to, offered)
             ));
         }
     }
     lines.push(
-        "Nothing for you to do. If something seems off, the previous model takes over \
-         automatically. To keep the previous one, tell me to switch back or change the \
-         model in Settings, and I won't move you to this one again. Settings > \
-         provider.auto_upgrade turns these switches off."
+        "Nothing for you to do: if the new model has trouble, the previous one takes over \
+         on its own. To keep the previous model, tell me to switch back (or pick it in \
+         Settings) and I won't move you to this one again."
             .to_string(),
     );
     lines.join("\n\n")
 }
 
-fn suggested_message(from: &str, to: &str, offered: &[Offered]) -> String {
+fn suggested_message(
+    slot: Slot,
+    kind: ProviderKind,
+    from: &str,
+    to: &str,
+    offered: &[Offered],
+) -> String {
     let mut text = format!(
-        "A newer version of the model I use is out: {} (I use {}). I haven't switched, \
-         because it may cost more per message on your account.",
+        "Model update: {} released {}, a newer version of {} (my {}). I haven't switched, \
+         because a newer model can cost more per message on your account.",
+        maker(kind),
         name_of(to, offered),
-        name_of(from, offered)
+        name_of(from, offered),
+        slot.label(kind)
     );
     if let Some(about) = offered
         .iter()
@@ -340,14 +489,16 @@ fn suggested_message(from: &str, to: &str, offered: &[Offered]) -> String {
         text.push_str("\n\n");
         text.push_str(about);
     }
-    text.push_str("\n\nTell me \"switch to the newer model\" if you want to try it.");
+    text.push_str(&format!(
+        "\n\nTell me \"switch to {to}\" if you want to try it."
+    ));
     text
 }
 
 pub(crate) struct ModelUpgrader {
     config_path: PathBuf,
     agent: Arc<dyn DaemonAgentRuntime>,
-    hub: Arc<ChannelHub>,
+    state: Arc<dyn StateStore>,
     notify_session_ids: Vec<String>,
 }
 
@@ -355,13 +506,13 @@ impl ModelUpgrader {
     pub(crate) fn new(
         config_path: PathBuf,
         agent: Arc<dyn DaemonAgentRuntime>,
-        hub: Arc<ChannelHub>,
+        state: Arc<dyn StateStore>,
         notify_session_ids: Vec<String>,
     ) -> Self {
         Self {
             config_path,
             agent,
-            hub,
+            state,
             notify_session_ids,
         }
     }
@@ -378,9 +529,8 @@ impl ModelUpgrader {
         });
     }
 
-    /// The models the main provider offers; `Err` when it could not say.
-    async fn offered(config: &AppConfig) -> anyhow::Result<Vec<Offered>> {
-        let provider = &config.provider;
+    /// The models a provider offers; `Err` when it could not say.
+    async fn offered(provider: &ProviderConfig) -> anyhow::Result<Vec<Offered>> {
         if provider.kind == ProviderKind::OpenaiChatgpt {
             let backend = crate::providers::factory::chatgpt_backend(None, None)?;
             let listed = backend.list_models().await?;
@@ -393,13 +543,13 @@ impl ModelUpgrader {
                 })
                 .collect());
         }
-        let ids = aidaemon_providers::catalog::list_models(
-            provider.kind,
-            &provider.base_url,
-            &provider.api_key,
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
+        // A backup left at the default base URL has none of its own.
+        let base_url =
+            crate::providers::factory::provider_specific_base_url_override(provider).unwrap_or("");
+        let ids =
+            aidaemon_providers::catalog::list_models(provider.kind, base_url, &provider.api_key)
+                .await
+                .map_err(anyhow::Error::msg)?;
         Ok(ids
             .into_iter()
             .map(|id| Offered {
@@ -411,8 +561,8 @@ impl ModelUpgrader {
     }
 
     /// One real call with a tool, as the agent makes them.
-    async fn trial(config: &AppConfig, model: &str) -> anyhow::Result<()> {
-        let (backend, _) = crate::providers::factory::build_provider(&config.provider)?;
+    async fn trial(provider: &ProviderConfig, model: &str) -> anyhow::Result<()> {
+        let (backend, _) = crate::providers::factory::build_provider(provider)?;
         let request = ModelRequest {
             model: model.to_string(),
             messages: vec![Message::user(
@@ -446,6 +596,25 @@ impl ModelUpgrader {
         Ok(())
     }
 
+    /// Queue `message` for each owner chat: delivered there and kept in
+    /// that conversation's history.
+    async fn tell_owner(&self, message: &str) {
+        if self.notify_session_ids.is_empty() {
+            info!("No owner chat to tell about a model upgrade; Settings shows it");
+        }
+        for session_id in &self.notify_session_ids {
+            let entry = crate::traits::NotificationEntry::new(
+                NOTIFICATION_TYPE,
+                session_id,
+                NOTIFICATION_TYPE,
+                message,
+            );
+            if let Err(error) = self.state.enqueue_notification(&entry).await {
+                warn!(%error, %session_id, "Could not queue the model upgrade message");
+            }
+        }
+    }
+
     async fn check(&self) -> anyhow::Result<()> {
         let config = AppConfig::load(&self.config_path)?;
         if !config.provider.auto_upgrade {
@@ -453,111 +622,151 @@ impl ModelUpgrader {
             return Ok(());
         }
         let file = crate::config::config_file(&self.config_path);
-        let text = file.read().await?;
+        let mut text = file.read().await?;
         let doc: toml_edit::DocumentMut = text.parse()?;
-        let written = written_models(&doc);
 
+        let mut slots = vec![(Slot::Main, config.provider.clone())];
+        for (i, fallback) in config.provider.fallbacks.iter().enumerate() {
+            slots.push((Slot::Fallback(i), fallback.clone()));
+        }
         let mut state = load_state(&self.config_path);
-        if note_undo(&mut state, &written) {
+        let slot_ids: Vec<Slot> = slots.iter().map(|(slot, _)| *slot).collect();
+        if note_undo(&mut state, &defaults_by_slot(&doc, &slot_ids)) {
             save_state(&self.config_path, &state);
         }
 
-        let local = config.provider.kind == ProviderKind::OpenaiCompatible
-            && ["localhost", "127.0.0.1", "[::1]"]
-                .iter()
-                .any(|host| config.provider.base_url.contains(host));
-        if local {
-            return Ok(());
-        }
-        let offered = Self::offered(&config).await?;
-        info!(
-            provider = ?config.provider.kind,
-            offered = offered.len(),
-            models = %offered.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", "),
-            "Model upgrade check: the provider's models"
-        );
         let vision = VisionConfig::from_files(&config.files);
-        let moves = plan(&written, &offered, &state.declined, &vision);
-        if moves.is_empty() {
-            info!("Model upgrade check: every configured model is the newest of its line");
-            return Ok(());
-        }
-
-        // A subscription has no per-call price; elsewhere a newer model can
-        // cost more, so the owner is told and decides.
-        if config.provider.kind != ProviderKind::OpenaiChatgpt {
-            for (from, to) in &moves {
-                if state.suggested.contains(to) {
+        let pinned = self.agent.model_pinned().await;
+        let original = text.clone();
+        let mut switched = Vec::new();
+        for (slot, provider) in &slots {
+            let local = provider.kind == ProviderKind::OpenaiCompatible
+                && ["localhost", "127.0.0.1", "[::1]"]
+                    .iter()
+                    .any(|host| provider.base_url.contains(host));
+            if local {
+                continue;
+            }
+            let offered = match Self::offered(provider).await {
+                Ok(offered) => offered,
+                Err(error) => {
+                    warn!(?slot, kind = ?provider.kind, %error, "Model upgrade check: could not read the provider's models");
                     continue;
                 }
-                info!(%from, %to, "Suggesting a newer model (pay-per-token provider)");
-                self.hub
-                    .broadcast_text(
-                        &self.notify_session_ids,
-                        &suggested_message(from, to, &offered),
-                    )
-                    .await;
-                state.suggested.push(to.clone());
+            };
+            let current_doc: toml_edit::DocumentMut = text.parse()?;
+            let written = written_models(&current_doc, *slot);
+            info!(
+                ?slot,
+                kind = ?provider.kind,
+                offered = offered.len(),
+                models = %offered.iter().map(|m| m.id.as_str()).collect::<Vec<_>>().join(", "),
+                configured = ?written,
+                "Model upgrade check: the provider's models"
+            );
+            let moves = plan(&written, &offered, &state.declined, &vision);
+            if moves.is_empty() {
+                info!(
+                    ?slot,
+                    "Model upgrade check: these models are the newest of their line"
+                );
+                continue;
             }
-            save_state(&self.config_path, &state);
-            return Ok(());
-        }
 
-        if self.agent.model_pinned().await {
-            info!("Model upgrade postponed: the owner pinned a model with /model");
-            return Ok(());
-        }
-
-        let mut proven = BTreeMap::new();
-        for (from, to) in &moves {
-            match Self::trial(&config, to).await {
-                Ok(()) => {
-                    proven.insert(from.clone(), to.clone());
+            // A subscription has no per-call price; elsewhere a newer model
+            // can cost more, so the owner is told and decides.
+            if provider.kind != ProviderKind::OpenaiChatgpt {
+                for (from, to) in &moves {
+                    if state.suggestions.iter().any(|s| &s.to == to) {
+                        continue;
+                    }
+                    info!(?slot, %from, %to, "Suggesting a newer model (pay-per-token provider)");
+                    self.tell_owner(&suggested_message(*slot, provider.kind, from, to, &offered))
+                        .await;
+                    state.suggestions.push(Suggestion {
+                        slot: *slot,
+                        kind_name: maker(provider.kind).to_string(),
+                        from: from.clone(),
+                        to: to.clone(),
+                        at_ms: now_ms(),
+                    });
                 }
-                Err(error) => {
-                    warn!(%from, %to, %error, "A newer model failed its trial; not switching")
+                continue;
+            }
+
+            if pinned {
+                info!("Model upgrade postponed: the owner pinned a model with /model");
+                continue;
+            }
+            let mut proven = BTreeMap::new();
+            for (from, to) in &moves {
+                match Self::trial(provider, to).await {
+                    Ok(()) => {
+                        proven.insert(from.clone(), to.clone());
+                    }
+                    Err(error) => {
+                        warn!(%from, %to, %error, "A newer model failed its trial; not switching")
+                    }
                 }
             }
+            if proven.is_empty() {
+                continue;
+            }
+            text = apply(&text, *slot, &proven)?;
+            switched.push((
+                *slot,
+                provider.kind,
+                proven,
+                written.default.clone(),
+                offered,
+            ));
         }
-        if proven.is_empty() {
+        save_state(&self.config_path, &state);
+        if switched.is_empty() {
             return Ok(());
         }
 
-        let updated = apply(&text, &proven)?;
-        file.save(&updated).await?;
+        file.save(&text).await?;
         let reloaded = match AppConfig::load(&self.config_path) {
             Ok(new_config) => self.agent.reload_provider(&new_config).await,
             Err(error) => Err(error),
         };
         if let Err(error) = reloaded {
             warn!(%error, "The upgraded config did not load; putting the previous one back");
-            file.save(&text).await?;
+            file.save(&original).await?;
             if let Ok(previous) = AppConfig::load(&self.config_path) {
                 let _ = self.agent.reload_provider(&previous).await;
             }
             return Err(error);
         }
 
-        if let Some(from) = &written.default
-            && let Some(to) = proven.get(from)
-        {
-            state.last = Some(Switch {
-                from: from.clone(),
-                to: to.clone(),
-                at_ms: now_ms(),
-            });
+        for (slot, kind, proven, default, offered) in &switched {
+            info!(?slot, ?proven, "Switched to newer models");
+            if let Some(from) = default
+                && let Some(to) = proven.get(from)
+            {
+                for earlier in state.switches.iter_mut().filter(|s| s.slot == *slot) {
+                    earlier.current = false;
+                }
+                state.switches.push(Switch {
+                    slot: *slot,
+                    kind_name: maker(*kind).to_string(),
+                    from: from.clone(),
+                    to: to.clone(),
+                    at_ms: now_ms(),
+                    current: true,
+                });
+            }
+            self.tell_owner(&switched_message(
+                *slot,
+                *kind,
+                proven,
+                default.as_deref(),
+                offered,
+            ))
+            .await;
         }
         save_state(&self.config_path, &state);
-        info!(?proven, "Switched to newer models");
-        let message = switched_message(
-            &proven,
-            written.default.as_deref(),
-            &offered,
-            config.provider.kind,
-        );
-        self.hub
-            .broadcast_text(&self.notify_session_ids, &message)
-            .await;
         Ok(())
     }
 }
@@ -581,7 +790,7 @@ mod tests {
             enabled: true,
             max_image_bytes: 1,
             mime_types: Vec::new(),
-            model_patterns: vec!["gpt-6".into(), "grok-4".into()],
+            model_patterns: vec!["gpt-6".into(), "grok-4".into(), "claude-".into()],
         }
     }
 
@@ -593,6 +802,7 @@ kind = "anthropic"
 
 [provider.fallbacks.models]
 default = "claude-haiku-5-5"
+fallback = ["claude-sonnet-5-5"]
 
 [provider.models]
 default = "gpt-6-sol"
@@ -603,32 +813,49 @@ fallback = [
 fast = "gpt-6-luna"
 "#;
 
-    fn written(text: &str) -> WrittenModels {
-        written_models(&text.parse().unwrap())
+    fn written(text: &str, slot: Slot) -> WrittenModels {
+        written_models(&text.parse().unwrap(), slot)
     }
 
     #[test]
     fn the_default_moves_and_the_old_one_leads_the_fallbacks() {
         let listed = offered(&["gpt-6-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"]);
-        let moves = plan(&written(CONFIG), &listed, &[], &vision());
+        let moves = plan(&written(CONFIG, Slot::Main), &listed, &[], &vision());
         assert_eq!(
             moves,
             BTreeMap::from([("gpt-6-sol".to_string(), "gpt-6.2-sol".to_string())])
         );
-        let updated = apply(CONFIG, &moves).unwrap();
-        let after = written(&updated);
+        let updated = apply(CONFIG, Slot::Main, &moves).unwrap();
+        let after = written(&updated, Slot::Main);
         assert_eq!(after.default.as_deref(), Some("gpt-6.2-sol"));
         assert_eq!(after.fast.as_deref(), Some("gpt-6-luna"));
         assert_eq!(after.fallback, ["gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra"]);
         // The fallback provider's own models are untouched.
-        assert!(updated.contains("default = \"claude-haiku-5-5\""));
+        assert_eq!(
+            written(&updated, Slot::Fallback(0)),
+            written(CONFIG, Slot::Fallback(0))
+        );
+    }
+
+    #[test]
+    fn a_fallback_provider_is_read_and_moved_on_its_own() {
+        let fallback = written(CONFIG, Slot::Fallback(0));
+        assert_eq!(fallback.default.as_deref(), Some("claude-haiku-5-5"));
+        let listed = offered(&["claude-haiku-6", "claude-sonnet-6", "claude-opus-6"]);
+        let moves = plan(&fallback, &listed, &[], &vision());
+        assert_eq!(moves.len(), 2);
+        let updated = apply(CONFIG, Slot::Fallback(0), &moves).unwrap();
+        let after = written(&updated, Slot::Fallback(0));
+        assert_eq!(after.default.as_deref(), Some("claude-haiku-6"));
+        assert_eq!(after.fallback, ["claude-haiku-5-5", "claude-sonnet-6"]);
+        assert_eq!(written(&updated, Slot::Main), written(CONFIG, Slot::Main));
     }
 
     #[test]
     fn a_declined_model_is_not_offered_again() {
         let listed = offered(&["gpt-6.2-sol"]);
         let declined = vec!["gpt-6.2-sol".to_string()];
-        assert!(plan(&written(CONFIG), &listed, &declined, &vision()).is_empty());
+        assert!(plan(&written(CONFIG, Slot::Main), &listed, &declined, &vision()).is_empty());
     }
 
     #[test]
@@ -641,26 +868,27 @@ fast = "gpt-6-luna"
     #[test]
     fn going_back_declines_the_upgrade() {
         let mut state = UpgradeState {
-            last: Some(Switch {
+            switches: vec![Switch {
+                slot: Slot::Main,
+                kind_name: "OpenAI".into(),
                 from: "gpt-6-sol".into(),
                 to: "gpt-6.2-sol".into(),
                 at_ms: 1,
-            }),
+                current: true,
+            }],
             ..Default::default()
         };
         // Still on the new model: nothing changes.
-        let on_new = WrittenModels {
-            default: Some("gpt-6.2-sol".into()),
-            ..Default::default()
-        };
-        assert!(!note_undo(&mut state, &on_new));
-        let back = WrittenModels {
-            default: Some("gpt-6-sol".into()),
-            ..Default::default()
-        };
-        assert!(note_undo(&mut state, &back));
+        assert!(!note_undo(
+            &mut state,
+            &[(Slot::Main, Some("gpt-6.2-sol".into()))]
+        ));
+        assert!(note_undo(
+            &mut state,
+            &[(Slot::Main, Some("gpt-6-sol".into()))]
+        ));
         assert_eq!(state.declined, ["gpt-6.2-sol"]);
-        assert!(state.last.is_none());
+        assert!(!state.switches[0].current);
     }
 
     #[test]
@@ -672,12 +900,24 @@ fast = "gpt-6-luna"
         }];
         let moves = BTreeMap::from([("gpt-6-sol".to_string(), "gpt-6.2-sol".to_string())]);
         let text = switched_message(
+            Slot::Main,
+            ProviderKind::OpenaiChatgpt,
             &moves,
             Some("gpt-6-sol"),
             &listed,
-            ProviderKind::OpenaiChatgpt,
         );
-        assert!(text.starts_with("OpenAI released a newer model, so I've switched to it: GPT-6.2 Sol (it replaces gpt-6-sol)."));
+        assert!(text.starts_with(
+            "Model upgrade: OpenAI released a newer model, so I switched my main model from \
+             gpt-6-sol to GPT-6.2 Sol."
+        ));
         assert!(text.contains("Faster on everyday work."));
+        let backup = suggested_message(
+            Slot::Fallback(0),
+            ProviderKind::Anthropic,
+            "claude-haiku-5-5",
+            "claude-haiku-6",
+            &[],
+        );
+        assert!(backup.contains("my backup on Anthropic"));
     }
 }

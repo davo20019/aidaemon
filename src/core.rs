@@ -542,7 +542,7 @@ pub async fn run(
     crate::model_upgrade::ModelUpgrader::new(
         config_path.clone(),
         agent.clone(),
-        hub.clone(),
+        state.clone(),
         notify_session_ids.clone(),
     )
     .spawn();

@@ -39,11 +39,21 @@ impl ModelList {
         match self {
             ModelList::Fixed(models) => Ok(models.clone()),
             ModelList::ChatGpt { backend, known } => match backend.list_models().await {
-                Ok(listed) => Ok(listed
-                    .into_iter()
-                    .filter(|m| m.listed)
-                    .map(|m| m.id)
-                    .collect()),
+                Ok(listed) => {
+                    let mut models: Vec<String> = listed
+                        .into_iter()
+                        .filter(|m| m.listed)
+                        .map(|m| m.id)
+                        .collect();
+                    // The configured models stay offered even when the
+                    // listing leaves them out.
+                    for model in known {
+                        if !models.contains(model) {
+                            models.push(model.clone());
+                        }
+                    }
+                    Ok(models)
+                }
                 Err(error) => {
                     tracing::warn!(%error, "ChatGPT model listing failed; offering the known models");
                     Ok(known.clone())
