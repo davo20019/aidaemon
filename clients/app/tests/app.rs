@@ -1277,6 +1277,13 @@ fn a_handoff_card_opens_the_live_view_and_watching_needs_no_card() -> Result<(),
     // Watching, a tap can point the agent at something.
     app.press("Point")?;
     app.wait_for("Tap what you mean")?;
+    // The view is built once per opening: the client's other changes (the
+    // page's new title here) keep its state (a zoom, the keyboard, Point).
+    feed([frame(
+        r#"{"type":"event","at_ms":3,"event":{"type":"surface_updated","surface":{"id":"srf_live_1","kind":"browser_tab","session_id":"app:synthetic-live","title":"Secure area","site":"login.acme.example","width":1280,"height":720,"controller":{"kind":"agent"},"handoff_pending":true,"interactive":true}}}"#,
+    )]);
+    app.wait_for("Secure area · login.acme.example")?;
+    app.wait_for("Tap what you mean")?;
     Ok(())
 }
 

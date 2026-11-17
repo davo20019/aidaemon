@@ -180,6 +180,9 @@ struct Reads {
     finished: Memo<Option<(String, u64)>>,
     commands: Memo<Vec<SlashCommand>>,
     models: Memo<Read<aidaemon_client_protocol::ModelOptions>>,
+    /// Whether a live view is open: the view is built once per opening,
+    /// so its zoom and keyboard survive the client's other changes.
+    live_open: Memo<bool>,
 }
 
 impl Reads {
@@ -216,6 +219,7 @@ impl Reads {
             finished: computed(move || client.with(|c| c.finished.clone())),
             commands: computed(move || client.with(|c| c.commands.clone())),
             models: computed(move || client.with(|c| c.models.clone())),
+            live_open: computed(move || client.with(|c| c.live.is_some())),
         }
     }
 }
@@ -562,7 +566,7 @@ impl Store {
 
     /// Whether a live view is open (tracked).
     pub fn live_open(&self) -> bool {
-        self.read(|c| c.live.is_some())
+        self.reads.live_open.get()
     }
 
     /// The focused field's place on the live view (tracked).
