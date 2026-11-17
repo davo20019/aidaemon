@@ -160,68 +160,97 @@ fn crumbs(
     folder: Signal<String>,
     ignored: Signal<bool>,
 ) -> View {
+    // One line, never wrapping: the project, then the folders down to the
+    // open one; deep, the middle folds into "…" (pressed, the deepest of
+    // them). The open folder reads as the place, the others as the way back.
     let path = dynamic(move || {
         let current = folder.get();
         let name = name.clone();
         Some(untracked(move || {
-            let mut row = view().flex_row().flex_wrap().items_center().gap_1();
-            row = row.child(ui::btn(name, Variant::Ghost, Size::Sm, move || {
-                folder.set(String::new())
-            }));
-            let mut so_far = String::new();
-            for part in current.split('/').filter(|p| !p.is_empty()) {
-                if !so_far.is_empty() {
-                    so_far.push('/');
-                }
-                so_far.push_str(part);
-                let target = so_far.clone();
+            let parts: Vec<&str> = current.split('/').filter(|p| !p.is_empty()).collect();
+            let up_to = |n: usize| parts[..n].join("/");
+            let step = |label: String, target: String| {
+                ui::btn(label, Variant::Ghost, Size::Sm, move || {
+                    folder.set(target.clone())
+                })
+                .flex_shrink(1.0)
+                .min_w(px(0.0))
+            };
+            let slash = || {
+                text("/")
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT)
+            };
+            let mut row = view().flex_row().items_center().gap_1().min_w(px(0.0));
+            let Some((here, above)) = parts.split_last() else {
+                return row.child(place(name));
+            };
+            row = row.child(step(name, String::new())).child(slash());
+            if above.len() > 1 {
                 row = row
-                    .child(
-                        text("/")
-                            .text_size(px(type_scale::XS))
-                            .text_color(colors::FAINT),
-                    )
-                    .child(ui::btn(
-                        part.to_owned(),
-                        Variant::Ghost,
-                        Size::Sm,
-                        move || folder.set(target.clone()),
-                    ));
+                    .child(step("…".to_owned(), up_to(above.len() - 1)))
+                    .child(slash());
             }
-            row
+            if let Some(parent) = above.last() {
+                row = row
+                    .child(step((*parent).to_owned(), up_to(above.len())))
+                    .child(slash());
+            }
+            row.child(place((*here).to_owned()))
         }))
     });
     view()
-        .flex_row()
-        .items_center()
         .gap_1()
         .px_2()
         .py_1()
         .border_b_1()
         .border_color(colors::LINE)
-        .child(view().flex_1().min_w(px(0.0)).child(path))
-        .child(dynamic(move || {
-            let branch = store.folder().ready().and_then(|d| d.branch.clone());
-            Some(untracked(move || match branch {
-                Some(branch) => ui::badge(branch, Tone::Neutral),
-                None => view(),
-            }))
-        }))
-        .child(dynamic(move || {
-            let label = if ignored.get() {
-                "Hide ignored"
-            } else {
-                "Show ignored"
-            };
-            Some(untracked(move || {
-                view().child(ui::btn(label, Variant::Ghost, Size::Sm, move || {
-                    ignored.update(|i| *i = !*i)
+        .child(path)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_row()
+                        .child(dynamic(move || {
+                            let branch = store.folder().ready().and_then(|d| d.branch.clone());
+                            Some(untracked(move || match branch {
+                                Some(branch) => ui::badge(branch, Tone::Neutral),
+                                None => view(),
+                            }))
+                        })),
+                )
+                .child(dynamic(move || {
+                    let label = if ignored.get() {
+                        "Hide ignored"
+                    } else {
+                        "Show ignored"
+                    };
+                    Some(untracked(move || {
+                        view().child(ui::btn(label, Variant::Ghost, Size::Sm, move || {
+                            ignored.update(|i| *i = !*i)
+                        }))
+                    }))
                 }))
-            }))
-        }))
-        .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Sm, move || {
-            store.list_project_files(&id, &folder.get_untracked(), ignored.get_untracked())
-        }))
+                .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Sm, move || {
+                    store.list_project_files(&id, &folder.get_untracked(), ignored.get_untracked())
+                })),
+        )
+}
+
+/// The open folder in the path: where the owner is, not a way back.
+fn place(name: String) -> View {
+    view().flex_shrink(1.0).min_w(px(0.0)).px_2().child(
+        text(name)
+            .number_of_lines(1)
+            .text_size(px(type_scale::SM))
+            .font_weight(FontWeight::SEMIBOLD)
+            .role(AccessibilityRole::Header),
+    )
 }
 
 fn listing(read: FolderRead, folder: Signal<String>, open: Signal<Option<String>>) -> View {
