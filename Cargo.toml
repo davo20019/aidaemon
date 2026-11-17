@@ -132,6 +132,8 @@ aidaemon-client-protocol = { version = "=0.20.0", path = "crates/client-protocol
 # The terminal bridge (`/agent` sessions and the local attach/share/start CLIs).
 aidaemon-terminal-bridge = { version = "=0.20.0", path = "crates/aidaemon-terminal-bridge", optional = true }
 aidaemon-tool-browser = { version = "=0.20.0", path = "crates/aidaemon-tool-browser" }
+# Live surfaces: the owner watches and controls the agent's browser from an app.
+aidaemon-surfaces = { version = "=0.20.0", path = "crates/aidaemon-surfaces" }
 aidaemon-providers = { version = "=0.20.0", path = "crates/aidaemon-providers", features = ["chatgpt-login"] }
 # The MCP transport; the daemon keeps its registry and result rendering.
 aidaemon-mcp = { version = "=0.20.0", path = "crates/aidaemon-mcp", features = ["registry"] }
@@ -192,6 +194,7 @@ strip = true
 
 [dev-dependencies]
 aidaemon-core = { path = "crates/aidaemon-core", features = ["testing"] }
+aidaemon-surfaces = { path = "crates/aidaemon-surfaces", features = ["testing"] }
 aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] }
 aidaemon-eval = { path = "crates/aidaemon-eval" }
 aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }

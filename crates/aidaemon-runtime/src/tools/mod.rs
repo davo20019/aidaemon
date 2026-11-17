@@ -8,6 +8,7 @@ pub mod computer_use;
 pub mod config_manager;
 pub mod diagnose;
 pub mod escalate;
+pub mod hand_over;
 pub mod image_generation;
 pub mod manage_api;
 pub mod manage_automations;

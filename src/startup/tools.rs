@@ -343,6 +343,8 @@ enum OptionalToolId {
     HealthProbe,
     ClientView,
     RequestFeature,
+    #[cfg(feature = "browser")]
+    HandOver,
     #[cfg(feature = "slack")]
     SlackChannelHistory,
 }
@@ -378,6 +380,12 @@ fn optional_enabled_node_monitoring(config: &AppConfig) -> bool {
 #[cfg(feature = "browser")]
 fn optional_enabled_browser(config: &AppConfig) -> bool {
     config.browser.enabled
+}
+
+/// Handing the browser to the owner needs the browser and live surfaces.
+#[cfg(feature = "browser")]
+fn optional_enabled_hand_over(config: &AppConfig) -> bool {
+    config.browser.enabled && config.surfaces.enabled
 }
 
 #[cfg(feature = "computer_use")]
@@ -483,6 +491,12 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::RequestFeature,
         name: "request_feature",
         enabled_if: optional_enabled_client_gateway,
+    },
+    #[cfg(feature = "browser")]
+    OptionalToolSpec {
+        id: OptionalToolId::HandOver,
+        name: "hand_over",
+        enabled_if: optional_enabled_hand_over,
     },
     #[cfg(feature = "slack")]
     OptionalToolSpec {
@@ -789,14 +803,19 @@ pub async fn register_optional_tools(
                 if !config.tools.is_enabled("browser") {
                     continue;
                 }
-                let browser_tool = BrowserTool::new(
-                    config.browser.settings(),
-                    media_tx.clone(),
-                    inbox_dir.clone(),
-                    execution_backend.clone(),
-                )
-                .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?;
-                tools.push(Arc::new(browser_tool));
+                let browser_tool = Arc::new(
+                    BrowserTool::new(
+                        config.browser.settings(),
+                        media_tx.clone(),
+                        inbox_dir.clone(),
+                        execution_backend.clone(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?,
+                );
+                if config.surfaces.enabled {
+                    crate::startup::surfaces::add_browser(config, browser_tool.clone());
+                }
+                tools.push(browser_tool);
             }
             #[cfg(feature = "computer_use")]
             OptionalToolId::ComputerUse => {
@@ -894,6 +913,18 @@ pub async fn register_optional_tools(
                 tools.push(Arc::new(crate::tools::ClientViewTool::new(Arc::new(
                     crate::startup::client_gateway::GatewayViews,
                 ))));
+            }
+            #[cfg(feature = "browser")]
+            OptionalToolId::HandOver => {
+                if !config.tools.is_enabled("hand_over") {
+                    continue;
+                }
+                tools.push(Arc::new(
+                    aidaemon_runtime::tools::hand_over::HandOverTool::new(
+                        crate::startup::surfaces::registry(config),
+                        crate::startup::surfaces::live_view_link(),
+                    ),
+                ));
             }
             OptionalToolId::RequestFeature => {
                 if !config.tools.is_enabled("request_feature") {

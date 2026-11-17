@@ -640,6 +640,16 @@ impl ClientGateway {
         &self.bus
     }
 
+    /// The address devices reach the gateway at: a live tunnel origin, else
+    /// `public_url`, else the loopback address.
+    pub fn public_base(&self) -> String {
+        PublicUrl {
+            endpoints: self.endpoints.clone(),
+            fallback: self.config.public_url(),
+        }
+        .get()
+    }
+
     /// Offer live surfaces to the owner's apps (protocol 1.30): their
     /// events, the surface commands and the frame socket. Once only.
     pub fn attach_surfaces(&self, registry: aidaemon_surfaces::SurfaceRegistry) {

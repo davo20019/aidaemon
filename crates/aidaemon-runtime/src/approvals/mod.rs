@@ -675,9 +675,13 @@ impl OwnerApprovals {
             .unwrap_or_else(|e| e.into_inner())
             .insert(card, abandon_tx);
         let (response_tx, response_rx) = oneshot::channel();
+        // A plan to read, or a step the owner does themselves (a sign-in),
+        // gets the longer window.
         let wait = if matches!(
             kind,
-            ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation
+            ApprovalKind::GoalConfirmation
+                | ApprovalKind::AutopilotConfirmation
+                | ApprovalKind::Handoff
         ) {
             self.goal_timeout
         } else {

@@ -165,7 +165,14 @@ impl Prompts {
     ) -> anyhow::Result<ApprovalResponse> {
         let session_button =
             approval_render::approval_use_session_button(ask.permission_mode, ask.risk_level);
-        let choices = approval_choices(session_button, ask.one_time_only);
+        let takes_over = ask
+            .card
+            .is_some_and(|card| matches!(card.action, aidaemon_core::CardAction::TakeOver { .. }));
+        let choices = if takes_over {
+            handoff_choices()
+        } else {
+            approval_choices(session_button, ask.one_time_only)
+        };
         let text = approval_render::build_approval_ask_markdown(ask);
         info!(
             risk = %ask.risk_level,
@@ -367,6 +374,12 @@ fn goal_choices(style: GoalConfirmationStyle) -> Vec<ApprovalChoice> {
     }
     choices.push(choice("cancel", "Cancel"));
     choices
+}
+
+/// A handoff: the owner did it (Done) or will not now. Their ids are the
+/// once and deny answers, so every channel reads them the same way.
+fn handoff_choices() -> Vec<ApprovalChoice> {
+    vec![choice("once", "Done"), choice("deny", "Not now")]
 }
 
 fn choice(id: &str, label: &str) -> ApprovalChoice {

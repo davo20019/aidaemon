@@ -1377,6 +1377,9 @@ pub enum SettingsChange {
     Database {
         action: DatabaseAction,
     },
+    /// Delete every sign-in the agent's own browser profile kept (protocol
+    /// 1.30). Asks first; open tabs close.
+    ForgetSignIns,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

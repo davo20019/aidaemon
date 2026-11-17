@@ -2396,6 +2396,9 @@ pub enum ApprovalKind {
     /// Kept distinct so channels never infer high-autonomy presentation from
     /// user or model prose.
     AutopilotConfirmation,
+    /// The agent asks the owner to do something themselves on a live surface
+    /// (sign in, enter a code): Done or Not now, this one time only.
+    Handoff,
 }
 
 /// Response to an approval request from the user.

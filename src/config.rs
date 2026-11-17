@@ -285,6 +285,10 @@ pub struct AppConfig {
     pub browser: BrowserConfig,
     #[serde(default)]
     pub computer_use: ComputerUseConfig,
+    /// Live surfaces: watching and controlling the agent's browser from a
+    /// paired app (`[surfaces]`).
+    #[serde(default)]
+    pub surfaces: SurfacesSettings,
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
@@ -1564,6 +1568,92 @@ impl Default for BrowserConfig {
 }
 
 pub use aidaemon_runtime::settings::ComputerUseConfig;
+
+/// `[surfaces]`: the screens the agent works on (its browser tabs), which
+/// the owner can watch and control from a paired app. Every limit on a
+/// person is inactivity, never a wall clock.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct SurfacesSettings {
+    /// Paired apps can watch the agent's browser.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The owner can control it, not only watch.
+    #[serde(default = "default_true")]
+    pub allow_control: bool,
+    /// The owner can take control at any time; off: only while the agent
+    /// waits for them there (a handoff).
+    #[serde(default = "default_true")]
+    pub control_anytime: bool,
+    /// Live views open at once.
+    #[serde(default = "default_surface_views")]
+    pub max_live_sessions: usize,
+    /// Frames per second a view gets at most.
+    #[serde(default = "default_surface_fps")]
+    pub max_fps: u32,
+    /// The widest frame a view gets.
+    #[serde(default = "default_surface_width")]
+    pub max_width: u32,
+    /// Control goes back to the agent this long after the owner's device
+    /// stopped watching.
+    #[serde(default = "default_surface_grace_secs")]
+    pub disconnect_grace_secs: u64,
+    /// Control goes back to the agent after this long with no input.
+    #[serde(default = "default_surface_idle_secs")]
+    pub idle_release_secs: u64,
+}
+
+fn default_surface_views() -> usize {
+    8
+}
+fn default_surface_fps() -> u32 {
+    10
+}
+fn default_surface_width() -> u32 {
+    1280
+}
+fn default_surface_grace_secs() -> u64 {
+    30
+}
+fn default_surface_idle_secs() -> u64 {
+    15 * 60
+}
+
+impl Default for SurfacesSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_control: true,
+            control_anytime: true,
+            max_live_sessions: default_surface_views(),
+            max_fps: default_surface_fps(),
+            max_width: default_surface_width(),
+            disconnect_grace_secs: default_surface_grace_secs(),
+            idle_release_secs: default_surface_idle_secs(),
+        }
+    }
+}
+
+impl SurfacesSettings {
+    /// What the surface registry runs with.
+    pub fn registry_config(&self) -> aidaemon_surfaces::SurfacesConfig {
+        aidaemon_surfaces::SurfacesConfig {
+            enabled: self.enabled,
+            allow_control: self.allow_control,
+            control_anytime: self.control_anytime,
+            max_live_sessions: self.max_live_sessions.clamp(1, 64),
+            stream_cap: aidaemon_surfaces::StreamParams {
+                max_w: self.max_width.clamp(320, 3840),
+                max_h: self.max_width.clamp(320, 3840),
+                max_fps: self.max_fps.clamp(1, 30),
+                quality: 70,
+            },
+            disconnect_grace: std::time::Duration::from_secs(
+                self.disconnect_grace_secs.clamp(5, 3600),
+            ),
+            idle_release: std::time::Duration::from_secs(self.idle_release_secs.clamp(60, 86_400)),
+        }
+    }
+}
 
 impl BrowserConfig {
     /// What the browser tool takes from `[browser]`.

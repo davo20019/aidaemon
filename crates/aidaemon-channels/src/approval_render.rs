@@ -306,6 +306,18 @@ pub fn card_headline(card: &ApprovalCard) -> String {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or("Your assistant");
+    if let CardAction::TakeOver { what, site, .. } = &card.action {
+        let what = what.trim().trim_end_matches('.');
+        let what = if what.is_empty() {
+            "do a step yourself"
+        } else {
+            what
+        };
+        return match site.as_deref().filter(|site| !site.is_empty()) {
+            Some(site) => format!("{who} needs you to {what} on {site}."),
+            None => format!("{who} needs you to {what}."),
+        };
+    }
     let what = match &card.action {
         CardAction::Command {
             looks_inside,
@@ -365,6 +377,25 @@ fn card_why(card: &ApprovalCard) -> Option<String> {
             "You said no to {what} earlier in this task, so I'm checking with you before \
              steps whose effects I can't fully tell."
         ));
+    }
+    if let CardAction::TakeOver {
+        keeps_sign_in,
+        open_url,
+        ..
+    } = &card.action
+    {
+        lines.push(
+            "Do it in the live view in the AIdaemon app, or at the computer, then press              Done. The agent waits and never sees what you type."
+                .to_string(),
+        );
+        match keeps_sign_in {
+            Some(true) => lines.push("A sign-in here is kept for later tasks.".to_string()),
+            Some(false) => lines.push("A sign-in here lasts only for this task.".to_string()),
+            None => {}
+        }
+        if let Some(url) = open_url.as_deref().filter(|url| !url.is_empty()) {
+            lines.push(format!("Open the live view: {url}"));
+        }
     }
     if let CardAction::OpenLocalSite { once_minutes, .. } = &card.action {
         lines.push(format!(
@@ -735,6 +766,24 @@ mod tests {
                 "Details: rm -rf x"
             ]
         );
+    }
+
+    #[test]
+    fn a_take_over_card_names_the_step_the_site_and_what_is_kept() {
+        let card = ApprovalCard::new(CardAction::TakeOver {
+            surface_id: "srf_1".into(),
+            what: "Sign in to your Acme account".into(),
+            site: Some("login.acme.example".into()),
+            keeps_sign_in: Some(true),
+            open_url: Some("https://daemon.example.invalid/client/v1/next/#surface=srf_1".into()),
+        });
+        let text = build_card_markdown(&card, RiskLevel::Safe, &[]);
+        assert!(text.contains(
+            "Your assistant needs you to Sign in to your Acme account on login.acme.example."
+        ));
+        assert!(text.contains("kept for later tasks"));
+        assert!(text.contains("never sees what you type"));
+        assert!(text.contains("#surface=srf_1"));
     }
 
     #[test]

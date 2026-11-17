@@ -282,7 +282,7 @@ fn options(kind: ApprovalKind, ask: &ApprovalAsk<'_>) -> Vec<ApprovalDecision> {
         ApprovalKind::GoalConfirmation | ApprovalKind::AutopilotConfirmation => {
             vec![ApproveOnce, Deny]
         }
-        ApprovalKind::CommandOnce => vec![ApproveOnce, Deny],
+        ApprovalKind::CommandOnce | ApprovalKind::Handoff => vec![ApproveOnce, Deny],
         ApprovalKind::Command if ask.one_time_only => vec![ApproveOnce, Deny],
         ApprovalKind::Command => {
             if approval_use_session_button(ask.permission_mode, ask.risk_level) {
@@ -315,6 +315,18 @@ fn card_of(card: &aidaemon_core::ApprovalCard) -> wire::ApprovalCard {
             CardAction::Use { what, detail } => wire::CardAction::Use {
                 what: what.clone(),
                 detail: detail.clone(),
+            },
+            CardAction::TakeOver {
+                surface_id,
+                what,
+                site,
+                keeps_sign_in,
+                ..
+            } => wire::CardAction::TakeOver {
+                surface_id: surface_id.clone(),
+                what: what.clone(),
+                site: site.clone(),
+                keeps_sign_in: *keeps_sign_in,
             },
             _ => wire::CardAction::Unknown,
         },
@@ -358,6 +370,7 @@ fn approval_of(id: String, tapped: &TappedApproval<'_>) -> Approval {
         session_id: tapped.session_id.to_string(),
         kind: match tapped.kind {
             ApprovalKind::Command | ApprovalKind::CommandOnce => wire::ApprovalKind::Command,
+            ApprovalKind::Handoff => wire::ApprovalKind::Handoff,
             ApprovalKind::GoalConfirmation => wire::ApprovalKind::GoalConfirmation,
             ApprovalKind::AutopilotConfirmation => wire::ApprovalKind::AutopilotConfirmation,
         },

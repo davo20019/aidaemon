@@ -322,6 +322,22 @@ health_port = 8080
 # # "browser_context" combined with user_data_dir/remote_debugging_port is
 # # REJECTED at startup rather than silently claiming isolation it can't deliver.
 # session_isolation = "page"
+# # Keep the sign-ins you make in the agent's own profile (~/.aidaemon/chrome-profile),
+# # so you sign in to a site once. false: a fresh profile each time, nothing kept.
+# keep_sign_ins = true
+
+# [surfaces]
+# Watch and control the agent's browser from a paired app (the live view). When the
+# agent needs you to sign in or enter a code it hands you the tab (`hand_over`) and
+# waits; you type it yourself and the agent never sees it.
+# enabled = true
+# allow_control = true            # control, not only watch
+# control_anytime = true          # take control without the agent asking; false: only during a handoff
+# max_live_sessions = 8           # live views open at once
+# max_fps = 10                    # frames per second a view gets at most
+# max_width = 1280                # widest frame a view gets
+# disconnect_grace_secs = 30      # control returns to the agent this long after your device stops watching
+# idle_release_secs = 900         # control returns to the agent after this long with no input
 
 # [computer_use]
 # Native macOS desktop control: the agent inspects and operates GUI apps via the

@@ -5501,6 +5501,19 @@
             "action"
           ],
           "type": "object"
+        },
+        {
+          "description": "Delete every sign-in the agent's own browser profile kept (protocol\n1.30). Asks first; open tabs close.",
+          "properties": {
+            "kind": {
+              "const": "forget_sign_ins",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
         }
       ]
     },

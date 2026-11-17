@@ -496,6 +496,22 @@ pub enum CardAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// The agent asks the owner to do something themselves on a live
+    /// surface (sign in, enter a code), then press Done. `what` is the
+    /// agent's few words; `site` the host only.
+    TakeOver {
+        surface_id: String,
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
+        /// Whether a sign-in made there is kept for later tasks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keeps_sign_in: Option<bool>,
+        /// Where the owner's app opens the live view, when the daemon has an
+        /// address a phone can reach. The id in it grants nothing alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_url: Option<String>,
+    },
 }
 
 /// Why the owner is asked.

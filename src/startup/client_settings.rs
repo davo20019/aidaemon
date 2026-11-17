@@ -201,7 +201,7 @@ fn kind_of_text(text: &str) -> SettingKind {
 /// place; the rest is read at start.
 fn applies_of(key: &str) -> Applies {
     match key.split(['.', '[']).next().unwrap_or_default() {
-        "provider" | "decisions" => Applies::Reload,
+        "provider" | "decisions" | "surfaces" => Applies::Reload,
         _ => Applies::Restart,
     }
 }
@@ -689,6 +689,12 @@ impl SettingsHost {
                 DatabaseAction::Cancel => SettingsGate::Free,
                 DatabaseAction::Unknown => return Err("Unknown database action".to_string()),
             },
+            SettingsChange::ForgetSignIns => ask(
+                "Forget every sign-in the agent's browser kept. Its open tabs close, and you \
+                 sign in again next time."
+                    .to_string(),
+                false,
+            ),
             SettingsChange::RemoveBot { .. }
             | SettingsChange::Apply { .. }
             | SettingsChange::CheckKey { .. }
@@ -921,6 +927,15 @@ impl SettingsHost {
         if matches!(change, SettingsChange::RestoreBackup) {
             self.note_saved(Applies::Restart);
         }
+        // Watching and control switch at once: turning control off gives
+        // every screen back to the agent now.
+        if key.starts_with("surfaces")
+            && let Some(registry) = crate::startup::surfaces::running()
+            && let Ok(text) = std::fs::read_to_string(&self.config_path)
+            && let Ok(config) = toml::from_str::<SurfacesOnly>(&text)
+        {
+            registry.set_config(config.surfaces.registry_config());
+        }
         Ok(SettingsDone {
             message: first_paragraph(&text),
             applies: Some(applies),
@@ -1086,9 +1101,23 @@ impl SettingsHost {
                     applies: Some(Applies::Restart),
                 })
             }
+            SettingsChange::ForgetSignIns => {
+                let message = crate::startup::surfaces::forget_sign_ins().await?;
+                Ok(SettingsDone {
+                    message,
+                    applies: Some(Applies::Now),
+                })
+            }
             _ => Err("This change is not known to this daemon".to_string()),
         }
     }
+}
+
+/// The `[surfaces]` table of a config file, alone.
+#[derive(serde::Deserialize)]
+struct SurfacesOnly {
+    #[serde(default)]
+    surfaces: crate::config::SurfacesSettings,
 }
 
 /// A key a provider change stores.

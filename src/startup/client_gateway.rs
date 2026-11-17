@@ -1234,6 +1234,9 @@ pub async fn start(
         approvals: Some(confirm_tx),
     })
     .await?;
+    if config.surfaces.enabled {
+        gateway.attach_surfaces(crate::startup::surfaces::registry(config));
+    }
     let _ = GATEWAY.set(gateway.clone());
     tokio::spawn(async move {
         if let Err(error) = aidaemon_client_gateway::serve(gateway).await {
