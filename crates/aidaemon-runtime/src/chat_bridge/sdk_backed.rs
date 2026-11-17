@@ -574,10 +574,10 @@ pub fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
         ProviderErrorKind::RateLimit => sdk::ProviderError::RateLimited {
             retry_after: error.retry_after_secs.map(std::time::Duration::from_secs),
         },
-        ProviderErrorKind::BadRequest => match super::context_overflow(&error.message) {
+        ProviderErrorKind::BadRequest => match error.context_overflow {
             Some(limit) => sdk::ProviderError::ContextOverflow {
                 message: detail,
-                limit: limit.map(|l| l as u64),
+                limit,
             },
             None => sdk::ProviderError::InvalidRequest(detail),
         },
@@ -588,9 +588,9 @@ pub fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
             per_model: false,
             in_stream: false,
         },
-        ProviderErrorKind::Timeout => {
-            sdk::ProviderError::Transient(format!("request timed out: {}", error.message))
-        }
+        ProviderErrorKind::Timeout => sdk::ProviderError::Transient(
+            aidaemon_providers::TransportFailure::Timeout.message(&error.message),
+        ),
         ProviderErrorKind::Network => sdk::ProviderError::Transient(detail),
         ProviderErrorKind::ServerError => sdk::ProviderError::Transient(detail),
         ProviderErrorKind::MalformedResponse => sdk::ProviderError::Malformed {
@@ -616,6 +616,9 @@ pub fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
     out.status = status;
     out.message = text.clone();
     out.spent_nothing = error.proves_nothing_spent();
+    // The SDK error's variant is the typed classification; only
+    // `ContextOverflow` below carries an overflow.
+    out.context_overflow = None;
     out.kind = match &error {
         sdk::ProviderError::RateLimited { retry_after } => {
             out.retry_after_secs = retry_after.map(|d| d.as_secs().max(1));
@@ -634,7 +637,9 @@ pub fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
             out.resets_at = *resets_at;
             ProviderErrorKind::QuotaExhausted
         }
-        sdk::ProviderError::InvalidRequest(_) | sdk::ProviderError::ContextOverflow { .. } => {
+        sdk::ProviderError::InvalidRequest(_) => ProviderErrorKind::BadRequest,
+        sdk::ProviderError::ContextOverflow { limit, .. } => {
+            out.context_overflow = Some(*limit);
             ProviderErrorKind::BadRequest
         }
         sdk::ProviderError::Malformed { parse, .. } => {
@@ -645,17 +650,16 @@ pub fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
             });
             ProviderErrorKind::MalformedResponse
         }
+        // A transient failure is the network's when the transport raised it
+        // (its typed marker), else the provider's own (a status, a stream
+        // failure event such as an overload): never from the words.
         sdk::ProviderError::Transient(message) => {
-            if message.starts_with("request timed out") {
-                ProviderErrorKind::Timeout
-            } else if status.is_some_and(|s| s >= 500) {
-                ProviderErrorKind::ServerError
-            } else if status == Some(408) {
-                ProviderErrorKind::Timeout
-            } else if message.starts_with("Codex stream failed") || message.contains("overload") {
-                ProviderErrorKind::ServerError
-            } else {
-                ProviderErrorKind::Network
+            match (aidaemon_providers::TransportFailure::of(message), status) {
+                (Some(aidaemon_providers::TransportFailure::Timeout), _) | (None, Some(408)) => {
+                    ProviderErrorKind::Timeout
+                }
+                (Some(_), _) => ProviderErrorKind::Network,
+                (None, _) => ProviderErrorKind::ServerError,
             }
         }
         sdk::ProviderError::Other(_) => ProviderErrorKind::Unknown,
@@ -851,5 +855,43 @@ mod tests {
             "request timed out: deadline".into(),
         ));
         assert_eq!(timeout.kind, ProviderErrorKind::Timeout);
+        // A transport failure is the network's; a provider's stream failure
+        // with no status is the provider's, whatever its words.
+        let network = to_daemon_error(sdk::ProviderError::Transient(
+            aidaemon_providers::TransportFailure::Connect.message("refused"),
+        ));
+        assert_eq!(network.kind, ProviderErrorKind::Network);
+        let stream = to_daemon_error(sdk::ProviderError::Transient(
+            "stream error (api_error): something broke".into(),
+        ));
+        assert_eq!(stream.kind, ProviderErrorKind::ServerError);
+    }
+
+    /// A context overflow stays typed through the daemon's error and back,
+    /// however the provider worded it: nothing re-reads the message.
+    #[test]
+    fn a_context_overflow_is_carried_typed_not_reparsed() {
+        let error = to_daemon_error(sdk::ProviderError::ContextOverflow {
+            message: "HTTP 400: Your request is bigger than this model accepts.".into(),
+            limit: Some(64_000),
+        });
+        assert_eq!(error.kind, ProviderErrorKind::BadRequest);
+        assert_eq!(error.context_overflow, Some(Some(64_000)));
+        assert!(matches!(
+            to_sdk_error(&error),
+            sdk::ProviderError::ContextOverflow {
+                limit: Some(64_000),
+                ..
+            }
+        ));
+        // A plain rejection that quotes the old wording is not an overflow.
+        let plain = to_daemon_error(sdk::ProviderError::InvalidRequest(
+            "HTTP 400: the prompt is too long for this field".into(),
+        ));
+        assert_eq!(plain.context_overflow, None);
+        assert!(matches!(
+            to_sdk_error(&plain),
+            sdk::ProviderError::InvalidRequest(_)
+        ));
     }
 }

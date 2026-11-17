@@ -511,7 +511,11 @@ impl TurnEngine<'_> {
                 if error.is::<ModelCallTimedOut>() {
                     return Err(sdk::ProviderError::Transient(error.to_string()));
                 }
-                if let Some(stated) = crate::chat_bridge::context_overflow(&error.to_string()) {
+                if let Some(stated) = error
+                    .downcast_ref::<crate::chat_bridge::ProviderError>()
+                    .and_then(|provider| provider.context_overflow)
+                    .map(|limit| limit.map(|l| l as usize))
+                {
                     let budget = crate::settings::record_context_overflow(
                         &request.model,
                         stated,

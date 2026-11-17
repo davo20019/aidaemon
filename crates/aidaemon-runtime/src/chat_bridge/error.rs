@@ -23,6 +23,10 @@ pub struct ProviderError {
     /// tokens (`aidaemon_core::ProviderError::proves_nothing_spent`). False
     /// whenever that is not proven.
     pub spent_nothing: bool,
+    /// The provider said the request exceeded the model's context window
+    /// (`aidaemon_core::ProviderError::ContextOverflow`), with the window
+    /// when it stated one. Typed, never re-read from `message`.
+    pub context_overflow: Option<Option<u64>>,
 }
 
 /// One model's failure during a failover chain.
@@ -140,6 +144,8 @@ impl ProviderError {
             resets_at: None,
             fallback_failures: Vec::new(),
             spent_nothing: false,
+            // The provider's own fields decide (`aidaemon_providers::context_overflow`).
+            context_overflow: aidaemon_providers::context_overflow(status, body),
         }
     }
 
@@ -155,6 +161,7 @@ impl ProviderError {
             resets_at: None,
             fallback_failures: Vec::new(),
             spent_nothing: false,
+            context_overflow: None,
         }
     }
 
@@ -169,6 +176,7 @@ impl ProviderError {
             resets_at: None,
             fallback_failures: Vec::new(),
             spent_nothing: false,
+            context_overflow: None,
         }
     }
 

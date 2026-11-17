@@ -547,7 +547,7 @@ pub async fn call_llm_with_recovery(
                 }
                 let terminal = provider_err.kind == ProviderErrorKind::Auth
                     || options.single_attempt_fail_closed
-                    || crate::chat_bridge::context_overflow(&provider_err.to_string()).is_some();
+                    || provider_err.context_overflow.is_some();
                 if terminal && !telemetry.fell_back {
                     return Err(provider_err.into());
                 }
