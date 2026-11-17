@@ -215,9 +215,15 @@ impl Provider for GoogleGenai {
             Ok(data) => return Ok(parse_response(&data)),
             Err(rejection) => rejection,
         };
+        // A 400 INVALID_ARGUMENT on a request whose history carries
+        // function calls without a thought signature is retried once with
+        // that history stripped. Gemini gives the missing signature no
+        // reason code of its own, so the request's typed shape (it holds
+        // unsigned calls) decides, not the message's words; a request with
+        // none is never retried.
         if !request.options.single_attempt
             && rejection.status == StatusCode::BAD_REQUEST
-            && is_missing_thought_signature_error(&rejection.body)
+            && rpc_status(&rejection.body) == Some("INVALID_ARGUMENT")
             && let Some(retry) = body_without_unsigned_calls(&body)
         {
             return match self.send(&url, &retry).await? {
@@ -253,7 +259,7 @@ fn gemini_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Provider
         429 => ProviderError::RateLimited {
             retry_after: retry_after(headers).or_else(|| body_retry_delay(body)),
         },
-        400 if body.contains("API_KEY_INVALID") => {
+        400 if has_error_reason(body, "API_KEY_INVALID") => {
             ProviderError::Auth(format!("HTTP 400: {}", body_excerpt(body)))
         }
         _ => map_status(status, headers, body),
@@ -289,11 +295,28 @@ fn body_retry_delay(body: &str) -> Option<Duration> {
         .map(Duration::from_secs_f64)
 }
 
-fn is_missing_thought_signature_error(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("missing a thought_signature")
-        || lower.contains("missing thought_signature")
-        || lower.contains("missing thoughtsignature")
+/// The google.rpc status of a rejection (`error.status`, e.g.
+/// `INVALID_ARGUMENT`).
+fn rpc_status(body: &str) -> Option<&'static str> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let status = value.pointer("/error/status")?.as_str()?;
+    // Only the statuses read here, so the result can outlive the body.
+    ["INVALID_ARGUMENT"]
+        .into_iter()
+        .find(|known| *known == status)
+}
+
+/// Whether a rejection's `google.rpc.ErrorInfo` detail names `reason`
+/// (`error.details[].reason`, e.g. `API_KEY_INVALID`).
+fn has_error_reason(body: &str, reason: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.pointer("/error/details")?.as_array().cloned())
+        .is_some_and(|details| {
+            details
+                .iter()
+                .any(|detail| detail.get("reason").and_then(Value::as_str) == Some(reason))
+        })
 }
 
 // ----------------------------------------------------------- request body
@@ -1493,14 +1516,20 @@ mod tests {
     }
 
     #[test]
-    fn detects_the_missing_signature_rejection() {
-        assert!(is_missing_thought_signature_error(
-            r#"{"error":{"code":400,"message":"Function call is missing a thought_signature in functionCall parts."}}"#
+    fn reads_the_rejection_from_its_rpc_fields() {
+        assert_eq!(
+            rpc_status(
+                r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Please ensure the call carries its signature."}}"#
+            ),
+            Some("INVALID_ARGUMENT")
+        );
+        assert_eq!(rpc_status("bad tool schema"), None);
+        // The key's reason is read from the ErrorInfo detail, not from the
+        // body's text: a message quoting the reason is not one.
+        assert!(!has_error_reason(
+            r#"{"error":{"message":"API_KEY_INVALID"}}"#,
+            "API_KEY_INVALID"
         ));
-        assert!(is_missing_thought_signature_error(
-            "missing thoughtSignature"
-        ));
-        assert!(!is_missing_thought_signature_error("bad tool schema"));
     }
 
     // -------------------------------------------------------- error mapping

@@ -862,30 +862,55 @@ fn stream_failure(event: &Value, message: &str) -> ProviderError {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let status = field("status").and_then(Value::as_u64);
-    let message = format!("Codex stream failed: {message}");
     tracing::warn!(code = %code, status = ?status, event = %event, "Codex stream failure event");
-    let overloaded = code.contains("overload")
-        || code == "server_error"
-        || code == "service_unavailable"
-        // Some failure events carry neither status nor code; the overload
-        // marker is then the only infrastructure signal.
-        || (code.is_empty() && status.is_none() && message.to_ascii_lowercase().contains("overload"));
-    if code == "usage_limit_reached" {
-        let resets_at = field("resets_at")
-            .and_then(Value::as_f64)
-            .filter(|secs| *secs > 0.0)
-            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs));
-        return ProviderError::QuotaExhausted {
-            message,
-            resets_at,
-            per_model: false,
-            in_stream: true,
-        };
+    // A stated HTTP status leads the message in the transport's own
+    // `HTTP <status>: ` form, so the daemon reads the status, not the words.
+    let message = match status {
+        Some(status) => format!("HTTP {status}: Codex stream failed: {message}"),
+        None => format!("Codex stream failed: {message}"),
+    };
+    // The Responses API's documented failure codes, compared exactly.
+    let overloaded = matches!(
+        code.as_str(),
+        "server_is_overloaded" | "slow_down" | "server_error" | "service_unavailable"
+    )
+        // A failure event with neither a status nor a code carries no
+        // structured signal at all; its "overloaded" wording is then the
+        // only one, so it alone is read, and only in that case.
+        || (code.is_empty()
+            && status.is_none()
+            && message.to_ascii_lowercase().contains("overloaded"));
+    match code.as_str() {
+        "usage_limit_reached" => {
+            let resets_at = field("resets_at")
+                .and_then(Value::as_f64)
+                .filter(|secs| *secs > 0.0)
+                .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs));
+            return ProviderError::QuotaExhausted {
+                message,
+                resets_at,
+                per_model: false,
+                in_stream: true,
+            };
+        }
+        "context_length_exceeded" => {
+            return ProviderError::ContextOverflow {
+                message,
+                limit: None,
+            };
+        }
+        "insufficient_quota" => {
+            return ProviderError::Billing {
+                message,
+                affordable_tokens: None,
+            };
+        }
+        _ => {}
     }
     match status {
         Some(429) => ProviderError::RateLimited { retry_after: None },
         Some(408 | 500 | 502 | 503 | 504) => ProviderError::Transient(message),
-        _ if code.contains("rate_limit") => ProviderError::RateLimited { retry_after: None },
+        _ if code == "rate_limit_exceeded" => ProviderError::RateLimited { retry_after: None },
         _ if overloaded => ProviderError::Transient(message),
         _ => ProviderError::Other(message),
     }
@@ -1226,6 +1251,28 @@ mod tests {
         assert_eq!(rate, Err(ProviderError::RateLimited { retry_after: None }));
         let overload = decode(&[json!({"type": "error", "message": "Model is overloaded"})]);
         assert!(matches!(overload, Err(ProviderError::Transient(_))));
+        let coded =
+            decode(&[json!({"type": "error", "code": "server_is_overloaded", "message": "x"})]);
+        assert!(matches!(coded, Err(ProviderError::Transient(_))));
+        // A code is compared whole: a refusal code that merely contains
+        // the word is not an overload or a rate limit.
+        let refusal = decode(&[
+            json!({"type": "error", "code": "invalid_prompt_overload_policy", "message": "Model is overloaded"}),
+        ]);
+        assert!(matches!(refusal, Err(ProviderError::Other(_))));
+        let not_rate = decode(&[
+            json!({"type": "error", "code": "rate_limit_policy_violation", "message": "x"}),
+        ]);
+        assert!(matches!(not_rate, Err(ProviderError::Other(_))));
+        let overflow = decode(&[
+            json!({"type": "response.failed", "response": {"error": {"code": "context_length_exceeded", "message": "Your input is too big."}}}),
+        ]);
+        assert!(matches!(
+            overflow,
+            Err(ProviderError::ContextOverflow { limit: None, .. })
+        ));
+        let status = decode(&[json!({"type": "error", "status": 503, "message": "x"})]);
+        assert!(matches!(status, Err(ProviderError::Transient(m)) if m.starts_with("HTTP 503: ")));
         let refused = decode(&[
             json!({"type": "response.failed", "response": {"error": {"message": "policy"}}}),
         ]);

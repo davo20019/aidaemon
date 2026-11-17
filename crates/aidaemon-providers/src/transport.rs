@@ -66,19 +66,56 @@ pub(crate) fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, Conf
     Ok(map)
 }
 
+/// How a transport-level failure was raised: the request never got an
+/// answer from the provider (it timed out, could not connect, or its body
+/// broke mid-flight). [`map_reqwest_error`] writes the kind as the
+/// message's leading marker; [`TransportFailure::of`] reads it back, so a
+/// caller holding only the [`ProviderError::Transient`] message tells a
+/// network failure from a failure the provider itself reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    Timeout,
+    Connect,
+    Body,
+}
+
+impl TransportFailure {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::Timeout => "request timed out: ",
+            Self::Connect => "connection failed: ",
+            Self::Body => "http error: ",
+        }
+    }
+
+    /// The transport failure a [`ProviderError::Transient`] message was
+    /// raised for, by the marker this crate wrote at its start; `None` for
+    /// a failure the provider reported (a stream error event, an overload).
+    pub fn of(message: &str) -> Option<Self> {
+        [Self::Timeout, Self::Connect, Self::Body]
+            .into_iter()
+            .find(|kind| message.starts_with(kind.marker()))
+    }
+
+    /// The message for this failure.
+    pub fn message(self, detail: impl std::fmt::Display) -> String {
+        format!("{}{detail}", self.marker())
+    }
+}
+
 /// Map a transport-level failure (connect, timeout, broken body).
 pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
     if err.is_builder() {
         return ProviderError::InvalidRequest(format!("could not build request: {err}"));
     }
     if err.is_timeout() {
-        return ProviderError::Transient(format!("request timed out: {err}"));
+        return ProviderError::Transient(TransportFailure::Timeout.message(err));
     }
     if err.is_connect() {
-        return ProviderError::Transient(format!("connection failed: {err}"));
+        return ProviderError::Transient(TransportFailure::Connect.message(err));
     }
     // Body/decode/request errors mid-flight are network trouble, so retryable.
-    ProviderError::Transient(format!("http error: {err}"))
+    ProviderError::Transient(TransportFailure::Body.message(err))
 }
 
 /// Map a non-success HTTP status to a [`ProviderError`].
@@ -93,7 +130,7 @@ pub(crate) fn map_status(status: StatusCode, headers: &HeaderMap, body: &str) ->
         "provider HTTP error"
     );
     match status.as_u16() {
-        429 if !crate::errors::out_of_credit(body) => ProviderError::RateLimited {
+        429 if !crate::errors::out_of_credit(429, body) => ProviderError::RateLimited {
             retry_after: retry_after(headers),
         },
         status => crate::errors::error_for_status(status, body, detail),
