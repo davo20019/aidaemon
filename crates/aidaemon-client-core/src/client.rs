@@ -19,8 +19,11 @@ use aidaemon_client_protocol::{
     AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
     MidRun, ModelChoice, ModelOptions, ProjectSummary, QueuedMessage, SearchHit, ServerFrame,
     SessionChanges, SessionModel, Settings, SettingsChange, SettingsOutcome, SetupAction,
-    SetupStep, SlashCommand, SystemStatus, TaskSummary, TurnStatus,
+    SetupStep, SlashCommand, StreamAccept, SurfaceController, SurfaceInfo, SurfaceMode,
+    SurfaceTransport, SystemStatus, TaskSummary, TurnStatus,
 };
+
+use crate::surfaces::LiveView;
 
 use crate::machine::{DropKind, Update, request_id};
 use crate::state::{Line, State, ViewRequest};
@@ -285,6 +288,14 @@ pub enum Effect {
     ProjectSaved(ProjectSummary),
     /// The agent asked for a view move.
     View(ViewRequest),
+    /// A live view opened: connect to its frame socket (protocol 1.30).
+    OpenLive {
+        live_id: String,
+        transport: SurfaceTransport,
+    },
+    /// The live view ended (closed here, or its surface went away): close
+    /// its frame socket.
+    CloseLive,
 }
 
 /// The client, as [`crate::client`] describes it.
@@ -384,6 +395,16 @@ pub struct Client {
     /// Turns that already showed the changes, so the owner's own choice
     /// sticks for the rest of a turn.
     changes_shown: BTreeSet<String>,
+    /// The live view open on this client (protocol 1.30), and the request
+    /// that opens it.
+    pub live: Option<LiveView>,
+    live_request: Option<String>,
+    /// Why the last take or release of control was refused.
+    pub control_error: Option<String>,
+    control_requests: BTreeSet<String>,
+    /// This device asked for control and has not given it back: the
+    /// surface's owner controller is this device.
+    live_controller_is_mine: bool,
 }
 
 impl Client {
@@ -486,8 +507,24 @@ impl Client {
 
     fn frame(&mut self, frame: ServerFrame, cx: &Context) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.live_answer(&frame, &mut effects) {
+            return effects;
+        }
         if self.answer(&frame, cx, &mut effects) {
             return effects;
+        }
+        if let ServerFrame::Event {
+            event: Event::SurfaceClosed { surface_id },
+            ..
+        } = &frame
+            && self
+                .live
+                .as_ref()
+                .is_some_and(|l| &l.surface_id == surface_id)
+        {
+            self.live = None;
+            self.live_request = None;
+            effects.push(Effect::CloseLive);
         }
         self.state.apply(frame);
         if let Some(request) = self.state.take_view_request() {
@@ -2140,6 +2177,202 @@ impl Client {
             .unwrap_or_default()
     }
 
+    // ----- Live surfaces (protocol 1.30) -------------------------------------
+
+    /// The screens of `session` the owner can watch: the one the agent
+    /// waits on first, then the active one.
+    pub fn surfaces_of(&self, session: &str) -> Vec<SurfaceInfo> {
+        let mut found: Vec<SurfaceInfo> = self
+            .state
+            .surfaces
+            .values()
+            .filter(|s| s.session_id.as_deref() == Some(session))
+            .cloned()
+            .collect();
+        found.sort_by_key(|s| (!s.handoff_pending, s.id.clone()));
+        found
+    }
+
+    pub fn surface(&self, id: &str) -> Option<&SurfaceInfo> {
+        self.state.surfaces.get(id)
+    }
+
+    /// The waiting take-over card for `surface_id`, if any.
+    pub fn handoff_for(&self, surface_id: &str) -> Option<Approval> {
+        self.approvals().into_iter().find(|a| {
+            matches!(
+                a.card.as_ref().map(|c| &c.action),
+                Some(aidaemon_client_protocol::CardAction::TakeOver { surface_id: s, .. }) if s == surface_id
+            )
+        })
+    }
+
+    /// Whether this device controls `surface_id` now.
+    pub fn controls(&self, surface_id: &str) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|l| l.surface_id == surface_id)
+            && matches!(
+                self.surface(surface_id).map(|s| &s.controller),
+                Some(SurfaceController::Owner { .. })
+            )
+            && self.live_controller_is_mine
+    }
+
+    /// Open a live view of `surface_id` (closing any other first); with
+    /// `control`, take control too.
+    pub fn open_surface(&mut self, surface_id: &str, control: bool) -> Vec<Effect> {
+        let mut effects = self.close_surface();
+        self.control_error = None;
+        self.live = Some(LiveView {
+            surface_id: surface_id.to_owned(),
+            control,
+            live_id: None,
+            transport: None,
+            error: None,
+        });
+        self.live_request = Some(self.send(Command::OpenSurface {
+            surface_id: surface_id.to_owned(),
+            mode: if control {
+                SurfaceMode::Control
+            } else {
+                SurfaceMode::View
+            },
+            accept: StreamAccept {
+                codecs: vec!["jpeg".into()],
+                ..StreamAccept::default()
+            },
+        }));
+        self.live_controller_is_mine = control;
+        effects.retain(|e| *e == Effect::CloseLive);
+        effects
+    }
+
+    /// Close the live view, if one is open.
+    pub fn close_surface(&mut self) -> Vec<Effect> {
+        let Some(live) = self.live.take() else {
+            return Vec::new();
+        };
+        self.live_request = None;
+        self.live_controller_is_mine = false;
+        if let Some(live_id) = live.live_id {
+            self.send(Command::CloseSurface { live_id });
+        }
+        vec![Effect::CloseLive]
+    }
+
+    pub fn take_control(&mut self, surface_id: &str) {
+        self.control_error = None;
+        let id = self.send(Command::TakeControl {
+            surface_id: surface_id.to_owned(),
+        });
+        self.control_requests.insert(id);
+        self.live_controller_is_mine = true;
+    }
+
+    pub fn release_control(&mut self, surface_id: &str) {
+        let id = self.send(Command::ReleaseControl {
+            surface_id: surface_id.to_owned(),
+        });
+        self.control_requests.insert(id);
+        self.live_controller_is_mine = false;
+    }
+
+    /// Answer the take-over card of `surface_id`: done (the step is made)
+    /// or not now. Control goes back to the agent either way.
+    pub fn finish_handoff(&mut self, surface_id: &str, done: bool) {
+        if let Some(approval) = self.handoff_for(surface_id) {
+            self.resolve(
+                &approval.id,
+                if done {
+                    ApprovalDecision::ApproveOnce
+                } else {
+                    ApprovalDecision::Deny
+                },
+            );
+        }
+        if self.controls(surface_id) {
+            self.release_control(surface_id);
+        }
+    }
+
+    /// Answers to the live view's own commands.
+    fn live_answer(&mut self, frame: &ServerFrame, out: &mut Vec<Effect>) -> bool {
+        match frame {
+            ServerFrame::Ack {
+                request_id,
+                result:
+                    CommandResult::SurfaceOpened {
+                        live_id,
+                        surface,
+                        transports,
+                    },
+            } if self.live_request.as_deref() == Some(request_id) => {
+                self.live_request = None;
+                self.state
+                    .surfaces
+                    .insert(surface.id.clone(), surface.clone());
+                let Some(live) = self.live.as_mut() else {
+                    // Closed meanwhile: close it on the daemon too.
+                    self.send(Command::CloseSurface {
+                        live_id: live_id.clone(),
+                    });
+                    return true;
+                };
+                let transport = transports
+                    .iter()
+                    .find(|t| t.kind == aidaemon_client_protocol::TransportKind::WsFrames)
+                    .cloned();
+                match transport {
+                    Some(transport) => {
+                        live.live_id = Some(live_id.clone());
+                        live.transport = Some(transport.clone());
+                        out.push(Effect::OpenLive {
+                            live_id: live_id.clone(),
+                            transport,
+                        });
+                    }
+                    None => {
+                        live.error =
+                            Some("This daemon offers no way to show the screen here.".into());
+                    }
+                }
+                true
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.live_request.as_deref() == Some(request_id) => {
+                self.live_request = None;
+                self.live_controller_is_mine = false;
+                if let Some(live) = self.live.as_mut() {
+                    live.error = Some(error.message.clone());
+                }
+                true
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::SurfaceControl { surface },
+            } if self.control_requests.contains(request_id) => {
+                self.control_requests.remove(request_id);
+                self.state
+                    .surfaces
+                    .insert(surface.id.clone(), surface.clone());
+                true
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.control_requests.contains(request_id) => {
+                self.control_requests.remove(request_id);
+                self.live_controller_is_mine = false;
+                self.control_error = Some(error.message.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn resolve(&mut self, approval: &str, decision: ApprovalDecision) {
         self.send(Command::ResolveApproval {
             approval_id: approval.to_owned(),
@@ -2300,6 +2533,114 @@ mod tests {
             selected: selected.map(str::to_owned),
             ..Context::default()
         }
+    }
+
+    fn surface_json(id: &str, waiting: bool) -> String {
+        format!(
+            r#"{{"id":"{id}","kind":"browser_tab","session_id":"app:s1","title":"Sign in","site":"login.acme.example","width":1280,"height":720,"controller":{{"kind":"agent"}},"handoff_pending":{waiting},"interactive":true}}"#
+        )
+    }
+
+    fn surface_command(client: &mut Client) -> (String, Command) {
+        client
+            .take_outgoing()
+            .into_iter()
+            .rfind(|(_, c)| {
+                matches!(
+                    c,
+                    Command::OpenSurface { .. }
+                        | Command::CloseSurface { .. }
+                        | Command::TakeControl { .. }
+                        | Command::ReleaseControl { .. }
+                        | Command::ResolveApproval { .. }
+                )
+            })
+            .expect("a surface command")
+    }
+
+    #[test]
+    fn a_live_view_opens_with_its_transport_and_closes_with_its_surface() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.update(
+            frame(&format!(
+                r#"{{"type":"event","at_ms":1,"event":{{"type":"surface_updated","surface":{}}}}}"#,
+                surface_json("srf_1", true)
+            )),
+            &cx(None),
+        );
+        assert_eq!(client.surfaces_of("app:s1").len(), 1);
+        client.open_surface("srf_1", true);
+        let (request, command) = surface_command(&mut client);
+        assert!(matches!(
+            command,
+            Command::OpenSurface {
+                mode: SurfaceMode::Control,
+                ..
+            }
+        ));
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"surface_opened","live_id":"live_1","surface":{},"transports":[{{"kind":"ws_frames","url":"/client/v1/surfaces/live_1/ws","ticket":"tkt_1","codecs":["jpeg"]}}]}}}}"#,
+                surface_json("srf_1", true)
+            )),
+            &cx(None),
+        );
+        assert!(
+            matches!(&effects[..], [Effect::OpenLive { live_id, transport }] if live_id == "live_1" && transport.ticket == "tkt_1")
+        );
+        assert_eq!(
+            client.live.as_ref().unwrap().live_id.as_deref(),
+            Some("live_1")
+        );
+
+        let effects = client.update(
+            frame(r#"{"type":"event","at_ms":2,"event":{"type":"surface_closed","surface_id":"srf_1"}}"#),
+            &cx(None),
+        );
+        assert_eq!(effects, vec![Effect::CloseLive]);
+        assert!(client.live.is_none());
+        assert!(client.surfaces_of("app:s1").is_empty());
+    }
+
+    #[test]
+    fn a_refused_view_says_why_and_closing_tells_the_daemon() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.open_surface("srf_9", false);
+        let (request, _) = surface_command(&mut client);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{request}","error":{{"code":"forbidden","message":"This device may not Control","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(
+            client.live.as_ref().unwrap().error.as_deref(),
+            Some("This device may not Control")
+        );
+        assert_eq!(client.close_surface(), vec![Effect::CloseLive]);
+        assert!(client.live.is_none());
+    }
+
+    #[test]
+    fn done_answers_the_take_over_card() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.update(
+            frame(r#"{"type":"event","seq":3,"at_ms":1,"session_id":"app:s1","event":{"type":"approval_requested","approval":{"id":"a-1","session_id":"app:s1","kind":"handoff","risk":"low","summary":"Sign in, then press Done.","card":{"action":{"kind":"take_over","surface_id":"srf_1","what":"Sign in"}},"options":["approve_once","deny"],"requested_at_ms":1}}}"#),
+            &cx(None),
+        );
+        assert!(client.handoff_for("srf_1").is_some());
+        client.finish_handoff("srf_1", true);
+        let (_, command) = surface_command(&mut client);
+        assert_eq!(
+            command,
+            Command::ResolveApproval {
+                approval_id: "a-1".into(),
+                decision: ApprovalDecision::ApproveOnce
+            }
+        );
     }
 
     fn settings_reads(client: &mut Client) -> Vec<String> {
