@@ -269,6 +269,12 @@ pub aidaemon_core::CardAction::Command::title: core::option::Option<alloc::strin
 pub aidaemon_core::CardAction::OpenLocalSite
 pub aidaemon_core::CardAction::OpenLocalSite::once_minutes: u64
 pub aidaemon_core::CardAction::OpenLocalSite::site: alloc::string::String
+pub aidaemon_core::CardAction::TakeOver
+pub aidaemon_core::CardAction::TakeOver::keeps_sign_in: core::option::Option<bool>
+pub aidaemon_core::CardAction::TakeOver::open_url: core::option::Option<alloc::string::String>
+pub aidaemon_core::CardAction::TakeOver::site: core::option::Option<alloc::string::String>
+pub aidaemon_core::CardAction::TakeOver::surface_id: alloc::string::String
+pub aidaemon_core::CardAction::TakeOver::what: alloc::string::String
 pub aidaemon_core::CardAction::Use
 pub aidaemon_core::CardAction::Use::detail: core::option::Option<alloc::string::String>
 pub aidaemon_core::CardAction::Use::what: alloc::string::String
