@@ -880,6 +880,9 @@ pub struct OwnerApprovalResolver<'a> {
     pub emitter: &'a EventEmitter,
     pub task_id: &'a str,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// The effects the owner approved in this turn: a request a restart
+    /// cut off and this turn asked again and got is not reported undone.
+    pub granted: Mutex<Vec<sdk::EffectKey>>,
 }
 
 impl OwnerApprovalResolver<'_> {
@@ -1049,6 +1052,10 @@ impl OwnerApprovalResolver<'_> {
                 }
                 self.record("owner_approval_granted", tool, request, None)
                     .await;
+                self.granted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(request.effects.iter().cloned());
                 sdk::Resolution::Approve
             }
             Answer::Declined(reason) => {
@@ -1089,7 +1096,75 @@ fn unanswered_reason(tool: &str, why: &str) -> String {
 /// so the turn can say what was not done.
 pub struct AbandonedRunResolver<'a, 'r> {
     pub turn: &'a DaemonInterruptResolver<'r>,
-    pub not_done: Mutex<Vec<String>>,
+    /// The cut-off run's requests: their effects and their card's words.
+    pub not_done: Mutex<Vec<(Vec<sdk::EffectKey>, String)>>,
+}
+
+impl AbandonedRunResolver<'_, '_> {
+    /// The cut-off requests still undone: those whose effects the owner
+    /// approved again in this turn were carried out after all.
+    pub fn still_undone(&self) -> Vec<String> {
+        let granted = self
+            .turn
+            .owner
+            .granted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let not_done = self
+            .not_done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        not_redone(&not_done, &granted)
+    }
+}
+
+/// The cut-off requests the owner did not approve again: one whose every
+/// effect was approved in this turn was asked again and carried out. A
+/// request with no typed effects cannot be matched and stays listed.
+pub fn not_redone(
+    not_done: &[(Vec<sdk::EffectKey>, String)],
+    granted: &[sdk::EffectKey],
+) -> Vec<String> {
+    not_done
+        .iter()
+        .filter(|(effects, _)| {
+            effects.is_empty() || !effects.iter().all(|effect| granted.contains(effect))
+        })
+        .map(|(_, summary)| summary.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod not_redone_tests {
+    use super::*;
+
+    /// Live 2026-11-17: a restart cut off a handoff, the next turn asked
+    /// for it again and the owner signed in, and the reply still opened
+    /// with "the daemon restarted… so it was not done".
+    #[test]
+    fn a_request_approved_again_is_not_reported_undone() {
+        let handoff = sdk::EffectKey::named(sdk::EffectClass::Call, "hand_over");
+        let post = sdk::EffectKey::named(sdk::EffectClass::Call, "synthetic_post");
+        let not_done = vec![
+            (
+                vec![handoff.clone()],
+                "Sign in on the login page".to_string(),
+            ),
+            (vec![post.clone()], "Post the synthetic report".to_string()),
+            (Vec::new(), "Something untyped".to_string()),
+        ];
+        assert_eq!(
+            not_redone(&not_done, &[handoff.clone()]),
+            vec!["Post the synthetic report", "Something untyped"]
+        );
+        assert_eq!(not_redone(&not_done, &[]).len(), 3);
+        assert_eq!(
+            not_redone(&not_done, &[handoff, post]),
+            vec!["Something untyped"]
+        );
+    }
 }
 
 #[async_trait]
@@ -1112,7 +1187,7 @@ impl sdk::InterruptResolver for AbandonedRunResolver<'_, '_> {
         self.not_done
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(request.summary.clone());
+            .push((request.effects.clone(), request.summary.clone()));
         Some(
             self.turn
                 .owner

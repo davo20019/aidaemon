@@ -347,8 +347,15 @@ impl ToolSemantics for HandOverTool {
         aidaemon_core::SourceTrust::Untrusted
     }
 
+    /// The owner acts on the screen (signs in, enters a code), which
+    /// changes the browser's session; the call then reports where the tab
+    /// is. A step done, not a look: a run that handed over did the step it
+    /// handed over. Nothing is sent anywhere by the call itself, so it
+    /// declares no egress.
     fn call_semantics(&self, _arguments: &str) -> ToolCallSemantics {
-        ToolCallSemantics::observation()
+        ToolCallSemantics::observation_and_mutation_with(
+            aidaemon_tools::semantics::ToolMutationEffects::PROCESS_STATE,
+        )
     }
 }
 

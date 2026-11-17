@@ -203,3 +203,51 @@ async fn a_handoff_with_no_tab_asks_nothing_and_says_why() {
         "{results:?}"
     );
 }
+
+/// Live 2026-11-17: "open the sign-in page and hand it over so I can sign
+/// in". The run opened the page and handed it over, the owner signed in,
+/// and the reply still said "I didn't start these parts": a handoff was
+/// typed as a look, so a request for a step counted no step done. The
+/// owner's step through a handoff is work done.
+#[tokio::test]
+async fn a_finished_handoff_is_the_step_it_handed_over() {
+    let (_registry, _mock, _id, tool) = handoff_surfaces();
+    let items = |status: &str| {
+        json!({"items": [
+            {"text": "Open the synthetic sign-in page and hand it over for the owner's sign-in", "status": status, "mutation_effects": ["process_state"], "owner_units": [0]}
+        ]})
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &items("in_progress").to_string()),
+        hand_over_call(),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &{
+                let mut done = items("completed");
+                done["outcome"] = json!("done");
+                done.to_string()
+            },
+        ),
+        MockProvider::text_response("You're signed in; the secure page is open."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[(
+        "Open the synthetic sign-in page and hand it over so I can sign in",
+        true,
+    )])]);
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, vec![tool], None)
+        .await
+        .unwrap();
+    let (broker, approver) =
+        crate::testing::ScriptedApprover::start(vec![Some(crate::types::ApprovalResponse::AllowOnce)]);
+    harness.agent.owner_approvals().set_broker(broker);
+    let reply = ask_owner_turn(
+        &harness,
+        APPROVALS_SESSION,
+        "Open the synthetic sign-in page and hand it over so I can sign in.",
+    )
+    .await;
+    assert_eq!(approver.card_count(), 1);
+    assert!(!reply.contains("didn't start"), "{reply}");
+    assert_eq!(reply, "You're signed in; the secure page is open.");
+}

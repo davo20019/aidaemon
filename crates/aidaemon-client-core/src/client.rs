@@ -402,6 +402,9 @@ pub struct Client {
     /// Why the last take or release of control was refused.
     pub control_error: Option<String>,
     control_requests: BTreeSet<String>,
+    /// Closing a live view: the view going away says it, so the daemon's
+    /// answer ("Closed", "Already closed") is no notice.
+    close_requests: BTreeSet<String>,
     /// This device asked for control and has not given it back: the
     /// surface's owner controller is this device.
     live_controller_is_mine: bool,
@@ -2356,7 +2359,8 @@ impl Client {
         self.live_request = None;
         self.live_controller_is_mine = false;
         if let Some(live_id) = live.live_id {
-            self.send(Command::CloseSurface { live_id });
+            let id = self.send(Command::CloseSurface { live_id });
+            self.close_requests.insert(id);
         }
         vec![Effect::CloseLive]
     }
@@ -2525,6 +2529,14 @@ impl Client {
                 self.state
                     .surfaces
                     .insert(surface.id.clone(), surface.clone());
+                true
+            }
+            ServerFrame::Ack { request_id, .. }
+            | ServerFrame::Error {
+                request_id: Some(request_id),
+                ..
+            } if self.close_requests.contains(request_id) => {
+                self.close_requests.remove(request_id);
                 true
             }
             ServerFrame::Error {
@@ -2768,6 +2780,38 @@ mod tests {
         assert_eq!(effects, vec![Effect::CloseLive]);
         assert!(client.live.is_none());
         assert!(client.surfaces_of("app:s1").is_empty());
+    }
+
+    /// Live 2026-11-17: Done ended the view, the app closed it too, and
+    /// "Already closed" stayed on screen with a Dismiss button.
+    #[test]
+    fn closing_a_view_says_nothing() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.open_surface("srf_1", true);
+        let (request, _) = surface_command(&mut client);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"surface_opened","live_id":"live_1","surface":{},"transports":[{{"kind":"ws_frames","url":"/client/v1/surfaces/live_1/ws","ticket":"tkt_1","codecs":["jpeg"]}}]}}}}"#,
+                surface_json("srf_1", true)
+            )),
+            &cx(None),
+        );
+        client.close_surface();
+        let close = client
+            .take_outgoing()
+            .into_iter()
+            .find_map(|(request_id, command)| {
+                matches!(command, Command::CloseSurface { .. }).then_some(request_id)
+            })
+            .expect("a close");
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{close}","result":{{"type":"reply","text":"Already closed"}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(client.state.notice, None);
     }
 
     #[test]

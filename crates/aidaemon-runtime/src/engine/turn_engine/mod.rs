@@ -1377,6 +1377,7 @@ impl TurnEngine<'_> {
                 emitter: &emitter,
                 task_id: &task_id,
                 cancel: cancel.clone(),
+                granted: Default::default(),
             },
         };
         // A run the daemon stopped on (a crash, a restart) is settled first:
@@ -1568,11 +1569,7 @@ impl TurnEngine<'_> {
                 {
                     reply = format!("{}\n\n⚠️ {}", reply.trim_end(), fallback.note(now));
                 }
-                let not_done = abandoned
-                    .not_done
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let not_done = abandoned.still_undone();
                 if let Some(note) = recovery::not_done_note(&not_done) {
                     reply = format!("{note}\n\n{reply}");
                 }
