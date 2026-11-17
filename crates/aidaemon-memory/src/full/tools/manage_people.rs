@@ -256,10 +256,14 @@ impl aidaemon_tools::semantics::ToolSemantics for ManagePeopleTool {
                 ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::MEMORY_WRITE),
             );
         }
+        // Every other action writes the people store too (notes that go
+        // into later prompts, or who a sender is linked to), and is typed
+        // the same way: after outside content was read, such a write is
+        // checked like any other change to what the agent is told.
         semantics_for_exact_read_actions(
             arguments,
             &["status", "list", "view", "brief", "upcoming", "audit"],
-            ToolMutationEffects::NONE,
+            ToolMutationEffects::CONFIGURATION.union(ToolMutationEffects::MEMORY_WRITE),
         )
     }
 
