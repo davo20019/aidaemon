@@ -154,6 +154,10 @@ struct Stream {
     sink: FrameSink,
     _handle: StreamHandle,
     viewers: usize,
+    /// Held for the stream's life: between a view opening and its socket
+    /// subscribing, the backend must still see the stream as watched (or it
+    /// stops sending pictures for good).
+    _watching: watch::Receiver<Option<Arc<Frame>>>,
 }
 
 struct Live {
@@ -533,7 +537,7 @@ impl SurfaceRegistry {
             let sink = match existing {
                 Some(sink) => sink,
                 None => {
-                    let (sink, _first) = FrameSink::new();
+                    let (sink, watching) = FrameSink::new();
                     let handle = backend.start_stream(id, params, sink.clone()).await?;
                     let mut state = lock(&self.shared.state);
                     let entry = state.surfaces.get_mut(id).ok_or(SurfaceError::NotFound)?;
@@ -541,6 +545,7 @@ impl SurfaceRegistry {
                         sink: sink.clone(),
                         _handle: handle,
                         viewers: 0,
+                        _watching: watching,
                     });
                     sink
                 }

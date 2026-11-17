@@ -1811,7 +1811,8 @@ pub struct LiveScreen {
     /// controlling): it gets what is there as the owner's message.
     pub point: std::rc::Rc<dyn Fn(f32, f32)>,
     pub can_point: std::rc::Rc<dyn Fn() -> bool>,
-    pub wheel: std::rc::Rc<dyn Fn(f32)>,
+    /// A scroll at a fraction of the picture, by page pixels.
+    pub wheel: std::rc::Rc<dyn Fn(f32, f32, f32, f32)>,
     pub text: std::rc::Rc<dyn Fn(String)>,
     /// A key by its `code` and `key`.
     pub key: std::rc::Rc<dyn Fn(&'static str, &'static str)>,
@@ -1870,21 +1871,23 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     // Where a finger or the pointer acts: an empty layer over the picture,
     // so its place is in the picture's own frame.
     let start = signal((0.0f32, 0.0f32));
+    // As on a phone's own browser: a tap clicks where it lands, a drag
+    // scrolls the page under the finger.
+    let dragging = signal(false);
+    let scrolled = signal((0.0f32, 0.0f32));
+    // The page's size in its own pixels, to turn a drag into a scroll.
+    let page_size = move || {
+        frame
+            .with(|f| f.as_ref().map(|f| (f.w as f32, f.h as f32)))
+            .unwrap_or((1280.0, 720.0))
+    };
     let pad = {
-        let (down, moved, up, cancel) = (
-            screen.pointer.clone(),
-            screen.pointer.clone(),
-            screen.pointer.clone(),
-            screen.pointer.clone(),
-        );
+        let pointer = screen.pointer.clone();
+        let wheel = screen.wheel.clone();
         let point = screen.point.clone();
         let controlling = controlling.clone();
-        let (c_down, c_move, c_up, c_cancel) = (
-            controlling.clone(),
-            controlling.clone(),
-            controlling.clone(),
-            controlling.clone(),
-        );
+        let c_move = controlling.clone();
+        let c_up = controlling.clone();
         view()
             .absolute()
             .inset_0()
@@ -1901,48 +1904,40 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 }
                 let at = (e.location.x.0 / w, e.location.y.0 / h);
                 start.set(at);
-                tapped.set(Some(at));
-                if c_down() {
-                    down("down", at.0, at.1);
-                }
+                dragging.set(false);
+                scrolled.set((0.0, 0.0));
             })
             .on_responder_move(move |e: &ResponderEvent| {
                 let (w, h) = fitted();
-                if w <= 0.0 || h <= 0.0 {
+                if w <= 0.0 || h <= 0.0 || !c_move() {
                     return;
                 }
-                if !c_move() {
+                let (dx, dy) = (e.gesture.delta.x.0, e.gesture.delta.y.0);
+                if !dragging.get_untracked() && dx.hypot(dy) < 10.0 {
                     return;
                 }
+                dragging.set(true);
+                // Scroll by what the finger moved since the last report,
+                // in the page's pixels; the page follows the finger.
+                let (pw, ph) = page_size();
+                let (sx, sy) = scrolled.get_untracked();
+                let (step_x, step_y) = (dx - sx, dy - sy);
+                scrolled.set((dx, dy));
                 let (x0, y0) = start.get_untracked();
-                moved(
-                    "move",
-                    (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
-                    (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
-                );
+                wheel(x0, y0, -step_x / w * pw, -step_y / h * ph);
             })
-            .on_responder_release(move |e: &ResponderEvent| {
-                let (w, h) = fitted();
-                let (x0, y0) = start.get_untracked();
-                let at = if w > 0.0 && h > 0.0 {
-                    (
-                        (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
-                        (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
-                    )
-                } else {
-                    (x0, y0)
-                };
+            .on_responder_release(move |_: &ResponderEvent| {
+                if dragging.get_untracked() {
+                    return;
+                }
+                let at = start.get_untracked();
+                tapped.set(Some(at));
                 if c_up() {
-                    up("up", at.0, at.1);
+                    pointer("down", at.0, at.1);
+                    pointer("up", at.0, at.1);
                 } else if pointing.get_untracked() {
                     pointing.set(false);
                     point(at.0, at.1);
-                }
-            })
-            .on_responder_terminate(move |_: &ResponderEvent| {
-                if c_cancel() {
-                    let (x0, y0) = start.get_untracked();
-                    cancel("cancel", x0, y0);
                 }
             })
     };
@@ -2056,8 +2051,8 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 .child(status_line)
                 .child(when(controlling.clone(), || {
                     text(
-                        "This is the agent's browser, live. Tap a box on the page, type below and \
-                         press Type; Enter submits. The ring shows where you tapped.",
+                        "This is the agent's browser, live. Tap to click, drag to scroll. Tap a \
+                         box, then type below: it goes straight in.",
                     )
                     .text_size(px(type_scale::XS))
                     .text_color(colors::ON_LIGHTBOX)
@@ -2128,33 +2123,55 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             },
         ));
 
-    // Typing: a masked field whose text goes to the page, and the keys a
-    // phone keyboard cannot send.
+    // Typing goes straight into the page as you type: each change of the
+    // field sends what was added, and deletes what was removed. The field
+    // is masked only while a password box has the keyboard.
     let typed = signal(String::new());
+    let sent_text = signal(String::new());
     let send_text = screen.text.clone();
-    let send = move || {
-        let value = typed.get_untracked();
-        if !value.is_empty() {
-            send_text(value);
-            typed.set(String::new());
+    let delete_key = screen.key.clone();
+    let on_typed = move |now: &str| {
+        let before = sent_text.get_untracked();
+        let common = before
+            .chars()
+            .zip(now.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        for _ in 0..before.chars().count().saturating_sub(common) {
+            delete_key("Backspace", "Backspace");
         }
+        let added: String = now.chars().skip(common).collect();
+        if !added.is_empty() {
+            send_text(added);
+        }
+        sent_text.set(now.to_owned());
+        typed.set(now.to_owned());
     };
+    // A new tap is a new target: the field starts empty again.
+    effect(move || {
+        if tapped.get().is_some() {
+            typed.set(String::new());
+            sent_text.set(String::new());
+        }
+    });
     let key = screen.key.clone();
     let wheel = screen.wheel.clone();
     let press = |label: &'static str, code: &'static str, name: &'static str| {
         let key = key.clone();
         viewer_text_btn(label, false, move || key(code, name))
     };
+    let password = {
+        let focus = screen.focus.clone();
+        move || {
+            focus()
+                .flatten()
+                .is_some_and(|words| words.contains("password"))
+        }
+    };
     let focus = screen.focus.clone();
     let sent = screen.typed.clone();
     let focus_line = text(move || match (focus(), sent()) {
-        (Some(Some(words)), Some(count)) => {
-            let what = words.split(',').next().unwrap_or(&words).trim().to_owned();
-            format!(
-                "Typed {count} character{} into {what}",
-                if count == 1 { "" } else { "s" }
-            )
-        }
+        (Some(Some(words)), Some(_)) => format!("Typing into {words}"),
         (Some(Some(words)), None) => format!("✓ Ready: typing goes into {words}"),
         (Some(None), _) => "Nothing to type into: tap a box on the page first".to_owned(),
         (None, _) => "Tap a box on the page to type into it".to_owned(),
@@ -2167,17 +2184,18 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         .px_3()
         .child(focus_line)
         .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(view().flex_1().min_w(px(0.0)).child(
-                    super::controls::secret_field("Text to type into the page", typed).on_submit({
-                        let send = send.clone();
-                        move |_: &str| send()
-                    }),
-                ))
-                .child(viewer_text_btn("Type", true, send)),
+            view().flex_row().items_center().gap_2().child(
+                view().flex_1().min_w(px(0.0)).child(
+                    super::controls::field("Type here: it goes straight into the page", typed)
+                        .on_change(on_typed)
+                        .masked(password)
+                        .auto_correct(false)
+                        .on_submit({
+                            let key = key.clone();
+                            move |_: &str| key("Enter", "Enter")
+                        }),
+                ),
+            ),
         )
         .child(
             view()
@@ -2190,9 +2208,11 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 .child(press("Enter", "Enter", "Enter"))
                 .child({
                     let wheel = wheel.clone();
-                    viewer_text_btn("Scroll up", false, move || wheel(-400.0))
+                    viewer_text_btn("Scroll up", false, move || wheel(0.5, 0.5, 0.0, -400.0))
                 })
-                .child(viewer_text_btn("Scroll down", false, move || wheel(400.0))),
+                .child(viewer_text_btn("Scroll down", false, move || {
+                    wheel(0.5, 0.5, 0.0, 400.0)
+                })),
         );
 
     let close = screen.close.clone();

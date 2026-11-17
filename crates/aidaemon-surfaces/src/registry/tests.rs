@@ -94,6 +94,26 @@ async fn viewers_share_one_stream_that_stops_with_the_last() {
     assert!(*a.ended.borrow());
 }
 
+/// A view whose own receivers are dropped (its socket subscribes later)
+/// keeps its stream watched, so the backend never stops sending.
+#[tokio::test]
+async fn a_stream_stays_watched_until_its_view_closes() {
+    let (registry, mock) = setup(SurfacesConfig::default());
+    let id = mock.add("s1", "tab-1");
+    registry.refresh().await;
+    let live = registry
+        .open_live(&id, "phone", LiveMode::View, StreamParams::default())
+        .await
+        .unwrap();
+    let live_id = live.live_id.clone();
+    drop(live);
+    assert!(mock.push_frame(&id, b"one"), "still watched before the socket subscribes");
+    let mut later = registry.subscribe_live(&live_id).unwrap();
+    assert_eq!(&*later.frames.borrow_and_update().clone().unwrap().data, b"one");
+    registry.close_live(&live_id);
+    assert_eq!(mock.streams_stopped(), 1);
+}
+
 #[tokio::test]
 async fn watching_needs_no_control_and_sends_no_input() {
     let (registry, mock) = setup(SurfacesConfig::default());

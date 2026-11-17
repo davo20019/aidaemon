@@ -654,12 +654,12 @@ impl Store {
         self.live_input(aidaemon_client_core::surfaces::pointer(action, x, y));
     }
 
-    pub fn live_wheel(&self, dy: f32) {
+    pub fn live_wheel(&self, x: f32, y: f32, dx: f32, dy: f32) {
         self.live_input(aidaemon_client_protocol::media::SurfaceInput::Wheel {
-            x: 0.5,
-            y: 0.5,
-            dx: 0.0,
-            dy: f64::from(dy),
+            x: f64::from(x.clamp(0.0, 1.0)),
+            y: f64::from(y.clamp(0.0, 1.0)),
+            dx: f64::from(dx.clamp(-5000.0, 5000.0)),
+            dy: f64::from(dy.clamp(-5000.0, 5000.0)),
         });
     }
 
