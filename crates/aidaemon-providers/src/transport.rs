@@ -68,7 +68,7 @@ pub(crate) fn header_map(headers: &[(String, String)]) -> Result<HeaderMap, Conf
 
 /// How a transport-level failure was raised: the request never got an
 /// answer from the provider (it timed out, could not connect, or its body
-/// broke mid-flight). [`map_reqwest_error`] writes the kind as the
+/// broke mid-flight). `map_reqwest_error` writes the kind as the
 /// message's leading marker; [`TransportFailure::of`] reads it back, so a
 /// caller holding only the [`ProviderError::Transient`] message tells a
 /// network failure from a failure the provider itself reported.

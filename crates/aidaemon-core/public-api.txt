@@ -262,6 +262,9 @@ pub aidaemon_core::BuildError::MissingModel
 pub aidaemon_core::BuildError::MissingProvider
 pub aidaemon_core::BuildError::MissingSafeguard(aidaemon_core::Safeguard)
 #[non_exhaustive] pub enum aidaemon_core::CardAction
+pub aidaemon_core::CardAction::ClickOnSite
+pub aidaemon_core::CardAction::ClickOnSite::site: alloc::string::String
+pub aidaemon_core::CardAction::ClickOnSite::target: core::option::Option<alloc::string::String>
 pub aidaemon_core::CardAction::Command
 pub aidaemon_core::CardAction::Command::line: alloc::string::String
 pub aidaemon_core::CardAction::Command::looks_inside: alloc::vec::Vec<alloc::string::String>

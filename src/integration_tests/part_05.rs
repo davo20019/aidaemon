@@ -13,6 +13,10 @@
 /// agent explored a project with `ls`, `git status`, `pwd`, etc. and the
 /// stall detection falsely triggered.
 #[tokio::test]
+// Twelve Unix commands (`uname`, `ps aux`, `df -h`, ...): on Windows they
+// run through a slow shell start each and the test overran 120 s. Linux and
+// macOS cover the stall invariant in about 2 s.
+#[cfg_attr(windows, ignore = "Unix shell commands; covered on Linux and macOS")]
 async fn test_full_stack_website_exploration_no_stall() {
     let mut responses: Vec<ProviderResponse> = Vec::new();
 
