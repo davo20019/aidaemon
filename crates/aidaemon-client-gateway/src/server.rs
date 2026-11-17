@@ -63,6 +63,14 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
         .route("/client/v1/sessions", post(open_session))
         .route("/client/v1/devices", get(devices))
         .route("/client/v1/devices/{device_id}/revoke", post(revoke_device))
+        .route(
+            "/client/v1/devices/{device_id}/scopes",
+            post(set_device_scopes),
+        )
+        .route(
+            "/client/v1/surfaces/{live_id}/ws",
+            get(crate::surfaces::media_socket),
+        )
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
         .route("/client/v1/next", get(app_root))
@@ -242,6 +250,14 @@ fn http_caller(headers: &HeaderMap, principal: Principal) -> Caller {
     caller_of(kind, header("x-aidaemon-device"), &capabilities, principal)
 }
 
+fn server_capabilities(gateway: &ClientGateway) -> Vec<Capability> {
+    let mut offered = vec![Capability::Compact, Capability::ViewActions];
+    if gateway.surface_desk().is_some() {
+        offered.push(Capability::Surfaces);
+    }
+    offered
+}
+
 fn caller_of(
     kind: Option<ClientKind>,
     device: Option<String>,
@@ -389,6 +405,30 @@ async fn devices(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) 
         return refused;
     }
     reply(gateway.pairing.devices().await)
+}
+
+/// `POST /client/v1/devices/{device_id}/scopes`, owner only: what a device
+/// may do (`{"scopes": ["observe", "control", ...]}`). Answers with the
+/// devices as they are after.
+async fn set_device_scopes(
+    State(gateway): State<Arc<ClientGateway>>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+    Json(body): Json<DeviceScopes>,
+) -> Response {
+    if let Err(refused) = owner_only(&gateway, &headers) {
+        return refused;
+    }
+    match gateway.pairing.set_scopes(&device_id, &body.scopes).await {
+        Ok(true) => reply(gateway.pairing.devices().await),
+        Ok(false) => error_response(ErrorCode::NotFound, "No such device"),
+        Err(error) => refusal(error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DeviceScopes {
+    scopes: Vec<Scope>,
 }
 
 async fn revoke_device(
@@ -650,7 +690,9 @@ async fn http_events(
     let since = match query.since {
         Some(since) if gateway.bus.can_resume(since).await => since,
         _ => {
-            let (seq, state) = gateway.snapshot().await;
+            let (seq, mut state) = gateway.snapshot().await;
+            // The HTTP mode has no live surfaces.
+            state.surfaces.clear();
             let frame = ServerFrame::Snapshot { seq, state };
             let frames = fit(&frame, caller.compact).into_iter().collect();
             return Json(EventsPage {
@@ -797,6 +839,10 @@ async fn run_socket(
         .then(|| gateway.views.connect());
     caller.view_connection = view.as_ref().map(|view| view.id);
 
+    let wants_surfaces = capabilities.contains(&Capability::Surfaces)
+        && gateway.surface_desk().is_some()
+        && gateway.pairing.may_now(&caller.principal, Scope::Control);
+
     // Subscribe before reading the log, so nothing falls between them.
     let mut live = gateway.bus.subscribe();
     let latest = gateway.bus.latest().await;
@@ -804,7 +850,7 @@ async fn run_socket(
         &mut socket,
         &ServerFrame::Welcome {
             version: ProtocolVersion::CURRENT,
-            server_capabilities: vec![Capability::Compact, Capability::ViewActions],
+            server_capabilities: server_capabilities(&gateway),
             owner: gateway.owner(),
             latest_seq: latest,
             setup: gateway.setup().await,
@@ -816,7 +862,10 @@ async fn run_socket(
     let mut sent = match resume_from {
         Some(seq) if gateway.bus.can_resume(seq).await => seq,
         _ => {
-            let (seq, state) = gateway.snapshot().await;
+            let (seq, mut state) = gateway.snapshot().await;
+            if !wants_surfaces {
+                state.surfaces.clear();
+            }
             if let Some(frame) = fit(&ServerFrame::Snapshot { seq, state }, caller.compact) {
                 send(&mut socket, &frame).await?;
             }
@@ -894,6 +943,14 @@ async fn run_socket(
                         }
                         ServerFrame::Event { seq: Some(seq), .. } => sent = *seq,
                         _ => {}
+                    }
+                    if let ServerFrame::Event {
+                        event: Event::SurfaceUpdated { .. } | Event::SurfaceClosed { .. },
+                        ..
+                    } = &*frame
+                        && !wants_surfaces
+                    {
+                        continue;
                     }
                     if let Some(frame) = fit(&frame, caller.compact) {
                         send(&mut socket, &frame).await?;

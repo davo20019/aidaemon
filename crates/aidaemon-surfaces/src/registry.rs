@@ -81,6 +81,13 @@ pub struct LiveSession {
     pub ended: watch::Receiver<bool>,
 }
 
+/// Receivers for an open live session (see
+/// [`SurfaceRegistry::subscribe_live`]).
+pub struct LiveReceivers {
+    pub frames: watch::Receiver<Option<Arc<Frame>>>,
+    pub ended: watch::Receiver<bool>,
+}
+
 /// Lets a backend tell the registry its surfaces changed.
 #[derive(Clone)]
 pub struct SurfaceNotifier(Weak<Shared>);
@@ -588,6 +595,20 @@ impl SurfaceRegistry {
         };
         drop(stopped);
         debug!(live = %live_id, "live session closed");
+    }
+
+    /// Fresh receivers for a live session that is open: its frames (the
+    /// current one reads as unseen) and its end.
+    pub fn subscribe_live(&self, live_id: &str) -> Option<LiveReceivers> {
+        let state = lock(&self.shared.state);
+        let live = state.lives.get(live_id)?;
+        let stream = state.surfaces.get(&live.surface)?.stream.as_ref()?;
+        let mut frames = stream.sink.subscribe();
+        frames.mark_changed();
+        Some(LiveReceivers {
+            frames,
+            ended: live.ended.subscribe(),
+        })
     }
 
     /// The surface and device a live session belongs to.

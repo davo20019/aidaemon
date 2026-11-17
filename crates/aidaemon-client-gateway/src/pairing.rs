@@ -134,6 +134,22 @@ fn scopes_of(text: &str) -> Vec<Scope> {
         .collect()
 }
 
+/// What a device gets when it asks for nothing in particular: everything,
+/// but watching and controlling surfaces only on a phone or a computer.
+pub(crate) fn default_scopes(kind: Option<ClientKind>) -> Vec<Scope> {
+    let gets_control = kind.is_some_and(|kind| {
+        matches!(
+            kind,
+            ClientKind::Mobile | ClientKind::Desktop | ClientKind::Web | ClientKind::Tui
+        )
+    });
+    ALL_SCOPES
+        .iter()
+        .copied()
+        .filter(|scope| *scope != Scope::Control || gets_control)
+        .collect()
+}
+
 fn kind_text(kind: ClientKind) -> String {
     serde_json::to_value(kind)
         .ok()
@@ -294,7 +310,7 @@ impl Pairing {
             return Err(ProtocolError::new(ErrorCode::Invalid, "Name the device"));
         }
         let scopes = if request.scopes.is_empty() {
-            ALL_SCOPES.to_vec()
+            default_scopes(Some(request.device_kind))
         } else {
             request.scopes.clone()
         };
@@ -349,6 +365,9 @@ impl Pairing {
         }
         if scopes.contains(&Scope::Approve) {
             can.push("answer approvals");
+        }
+        if scopes.contains(&Scope::Control) {
+            can.push("watch and use the agent's browser");
         }
         let request = ApprovalRequest {
             command: format!(
@@ -611,6 +630,53 @@ impl Pairing {
                 last_seen_ms: device.last_seen_ms,
             })
             .collect())
+    }
+
+    /// Change what a device may do. Its live access tokens change with it;
+    /// taking a scope away does not wait for them to expire.
+    pub async fn set_scopes(
+        &self,
+        device_id: &str,
+        scopes: &[Scope],
+    ) -> Result<bool, ProtocolError> {
+        let scopes: Vec<Scope> = scopes
+            .iter()
+            .copied()
+            .filter(|scope| *scope != Scope::Unknown)
+            .collect();
+        let changed = self
+            .log
+            .set_device_scopes(device_id, &scopes_text(&scopes))
+            .await
+            .map_err(internal)?;
+        if changed {
+            for access in self
+                .access
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values_mut()
+                .filter(|a| a.principal.device_id.as_deref() == Some(device_id))
+            {
+                access.principal.scopes = scopes.clone();
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Whether `principal` may use `scope` now: a device's scopes as they
+    /// are after any change since its socket opened.
+    pub fn may_now(&self, principal: &Principal, scope: Scope) -> bool {
+        let Some(device_id) = principal.device_id.as_deref() else {
+            return principal.may(scope);
+        };
+        if principal.revoked.is_cancelled() {
+            return false;
+        }
+        let access = self.access.lock().unwrap_or_else(|p| p.into_inner());
+        access
+            .values()
+            .find(|a| a.principal.device_id.as_deref() == Some(device_id))
+            .map_or_else(|| principal.may(scope), |a| a.principal.may(scope))
     }
 
     /// Revoke a device: its tokens stop working and its sockets close now.

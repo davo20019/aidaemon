@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use aidaemon_client_protocol::{
     Approval, AttachmentRef, CommandResult, ErrorCode, Event, Feature, HistoryMessage,
-    ProjectSummary, ServerFrame, SessionSummary, SetupState, Snapshot, TaskState, TaskSummary,
-    ToolCallInfo, TurnState, TurnStatus, ViewAction,
+    ProjectSummary, ServerFrame, SessionSummary, SetupState, Snapshot, SurfaceInfo, TaskState,
+    TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -118,6 +118,10 @@ pub struct State {
     /// Features the agent asked for and the owner has not answered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feature_requests: Vec<FeatureRequest>,
+    /// Live surfaces, by id (protocol 1.30, capability `surfaces`): the
+    /// screens the agent works on that the owner can watch or control.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub surfaces: BTreeMap<String, SurfaceInfo>,
 }
 
 /// The agent needs a feature that is off.
@@ -198,6 +202,11 @@ impl State {
         self.order.clear();
         self.approvals.clear();
         self.tasks.clear();
+        self.surfaces = state
+            .surfaces
+            .into_iter()
+            .map(|surface| (surface.id.clone(), surface))
+            .collect();
         for summary in state.sessions {
             let id = summary.id.clone();
             let mut view = transcripts.get(&id).cloned().unwrap_or_default();
@@ -390,6 +399,12 @@ impl State {
                     feature,
                     reason,
                 });
+            }
+            Event::SurfaceUpdated { surface } => {
+                self.surfaces.insert(surface.id.clone(), surface);
+            }
+            Event::SurfaceClosed { surface_id } => {
+                self.surfaces.remove(&surface_id);
             }
             Event::TurnStarted {
                 turn_id,

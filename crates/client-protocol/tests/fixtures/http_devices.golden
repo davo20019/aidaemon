@@ -9,7 +9,8 @@
     "scopes": [
       "observe",
       "chat",
-      "approve"
+      "approve",
+      "control"
     ]
   }
 ]

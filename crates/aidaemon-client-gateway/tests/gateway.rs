@@ -1754,6 +1754,9 @@ async fn no_view_action_can_resolve_an_approval() {
         },
         ViewAction::NewSession,
         ViewAction::ShowDevices,
+        ViewAction::ShowSurface {
+            surface_id: "srf_synthetic".into(),
+        },
         ViewAction::Unknown,
     ];
     // The list is every kind there is: adding one fails to compile here.
@@ -1765,6 +1768,7 @@ async fn no_view_action_can_resolve_an_approval() {
             | ViewAction::FocusPane { .. }
             | ViewAction::NewSession
             | ViewAction::ShowDevices
+            | ViewAction::ShowSurface { .. }
             | ViewAction::Unknown => {}
         }
     }
@@ -2148,4 +2152,318 @@ async fn only_app_conversations_take_a_model() {
             if session_model.model == ModelChoice::Auto && session_model.effort == Effort::Auto),
         "{read:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Live surfaces (protocol 1.30)
+// ---------------------------------------------------------------------------
+
+use aidaemon_client_protocol::media::{self, MediaClientMessage, MediaHeader, SurfaceInput};
+use aidaemon_surfaces::testing::MockSurface;
+use aidaemon_surfaces::{SurfaceRegistry, SurfacesConfig};
+
+async fn with_surfaces(f: &Fixture) -> (SurfaceRegistry, MockSurface, String) {
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let mock = MockSurface::new();
+    mock.set_notifier(registry.notifier());
+    registry.add_backend(Arc::new(mock.clone()));
+    let id = mock.add("app:surface-test", "tab-1");
+    registry.refresh().await;
+    f.gateway.attach_surfaces(registry.clone());
+    (registry, mock, id.to_string())
+}
+
+async fn media_socket(f: &Fixture, transport: &SurfaceTransport, ticket: &str) -> Socket {
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}{}", f.url, transport.url))
+            .await
+            .unwrap();
+    let auth = MediaClientMessage::Auth {
+        ticket: ticket.into(),
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&auth).unwrap()))
+        .await
+        .unwrap();
+    socket
+}
+
+/// The next binary message's header and payload.
+async fn media_next(socket: &mut Socket) -> (MediaHeader, Vec<u8>) {
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("a media message in time")
+            .expect("the socket open")
+            .unwrap();
+        if let Message::Binary(bytes) = message {
+            let (header, payload) = media::decode(&bytes).unwrap();
+            return (header, payload.to_vec());
+        }
+    }
+}
+
+async fn media_until_frame(socket: &mut Socket) -> (u64, Vec<u8>) {
+    loop {
+        if let (MediaHeader::Frame { seq, .. }, payload) = media_next(socket).await {
+            return (seq, payload);
+        }
+    }
+}
+
+async fn media_send(socket: &mut Socket, message: &MediaClientMessage) {
+    socket
+        .send(Message::text(serde_json::to_string(message).unwrap()))
+        .await
+        .unwrap();
+}
+
+fn opened(result: CommandResult) -> (String, SurfaceTransport) {
+    let CommandResult::SurfaceOpened {
+        live_id,
+        mut transports,
+        ..
+    } = result
+    else {
+        panic!("surface_opened, got {result:?}");
+    };
+    (live_id, transports.remove(0))
+}
+
+#[tokio::test]
+async fn a_surface_streams_the_newest_frame_and_takes_input_only_under_control() {
+    let f = fixture(RiskLevel::Medium).await;
+    let (registry, mock, surface_id) = with_surfaces(&f).await;
+    let mut socket = socket_with(&f, vec![Capability::ViewActions, Capability::Surfaces]).await;
+    let (listed, _) = command_on(&mut socket, &command("s-1", Command::ListSurfaces)).await;
+    assert!(
+        matches!(&listed, CommandResult::Surfaces { surfaces } if surfaces.len() == 1 && surfaces[0].id == surface_id),
+        "{listed:?}"
+    );
+    let (result, _) = command_on(
+        &mut socket,
+        &command(
+            "s-2",
+            Command::OpenSurface {
+                surface_id: surface_id.clone(),
+                mode: SurfaceMode::View,
+                accept: StreamAccept::default(),
+            },
+        ),
+    )
+    .await;
+    let (live_id, transport) = opened(result);
+    assert!(
+        !transport.url.contains(&transport.ticket),
+        "never in the URL"
+    );
+
+    // A wrong ticket is refused.
+    let mut wrong = media_socket(&f, &transport, "tkt_wrong").await;
+    assert!(matches!(
+        media_next(&mut wrong).await.0,
+        MediaHeader::Closed { .. }
+    ));
+
+    let mut media = media_socket(&f, &transport, &transport.ticket).await;
+    assert!(matches!(
+        media_next(&mut media).await.0,
+        MediaHeader::Ready { .. }
+    ));
+    assert!(matches!(
+        media_next(&mut media).await.0,
+        MediaHeader::Controller {
+            controller: SurfaceController::Agent
+        }
+    ));
+    // The ticket works once.
+    let mut again = media_socket(&f, &transport, &transport.ticket).await;
+    assert!(matches!(
+        media_next(&mut again).await.0,
+        MediaHeader::Closed { .. }
+    ));
+
+    let surface = aidaemon_surfaces::SurfaceId::from_string(surface_id.clone());
+    assert!(mock.push_frame(&surface, b"first"));
+    let (seq, payload) = media_until_frame(&mut media).await;
+    assert_eq!(payload, b"first");
+    // Unacked: newer frames wait, and only the newest is sent after the ack.
+    mock.push_frame(&surface, b"second");
+    mock.push_frame(&surface, b"third");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), media_until_frame(&mut media))
+            .await
+            .is_err(),
+        "no frame before the ack"
+    );
+    media_send(&mut media, &MediaClientMessage::Ack { seq }).await;
+    let (_, payload) = media_until_frame(&mut media).await;
+    assert_eq!(payload, b"third");
+
+    // Watching sends no input.
+    let typed = MediaClientMessage::Input {
+        event: SurfaceInput::Text {
+            text: "synthetic-secret".into(),
+        },
+    };
+    media_send(&mut media, &typed).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(mock.inputs().is_empty());
+
+    // Under control it does.
+    let (result, _) = command_on(
+        &mut socket,
+        &command(
+            "s-3",
+            Command::TakeControl {
+                surface_id: surface_id.clone(),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        matches!(&result, CommandResult::SurfaceControl { surface } if matches!(surface.controller, SurfaceController::Owner { .. })),
+        "{result:?}"
+    );
+    media_send(&mut media, &typed).await;
+    for _ in 0..50 {
+        if !mock.inputs().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(mock.inputs().len(), 1);
+
+    // Closing the view ends the stream; nothing typed was kept by the gateway.
+    let (result, _) = command_on(
+        &mut socket,
+        &command("s-4", Command::CloseSurface { live_id }),
+    )
+    .await;
+    assert!(matches!(result, CommandResult::Reply { .. }));
+    let (_, snapshot) = f.gateway.snapshot().await;
+    let snapshot = serde_json::to_string(&snapshot).unwrap();
+    assert!(!snapshot.contains("synthetic-secret"));
+    drop(registry);
+}
+
+#[tokio::test]
+async fn surfaces_need_the_control_scope_and_a_scope_change_applies_at_once() {
+    let f = fixture(RiskLevel::Medium).await;
+    let (_registry, _mock, surface_id) = with_surfaces(&f).await;
+    let phone = f
+        .pair(vec![Scope::Observe, Scope::Chat, Scope::Approve])
+        .await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let open = command(
+        "c-1",
+        Command::OpenSurface {
+            surface_id: surface_id.clone(),
+            mode: SurfaceMode::View,
+            accept: StreamAccept::default(),
+        },
+    );
+    let refused = f.post_as(&grant.access_token, &open).await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    let snapshot = f
+        .post_as(&grant.access_token, &command("c-2", Command::GetSnapshot))
+        .await;
+    assert!(
+        matches!(&snapshot, ServerFrame::Ack { result: CommandResult::Snapshot { state, .. }, .. } if state.surfaces.is_empty()),
+        "a device without control sees no surfaces"
+    );
+    // The owner grants it: the same token may now.
+    let devices: Vec<DeviceInfo> = f
+        .owner_post(
+            &format!("/client/v1/devices/{}/scopes", phone.device_id),
+            serde_json::json!({"scopes": ["observe", "chat", "approve", "control"]}),
+        )
+        .await;
+    assert!(devices[0].scopes.contains(&Scope::Control));
+    let allowed = f
+        .post_as(
+            &grant.access_token,
+            &command(
+                "c-3",
+                Command::OpenSurface {
+                    surface_id,
+                    mode: SurfaceMode::View,
+                    accept: StreamAccept::default(),
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            &allowed,
+            ServerFrame::Ack {
+                result: CommandResult::SurfaceOpened { .. },
+                ..
+            }
+        ),
+        "{allowed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_phone_pairs_with_control_by_default() {
+    let f = fixture(RiskLevel::Medium).await;
+    let phone = f.pair(Vec::new()).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    assert!(grant.scopes.contains(&Scope::Control));
+}
+
+#[tokio::test]
+async fn a_handoff_brings_the_surface_forward_and_control_waits_for_it_when_off() {
+    let f = fixture(RiskLevel::Medium).await;
+    let registry = SurfaceRegistry::new(SurfacesConfig {
+        control_anytime: false,
+        ..SurfacesConfig::default()
+    });
+    let mock = MockSurface::new();
+    mock.set_notifier(registry.notifier());
+    registry.add_backend(Arc::new(mock.clone()));
+    f.gateway.attach_surfaces(registry.clone());
+    let mut socket = socket_with(&f, vec![Capability::ViewActions, Capability::Surfaces]).await;
+    // A message makes this socket the session's view target.
+    let (accepted, _) = command_on(&mut socket, &command("h-0", send("open the site"))).await;
+    let CommandResult::MessageAccepted { session_id, .. } = accepted else {
+        panic!("{accepted:?}");
+    };
+    let surface = mock.add(&session_id, "tab-1");
+    registry.refresh().await;
+    let take = command(
+        "h-1",
+        Command::TakeControl {
+            surface_id: surface.to_string(),
+        },
+    );
+    let refused = f.post(&[], &take).await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    registry.begin_handoff(&surface).unwrap();
+    let actions = view_actions_within(&mut socket, Duration::from_millis(800)).await;
+    assert!(
+        actions.contains(&ViewAction::ShowSurface {
+            surface_id: surface.to_string()
+        }),
+        "{actions:?}"
+    );
+    let allowed = f
+        .post(
+            &[],
+            &command(
+                "h-2",
+                Command::TakeControl {
+                    surface_id: surface.to_string(),
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(allowed, ServerFrame::Ack { .. }), "{allowed:?}");
 }

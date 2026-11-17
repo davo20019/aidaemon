@@ -23,6 +23,7 @@ aidaemon-client-protocol = { version = "0.20.0", path = "../client-protocol" }
 aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
 aidaemon-events = { version = "0.20.0", path = "../aidaemon-events" }
 aidaemon-store-sqlite = { version = "0.20.0", path = "../aidaemon-store-sqlite", features = ["client-events"] }
+aidaemon-surfaces = { version = "0.20.0", path = "../aidaemon-surfaces" }
 aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-trait = "0.1"
@@ -44,6 +45,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 aidaemon-client-core = { path = "../aidaemon-client-core" }
+aidaemon-surfaces = { path = "../aidaemon-surfaces", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 rand = "0.10"
 aidaemon-channels = { path = "../aidaemon-channels", features = ["testing"] }

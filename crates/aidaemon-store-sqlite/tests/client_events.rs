@@ -198,3 +198,69 @@ async fn devices_are_listed_and_revoked_once() {
     assert!(!log.revoke_device("d1", 10).await.unwrap());
     assert_eq!(log.devices().await.unwrap()[0].revoked_at_ms, Some(9));
 }
+
+fn device(id: &str, kind: &str, scopes: &str) -> aidaemon_store_sqlite::DeviceRow {
+    aidaemon_store_sqlite::DeviceRow {
+        device_id: id.into(),
+        name: format!("Synthetic {kind}"),
+        kind: kind.into(),
+        public_key: "pk".into(),
+        scopes: scopes.into(),
+        risk_ceiling: None,
+        created_at_ms: 1,
+        last_seen_ms: None,
+        revoked_at_ms: None,
+    }
+}
+
+/// Phones and computers paired before the control scope existed get it once,
+/// on the first open after the upgrade; a watch, a narrowed device and a
+/// device the owner later took it from do not.
+#[tokio::test]
+async fn paired_phones_and_computers_get_control_once() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    // A database from before the upgrade: devices exist, no upgrade marker.
+    let log = SqliteClientEventLog::open(pool.clone()).await.unwrap();
+    for row in [
+        device("phone", "mobile", "observe,chat,approve"),
+        device("laptop", "desktop", "observe,chat,approve"),
+        device("watch", "watch", "observe,chat,approve"),
+        device("narrow", "mobile", "observe,approve"),
+    ] {
+        log.add_device(&row).await.unwrap();
+    }
+    sqlx::query("DELETE FROM client_upgrades")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let log = SqliteClientEventLog::open(pool.clone()).await.unwrap();
+    let scopes = |log: SqliteClientEventLog, id: &'static str| async move {
+        log.device(id).await.unwrap().unwrap().scopes
+    };
+    assert_eq!(
+        scopes(log.clone(), "phone").await,
+        "observe,chat,approve,control"
+    );
+    assert_eq!(
+        scopes(log.clone(), "laptop").await,
+        "observe,chat,approve,control"
+    );
+    assert_eq!(scopes(log.clone(), "watch").await, "observe,chat,approve");
+    assert_eq!(scopes(log.clone(), "narrow").await, "observe,approve");
+    // The owner takes it away; opening again never adds it back.
+    assert!(
+        log.set_device_scopes("phone", "observe,chat,approve")
+            .await
+            .unwrap()
+    );
+    let log = SqliteClientEventLog::open(pool).await.unwrap();
+    assert_eq!(scopes(log.clone(), "phone").await, "observe,chat,approve");
+    assert!(!log.set_device_scopes("missing", "observe").await.unwrap());
+}

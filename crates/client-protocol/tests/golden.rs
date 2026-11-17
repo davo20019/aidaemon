@@ -81,11 +81,57 @@ fn project() -> ProjectSummary {
     }
 }
 
+fn handoff() -> Approval {
+    Approval {
+        id: "a-7f3e-2".into(),
+        session_id: "app:6c1f".into(),
+        kind: ApprovalKind::Handoff,
+        risk: Risk::Low,
+        summary: "Sign in to login.acme.example, then press Done.".into(),
+        detail: None,
+        card: Some(ApprovalCard {
+            asked_by: None,
+            action: CardAction::TakeOver {
+                surface_id: "srf_7d1c".into(),
+                what: "Sign in to your Acme account".into(),
+                site: Some("login.acme.example".into()),
+                keeps_sign_in: Some(true),
+            },
+            reason: None,
+            impact: None,
+        }),
+        warnings: vec![],
+        options: vec![ApprovalDecision::ApproveOnce, ApprovalDecision::Deny],
+        requested_at_ms: 1_767_225_600_000,
+        expires_at_ms: None,
+        channel: None,
+    }
+}
+
+fn surface() -> SurfaceInfo {
+    SurfaceInfo {
+        id: "srf_7d1c".into(),
+        kind: SurfaceKind::BrowserTab,
+        session_id: Some("app:6c1f".into()),
+        title: "Sign in - Acme".into(),
+        site: Some("login.acme.example".into()),
+        width: 1280,
+        height: 720,
+        controller: SurfaceController::Owner {
+            device_id: "dev-phone-1".into(),
+            device: Some("Synthetic phone".into()),
+        },
+        handoff_pending: true,
+        interactive: true,
+        opener: None,
+    }
+}
+
 fn snapshot() -> Snapshot {
     Snapshot {
         sessions: vec![session()],
         running_tasks: vec![task()],
-        pending_approvals: vec![approval()],
+        pending_approvals: vec![approval(), handoff()],
         live_turns: vec![LiveTurnState {
             session_id: "app:synthetic-1".into(),
             turn_id: "turn-7".into(),
@@ -98,6 +144,7 @@ fn snapshot() -> Snapshot {
             }),
             tools: vec!["terminal".into()],
         }],
+        surfaces: vec![surface()],
     }
 }
 
@@ -149,6 +196,11 @@ fn command_name(command: &Command) -> &'static str {
         Command::RevertFile { .. } => "revert_file",
         Command::ListQueued { .. } => "list_queued",
         Command::EditQueued { .. } => "edit_queued",
+        Command::ListSurfaces => "list_surfaces",
+        Command::OpenSurface { .. } => "open_surface",
+        Command::CloseSurface { .. } => "close_surface",
+        Command::TakeControl { .. } => "take_control",
+        Command::ReleaseControl { .. } => "release_control",
         Command::Unknown => "unknown",
     }
 }
@@ -190,6 +242,9 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Models { .. } => "models",
         CommandResult::SessionModel { .. } => "session_model",
         CommandResult::Queued { .. } => "queued",
+        CommandResult::Surfaces { .. } => "surfaces",
+        CommandResult::SurfaceOpened { .. } => "surface_opened",
+        CommandResult::SurfaceControl { .. } => "surface_control",
         CommandResult::Unknown => "unknown",
     }
 }
@@ -451,6 +506,39 @@ fn client_samples() -> Vec<ClientFrame> {
                 text: Some("Also check the footer".into()),
             },
         ),
+        command("5d0c2b1e-0026", Command::ListSurfaces),
+        command(
+            "5d0c2b1e-0027",
+            Command::OpenSurface {
+                surface_id: "srf_7d1c".into(),
+                mode: SurfaceMode::Control,
+                accept: StreamAccept {
+                    codecs: vec!["jpeg".into()],
+                    max_w: Some(1080),
+                    max_h: None,
+                    max_fps: Some(8),
+                    quality: Some(60),
+                },
+            },
+        ),
+        command(
+            "5d0c2b1e-0028",
+            Command::CloseSurface {
+                live_id: "live_3a9f".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-0029",
+            Command::TakeControl {
+                surface_id: "srf_7d1c".into(),
+            },
+        ),
+        command(
+            "5d0c2b1e-002a",
+            Command::ReleaseControl {
+                surface_id: "srf_7d1c".into(),
+            },
+        ),
         command("5d0c2b1e-000b", Command::Unknown),
         ClientFrame::Ping,
     ]
@@ -668,6 +756,18 @@ fn server_samples() -> Vec<ServerFrame> {
                 session_id: "app:6c1f".into(),
                 feature: Feature::Browser,
                 reason: "to read the synthetic report page".into(),
+            },
+        ),
+        event(
+            None,
+            Event::SurfaceUpdated {
+                surface: surface(),
+            },
+        ),
+        event(
+            None,
+            Event::SurfaceClosed {
+                surface_id: "srf_7d1c".into(),
             },
         ),
         ack(CommandResult::MessageAccepted {
@@ -1080,6 +1180,25 @@ fn server_samples() -> Vec<ServerFrame> {
                 after: true,
             }],
         }),
+        ack(CommandResult::Surfaces {
+            surfaces: vec![surface()],
+        }),
+        ack(CommandResult::SurfaceOpened {
+            live_id: "live_3a9f".into(),
+            surface: surface(),
+            transports: vec![SurfaceTransport {
+                kind: TransportKind::WsFrames,
+                url: "/client/v1/surfaces/live_3a9f/ws".into(),
+                ticket: "tkt_synthetic_0001".into(),
+                codecs: vec!["jpeg".into()],
+            }],
+        }),
+        ack(CommandResult::SurfaceControl {
+            surface: SurfaceInfo {
+                controller: SurfaceController::Agent,
+                ..surface()
+            },
+        }),
         ack(CommandResult::Unknown),
         ServerFrame::Error {
             request_id: Some("5d0c2b1e-0003".into()),
@@ -1357,6 +1476,9 @@ fn every_view_action_round_trips_and_carries_no_decision() {
         ViewAction::FocusPane { pane: Pane::Tasks },
         ViewAction::NewSession,
         ViewAction::ShowDevices,
+        ViewAction::ShowSurface {
+            surface_id: "srf_7d1c".into(),
+        },
     ];
     for action in actions {
         match &action {
@@ -1366,6 +1488,7 @@ fn every_view_action_round_trips_and_carries_no_decision() {
             | ViewAction::FocusPane { .. }
             | ViewAction::NewSession
             | ViewAction::ShowDevices
+            | ViewAction::ShowSurface { .. }
             | ViewAction::Unknown => {}
         }
         let value = serde_json::to_value(&action).unwrap();

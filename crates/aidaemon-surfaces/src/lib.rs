@@ -24,7 +24,8 @@ mod types;
 pub mod testing;
 
 pub use registry::{
-    LiveMode, LiveSession, SurfaceChange, SurfaceNotifier, SurfaceRegistry, SurfacesConfig,
+    LiveMode, LiveReceivers, LiveSession, SurfaceChange, SurfaceNotifier, SurfaceRegistry,
+    SurfacesConfig,
 };
 pub use types::{
     Codec, Controller, ExclusiveGuard, Frame, FrameSink, HandoffPrep, InputEvent, KeyAction,

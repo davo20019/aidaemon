@@ -292,6 +292,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-events",
  "aidaemon-store-sqlite",
+ "aidaemon-surfaces",
  "aidaemon-tools",
  "anyhow",
  "async-trait",

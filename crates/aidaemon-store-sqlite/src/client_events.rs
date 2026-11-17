@@ -64,7 +64,14 @@ CREATE TABLE IF NOT EXISTS client_devices (
     last_seen_ms  INTEGER,
     revoked_at_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS client_upgrades (
+    name TEXT PRIMARY KEY NOT NULL
+);
 "#;
+
+/// Device kinds that get the `control` scope (watching and controlling live
+/// surfaces) by default: phones and computers, never a watch or a script.
+pub const CONTROL_SCOPE_KINDS: [&str; 4] = ["mobile", "desktop", "web", "tui"];
 
 /// One pairing offer and, once redeemed, the device asking to pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +141,63 @@ impl SqliteClientEventLog {
     /// Use `pool`, creating the tables if they are not there.
     pub async fn open(pool: SqlitePool) -> Result<Self, Error> {
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        Ok(Self { pool })
+        let log = Self { pool };
+        log.grant_control_once().await?;
+        Ok(log)
+    }
+
+    /// Once per database: phones and computers paired before the `control`
+    /// scope existed, holding every scope a phone had then, get it too. The
+    /// owner can take it away after, and it is never added back.
+    async fn grant_control_once(&self) -> Result<(), Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let first =
+            sqlx::query("INSERT OR IGNORE INTO client_upgrades (name) VALUES ('scope_control')")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                == 1;
+        if first {
+            let rows = sqlx::query(
+                "SELECT device_id, kind, scopes FROM client_devices WHERE revoked_at_ms IS NULL",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            for row in rows {
+                let kind: String = row.get("kind");
+                let scopes: String = row.get("scopes");
+                let held: Vec<&str> = scopes.split(',').collect();
+                let phone_scopes = ["observe", "chat", "approve"]
+                    .iter()
+                    .all(|scope| held.contains(scope));
+                if CONTROL_SCOPE_KINDS.contains(&kind.as_str())
+                    && phone_scopes
+                    && !held.contains(&"control")
+                {
+                    let device_id: String = row.get("device_id");
+                    sqlx::query("UPDATE client_devices SET scopes = ?2 WHERE device_id = ?1")
+                        .bind(&device_id)
+                        .bind(format!("{scopes},control"))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replace a device's scopes (comma-separated); returns whether the
+    /// device exists and is not revoked.
+    pub async fn set_device_scopes(&self, device_id: &str, scopes: &str) -> Result<bool, Error> {
+        let done = sqlx::query(
+            "UPDATE client_devices SET scopes = ?2 WHERE device_id = ?1 AND revoked_at_ms IS NULL",
+        )
+        .bind(device_id)
+        .bind(scopes)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
     }
 
     pub fn pool(&self) -> &SqlitePool {

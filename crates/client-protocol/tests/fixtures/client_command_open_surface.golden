@@ -1,0 +1,17 @@
+{
+  "command": {
+    "accept": {
+      "codecs": [
+        "jpeg"
+      ],
+      "max_fps": 8,
+      "max_w": 1080,
+      "quality": 60
+    },
+    "mode": "control",
+    "surface_id": "srf_7d1c",
+    "type": "open_surface"
+  },
+  "request_id": "5d0c2b1e-0027",
+  "type": "command"
+}

@@ -53,6 +53,7 @@ mod observer;
 pub mod pairing;
 mod server;
 pub mod setup;
+pub mod surfaces;
 pub mod token;
 pub mod views;
 
@@ -454,6 +455,8 @@ pub struct ClientGateway {
     /// Requests being handled now, so a retry waits for the first answer.
     in_flight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) files: Option<Arc<files::FileStore>>,
+    /// Live surfaces, once the daemon attaches its registry.
+    pub(crate) surfaces: std::sync::OnceLock<Arc<surfaces::SurfaceDesk>>,
 }
 
 impl ClientGateway {
@@ -596,6 +599,7 @@ impl ClientGateway {
             views: Arc::default(),
             in_flight: Mutex::default(),
             files: deps.files,
+            surfaces: std::sync::OnceLock::new(),
         });
         let upkeep = Arc::downgrade(&gateway);
         tokio::spawn(async move {
@@ -634,6 +638,20 @@ impl ClientGateway {
 
     pub fn bus(&self) -> &EventBus {
         &self.bus
+    }
+
+    /// Offer live surfaces to the owner's apps (protocol 1.30): their
+    /// events, the surface commands and the frame socket. Once only.
+    pub fn attach_surfaces(&self, registry: aidaemon_surfaces::SurfaceRegistry) {
+        let desk = surfaces::SurfaceDesk::new(registry);
+        if self.surfaces.set(desk.clone()).is_ok() {
+            desk.spawn_pump(self.publisher.clone(), self.views.clone());
+        }
+    }
+
+    /// The surfaces desk, when surfaces are attached and turned on.
+    pub(crate) fn surface_desk(&self) -> Option<Arc<surfaces::SurfaceDesk>> {
+        self.surfaces.get().filter(|desk| desk.enabled()).cloned()
     }
 
     pub fn owner(&self) -> OwnerInfo {
@@ -797,10 +815,15 @@ impl ClientGateway {
             | Command::UploadFile { .. }
             | Command::ChangeSettings { .. }
             | Command::Setup { .. } => Some(Scope::Chat),
+            Command::ListSurfaces => Some(Scope::Observe),
+            Command::OpenSurface { .. }
+            | Command::CloseSurface { .. }
+            | Command::TakeControl { .. }
+            | Command::ReleaseControl { .. } => Some(Scope::Control),
             Command::Unknown => None,
         };
         if let Some(scope) = needs
-            && !caller.principal.may(scope)
+            && !self.pairing.may_now(&caller.principal, scope)
         {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
@@ -991,7 +1014,10 @@ impl ClientGateway {
                 glance: self.glance(caller.compact).await,
             }),
             Command::GetSnapshot => {
-                let (seq, state) = self.snapshot().await;
+                let (seq, mut state) = self.snapshot().await;
+                if !self.pairing.may_now(&caller.principal, Scope::Control) {
+                    state.surfaces.clear();
+                }
                 Ok(CommandResult::Snapshot { seq, state })
             }
             Command::GetSystem => match self.host.system().await {
@@ -1250,11 +1276,46 @@ impl ClientGateway {
                 );
                 Ok(CommandResult::Setup { setup })
             }
+            Command::ListSurfaces => Ok(CommandResult::Surfaces {
+                surfaces: self
+                    .surface_desk()
+                    .map(|desk| desk.list())
+                    .unwrap_or_default(),
+            }),
+            Command::OpenSurface {
+                surface_id,
+                mode,
+                accept,
+            } => {
+                self.need_surfaces()?
+                    .open(&caller.principal, surface_id, mode, accept)
+                    .await
+            }
+            Command::CloseSurface { live_id } => {
+                self.need_surfaces()?.close(&caller.principal, &live_id)
+            }
+            Command::TakeControl { surface_id } => {
+                self.need_surfaces()?
+                    .take(&caller.principal, surface_id)
+                    .await
+            }
+            Command::ReleaseControl { surface_id } => {
+                self.need_surfaces()?.release(&caller.principal, surface_id)
+            }
             Command::Unknown => Err(ProtocolError::new(
                 ErrorCode::Invalid,
                 "Unknown command for this gateway version",
             )),
         }
+    }
+
+    fn need_surfaces(&self) -> Result<Arc<surfaces::SurfaceDesk>, ProtocolError> {
+        self.surface_desk().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Forbidden,
+                "Watching the agent's screens is turned off in Settings",
+            )
+        })
     }
 
     /// A settings change from a client: made now, or after the owner
@@ -1934,6 +1995,10 @@ impl ClientGateway {
                 running_tasks: self.running_tasks().await,
                 pending_approvals: self.approvals.pending(),
                 live_turns: self.live_turns(),
+                surfaces: self
+                    .surface_desk()
+                    .map(|desk| desk.list())
+                    .unwrap_or_default(),
             },
         )
     }

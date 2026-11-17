@@ -234,6 +234,11 @@
           "const": "autopilot_confirmation",
           "description": "Confirm an Autopilot posture.",
           "type": "string"
+        },
+        {
+          "const": "handoff",
+          "description": "The agent asks the owner to do something themselves on a surface\n(protocol 1.30): `approve_once` means done, `deny` means not now.",
+          "type": "string"
         }
       ]
     },
@@ -629,6 +634,11 @@
           "const": "view_actions",
           "description": "The agent may move this connection's view (`view_action` events):\nopen a session, show an approval or a piece of work, focus a pane.\nSent only to the connection whose message started the turn, never\nreplayed, and never able to answer, pair, send or stop anything.",
           "type": "string"
+        },
+        {
+          "const": "surfaces",
+          "description": "Live surfaces (protocol 1.30): `snapshot.surfaces`,\n`surface_updated` and `surface_closed` events, and the surface\ncommands. Watching and controlling a surface also needs\n[`Scope::Control`].",
+          "type": "string"
         }
       ]
     },
@@ -706,6 +716,40 @@
           },
           "required": [
             "kind",
+            "what"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Do something on a surface yourself (protocol 1.30): sign in, enter\na code. `what` is the agent's few words; `site` the host only.",
+          "properties": {
+            "keeps_sign_in": {
+              "description": "Whether a sign-in made there is kept for later tasks.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "take_over",
+              "type": "string"
+            },
+            "site": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "surface_id": {
+              "type": "string"
+            },
+            "what": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "surface_id",
             "what"
           ],
           "type": "object"
@@ -1839,6 +1883,95 @@
             "message_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "Every live surface now (protocol 1.30, capability `surfaces`).\nAnswers with `surfaces`.",
+          "properties": {
+            "type": {
+              "const": "list_surfaces",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Watch a surface, and with `mode: control` take control of it\n(protocol 1.30; needs scope `control`). Answers with\n`surface_opened`: where to connect for frames.",
+          "properties": {
+            "accept": {
+              "$ref": "#/$defs/StreamAccept",
+              "default": {}
+            },
+            "mode": {
+              "$ref": "#/$defs/SurfaceMode"
+            },
+            "surface_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "open_surface",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id",
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stop watching (protocol 1.30). Answers with `reply`.",
+          "properties": {
+            "live_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "close_surface",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "live_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Take control of a surface (protocol 1.30; scope `control`).\nAnswers with `surface_control`.",
+          "properties": {
+            "surface_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "take_control",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Give a surface back to the agent (protocol 1.30). Answers with\n`surface_control`.",
+          "properties": {
+            "surface_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "release_control",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2312,6 +2445,71 @@
             "type",
             "session_id",
             "messages"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`list_surfaces` (protocol 1.30).",
+          "properties": {
+            "surfaces": {
+              "items": {
+                "$ref": "#/$defs/SurfaceInfo"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "surfaces",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surfaces"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`open_surface` (protocol 1.30): connect to one of `transports`.",
+          "properties": {
+            "live_id": {
+              "type": "string"
+            },
+            "surface": {
+              "$ref": "#/$defs/SurfaceInfo"
+            },
+            "transports": {
+              "items": {
+                "$ref": "#/$defs/SurfaceTransport"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "surface_opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "live_id",
+            "surface",
+            "transports"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`take_control` and `release_control` (protocol 1.30): the surface\nas it is after.",
+          "properties": {
+            "surface": {
+              "$ref": "#/$defs/SurfaceInfo"
+            },
+            "type": {
+              "const": "surface_control",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface"
           ],
           "type": "object"
         }
@@ -3057,6 +3255,40 @@
             "reason"
           ],
           "type": "object"
+        },
+        {
+          "description": "Ephemeral, capability `surfaces` (protocol 1.30): a surface appeared\nor changed (title, site, controller, handoff).",
+          "properties": {
+            "surface": {
+              "$ref": "#/$defs/SurfaceInfo"
+            },
+            "type": {
+              "const": "surface_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral, capability `surfaces` (protocol 1.30).",
+          "properties": {
+            "surface_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "surface_closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3604,6 +3836,173 @@
         "enabled"
       ],
       "type": "object"
+    },
+    "MediaClientMessage": {
+      "description": "A text message from the client.",
+      "oneOf": [
+        {
+          "description": "The first message: the ticket from `surface_opened`.",
+          "properties": {
+            "ticket": {
+              "type": "string"
+            },
+            "type": {
+              "const": "auth",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ticket"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The client drew frame `seq` and can take the next.",
+          "properties": {
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "ack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "seq"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Input for the surface. Only the controlling device's input is\napplied; anything else is dropped.",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/SurfaceInput"
+            },
+            "type": {
+              "const": "input",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MediaHeader": {
+      "description": "The header of one binary message from the server.",
+      "oneOf": [
+        {
+          "description": "A picture of the surface; the payload is its encoded bytes.",
+          "properties": {
+            "at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "codec": {
+              "type": "string"
+            },
+            "h": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "key": {
+              "description": "Stands alone.",
+              "type": "boolean"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "frame",
+              "type": "string"
+            },
+            "v": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "w": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "v",
+            "seq",
+            "at_ms",
+            "codec",
+            "w",
+            "h",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Who controls the surface now.",
+          "properties": {
+            "controller": {
+              "$ref": "#/$defs/SurfaceController"
+            },
+            "type": {
+              "const": "controller",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "controller"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The authenticated session is ready; frames follow.",
+          "properties": {
+            "surface_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The session ended; the server closes the socket next.",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "MemoryItem": {
       "description": "One remembered fact.",
@@ -4284,6 +4683,11 @@
         {
           "const": "approve",
           "description": "Answer approvals (within the device's risk ceiling).",
+          "type": "string"
+        },
+        {
+          "const": "control",
+          "description": "Watch and control live surfaces: the agent's browser, the screen\n(protocol 1.30).",
           "type": "string"
         }
       ]
@@ -5502,6 +5906,13 @@
             "$ref": "#/$defs/SessionSummary"
           },
           "type": "array"
+        },
+        "surfaces": {
+          "description": "Live surfaces (protocol 1.30, capability `surfaces`).",
+          "items": {
+            "$ref": "#/$defs/SurfaceInfo"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -5518,6 +5929,350 @@
         "failed"
       ],
       "type": "string"
+    },
+    "StreamAccept": {
+      "description": "What a viewer can take (protocol 1.30). Every field is a ceiling; the\ndaemon may send less.",
+      "properties": {
+        "codecs": {
+          "description": "Codecs the client can draw, best first (`jpeg`, `png`). Empty: `jpeg`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_fps": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_h": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_w": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "quality": {
+          "description": "10 to 100.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SurfaceController": {
+      "description": "Who acts on a surface now (protocol 1.30).",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "agent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner, from one device.",
+          "properties": {
+            "device": {
+              "description": "The device's name, when the gateway knows it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "device_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "owner",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "device_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SurfaceInfo": {
+      "description": "A screen the agent works on that the owner can watch and control\n(protocol 1.30).",
+      "properties": {
+        "controller": {
+          "$ref": "#/$defs/SurfaceController"
+        },
+        "handoff_pending": {
+          "default": false,
+          "description": "The agent asked the owner to do something here and waits.",
+          "type": "boolean"
+        },
+        "height": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "interactive": {
+          "default": false,
+          "description": "Whether it takes pointer, key and text input.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/SurfaceKind"
+        },
+        "opener": {
+          "description": "A popup's parent surface.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "description": "The conversation it belongs to.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "site": {
+          "description": "The host only, never a path or a query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "From the page; show it as data, never as the app's own words.",
+          "type": "string"
+        },
+        "width": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "title",
+        "width",
+        "height",
+        "controller"
+      ],
+      "type": "object"
+    },
+    "SurfaceInput": {
+      "description": "Input for a surface. Coordinates are fractions of the frame (0 to 1).",
+      "oneOf": [
+        {
+          "properties": {
+            "action": {
+              "description": "`down`, `move`, `up` or `cancel`.",
+              "type": "string"
+            },
+            "button": {
+              "description": "`left` (default), `right` or `middle`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "pointer",
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": "number"
+            },
+            "y": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "action",
+            "x",
+            "y"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "dx": {
+              "default": 0.0,
+              "format": "double",
+              "type": "number"
+            },
+            "dy": {
+              "default": 0.0,
+              "format": "double",
+              "type": "number"
+            },
+            "type": {
+              "const": "wheel",
+              "type": "string"
+            },
+            "x": {
+              "format": "double",
+              "type": "number"
+            },
+            "y": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "x",
+            "y"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "description": "`down` or `up`.",
+              "type": "string"
+            },
+            "code": {
+              "description": "`KeyboardEvent.code`: `KeyA`, `Enter`, `Backspace`.",
+              "type": "string"
+            },
+            "key": {
+              "default": "",
+              "description": "`KeyboardEvent.key`.",
+              "type": "string"
+            },
+            "mods": {
+              "description": "`shift`, `ctrl`, `alt`, `meta`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "key",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "action",
+            "code"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Committed text (a phone keyboard, a paste, a password manager).",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SurfaceKind": {
+      "description": "What kind of screen a surface is (protocol 1.30).",
+      "oneOf": [
+        {
+          "enum": [
+            "window",
+            "node"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "browser_tab",
+          "description": "A tab of the agent's browser.",
+          "type": "string"
+        },
+        {
+          "const": "desktop",
+          "description": "A whole display of the daemon's computer.",
+          "type": "string"
+        }
+      ]
+    },
+    "SurfaceMode": {
+      "description": "How a client opens a surface (protocol 1.30).",
+      "oneOf": [
+        {
+          "const": "view",
+          "description": "Watch; input is off.",
+          "type": "string"
+        },
+        {
+          "const": "control",
+          "description": "Watch and take control.",
+          "type": "string"
+        }
+      ]
+    },
+    "SurfaceTransport": {
+      "description": "Where a client connects for a live session's frames (protocol 1.30).",
+      "properties": {
+        "codecs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/TransportKind"
+        },
+        "ticket": {
+          "description": "Sent as the first message on the socket, never in the URL. Single\nuse, short lived, bound to this device and live session.",
+          "type": "string"
+        },
+        "url": {
+          "description": "A path on the gateway's own origin.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "url",
+        "ticket",
+        "codecs"
+      ],
+      "type": "object"
     },
     "SystemStatus": {
       "description": "How the daemon itself is doing, for the app's System area.",
@@ -5756,6 +6511,15 @@
         {
           "const": "change",
           "description": "Any other change.",
+          "type": "string"
+        }
+      ]
+    },
+    "TransportKind": {
+      "oneOf": [
+        {
+          "const": "ws_frames",
+          "description": "A WebSocket of binary frames (see [`media`]).",
           "type": "string"
         }
       ]
@@ -6068,6 +6832,23 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Bring a surface's viewer forward (protocol 1.30). It opens no\nstream and takes no control.",
+          "properties": {
+            "kind": {
+              "const": "show_surface",
+              "type": "string"
+            },
+            "surface_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "surface_id"
           ],
           "type": "object"
         }

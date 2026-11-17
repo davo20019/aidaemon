@@ -1,0 +1,21 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "surface": {
+      "controller": {
+        "kind": "agent"
+      },
+      "handoff_pending": true,
+      "height": 720,
+      "id": "srf_7d1c",
+      "interactive": true,
+      "kind": "browser_tab",
+      "session_id": "app:6c1f",
+      "site": "login.acme.example",
+      "title": "Sign in - Acme",
+      "width": 1280
+    },
+    "type": "surface_control"
+  },
+  "type": "ack"
+}

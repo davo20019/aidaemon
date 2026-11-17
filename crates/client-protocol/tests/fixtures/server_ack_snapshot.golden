@@ -54,6 +54,27 @@
           "warnings": [
             "Sends data outside this computer."
           ]
+        },
+        {
+          "card": {
+            "action": {
+              "keeps_sign_in": true,
+              "kind": "take_over",
+              "site": "login.acme.example",
+              "surface_id": "srf_7d1c",
+              "what": "Sign in to your Acme account"
+            }
+          },
+          "id": "a-7f3e-2",
+          "kind": "handoff",
+          "options": [
+            "approve_once",
+            "deny"
+          ],
+          "requested_at_ms": 1767225600000,
+          "risk": "low",
+          "session_id": "app:6c1f",
+          "summary": "Sign in to login.acme.example, then press Done."
         }
       ],
       "running_tasks": [
@@ -74,6 +95,24 @@
           "project_id": "project-acme",
           "title": "Synthetic report for Alice Rivera",
           "writable": true
+        }
+      ],
+      "surfaces": [
+        {
+          "controller": {
+            "device": "Synthetic phone",
+            "device_id": "dev-phone-1",
+            "kind": "owner"
+          },
+          "handoff_pending": true,
+          "height": 720,
+          "id": "srf_7d1c",
+          "interactive": true,
+          "kind": "browser_tab",
+          "session_id": "app:6c1f",
+          "site": "login.acme.example",
+          "title": "Sign in - Acme",
+          "width": 1280
         }
       ]
     },

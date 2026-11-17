@@ -32,10 +32,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod media;
+
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 29;
+pub const PROTOCOL_MINOR: u16 = 30;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -199,6 +201,11 @@ pub enum Capability {
     /// Sent only to the connection whose message started the turn, never
     /// replayed, and never able to answer, pair, send or stop anything.
     ViewActions,
+    /// Live surfaces (protocol 1.30): `snapshot.surfaces`,
+    /// `surface_updated` and `surface_closed` events, and the surface
+    /// commands. Watching and controlling a surface also needs
+    /// [`Scope::Control`].
+    Surfaces,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -448,6 +455,140 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Every live surface now (protocol 1.30, capability `surfaces`).
+    /// Answers with `surfaces`.
+    ListSurfaces,
+    /// Watch a surface, and with `mode: control` take control of it
+    /// (protocol 1.30; needs scope `control`). Answers with
+    /// `surface_opened`: where to connect for frames.
+    OpenSurface {
+        surface_id: String,
+        mode: SurfaceMode,
+        #[serde(default)]
+        accept: StreamAccept,
+    },
+    /// Stop watching (protocol 1.30). Answers with `reply`.
+    CloseSurface { live_id: String },
+    /// Take control of a surface (protocol 1.30; scope `control`).
+    /// Answers with `surface_control`.
+    TakeControl { surface_id: String },
+    /// Give a surface back to the agent (protocol 1.30). Answers with
+    /// `surface_control`.
+    ReleaseControl { surface_id: String },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// How a client opens a surface (protocol 1.30).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceMode {
+    /// Watch; input is off.
+    #[default]
+    View,
+    /// Watch and take control.
+    Control,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// What a viewer can take (protocol 1.30). Every field is a ceiling; the
+/// daemon may send less.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct StreamAccept {
+    /// Codecs the client can draw, best first (`jpeg`, `png`). Empty: `jpeg`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_h: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fps: Option<u32>,
+    /// 10 to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
+}
+
+/// A screen the agent works on that the owner can watch and control
+/// (protocol 1.30).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SurfaceInfo {
+    pub id: String,
+    pub kind: SurfaceKind,
+    /// The conversation it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// From the page; show it as data, never as the app's own words.
+    pub title: String,
+    /// The host only, never a path or a query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub controller: SurfaceController,
+    /// The agent asked the owner to do something here and waits.
+    #[serde(default)]
+    pub handoff_pending: bool,
+    /// Whether it takes pointer, key and text input.
+    #[serde(default)]
+    pub interactive: bool,
+    /// A popup's parent surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opener: Option<String>,
+}
+
+/// What kind of screen a surface is (protocol 1.30).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceKind {
+    /// A tab of the agent's browser.
+    BrowserTab,
+    /// A whole display of the daemon's computer.
+    Desktop,
+    Window,
+    Node,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// Who acts on a surface now (protocol 1.30).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SurfaceController {
+    Agent,
+    /// The owner, from one device.
+    Owner {
+        device_id: String,
+        /// The device's name, when the gateway knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
+    },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+/// Where a client connects for a live session's frames (protocol 1.30).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SurfaceTransport {
+    pub kind: TransportKind,
+    /// A path on the gateway's own origin.
+    pub url: String,
+    /// Sent as the first message on the socket, never in the URL. Single
+    /// use, short lived, bound to this device and live session.
+    pub ticket: String,
+    pub codecs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportKind {
+    /// A WebSocket of binary frames (see [`media`]).
+    WsFrames,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -690,6 +831,21 @@ pub enum CommandResult {
     Queued {
         session_id: String,
         messages: Vec<QueuedMessage>,
+    },
+    /// `list_surfaces` (protocol 1.30).
+    Surfaces {
+        surfaces: Vec<SurfaceInfo>,
+    },
+    /// `open_surface` (protocol 1.30): connect to one of `transports`.
+    SurfaceOpened {
+        live_id: String,
+        surface: SurfaceInfo,
+        transports: Vec<SurfaceTransport>,
+    },
+    /// `take_control` and `release_control` (protocol 1.30): the surface
+    /// as it is after.
+    SurfaceControl {
+        surface: SurfaceInfo,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -1649,6 +1805,15 @@ pub enum Event {
         /// What it is needed for, in the agent's words.
         reason: String,
     },
+    /// Ephemeral, capability `surfaces` (protocol 1.30): a surface appeared
+    /// or changed (title, site, controller, handoff).
+    SurfaceUpdated {
+        surface: SurfaceInfo,
+    },
+    /// Ephemeral, capability `surfaces` (protocol 1.30).
+    SurfaceClosed {
+        surface_id: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -1664,6 +1829,8 @@ impl Event {
                 | Event::ViewAction { .. }
                 | Event::SettingsUpdated { .. }
                 | Event::SetupUpdated { .. }
+                | Event::SurfaceUpdated { .. }
+                | Event::SurfaceClosed { .. }
         )
     }
 
@@ -1689,6 +1856,8 @@ impl Event {
             Event::SettingsUpdated { .. } => "settings_updated",
             Event::SetupUpdated { .. } => "setup_updated",
             Event::FeatureRequested { .. } => "feature_requested",
+            Event::SurfaceUpdated { .. } => "surface_updated",
+            Event::SurfaceClosed { .. } => "surface_closed",
             Event::Unknown => "unknown",
         }
     }
@@ -1713,6 +1882,9 @@ pub enum ViewAction {
     NewSession,
     /// Show the paired devices.
     ShowDevices,
+    /// Bring a surface's viewer forward (protocol 1.30). It opens no
+    /// stream and takes no control.
+    ShowSurface { surface_id: String },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -1856,6 +2028,9 @@ pub enum ApprovalKind {
     GoalConfirmation,
     /// Confirm an Autopilot posture.
     AutopilotConfirmation,
+    /// The agent asks the owner to do something themselves on a surface
+    /// (protocol 1.30): `approve_once` means done, `deny` means not now.
+    Handoff,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -1960,6 +2135,17 @@ pub enum CardAction {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+    /// Do something on a surface yourself (protocol 1.30): sign in, enter
+    /// a code. `what` is the agent's few words; `site` the host only.
+    TakeOver {
+        surface_id: String,
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        site: Option<String>,
+        /// Whether a sign-in made there is kept for later tasks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keeps_sign_in: Option<bool>,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -2186,6 +2372,9 @@ pub struct Snapshot {
     /// runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live_turns: Vec<LiveTurnState>,
+    /// Live surfaces (protocol 1.30, capability `surfaces`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<SurfaceInfo>,
 }
 
 /// A running turn as far as it has got: the text streamed so far, what it
@@ -2434,13 +2623,16 @@ pub enum Scope {
     Chat,
     /// Answer approvals (within the device's risk ceiling).
     Approve,
+    /// Watch and control live surfaces: the agent's browser, the screen
+    /// (protocol 1.30).
+    Control,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
 }
 
 /// Every scope: what a phone or computer gets by default.
-pub const ALL_SCOPES: [Scope; 3] = [Scope::Observe, Scope::Chat, Scope::Approve];
+pub const ALL_SCOPES: [Scope; 4] = [Scope::Observe, Scope::Chat, Scope::Approve, Scope::Control];
 
 /// The owner's offer to pair a device (owner only:
 /// `POST /client/v1/pairing/offers`).
@@ -2600,6 +2792,8 @@ pub fn schema() -> serde_json::Value {
     let _ = generator.subschema_for::<SessionRequest>();
     let _ = generator.subschema_for::<AccessGrant>();
     let _ = generator.subschema_for::<Vec<DeviceInfo>>();
+    let _ = generator.subschema_for::<media::MediaHeader>();
+    let _ = generator.subschema_for::<media::MediaClientMessage>();
     let mut defs = serde_json::Value::Object(generator.take_definitions(true));
     drop_empty_alternatives(&mut defs);
     serde_json::json!({
