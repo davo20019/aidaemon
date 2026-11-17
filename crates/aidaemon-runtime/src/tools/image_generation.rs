@@ -706,6 +706,14 @@ impl GenerateImageTool {
             }
         };
 
+        // The image is the request's own artifact: a later send_file of it
+        // (by path or resource id, from any run of the request) delivers
+        // what this call made, and the untrusted-call check knows so (live
+        // 2026-11-17: a mascot this call generated was carded to the owner
+        // as a file "not identified as an artifact" of the request).
+        if let Some(produced) = aidaemon_tools::semantics::produced_files(facts) {
+            produced.note_created(&attachment.local_path, attachment.resource_id.as_deref());
+        }
         let resource_id = attachment.resource_id.as_deref().unwrap_or("unavailable");
         let model = generated.model.as_deref().unwrap_or("provider default");
         let dimensions = generated

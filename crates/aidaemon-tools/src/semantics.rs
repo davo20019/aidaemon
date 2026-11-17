@@ -3107,6 +3107,21 @@ impl ProducedFiles {
         }
     }
 
+    /// A tool of the request made the file at `path` itself (with
+    /// `resource_id`, when it has one): a generated image saved to the
+    /// daemon's inbox. A capture already noted keeps what it shows.
+    pub fn note_created(&self, path: &str, resource_id: Option<&str>) {
+        let mut produced = self.0.write().unwrap_or_else(|e| e.into_inner());
+        produced
+            .entry(produced_key(path))
+            .or_insert(ProducedFile::Created);
+        if let Some(id) = resource_id.map(str::trim).filter(|id| !id.is_empty()) {
+            produced
+                .entry(id.to_string())
+                .or_insert(ProducedFile::Created);
+        }
+    }
+
     /// Ownership from evidence of creation: of `absent` (taken before a
     /// call that then succeeded, [`OwnedFolders::absent_write_targets`]),
     /// each path that is now a regular file was made by this request's
@@ -3228,6 +3243,26 @@ pub fn produced_files(facts: &ToolCallContext) -> Option<&ProducedFiles> {
 #[cfg(test)]
 mod produced_file_tests {
     use super::{DeliverableKind, ProducedFile, ProducedFiles};
+
+    /// A file a tool made itself (a generated image in the inbox) is the
+    /// request's own by its path and by its resource id; a capture noted
+    /// at that path keeps what it shows.
+    #[test]
+    fn a_file_a_tool_made_is_the_requests_own_by_path_and_id() {
+        let produced = ProducedFiles::default();
+        produced.note_created("/inbox/018d9d29_generated_image.png", Some("res_img"));
+        assert_eq!(
+            produced.get("/inbox/018d9d29_generated_image.png"),
+            Some(ProducedFile::Created)
+        );
+        assert_eq!(produced.get("res_img"), Some(ProducedFile::Created));
+        let page = DeliverableKind::Screenshot {
+            page: "demo.ddev.site".to_string(),
+        };
+        produced.note_capture("/inbox/shot.png", None, &page);
+        produced.note_created("/inbox/shot.png", None);
+        assert_eq!(produced.capture_kind("/inbox/shot.png"), Some(page));
+    }
 
     /// A capture is found by its path in any spelling and by its resource
     /// id; a file a call created joins, one that existed before does not,
