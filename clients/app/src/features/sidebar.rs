@@ -88,7 +88,12 @@ pub fn sidebar(store: Store) -> View {
                         let shown = store.sidebar_view();
                         Some(untracked(move || {
                             if archived && !flat {
-                                return archived_page(store, ids);
+                                // A project's own, asked for on its page.
+                                let project = match &shown {
+                                    SidebarView::Project(id) => Some(id.clone()),
+                                    _ => None,
+                                };
+                                return archived_page(store, project, ids);
                             }
                             if flat {
                                 return view()
@@ -750,6 +755,9 @@ fn new_project_row(store: Store) -> View {
 /// The top of a page inside the sidebar: Back, its title and what it
 /// offers.
 fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) -> View {
+    let in_project = untracked(|| {
+        store.showing_archived() && matches!(store.sidebar_view(), SidebarView::Project(_))
+    });
     view()
         .flex_row()
         .items_center()
@@ -757,13 +765,19 @@ fn page_head(store: Store, title: impl Fn() -> String + 'static, tools: View) ->
         .pt_1()
         .child(ui::icon_btn(
             Glyph::Back,
-            "Back to all conversations",
+            if in_project {
+                "Back to the project"
+            } else {
+                "Back to all conversations"
+            },
             ui::Size::Md,
             move || {
-                if store.showing_archived() {
+                // A project's archived are a page of the project's.
+                if in_project {
                     store.show_archived(false);
+                } else {
+                    store.show_sidebar_view(SidebarView::Home)
                 }
-                store.show_sidebar_view(SidebarView::Home)
             },
         ))
         .child(
@@ -815,6 +829,7 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
         })
     };
     let (name, folder, edit, empty) = (id.clone(), id.clone(), id.clone(), id.clone());
+    let put_away = id.clone();
     let (pin, unpin, pinned, unpinned, gone) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
     let tools = view().flex_row().items_center().child(ui::press_menu(
@@ -836,18 +851,48 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
             move || store.project(&name).map(|p| p.name).unwrap_or_default(),
             tools,
         ))
+        // Its folder, and at the top whatever the list's length, the way
+        // to its archived conversations (only when it has some).
         .child(
-            text(move || {
-                store
-                    .project(&folder)
-                    .and_then(|p| p.path)
-                    .unwrap_or_else(|| "No folder".to_owned())
-            })
-            .px_2()
-            .pb_1()
-            .number_of_lines(1)
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT),
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    text(move || {
+                        store
+                            .project(&folder)
+                            .and_then(|p| p.path)
+                            .unwrap_or_else(|| "No folder".to_owned())
+                    })
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px_2()
+                    .pb_1()
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                )
+                .child(dynamic(move || {
+                    let count = store
+                        .session_ids()
+                        .iter()
+                        .filter(|s| {
+                            store.is_archived(s)
+                                && store.session_project(s).as_deref() == Some(put_away.as_str())
+                        })
+                        .count();
+                    (count > 0).then(|| {
+                        untracked(move || {
+                            ui::btn(
+                                format!("Archived · {count}"),
+                                ui::Variant::Ghost,
+                                ui::Size::Sm,
+                                move || store.show_archived(true),
+                            )
+                        })
+                    })
+                })),
         )
         .child(when(
             move || store.project_form_open(),
@@ -1678,11 +1723,28 @@ fn connection(store: Store) -> View {
 }
 
 /// The archived conversations, as a page of the sidebar: Back, how one is
-/// brought back, then the conversations.
-fn archived_page(store: Store, ids: Memo<Vec<String>>) -> View {
+/// brought back, then the conversations. `project`: only that project's,
+/// asked for on its page.
+fn archived_page(store: Store, project: Option<String>, ids: Memo<Vec<String>>) -> View {
+    let named = project.clone();
+    let ids = computed(move || {
+        ids.with(|ids| {
+            ids.iter()
+                .filter(|s| project.is_none() || store.session_project(s) == project)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
     view()
         .gap(px(1.0))
-        .child(page_head(store, || "Archived".to_owned(), view()))
+        .child(page_head(
+            store,
+            move || match named.as_ref().and_then(|id| store.project(id)) {
+                Some(project) => format!("Archived in {}", project.name),
+                None => "Archived".to_owned(),
+            },
+            view(),
+        ))
         .child(
             text(move || {
                 if ids.with(Vec::is_empty) {

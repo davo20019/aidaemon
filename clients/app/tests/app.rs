@@ -663,7 +663,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
             r#"{"type":"ack","request_id":"r0","result":{"type":"projects","projects":[{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"},{"id":"project-notes","name":"Design notes"}]}}"#,
         ),
         frame(
-            r#"{"type":"ack","request_id":"r1","result":{"type":"sessions","sessions":[{"id":"app:synthetic-3","channel":"app","title":"Contact form copy","writable":true,"project_id":"project-acme"},{"id":"app:synthetic-4","channel":"app","title":"Grocery list","writable":true}]}}"#,
+            r#"{"type":"ack","request_id":"r1","result":{"type":"sessions","sessions":[{"id":"app:synthetic-3","channel":"app","title":"Contact form copy","writable":true,"project_id":"project-acme"},{"id":"app:synthetic-5","channel":"app","title":"Old landing page","writable":true,"archived":true,"project_id":"project-acme"},{"id":"app:synthetic-4","channel":"app","title":"Grocery list","writable":true}]}}"#,
         ),
     ]);
     app.wait_for("Acme site")?;
@@ -675,6 +675,14 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press("Project Acme site, 1 conversations")?;
     app.wait_for("Back to all conversations")?;
     app.wait_for_gone("Grocery list", std::time::Duration::from_secs(5))?;
+    app.wait_for("Contact form copy")?;
+    // Its archived conversations are a press away at the top of its page,
+    // and Back returns to the project.
+    app.press("Archived · 1")?;
+    app.wait_for("Archived in Acme site")?;
+    app.wait_for("Old landing page")?;
+    app.press("Back to the project")?;
+    app.wait_for_gone("Old landing page", std::time::Duration::from_secs(5))?;
     app.wait_for("Contact form copy")?;
     // New conversation, inside a project, starts one there.
     app.press("New conversation >> nth=0")?;

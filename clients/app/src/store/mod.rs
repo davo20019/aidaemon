@@ -1452,6 +1452,10 @@ impl Store {
         if self.project_form.get_untracked() {
             self.show_project_form(false);
         }
+        // The archived are a page of the view they were asked for in.
+        if self.show_archived.get_untracked() {
+            self.show_archived.set(false);
+        }
         self.sidebar_view.set(view);
     }
 
