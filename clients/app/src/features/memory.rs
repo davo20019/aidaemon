@@ -93,21 +93,66 @@ fn body(store: Store, read: MemoryRead, query: &str) -> View {
                             .contains(query)
                 })
                 .collect();
-            let mut list = view().gap_1().child(section_label(format!(
-                "{} {}",
-                shown.len(),
-                if shown.len() == 1 {
-                    "memory"
-                } else {
-                    "memories"
-                }
-            )));
+            let count = text(match shown.len() {
+                0 => format!("Nothing matches \"{query}\""),
+                1 => "1 memory".to_owned(),
+                n => format!("{n} memories"),
+            })
+            .px_1()
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT);
+            // Grouped by category, each group where its newest memory
+            // falls (the list arrives newest first), rows newest first.
+            let mut groups: Vec<(String, Vec<MemoryItem>)> = Vec::new();
             for item in shown {
-                list = list.child(memory_row(store, item));
+                match groups.iter_mut().find(|g| g.0 == item.category) {
+                    Some(group) => group.1.push(item),
+                    None => groups.push((item.category.clone(), vec![item])),
+                }
             }
-            list
+            let mut page = view().gap_2().child(count);
+            for (category, items) in groups {
+                let heading = match readable_key(&category) {
+                    name if name.is_empty() => "Other".to_owned(),
+                    name => name,
+                };
+                let mut card = ui::surface().overflow_hidden();
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        card = card.child(ui::separator());
+                    }
+                    card = card.child(memory_row(store, item.clone()));
+                }
+                page = page.child(
+                    view()
+                        .gap_1()
+                        .child(
+                            section_label(format!("{heading} · {}", items.len()))
+                                .role(AccessibilityRole::Header),
+                        )
+                        .child(card),
+                );
+            }
+            page
         }
     }
+}
+
+/// Where a memory came from, in the owner's words.
+fn source_words(source: &str) -> Option<String> {
+    Some(
+        match source {
+            "" => return None,
+            "user_stated" | "owner_quoted" => "you said it",
+            "consolidation" => "from past conversations",
+            "progressive" => "picked up while talking",
+            "inferred" | "derived" => "inferred",
+            "agent" => "saved by the assistant",
+            "task_learning" => "learned from a task",
+            other => return Some(other.replace('_', " ")),
+        }
+        .to_owned(),
+    )
 }
 
 fn memory_row(store: Store, item: MemoryItem) -> View {
@@ -115,42 +160,31 @@ fn memory_row(store: Store, item: MemoryItem) -> View {
     let forgotten = format!("Your agent stops remembering: {}", item.value);
     let label = readable_key(&item.key);
     let meta = {
-        let mut parts = vec![item.category.clone()];
-        if !item.source.is_empty() {
-            parts.push(item.source.clone());
+        let mut parts = vec![time::ago(item.updated_ms, now_ms())];
+        if let Some(source) = source_words(&item.source) {
+            parts.push(source);
         }
-        parts.push(format!("updated {}", time::ago(item.updated_ms, now_ms())));
         parts.join(" · ")
     };
-    let mut body = view().flex_1().min_w(px(0.0)).gap(px(2.0));
-    if !label.is_empty() {
-        body = body.child(
-            text(label)
-                .number_of_lines(1)
-                .text_size(px(type_scale::XS))
-                .text_color(colors::MUTED),
-        );
-    }
-    let body = body
-        .child(
-            text(item.value.clone())
-                .selectable(true)
-                .text_size(px(ui::fit::body()))
-                .text_color(colors::TEXT),
-        )
-        .child(
-            text(meta)
-                .number_of_lines(1)
-                .text_size(px(type_scale::XS))
-                .text_color(colors::FAINT),
-        );
-    ui::surface()
+    // The key and Forget share the top line, so what is remembered gets
+    // the card's whole width under them.
+    let top = view()
         .flex_row()
         .items_center()
-        .gap_3()
-        .px_3()
-        .py_2()
-        .child(body)
+        .gap_2()
+        .child(
+            text(if label.is_empty() {
+                "Memory".to_owned()
+            } else {
+                label
+            })
+            .flex_1()
+            .min_w(px(0.0))
+            .number_of_lines(1)
+            .text_size(px(ui::fit::small()))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(colors::MUTED),
+        )
         .child(
             ui::btn("Forget", Variant::Ghost, Size::Sm, move || {
                 let id = id.clone();
@@ -159,7 +193,24 @@ fn memory_row(store: Store, item: MemoryItem) -> View {
                 })
             })
             .accessibility_label(format!("Forget: {}", item.value)),
-        )
+        );
+    view().pl_3().pr_1().pb_2().child(top).child(
+        view()
+            .pr_2()
+            .gap(px(2.0))
+            .child(
+                text(item.value.clone())
+                    .selectable(true)
+                    .text_size(px(ui::fit::body()))
+                    .text_color(colors::TEXT),
+            )
+            .child(
+                text(meta)
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+            ),
+    )
 }
 
 /// A fact's key as words, so a bare value such as `ddev` says what it is

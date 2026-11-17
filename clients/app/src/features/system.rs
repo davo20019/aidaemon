@@ -86,8 +86,8 @@ fn body(store: Store, read: SystemRead) -> View {
             }),
         )),
         SystemRead::Ready { status, .. } => column
-            .child(overview(&status))
             .child(attention(&status))
+            .child(overview(&status))
             .child(bots(store))
             .child(runs(store, &status))
             .child(usage(&status))
@@ -104,7 +104,7 @@ fn bots(store: Store) -> View {
     if bots.is_empty() {
         return view();
     }
-    let mut c = card();
+    let mut rows = Vec::new();
     for bot in bots {
         let channel = bot.channel.clone();
         let current = {
@@ -122,13 +122,13 @@ fn bots(store: Store) -> View {
             1 => "1 conversation".to_owned(),
             n => format!("{n} conversations"),
         };
-        c = c.child(
+        rows.push(
             view()
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .min_h(px(ui::fit::row()))
-                .px_2()
+                .px_3()
+                .py_2()
                 .child(
                     view()
                         .flex_1()
@@ -195,15 +195,15 @@ fn bots(store: Store) -> View {
                         },
                         move || format!("Project for direct messages to {bot_name}: {}", shown()),
                         view()
-                            .min_h(px(ui::fit::row()))
-                            .max_w(px(200.0))
+                            .min_h(px(Size::Sm.height()))
+                            .max_w(px(160.0))
                             .flex_row()
                             .items_center()
                             .gap_1()
                             .px_2()
                             .rounded(px(ui::radius::CONTROL))
-                            .border_1()
-                            .border_color(colors::EDGE)
+                            .bg(colors::INSET)
+                            .hover(|s| s.bg(colors::HOVER))
                             .child(
                                 ui::icon(ui::Glyph::Folder)
                                     .text_color(colors::MUTED)
@@ -226,7 +226,7 @@ fn bots(store: Store) -> View {
                 }),
         );
     }
-    section("Chat bots").child(c).child(
+    section("Chat bots").child(list(rows)).child(
         text(
             "Direct messages to a bot work in its project's folder unless moved. \
              Group chats join a project only when you move them there.",
@@ -244,28 +244,89 @@ fn section(title: &'static str) -> View {
         .child(section_label(title).role(AccessibilityRole::Header))
 }
 
-/// A label and its value on one line.
+/// A label and its value on one line; a long value wraps under its own
+/// end instead of cutting the label short. Read-only, so no touch height.
 fn fact(label: impl Into<SharedString>, value: impl Into<SharedString>) -> View {
     view()
         .flex_row()
-        .items_center()
+        .items_start()
         .gap_3()
-        .min_h(px(ui::fit::row() - 4.0))
-        .px_2()
+        .px_3()
+        .py_2()
         .child(
             text(label.into())
-                .flex_1()
                 .number_of_lines(1)
-                .text_size(px(ui::fit::body()))
+                .text_size(px(ui::fit::small()))
                 .text_color(colors::MUTED),
         )
         .child(
             text(value.into())
-                .number_of_lines(1)
+                .flex_1()
+                .min_w(px(0.0))
+                .text_right()
                 .tabular_nums()
                 .selectable(true)
-                .text_size(px(ui::fit::body())),
+                .text_size(px(ui::fit::small())),
         )
+}
+
+/// Rows with a hairline between each.
+fn list(rows: Vec<View>) -> View {
+    let mut c = ui::surface().overflow_hidden();
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 {
+            c = c.child(ui::separator());
+        }
+        c = c.child(row);
+    }
+    c
+}
+
+/// One number that matters, large, with what it is under it and an
+/// optional second line in its tone (failures, the slow end).
+fn stat(value: String, label: &'static str, note: Option<(String, Tone)>) -> View {
+    let mut tile = ui::surface()
+        .flex_1()
+        .min_w(px(0.0))
+        .px_3()
+        .py_2()
+        .gap(px(2.0))
+        .role(AccessibilityRole::Text)
+        .child(
+            text(value)
+                .number_of_lines(1)
+                .tabular_nums()
+                .text_size(px(ui::fit::title()))
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+        .child(
+            text(label)
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        );
+    if let Some((note, tone)) = note {
+        tile = tile.child(
+            text(note)
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(tone.color()),
+        );
+    }
+    tile
+}
+
+/// 3570 → "3,570".
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn card() -> View {
@@ -273,39 +334,39 @@ fn card() -> View {
 }
 
 fn overview(s: &SystemStatus) -> View {
-    let mut c = card()
-        .child(fact("Version", s.version.clone()))
-        .child(fact("Running for", time::span(s.uptime_secs)));
-    if let Some(model) = &s.model {
-        c = c.child(fact("Model", model.clone()));
-    }
-    if !s.fallback_models.is_empty() {
-        c = c.child(fact("Falls back to", s.fallback_models.join(", ")));
-    }
+    let mut tiles =
+        view()
+            .flex_row()
+            .gap_2()
+            .child(stat(time::span(s.uptime_secs), "Running for", None));
     if let Some(calls) = &s.model_calls {
-        c = c
-            .child(fact(
-                "Model calls, last 24h",
-                format!(
-                    "{}{}",
-                    calls.total,
-                    if calls.failed > 0 {
-                        format!(" · {} failed", calls.failed)
-                    } else {
-                        String::new()
-                    }
-                ),
-            ))
-            .child(fact(
-                "Response time",
-                format!(
-                    "{} typical · {} slow (p95)",
-                    seconds(calls.p50_ms),
-                    seconds(calls.p95_ms)
-                ),
+        let failed = (calls.failed > 0).then(|| {
+            let share = calls.failed as f64 * 100.0 / calls.total.max(1) as f64;
+            (
+                format!("{} failed ({share:.0}%)", grouped(calls.failed)),
+                if share >= 10.0 {
+                    Tone::Danger
+                } else {
+                    Tone::Warning
+                },
+            )
+        });
+        tiles = tiles
+            .child(stat(grouped(calls.total), "Calls, 24h", failed))
+            .child(stat(
+                seconds(calls.p50_ms),
+                "Typical reply",
+                Some((format!("p95 {}", seconds(calls.p95_ms)), Tone::Neutral)),
             ));
     }
-    section("Daemon").child(c)
+    let mut rows = vec![fact("Version", s.version.clone())];
+    if let Some(model) = &s.model {
+        rows.push(fact("Model", model.clone()));
+    }
+    if !s.fallback_models.is_empty() {
+        rows.push(fact("Falls back to", s.fallback_models.join(", ")));
+    }
+    section("Daemon").child(view().gap_2().child(tiles).child(list(rows)))
 }
 
 fn seconds(ms: u64) -> String {
@@ -515,7 +576,7 @@ fn runs(store: Store, s: &SystemStatus) -> View {
         return view();
     }
     let now = now_ms();
-    let mut c = card();
+    let mut rows = Vec::new();
     for run in &s.runs {
         let (_, (label, tone)) = run_verdict(run);
         let when = format!(
@@ -529,8 +590,8 @@ fn runs(store: Store, s: &SystemStatus) -> View {
             .unwrap_or_default();
         let mut entry = view()
             .gap(px(2.0))
-            .px_2()
-            .py_1()
+            .px_3()
+            .py_2()
             .child(
                 view()
                     .flex_row()
@@ -567,9 +628,9 @@ fn runs(store: Store, s: &SystemStatus) -> View {
             )),
             None => entry.child(meta),
         };
-        c = c.child(entry);
+        rows.push(entry);
     }
-    section("While you were away").child(c)
+    section("While you were away").child(list(rows))
 }
 
 fn jobs(s: &SystemStatus) -> View {
@@ -577,7 +638,7 @@ fn jobs(s: &SystemStatus) -> View {
         return view();
     }
     let now = now_ms();
-    let mut c = card();
+    let mut rows = Vec::new();
     for job in &s.jobs {
         let (label, tone) = if job.running {
             ("Running".to_owned(), Tone::Accent)
@@ -594,13 +655,13 @@ fn jobs(s: &SystemStatus) -> View {
                 Tone::Neutral,
             )
         };
-        c = c.child(
+        rows.push(
             view()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .px_2()
-                .min_h(px(ui::fit::row() - 4.0))
+                .px_3()
+                .py_2()
                 .child(
                     text(job.name.replace('_', " "))
                         .flex_1()
@@ -616,7 +677,7 @@ fn jobs(s: &SystemStatus) -> View {
         );
     }
     for queue in &s.queues {
-        c = c.child(fact(
+        rows.push(fact(
             format!("Queue: {}", queue.name),
             format!(
                 "{} of {}{}",
@@ -630,7 +691,7 @@ fn jobs(s: &SystemStatus) -> View {
             ),
         ));
     }
-    section("Background jobs").child(c)
+    section("Background jobs").child(list(rows))
 }
 
 fn checks(s: &SystemStatus) -> View {
@@ -638,7 +699,7 @@ fn checks(s: &SystemStatus) -> View {
         return view();
     }
     let now = now_ms();
-    let mut c = card();
+    let mut rows = Vec::new();
     for check in &s.checks {
         let (label, tone) = match (check.paused, check.status) {
             (true, _) => ("Paused", Tone::Neutral),
@@ -657,13 +718,13 @@ fn checks(s: &SystemStatus) -> View {
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
-        c = c.child(
+        rows.push(
             view()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .px_2()
-                .py_1()
+                .px_3()
+                .py_2()
                 .child(
                     view()
                         .flex_1()
@@ -683,5 +744,5 @@ fn checks(s: &SystemStatus) -> View {
                 .child(badge(label, tone)),
         );
     }
-    section("Health checks").child(c)
+    section("Health checks").child(list(rows))
 }

@@ -35,7 +35,7 @@ pub enum Size {
 
 impl Size {
     /// On touch every size is a full 44 pt target or more.
-    fn height(self) -> f32 {
+    pub fn height(self) -> f32 {
         match (self, touch()) {
             (Self::Sm, false) => size::CONTROL_SM,
             (Self::Md, false) => size::CONTROL_MD,

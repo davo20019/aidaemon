@@ -253,26 +253,31 @@ fn row(store: Store, settings: &Settings, item: &Item) -> View {
     let now = current(settings, key, item.default);
     let setting = find(settings, key);
     let asks = setting.is_some_and(|s| s.guarded);
+    // When it applies, as a quiet tag on the title rather than a line
+    // under every setting; the restart banner says so again once saved.
     let later = match setting.map(|s| s.applies) {
-        Some(aidaemon_client_protocol::Applies::Restart) => Some("Takes effect on a restart."),
-        Some(aidaemon_client_protocol::Applies::Reload) => Some("Takes effect on a reload."),
+        Some(aidaemon_client_protocol::Applies::Restart) => Some("on restart"),
+        Some(aidaemon_client_protocol::Applies::Reload) => Some("on reload"),
         _ => None,
     };
-    let mut words = view()
+    let mut title = view().flex_row().flex_wrap().items_center().gap_2().child(
+        text(item.title)
+            .text_size(px(ui::fit::body()))
+            .font_weight(FontWeight::MEDIUM),
+    );
+    if let Some(later) = later {
+        title = title.child(ui::badge(later, Tone::Neutral));
+    }
+    if asks {
+        title = title.child(ui::badge("asks", Tone::Warning));
+    }
+    let words = view()
         .flex_1()
         .min_w(px(0.0))
-        .gap_0p5()
-        .child(text(item.title).text_size(px(ui::fit::body())))
+        .gap_1()
+        .child(title)
         .child(faint(item.help).number_of_lines(3));
-    if let Some(later) = later {
-        words = words.child(faint(later));
-    }
-    let head = view()
-        .flex_row()
-        .items_center()
-        .gap_3()
-        .child(words)
-        .child(when(asks, || ui::badge("asks", Tone::Warning)));
+    let head = view().flex_row().items_center().gap_3().child(words);
     let body = match item.control {
         Control::Switch => {
             let on = now == "true";
