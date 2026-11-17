@@ -519,6 +519,15 @@ impl ScheduledGoalRuns {
         if schedules.is_empty() {
             return Ok("Only scheduled work can be run now.".to_string());
         }
+        // A reminder was scheduled without the owner's approval because all
+        // it ever does is send its message at its time. Running it now would
+        // hand that message to an agent as trusted scheduled work.
+        if crate::reminders::message_from_context(goal.context.as_deref()).is_some() {
+            return Ok(
+                "A reminder only sends its message at its time; there is no work to run now."
+                    .to_string(),
+            );
+        }
 
         let mut adaptive_extension = None;
         if let Some(configured_budget) = goal.budget_daily.filter(|budget| *budget > 0) {
