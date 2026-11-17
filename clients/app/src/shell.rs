@@ -142,7 +142,11 @@ pub fn shell(store: Store) -> View {
                         Placement::Left,
                         move || store.sidebar_open(),
                         move || store.close_panes(),
-                        sidebar(store),
+                        view()
+                            .w_full()
+                            .h_full()
+                            .child(sidebar(store))
+                            .child(when(move || store.sidebar_open(), move || toasts(store))),
                     ))
                     .child(ui::drawer(
                         Placement::Right,
@@ -193,17 +197,27 @@ pub fn shell(store: Store) -> View {
             picture_actions(store),
         ))
         .child(crate::ui::live_screen(live_screen(store)))
-        .child(ui::toasts(
-            move || store.toast(),
-            move || store.dismiss_toast(),
-            move |session: &str| store.select(Some(session.to_owned())),
-            move |session: &str| store.undo_archive(session),
+        // A phone's open list is a surface of its own, over this one: a
+        // note about what was done there shows in it (see the drawer).
+        .child(when(
+            move || !(store.is_compact() && store.sidebar_open()),
+            move || toasts(store),
         ));
     if terminal {
         view().flex_1().child(main).child(key_line(store))
     } else {
         main
     }
+}
+
+/// The app's notes, wherever they are shown.
+fn toasts(store: Store) -> impl IntoElement {
+    ui::toasts(
+        move || store.toast(),
+        move || store.dismiss_toast(),
+        move |session: &str| store.select(Some(session.to_owned())),
+        move |session: &str| store.undo_archive(session),
+    )
 }
 
 /// The page beside the panes: setup, pairing, a page or a conversation.
