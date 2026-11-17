@@ -116,6 +116,7 @@ pub fn Offline() -> impl IntoElement {
             "set_session_project",
             "delete_project",
             "open_surface",
+            "send_message",
         ] {
             if let Some(id) = store.queued_id(kind)
                 && let Ok(mut sent) = SENT.lock()

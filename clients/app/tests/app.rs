@@ -1304,3 +1304,38 @@ fn an_automation_waiting_on_a_sign_in_says_so_on_its_card() -> Result<(), String
     wait_sent_new("open_surface", before)?;
     Ok(())
 }
+
+#[test]
+fn a_sent_message_can_be_sent_again_or_edited_first() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-again","channel":"app","title":"Open the sign-in page","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Open the sign-in page")?;
+    app.press("Open the sign-in page >> nth=0")?;
+    // A message no reply came to: nothing failed, so there is no Retry,
+    // and the message itself can go again.
+    feed([frame(
+        r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:synthetic-again","event":{"type":"user_message","session_id":"app:synthetic-again","text":"Open login.acme.example and hand it over","origin":"app"}}"#,
+    )]);
+    app.wait_for("Open login.acme.example and hand it over")?;
+    let before = sent("send_message");
+    app.press("Send again")?;
+    let again = wait_sent_new("send_message", before)?;
+    // Edit puts it in the composer; Send sends what is there.
+    app.press("Edit and send again")?;
+    app.press("Send")?;
+    wait_sent_new("send_message", Some(again))?;
+    // While the conversation works, a message goes from the composer.
+    feed([frame(
+        r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:synthetic-again","event":{"type":"turn_started","turn_id":"t1","session_id":"app:synthetic-again","origin":"app"}}"#,
+    )]);
+    app.wait_for_gone("Send again", std::time::Duration::from_secs(2))?;
+    assert!(app.press("Edit and send again").is_ok());
+    Ok(())
+}

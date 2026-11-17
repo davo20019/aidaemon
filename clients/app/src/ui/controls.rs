@@ -327,7 +327,7 @@ pub enum Glyph {
     External,
     /// Share with another app.
     Share,
-    /// Draw over a picture.
+    /// Draw over a picture; change a sent message.
     Pen,
     /// Take back the last one.
     Undo,

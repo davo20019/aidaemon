@@ -1978,17 +1978,7 @@ impl Client {
             session,
             text.strip_prefix('/').filter(|_| attachments.is_empty()),
         ) {
-            (Some(session), Some(slash)) => {
-                let (command, args) = slash.split_once(' ').unwrap_or((slash, ""));
-                let id = self.send(Command::RunSlash {
-                    session_id: session.to_owned(),
-                    command: command.to_owned(),
-                    args: args.trim().to_owned(),
-                });
-                if matches!(command.to_lowercase().as_str(), "model" | "auto") {
-                    self.model_commands.insert(id, session.to_owned());
-                }
-            }
+            (Some(session), Some(slash)) => self.run_slash(session, slash),
             _ => {
                 // A new conversation starts on the model picked for it; an
                 // existing one already answers with its own.
@@ -2041,10 +2031,92 @@ impl Client {
         });
     }
 
-    /// Send the last message of `session` again.
+    /// Run the slash command `slash` ("model fast", no leading `/`) in
+    /// `session`.
+    fn run_slash(&mut self, session: &str, slash: &str) {
+        let (command, args) = slash.split_once(' ').unwrap_or((slash, ""));
+        let id = self.send(Command::RunSlash {
+            session_id: session.to_owned(),
+            command: command.to_owned(),
+            args: args.trim().to_owned(),
+        });
+        if matches!(command.to_lowercase().as_str(), "model" | "auto") {
+            self.model_commands.insert(id, session.to_owned());
+        }
+    }
+
+    /// Send the last message of `session` again, with its files.
     pub fn retry(&mut self, session: &str) {
-        if let Some(text) = self.last_user_text(session) {
-            self.ask(session, text);
+        let last = self
+            .lines(session)
+            .iter()
+            .rev()
+            .find_map(|line| match line {
+                Line::User {
+                    text, attachments, ..
+                } => Some((text.clone(), attachments.clone())),
+                _ => None,
+            });
+        if let Some((text, attachments)) = last {
+            // A turn that failed or was stopped is not running.
+            let _ = self.resend(session, &text, attachments);
+        }
+    }
+
+    /// Say a message of `session` again, with the files it had: a new
+    /// message at the end, so nothing said or done since is lost (the
+    /// agent's work after the first one already happened). A slash
+    /// command runs again. `Err` with what to tell the owner while the
+    /// conversation works: the composer places a message then.
+    pub fn resend(
+        &mut self,
+        session: &str,
+        text: &str,
+        attachments: Vec<AttachmentRef>,
+    ) -> Result<(), String> {
+        let text = text.trim();
+        if text.is_empty() && attachments.is_empty() {
+            return Ok(());
+        }
+        if self.is_running(session) {
+            return Err("Wait for this to finish, or stop it, then send it again".into());
+        }
+        match text.strip_prefix('/').filter(|_| attachments.is_empty()) {
+            Some(slash) => self.run_slash(session, slash),
+            None => {
+                self.send(Command::SendMessage {
+                    session_id: Some(session.to_owned()),
+                    text: text.to_owned(),
+                    attachments,
+                    mid_run: None,
+                    project_id: None,
+                    model: None,
+                    effort: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Put the files of a sent message back on the message being written
+    /// (the owner edits it before sending it again). They are already
+    /// uploaded; one already on the draft is not added twice.
+    pub fn attach_sent(&mut self, attachments: Vec<AttachmentRef>) {
+        for attachment in attachments {
+            let there = self
+                .draft_files
+                .iter()
+                .any(|f| matches!(&f.state, DraftFileState::Ready(a) if a.id == attachment.id));
+            if there {
+                continue;
+            }
+            self.next_upload += 1;
+            self.draft_files.push(DraftFile {
+                number: self.next_upload,
+                name: attachment.name.clone(),
+                state: DraftFileState::Ready(attachment),
+                marked_from: None,
+            });
         }
     }
 
@@ -3429,5 +3501,46 @@ mod tests {
             assert_eq!(key_for_approval(decision), Some(key));
         }
         assert_eq!(key_for_approval(ApprovalDecision::ApproveAlways), None);
+    }
+
+    #[test]
+    fn a_sent_message_goes_again_with_its_files_and_waits_while_the_work_runs() {
+        let file: AttachmentRef =
+            serde_json::from_str(r#"{"id":"f1","name":"plan.pdf"}"#).expect("a file");
+        let mut client = Client::new();
+        client
+            .resend("app:a", " Read the plan ", vec![file.clone()])
+            .expect("it goes");
+        client
+            .resend("app:a", "/model fast", Vec::new())
+            .expect("it runs");
+        let sent = client.take_outgoing();
+        assert!(matches!(
+            &sent[0].1,
+            Command::SendMessage { session_id: Some(s), text, attachments, mid_run: None, .. }
+                if s == "app:a" && text == "Read the plan" && attachments.as_slice() == std::slice::from_ref(&file)
+        ));
+        assert!(matches!(
+            &sent[1].1,
+            Command::RunSlash { command, args, .. } if command == "model" && args == "fast"
+        ));
+
+        // Edited first: its files are on the draft once, already uploaded.
+        client.attach_sent(vec![file.clone()]);
+        client.attach_sent(vec![file.clone()]);
+        assert_eq!(client.draft_files.len(), 1);
+        assert_eq!(client.draft_files[0].state, DraftFileState::Ready(file));
+
+        client.update(
+            frame(r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:a","event":{"type":"turn_started","turn_id":"t1","session_id":"app:a","origin":"app"}}"#),
+            &cx(Some("app:a")),
+        );
+        assert!(client.resend("app:a", "Read the plan", Vec::new()).is_err());
+        assert!(
+            client
+                .take_outgoing()
+                .iter()
+                .all(|(_, c)| !matches!(c, Command::SendMessage { .. }))
+        );
     }
 }

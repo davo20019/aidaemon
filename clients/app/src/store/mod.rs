@@ -280,6 +280,8 @@ pub struct Store {
     automation_editing: Signal<Option<String>>,
     /// Advanced when the keyboard should go back to the composer.
     composer_focus: Signal<u64>,
+    /// Counts messages put back in the composer to change.
+    composer_edit: Signal<u64>,
     /// The sidebar lists archived conversations instead of the others.
     show_archived: Signal<bool>,
     /// While the agent works, Enter queues (sends after) and ⌘↩ tells it
@@ -352,6 +354,7 @@ impl Store {
             source: signal(Source::All),
             automation_editing: signal(None),
             composer_focus: signal(0),
+            composer_edit: signal(0),
             show_archived: signal(false),
             enter_queues: signal(
                 nsh_core::storage::Storage::get_item(ENTER_QUEUES_KEY).as_deref() == Some("1"),
@@ -1578,6 +1581,33 @@ impl Store {
 
     pub fn retry(&self, session: &str) {
         self.act(|c| c.retry(session));
+    }
+
+    /// Send a message of `session` again, with its files: a new message
+    /// at the end, so the conversation keeps everything since.
+    pub fn resend(&self, session: &str, text: &str, files: Vec<AttachmentRef>) {
+        if let Err(note) = self.act(|c| c.resend(session, text, files)) {
+            self.say(note);
+        }
+    }
+
+    /// Put a sent message, with its files, back in the composer to change
+    /// before sending it again. What is being written is never replaced.
+    pub fn edit_again(&self, text: String, files: Vec<AttachmentRef>) {
+        let draft = self.draft_untracked();
+        if !draft.trim().is_empty() && draft.trim() != text.trim() {
+            self.say("Send or clear what you are writing first");
+            return;
+        }
+        self.act(|c| c.attach_sent(files));
+        self.set_draft(text);
+        self.composer_edit.update(|n| *n += 1);
+    }
+
+    /// Changes when a sent message was put in the composer: the keyboard
+    /// goes there, on a phone too (the owner asked to write).
+    pub fn composer_edit(&self) -> u64 {
+        self.composer_edit.get()
     }
 
     /// Say `text` in `session`, as if typed (a suggested prompt pressed).

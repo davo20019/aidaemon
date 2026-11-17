@@ -957,7 +957,7 @@ fn transcript_list(
                                 move || !content().trim().is_empty(),
                                 move || user_bubble(content),
                             ))
-                            .child(stamp(at)),
+                            .child(message_footer(store, session, content, attached, at)),
                         1 => column
                             .gap_1()
                             .child(when(
@@ -1157,6 +1157,48 @@ fn reply_footer(
             set_clipboard(content());
             store.say("Copied the reply");
         }))
+}
+
+/// Under a message of the owner's: its time, then Copy, Edit (back into
+/// the composer, with its files) and Send again. Every message has them,
+/// however old, and none changes the conversation above: what is sent
+/// goes at the end.
+fn message_footer(
+    store: Store,
+    session: String,
+    content: impl Fn() -> String + Clone + 'static,
+    attached: impl Fn() -> Vec<AttachmentRef> + Clone + 'static,
+    at: impl Fn() -> u64 + 'static,
+) -> View {
+    let (copied, edited, edited_files) = (content.clone(), content.clone(), attached.clone());
+    let running = session.clone();
+    view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .child(stamp(at))
+        .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
+            set_clipboard(copied());
+            store.say("Copied the message");
+        }))
+        .child(ui::icon_btn(
+            Glyph::Pen,
+            "Edit and send again",
+            Size::Sm,
+            move || store.edit_again(edited(), edited_files()),
+        ))
+        // While the conversation works, a message is placed from the
+        // composer (into the work, or after it): Edit takes it there.
+        .child(when(
+            move || !store.is_running(&running),
+            move || {
+                let (session, content, attached) =
+                    (session.clone(), content.clone(), attached.clone());
+                ui::icon_btn(Glyph::Retry, "Send again", Size::Sm, move || {
+                    store.resend(&session, &content(), attached());
+                })
+            },
+        ))
 }
 
 /// "Today", centred between hairlines.
@@ -1477,6 +1519,13 @@ fn composer(store: Store, session: Option<String>) -> View {
             }
         });
     }
+    // A sent message put back to change: the owner asked to write, so the
+    // keyboard comes up on a phone too.
+    effect(move || {
+        if store.composer_edit() > 0 {
+            untracked(|| field.focus());
+        }
+    });
     let slash = computed(move || store.slash_matches());
     // A chat's messages from here also go to the chat itself.
     let chat_note = session
