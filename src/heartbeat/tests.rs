@@ -2232,6 +2232,32 @@ async fn test_dispatch_no_agent_reverts_claim() {
     assert_eq!(notifications[0].goal_id, goal.id);
 }
 
+/// A completed goal's notice follows the typed task and run state: a result
+/// whose words say "partially completed" or "not verified yet" neither
+/// suppresses nor downgrades it.
+#[tokio::test]
+async fn completion_notice_follows_typed_state_not_summary_wording() {
+    let state = test_state_store().await;
+    let mut goal = Goal::new_finite("Prepare the synthetic report", "session-1");
+    goal.status = "completed".to_string();
+    state.create_goal(&goal).await.unwrap();
+    let mut task = synthetic_task("write the synthetic report", "completed");
+    task.goal_id = goal.id.clone();
+    task.result = Some(
+        "Partially completed wording from a quoted source; not verified yet per the source."
+            .to_string(),
+    );
+    state.create_task(&task).await.unwrap();
+
+    let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+    let coordinator = HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+    coordinator.enqueue_goal_notifications().await;
+
+    let notifications = state.get_pending_notifications(10).await.unwrap();
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert_eq!(notifications[0].notification_type, "completed");
+}
+
 #[tokio::test]
 async fn heartbeat_recovers_stranded_manual_run_before_dispatch() {
     let state = test_state_store().await;

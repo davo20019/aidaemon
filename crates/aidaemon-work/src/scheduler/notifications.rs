@@ -51,6 +51,11 @@ impl GoalCycle {
                         .as_ref()
                         .and_then(|run| run.root_task_id.as_deref())
                         .map(str::to_string);
+                    // The run's typed terminal status is the outcome; the
+                    // wording of its summary never is.
+                    let latest_run_unsuccessful = latest_run
+                        .as_ref()
+                        .is_some_and(|run| matches!(run.status.as_str(), "failed" | "blocked"));
                     let completed_tasks = match latest_run {
                         Some(run) => self
                             .state
@@ -70,8 +75,9 @@ impl GoalCycle {
                         &fallback_summary,
                     );
 
-                    if !completed_tasks.is_empty()
-                        && !crate::goals::tasks_satisfy_goal_completion(&completed_tasks)
+                    if latest_run_unsuccessful
+                        || (!completed_tasks.is_empty()
+                            && !crate::goals::tasks_satisfy_goal_completion(&completed_tasks))
                     {
                         let mut corrected = goal.clone();
                         corrected.status = "failed".to_string();
@@ -120,13 +126,6 @@ impl GoalCycle {
                                     task_results_summary.chars().take(4000).collect::<String>()
                                 ),
                             )
-                        } else if crate::goals::goal_completion_summary_indicates_not_finished(
-                            &task_results_summary,
-                        ) {
-                            // The summary contains verification-blocked or incomplete-work
-                            // language. Suppress a duplicate terminal notice; structural task
-                            // state above remains the authoritative completion gate.
-                            continue;
                         } else {
                             (
                                 "completed",
