@@ -855,19 +855,43 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
             move || store.project(&name).map(|p| p.name).unwrap_or_default(),
             tools,
         ))
-        .child(
-            text(move || {
-                store
-                    .project(&folder)
-                    .and_then(|p| p.path)
-                    .unwrap_or_else(|| "No folder".to_owned())
-            })
-            .px_2()
-            .pb_1()
-            .number_of_lines(1)
-            .text_size(px(type_scale::XS))
-            .text_color(colors::FAINT),
-        )
+        // Its folder, the way into its files (a page of their own, no
+        // conversation needed); without one, the way to add one.
+        .child(dynamic(move || {
+            let path = store
+                .project(&folder)
+                .and_then(|p| p.path)
+                .filter(|f| !f.trim().is_empty());
+            let (open, on, add) = (browse.clone(), browsing.clone(), has_folder.clone());
+            Some(untracked(move || match path {
+                Some(path) => row(
+                    move || store.showing_files_of(&on),
+                    move || store.open_project_files(&open),
+                )
+                .accessibility_label("This project's files")
+                .child(icon(Glyph::Folder).text_color(colors::MUTED))
+                .child(
+                    text(short_path(&path))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .font_family(ui::theme::MONO)
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::MUTED),
+                )
+                .child(icon(Glyph::Chevron).text_color(colors::FAINT)),
+                None => row(|| false, move || store.edit_project(&add))
+                    .accessibility_label("Add a folder to this project")
+                    .child(icon(Glyph::Folder).text_color(colors::FAINT))
+                    .child(
+                        text("Add a folder…")
+                            .flex_1()
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::SM))
+                            .text_color(colors::MUTED),
+                    ),
+            }))
+        }))
         .child(when(
             move || store.project_form_open(),
             move || project_form(store),
@@ -890,33 +914,19 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                     .text_size(px(type_scale::BASE)),
                 )
         }))
-        // Its files, a page of their own (no conversation needed), when it
-        // has a folder.
         .child(when(
+            move || mine.with(Vec::is_empty),
             move || {
-                store
-                    .project(&has_folder)
-                    .and_then(|p| p.path)
-                    .is_some_and(|f| !f.trim().is_empty())
-            },
-            move || {
-                let (open, on) = (browse.clone(), browsing.clone());
-                row(
-                    move || store.showing_files_of(&on),
-                    move || store.open_project_files(&open),
-                )
-                .accessibility_label("This project's files")
-                .child(icon(Glyph::Folder).text_color(colors::MUTED))
-                .child(
-                    text("Files")
-                        .flex_1()
-                        .number_of_lines(1)
-                        .text_size(px(type_scale::BASE)),
-                )
+                text("No conversations yet")
+                    .px_2()
+                    .py_1()
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::FAINT)
             },
         ))
-        // Its archived conversations, a row like the one above it, at the
-        // top whatever the list's length (only when it has some).
+        .child(listed(store, mine))
+        // Its archived conversations, a quiet line after the list (only
+        // when it has some): looked for past the active ones.
         .child(dynamic(move || {
             let count = store
                 .session_ids()
@@ -930,12 +940,13 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                 untracked(move || {
                     row(|| false, move || store.show_archived(true))
                         .accessibility_label("Archived conversations in this project")
-                        .child(icon(Glyph::Archive).text_color(colors::MUTED))
+                        .child(icon(Glyph::Archive).text_color(colors::FAINT))
                         .child(
                             text("Archived")
                                 .flex_1()
                                 .number_of_lines(1)
-                                .text_size(px(type_scale::BASE)),
+                                .text_size(px(type_scale::SM))
+                                .text_color(colors::MUTED),
                         )
                         .child(
                             text(count.to_string())
@@ -945,17 +956,6 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
                 })
             })
         }))
-        .child(when(
-            move || mine.with(Vec::is_empty),
-            move || {
-                text("No conversations yet")
-                    .px_2()
-                    .py_1()
-                    .text_size(px(type_scale::SM))
-                    .text_color(colors::FAINT)
-            },
-        ))
-        .child(listed(store, mine))
 }
 
 /// Conversations newest first, each with when it last moved; no day
