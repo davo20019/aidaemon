@@ -591,12 +591,73 @@ fn menu_surface(s: nsh_core::element::StyleRefinement) -> nsh_core::element::Sty
 /// `trigger` with a menu on a secondary press (right click, a long press,
 /// the context-menu key).
 pub fn with_menu(trigger: impl IntoElement, actions: Vec<MenuAction>) -> View {
+    context_menu_of(trigger, actions, None)
+}
+
+/// [`with_menu`] for a row among rows like it, one of which may already
+/// be marked as the current one: the menu says which row it is about.
+/// `open` holds while the menu is up, for the row to mark itself with
+/// [`menu_target`]; on a touch screen, where the sheet can cover the row,
+/// `title` heads the sheet.
+pub fn with_menu_about(
+    title: impl Fn() -> String + 'static,
+    open: Signal<bool>,
+    trigger: impl IntoElement,
+    actions: Vec<MenuAction>,
+) -> View {
+    context_menu_of(trigger, actions, Some((Box::new(title), open)))
+}
+
+/// The look of the row a menu is about, while the menu is up: filled and
+/// ringed, so it reads over the scrim and apart from the current row.
+pub fn menu_target(s: nsh_core::element::StyleRefinement) -> nsh_core::element::StyleRefinement {
+    s.bg(colors::SELECTED)
+        .outline(px(2.0))
+        .outline_color(colors::ACCENT)
+}
+
+/// What a menu is about: its name, and the signal that holds while it is up.
+type About = (Box<dyn Fn() -> String>, Signal<bool>);
+
+fn context_menu_of(
+    trigger: impl IntoElement,
+    actions: Vec<MenuAction>,
+    about: Option<About>,
+) -> View {
     let mut menu = context_menu()
         .trigger(trigger)
         .popup_style(menu_surface)
+        // A phone's sheet sits over a dimmed page, as the app's others do.
+        .backdrop_style(|s| s.bg(colors::SCRIM))
         // It grows from where it was asked for, and fades as it goes.
         .popup_starting_class("opacity-0 scale-95")
         .popup_ending_class("opacity-0 scale-95");
+    if let Some((title, open)) = about {
+        menu = menu.on_open_change(move |event: &nsh_base::MenuEvent| {
+            if let nsh_base::MenuEvent::OpenChange(now_open, _) = event {
+                open.set(*now_open);
+            }
+        });
+        if super::touch() {
+            menu = menu.child(
+                view()
+                    .test_id("menu-title")
+                    .px_2()
+                    .pt_2()
+                    .pb_2()
+                    .mb_1()
+                    .border_b_1()
+                    .border_color(colors::EDGE)
+                    .child(
+                        text(title)
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::XS))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors::MUTED),
+                    ),
+            );
+        }
+    }
     for action in actions {
         menu = menu.child(menu_row(action));
     }
@@ -634,6 +695,7 @@ pub fn press_menu(
                 ),
         )
         .popup_style(menu_surface)
+        .backdrop_style(|s| s.bg(colors::SCRIM))
         .popup_starting_class("opacity-0 scale-95")
         .popup_ending_class("opacity-0 scale-95");
     for action in actions {

@@ -191,11 +191,17 @@ fn menu_row(store: Store, id: String, dated: bool) -> View {
             move || store.archive_session(&session, !archived),
         ));
     }
-    let preview = id.clone();
-    ui::with_menu(
-        ui::with_preview(session_button(store, id, dated), move || {
-            session_preview(store, preview)
-        }),
+    let (preview, title) = (id.clone(), id.clone());
+    // While the menu is up its row is the marked one, whichever
+    // conversation is open behind it.
+    let about = signal(false);
+    ui::with_menu_about(
+        move || store.title(&title),
+        about,
+        ui::with_preview(
+            session_button(store, id, dated).style_when(move || about.get(), ui::menu_target),
+            move || session_preview(store, preview),
+        ),
         actions,
     )
 }
@@ -614,8 +620,14 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
         .text_size(px(type_scale::XS))
         .text_color(colors::FAINT),
     );
+    let about = signal(false);
+    line = line.style_when(move || about.get(), ui::menu_target);
+    let about_id = id.clone();
+    let about_name = move || store.project(&about_id).map(|p| p.name).unwrap_or_default();
     let Some(reorder) = reorder else {
-        return ui::with_menu(
+        return ui::with_menu_about(
+            about_name,
+            about,
             line.child(icon(Glyph::Chevron).text_color(colors::FAINT)),
             actions,
         );
@@ -643,7 +655,7 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
                     view()
                         .flex_1()
                         .min_w(px(0.0))
-                        .child(ui::with_menu(line, actions)),
+                        .child(ui::with_menu_about(about_name, about, line, actions)),
                 )
                 .child(drag_handle(store, reorder, handle_id)),
         )

@@ -703,6 +703,16 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     app.press_key("escape")?;
     app.press("Back to all conversations >> nth=0")?;
     app.long_press("Grocery list >> nth=0")?;
+    // The sheet says which conversation it is about: another may be the
+    // one marked as open.
+    app.wait_for("Move to project…")?;
+    assert!(
+        app.screen()
+            .layout_nodes()
+            .iter()
+            .any(|n| n.test_id.as_deref() == Some("menu-title") && !n.hidden),
+        "the menu names its conversation"
+    );
     let before = sent("set_session_project");
     app.press("Move to project…")?;
     app.wait_for("Move to project")?;
