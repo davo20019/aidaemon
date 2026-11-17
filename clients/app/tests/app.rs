@@ -890,9 +890,8 @@ fn a_missed_run_reads_as_missed_in_the_last_run_line_and_history() -> Result<(),
     feed([frame(
         r#"{"type":"ack","request_id":"r9","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every day at 9:00 AM ET","status":"active","edit":{"when":"every day at 9am","instructions":"Summarize the synthetic inbox"},"recent_runs":[{"started_ms":1767088800000,"finished_ms":1767092400000,"outcome":"missed","summary":"The daemon wasn't running when this was due."},{"started_ms":1767002400000,"finished_ms":1767002460000,"outcome":"done","summary":"3 new messages, 1 needs a reply."}]}]}}"#,
     )]);
-    app.wait_for(
-        r"text:/^Last run due .* · Missed: The daemon wasn't running when this was due\.$/",
-    )?;
+    app.wait_for(r"text:/^Last run due /")?;
+    app.wait_for("The daemon wasn't running when this was due.")?;
     // Its recent runs, under Details, say the same.
     app.press("Details")?;
     app.wait_for("Recent runs")?;
@@ -916,7 +915,7 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     app.wait_for("It hasn't run yet.")?;
     // Runs that reported something since the last look are marked.
     app.wait_for("New since you last looked")?;
-    app.wait_for(r"text:/^Last run .* · Failed: The synthetic token expired\.$/")?;
+    app.wait_for("The synthetic token expired.")?;
     // Paused after its runs kept failing: the way back is a good run.
     app.wait_for("Paused after failures")?;
     app.wait_for("Try again")?;
@@ -936,13 +935,14 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
         std::time::Duration::from_secs(5),
     )?;
     app.wait_for("Inbox digest")?;
-    app.wait_for("Scheduled · Every weekday at 9:00 AM ET")?;
+    app.wait_for("Every weekday at 9:00 AM ET")?;
     // A paused one resumes; only scheduled work runs now.
     app.wait_for("Paused")?;
     app.wait_for("Resume")?;
     app.wait_for("Run now")?;
-    // Cancelling asks first.
-    app.press("Cancel >> nth=0")?;
+    // Cancelling sits under Details, and asks first.
+    app.press("Details >> nth=0")?;
+    app.press("Cancel automation")?;
     app.wait_for("Cancel it for good?")?;
     app.press("Keep it")?;
     app.wait_for_gone("Cancel it for good?", std::time::Duration::from_secs(5))?;
@@ -982,7 +982,7 @@ fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
     feed([frame(
         r#"{"type":"ack","request_id":"r10","result":{"type":"automations","automations":[{"id":"goal-1","kind":"scheduled","name":"Inbox digest","what":"Summarize the synthetic inbox","how_often":"Every weekday and Saturday at 9:00 AM ET","status":"active","edit":{"when":"every weekday at 9am and saturdays","instructions":"Summarize the synthetic inbox"}}],"note":"Rescheduled \"Inbox digest\".","changed":true}}"#,
     )]);
-    app.wait_for("Scheduled · Every weekday and Saturday at 9:00 AM ET")?;
+    app.wait_for("Every weekday and Saturday at 9:00 AM ET")?;
     Ok(())
 }
 

@@ -74,7 +74,8 @@ pub fn short_date(at_ms: u64, now_ms: u64) -> String {
     }
 }
 
-/// "Today", "Yesterday", "Monday", "Mar 3" or "Mar 3, 2025".
+/// "Today", "Yesterday", "Tomorrow", "Monday" (the week either side),
+/// "Mar 3" or "Mar 3, 2025".
 pub fn day_label(at_ms: u64, now_ms: u64) -> String {
     let (Some(at), Some(now)) = (local(at_ms), local(now_ms)) else {
         return String::new();
@@ -83,7 +84,8 @@ pub fn day_label(at_ms: u64, now_ms: u64) -> String {
     match days {
         0 => "Today".into(),
         1 => "Yesterday".into(),
-        2..=6 => at.format("%A").to_string(),
+        -1 => "Tomorrow".into(),
+        2..=6 | -6..=-2 => at.format("%A").to_string(),
         _ if at.year() == now.year() => at.format("%b %-d").to_string(),
         _ => at.format("%b %-d, %Y").to_string(),
     }

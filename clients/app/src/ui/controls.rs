@@ -1016,6 +1016,15 @@ pub fn surface() -> View {
         .bg(colors::SURFACE)
 }
 
+/// A recessed block inside a surface: what a card last did, a quote.
+pub fn inset() -> View {
+    view()
+        .rounded(px(radius::CONTROL))
+        .bg(colors::INSET)
+        .px_3()
+        .py_2()
+}
+
 /// An empty state: what is missing and what to do about it.
 pub fn empty(title: &'static str, detail: impl IntoReactive<SharedString>) -> View {
     view()

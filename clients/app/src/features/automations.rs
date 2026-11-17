@@ -60,9 +60,13 @@ fn header(store: Store) -> View {
                 .text_size(px(ui::fit::body()))
                 .font_weight(FontWeight::SEMIBOLD),
         )
-        .child(ui::btn("New", Variant::Ghost, Size::Sm, move || {
-            new_automation(store)
-        }))
+        .child(ui::btn_icon(
+            Glyph::Plus,
+            "New",
+            Variant::Ghost,
+            Size::Sm,
+            move || new_automation(store),
+        ))
         .child(ui::icon_btn(Glyph::Retry, "Refresh", Size::Md, move || {
             store.refresh_automations()
         }))
@@ -103,16 +107,20 @@ fn body(store: Store, read: AutomationsRead) -> View {
                 move || new_automation(store),
             ))),
         AutomationsRead::Ready(list) => {
-            let mut column = column;
+            let count = list.len();
+            let mut column = column.child(
+                text(format!(
+                    "{count} automation{}, next to run first",
+                    if count == 1 { "" } else { "s" }
+                ))
+                .px_1()
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+            );
             for automation in list {
                 column = column.child(card(store, automation));
             }
-            column.child(
-                text("To make a new one, ask in a conversation.")
-                    .px_2()
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-            )
+            column
         }
     }
 }
@@ -161,27 +169,46 @@ fn ran_at(at_ms: u64) -> String {
     )
 }
 
-/// Its latest run in one line: when, how it ended, what it said. A missed
-/// run says it was due and never ran, not that it ran.
-fn last_run(run: &AutomationRun) -> Text {
-    let (word, _) = outcome_word(run.outcome);
-    let mut line = if run.outcome == RunOutcome::Missed {
-        format!("Last run due {} · {word}", ran_at(run.started_ms))
+/// Its latest run, recessed in the card: how it ended and when on one
+/// line (a missed run says it was due, not that it ran), what it said
+/// under it. `new`: it reported something since the last look.
+fn last_run(run: &AutomationRun, new: bool) -> View {
+    let (word, tone) = outcome_word(run.outcome);
+    let when = if run.outcome == RunOutcome::Missed {
+        format!("Last run due {}", ran_at(run.started_ms))
     } else {
-        format!("Last run {} · {word}", ran_at(run.started_ms))
+        format!("Last run {}", ran_at(run.started_ms))
     };
-    if let Some(summary) = run.summary.as_deref() {
-        line.push_str(": ");
-        line.push_str(summary);
+    let mut head = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(ui::badge_dot(word, tone))
+        .child(
+            text(when)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .text_size(px(type_scale::XS))
+                .text_color(colors::FAINT),
+        );
+    if new {
+        head = head.child(badge("New since you last looked", Tone::Accent));
     }
-    text(line)
-        .number_of_lines(2)
-        .text_size(px(type_scale::SM))
-        .text_color(if run.outcome == RunOutcome::Failed {
-            colors::DANGER
-        } else {
-            colors::TEXT
-        })
+    let mut block = ui::inset().gap_1().child(head);
+    if let Some(summary) = run.summary.as_deref() {
+        block = block.child(
+            text(summary.to_owned())
+                .number_of_lines(3)
+                .text_size(px(ui::fit::small()))
+                .text_color(if run.outcome == RunOutcome::Failed {
+                    colors::DANGER
+                } else {
+                    colors::TEXT
+                }),
+        );
+    }
+    block
 }
 
 /// Its recent runs, newest first: each run's end and what it said.
@@ -220,7 +247,8 @@ fn card(store: Store, automation: AutomationSummary) -> View {
         .name
         .clone()
         .unwrap_or_else(|| automation.what.clone());
-    let mut schedule = format!("{} · {}", kind_word(automation.kind), automation.how_often);
+    // How often, then when next: "Every 8 hours · next Tomorrow 1:11 AM".
+    let mut schedule = automation.how_often.clone();
     if let Some(next) = automation.next_run_ms {
         let now = now_ms();
         schedule.push_str(&format!(
@@ -235,7 +263,7 @@ fn card(store: Store, automation: AutomationSummary) -> View {
         move || store.automation_busy().as_deref() == Some(id.as_str())
     };
     let confirming = signal(false);
-    let mut heading = view().flex_row().items_center().gap_2().child(
+    let mut heading = view().flex_row().items_start().gap_2().child(
         text(title)
             .flex_1()
             .min_w(px(0.0))
@@ -247,39 +275,46 @@ fn card(store: Store, automation: AutomationSummary) -> View {
     if let Some((label, tone)) = state_badge(&automation.status) {
         heading = heading.child(badge(label, tone));
     }
-    let mut c = ui::surface().p_3().gap_1().child(heading).child(
-        text(schedule)
-            .text_size(px(type_scale::XS))
-            .text_color(colors::MUTED),
-    );
+    // Its kind as a quiet tag before its cadence.
+    let meta = view()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .child(badge(kind_word(automation.kind), Tone::Neutral))
+        .child(
+            text(schedule)
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(ui::fit::small()))
+                .text_color(colors::MUTED),
+        );
+    let mut c = ui::surface().p_4().gap_2().child(heading).child(meta);
     if automation.name.is_some() {
         c = c.child(
             text(automation.what.clone())
-                .number_of_lines(3)
-                .text_size(px(type_scale::SM))
+                .number_of_lines(2)
+                .text_size(px(ui::fit::small()))
                 .text_color(colors::MUTED),
         );
     }
     // What it did, not only what it will do.
     match automation.recent_runs.first() {
-        Some(run) => {
-            c = c.child(last_run(run));
-            if store.run_is_new(run) {
-                c = c.child(ui::badge("New since you last looked", Tone::Accent));
-            }
-        }
+        Some(run) => c = c.child(last_run(run, store.run_is_new(run))),
         None => {
             // A failing check keeps no runs here: its badge says it failed,
             // so "hasn't run" would contradict it.
             let failing = matches!(automation.status.as_str(), "failed" | "stalled");
             c = c.child(
-                text(if failing {
-                    "It is failing. Its runs are not recorded here; Details has what is known."
-                } else {
-                    "It hasn't run yet."
-                })
-                .text_size(px(type_scale::XS))
-                .text_color(colors::FAINT),
+                ui::inset().child(
+                    text(if failing {
+                        "It is failing. Its runs are not recorded here; Details has what is known."
+                    } else {
+                        "It hasn't run yet."
+                    })
+                    .text_size(px(ui::fit::small()))
+                    .text_color(colors::FAINT),
+                ),
             )
         }
     }
@@ -307,7 +342,7 @@ fn card(store: Store, automation: AutomationSummary) -> View {
     // Paused after failures: its next good run turns it back on.
     let held = automation.status == "held_after_failures";
     let failed = matches!(automation.status.as_str(), "failed" | "stalled");
-    let mut actions = view().flex_row().flex_wrap().gap_1().pt_1();
+    let mut actions = view().flex_row().flex_wrap().items_center().gap_1();
     if held {
         actions = actions.child(
             ui::btn(
@@ -389,36 +424,43 @@ fn card(store: Store, automation: AutomationSummary) -> View {
             })
         }),
     );
+    // Cancelling is rare and final: it sits at the foot of Details, and
+    // asks again before it happens.
     let cancel = act(AutomationChange::Cancel);
-    actions = actions.child(
-        when(confirming, move || {
-            let cancel = cancel.clone();
-            view()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .child(
-                    text("Cancel it for good?")
-                        .text_size(px(type_scale::SM))
-                        .text_color(colors::MUTED),
-                )
-                .child(ui::btn("Yes, cancel", Variant::Danger, Size::Sm, {
-                    let cancel = cancel.clone();
-                    move || {
-                        confirming.set(false);
-                        cancel()
-                    }
-                }))
-                .child(ui::btn("Keep it", Variant::Ghost, Size::Sm, move || {
-                    confirming.set(false)
-                }))
-        })
-        .otherwise(move || {
-            ui::btn("Cancel", Variant::Ghost, Size::Sm, move || {
-                confirming.set(true)
+    let cancel_row = move || {
+        let cancel = cancel.clone();
+        view().flex_row().pt_2().child(
+            when(confirming, move || {
+                let cancel = cancel.clone();
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        text("Cancel it for good?")
+                            .pr_1()
+                            .text_size(px(ui::fit::small()))
+                            .text_color(colors::MUTED),
+                    )
+                    .child(ui::btn("Yes, cancel", Variant::Danger, Size::Sm, {
+                        let cancel = cancel.clone();
+                        move || {
+                            confirming.set(false);
+                            cancel()
+                        }
+                    }))
+                    .child(ui::btn("Keep it", Variant::Ghost, Size::Sm, move || {
+                        confirming.set(false)
+                    }))
             })
-        }),
-    );
+            .otherwise(move || {
+                ui::btn("Cancel automation", Variant::Outline, Size::Sm, move || {
+                    confirming.set(true)
+                })
+            }),
+        )
+    };
     let runs = automation.recent_runs.clone();
     let lines = automation.details.clone();
     let form = automation.edit.clone().map(|edit| {
@@ -426,9 +468,9 @@ fn card(store: Store, automation: AutomationSummary) -> View {
         let name = automation.name.clone().unwrap_or_default();
         move || edit_form(store, id.clone(), name.clone(), edit.clone())
     });
-    let mut c = c
-        .child(actions)
-        .child(when(showing, move || details(lines.clone(), runs.clone())));
+    let mut c = c.child(actions).child(when(showing, move || {
+        details(lines.clone(), runs.clone()).child(cancel_row())
+    }));
     if let Some(form) = form {
         c = c.child(when(editing, form));
     }
@@ -438,11 +480,11 @@ fn card(store: Store, automation: AutomationSummary) -> View {
 /// All of it: what it may do, when it tells you, when it ends and the rest
 /// of its card, then its recent runs.
 fn details(lines: Vec<String>, runs: Vec<AutomationRun>) -> View {
-    let mut list = view().gap_1().pt_1();
+    let mut list = view().gap_1().pt_1().child(ui::separator().mb_2());
     for line in lines {
         list = list.child(
             text(line)
-                .text_size(px(type_scale::SM))
+                .text_size(px(ui::fit::small()))
                 .text_color(colors::MUTED),
         );
     }
