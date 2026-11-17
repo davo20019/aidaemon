@@ -622,12 +622,6 @@ async fn live_surface_follows_a_real_sign_in() {
         .await
         .expect("open live");
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let before = live
-        .frames
-        .borrow_and_update()
-        .as_ref()
-        .map(|f| f.seq)
-        .unwrap_or(0);
     for action in [PointerAction::Down, PointerAction::Up] {
         registry
             .input(
@@ -642,27 +636,30 @@ async fn live_surface_follows_a_real_sign_in() {
             .await
             .expect("tap Login");
     }
-    tokio::time::sleep(Duration::from_millis(5000)).await;
-    let after = live
-        .frames
-        .borrow_and_update()
-        .as_ref()
-        .map(|f| f.seq)
-        .unwrap_or(0);
-    let observed = registry.observe(&surface.id).await.expect("observe");
-    eprintln!(
-        "DIAG frames {before} -> {after}, title {:?}",
-        observed.title
-    );
-    registry.close_live(&live.live_id);
+    // The sign-in leads on to the secure area, whose banner is green: the
+    // owner's picture shows it (a stalled one stays on the sign-in page).
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+    let latest = live.frames.borrow_and_update().clone().expect("a frame");
+    if let Some(path) = std::env::var_os("AIDAEMON_SMOKE_FRAME") {
+        let _ = std::fs::write(path, &latest.data);
+    }
+    let picture = image::load_from_memory(&latest.data)
+        .expect("a JPEG")
+        .to_rgb8();
+    // A spot in the banner: dark green there, light on the sign-in page.
+    let spot = picture.get_pixel(picture.width() / 2, picture.height() * 105 / 577);
+    let banner = spot[0] < 60 && spot[1] > spot[0] + 15 && spot[1] < 110;
     registry
         .release_control(&surface.id, "real-phone")
         .expect("give control back");
+    let observed = registry.observe(&surface.id).await.expect("observe");
+    registry.close_live(&live.live_id);
     assert!(observed.title.contains("Internet"), "{observed:?}");
     let text = call(json!({"action": "get_text", "selector": "body"})).await;
     assert!(text.contains("secure area"), "the tap signed in: {text}");
     assert!(
-        after > before + 1,
-        "the picture stopped at the sign-in (frame {before} then {after})"
+        banner,
+        "the picture stopped at the sign-in: no secure-area banner (frame {}, colour {spot:?})",
+        latest.seq
     );
 }

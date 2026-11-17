@@ -1365,6 +1365,39 @@ impl PageHandle for ChromiumoxidePage {
             .execute(params)
             .await
             .map_err(|e| format!("Failed to start the live view: {e}"))?;
+        // A new document in the tab (a link, a form sent, a redirect)
+        // stalls Chrome's screencast on the old one: start it again, so the
+        // picture follows the page.
+        let navigations = self
+            .page
+            .event_listener::<chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated>()
+            .await
+            .map_err(|e| format!("Failed to follow the page: {e}"))?;
+        let page = self.page.clone();
+        let quality = i64::from(quality.clamp(10, 100));
+        let (max_w, max_h) = (i64::from(max_w), i64::from(max_h));
+        let restarts = navigations
+            .filter(|event| futures::future::ready(event.frame.parent_id.is_none()))
+            .then(move |_| {
+                let page = page.clone();
+                async move {
+                    let again = StartScreencastParams::builder()
+                        .format(StartScreencastFormat::Jpeg)
+                        .quality(quality)
+                        .max_width(max_w)
+                        .max_height(max_h)
+                        .build();
+                    // Chrome still waits for an ack of the old page's last
+                    // frame, which it no longer takes: stop, then start.
+                    let _ = page
+                        .execute(
+                            chromiumoxide::cdp::browser_protocol::page::StopScreencastParams::default(),
+                        )
+                        .await;
+                    let _ = page.execute(again).await;
+                    None
+                }
+            });
         let frames = events.filter_map(|event| async move {
             let data = base64::engine::general_purpose::STANDARD
                 .decode(AsRef::<str>::as_ref(&event.data))
@@ -1376,6 +1409,8 @@ impl PageHandle for ChromiumoxidePage {
                 session: event.session_id,
             })
         });
+        let frames =
+            futures::stream::select(frames.map(Some), restarts).filter_map(futures::future::ready);
         Ok(Box::pin(frames))
     }
 

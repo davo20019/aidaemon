@@ -785,6 +785,7 @@ dependencies = [
  "dunce",
  "futures",
  "hex",
+ "image",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
