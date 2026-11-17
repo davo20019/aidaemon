@@ -182,8 +182,7 @@ fn choice_sized(
                     }),
                 )
                 .child(
-                    text("▾")
-                        .text_size(px(type_scale::XS))
+                    super::icon(super::Glyph::Down)
                         .text_color(colors::FAINT)
                         .accessibility_elements_hidden(true),
                 ),

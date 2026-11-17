@@ -71,7 +71,7 @@ fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), 
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     // A phone: the page alone, as wide as the screen.
     let mut app = start_at(390.0, 844.0);
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     let phone = conversation_width(&app);
     assert!(
         phone > 380.0,
@@ -79,7 +79,7 @@ fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), 
     );
     // A roomy window: the page takes what the panes leave.
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     let desk = conversation_width(&app);
     assert!(
         desk > 600.0,
@@ -92,7 +92,7 @@ fn the_conversation_fills_a_phone_and_the_room_beside_the_panes() -> Result<(), 
 fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -214,9 +214,12 @@ fn the_name_goes_home() -> Result<(), String> {
     ]);
     app.wait_for("Garden notes")?;
     app.press("Garden notes >> nth=0")?;
-    app.wait_for_gone("What can I help with?", std::time::Duration::from_secs(5))?;
+    app.wait_for_gone(
+        "What can I help you with?",
+        std::time::Duration::from_secs(5),
+    )?;
     app.press("AIDaemon, home")?;
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     Ok(())
 }
 
@@ -248,7 +251,7 @@ fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     let before = sent("get_settings");
     feed([Update::Connected]);
     // From the keyboard: the command palette, then Settings.
@@ -312,7 +315,7 @@ fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<
 fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     app.press("Settings: change how the daemon runs")?;
     app.wait_for("Reading settings…")?;
@@ -413,7 +416,7 @@ fn wait_setup_sent(before: usize, what: &str) -> Result<String, String> {
 fn settings_opens_the_phone_step_and_not_now_leaves_it() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     app.press("Settings: change how the daemon runs")?;
     let id = wait_sent("get_settings")?;
@@ -521,7 +524,7 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
 fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -547,7 +550,7 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
 fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -599,7 +602,7 @@ fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
 fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -642,13 +645,13 @@ fn chats_filter_by_source_and_a_group_asks_before_posting() -> Result<(), String
 fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     // Code before any project exists says how to make the first.
     app.press("Code")?;
     app.wait_for("Which project is this for?")?;
     app.wait_for("New project")?;
     app.press("Chat")?;
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -676,7 +679,7 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     // the project and brings the question; Code shows the project on a
     // card, the one this device last worked in.
     app.press("Chat")?;
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     app.press("Code")?;
     app.wait_for("Which project is this for?")?;
     app.wait_for("/home/synthetic/acme-site")?;
@@ -725,7 +728,7 @@ fn above(screen: &nsh_testing::Screen, first: &str, second: &str) -> bool {
 fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -824,7 +827,7 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
 fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -845,7 +848,7 @@ fn a_file_the_agent_sends_shows_with_its_reply() -> Result<(), String> {
 fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -883,7 +886,7 @@ fn a_sent_picture_shows_at_its_size_before_it_loads() -> Result<(), String> {
 fn a_missed_run_reads_as_missed_in_the_last_run_line_and_history() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
@@ -904,7 +907,7 @@ fn a_missed_run_reads_as_missed_in_the_last_run_line_and_history() -> Result<(),
 fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
@@ -960,7 +963,7 @@ fn automations_list_and_ask_before_cancelling() -> Result<(), String> {
 fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     app.press("Automations: what runs on its own")?;
     app.wait_for("Reading your automations…")?;
@@ -990,7 +993,7 @@ fn an_automation_is_edited_in_place_and_saved() -> Result<(), String> {
 fn resting_the_pointer_on_a_conversation_previews_it() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start_desktop();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -1037,7 +1040,7 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
     config.environment.idiom = nsh_core::platform::Idiom::Desktop;
     config.speech = Some(std::sync::Arc::new(Hears));
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     app.type_text("label:Message", "Fix the footer")?;
     app.press("Speak instead of typing")?;
     app.wait_for("Stop listening")?;
@@ -1051,7 +1054,7 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
 fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -1082,7 +1085,7 @@ fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
 fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start_at(390.0, 844.0);
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     let before = sent("list_models");
     feed([Update::Connected]);
     let id = wait_sent_new("list_models", before)?;
@@ -1120,7 +1123,7 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
     // window, where the list of conversations shows).
     drop(app);
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
     let id = wait_sent_new("list_models", Some(id))?;
     feed([frame(&format!(
@@ -1150,7 +1153,7 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
 -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(
@@ -1192,7 +1195,7 @@ fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("What can I help with?")?;
+    app.wait_for("What can I help you with?")?;
     feed([
         Update::Connected,
         frame(

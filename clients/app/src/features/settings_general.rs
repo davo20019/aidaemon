@@ -293,18 +293,24 @@ fn row(store: Store, settings: &Settings, item: &Item) -> View {
                 .iter()
                 .map(|(v, t)| (v.to_string(), t.to_string()))
                 .collect();
-            view().flex_row().child(ui::choice(
-                item.title,
-                "Choose",
-                items,
-                move || Some(chosen.get()),
-                move |next: Option<String>| {
-                    if let Some(next) = next {
-                        chosen.set(next.clone());
-                        set(store, key, quoted(&next));
-                    }
-                },
-            ))
+            // A phone's list fills the row, as a form's does; a window's
+            // stops at a readable width.
+            view().flex_row().child(
+                ui::choice(
+                    item.title,
+                    "Choose",
+                    items,
+                    move || Some(chosen.get()),
+                    move |next: Option<String>| {
+                        if let Some(next) = next {
+                            chosen.set(next.clone());
+                            set(store, key, quoted(&next));
+                        }
+                    },
+                )
+                .flex_1()
+                .max_w(px(if ui::touch() { f32::MAX } else { 360.0 })),
+            )
         }
         Control::Text(placeholder) | Control::Number(placeholder) => {
             let number = matches!(item.control, Control::Number(_));
@@ -332,15 +338,24 @@ fn row(store: Store, settings: &Settings, item: &Item) -> View {
                         .flex_1()
                         .min_w(px(0.0)),
                 )
-                .child(
-                    ui::btn("Save", Variant::Secondary, Size::Sm, save).disabled(move || {
-                        draft.with(|d| {
-                            d.trim() == saved.trim()
-                                || d.trim().is_empty()
-                                || (number && d.trim().parse::<i64>().is_err())
+                // Save shows once there is a change, so an untouched
+                // field is not followed by a dead button.
+                .child(when(
+                    {
+                        let saved = saved.clone();
+                        move || draft.with(|d| d.trim() != saved.trim())
+                    },
+                    move || {
+                        let saved = saved.clone();
+                        ui::btn("Save", Variant::Primary, Size::Sm, save).disabled(move || {
+                            draft.with(|d| {
+                                d.trim() == saved.trim()
+                                    || d.trim().is_empty()
+                                    || (number && d.trim().parse::<i64>().is_err())
+                            })
                         })
-                    }),
-                )
+                    },
+                ))
         }
     };
     view().p_3().gap_2().child(head).child(body)
