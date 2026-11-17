@@ -633,6 +633,32 @@ async fn run_media(
     result
 }
 
+/// A view's frames, for the log when it ends: whether the picture stopped
+/// at the page, here, or at the device.
+#[derive(Default)]
+struct Tally {
+    surface: String,
+    opened: Option<Instant>,
+    sent: u64,
+    acked: u64,
+    last: u64,
+    waiting_on: Option<u64>,
+}
+
+impl Drop for Tally {
+    fn drop(&mut self) {
+        info!(
+            surface = %self.surface,
+            frames_sent = self.sent,
+            frames_acked = self.acked,
+            last_frame = self.last,
+            waiting_on_ack = ?self.waiting_on,
+            secs = self.opened.map_or(0, |at| at.elapsed().as_secs()),
+            "Live view picture"
+        );
+    }
+}
+
 async fn pump_media(
     desk: &SurfaceDesk,
     socket: &mut WebSocket,
@@ -665,6 +691,12 @@ async fn pump_media(
     // One frame in flight: the next goes once the client acks this one.
     let mut in_flight: Option<u64> = None;
     let mut waiting = true;
+    // How the picture went, said in the log when the view ends.
+    let mut tally = Tally {
+        surface: surface_id.to_string(),
+        opened: Some(Instant::now()),
+        ..Tally::default()
+    };
     let mut last_heard = Instant::now();
     let mut ping = tokio::time::interval(PING_EVERY);
     let mut window_start = Instant::now();
@@ -686,6 +718,9 @@ async fn pump_media(
                     .send(Message::Binary(media::encode(&header, &frame.data).into()))
                     .await?;
                 in_flight = Some(frame.seq);
+                tally.sent += 1;
+                tally.last = frame.seq;
+                tally.waiting_on = in_flight;
             }
             waiting = false;
         }
@@ -725,6 +760,8 @@ async fn pump_media(
                     Ok(MediaClientMessage::Ack { seq }) => {
                         if in_flight.is_some_and(|sent| seq >= sent) {
                             in_flight = None;
+                            tally.acked += 1;
+                            tally.waiting_on = None;
                         }
                     }
                     Ok(MediaClientMessage::Input { event }) => {

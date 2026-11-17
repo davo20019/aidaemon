@@ -190,9 +190,10 @@ export class MediaSocket {
       }
       if (header.type === "frame") {
         const mime = header.codec === "png" ? "image/png" : "image/jpeg";
+        // Acked first: whatever happens drawing it, the next frame comes.
+        this.send(JSON.stringify({ type: "ack", seq: header.seq }));
         const uri = `data:${mime};base64,${b64(bytes.subarray(4 + length))}`;
         event("frame", JSON.stringify({ seq: header.seq, w: header.w, h: header.h, uri }));
-        this.send(JSON.stringify({ type: "ack", seq: header.seq }));
       } else {
         event("header", JSON.stringify(header));
       }

@@ -562,3 +562,107 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
         )
         .await;
 }
+
+/// A real sign-in page on the internet (a form posted, a redirect, a new
+/// page): the owner's picture follows the page to where the form leads.
+#[tokio::test]
+#[ignore = "requires local Chrome and the internet; run with --ignored"]
+async fn live_surface_follows_a_real_sign_in() {
+    use aidaemon_surfaces::{
+        InputEvent, LiveMode, PointerAction, PointerButton, StreamParams, SurfaceRegistry,
+        SurfacesConfig,
+    };
+    let profile = TempDir::new().expect("temp profile");
+    let (media_tx, _media_rx) = mpsc::channel(4);
+    let tool = BrowserTool::new(
+        BrowserSettings {
+            headless: std::env::var_os("AIDAEMON_SMOKE_HEADED").is_none(),
+            user_data_dir: Some(profile.path().to_str().unwrap().to_string()),
+            ..BrowserSettings::default()
+        },
+        media_tx,
+        profile.path().join("inbox"),
+        aidaemon_tools::testing::active_execution_backend(),
+    )
+    .expect("construct browser tool");
+    let session = "live-real";
+    let call = |args: serde_json::Value| {
+        let tool = &tool;
+        async move { call_approved(tool, &args.to_string(), session).await }
+    };
+    let nav =
+        call(json!({"action": "navigate", "url": "https://the-internet.herokuapp.com/login"}))
+            .await;
+    assert!(nav.starts_with("Navigated to"), "navigate failed: {nav}");
+    call(json!({"action": "fill", "selector": "#username", "value": "tomsmith"})).await;
+    call(json!({"action": "fill", "selector": "#password", "value": "SuperSecretPassword!"})).await;
+    let place = call(json!({"action": "execute_js", "script":
+        "(() => { const r = document.querySelector('#login button').getBoundingClientRect(); return JSON.stringify([(r.left + r.width / 2) / innerWidth, (r.top + r.height / 2) / innerHeight]); })()"
+    }))
+    .await;
+    let start = place.find('[').expect("the button's place");
+    let end = place[start..].find(']').expect("the button's place") + start;
+    let [x, y]: [f64; 2] = serde_json::from_str(&place[start..=end]).expect("two numbers");
+
+    let registry = SurfaceRegistry::new(SurfacesConfig::default());
+    let surfaces = tool.surface_backend();
+    surfaces.set_notifier(registry.notifier());
+    registry.add_backend(surfaces);
+    let surface = registry
+        .find_for_agent(session, None)
+        .await
+        .expect("the tab is a surface");
+    let mut live = registry
+        .open_live(
+            &surface.id,
+            "real-phone",
+            LiveMode::Control,
+            StreamParams::default(),
+        )
+        .await
+        .expect("open live");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
+    for action in [PointerAction::Down, PointerAction::Up] {
+        registry
+            .input(
+                &live.live_id,
+                &InputEvent::Pointer {
+                    action,
+                    x,
+                    y,
+                    button: PointerButton::Left,
+                },
+            )
+            .await
+            .expect("tap Login");
+    }
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+    let after = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
+    let observed = registry.observe(&surface.id).await.expect("observe");
+    eprintln!(
+        "DIAG frames {before} -> {after}, title {:?}",
+        observed.title
+    );
+    registry.close_live(&live.live_id);
+    registry
+        .release_control(&surface.id, "real-phone")
+        .expect("give control back");
+    assert!(observed.title.contains("Internet"), "{observed:?}");
+    let text = call(json!({"action": "get_text", "selector": "body"})).await;
+    assert!(text.contains("secure area"), "the tap signed in: {text}");
+    assert!(
+        after > before + 1,
+        "the picture stopped at the sign-in (frame {before} then {after})"
+    );
+}

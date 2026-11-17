@@ -23,7 +23,6 @@ use aidaemon_surfaces::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use tracing::debug;
 
 use super::backend::{
     BrowserBackend, KeyInput, MouseButtonKind, MouseInput, MouseKind, PageHandle, SignInStore,
@@ -438,12 +437,17 @@ impl SurfaceBackend for BrowserSurface {
             next
         };
         tokio::spawn(async move {
+            let mut produced = 0u64;
+            let started = std::time::Instant::now();
+            let mut last_frame = started;
             loop {
                 let frame = tokio::select! {
                     _ = &mut stop_rx => break,
                     frame = frames.next() => frame,
                 };
                 let Some(frame) = frame else { break };
+                produced += 1;
+                last_frame = std::time::Instant::now();
                 lock(&viewports).insert(target.clone(), (frame.css_w, frame.css_h));
                 let w = frame.css_w.round().max(1.0) as u32;
                 let h = frame.css_h.round().max(1.0) as u32;
@@ -459,7 +463,12 @@ impl SurfaceBackend for BrowserSurface {
             if lock(&streams).get(&target) == Some(&generation) {
                 let _ = page.stop_screencast().await;
             }
-            debug!(target = %target, "live view stopped");
+            tracing::info!(
+                frames = produced,
+                secs = started.elapsed().as_secs(),
+                quiet_for_secs = last_frame.elapsed().as_secs(),
+                "Live view stream ended"
+            );
         });
         Ok(StreamHandle::new(move || {
             let _ = stop_tx.send(());
