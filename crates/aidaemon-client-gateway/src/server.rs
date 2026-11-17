@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aidaemon_client_protocol::{
-    Capability, ChallengeRequest, ClientFrame, ClientKind, ErrorCode, Event, EventsPage,
+    Capability, ChallengeRequest, ClientFrame, ClientKind, Command, ErrorCode, Event, EventsPage,
     OfferRequest, PairingDecision, ProtocolError, ProtocolVersion, RedeemRequest, Scope,
     ServerFrame, SessionRequest,
 };
@@ -793,6 +793,7 @@ async fn run_socket(
     mut socket: WebSocket,
     by_header: Option<Principal>,
 ) -> anyhow::Result<()> {
+    let accepted = tokio::time::Instant::now();
     let hello = match tokio::time::timeout(HELLO_WITHIN, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<ClientFrame>(&text).ok(),
         _ => None,
@@ -807,6 +808,7 @@ async fn run_socket(
     else {
         return refuse(&mut socket, ErrorCode::Invalid, "Say hello first").await;
     };
+    let hello_ms = accepted.elapsed().as_millis();
     let Some(principal) = by_header.or_else(|| principal(&gateway, token.as_deref())) else {
         return refuse(
             &mut socket,
@@ -867,9 +869,11 @@ async fn run_socket(
     .await?;
 
     // Catch up: everything after the client's seq, or a snapshot.
+    let mut resumed = true;
     let mut sent = match resume_from {
         Some(seq) if gateway.bus.can_resume(seq).await => seq,
         _ => {
+            resumed = false;
             let (seq, mut state) = gateway.snapshot().await;
             if !wants_surfaces {
                 state.surfaces.clear();
@@ -887,6 +891,16 @@ async fn run_socket(
     let opened = tokio::time::Instant::now();
     let who = format!("{:?}", client.kind).to_lowercase();
     let device = client.device.clone().unwrap_or_default();
+    // How long a (re)connect takes before commands can flow: a phone
+    // coming back to the tab waits this long before its first reply.
+    info!(
+        client = %who,
+        device = %device,
+        resumed,
+        hello_ms,
+        ready_ms = accepted.elapsed().as_millis(),
+        "Client socket opened"
+    );
     let ended = async {
     loop {
         let idle = tokio::time::sleep_until(last_heard + IDLE_LIMIT);
@@ -908,7 +922,22 @@ async fn run_socket(
                         let caller = caller.clone();
                         let replies = replies_tx.clone();
                         tokio::spawn(async move {
+                            let file_read = match &command {
+                                Command::ListProjectFiles { .. } => Some("list_project_files"),
+                                Command::ReadProjectFile { .. } => Some("read_project_file"),
+                                _ => None,
+                            };
+                            let started = tokio::time::Instant::now();
                             let reply = gateway.command(&request_id, command, &caller).await;
+                            if let Some(command) = file_read {
+                                let bytes = serde_json::to_vec(&reply).map_or(0, |v| v.len());
+                                info!(
+                                    command,
+                                    ms = started.elapsed().as_millis(),
+                                    bytes,
+                                    "Client file command served"
+                                );
+                            }
                             let _ = replies.send(reply).await;
                         });
                     }
