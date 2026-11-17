@@ -42,11 +42,11 @@
           "type": "integer"
         },
         "element_role": {
-          "description": "Target an element by accessibility role (case-insensitive substring), e.g. 'button', 'textfield'. Use with or instead of element_title to disambiguate.",
+          "description": "Target an element by its accessibility role, e.g. 'button' or 'AXButton', 'textfield'. Use with or instead of element_title to disambiguate.",
           "type": "string"
         },
         "element_title": {
-          "description": "Target an element by its visible title/label (case-insensitive substring), resolved against the latest snapshot. More robust than element_index because it survives re-renders. E.g. 'Address and search bar', 'Like', 'Send'. Combine with occurrence to disambiguate repeats.",
+          "description": "Target an element by its exact title/label as get_app_state lists it (case-insensitive, whitespace-normalized; no partial or synonym matching), resolved against the latest snapshot. More robust than element_index because it survives re-renders. Combine with occurrence to disambiguate repeats.",
           "type": "string"
         },
         "key": {
@@ -54,7 +54,7 @@
           "type": "string"
         },
         "occurrence": {
-          "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Default 1.",
+          "description": "1-based: which match to use when element_title/element_role match several elements (e.g. occurrence 1 = first 'Like' button in a feed). Required when several elements match.",
           "type": "integer"
         },
         "pages": {

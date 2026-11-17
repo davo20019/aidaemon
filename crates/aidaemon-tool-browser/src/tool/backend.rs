@@ -2063,7 +2063,6 @@ pub struct MockElementState {
 #[derive(Debug, Clone)]
 pub enum MockFacts {
     Element(super::policy::ElementFacts),
-    Missing,
     Unreadable,
 }
 
@@ -2466,7 +2465,6 @@ impl PageHandle for MockPage {
         let scripted = self.element_state.lock().await.facts.get(selector).cloned();
         match scripted {
             Some(MockFacts::Element(facts)) => Ok(Some(facts)),
-            Some(MockFacts::Missing) => Ok(None),
             Some(MockFacts::Unreadable) => Err("facts unavailable".to_string()),
             None => Ok(Some(super::policy::ElementFacts {
                 tag: "input".to_string(),
