@@ -1,0 +1,32 @@
+[package]
+name = "aidaemon-surfaces"
+description = "Live surfaces for aidaemon: screens the agent works on (a browser tab, a desktop) that the owner can watch and take over from an app, with one control lease per surface; implementation crate of the aidaemon SDK, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-surfaces"
+keywords = ["agent", "screen", "remote-control", "browser"]
+categories = ["asynchronous"]
+publish = false
+
+[features]
+# Exposes `aidaemon_surfaces::testing::MockSurface`.
+testing = []
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+aidaemon-surfaces = { path = ".", features = ["testing"] }
+proptest = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -714,6 +714,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-surfaces"
+version = "0.20.0"
+dependencies = [
+ "aidaemon-surfaces",
+ "async-trait",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aidaemon-terminal-bridge"
 version = "0.20.0"
 dependencies = [

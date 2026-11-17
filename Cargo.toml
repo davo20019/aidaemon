@@ -51,6 +51,7 @@ members = [
     "crates/aidaemon-secrets",
     "crates/aidaemon-nodes",
     "crates/aidaemon-exposure",
+    "crates/aidaemon-surfaces",
     "crates/aidaemon-terminal-bridge",
     "crates/aidaemon-channels",
     "crates/aidaemon-channel-telegram",
