@@ -513,12 +513,22 @@ fn shown_file(store: Store, link: AttachmentRef, size_bytes: u64) -> View {
             name: link.name.clone(),
             pixels,
         };
-        return view().flex_1().items_center().p_4().child(ui::picture(
-            url,
-            format!("Picture: {}", link.name),
-            pixels,
-            move || store.view_picture(viewed.clone()),
-        ));
+        // Zooms in place; Full screen for the viewer (share, save, mark up).
+        return view()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .child(ui::zoomable_picture(
+                url,
+                format!("Picture: {}", link.name),
+                pixels,
+            ))
+            .child(view().flex_row().justify_center().p_2().child(ui::btn(
+                "Full screen",
+                Variant::Ghost,
+                Size::Sm,
+                move || store.view_picture(viewed.clone()),
+            )));
     }
     let what = if link.is_image() {
         "A picture"

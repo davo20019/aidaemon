@@ -1796,6 +1796,82 @@ fn viewer(
     )
 }
 
+/// A picture filling its place, fitted whole, that zooms where it is:
+/// a press or click (in to 2.5x, then back out), pinch, or Ctrl + wheel.
+/// `pixels` gives its shape (square until known).
+pub fn zoomable_picture(url: String, label: String, pixels: Option<(u32, u32)>) -> View {
+    let room = signal((0.0f32, 0.0f32));
+    let ratio = pixels
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map_or(1.0, |(w, h)| w as f32 / h as f32);
+    let fitted = move || {
+        let (w, h) = room.get();
+        let width = w.min(h * ratio).max(0.0);
+        (width, width / ratio)
+    };
+    let zoomer = element_ref();
+    let zoomed = signal(1.0f32);
+    let commanded = signal(None::<nsh_core::time::Instant>);
+    let reports = signal(false);
+    let picture = nsh_base::button()
+        .w(move || px(fitted().0))
+        .h(move || px(fitted().1))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+        .accessibility_label(label)
+        .on_press(move || {
+            let to = if zoomed.get_untracked() > 1.05 {
+                1.0
+            } else {
+                2.5
+            };
+            // Set here: while the zoom animates, the scroll reports pass
+            // through the old scales (ignored for a moment below).
+            zoomed.set(to);
+            commanded.set(Some(now()));
+            zoomer.zoom_to(to, None, true);
+        })
+        .child(image(url).w_full().h_full().object_fit(ResizeMode::Contain));
+    let zoomable = scroll()
+        .w_full()
+        .h_full()
+        .zoom_range(1.0, 5.0)
+        .zoomable(|| true)
+        .center_content(true)
+        .scrollbar(false)
+        .element_ref(&zoomer)
+        .on_scroll(move |e: &ScrollEvent| {
+            let settling = commanded
+                .get_untracked()
+                .is_some_and(|at| now().duration_since(at) < Duration::from_millis(700));
+            // The web reports no scale (always 1): trust a report only
+            // once one has shown another scale.
+            if (e.zoom_scale - 1.0).abs() > f32::EPSILON {
+                reports.set(true);
+            }
+            if !settling && reports.get_untracked() {
+                zoomed.set(e.zoom_scale);
+            }
+        })
+        // A frame the scroll view's size centers the picture (the web
+        // does not centre a scroll view's content).
+        .child(
+            view()
+                .w(move || px(room.get().0))
+                .h(move || px(room.get().1))
+                .items_center()
+                .justify_center()
+                .child(picture),
+        );
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .overflow_hidden()
+        .test_id("zoomable-picture")
+        .on_layout(move |b: &Bounds<Points>| room.set((b.size.width.0, b.size.height.0)))
+        .child(zoomable)
+}
+
 /// The live screen's column beside the picture on a phone held sideways,
 /// in points: the status, the typing row and the answers.
 const LIVE_SIDE: f32 = 300.0;
