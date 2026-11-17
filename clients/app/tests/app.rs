@@ -858,6 +858,8 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
     app.press("All projects")?;
     app.wait_for("Echo blog")?;
     app.long_press("Project Echo blog, 0 conversations")?;
+    // The menu opens a frame or more later on a slow runner.
+    app.wait_for("Pin to the top")?;
     app.press("Pin to the top")?;
     app.wait_for("label:Project Echo blog, pinned, 0 conversations")?;
     assert!(above(app.screen(), "Echo blog", "Acme site"));
@@ -877,6 +879,7 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
     )?;
     // The menu moves one too, for the keyboard.
     app.long_press("Project Delta api, 0 conversations")?;
+    app.wait_for("Move down")?;
     app.press("Move down")?;
     app.wait_until(
         "Charlie docs above Delta api",
@@ -903,6 +906,7 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
     // Delete asks first and says what happens to its conversations and
     // folder.
     app.long_press("Project Acme site, 1 conversations")?;
+    app.wait_for("Delete project…")?;
     app.answer_dialogs_myself();
     let before = sent("delete_project");
     app.press("Delete project…")?;
