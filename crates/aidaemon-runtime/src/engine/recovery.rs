@@ -367,15 +367,15 @@ mod tests {
     #[test]
     fn the_resume_note_names_calls_with_unknown_effect_only() {
         let mut state = sdk::RunState::new("aidaemon", "app:synthetic-1", "Draw a logo.");
-        let mut in_flight = sdk::InFlight::default();
-        in_flight.calls = vec![
-            sdk::ToolCall::new("c1", "generate_image", serde_json::json!({})),
-            sdk::ToolCall::new("c2", "send_file", serde_json::json!({})),
-            sdk::ToolCall::new("c3", "browser", serde_json::json!({})),
-        ];
-        in_flight.started = vec!["c1".into(), "c2".into()];
-        in_flight.done = vec!["c1".into()];
-        state.in_flight = Some(in_flight);
+        state.in_flight = Some(sdk::InFlight {
+            calls: vec![
+                sdk::ToolCall::new("c1", "generate_image", serde_json::json!({})),
+                sdk::ToolCall::new("c2", "send_file", serde_json::json!({})),
+                sdk::ToolCall::new("c3", "browser", serde_json::json!({})),
+            ],
+            started: vec!["c1".into(), "c2".into()],
+            done: vec!["c1".into()],
+        });
         let note = resume_note(&state);
         assert!(note.contains("`send_file`"), "{note}");
         assert!(!note.contains("`generate_image`"), "done: {note}");

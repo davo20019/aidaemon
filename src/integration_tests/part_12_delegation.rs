@@ -918,8 +918,11 @@ async fn run_limited_child(provider: MockProvider) -> crate::runtime_ports::Chil
             None,
             None,
             None,
+            // Long enough for the first tool call to finish on a loaded
+            // Windows runner (a shell start alone can take seconds), well
+            // under the 30s stalled model reply that trips it.
             Some(crate::runtime_ports::ChildTimeLimit {
-                limit: std::time::Duration::from_millis(1_500),
+                limit: std::time::Duration::from_secs(6),
             }),
             None,
         )

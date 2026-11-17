@@ -838,6 +838,22 @@ fn above(screen: &nsh_testing::Screen, first: &str, second: &str) -> bool {
 
 #[test]
 fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String> {
+    /// Long-presses `target` until its menu shows `item`. On a loaded
+    /// runner a press landing while a just-reordered list redraws can be
+    /// lost, and the menu opens a frame or more later.
+    fn open_menu(app: &mut Headless, target: &str, item: &str) -> Result<(), String> {
+        for _ in 0..3 {
+            app.long_press(target)?;
+            if app
+                .wait_until(item, std::time::Duration::from_secs(3), |s| s.shows(item))
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        app.wait_for(item)
+    }
+
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     app.wait_for("What can I help you with?")?;
@@ -857,9 +873,11 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
     // Pinned from the list of every project, it is first there and on Home.
     app.press("All projects")?;
     app.wait_for("Echo blog")?;
-    app.long_press("Project Echo blog, 0 conversations")?;
-    // The menu opens a frame or more later on a slow runner.
-    app.wait_for("Pin to the top")?;
+    open_menu(
+        &mut app,
+        "Project Echo blog, 0 conversations",
+        "Pin to the top",
+    )?;
     app.press("Pin to the top")?;
     app.wait_for("label:Project Echo blog, pinned, 0 conversations")?;
     assert!(above(app.screen(), "Echo blog", "Acme site"));
@@ -878,8 +896,7 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
         |s| above(s, "Delta api", "Charlie docs"),
     )?;
     // The menu moves one too, for the keyboard.
-    app.long_press("Project Delta api, 0 conversations")?;
-    app.wait_for("Move down")?;
+    open_menu(&mut app, "Project Delta api, 0 conversations", "Move down")?;
     app.press("Move down")?;
     app.wait_until(
         "Charlie docs above Delta api",
@@ -905,8 +922,11 @@ fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String>
     assert!(above(app.screen(), "Echo blog", "Beta app"));
     // Delete asks first and says what happens to its conversations and
     // folder.
-    app.long_press("Project Acme site, 1 conversations")?;
-    app.wait_for("Delete project…")?;
+    open_menu(
+        &mut app,
+        "Project Acme site, 1 conversations",
+        "Delete project…",
+    )?;
     app.answer_dialogs_myself();
     let before = sent("delete_project");
     app.press("Delete project…")?;
