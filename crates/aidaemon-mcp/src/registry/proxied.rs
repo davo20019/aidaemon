@@ -176,7 +176,16 @@ impl OutcomeTool for RegisteredMcpTool {
             result
         }
         .await;
-        output.map(ToolCallOutcome::from_output)
+        // The server's `isError` flag is the call's outcome: a flagged
+        // result is an `Err` above (`format_tool_call_result`), so any
+        // result here is one the server reported as a success, whatever
+        // words its data holds.
+        output.map(|output| {
+            let mut outcome = ToolCallOutcome::from_output(output);
+            outcome.metadata.outcome_status =
+                Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded);
+            outcome
+        })
     }
 }
 

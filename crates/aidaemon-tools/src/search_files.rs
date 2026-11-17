@@ -171,7 +171,7 @@ impl SearchFiles {
         let search_metadata = backend
             .metadata(&search_dir)
             .await
-            .map_err(|_| anyhow::anyhow!("Directory not found: {}", search_dir))?;
+            .map_err(|_| crate::TargetNotFound(format!("Directory not found: {search_dir}")))?;
         if !search_metadata.is_dir() {
             anyhow::bail!("Not a directory: {}", search_dir);
         }

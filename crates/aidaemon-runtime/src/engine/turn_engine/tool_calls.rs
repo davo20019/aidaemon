@@ -591,16 +591,14 @@ impl TurnEngine<'_> {
                     aidaemon_tools::semantics::prepare_invocation(tool.as_ref(), arguments).ok()
                 });
                 let mut metadata = aidaemon_tools::semantics::ToolCallMetadata {
-                    outcome_status: Some(
-                        if error
-                            .downcast_ref::<aidaemon_tools::NothingSentError>()
-                            .is_some()
-                        {
-                            aidaemon_tools::semantics::ToolOutcomeStatus::FailedRetryable
-                        } else {
-                            aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
-                        },
-                    ),
+                    // A raised error typed as having taken no effect (nothing
+                    // sent, a path that does not exist, a checkpoint refused
+                    // before the process ran) may succeed on another call.
+                    outcome_status: Some(if aidaemon_tools::failed_without_effect(&error) {
+                        aidaemon_tools::semantics::ToolOutcomeStatus::FailedRetryable
+                    } else {
+                        aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
+                    }),
                     transport_error: Some(error.to_string()),
                     invocation_stage: if error
                         .downcast_ref::<crate::engine::tool_exec::UnknownToolError>()
@@ -1297,9 +1295,16 @@ impl TurnEngine<'_> {
             .turn_tool(scope, &request.name)
             .is_some_and(|tool| tool.capabilities().external_side_effect);
         if external_mutation && let Ok(mut ack) = scope.verdict.external_action_ack.lock() {
-            *ack = (!failed
-                && crate::turn::tool_dispatch::should_build_external_action_ack(&output))
-            .then(|| crate::turn::tool_dispatch::build_external_action_completion_ack(&output));
+            // Acknowledged from the receipt's typed outcome alone.
+            *ack = receipt
+                .as_ref()
+                .filter(|_| !failed)
+                .map(|receipt| receipt.outcome_status)
+                .map(|status| {
+                    crate::turn::tool_dispatch::build_external_action_completion_ack(
+                        &output, status,
+                    )
+                });
         }
         if let Ok(mut learning) = scope.learning.lock() {
             let rejected = metadata

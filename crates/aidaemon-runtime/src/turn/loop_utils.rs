@@ -4,10 +4,8 @@
 use std::collections::HashMap;
 
 use aidaemon_events::traits::ToolOutcomeStatus;
-use regex::Regex;
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::sync::LazyLock;
 use tracing::warn;
 
 pub fn strip_appended_diagnostics(raw: &str) -> Cow<'_, str> {
@@ -33,27 +31,6 @@ pub fn semantic_failure_limit(tool_name: &str) -> usize {
     }
 }
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-static HTTP_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\bhttp/\d(?:\.\d+)?\s+([1-5][0-9]{2})\b|\bhttp\s+([1-5][0-9]{2})\b|\bstatus\s+code\s+([1-5][0-9]{2})\b|\bstatus\s*[:=]\s*([1-5][0-9]{2})\b|"(?:status|status_code|statusCode|http_status|httpStatus)"\s*:\s*"?([1-5][0-9]{2})"?|\battempt\s+\d+\s*[:=-]\s*([1-5][0-9]{2})\b|\b(?:http\s*)?code\s*[:=]\s*([1-5][0-9]{2})\b"#)
-        .expect("http status regex must compile")
-});
-
-static HTTPBIN_STATUS_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\bhttps?://(?:[^/\s]+\.)?httpbin\.org/status/([1-5][0-9]{2})(?:[/?#][^\s]*)?"#,
-    )
-    .expect("httpbin status url regex must compile")
-});
-
-static EXIT_CODE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:\bexit\s*:\s*|\bexit\s*code\s*[:=]?\s*|\[exit\s*code:\s*)(-?\d+)")
-        .expect("exit code regex must compile")
-});
-
 fn classify_http_status(status: u16) -> Option<ToolFailureClass> {
     if status >= 500 || matches!(status, 408 | 409 | 425 | 429) {
         return Some(ToolFailureClass::Transient);
@@ -64,316 +41,27 @@ fn classify_http_status(status: u16) -> Option<ToolFailureClass> {
     None
 }
 
-fn extract_status_from_value(value: &Value) -> Option<u16> {
-    match value {
-        Value::Number(n) => n.as_u64().and_then(|v| u16::try_from(v).ok()),
-        Value::String(s) => s.parse::<u16>().ok(),
-        _ => None,
-    }
-}
+/// The leading markers the daemon's own tools write when they return a
+/// refusal or failure as text (`Error: …`, `Blocked: …`): the daemon wrote
+/// these, at the start of the result, so they are a protocol marker, not
+/// the result's words. Text anywhere else in a result is the result's
+/// content and never decides failure.
+const DAEMON_FAILURE_MARKERS: [&str; 6] = [
+    "ERROR:",
+    "Error:",
+    "Failed to ",
+    "Request blocked:",
+    "Blocked:",
+    "[SYSTEM] BLOCKED:",
+];
 
-fn classify_text_error(lower: &str) -> ToolFailureClass {
-    if is_recoverable_checkpoint_scope_failure(lower) {
-        // The process never started. A different explicit project target can
-        // satisfy this preflight condition, so it must not consume the
-        // semantic-error lockout budget for the execution tool.
-        return ToolFailureClass::Transient;
-    }
-
-    if contains_any(
-        lower,
-        &[
-            "temporarily unavailable in this session",
-            "unavailable in this session",
-        ],
-    ) {
-        return ToolFailureClass::Semantic;
-    }
-
-    if contains_any(
-        lower,
-        &[
-            "rate limit",
-            "too many requests",
-            "timed out",
-            "timeout",
-            "temporarily unavailable",
-            "service unavailable",
-            "bad gateway",
-            "gateway timeout",
-            "network error",
-            "connection reset",
-            "connection refused",
-            "connection aborted",
-            "connection failed",
-            "retry later",
-            "try again later",
-            "econnreset",
-            "etimedout",
-            "ehostunreach",
-            "unreachable",
-            "dns",
-        ],
-    ) {
-        return ToolFailureClass::Transient;
-    }
-    ToolFailureClass::Semantic
-}
-
-pub fn is_recoverable_checkpoint_scope_failure(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "refusing an unbounded checkpoint",
-            "outside checkpoint scope",
-            "checkpoint for a command spanning multiple project roots",
-        ],
-    )
-}
-
-fn is_file_lookup_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file" | "write_file" | "edit_file" | "search_files" | "send_file"
-    )
-}
-
-fn looks_like_file_lookup_miss(lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "file not found",
-            "no such file",
-            "no such file or directory",
-            "does not exist",
-            "enoent",
-        ],
-    )
-}
-
-pub fn is_file_lookup_miss_for_tool(tool_name: &str, lower_text: &str) -> bool {
-    is_file_lookup_tool(tool_name) && looks_like_file_lookup_miss(lower_text)
-}
-
-fn looks_like_error_signal(lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "error:",
-            "failed to ",
-            "exception",
-            "traceback",
-            "unknown tool",
-            "not a real tool",
-            "invalid",
-            "missing required",
-            "permission denied",
-            "unauthorized",
-            "forbidden",
-            "file not found",
-            "command not found",
-            "resource not found",
-            "404 not found",
-            "no such file",
-            "status code ",
-            "timed out",
-            "timeout",
-            "rate limit",
-            "too many requests",
-            "connection reset",
-            "connection refused",
-            "connection aborted",
-            "connection failed",
-            "connection timed out",
-            "temporarily unavailable in this session",
-            "unavailable in this session",
-        ],
-    )
-}
-
-fn classify_json_error(value: &Value) -> Option<ToolFailureClass> {
-    match value {
-        Value::Object(map) => {
-            for key in [
-                "status",
-                "status_code",
-                "statusCode",
-                "http_status",
-                "httpStatus",
-                "code",
-            ] {
-                if let Some(status_value) = map.get(key)
-                    && let Some(status) = extract_status_from_value(status_value)
-                    && let Some(kind) = classify_http_status(status)
-                {
-                    return Some(kind);
-                }
-            }
-
-            if map.get("success").and_then(Value::as_bool) == Some(false)
-                || map.get("ok").and_then(Value::as_bool) == Some(false)
-            {
-                if let Some(error_value) = map.get("error")
-                    && !error_value.is_null()
-                    && let Some(kind) = classify_json_error(error_value)
-                {
-                    return Some(kind);
-                }
-                if let Some(message) = map.get("message").and_then(Value::as_str) {
-                    let lower = message.to_ascii_lowercase();
-                    if looks_like_error_signal(&lower) {
-                        return Some(classify_text_error(&lower));
-                    }
-                }
-                return Some(ToolFailureClass::Semantic);
-            }
-
-            if let Some(error_value) = map.get("error")
-                && !error_value.is_null()
-            {
-                if let Some(kind) = classify_json_error(error_value) {
-                    return Some(kind);
-                }
-                return Some(ToolFailureClass::Semantic);
-            }
-
-            if let Some(errors_value) = map.get("errors") {
-                match errors_value {
-                    Value::Array(arr) if !arr.is_empty() => {
-                        for entry in arr {
-                            if let Some(kind) = classify_json_error(entry) {
-                                return Some(kind);
-                            }
-                        }
-                        return Some(ToolFailureClass::Semantic);
-                    }
-                    Value::Object(obj) if !obj.is_empty() => {
-                        return Some(ToolFailureClass::Semantic);
-                    }
-                    Value::String(s) if !s.trim().is_empty() => {
-                        let lower = s.to_ascii_lowercase();
-                        return Some(classify_text_error(&lower));
-                    }
-                    _ => {}
-                }
-            }
-
-            if let Some(message) = map.get("message").and_then(Value::as_str) {
-                let lower = message.to_ascii_lowercase();
-                if looks_like_error_signal(&lower) {
-                    return Some(classify_text_error(&lower));
-                }
-            }
-
-            for nested in map.values() {
-                if let Some(kind) = classify_json_error(nested) {
-                    return Some(kind);
-                }
-            }
-            None
-        }
-        Value::Array(arr) => arr.iter().find_map(classify_json_error),
-        Value::String(s) => {
-            let lower = s.to_ascii_lowercase();
-            if looks_like_error_signal(&lower) {
-                Some(classify_text_error(&lower))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn extract_http_status_from_text(text: &str) -> Option<u16> {
-    let caps = HTTP_STATUS_RE.captures(text)?;
-    for idx in 1..caps.len() {
-        if let Some(m) = caps.get(idx)
-            && let Ok(code) = m.as_str().parse::<u16>()
-        {
-            return Some(code);
-        }
-    }
-    None
-}
-
-fn extract_httpbin_status_hint_from_command(command: &str) -> Option<u16> {
-    let caps = HTTPBIN_STATUS_URL_RE.captures(command)?;
-    caps.get(1)?.as_str().parse::<u16>().ok()
-}
-
-fn looks_like_empty_tool_output(text: &str) -> bool {
-    let cleaned = strip_appended_diagnostics(text);
-    let cleaned = cleaned.trim();
-    cleaned.is_empty() || cleaned.eq_ignore_ascii_case("(no output)")
-}
-
-fn classify_embedded_json_error(text: &str) -> Option<ToolFailureClass> {
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut depth = 0usize;
-    let mut start: Option<usize> = None;
-    let mut candidates = 0usize;
-
-    for (idx, ch) in text.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match ch {
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(idx);
-                }
-                depth = depth.saturating_add(1);
-            }
-            '}' => {
-                if depth == 0 {
-                    continue;
-                }
-                depth -= 1;
-                if depth == 0
-                    && let Some(s) = start.take()
-                {
-                    let end = idx + ch.len_utf8();
-                    if let Ok(value) = serde_json::from_str::<Value>(&text[s..end])
-                        && let Some(kind) = classify_json_error(&value)
-                    {
-                        return Some(kind);
-                    }
-                    candidates += 1;
-                    if candidates >= 8 {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn extract_nonzero_exit_code(text: &str) -> Option<i32> {
-    let captures = EXIT_CODE_RE.captures(text)?;
-    let parsed = captures.get(1)?.as_str().parse::<i32>().ok()?;
-    if parsed == 0 { None } else { Some(parsed) }
+fn starts_with_daemon_failure_marker(text: &str) -> bool {
+    DAEMON_FAILURE_MARKERS
+        .iter()
+        .any(|marker| text.starts_with(marker))
 }
 
 /// Tools whose results are file/data content, not tool execution status.
-/// Their output routinely contains words like "error:", "exception", "invalid"
-/// (e.g., Python source code with error handling) which are NOT tool failures.
 fn is_data_content_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -381,49 +69,49 @@ fn is_data_content_tool(tool_name: &str) -> bool {
     )
 }
 
-/// Tools that return external data which may contain error-like keywords in
-/// successful responses. Skips generic error detection but still checks HTTP
-/// status codes (which indicate actual request failures).
+/// Tools that return external data, whose bodies are the remote site's.
 fn is_external_data_tool(tool_name: &str) -> bool {
     matches!(tool_name, "web_fetch" | "http_request")
 }
 
-fn successful_management_output_is_structural(
-    tool_name: &str,
-    result_text: &str,
-    tool_arguments: Option<&str>,
-) -> bool {
-    let action = tool_arguments
-        .and_then(|args| serde_json::from_str::<Value>(args).ok())
-        .and_then(|args| {
-            args.get("action")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    let cleaned = strip_appended_diagnostics(result_text);
-    let trimmed = cleaned.trim_start();
-    if trimmed.starts_with("ERROR:")
-        || trimmed.starts_with("Error:")
-        || trimmed.starts_with("Failed to ")
-        || trimmed.starts_with("Request blocked:")
-        || trimmed.starts_with("Blocked:")
-    {
-        return false;
-    }
-
-    match (tool_name, action.as_deref()) {
-        // These actions return policy/user data. Words such as "unauthorized",
-        // "invalid", or "rate limits" inside that data are not execution
-        // failures. Current tools emit a typed outcome; this compatibility path
-        // also keeps legacy receipts and direct classifier callers safe.
-        ("manage_mandates", Some("draft" | "list" | "get" | "list_intentions")) => true,
-        ("manage_memories", Some("create_personal_goal")) => {
-            trimmed.starts_with("Created personal goal ")
+/// A JSON result's own top-level failure fields, a machine format: a 4xx/5xx
+/// `status`/`status_code`/`http_status`, `success: false`/`ok: false`, a
+/// non-null `error` or a non-empty `errors`. Nested values are the result's
+/// data, and no string value is read for its words.
+fn classify_json_result(value: &Value) -> Option<ToolFailureClass> {
+    let map = value.as_object()?;
+    for key in [
+        "status",
+        "status_code",
+        "statusCode",
+        "http_status",
+        "httpStatus",
+    ] {
+        let status = match map.get(key) {
+            Some(Value::Number(n)) => n.as_u64().and_then(|v| u16::try_from(v).ok()),
+            _ => None,
+        };
+        if let Some(kind) = status.and_then(classify_http_status) {
+            return Some(kind);
         }
-        _ => false,
     }
+    let failed_flag = map.get("success").and_then(Value::as_bool) == Some(false)
+        || map.get("ok").and_then(Value::as_bool) == Some(false);
+    let error = map.get("error").is_some_and(|error| !error.is_null());
+    let errors = match map.get("errors") {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(fields)) => !fields.is_empty(),
+        _ => false,
+    };
+    (failed_flag || error || errors).then_some(ToolFailureClass::Semantic)
 }
 
+/// Failure read from a result's text when the tool reported nothing typed.
+/// Only two things count: the daemon's own leading failure marker, and a
+/// whole-result JSON object's top-level failure fields. Words inside a
+/// result ("invalid", "timeout", "forbidden", an HTTP status line, an exit
+/// code someone printed) are its content: they never decide failure, so a
+/// result with no typed signal and neither of these is not a failure.
 pub fn classify_tool_result_failure(
     tool_name: &str,
     result_text: &str,
@@ -433,94 +121,17 @@ pub fn classify_tool_result_failure(
     if cleaned.is_empty() {
         return None;
     }
-
-    let lower = cleaned.to_ascii_lowercase();
-    if is_file_lookup_miss_for_tool(tool_name, &lower) {
-        // Missing file/path while exploring a project is usually recoverable and
-        // should not consume semantic lockout budget.
-        return Some(ToolFailureClass::Transient);
+    if starts_with_daemon_failure_marker(cleaned) {
+        return Some(ToolFailureClass::Semantic);
     }
-
-    if cleaned.starts_with("ERROR:")
-        || cleaned.starts_with("Error:")
-        || cleaned.starts_with("Failed to ")
-        || cleaned.starts_with("Request blocked:")
-        || cleaned.starts_with("Blocked:")
-        || cleaned.starts_with("[SYSTEM] BLOCKED:")
-    {
-        return Some(classify_text_error(&lower));
-    }
-
-    // Data-content tools (read_file, search_files) return file content that
-    // routinely contains error-related keywords. Only prefix errors above
-    // (which indicate actual tool failures like "File not found") should be
-    // classified as failures — not content-level error signals or exit codes.
-    if is_data_content_tool(tool_name) {
+    if is_data_content_tool(tool_name) || is_external_data_tool(tool_name) {
         return None;
     }
-
-    let mut saw_success_http_status = false;
-    if let Some(status) = extract_http_status_from_text(cleaned) {
-        if let Some(kind) = classify_http_status(status) {
-            return Some(kind);
-        }
-        // A parseable 2xx/3xx status is success evidence (e.g. a sub-agent
-        // quoting `HTTP/2 200` from curl output). Suppress the generic
-        // keyword scan below, which would otherwise misread the quoted
-        // status line as an error signal; JSON and exit-code checks still
-        // run.
-        saw_success_http_status = true;
-    }
-
-    // External data tools (http_request, web_fetch) return content that
-    // routinely contains error-like keywords from remote sites. Only HTTP
-    // status failures (checked above) indicate real tool failures.
-    if is_external_data_tool(tool_name) {
-        return None;
-    }
-
     if (cleaned.starts_with('{') || cleaned.starts_with('['))
         && let Ok(value) = serde_json::from_str::<Value>(cleaned)
     {
-        if let Some(kind) = classify_json_error(&value) {
-            return Some(kind);
-        }
-        // Valid structured output with no error-bearing value is a
-        // successful data result. Do not scan JSON field names such as
-        // `watchdog_timeout_seconds` as if they were failure prose.
-        return None;
+        return classify_json_result(&value);
     }
-
-    if let Some(kind) = classify_embedded_json_error(cleaned) {
-        return Some(kind);
-    }
-
-    if let Some(exit_code) = extract_nonzero_exit_code(cleaned) {
-        let _ = exit_code;
-        // For terminal commands that produced substantial output (>500 chars),
-        // the command clearly ran and returned data (e.g., pytest with failing
-        // tests). Only treat short-output non-zero exits as real failures.
-        if tool_name == "terminal" && cleaned.len() > 500 {
-            return None;
-        }
-        return Some(classify_text_error(&lower));
-    }
-
-    if lower == "null" {
-        return Some(ToolFailureClass::Semantic);
-    }
-
-    // For terminal commands that produced substantial output (>500 chars),
-    // the command clearly ran and returned data. Error-related keywords
-    // in the output (e.g. pytest headers, test names containing "error")
-    // are content, not actual errors. Only flag short outputs.
-    if !saw_success_http_status && looks_like_error_signal(&lower) {
-        if tool_name == "terminal" && cleaned.len() > 500 {
-            return None;
-        }
-        return Some(classify_text_error(&lower));
-    }
-
     None
 }
 
@@ -529,28 +140,13 @@ pub fn classify_tool_result_failure_with_args(
     result_text: &str,
     tool_arguments: Option<&str>,
 ) -> Option<ToolFailureClass> {
-    if successful_management_output_is_structural(tool_name, result_text, tool_arguments) {
-        return None;
-    }
     if crate::turn::tool_facts::memory_tool_facts(tool_name)
         .and_then(|facts| facts.output_is_report)
         .is_some_and(|is_report| is_report(result_text, tool_arguments))
     {
         return None;
     }
-
-    let classified = classify_tool_result_failure(tool_name, result_text);
-    if classified.is_some() {
-        return classified;
-    }
-
-    if tool_name != "terminal" || !looks_like_empty_tool_output(result_text) {
-        return None;
-    }
-
-    let command = tool_arguments.and_then(extract_command_from_args)?;
-    let hinted_status = extract_httpbin_status_hint_from_command(&command)?;
-    classify_http_status(hinted_status)
+    classify_tool_result_failure(tool_name, result_text)
 }
 
 /// Whether a command tool call runs a test runner, judged by the parsed
@@ -603,40 +199,12 @@ pub fn classify_tool_result_failure_with_context(
         if let Some(status) = meta.outcome_status {
             return failure_class_from_outcome_status(status);
         }
-        if let Some(ref transport_err) = meta.transport_error {
-            // Tool Err results always set transport_error, but many are semantic
-            // errors (wrong path, invalid args) not true transport failures.
-            // Only classify as Transient if the error looks like an actual
-            // transport issue (timeout, network, rate limit). Otherwise, fall
-            // through to the regular text-based classification.
-            let lower_err = transport_err.to_ascii_lowercase();
-            let is_transport = contains_any(
-                &lower_err,
-                &[
-                    "timed out",
-                    "timeout",
-                    "connection refused",
-                    "connection reset",
-                    "broken pipe",
-                    "network",
-                    "rate limit",
-                    "429",
-                    "503",
-                    "502",
-                    "504",
-                    "econnrefused",
-                    "econnreset",
-                    "etimedout",
-                    "ehostunreach",
-                    "dns",
-                ],
-            );
-            if is_transport {
-                return Some(ToolFailureClass::Transient);
-            }
-            // Non-transport errors: fall through to text-based classification
-            // so file-path errors, "Path is a directory", etc. get proper
-            // semantic classification instead of triggering cooldowns.
+        if meta.transport_error.is_some() {
+            // The tool raised an error and reported no outcome of its own:
+            // a failure, of a kind it did not type. Whether it may be
+            // retried is the tool's to say (`outcome_status`, or a typed
+            // error the dispatcher maps), never read from the error's text.
+            return Some(ToolFailureClass::Semantic);
         }
         if meta.background_started {
             // A command moved to background tracking sets timed_out alongside
@@ -650,27 +218,21 @@ pub fn classify_tool_result_failure_with_context(
         if let Some(code) = meta.exit_code {
             if code != 0 {
                 // Test runners exit non-zero when tests fail — that's expected
-                // informational output, not a tool failure.  Let the LLM read
+                // informational output, not a tool failure. Let the LLM read
                 // and interpret the test results instead of entering a repair loop.
                 if !tool_arguments.is_some_and(invokes_test_runner) {
                     return Some(ToolFailureClass::Semantic);
                 }
-                // Test runner with failures: not an error, let LLM interpret
+                return None;
             }
-            // Explicit terminal success should not be reclassified by text scanning.
+            // Explicit terminal success should not be reclassified by text.
             if tool_name == "terminal" {
                 return None;
             }
         }
-        // Structured HTTP status takes priority over text scraping
         if let Some(status) = meta.http_status {
-            if let Some(kind) = classify_http_status(status) {
-                return Some(kind);
-            }
-            // 2xx/3xx with structured status → definitively not an error for HTTP tools
-            if matches!(tool_name, "http_request" | "web_fetch") {
-                return None;
-            }
+            // Structured HTTP status is the call's outcome.
+            return classify_http_status(status);
         }
     }
     classify_tool_result_failure_with_args(tool_name, result_text, tool_arguments)
@@ -828,264 +390,137 @@ mod tool_error_detection_tests {
         ToolFailureClass, classify_tool_result_failure, classify_tool_result_failure_with_args,
         classify_tool_result_failure_with_context,
     };
+    use aidaemon_events::traits::{ToolCallMetadata, ToolOutcomeStatus};
 
     #[test]
-    fn detects_prefixed_transient_error() {
-        let result = "Error: request timed out while connecting to api";
-        let classified = classify_tool_result_failure("http_request", result);
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    fn the_daemons_leading_failure_marker_is_a_failure() {
+        for result in [
+            "Error: request timed out while connecting to api",
+            "Error: specialist failed: invalid research request",
+            "Request blocked: tool-only parameters were embedded in the URL (auth_profile, body).",
+            "Blocked: outside the workspace",
+        ] {
+            assert_eq!(
+                classify_tool_result_failure("spawn_agent", result),
+                Some(ToolFailureClass::Semantic),
+                "{result}"
+            );
+        }
+    }
+
+    /// Words inside a result are its content: with no typed signal, an
+    /// answer that quotes an error status, a timeout, an exit code or a
+    /// "forbidden" is not a failure, and is not retried as one.
+    #[test]
+    fn words_inside_a_result_never_decide_failure() {
+        for (tool, result) in [
+            (
+                "spawn_agent",
+                "The blog post is live. `curl -I` returned:\nHTTP/2 200 \nserver: cloudflare",
+            ),
+            (
+                "spawn_agent",
+                "The request failed. Response line: HTTP/1.1 503 Service Unavailable",
+            ),
+            (
+                "spawn_agent",
+                "Fixed the handler so it returns forbidden for guests.",
+            ),
+            ("terminal", "Attempt 2: 503"),
+            ("terminal", "$ make test (exit: 2, 22ms)"),
+            ("terminal", "[Process pid=123 finished]\n[exit code: 42]"),
+            ("http_request", "Status: 404 Not Found"),
+            (
+                "synthetic_mcp__import",
+                "Imported 120 rows, 0 invalid rows, no timeout.",
+            ),
+            (
+                "terminal",
+                "$ curl -s https://api.example.com (exit: 0, 9ms)\n\n{\"error\":\"not found\"}",
+            ),
+            (
+                "search_files",
+                "Search complete: 24 files scanned, 0 patterns not found",
+            ),
+        ] {
+            assert_eq!(
+                classify_tool_result_failure(tool, result),
+                None,
+                "{tool}: {result}"
+            );
+        }
     }
 
     #[test]
-    fn detects_spawn_agent_timeout_as_transient_error() {
-        let result = "Error: specialist timed out after 300 seconds";
-        let classified = classify_tool_result_failure("spawn_agent", result);
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn successful_answer_quoting_http_2xx_is_not_a_failure() {
-        // Live repro from telemetry 2026-06-30: a sub-agent verified a blog
-        // post with `curl -I`, quoted the HTTP/2 200 response, and the
-        // classifier marked the success as a Semantic failure via the
-        // "http/" keyword, injecting "The error says: The blog post is
-        // live..." coaching into the parent loop.
-        let result = "The blog post is live. The `curl -I` command returned an **HTTP 200** status code.\n\n\
-**Command run**:\n`curl -I https://blog.example.com/posts/synthetic-post/`\n\n\
-**Output**:\n```http\nHTTP/2 200 \ndate: Tue, 30 Jun 2026 15:21:40 GMT\ncontent-type: text/html\ncf-cache-status: MISS\nserver: cloudflare\n```";
-        let classified = classify_tool_result_failure("spawn_agent", result);
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn successful_answer_mentioning_status_code_2xx_is_not_a_failure() {
-        let result = "Verified: the endpoint returned status code 200 and the payload matched.";
-        let classified = classify_tool_result_failure("spawn_agent", result);
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn mentioning_http_protocol_version_without_status_is_not_a_failure() {
-        let result = "The connection was upgraded to HTTP/2 and the site loads correctly.";
-        let classified = classify_tool_result_failure("spawn_agent", result);
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn http_error_status_in_answer_still_classifies_as_failure() {
-        let result = "The request failed. Response line: HTTP/1.1 503 Service Unavailable";
-        let classified = classify_tool_result_failure("spawn_agent", result);
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn detects_spawn_agent_child_error_as_semantic_error() {
-        let result = "Error: specialist failed: invalid research request";
-        let classified = classify_tool_result_failure("spawn_agent", result);
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn detects_request_blocked_as_semantic_error() {
-        let result =
-            "Request blocked: tool-only parameters were embedded in the URL (auth_profile, body).";
-        let classified = classify_tool_result_failure("http_request", result);
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn detects_json_semantic_error() {
-        let result = r#"{"error":"invalid arguments: missing required field"}"#;
-        let classified = classify_tool_result_failure("manage_memories", result);
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn policy_metrics_output_not_classified_as_error() {
-        // policy_metrics returns JSON with field names like "tokens_failed_tasks_total"
-        // and "llm_payload_invalid_total" — these should NOT be classified as errors.
-        let result = r#"{"metrics":{"tokens_failed_tasks_total":0,"llm_payload_invalid_total":0,"no_progress_iterations_total":0},"derived":{"response_total":5}}"#;
-        let classified = classify_tool_result_failure("policy_metrics", result);
+    fn a_whole_json_result_is_read_by_its_top_level_failure_fields() {
+        let error = r#"{"error":"invalid arguments: missing required field"}"#;
         assert_eq!(
-            classified, None,
-            "policy_metrics output should not be classified as an error"
+            classify_tool_result_failure("manage_memories", error),
+            Some(ToolFailureClass::Semantic)
         );
-    }
-
-    #[test]
-    fn detects_http_status_failures() {
-        let semantic = classify_tool_result_failure("http_request", "Status: 404 Not Found");
-        assert_eq!(semantic, Some(ToolFailureClass::Semantic));
-
-        let semantic_plain = classify_tool_result_failure(
-            "web_fetch",
-            "Error fetching https://example.com: HTTP 400 Bad Request",
+        assert_eq!(
+            classify_tool_result_failure("synthetic_tool", r#"{"status":503}"#),
+            Some(ToolFailureClass::Transient)
         );
-        assert_eq!(semantic_plain, Some(ToolFailureClass::Semantic));
-
-        let transient =
-            classify_tool_result_failure("http_request", "HTTP/1.1 503 Service Unavailable");
-        assert_eq!(transient, Some(ToolFailureClass::Transient));
-
-        let transient_h2 = classify_tool_result_failure("http_request", "HTTP/2 503");
-        assert_eq!(transient_h2, Some(ToolFailureClass::Transient));
-
-        let transient_attempt = classify_tool_result_failure("terminal", "Attempt 2: 503");
-        assert_eq!(transient_attempt, Some(ToolFailureClass::Transient));
-
-        let semantic_attempt = classify_tool_result_failure("terminal", "Attempt 1: 404");
-        assert_eq!(semantic_attempt, Some(ToolFailureClass::Semantic));
+        // Field names, nested values and string values are data.
+        for result in [
+            r#"{"metrics":{"tokens_failed_tasks_total":0,"llm_payload_invalid_total":0}}"#,
+            r#"{"connection_state":"ok","recovery":{"watchdog_timeout_seconds":90}}"#,
+            r#"{"stop_conditions":["Any unauthorized API behavior."]}"#,
+            r#"{"items":[{"error":"a stored row's own field"}]}"#,
+            r#"{"message":"Error: timed out (quoted)"}"#,
+        ] {
+            assert_eq!(
+                classify_tool_result_failure("synthetic_tool", result),
+                None,
+                "{result}"
+            );
+        }
     }
 
     #[test]
-    fn treats_file_lookup_miss_as_transient_for_file_tools() {
-        let classified = classify_tool_result_failure(
-            "read_file",
-            "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
-        );
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn keeps_non_file_tool_enoent_as_semantic() {
-        let classified = classify_tool_result_failure(
-            "terminal",
-            "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
-        );
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn infers_httpbin_status_for_empty_curl_output() {
-        let args = r#"{"action":"run","command":"curl -s https://httpbin.org/status/503"}"#;
-        let classified =
-            classify_tool_result_failure_with_args("terminal", "(no output)", Some(args));
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn manage_memories_list_output_is_not_classified_as_error() {
+    fn a_report_tool_output_is_data() {
         let args = r#"{"action":"list"}"#;
         let result = "**Stored Memories** (showing 2 of 2 facts)\n\n- **api_auth_resolution**: Uses manage_oauth to resolve HTTP 401 Unauthorized errors";
-        let classified =
-            classify_tool_result_failure_with_args("manage_memories", result, Some(args));
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn manage_memories_search_results_can_contain_error_words() {
-        let args = r#"{"action":"search","query":"home residence"}"#;
-        let result = "══ Stored facts matching 'home residence' ══\n\
-                      • [technical] past_failure → \"Failed to connect: error: timeout\"\n\
-                      • [user] residence → \"Exampletown, VA\"";
-        let classified =
-            classify_tool_result_failure_with_args("manage_memories", result, Some(args));
         assert_eq!(
-            classified, None,
-            "successful read output is data even when a stored value contains error words"
+            classify_tool_result_failure_with_args("manage_memories", result, Some(args)),
+            None
         );
     }
 
     #[test]
-    fn does_not_infer_httpbin_status_when_output_is_non_empty() {
-        let args = r#"{"action":"run","command":"curl -s https://httpbin.org/status/503"}"#;
-        let classified = classify_tool_result_failure_with_args("terminal", "ok", Some(args));
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn does_not_infer_non_httpbin_status_urls() {
-        let args = r#"{"action":"run","command":"curl -s https://example.com/status/503"}"#;
-        let classified =
-            classify_tool_result_failure_with_args("terminal", "(no output)", Some(args));
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn detects_nonzero_exit_without_prefix() {
-        let classified = classify_tool_result_failure("terminal", "$ make test (exit: 2, 22ms)");
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn detects_terminal_style_exit_code_marker() {
-        let classified =
-            classify_tool_result_failure("terminal", "[Process pid=123 finished]\n[exit code: 42]");
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn detects_embedded_json_error_payload_inside_wrapper_text() {
-        let wrapped = "[UNTRUSTED EXTERNAL DATA from 'web_fetch']\n{\"error\":\"not found\",\"status\":404}\n[END UNTRUSTED EXTERNAL DATA]";
-        let classified = classify_tool_result_failure("web_fetch", wrapped);
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn detects_embedded_json_error_payload_with_command_header() {
-        let result =
-            "$ curl -s https://api.example.com (exit: 0, 9ms)\n\n{\"error\":\"not found\"}";
-        let classified = classify_tool_result_failure("terminal", result);
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn does_not_flag_success_output() {
-        let classified = classify_tool_result_failure("terminal", "$ cargo test (exit: 0, 1.2s)");
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn does_not_flag_generic_connection_success_text() {
-        let classified = classify_tool_result_failure(
-            "terminal",
-            "Connection established successfully to upstream service",
-        );
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn does_not_flag_generic_not_found_summary_text() {
-        let classified = classify_tool_result_failure(
-            "search_files",
-            "Search complete: 24 files scanned, 0 patterns not found",
-        );
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn structured_exit_code_zero_prevents_terminal_text_false_positive() {
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
+    fn structured_exit_code_decides_a_terminal_result() {
+        let success = ToolCallMetadata {
             exit_code: Some(0),
             ..Default::default()
         };
-        let classified = classify_tool_result_failure_with_context(
-            "terminal",
-            "pytest summary includes: error: expected failure pattern",
-            None,
-            Some(&metadata),
+        assert_eq!(
+            classify_tool_result_failure_with_context(
+                "terminal",
+                "Error: printed by the program, which still exited 0",
+                None,
+                Some(&success),
+            ),
+            None
         );
-        assert_eq!(classified, None);
-    }
-
-    #[test]
-    fn structured_exit_code_nonzero_marks_terminal_failure() {
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
+        let failure = ToolCallMetadata {
             exit_code: Some(2),
             ..Default::default()
         };
-        let classified = classify_tool_result_failure_with_context(
-            "terminal",
-            "all good text otherwise",
-            None,
-            Some(&metadata),
+        assert_eq!(
+            classify_tool_result_failure_with_context(
+                "terminal",
+                "all good text otherwise",
+                None,
+                Some(&failure),
+            ),
+            Some(ToolFailureClass::Semantic)
         );
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
     }
 
     #[test]
     fn test_runner_negative_result_is_not_counted_as_success() {
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
+        let metadata = ToolCallMetadata {
             exit_code: Some(1),
             ..Default::default()
         };
@@ -1095,10 +530,7 @@ mod tool_error_detection_tests {
             Some(r#"{"command":"cargo test"}"#),
             Some(&metadata),
         );
-        assert_eq!(
-            status,
-            aidaemon_events::traits::ToolOutcomeStatus::CompletedWithNegativeResult
-        );
+        assert_eq!(status, ToolOutcomeStatus::CompletedWithNegativeResult);
         assert!(!status.satisfies_requested_condition());
         assert!(!status.is_failure());
     }
@@ -1134,7 +566,7 @@ mod tool_error_detection_tests {
 
     #[test]
     fn failing_command_mentioning_test_in_an_argument_is_a_failure() {
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
+        let metadata = ToolCallMetadata {
             exit_code: Some(22),
             ..Default::default()
         };
@@ -1149,111 +581,56 @@ mod tool_error_detection_tests {
 
     #[test]
     fn tool_supplied_outcome_status_is_authoritative() {
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
-            outcome_status: Some(aidaemon_events::traits::ToolOutcomeStatus::Blocked),
+        let metadata = ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Blocked),
             exit_code: Some(0),
             ..Default::default()
         };
         assert_eq!(
             super::classify_tool_outcome_status("terminal", "success", None, Some(&metadata)),
-            aidaemon_events::traits::ToolOutcomeStatus::Blocked
+            ToolOutcomeStatus::Blocked
         );
-    }
-
-    #[test]
-    fn mandate_policy_words_do_not_turn_a_successful_get_into_a_failure() {
-        let result =
-            r#"{"stop_conditions":["Any unauthorized API behavior or account-security concern."]}"#;
+        // An MCP result the server did not flag `isError` is a success,
+        // whatever words its data holds.
+        let mcp = ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Succeeded),
+            ..Default::default()
+        };
         assert_eq!(
-            classify_tool_result_failure_with_args(
-                "manage_mandates",
-                result,
-                Some(r#"{"action":"get","section":"policy"}"#),
+            super::classify_tool_outcome_status(
+                "synthetic_mcp__import",
+                "Error: 0 invalid rows",
+                None,
+                Some(&mcp),
             ),
-            None
+            ToolOutcomeStatus::Succeeded
         );
     }
 
+    /// A raised tool error with no typed outcome is a failure whose kind
+    /// was not typed: its text never makes it retryable.
     #[test]
-    fn benign_json_timeout_field_does_not_become_a_transient_failure() {
-        let result = r#"{
-            "connection_state": "recently_connected",
-            "recovery": {"watchdog_timeout_seconds": 90, "watchdog_ready": true}
-        }"#;
-        assert_eq!(
-            classify_tool_result_failure("read_node_health", result),
-            None
-        );
-    }
-
-    #[test]
-    fn created_goal_text_can_describe_rate_limits_without_becoming_transient() {
-        let result =
-            "Created personal goal goal-1: Steward an account under confirmed rate limits.";
-        assert_eq!(
-            classify_tool_result_failure_with_args(
-                "manage_memories",
-                result,
-                Some(r#"{"action":"create_personal_goal"}"#),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn transport_error_semantic_not_classified_as_transient() {
-        // When a tool returns Err("Path is a directory"), transport_error is set
-        // in metadata. This should NOT be classified as Transient — it's a semantic
-        // error, not a network/timeout issue.
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
-            transport_error: Some("Path is a directory, not a file: /tmp/test86".to_string()),
-            ..Default::default()
-        };
-        let classified = classify_tool_result_failure_with_context(
-            "read_file",
-            "Error: Path is a directory, not a file: /tmp/test86",
-            None,
-            Some(&metadata),
-        );
-        // Should be Semantic (from text classification), NOT Transient
-        assert_eq!(classified, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn transport_error_actual_timeout_still_transient() {
-        // Actual transport errors (timeouts, connection refused) should
-        // still be classified as Transient.
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
-            transport_error: Some("connection refused".to_string()),
-            ..Default::default()
-        };
-        let classified = classify_tool_result_failure_with_context(
-            "web_fetch",
-            "Error: connection refused",
-            None,
-            Some(&metadata),
-        );
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn transport_error_file_not_found_not_transient() {
-        // "File not found" through transport_error should NOT be transient.
-        // The text-based classification will classify it as Transient for
-        // file tools (via is_file_lookup_miss), but the transport_error
-        // path should not short-circuit to Transient.
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
-            transport_error: Some("File not found: /tmp/missing.txt".to_string()),
-            ..Default::default()
-        };
-        let classified = classify_tool_result_failure_with_context(
-            "read_file",
-            "Error: File not found: /tmp/missing.txt",
-            None,
-            Some(&metadata),
-        );
-        // Falls through to text classification → Transient (file lookup miss)
-        assert_eq!(classified, Some(ToolFailureClass::Transient));
+    fn an_untyped_transport_error_is_a_failure_never_guessed_transient() {
+        for error in [
+            "Path is a directory, not a file: /tmp/synthetic",
+            "connection refused",
+            "HTTP 503 from upstream",
+        ] {
+            let metadata = ToolCallMetadata {
+                transport_error: Some(error.to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                classify_tool_result_failure_with_context(
+                    "web_fetch",
+                    &format!("Error: {error}"),
+                    None,
+                    Some(&metadata),
+                ),
+                Some(ToolFailureClass::Semantic),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1261,15 +638,14 @@ mod tool_error_detection_tests {
         // A command moved to background sets timed_out=true alongside
         // background_started=true. The handoff is not a failure — the command
         // is still running and may well succeed.
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
+        let metadata = ToolCallMetadata {
             background_started: true,
             timed_out: true,
             ..Default::default()
         };
         let classified = classify_tool_result_failure_with_context(
             "terminal",
-            "Command still running after 30s. Moved to background (pid=5822).\n\
-             IMPORTANT: Continue with your next steps immediately — do NOT wait or repeatedly check this process.",
+            "Command still running after 30s. Moved to background (pid=5822).",
             None,
             Some(&metadata),
         );
@@ -1277,63 +653,38 @@ mod tool_error_detection_tests {
     }
 
     #[test]
-    fn plain_timeout_without_background_is_still_transient() {
-        let metadata = aidaemon_events::traits::ToolCallMetadata {
+    fn a_typed_timeout_is_transient() {
+        let metadata = ToolCallMetadata {
             timed_out: true,
             ..Default::default()
         };
-        let classified = classify_tool_result_failure_with_context(
-            "web_fetch",
-            "request timed out",
-            None,
-            Some(&metadata),
-        );
+        let classified =
+            classify_tool_result_failure_with_context("web_fetch", "", None, Some(&metadata));
         assert_eq!(classified, Some(ToolFailureClass::Transient));
     }
 
     #[test]
-    fn classify_uses_structured_http_status_over_text_scraping() {
-        let meta = aidaemon_events::traits::ToolCallMetadata {
-            http_status: Some(403),
-            ..Default::default()
-        };
-        let result = classify_tool_result_failure_with_context(
-            "http_request",
-            "some response body without status line",
-            None,
-            Some(&meta),
-        );
-        assert_eq!(result, Some(ToolFailureClass::Semantic));
-    }
-
-    #[test]
-    fn classify_structured_http_status_transient() {
-        let meta = aidaemon_events::traits::ToolCallMetadata {
-            http_status: Some(429),
-            ..Default::default()
-        };
-        let result = classify_tool_result_failure_with_context(
-            "http_request",
-            "rate limited",
-            None,
-            Some(&meta),
-        );
-        assert_eq!(result, Some(ToolFailureClass::Transient));
-    }
-
-    #[test]
-    fn classify_structured_http_200_is_not_error() {
-        let meta = aidaemon_events::traits::ToolCallMetadata {
-            http_status: Some(200),
-            ..Default::default()
-        };
-        let result = classify_tool_result_failure_with_context(
-            "http_request",
-            "success body",
-            None,
-            Some(&meta),
-        );
-        assert_eq!(result, None);
+    fn structured_http_status_decides_an_http_result() {
+        for (status, expected) in [
+            (403, Some(ToolFailureClass::Semantic)),
+            (429, Some(ToolFailureClass::Transient)),
+            (200, None),
+        ] {
+            let meta = ToolCallMetadata {
+                http_status: Some(status),
+                ..Default::default()
+            };
+            assert_eq!(
+                classify_tool_result_failure_with_context(
+                    "http_request",
+                    "Error: the body of a page that talks about errors",
+                    None,
+                    Some(&meta),
+                ),
+                expected,
+                "{status}"
+            );
+        }
     }
 }
 
@@ -1602,7 +953,11 @@ pub fn collapse_repeated_tool_errors(messages: &mut [Value]) -> usize {
             .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        let is_error = classify_tool_result_failure(&name, content).is_some();
+        // The receipt line's typed outcome when the result carries one.
+        let is_error = match aidaemon_events::ToolReceiptV1::outcome_in_context_header(content) {
+            Some(status) => status.is_failure(),
+            None => classify_tool_result_failure(&name, content).is_some(),
+        };
 
         if is_error {
             if let Some(prev_idx) = last_error_idx_by_tool.insert(name.clone(), idx) {

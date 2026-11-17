@@ -788,7 +788,14 @@ pub trait ToolDispatch: TurnHost {
             .await
             .map(|outcome| sanitize_workspace_tool_outcome(outcome, grant))
             .map_err(|error| {
-                anyhow::anyhow!(sanitize_workspace_tool_text(&error.to_string(), grant))
+                let text = sanitize_workspace_tool_text(&error.to_string(), grant);
+                // The redacted text keeps the error's typed kind: a call
+                // that took no effect stays retryable.
+                if aidaemon_tools::failed_without_effect(&error) {
+                    anyhow::Error::new(aidaemon_tools::NothingSentError(text))
+                } else {
+                    anyhow::anyhow!(text)
+                }
             });
         }
 

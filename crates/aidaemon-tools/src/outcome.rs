@@ -33,6 +33,38 @@ impl std::fmt::Display for NothingSentError {
 
 impl std::error::Error for NothingSentError {}
 
+/// The path a call names does not exist, so the call took no effect. A
+/// call that names another path may succeed: a missed lookup while
+/// exploring is a retryable failure, not one that counts toward the
+/// tool's lockout. Raised by the file tools from the backend's own
+/// metadata failure, never inferred from an error's words.
+#[derive(Debug)]
+pub struct TargetNotFound(pub String);
+
+impl std::fmt::Display for TargetNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TargetNotFound {}
+
+/// Whether a raised tool error says, by its type, that the call took no
+/// effect and another call may succeed ([`NothingSentError`],
+/// [`TargetNotFound`], and with checkpoints a checkpoint refused for an
+/// unbounded scope before the process started).
+pub fn failed_without_effect(error: &anyhow::Error) -> bool {
+    #[cfg(feature = "checkpoints")]
+    if error
+        .downcast_ref::<crate::checkpoints::UnboundedCheckpoint>()
+        .is_some()
+    {
+        return true;
+    }
+    error.downcast_ref::<NothingSentError>().is_some()
+        || error.downcast_ref::<TargetNotFound>().is_some()
+}
+
 /// A tool whose execution returns a typed outcome.
 #[async_trait]
 pub trait OutcomeTool: ToolSemantics {

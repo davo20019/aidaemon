@@ -1402,13 +1402,17 @@ fn self_healable_denied_reads(output: &str, home: &str, already_granted: &[Strin
         "tsconfig.json",
         "jsconfig.json",
     ];
+    // The sandbox reports no violation to the process in a structured way,
+    // so the confined process's own errno line is the only signal; it stays
+    // narrow: only the platform's sandbox errno text
+    // ([`SANDBOX_DENIAL_ERRNO_TEXT`]), only for a confined run that failed
+    // (the caller checks both), and it only nominates candidates for the
+    // basename allowlist above, never a grant on its own.
     let looks_denied = |line: &str| {
         let l = line.to_ascii_lowercase();
-        l.contains("operation not permitted")
-            || l.contains("permission denied")
-            || l.contains("eperm")
-            || l.contains("eacces")
-            || l.contains("blocked by sandbox")
+        SANDBOX_DENIAL_ERRNO_TEXT
+            .iter()
+            .any(|errno| l.contains(errno))
     };
     let _ = home;
     let mut found: Vec<String> = Vec::new();
@@ -5729,7 +5733,8 @@ impl TerminalTool {
                         metadata.semantics = semantics;
                     }
                 }
-                metadata.access_denial = sandbox_access_denial(stderr.as_ref(), exit_code);
+                metadata.access_denial =
+                    sandbox_access_denial(stderr.as_ref(), exit_code, confined);
                 Ok(ToolCallOutcome {
                     metadata,
                     output,
@@ -5971,6 +5976,7 @@ impl TerminalTool {
                                 stderr: &stderr,
                                 semantics,
                                 elapsed_secs: started.elapsed().as_secs(),
+                                confined,
                             },
                         )
                         .await;
@@ -6208,6 +6214,7 @@ impl TerminalTool {
                                             stderr: &stderr,
                                             semantics: completion_semantics_for_notify.clone(),
                                             elapsed_secs,
+                                            confined,
                                         },
                                     )
                                     .await;
@@ -7466,19 +7473,37 @@ fn extract_terminal_exit_code(output: &str) -> Option<i32> {
     }
 }
 
-/// Classify the small set of diagnostics emitted by the process boundary when
-/// the installed filesystem policy rejects an open. This is adapter/kernel
-/// telemetry, not request-language matching: the manifest and sandbox remain
-/// authoritative, while the diagnostic simply records why a dispatched
-/// process returned a negative status.
+/// The errno text the confining sandbox's denial produces on this platform:
+/// seatbelt (macOS) refuses an open with `EPERM` ("Operation not
+/// permitted"); the Linux adapters refuse with `EACCES` ("Permission
+/// denied", Landlock) or `EPERM` (bubblewrap/seccomp).
+#[cfg(target_os = "macos")]
+const SANDBOX_DENIAL_ERRNO_TEXT: &[&str] = &["operation not permitted"];
+#[cfg(not(target_os = "macos"))]
+const SANDBOX_DENIAL_ERRNO_TEXT: &[&str] = &["operation not permitted", "permission denied"];
+
+/// Whether a failed confined process's stderr shows the sandbox refusing a
+/// path. Neither sandbox reports a violation to the process in a structured
+/// way (seatbelt logs it to the unified log only), so the process's own
+/// errno line is the only signal, and it is read as narrowly as it can be:
+/// only for a process that ran confined, only on a non-zero exit, only the
+/// platform's sandbox errno text, and only on a line that names an
+/// absolute path the open was refused for. A program's own refusal with no
+/// path (`git push`'s "Permission denied (publickey)") is never a policy
+/// denial.
 fn sandbox_access_denial(
     stderr: &str,
     exit_code: Option<i32>,
+    confined: bool,
 ) -> Option<crate::tools::traits::ToolAccessDenial> {
-    let denied = exit_code.is_some_and(|code| code != 0)
+    let denied = confined
+        && exit_code.is_some_and(|code| code != 0)
         && stderr.lines().any(|line| {
-            let line = line.trim().to_ascii_lowercase();
-            line.contains("operation not permitted") || line.contains("permission denied")
+            let lower = line.trim().to_ascii_lowercase();
+            SANDBOX_DENIAL_ERRNO_TEXT
+                .iter()
+                .any(|errno| lower.contains(errno))
+                && !extract_absolute_paths(line).is_empty()
         });
     denied.then(|| crate::tools::traits::ToolAccessDenial {
         reason_code: "sandbox_policy_denied".to_string(),
@@ -7514,6 +7539,8 @@ struct BackgroundCompletion<'a> {
     stderr: &'a str,
     semantics: ToolCallSemantics,
     elapsed_secs: u64,
+    /// The process ran inside the confining sandbox.
+    confined: bool,
 }
 
 /// Persist the terminal receipt of a background command that ended, under
@@ -7535,7 +7562,7 @@ async fn persist_background_completion_receipt(
     metadata.effective_tool_name = Some("terminal".to_string());
     metadata.truncation = ended.truncation.clone();
     metadata.semantics = ended.semantics.clone();
-    metadata.access_denial = sandbox_access_denial(ended.stderr, ended.exit_code);
+    metadata.access_denial = sandbox_access_denial(ended.stderr, ended.exit_code, ended.confined);
     let provenance = crate::tools::traits::ToolResultProvenance::from_authoritative_result(
         ended.output,
         &metadata,
@@ -8816,12 +8843,38 @@ mod tests {
         let denial = sandbox_access_denial(
             "/bin/sh: cannot open /etc/hosts: Operation not permitted",
             Some(1),
+            true,
         )
         .expect("kernel denial diagnostic");
         assert_eq!(denial.reason_code, "sandbox_policy_denied");
         assert_eq!(denial.exit_code, Some(1));
-        assert!(sandbox_access_denial("ordinary command error", Some(1)).is_none());
-        assert!(sandbox_access_denial("Operation not permitted", Some(0)).is_none());
+        assert!(sandbox_access_denial("ordinary command error", Some(1), true).is_none());
+        assert!(
+            sandbox_access_denial(
+                "cannot open /etc/hosts: Operation not permitted",
+                Some(0),
+                true
+            )
+            .is_none()
+        );
+        // Only a process that ran confined can be refused by the sandbox.
+        assert!(
+            sandbox_access_denial(
+                "cannot open /etc/hosts: Operation not permitted",
+                Some(1),
+                false
+            )
+            .is_none()
+        );
+    }
+
+    /// `git push`'s own refusal names no path the sandbox refused: it is
+    /// the remote's authentication failing, never a sandbox policy block.
+    #[test]
+    fn a_programs_own_permission_refusal_is_not_a_sandbox_denial() {
+        let stderr = "git@example.com: Permission denied (publickey).\n\
+                      fatal: Could not read from remote repository.";
+        assert!(sandbox_access_denial(stderr, Some(128), true).is_none());
     }
 
     #[test]

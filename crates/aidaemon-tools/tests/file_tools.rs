@@ -393,3 +393,35 @@ async fn edit_batch_writes_nothing_when_one_fails() {
         assert!(edit.validate(&bad).is_err(), "{bad}");
     }
 }
+
+/// A path that does not exist is raised as a typed not-found, so the
+/// dispatcher records a retryable failure without reading the error's words.
+#[tokio::test]
+async fn a_missing_path_is_a_typed_not_found() {
+    let (_dir, workspace) = workspace();
+    let facts = aidaemon_tools::semantics::ToolCallContext::default();
+    let missing = json!({"path": "synthetic-missing.txt"}).to_string();
+    let read = ReadFile::new(workspace.clone());
+    let error = aidaemon_tools::OutcomeTool::execute(&read, &missing, &facts)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<aidaemon_tools::TargetNotFound>()
+            .is_some()
+    );
+    assert!(aidaemon_tools::failed_without_effect(&error));
+    let edit = EditFile::new(workspace);
+    let error = aidaemon_tools::OutcomeTool::execute(
+        &edit,
+        &json!({"path": "synthetic-missing.txt", "old_text": "a", "new_text": "b"}).to_string(),
+        &facts,
+    )
+    .await
+    .unwrap_err();
+    assert!(aidaemon_tools::failed_without_effect(&error));
+    // A failure that is not typed as taking no effect stays permanent.
+    assert!(!aidaemon_tools::failed_without_effect(&anyhow::anyhow!(
+        "File not found: synthetic-missing.txt"
+    )));
+}

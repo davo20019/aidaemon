@@ -133,10 +133,10 @@ impl OutcomeTool for WriteFile {
                 .await
                 .is_ok_and(|metadata| metadata.is_dir())
         {
-            anyhow::bail!(
-                "Parent directory does not exist: {}. Set create_dirs=true to create it.",
-                parent
-            );
+            return Err(crate::TargetNotFound(format!(
+                "Parent directory does not exist: {parent}. Set create_dirs=true to create it."
+            ))
+            .into());
         }
 
         // Write mode: "overwrite" (default, replaces with backup) or "append"

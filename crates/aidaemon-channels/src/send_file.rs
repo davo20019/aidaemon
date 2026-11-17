@@ -249,7 +249,7 @@ impl SendFileTool {
             let metadata = match backend.metadata(&backend_path).await {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    return Ok(SendReply::failed(format!(
+                    return Ok(SendReply::not_found(format!(
                         "Error: File not found: {file_path}"
                     )));
                 }
@@ -315,7 +315,7 @@ impl SendFileTool {
         ) {
             Ok(r) => r,
             Err(DeliveryError::FileNotFound(_)) => {
-                return Ok(SendReply::failed(format!(
+                return Ok(SendReply::not_found(format!(
                     "Error: File not found: {}",
                     file_path
                 )));
@@ -567,6 +567,15 @@ impl SendReply {
     fn failed(text: impl Into<String>) -> Self {
         Self {
             status: ToolOutcomeStatus::FailedPermanent,
+            text: text.into(),
+        }
+    }
+
+    /// The file named does not exist: nothing was sent, and a call naming
+    /// another path may succeed, so the failure is retryable.
+    fn not_found(text: impl Into<String>) -> Self {
+        Self {
+            status: ToolOutcomeStatus::FailedRetryable,
             text: text.into(),
         }
     }

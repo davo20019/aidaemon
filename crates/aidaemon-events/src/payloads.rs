@@ -523,6 +523,29 @@ impl ToolReceiptV1 {
         }
     }
 
+    /// The typed outcome recorded in the receipt line [`Self::context_header`]
+    /// wrote at the start of a reconstructed tool result, or `None` when the
+    /// text does not start with one. This reads the daemon's own machine
+    /// line, never the result's words.
+    pub fn outcome_in_context_header(text: &str) -> Option<ToolOutcomeStatus> {
+        let line = text.trim_start().lines().next()?;
+        let fields = line.strip_prefix("[Tool receipt v")?.strip_suffix(']')?;
+        let (_, fields) = fields.split_once(": ")?;
+        let value = fields
+            .split("; ")
+            .find_map(|field| field.strip_prefix("outcome="))?;
+        [
+            ToolOutcomeStatus::Succeeded,
+            ToolOutcomeStatus::CompletedWithNegativeResult,
+            ToolOutcomeStatus::FailedRetryable,
+            ToolOutcomeStatus::FailedPermanent,
+            ToolOutcomeStatus::Blocked,
+            ToolOutcomeStatus::Backgrounded,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == value)
+    }
+
     /// Compact trusted control-plane header prepended when a durable tool
     /// result is reconstructed for a later model turn.
     pub fn context_header(&self) -> String {
@@ -2387,6 +2410,17 @@ mod tests {
             roundtrip
                 .context_header()
                 .contains("returned_range=lines:4-9")
+        );
+        assert_eq!(
+            ToolReceiptV1::outcome_in_context_header(&format!(
+                "{}\nError: the output's own words",
+                roundtrip.context_header()
+            )),
+            Some(ToolOutcomeStatus::Succeeded)
+        );
+        assert_eq!(
+            ToolReceiptV1::outcome_in_context_header("outcome=failed_permanent"),
+            None
         );
         let replay = roundtrip.to_metadata();
         assert!(replay.receipt_replayed);

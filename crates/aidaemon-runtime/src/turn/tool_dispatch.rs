@@ -409,17 +409,6 @@ pub fn build_background_detach_ack(result_text: &str) -> String {
         .unwrap_or_else(|| "The task is running in the background.".to_string())
 }
 
-pub fn is_trivial_success_excerpt(s: &str) -> bool {
-    let lower = s.trim().to_ascii_lowercase();
-    lower.is_empty()
-        || lower == "ok"
-        || lower == "done"
-        || lower == "success"
-        || lower == "completed"
-        || lower == "completed successfully"
-        || lower == "request completed successfully"
-}
-
 pub fn summarize_completed_tool_result(result_text: &str) -> String {
     let summary = aidaemon_events::traits::first_primary_message_line(result_text, &[])
         .filter(|line| !line.trim().is_empty())
@@ -427,22 +416,13 @@ pub fn summarize_completed_tool_result(result_text: &str) -> String {
     truncate_str(summary.trim(), TOOL_COMPLETE_SUMMARY_MAX_CHARS)
 }
 
-pub fn has_nonzero_exit_code(text: &str) -> bool {
-    // Detect "[exit code: N]" where N != 0.
-    if let Some(pos) = text.to_ascii_lowercase().find("[exit code:") {
-        let after = &text[pos + 11..];
-        let code_str: String = after
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == ' ')
-            .collect();
-        if let Ok(code) = code_str.trim().parse::<i32>() {
-            return code != 0;
-        }
-    }
-    false
-}
-
-pub fn build_external_action_completion_ack(result_text: &str) -> String {
+/// The ack for a receipt-backed external change, from the call's typed
+/// outcome: only a call whose receipt succeeded is acknowledged as
+/// completed, and its own output follows as the latest result.
+pub fn build_external_action_completion_ack(
+    result_text: &str,
+    status: aidaemon_events::traits::ToolOutcomeStatus,
+) -> String {
     let primary = aidaemon_events::traits::extract_primary_message_content(result_text, &[]);
     let filtered: String = primary
         .lines()
@@ -450,13 +430,12 @@ pub fn build_external_action_completion_ack(result_text: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let excerpt = filtered.trim();
-    let has_error = has_nonzero_exit_code(excerpt);
-    let status = if has_error {
-        "The requested action finished with errors."
-    } else {
+    let status = if status == aidaemon_events::traits::ToolOutcomeStatus::Succeeded {
         "The requested action completed successfully."
+    } else {
+        "The requested action finished with errors."
     };
-    if excerpt.is_empty() || is_trivial_success_excerpt(excerpt) {
+    if excerpt.is_empty() {
         status.to_string()
     } else {
         format!(
@@ -489,16 +468,6 @@ pub fn user_facing_external_action_ack(ack: &str) -> String {
     )
 }
 
-pub fn should_build_external_action_ack(result_text: &str) -> bool {
-    let primary = aidaemon_events::traits::extract_primary_message_content(result_text, &[]);
-    let lower = primary.trim_start().to_ascii_lowercase();
-    !lower.starts_with("request blocked:")
-        && !lower.starts_with("blocked:")
-        && !lower.starts_with("[system] blocked:")
-        && !lower.starts_with("error:")
-        && !lower.starts_with("failed to ")
-}
-
 pub fn tool_result_contains_verifiable_evidence(
     semantics: &ToolCallSemantics,
     result_text: &str,
@@ -507,13 +476,12 @@ pub fn tool_result_contains_verifiable_evidence(
         return false;
     }
 
+    // Any returned content is evidence the observation can be read from;
+    // its words never decide that. A receipt without content is evidence
+    // only through its typed metadata
+    // (`tool_result_or_metadata_contains_verifiable_evidence`).
     let primary = aidaemon_events::traits::extract_primary_message_content(result_text, &[]);
-    let primary = primary.trim();
-    !primary.is_empty()
-        && !matches!(
-            primary.to_ascii_lowercase().as_str(),
-            "ok" | "done" | "success" | "completed" | "completed successfully"
-        )
+    !primary.trim().is_empty()
 }
 
 /// A completed observation can be evidenced by either substantive returned
@@ -1728,7 +1696,10 @@ mod tests {
             "Deployed 3 services successfully.\n{}",
             aidaemon_tools::text::truncation_notice(4000, 4265)
         );
-        let ack = build_external_action_completion_ack(&result_text);
+        let ack = build_external_action_completion_ack(
+            &result_text,
+            aidaemon_events::traits::ToolOutcomeStatus::Succeeded,
+        );
         assert!(ack.contains("Deployed 3 services successfully."));
         assert!(!ack.contains("OUTPUT TRUNCATED"));
     }
@@ -1740,7 +1711,10 @@ mod tests {
         // successfully.\n\nLatest result:\n[ {\"nctId\": ...500 chars of
         // JSON...]" — straight to the user.
         let json_result = "Fetched trial data.\n[\n  {\n    \"nctId\": \"NCT00000000\",\n    \"title\": \"Synthetic Trial Study of Compound X in Participants With Condition Y\",\n    \"status\": \"COMPLETED\",\n    \"conditions\": [\"Condition Y\"]\n  }\n]";
-        let ack = build_external_action_completion_ack(json_result);
+        let ack = build_external_action_completion_ack(
+            json_result,
+            aidaemon_events::traits::ToolOutcomeStatus::Succeeded,
+        );
         assert!(ack.contains("Latest result:"), "model-facing keeps excerpt");
         let user = user_facing_external_action_ack(&ack);
         assert!(
@@ -1753,12 +1727,32 @@ mod tests {
 
     #[test]
     fn user_facing_ack_keeps_short_prose_results() {
-        let ack = build_external_action_completion_ack("Tweet posted. id=1234567890");
+        let ack = build_external_action_completion_ack(
+            "Tweet posted. id=1234567890",
+            aidaemon_events::traits::ToolOutcomeStatus::Succeeded,
+        );
         let user = user_facing_external_action_ack(&ack);
         assert!(
             user.contains("Tweet posted"),
             "short prose results stay: {user}"
         );
+    }
+
+    /// The ack states the call's typed outcome; the output's words (an
+    /// "ok", an "Error:" it printed, an exit-code line) never decide it.
+    #[test]
+    fn external_action_ack_states_the_typed_outcome() {
+        let failed = build_external_action_completion_ack(
+            "ok",
+            aidaemon_events::traits::ToolOutcomeStatus::FailedPermanent,
+        );
+        assert!(failed.starts_with("The requested action finished with errors."));
+        let done = build_external_action_completion_ack(
+            "Error: none of the 3 posts were duplicates [exit code: 1]",
+            aidaemon_events::traits::ToolOutcomeStatus::Succeeded,
+        );
+        assert!(done.starts_with("The requested action completed successfully."));
+        assert!(done.contains("Latest result:"));
     }
 
     #[test]
@@ -1774,6 +1768,12 @@ mod tests {
             &non_verifyable,
             "Latest post title: Scheduled reflection"
         ));
+        // Any content counts; only an empty result has nothing to read.
+        assert!(tool_result_contains_verifiable_evidence(
+            &verifyable,
+            "done"
+        ));
+        assert!(!tool_result_contains_verifiable_evidence(&verifyable, "  "));
     }
 
     #[test]

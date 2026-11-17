@@ -39,6 +39,20 @@ mod tool;
 pub use schema::migrate;
 pub use tool::ListCheckpointsTool;
 
+/// A checkpoint refused before the call ran because its scope would be
+/// unbounded (outside the workspace, or the workspace container itself).
+/// Nothing ran; the same call aimed at a bounded project root can succeed.
+#[derive(Debug)]
+pub struct UnboundedCheckpoint(pub String);
+
+impl std::fmt::Display for UnboundedCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnboundedCheckpoint {}
+
 /// Where a checkpoint's lifecycle is recorded: the host's audit log.
 #[async_trait::async_trait]
 pub trait CheckpointAudit: Send + Sync {
@@ -1039,35 +1053,37 @@ impl CheckpointManager {
                 // metadata, treat that first-level child as the bounded root.
                 // The container itself remains ineligible.
                 let relative = candidate.strip_prefix(workspace).map_err(|_| {
-                    anyhow::anyhow!(
+                    UnboundedCheckpoint(format!(
                         "refusing an unbounded checkpoint: {} is outside {}",
                         candidate.display(),
                         workspace.display()
-                    )
+                    ))
                 })?;
                 let mut components = relative.components();
                 let first = components.next().ok_or_else(|| {
-                    anyhow::anyhow!(
+                    UnboundedCheckpoint(format!(
                         "refusing an unbounded checkpoint at workspace container {}",
                         workspace.display()
-                    )
+                    ))
                 })?;
                 let child_root = workspace.join(first.as_os_str());
                 if candidate_is_file && components.next().is_none() {
-                    anyhow::bail!(
+                    return Err(UnboundedCheckpoint(format!(
                         "refusing an unbounded checkpoint for a file directly in workspace container {}",
                         workspace.display()
-                    );
+                    ))
+                    .into());
                 }
                 fs::create_dir_all(&child_root)?;
                 child_root
             }
             Some(_) => {
-                anyhow::bail!(
+                return Err(UnboundedCheckpoint(format!(
                     "refusing an unbounded checkpoint: {} is outside {}",
                     candidate.display(),
                     workspace.display()
-                )
+                ))
+                .into());
             }
         };
         let root = dunce::canonicalize(&root)?;

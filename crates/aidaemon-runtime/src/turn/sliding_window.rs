@@ -236,15 +236,14 @@ fn extract_read_file_outcome(result: &str) -> String {
     }
 }
 
-/// Check if write/edit succeeded based on result content.
+/// A write or edit's outcome, from the typed outcome its receipt line
+/// records (the daemon writes that line at the start of a stored result);
+/// "completed" when the result carries none. Never from the result's words.
 fn extract_write_outcome(result: &str) -> String {
-    let lower = result.to_lowercase();
-    if lower.contains("successfully") || lower.contains("success") || lower.contains("written") {
-        "ok".to_string()
-    } else if lower.contains("error") || lower.contains("failed") || lower.contains("denied") {
-        "error".to_string()
-    } else {
-        "completed".to_string()
+    match aidaemon_events::ToolReceiptV1::outcome_in_context_header(result) {
+        Some(aidaemon_events::traits::ToolOutcomeStatus::Succeeded) => "ok".to_string(),
+        Some(status) => status.as_str().to_string(),
+        None => "completed".to_string(),
     }
 }
 
@@ -407,24 +406,35 @@ mod tests {
         assert_eq!(result, "read_file: src/main.rs -> 245 lines");
     }
 
+    fn receipted(outcome: &str, body: &str) -> String {
+        format!(
+            "[Tool receipt v7: stage=Dispatched; outcome={outcome}; dispatched=true; \
+             background_started=false; detached=false; exit_code=none; bytes_returned=0; \
+             denial=none; result_id=sha256:synthetic; source=tool_output; model_view=complete; \
+             durable_view=complete; requested_range=not_applicable; \
+             returned_range=not_applicable]\n{body}"
+        )
+    }
+
     #[test]
     fn test_write_file_success() {
         let result = summarize_tool_result(
             "write_file",
             r#"{"path": "src/utils.rs"}"#,
-            "File written successfully",
+            &receipted("succeeded", "Wrote 12 bytes; the old error handler is gone"),
         );
         assert_eq!(result, "write_file: src/utils.rs -> ok");
     }
 
+    /// The receipt's typed outcome decides, not the result's words.
     #[test]
     fn test_write_file_error() {
         let result = summarize_tool_result(
             "write_file",
             r#"{"path": "/etc/hosts"}"#,
-            "Error: permission denied",
+            &receipted("failed_permanent", "Saved successfully? No."),
         );
-        assert_eq!(result, "write_file: /etc/hosts -> error");
+        assert_eq!(result, "write_file: /etc/hosts -> failed_permanent");
     }
 
     #[test]
@@ -432,7 +442,7 @@ mod tests {
         let result = summarize_tool_result(
             "edit_file",
             r#"{"path": "src/config.rs"}"#,
-            "Edit applied successfully",
+            &receipted("succeeded", "Edit applied"),
         );
         assert_eq!(result, "edit_file: src/config.rs -> ok");
     }
@@ -513,7 +523,8 @@ mod tests {
             r#"{"file_path": "output.txt"}"#,
             "File written successfully",
         );
-        assert_eq!(result, "write_file: output.txt -> ok");
+        // No receipt line: the outcome is not claimed from the words.
+        assert_eq!(result, "write_file: output.txt -> completed");
     }
 
     #[test]

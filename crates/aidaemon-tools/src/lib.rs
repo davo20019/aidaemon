@@ -109,7 +109,10 @@ pub use fs::{
     MAX_READ_CHARS, ProtectedPathGuard, ReadFile, ToolText, WorkspaceBackend, WorkspaceFilePolicy,
     WriteFile, format_with_line_numbers, render_read_file_output, render_read_file_output_within,
 };
-pub use outcome::{CallValidator, KernelAdapter, NothingSentError, OutcomeRunner, OutcomeTool};
+pub use outcome::{
+    CallValidator, KernelAdapter, NothingSentError, OutcomeRunner, OutcomeTool, TargetNotFound,
+    failed_without_effect,
+};
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
 pub use search_files::SearchFiles;

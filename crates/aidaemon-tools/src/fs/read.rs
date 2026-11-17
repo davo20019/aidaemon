@@ -239,7 +239,7 @@ impl ReadFile {
         let metadata = backend
             .metadata(&path)
             .await
-            .map_err(|_| anyhow::anyhow!("File not found: {}", path_str))?;
+            .map_err(|_| crate::TargetNotFound(format!("File not found: {path_str}")))?;
 
         if metadata.is_dir() {
             anyhow::bail!("Path is a directory, not a file: {}", path_str);

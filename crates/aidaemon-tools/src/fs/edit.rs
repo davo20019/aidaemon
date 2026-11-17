@@ -332,7 +332,7 @@ impl OutcomeTool for EditFile {
         let path = backend.resolve_path(path_str).await?;
 
         if backend.metadata(&path).await.is_err() {
-            anyhow::bail!("File not found: {}", path_str);
+            return Err(crate::TargetNotFound(format!("File not found: {path_str}")).into());
         }
 
         // Held from before the read until the write has landed.
