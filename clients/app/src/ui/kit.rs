@@ -1891,8 +1891,6 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     // middle when it began; once seen, the touch neither clicks nor scrolls.
     let pinch = signal(None::<(f32, f32, (f32, f32))>);
     let pinched = signal(false);
-    // Fingers down, by id: where each is in the box.
-    let fingers = signal(Vec::<(u32, f32, f32)>::new());
 
     // The phone's own keyboard: a tap focuses an unseen field laid over the
     // spot (then over the page's field once the page says which), so the
@@ -1953,27 +1951,30 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             .keep_touches(true)
             .on_touch(move |e: &nsh_core::TouchEvent| {
                 // Two fingers zoom about their middle and pan as they move.
-                let mut down = fingers.get_untracked();
-                for p in &e.points {
-                    let at = (p.id, p.location.x.0, p.location.y.0);
-                    match e.phase {
-                        nsh_core::TouchPhase::End | nsh_core::TouchPhase::Cancel if p.changed => {
-                            down.retain(|f| f.0 != p.id);
-                        }
-                        _ => match down.iter_mut().find(|f| f.0 == p.id) {
-                            Some(f) => *f = at,
-                            None if !matches!(
-                                e.phase,
-                                nsh_core::TouchPhase::End | nsh_core::TouchPhase::Cancel
-                            ) =>
-                            {
-                                down.push(at);
-                            }
-                            None => {}
-                        },
-                    }
-                }
-                fingers.set(down.clone());
+                // The fingers down are the event's own list: it names every
+                // finger on the screen, also one that came down off the
+                // picture (whose lifting this view never hears), so nothing
+                // is kept between events.
+                let lifted = matches!(
+                    e.phase,
+                    nsh_core::TouchPhase::End | nsh_core::TouchPhase::Cancel
+                );
+                // Positions on the screen, turned into the picture's own
+                // through the finger this view heard (its target is the
+                // picture; another finger's is wherever it came down).
+                let Some(about) = e.points.iter().find(|p| p.changed) else {
+                    return;
+                };
+                let (ox, oy) = (
+                    about.page.x.0 - about.location.x.0,
+                    about.page.y.0 - about.location.y.0,
+                );
+                let down: Vec<(u32, f32, f32)> = e
+                    .points
+                    .iter()
+                    .filter(|p| !(lifted && p.changed))
+                    .map(|p| (p.id, p.page.x.0 - ox, p.page.y.0 - oy))
+                    .collect();
                 if down.len() < 2 {
                     pinch.set(None);
                     return;
