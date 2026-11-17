@@ -493,7 +493,20 @@ impl ClientHost for Host {
                     "Monday: review the synthetic report. Tuesday: the demo.",
                 ),
             ],
-            _ => &[("user", "What's on today?"), ("assistant", "Two meetings.")],
+            _ => &[
+                ("user", "What's on today?"),
+                ("assistant", "Two meetings."),
+                ("user", "Run the synthetic test suite"),
+                (
+                    "assistant",
+                    "Started in the background: run the synthetic tests. Its result will \
+                     come to this chat when it finishes.",
+                ),
+                (
+                    "assistant",
+                    "The synthetic tests passed: 42 of 42, in `crates/demo`.",
+                ),
+            ],
         };
         let count = lines.len() as u64;
         Ok(lines
@@ -506,29 +519,14 @@ impl ClientHost for Host {
                 text: text.to_string(),
                 // A minute apart, ending an hour ago.
                 at_ms: now_ms() - 3_600_000 - (count - n as u64) * 60_000,
-                // The plan's reply used many tools, to try a long list.
-                tools: if *role == "assistant" {
-                    let n = if session_id == "app:plan" { 18 } else { 3 };
-                    [
-                        "read_file",
-                        "web_search",
-                        "read_file",
-                        "terminal",
-                        "edit_file",
-                    ]
+                // The plan's reply used many tools, to try a long list; a
+                // launch line used none and is marked handed off.
+                tools: demo_tools(session_id, role, text)
                     .iter()
-                    .cycle()
-                    .take(n)
-                    .map(|t| t.to_string())
-                    .collect()
-                } else {
-                    Vec::new()
-                },
-                calls: if *role == "assistant" {
-                    demo_calls()
-                } else {
-                    Vec::new()
-                },
+                    .map(|c| c.name.clone())
+                    .collect(),
+                calls: demo_tools(session_id, role, text),
+                handed_off: text.starts_with("Started in the background"),
             })
             .collect())
     }
@@ -1100,24 +1098,66 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// What a demo reply's tools were given and gave back: none for a
+/// launch line or the owner's message, many for the plan.
+fn demo_tools(
+    session_id: &str,
+    role: &str,
+    text: &str,
+) -> Vec<aidaemon_client_protocol::ToolCallInfo> {
+    if role != "assistant" || text.starts_with("Started in the background") {
+        return Vec::new();
+    }
+    let n = if session_id == "app:plan" { 18 } else { 6 };
+    demo_calls().into_iter().cycle().take(n).collect()
+}
+
 /// What a demo reply's tools were given and gave back.
 fn demo_calls() -> Vec<aidaemon_client_protocol::ToolCallInfo> {
-    let call = |name: &str, input: &str, output: &str| aidaemon_client_protocol::ToolCallInfo {
-        name: name.into(),
-        input: input.into(),
-        output: output.into(),
-    };
+    use aidaemon_client_protocol::ToolKind;
+    let call =
+        |name: &str, kind, input: &str, output: &str| aidaemon_client_protocol::ToolCallInfo {
+            name: name.into(),
+            input: input.into(),
+            output: output.into(),
+            kind: Some(kind),
+        };
     vec![
         call(
             "read_file",
+            ToolKind::Read,
             "{\n  \"path\": \"notes/synthetic-week.md\"\n}",
             "# Week\n- Monday: review the synthetic report\n- Tuesday: the demo",
         ),
         call(
             "web_search",
+            ToolKind::Web,
             "{\n  \"query\": \"Acme Corp demo agenda\"\n}",
             "1. Acme Corp — Demo day agenda (example.invalid)",
         ),
-        call("read_file", "{\n  \"path\": \"notes/agenda.md\"\n}", ""),
+        call(
+            "terminal",
+            ToolKind::Run,
+            "{\n  \"action\": \"run\",\n  \"command\": \"cargo test -q -p demo\"\n}",
+            "running 42 tests\n..........................................\ntest result: ok. 42 passed; 0 failed",
+        ),
+        call(
+            "edit_file",
+            ToolKind::Write,
+            "{\n  \"path\": \"crates/demo/src/lib.rs\",\n  \"old_text\": \"fn a()\",\n  \"new_text\": \"fn b()\"\n}",
+            "Edited crates/demo/src/lib.rs (1 replacement)",
+        ),
+        call(
+            "track_requirements",
+            ToolKind::Check,
+            "{\n  \"action\": \"list\"\n}",
+            "2 of 3 done",
+        ),
+        call(
+            "read_file",
+            ToolKind::Read,
+            "{\n  \"path\": \"notes/agenda.md\"\n}",
+            "",
+        ),
     ]
 }

@@ -19,4 +19,12 @@ impl DaemonAgentRuntime for Agent {
     async fn reload_provider(&self, config: &crate::config::AppConfig) -> anyhow::Result<String> {
         super::models::reload_provider(self, config).await
     }
+
+    fn tool_activity(
+        &self,
+        name: &str,
+        arguments: &str,
+    ) -> Option<aidaemon_core::card::ActivityKind> {
+        Agent::tool_activity(self, name, arguments)
+    }
 }

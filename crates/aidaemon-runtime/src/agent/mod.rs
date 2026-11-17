@@ -268,6 +268,22 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// What kind of work a call of the tool `name` with `arguments` is, as
+    /// every card shows it (the same kind a live status gives); `None`
+    /// when this agent has no such tool.
+    pub fn tool_activity(
+        &self,
+        name: &str,
+        arguments: &str,
+    ) -> Option<aidaemon_core::card::ActivityKind> {
+        let tool = self.tools.iter().find(|tool| tool.name() == name)?;
+        let mutates = tool.call_semantics(arguments).mutates_state();
+        Some(crate::engine::turn_engine::tool_calls::step_kind(
+            &tool.dispatch_facts(),
+            mutates,
+        ))
+    }
+
     /// A root agent from its parts and the host's ports.
     pub fn new(parts: AgentParts, ports: HostPorts) -> Self {
         let AgentParts {

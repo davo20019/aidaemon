@@ -94,6 +94,7 @@ fn snapshot() -> Snapshot {
             status: Some(TurnStatus::ToolStarted {
                 name: "terminal".into(),
                 summary: "cargo test -q".into(),
+                activity: Some(ToolKind::Run),
             }),
             tools: vec!["terminal".into()],
         }],
@@ -572,6 +573,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 status: TurnStatus::ToolStarted {
                     name: "http_request".into(),
                     summary: "POST h.example.invalid".into(),
+                    activity: None,
                 },
             },
         ),
@@ -694,6 +696,7 @@ fn server_samples() -> Vec<ServerFrame> {
                     at_ms: 1_767_225_600_000,
                     tools: Vec::new(),
                     calls: Vec::new(),
+                    handed_off: false,
                 },
                 HistoryMessage {
                     attachments: Vec::new(),
@@ -707,7 +710,19 @@ fn server_samples() -> Vec<ServerFrame> {
                         input: r#"{"method":"POST","url":"https://reports.example.invalid/weekly"}"#
                             .into(),
                         output: "201 Created".into(),
+                        kind: Some(ToolKind::Web),
                     }],
+                    handed_off: false,
+                },
+                HistoryMessage {
+                    attachments: Vec::new(),
+                    id: "m-121".into(),
+                    role: "assistant".into(),
+                    text: "Started in the background: synthetic test run.".into(),
+                    at_ms: 1_767_225_720_000,
+                    tools: Vec::new(),
+                    calls: Vec::new(),
+                    handed_off: true,
                 },
             ],
             more: true,
@@ -1295,6 +1310,7 @@ fn every_turn_status_round_trips() {
         TurnStatus::ToolStarted {
             name: "terminal".into(),
             summary: String::new(),
+            activity: Some(ToolKind::Run),
         },
         TurnStatus::ToolProgress {
             name: "terminal".into(),

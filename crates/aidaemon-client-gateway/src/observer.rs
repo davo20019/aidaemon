@@ -169,9 +169,14 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
     let n = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
     Some(match update {
         StatusUpdate::Thinking(_) => TurnStatus::Thinking,
-        StatusUpdate::ToolStart { name, summary, .. } => TurnStatus::ToolStarted {
+        StatusUpdate::ToolStart {
+            name,
+            summary,
+            kind,
+        } => TurnStatus::ToolStarted {
             name: name.clone(),
             summary: summary.clone(),
+            activity: Some(crate::tool_kind(*kind)),
         },
         StatusUpdate::ToolProgress { name, chunk } => TurnStatus::ToolProgress {
             name: name.clone(),

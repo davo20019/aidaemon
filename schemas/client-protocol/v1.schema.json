@@ -3368,6 +3368,10 @@
           },
           "type": "array"
         },
+        "handed_off": {
+          "description": "A reply that only says its turn's work went on in the background\n(the turn ended handed off; protocol 1.29). The report comes later\nas its own reply.",
+          "type": "boolean"
+        },
         "id": {
           "type": "string"
         },
@@ -5672,6 +5676,17 @@
           "description": "What it was given: its arguments, trimmed, secrets redacted.",
           "type": "string"
         },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What kind of work it was (protocol 1.29); `None` from an older\ndaemon or a tool it no longer has."
+        },
         "name": {
           "type": "string"
         },
@@ -5684,6 +5699,66 @@
         "name"
       ],
       "type": "object"
+    },
+    "ToolKind": {
+      "description": "What kind of work a tool call was, as the daemon's cards show it\n(protocol 1.29): from the tool's own declared activity, never its name.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "Reading a file or document.",
+          "type": "string"
+        },
+        {
+          "const": "search",
+          "description": "Searching files or listing what is there.",
+          "type": "string"
+        },
+        {
+          "const": "write",
+          "description": "Writing or editing files.",
+          "type": "string"
+        },
+        {
+          "const": "run",
+          "description": "Running a command or program.",
+          "type": "string"
+        },
+        {
+          "const": "web",
+          "description": "Searching or reading the web.",
+          "type": "string"
+        },
+        {
+          "const": "delegate",
+          "description": "Handing work to a helper.",
+          "type": "string"
+        },
+        {
+          "const": "recall",
+          "description": "Reading what was remembered.",
+          "type": "string"
+        },
+        {
+          "const": "remember",
+          "description": "Saving or changing what is remembered.",
+          "type": "string"
+        },
+        {
+          "const": "remind",
+          "description": "Setting a reminder or a schedule.",
+          "type": "string"
+        },
+        {
+          "const": "check",
+          "description": "Any other look at the state of things.",
+          "type": "string"
+        },
+        {
+          "const": "change",
+          "description": "Any other change.",
+          "type": "string"
+        }
+      ]
     },
     "TurnState": {
       "description": "How a turn ended.",
@@ -5729,6 +5804,17 @@
         },
         {
           "properties": {
+            "activity": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "What kind of work it is (protocol 1.29)."
+            },
             "kind": {
               "const": "tool_started",
               "type": "string"

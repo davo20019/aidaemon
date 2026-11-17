@@ -32,6 +32,10 @@ pub enum Line {
         at_ms: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<AttachmentRef>,
+        /// It only says the turn's work went on in the background; the
+        /// report comes later as its own reply.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        handed_off: bool,
     },
     /// A note from the client itself (a stopped turn, an error).
     Note { text: String },
@@ -135,8 +139,10 @@ pub struct ViewRequest {
 pub fn status_text(status: &TurnStatus) -> String {
     match status {
         TurnStatus::Thinking => "Thinking...".into(),
-        TurnStatus::ToolStarted { name, summary } if summary.is_empty() => format!("{name}..."),
-        TurnStatus::ToolStarted { name, summary } => format!("{name}: {summary}..."),
+        TurnStatus::ToolStarted { name, summary, .. } if summary.is_empty() => {
+            format!("{name}...")
+        }
+        TurnStatus::ToolStarted { name, summary, .. } => format!("{name}: {summary}..."),
         // The output's latest line as a reader sees it, never its escapes.
         TurnStatus::ToolProgress { name, chunk } => {
             let plain = crate::text::plain_output(chunk);
@@ -315,6 +321,7 @@ impl State {
                         text: m.text,
                         at_ms: m.at_ms,
                         attachments: m.attachments,
+                        handed_off: m.handed_off,
                     });
                 }
             }
@@ -364,6 +371,7 @@ impl State {
                     text,
                     at_ms,
                     attachments,
+                    handed_off: false,
                 });
                 view.suggestions = suggestions;
                 // A message after a hand-off is its report.
@@ -404,12 +412,17 @@ impl State {
             Event::TurnStatus { turn_id, status } => {
                 if let Some(live) = self.live_turn(&turn_id) {
                     match &status {
-                        TurnStatus::ToolStarted { name, summary } => {
+                        TurnStatus::ToolStarted {
+                            name,
+                            summary,
+                            activity,
+                        } => {
                             live.tools.push(name.clone());
                             live.calls.push(ToolCallInfo {
                                 name: name.clone(),
                                 input: summary.clone(),
                                 output: String::new(),
+                                kind: *activity,
                             });
                         }
                         // The latest call of that name still running.
@@ -455,6 +468,7 @@ impl State {
                             text,
                             at_ms,
                             attachments,
+                            handed_off: state == TurnState::HandedOff,
                         });
                     }
                     return;
@@ -478,6 +492,7 @@ impl State {
                         text,
                         at_ms,
                         attachments,
+                        handed_off: state == TurnState::HandedOff,
                     });
                 }
                 view.background = state == TurnState::HandedOff;
@@ -633,6 +648,42 @@ mod tests {
         assert!(!state.sessions["app:s1"].background);
     }
 
+    /// The reply of a handed-off turn is marked as only a launch line; a
+    /// finished turn's reply is not.
+    #[test]
+    fn a_handed_off_reply_is_marked() {
+        let mut state = State::default();
+        for (turn, end) in [("t1", TurnState::HandedOff), ("t2", TurnState::Completed)] {
+            state.apply(event(
+                None,
+                Event::TurnStarted {
+                    turn_id: turn.into(),
+                    session_id: "app:s1".into(),
+                    origin: "app".into(),
+                },
+            ));
+            state.apply(event(
+                None,
+                Event::TurnCompleted {
+                    turn_id: turn.into(),
+                    text: format!("Reply of {turn}"),
+                    attachments: Vec::new(),
+                    state: end,
+                    error: None,
+                },
+            ));
+        }
+        let marks: Vec<bool> = state.sessions["app:s1"]
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Assistant { handed_off, .. } => Some(*handed_off),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marks, [true, false]);
+    }
+
     #[test]
     fn a_turn_streams_then_completes_once_even_when_replayed() {
         let mut state = State::default();
@@ -722,6 +773,7 @@ mod tests {
         state.apply(status(TurnStatus::ToolStarted {
             name: "running a command".into(),
             summary: "npm run typecheck".into(),
+            activity: Some(aidaemon_client_protocol::ToolKind::Run),
         }));
         state.apply(status(TurnStatus::ToolCompleted {
             name: "running a command".into(),
@@ -730,6 +782,7 @@ mod tests {
         state.apply(status(TurnStatus::ToolStarted {
             name: "reading a file".into(),
             summary: "src/synthetic.ts".into(),
+            activity: None,
         }));
         state.apply(event(
             Some(1),
@@ -746,6 +799,7 @@ mod tests {
         };
         assert_eq!(tools.len(), 2);
         assert_eq!(calls[0].input, "npm run typecheck");
+        assert_eq!(calls[0].kind, Some(aidaemon_client_protocol::ToolKind::Run));
         assert_eq!(calls[0].output, "exit 0");
         assert_eq!(calls[1].input, "src/synthetic.ts");
         assert!(calls[1].output.is_empty());
@@ -767,8 +821,10 @@ mod tests {
                     name: "read_file".into(),
                     input: "{\"path\": \"notes.md\"}".into(),
                     output: "Synthetic notes".into(),
+                    kind: None,
                 }],
                 attachments: Vec::new(),
+                handed_off: false,
             }],
         );
         let Line::Activity { calls, .. } = &state.sessions["app:s1"].lines[0] else {
@@ -809,6 +865,7 @@ mod tests {
                 status: TurnStatus::ToolStarted {
                     name: "read_file".into(),
                     summary: String::new(),
+                    activity: None,
                 },
             },
         ));

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 28;
+pub const PROTOCOL_MINOR: u16 = 29;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1757,6 +1757,9 @@ pub enum TurnStatus {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
+        /// What kind of work it is (protocol 1.29).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<ToolKind>,
     },
     ToolProgress {
         name: String,
@@ -2074,6 +2077,44 @@ pub struct HistoryMessage {
     /// Files sent with it (protocol 1.11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentRef>,
+    /// A reply that only says its turn's work went on in the background
+    /// (the turn ended handed off; protocol 1.29). The report comes later
+    /// as its own reply.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handed_off: bool,
+}
+
+/// What kind of work a tool call was, as the daemon's cards show it
+/// (protocol 1.29): from the tool's own declared activity, never its name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    /// Reading a file or document.
+    Read,
+    /// Searching files or listing what is there.
+    Search,
+    /// Writing or editing files.
+    Write,
+    /// Running a command or program.
+    Run,
+    /// Searching or reading the web.
+    Web,
+    /// Handing work to a helper.
+    Delegate,
+    /// Reading what was remembered.
+    Recall,
+    /// Saving or changing what is remembered.
+    Remember,
+    /// Setting a reminder or a schedule.
+    Remind,
+    /// Any other look at the state of things.
+    Check,
+    /// Any other change.
+    Change,
+    /// A kind added after this client was built.
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// One tool call of a reply's turn, as the owner's app shows it when a
@@ -2088,6 +2129,10 @@ pub struct ToolCallInfo {
     /// was recorded.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+    /// What kind of work it was (protocol 1.29); `None` from an older
+    /// daemon or a tool it no longer has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ToolKind>,
 }
 
 /// One entry of a session's running-work list: a turn, a helper (sub-agent)

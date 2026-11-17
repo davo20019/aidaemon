@@ -24,6 +24,26 @@
 //! application supplies what only it knows through [`ClientHost`].
 
 mod approvals;
+
+/// A tool call's kind of work as the app is told it: the daemon's card
+/// kind, one to one.
+pub fn tool_kind(kind: aidaemon_core::card::ActivityKind) -> aidaemon_client_protocol::ToolKind {
+    use aidaemon_client_protocol::ToolKind;
+    use aidaemon_core::card::ActivityKind;
+    match kind {
+        ActivityKind::Read => ToolKind::Read,
+        ActivityKind::Search => ToolKind::Search,
+        ActivityKind::Write => ToolKind::Write,
+        ActivityKind::Run => ToolKind::Run,
+        ActivityKind::Web => ToolKind::Web,
+        ActivityKind::Delegate => ToolKind::Delegate,
+        ActivityKind::Recall => ToolKind::Recall,
+        ActivityKind::Remember => ToolKind::Remember,
+        ActivityKind::Remind => ToolKind::Remind,
+        ActivityKind::Check => ToolKind::Check,
+        ActivityKind::Change => ToolKind::Change,
+    }
+}
 mod bus;
 pub mod client_feature;
 pub mod client_view;

@@ -26,13 +26,32 @@ use crate::run_state::{
     GroupEnd, GroupTurn, RunEnd, RunEvidence, RunMeasure, RunReport, RunState, RunStates,
 };
 
+/// How the launch line of one run ends.
+const ONE_RUN_END: &str = "Its result will come to this chat when it finishes.";
+/// How the launch line of several runs ends.
+const GROUP_ENDS: [&str; 2] = [
+    "I'll answer when both finish.",
+    "I'll answer when all of them finish.",
+];
+
 /// The reply of a turn that handed its work to a background run, and the
 /// first line of the call that started it: one plain line naming the run.
 pub fn started_in_background(label: &str) -> String {
-    format!(
-        "Started in the background: {}. Its result will come to this chat when it finishes.",
-        label.trim()
-    )
+    format!("Started in the background: {}. {ONE_RUN_END}", label.trim())
+}
+
+/// Whether a stored reply is exactly a launch line these functions made
+/// ([`started_in_background`], [`started_group_in_background`]): the reply
+/// of a turn that handed its work off, read back from history, where the
+/// turn's end state is not kept.
+pub fn is_launch_line(text: &str) -> bool {
+    let text = text.trim();
+    if text.contains('\n') || !text.starts_with("Started ") {
+        return false;
+    }
+    (text.starts_with("Started in the background") && text.ends_with(ONE_RUN_END))
+        || (text.contains(" in the background: ")
+            && GROUP_ENDS.iter().any(|end| text.ends_with(end)))
 }
 
 /// The launch line for the runs one turn left running, from their records:
@@ -45,16 +64,17 @@ pub fn started_group_in_background(labels: &[String]) -> String {
         .filter(|label| !label.is_empty())
         .collect();
     match labels.as_slice() {
-        [] => "Started in the background. Its result will come to this chat when it finishes."
-            .to_string(),
+        [] => format!("Started in the background. {ONE_RUN_END}"),
         [one] => started_in_background(one),
         [first, second] => format!(
-            "Started 2 in the background: {first} and {second}. I'll answer when both finish."
+            "Started 2 in the background: {first} and {second}. {}",
+            GROUP_ENDS[0]
         ),
         [rest @ .., last] => format!(
-            "Started {} in the background: {} and {last}. I'll answer when all of them finish.",
+            "Started {} in the background: {} and {last}. {}",
             labels.len(),
-            rest.join(", ")
+            rest.join(", "),
+            GROUP_ENDS[1]
         ),
     }
 }
@@ -414,6 +434,25 @@ mod tests {
             started_group_in_background(&["a".into(), "b".into(), "c".into()]),
             "Started 3 in the background: a, b and c. I'll answer when all of them finish."
         );
+    }
+
+    /// Every launch line reads back as one; a report or a line that only
+    /// mentions the background does not.
+    #[test]
+    fn a_launch_line_reads_back_as_one() {
+        for labels in [
+            vec![],
+            vec!["counting script".to_string()],
+            vec!["a".into(), "b".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+        ] {
+            assert!(is_launch_line(&started_group_in_background(&labels)));
+        }
+        assert!(!is_launch_line("The synthetic tests passed."));
+        assert!(!is_launch_line(&format!(
+            "{}\nThen I checked the logs.",
+            started_in_background("x")
+        )));
     }
 
     /// A command and a CLI agent one turn left running are one group: the

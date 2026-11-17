@@ -13,6 +13,7 @@
         "calls": [
           {
             "input": "{\"method\":\"POST\",\"url\":\"https://reports.example.invalid/weekly\"}",
+            "kind": "web",
             "name": "http_request",
             "output": "201 Created"
           }
@@ -23,6 +24,13 @@
         "tools": [
           "http_request"
         ]
+      },
+      {
+        "at_ms": 1767225720000,
+        "handed_off": true,
+        "id": "m-121",
+        "role": "assistant",
+        "text": "Started in the background: synthetic test run."
       }
     ],
     "more": true,

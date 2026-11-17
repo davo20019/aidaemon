@@ -32,6 +32,7 @@ pub mod state;
 pub mod text;
 #[cfg(feature = "native")]
 mod tls;
+pub mod tools;
 
 pub use client::{Client, Connection, Context, Effect, Felt, Read};
 pub use keystore::{FileKeyStore, KeyStore, StoredDevice};

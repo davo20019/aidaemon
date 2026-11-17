@@ -6,6 +6,7 @@
         "session_id": "app:synthetic-1",
         "started_at_ms": 1700000000000,
         "status": {
+          "activity": "run",
           "kind": "tool_started",
           "name": "terminal",
           "summary": "cargo test -q"

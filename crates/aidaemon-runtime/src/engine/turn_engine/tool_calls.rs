@@ -2059,7 +2059,7 @@ impl TurnEngine<'_> {
 /// What kind of work a call is, as every card shows it: from the tool's
 /// dispatch facts (a helper run delegates; else its declared `activity`) and
 /// its admitted semantics, never from its name.
-fn step_kind(
+pub(crate) fn step_kind(
     facts: &aidaemon_tools::semantics::ToolDispatchFacts,
     mutates: bool,
 ) -> aidaemon_core::card::ActivityKind {

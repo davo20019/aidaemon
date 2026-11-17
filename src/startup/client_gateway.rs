@@ -86,6 +86,8 @@ pub(crate) struct DaemonClientHost {
     pub files: Option<Arc<aidaemon_client_gateway::files::FileStore>>,
     /// The live providers and models, for a conversation's model picker.
     pub llm: aidaemon_runtime::llm::SharedLlmRuntime,
+    /// The agent, for what kind of work each stored tool call was.
+    pub agent: Arc<dyn crate::runtime_ports::DaemonAgentRuntime>,
 }
 
 impl DaemonClientHost {
@@ -381,7 +383,10 @@ struct PendingCall {
 
 /// The calls a stored assistant message made, in order, each with its
 /// arguments as the owner sees them.
-fn tool_calls(json: &str) -> Vec<PendingCall> {
+fn tool_calls(
+    json: &str,
+    kind_of: impl Fn(&str, &str) -> Option<aidaemon_client_protocol::ToolKind>,
+) -> Vec<PendingCall> {
     let Ok(serde_json::Value::Array(calls)) = serde_json::from_str::<serde_json::Value>(json)
     else {
         return Vec::new();
@@ -407,10 +412,20 @@ fn tool_calls(json: &str) -> Vec<PendingCall> {
                     name: name.to_owned(),
                     input: arguments.map(shown_input).unwrap_or_default(),
                     output: String::new(),
+                    kind: kind_of(name, &arguments.map(raw_arguments).unwrap_or_default()),
                 },
             })
         })
         .collect()
+}
+
+/// A call's arguments as the tool itself reads them: a JSON string as is,
+/// any other value as its JSON.
+fn raw_arguments(arguments: &serde_json::Value) -> String {
+    match arguments {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// A call's arguments as the owner's app shows them: one JSON object,
@@ -869,7 +884,11 @@ impl ClientHost for DaemonClientHost {
                 pending.clear();
             }
             if let Some(json) = &m.tool_calls_json {
-                pending.extend(tool_calls(json));
+                pending.extend(tool_calls(json, |name, arguments| {
+                    self.agent
+                        .tool_activity(name, arguments)
+                        .map(aidaemon_client_gateway::tool_kind)
+                }));
                 continue;
             }
             // A tool's result goes to the call it answers.
@@ -928,7 +947,11 @@ impl ClientHost for DaemonClientHost {
                     Vec::new()
                 };
             let tools = calls.iter().map(|c| c.name.clone()).collect();
+            let handed_off = m.role == "assistant"
+                && delivered.is_none()
+                && aidaemon_runtime::background_run::is_launch_line(&text);
             out.push(HistoryMessage {
+                handed_off,
                 attachments,
                 id: m.id,
                 role: m.role,
@@ -1186,6 +1209,7 @@ pub async fn start(
         },
         hub,
         host: Arc::new(DaemonClientHost {
+            agent: deps.agent.clone(),
             llm: system.llm.clone(),
             state: deps.state.clone(),
             settings: crate::startup::client_settings::SettingsHost::new(
@@ -1424,14 +1448,17 @@ mod tests {
     #[test]
     fn tool_calls_read_both_stored_shapes() {
         let names = |json: &str| -> Vec<String> {
-            tool_calls(json).into_iter().map(|c| c.info.name).collect()
+            tool_calls(json, |_, _| None)
+                .into_iter()
+                .map(|c| c.info.name)
+                .collect()
         };
         let flat =
             r#"[{"id":"1","name":"read_file","arguments":{}},{"id":"2","name":"web_search"}]"#;
         assert_eq!(names(flat), ["read_file", "web_search"]);
         let nested =
             r#"[{"id":"1","function":{"name":"terminal","arguments":"{\"command\":\"ls\"}"}}]"#;
-        let calls = tool_calls(nested);
+        let calls = tool_calls(nested, |_, _| None);
         assert_eq!(calls[0].info.name, "terminal");
         assert_eq!(calls[0].id, "1");
         assert!(
@@ -1439,8 +1466,17 @@ mod tests {
             "{}",
             calls[0].info.input
         );
-        assert!(tool_calls(flat)[0].info.input.is_empty());
-        assert!(tool_calls("not json").is_empty());
+        assert!(tool_calls(flat, |_, _| None)[0].info.input.is_empty());
+        assert!(tool_calls("not json", |_, _| None).is_empty());
+        // The kind comes from the tool, given the arguments it reads.
+        let kinds = tool_calls(nested, |name, arguments| {
+            (name == "terminal" && arguments == r#"{"command":"ls"}"#)
+                .then_some(aidaemon_client_protocol::ToolKind::Run)
+        });
+        assert_eq!(
+            kinds[0].info.kind,
+            Some(aidaemon_client_protocol::ToolKind::Run)
+        );
     }
 
     #[test]

@@ -155,6 +155,7 @@ impl ClientHost for Host {
                 at_ms: n,
                 tools: Vec::new(),
                 calls: Vec::new(),
+                handed_off: false,
             })
             .collect())
     }
