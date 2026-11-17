@@ -56,22 +56,25 @@ pub fn sidebar(store: Store) -> View {
         .child(top_line(store, query, status_shown))
         .child(when(!ui::touch(), move || {
             view().px_2().child(
-                row(move || store.selected().is_none(), move || new_here(store))
-                    .accessibility_label("New conversation")
-                    .child(icon(Glyph::Compose).text_color(colors::MUTED))
-                    .child(
-                        text(move || match store.sidebar_view() {
-                            SidebarView::Project(id) => format!(
-                                "New conversation in {}",
-                                store.project(&id).map(|p| p.name).unwrap_or_default()
-                            ),
-                            _ => "New conversation".to_owned(),
-                        })
-                        .flex_1()
-                        .number_of_lines(1)
-                        .text_size(px(type_scale::BASE)),
-                    )
-                    .child(ui::kbd(key_label("mod+n"))),
+                row(
+                    move || store.page() == Page::Conversation && store.selected().is_none(),
+                    move || new_here(store),
+                )
+                .accessibility_label("New conversation")
+                .child(icon(Glyph::Compose).text_color(colors::MUTED))
+                .child(
+                    text(move || match store.sidebar_view() {
+                        SidebarView::Project(id) => format!(
+                            "New conversation in {}",
+                            store.project(&id).map(|p| p.name).unwrap_or_default()
+                        ),
+                        _ => "New conversation".to_owned(),
+                    })
+                    .flex_1()
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::BASE)),
+                )
+                .child(ui::kbd(key_label("mod+n"))),
             )
         }))
         .child(
@@ -1252,7 +1255,11 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
     let label_id = id.clone();
     let date_id = id.clone();
     row(
-        move || store.selected().as_deref() == Some(a.as_str()),
+        // Lit only while the conversation is what the page shows, not
+        // behind another page (Files, Memory, …).
+        move || {
+            store.page() == Page::Conversation && store.selected().as_deref() == Some(a.as_str())
+        },
         move || store.select(Some(b.clone())),
     )
     // Read as one item: its name, where it lives and whether it is working.

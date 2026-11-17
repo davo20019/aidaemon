@@ -647,6 +647,20 @@ fn a_project_conversation_browses_its_files_read_only() -> Result<(), String> {
     ))]);
     app.wait_for("src/contact.rs")?;
     app.wait_for("Copy path")?;
+    // Full screen: the file fills the window, read again; Exit puts it
+    // back in the details pane, still open.
+    let before = sent("read_project_file");
+    app.press("label:Full screen")?;
+    let id = wait_sent_new("read_project_file", before)?;
+    app.wait_for("Acme site files")?;
+    app.wait_for("label:Exit full screen")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_file","file":{{"project_id":"p-acme","path":"src/contact.rs","size_bytes":26,"version":"sha256:00","text":"fn send() {{}}\nfn main() {{}}\n","status":"modified"}}}}}}"#
+    ))]);
+    app.press("label:Exit full screen")?;
+    wait_sent_new("read_project_file", Some(id))?;
+    app.wait_for("label:Full screen")?;
+    app.wait_for_gone("Acme site files", std::time::Duration::from_secs(5))?;
     app.press("label:src")?;
     app.wait_for("contact.rs")?;
     Ok(())

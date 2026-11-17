@@ -264,6 +264,10 @@ pub struct Store {
     page: Signal<Page>,
     /// The project whose files the Files page shows.
     files_of: Signal<Option<String>>,
+    /// The conversation a file went full screen from, to go back to.
+    files_from: Signal<Option<String>>,
+    /// The file the next files browser opens with.
+    files_start: Signal<Option<(String, String)>>,
     /// The sidebar's search.
     filter: Signal<String>,
     /// Conversations kept at the top of the list (this device's storage).
@@ -363,6 +367,8 @@ impl Store {
             toast: signal(None),
             page: signal(Page::Conversation),
             files_of: signal(None),
+            files_from: signal(None),
+            files_start: signal(None),
             filter: signal(String::new()),
             pins: signal(BTreeSet::new()),
             project_pins: signal(BTreeSet::new()),
@@ -1027,6 +1033,8 @@ impl Store {
 
     /// A project's files as a page of their own, from its sidebar page.
     pub fn open_project_files(&self, project: &str) {
+        self.files_from.set(None);
+        self.files_start.set(None);
         self.files_of.set(Some(project.to_owned()));
         self.open_page(Page::Files);
     }
@@ -1593,21 +1601,77 @@ impl Store {
 
     // ----- The details pane: Files ----------------------------------------------
 
-    /// The project of the conversation on screen, when it has a folder:
-    /// the one whose files the Files tab shows.
-    /// The project whose files show: the Files page's, else the open
-    /// conversation's (the details pane's Files tab).
+    /// The project whose files show: on the Files page its own, else the
+    /// open conversation's (the details pane's Files tab, which shows
+    /// nothing while the page does, so each starts afresh on the way back).
     pub fn files_project(&self) -> Option<ProjectSummary> {
-        let id = if self.page.get() == Page::Files {
-            self.files_of.get()?
-        } else {
-            let selected = self.selected.get()?;
-            self.read(|c| c.session_project(&selected))?
-        };
+        let id = self.files_project_id()?;
         self.reads
             .projects
             .with(|all| all.iter().find(|p| p.id == id).cloned())
             .filter(|p| p.path.as_deref().is_some_and(|f| !f.trim().is_empty()))
+    }
+
+    /// The Files tab's project: the conversation's, while it is on screen.
+    pub fn tab_files_project(&self) -> Option<ProjectSummary> {
+        if self.page.get() != Page::Conversation {
+            return None;
+        }
+        self.files_project()
+    }
+
+    fn files_project_id(&self) -> Option<String> {
+        if self.page.get() == Page::Files {
+            return self.files_of.get();
+        }
+        let selected = self.selected.get()?;
+        self.read(|c| c.session_project(&selected))
+    }
+
+    /// The file a browser opens with (full screen and back): kept until
+    /// the owner moves off it, as a pane may build its browser twice.
+    pub fn files_start(&self, project: &str) -> Option<String> {
+        self.files_start
+            .get_untracked()
+            .filter(|(p, _)| p == project)
+            .map(|(_, path)| path)
+    }
+
+    /// The owner moved off the file a browser opened with.
+    pub fn moved_off_files_start(&self, open: Option<&str>) {
+        let start = self.files_start.get_untracked();
+        if start.as_ref().map(|(_, path)| path.as_str()) != open {
+            self.files_start.set(None);
+        }
+    }
+
+    /// A file open in the details pane, full screen: the Files page with
+    /// it open, remembering the conversation to go back to.
+    pub fn files_full_screen(&self, project: &str, path: &str) {
+        self.files_from.set(self.selected.get_untracked());
+        self.files_start
+            .set(Some((project.to_owned(), path.to_owned())));
+        self.files_of.set(Some(project.to_owned()));
+        self.open_page(Page::Files);
+    }
+
+    /// Whether the Files page came from a conversation's details pane.
+    pub fn files_from_conversation(&self) -> bool {
+        self.files_from.get().is_some()
+    }
+
+    /// Back from full screen: the conversation, its details on Files with
+    /// the file (if one is open) still open.
+    pub fn files_leave_full_screen(&self, path: Option<String>) {
+        let Some(from) = self.files_from.get_untracked() else {
+            return;
+        };
+        self.files_from.set(None);
+        let project = self.files_of.get_untracked();
+        self.files_start.set(project.zip(path));
+        self.select(Some(from));
+        self.inspector_tab.set(FILES_TAB);
+        self.inspector.set(true);
     }
 
     pub fn folder(&self) -> FolderRead {
@@ -2148,7 +2212,8 @@ impl Store {
 
     /// The details pane, which only a coding conversation has.
     pub fn details_open(&self) -> bool {
-        self.inspector.get() && self.coding_on_screen()
+        // A file full screen has the window: no details beside it.
+        self.inspector.get() && self.coding_on_screen() && self.page.get() != Page::Files
     }
 
     pub fn open_inspector(&self) {

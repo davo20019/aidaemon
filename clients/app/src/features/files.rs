@@ -14,12 +14,24 @@ use nsh_core::prelude::*;
 use crate::store::{FileRead, FolderRead, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, type_scale};
 
+/// The details pane's Files tab.
 pub fn files(store: Store) -> View {
-    let project = computed(move || store.files_project());
+    shown(store, false)
+}
+
+/// The browser for the project in view; `in_page` on the Files page.
+fn shown(store: Store, in_page: bool) -> View {
+    let project = computed(move || {
+        if in_page {
+            store.files_project()
+        } else {
+            store.tab_files_project()
+        }
+    });
     view().flex_1().min_h(px(0.0)).child(dynamic(move || {
         let project = project.get();
         Some(untracked(move || match project {
-            Some(project) => browser(store, project),
+            Some(project) => browser(store, project, in_page),
             None => view().child(ui::empty(
                 "No project folder",
                 "Files show for a conversation in a project with a folder.",
@@ -66,17 +78,24 @@ pub fn page(store: Store) -> View {
                         .font_weight(FontWeight::SEMIBOLD),
                 ),
         )
-        .child(files(store))
+        .child(shown(store, true))
 }
 
 /// One project's files: the folder open, or the file open in it.
-fn browser(store: Store, project: ProjectSummary) -> View {
+fn browser(store: Store, project: ProjectSummary, in_page: bool) -> View {
     let id = project.id.clone();
     // The folder open (relative, "" for the project's own), whether
-    // ignored files show, and the file open.
-    let folder = signal(String::new());
+    // ignored files show, and the file open: a file brought from full
+    // screen or into it opens again, in its folder.
+    let start = store.files_start(&id);
+    let in_folder = start
+        .as_deref()
+        .and_then(|p| p.rsplit_once('/'))
+        .map(|(f, _)| f.to_owned())
+        .unwrap_or_default();
+    let folder = signal(in_folder);
     let ignored = signal(false);
-    let open: Signal<Option<String>> = signal(None);
+    let open: Signal<Option<String>> = signal(start);
     {
         let id = id.clone();
         effect(move || {
@@ -87,9 +106,15 @@ fn browser(store: Store, project: ProjectSummary) -> View {
     }
     {
         let id = id.clone();
-        effect(move || match open.get() {
-            Some(path) => untracked(|| store.read_project_file(&id, &path)),
-            None => untracked(|| store.close_project_file()),
+        effect(move || {
+            let shown = open.get();
+            untracked(|| {
+                store.moved_off_files_start(shown.as_deref());
+                match shown {
+                    Some(path) => store.read_project_file(&id, &path),
+                    None => store.close_project_file(),
+                }
+            });
         });
     }
     let name = project.name.clone();
@@ -98,7 +123,7 @@ fn browser(store: Store, project: ProjectSummary) -> View {
         let name = name.clone();
         let id = id.clone();
         Some(untracked(move || match shown {
-            Some(path) => file_view(store, path, open),
+            Some(path) => file_view(store, id, path, open, in_page),
             None => folder_view(store, id, name, folder, ignored, open),
         }))
     }))
@@ -328,7 +353,13 @@ fn entry_row(
 }
 
 /// The open file, filling the pane: Back, its path, Copy, then its text.
-fn file_view(store: Store, path: String, open: Signal<Option<String>>) -> View {
+fn file_view(
+    store: Store,
+    id: String,
+    path: String,
+    open: Signal<Option<String>>,
+    in_page: bool,
+) -> View {
     let back = path
         .rsplit_once('/')
         .map(|(folder, _)| folder.rsplit('/').next().unwrap_or(folder).to_owned())
@@ -364,12 +395,33 @@ fn file_view(store: Store, path: String, open: Signal<Option<String>>) -> View {
                 .child(ui::btn("Copy path", Variant::Ghost, Size::Sm, {
                     let path = path.clone();
                     move || set_clipboard(path.clone())
-                })),
+                }))
+                .child(full_screen(store, id, path.clone(), in_page)),
         )
         .child(dynamic(move || {
             let read = store.open_file();
             Some(untracked(move || file_body(read)))
         }))
+}
+
+/// Full screen from the details pane; back to it from the Files page when
+/// the file came from there (a page opened from the sidebar has nowhere
+/// to go back to but the sidebar).
+fn full_screen(store: Store, id: String, path: String, in_page: bool) -> View {
+    if !in_page {
+        return ui::icon_btn(Glyph::Expand, "Full screen", Size::Sm, move || {
+            store.files_full_screen(&id, &path)
+        });
+    }
+    view().child(when(
+        move || store.files_from_conversation(),
+        move || {
+            let path = path.clone();
+            ui::icon_btn(Glyph::Shrink, "Exit full screen", Size::Sm, move || {
+                store.files_leave_full_screen(Some(path.clone()))
+            })
+        },
+    ))
 }
 
 fn file_body(read: FileRead) -> View {
