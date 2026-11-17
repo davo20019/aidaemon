@@ -415,7 +415,10 @@ impl LocalScreen {
             .iter()
             .find(|m| m.is_primary().unwrap_or(false))
             .or_else(|| monitors.first())
-            .ok_or("This computer has no display to share")?;
+            .ok_or(
+                "No display can be seen from here. On macOS, allow Screen Recording for the app \
+                 that runs this (System Settings, Privacy & Security), then try again.",
+            )?;
         Ok(Self {
             display: Display {
                 id: monitor.id().map_err(|e| e.to_string())?,
