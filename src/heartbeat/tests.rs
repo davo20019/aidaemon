@@ -791,6 +791,7 @@ async fn test_reminder_fast_path_one_shot_delivers_and_completes() {
 
     let mut goal = Goal::new_deferred_finite("Remind me to call my daughter", "test_session");
     goal.status = "active".to_string();
+    goal.context = Some(crate::reminders::context_for_message("Call your daughter"));
     state.create_goal(&goal).await.unwrap();
     let schedule = due_schedule(&goal.id, "46 13 11 6 *", true);
     state.create_goal_schedule(&schedule).await.unwrap();
@@ -803,7 +804,7 @@ async fn test_reminder_fast_path_one_shot_delivers_and_completes() {
     // The reminder itself is the only message — no "Running scheduled
     // task", no progress updates.
     let msgs = channel.messages_for("test_session").await;
-    assert_eq!(msgs, vec!["⏰ Reminder: call your daughter".to_string()]);
+    assert_eq!(msgs, vec!["⏰ Reminder: Call your daughter".to_string()]);
 
     // Goal completed with notified_at set (suppresses the generic
     // "Goal completed" notification) and the one-shot schedule removed.
@@ -856,6 +857,7 @@ async fn test_reminder_fast_path_recurring_keeps_goal_active() {
 
     let mut goal = Goal::new_continuous("Remind me to take my meds", "test_session", None, None);
     goal.status = "active".to_string();
+    goal.context = Some(crate::reminders::context_for_message("Take your meds"));
     state.create_goal(&goal).await.unwrap();
     let schedule = due_schedule(&goal.id, "0 9 * * *", false);
     state.create_goal_schedule(&schedule).await.unwrap();
@@ -866,7 +868,7 @@ async fn test_reminder_fast_path_recurring_keeps_goal_active() {
         .unwrap();
 
     let msgs = channel.messages_for("test_session").await;
-    assert_eq!(msgs, vec!["⏰ Reminder: take your meds".to_string()]);
+    assert_eq!(msgs, vec!["⏰ Reminder: Take your meds".to_string()]);
 
     // Recurring reminders stay active with their schedule intact.
     let g = state.get_goal(&goal.id).await.unwrap().unwrap();
@@ -908,6 +910,38 @@ async fn test_non_reminder_schedule_creates_pending_task() {
     // No agent wired in this test, so the task stays pending for the
     // orphan dispatcher.
     assert_eq!(tasks[0].status, "pending");
+}
+
+/// A goal whose description merely reads like a reminder, with no typed
+/// reminder message (older goals), runs as a normal goal: the work it names
+/// is done by the agent, not replaced by a canned message.
+#[tokio::test]
+async fn a_reminder_worded_goal_without_a_typed_message_runs_as_work() {
+    let (state, _hub, channel, coordinator, _db_file) = reminder_test_setup().await;
+
+    let mut goal = Goal::new_deferred_finite(
+        "Remind me to check the synthetic server and restart it",
+        "test_session",
+    );
+    goal.status = "active".to_string();
+    state.create_goal(&goal).await.unwrap();
+    let schedule = due_schedule(&goal.id, "46 13 11 6 *", true);
+    state.create_goal_schedule(&schedule).await.unwrap();
+
+    coordinator
+        .fire_due_schedule(schedule.clone())
+        .await
+        .unwrap();
+
+    let msgs = channel.messages_for("test_session").await;
+    assert!(
+        msgs.iter().all(|msg| !msg.starts_with("⏰ Reminder")),
+        "no canned reminder text: {msgs:?}"
+    );
+    let tasks = state.get_tasks_for_goal(&goal.id).await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].status, "pending");
+    assert_ne!(tasks[0].agent_id.as_deref(), Some("reminder-fast-path"));
 }
 
 #[tokio::test]

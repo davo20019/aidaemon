@@ -665,9 +665,7 @@ impl GoalCycle {
         // and the task-lead pipeline (which adds a minute-plus of dispatch and
         // LLM latency). Falls through to the normal pipeline if the message
         // can't be delivered.
-        if let Some(fire_text) =
-            crate::reminders::fire_text_for_goal(goal.context.as_deref(), &goal.description)
-        {
+        if let Some(fire_text) = crate::reminders::fire_text_for_goal(goal.context.as_deref()) {
             let delivered = if let Some(hub_arc) = self.hub.clone() {
                 hub_arc
                     .send_text(&goal.session_id, &fire_text)
