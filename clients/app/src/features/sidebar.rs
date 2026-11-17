@@ -836,18 +836,38 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
     let (browse, browsing, has_folder) = (id.clone(), id.clone(), id.clone());
     let (pin, unpin, pinned, unpinned, gone) =
         (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
-    let tools = view().flex_row().items_center().child(ui::press_menu(
-        Glyph::More,
-        "Project options",
-        vec![
-            ui::MenuAction::new("Pin to the top", move || store.toggle_project_pin(&pin))
-                .shown_when(move || !store.is_project_pinned(&unpinned)),
-            ui::MenuAction::new("Unpin", move || store.toggle_project_pin(&unpin))
-                .shown_when(move || store.is_project_pinned(&pinned)),
-            ui::MenuAction::new("Edit name or folder", move || store.edit_project(&edit)),
-            ui::MenuAction::new("Delete project…", move || confirm_delete(store, &gone)),
-        ],
-    ));
+    // Its archived, an icon beside the menu (only when it has some).
+    let archived = dynamic(move || {
+        let any = store.session_ids().iter().any(|s| {
+            store.is_archived(s) && store.session_project(s).as_deref() == Some(put_away.as_str())
+        });
+        any.then(|| {
+            untracked(|| {
+                ui::icon_btn(
+                    Glyph::Archive,
+                    "Archived conversations in this project",
+                    ui::Size::Md,
+                    move || store.show_archived(true),
+                )
+            })
+        })
+    });
+    let tools = view()
+        .flex_row()
+        .items_center()
+        .child(archived)
+        .child(ui::press_menu(
+            Glyph::More,
+            "Project options",
+            vec![
+                ui::MenuAction::new("Pin to the top", move || store.toggle_project_pin(&pin))
+                    .shown_when(move || !store.is_project_pinned(&unpinned)),
+                ui::MenuAction::new("Unpin", move || store.toggle_project_pin(&unpin))
+                    .shown_when(move || store.is_project_pinned(&pinned)),
+                ui::MenuAction::new("Edit name or folder", move || store.edit_project(&edit)),
+                ui::MenuAction::new("Delete project…", move || confirm_delete(store, &gone)),
+            ],
+        ));
     view()
         .gap(px(1.0))
         .child(page_head(
@@ -900,18 +920,15 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
         // pencil (a window's top row already names the project): it opens
         // a new Code conversation in this project's folder.
         .child(when(ui::touch(), move || {
-            let (start, named) = (empty.clone(), empty.clone());
+            let start = empty.clone();
             row(|| false, move || store.new_in_project(Some(start.clone())))
                 .accessibility_label("New conversation in this project")
                 .child(icon(Glyph::Compose).text_color(colors::MUTED))
                 .child(
-                    text(move || {
-                        let name = store.project(&named).map(|p| p.name).unwrap_or_default();
-                        format!("New conversation in {name}")
-                    })
-                    .flex_1()
-                    .number_of_lines(1)
-                    .text_size(px(type_scale::BASE)),
+                    text("New conversation")
+                        .flex_1()
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::BASE)),
                 )
         }))
         .child(when(
@@ -925,37 +942,6 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
             },
         ))
         .child(listed(store, mine))
-        // Its archived conversations, a quiet line after the list (only
-        // when it has some): looked for past the active ones.
-        .child(dynamic(move || {
-            let count = store
-                .session_ids()
-                .iter()
-                .filter(|s| {
-                    store.is_archived(s)
-                        && store.session_project(s).as_deref() == Some(put_away.as_str())
-                })
-                .count();
-            (count > 0).then(|| {
-                untracked(move || {
-                    row(|| false, move || store.show_archived(true))
-                        .accessibility_label("Archived conversations in this project")
-                        .child(icon(Glyph::Archive).text_color(colors::FAINT))
-                        .child(
-                            text("Archived")
-                                .flex_1()
-                                .number_of_lines(1)
-                                .text_size(px(type_scale::SM))
-                                .text_color(colors::MUTED),
-                        )
-                        .child(
-                            text(count.to_string())
-                                .text_size(px(type_scale::SM))
-                                .text_color(colors::FAINT),
-                        )
-                })
-            })
-        }))
 }
 
 /// Conversations newest first, each with when it last moved; no day
