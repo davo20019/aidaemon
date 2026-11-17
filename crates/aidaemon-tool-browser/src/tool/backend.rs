@@ -765,6 +765,10 @@ impl ChromiumoxideBackend {
 
         builder = builder
             .window_size(self.config.screenshot_width, self.config.screenshot_height)
+            // The page fills the window. chromiumoxide otherwise emulates an
+            // 800x600 page inside it, and the live view (which shows the whole
+            // window) draws an empty strip beside the page.
+            .viewport(None)
             .arg("no-first-run")
             .arg("no-default-browser-check")
             .arg("disable-gpu")

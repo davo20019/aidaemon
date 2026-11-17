@@ -269,7 +269,9 @@ async fn live_surface_smoke_real_chrome() {
         r#"<!DOCTYPE html><html><body style="margin:0">
 <input id="pw" type="password" style="position:absolute;left:0;top:0;width:100vw;height:50vh;font-size:40px">
 <div id="out">waiting</div>
+<div id="size"></div>
 <script>
+document.getElementById('size').textContent = 'width ' + innerWidth;
 document.getElementById('pw').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') document.getElementById('out').textContent =
     'submitted ' + document.getElementById('pw').value.length;
@@ -448,6 +450,14 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
     assert!(
         text.contains("submitted 12"),
         "the typed text and Enter reached the page: {text}"
+    );
+    // The page fills the window the live view shows, with no empty strip.
+    assert!(
+        text.contains(&format!(
+            "width {}",
+            BrowserSettings::default().screenshot_width
+        )),
+        "the page is as wide as the window: {text}"
     );
     assert!(
         !text.contains("synthetic-pw"),
