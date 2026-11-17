@@ -224,6 +224,10 @@ pub struct Frame {
     pub h: u32,
     /// Stands alone (every JPEG or PNG frame does).
     pub key: bool,
+    /// Which page the picture shows: rises each time the screen shows a new
+    /// document ([`FrameSink::new_page`]), so what was focused or pointed at
+    /// on the old one is gone.
+    pub page: u64,
     pub data: Arc<[u8]>,
 }
 
@@ -268,6 +272,7 @@ impl Default for StreamParams {
 pub struct FrameSink {
     tx: Arc<watch::Sender<Option<Arc<Frame>>>>,
     seq: Arc<AtomicU64>,
+    page: Arc<AtomicU64>,
 }
 
 impl FrameSink {
@@ -277,6 +282,7 @@ impl FrameSink {
             Self {
                 tx: Arc::new(tx),
                 seq: Arc::new(AtomicU64::new(0)),
+                page: Arc::new(AtomicU64::new(0)),
             },
             rx,
         )
@@ -298,10 +304,17 @@ impl FrameSink {
             w,
             h,
             key: true,
+            page: self.page.load(Ordering::Relaxed),
             data: data.into(),
         };
         self.tx.send_replace(Some(Arc::new(frame)));
         self.is_watched()
+    }
+
+    /// The screen moved to a new document (a link, a form sent, a
+    /// redirect): frames from now on carry the next page number.
+    pub fn new_page(&self) {
+        self.page.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether anyone still watches.
@@ -393,6 +406,19 @@ pub struct PointedAt {
     /// can outline it whatever the surface itself draws.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rect: Option<[f64; 4]>,
+    /// What typing does there; `None` when it takes none (a button).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typing: Option<Typing>,
+}
+
+/// What typing does in an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Typing {
+    /// Text that can be shown.
+    Text,
+    /// A secret (a password): never shown.
+    Secret,
 }
 
 /// A pointer button.

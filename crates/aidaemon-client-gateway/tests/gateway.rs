@@ -2335,8 +2335,18 @@ async fn a_surface_streams_the_newest_frame_and_takes_input_only_under_control()
     assert_eq!(mock.inputs().len(), 1);
     // After typing, the view is told where the typing went (never what).
     let focus = loop {
-        if let (MediaHeader::Focus { what, label, rect }, _) = media_next(&mut media).await {
+        if let (
+            MediaHeader::Focus {
+                what,
+                label,
+                rect,
+                typing,
+            },
+            _,
+        ) = media_next(&mut media).await
+        {
             assert!(rect.is_some(), "the field's place comes with it");
+            assert_eq!(typing, Some(media::FocusTyping::Text), "a field takes text");
             break (what, label);
         }
     };

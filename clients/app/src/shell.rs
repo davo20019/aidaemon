@@ -522,18 +522,30 @@ fn live_screen(store: Store) -> crate::ui::LiveScreen {
             if let Some(why) = store.live_error() {
                 return why;
             }
-            if store.live_controlling() {
-                "You're in control: the agent waits until you give it back".to_owned()
-            } else if store.live_surface().is_some_and(|s| s.handoff_pending) {
-                "The agent is waiting for you: take control, then press Done".to_owned()
-            } else {
-                "Watching: the agent keeps working".to_owned()
+            let waiting = store.live_surface().is_some_and(|s| s.handoff_pending);
+            match (store.live_controlling(), waiting) {
+                (true, true) => "You're in control. When you're finished, tap Done to hand back",
+                (true, false) => "You're in control: the agent waits until you give it back",
+                (false, true) => {
+                    "The agent is waiting for you: take control, or tap Done if you finished at \
+                     the computer"
+                }
+                (false, false) => "Watching: the agent keeps working",
             }
+            .to_owned()
         }),
         frame: store.live_frame(),
         controlling: Rc::new(move || store.live_controlling()),
         focus: Rc::new(move || store.live_focus()),
         focus_rect: Rc::new(move || store.live_focus_rect()),
+        typing: Rc::new(move || {
+            use aidaemon_client_protocol::media::FocusTyping;
+            match store.live_typing() {
+                None => crate::ui::LiveTyping::None,
+                Some(FocusTyping::Text) => crate::ui::LiveTyping::Text,
+                Some(FocusTyping::Secret | FocusTyping::Unknown) => crate::ui::LiveTyping::Secret,
+            }
+        }),
         typed: Rc::new(move || store.live_typed()),
         can_control: Rc::new(move || store.live_surface().is_some_and(|s| s.interactive)),
         waiting: Rc::new(move || store.live_surface().is_some_and(|s| s.handoff_pending)),
@@ -552,7 +564,7 @@ fn live_screen(store: Store) -> crate::ui::LiveScreen {
         give_back: Rc::new(move || store.live_give_back()),
         done: Rc::new(move || store.live_finish(true)),
         not_now: Rc::new(move || store.live_finish(false)),
-        close: Rc::new(move || store.close_live()),
+        close: Rc::new(move || store.hide_live()),
     }
 }
 

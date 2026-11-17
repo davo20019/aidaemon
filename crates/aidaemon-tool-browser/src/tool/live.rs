@@ -48,6 +48,11 @@ const POINT_SCRIPT: &str = r#"(() => {
     : tag === 'img' ? 'a picture'
     : 'the ' + tag + ' element';
   const typed = tag === 'input' || tag === 'textarea' || tag === 'select';
+  // What typing does here: only a box that takes text gets the keyboard.
+  const noText = ['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'range', 'color', 'hidden'];
+  const typing = tag === 'input' && type === 'password' ? 'secret'
+    : (tag === 'input' && !noText.includes(type)) || tag === 'textarea' || el.isContentEditable ? 'text'
+    : null;
   const words = (el.getAttribute('aria-label') || (el.labels && el.labels[0] && el.labels[0].innerText) || el.getAttribute('placeholder')
     || el.getAttribute('alt') || (typed ? '' : el.innerText) || el.getAttribute('title') || '')
     .trim().replace(/\s+/g, ' ').slice(0, 80);
@@ -70,7 +75,7 @@ const POINT_SCRIPT: &str = r#"(() => {
   const box = el.getBoundingClientRect();
   const rect = [box.left / window.innerWidth, box.top / window.innerHeight,
     box.width / window.innerWidth, box.height / window.innerHeight];
-  return { what, text: words || null, selector, rect };
+  return { what, text: words || null, selector, rect, typing };
 })()"#;
 
 /// How long one page read for the surface list may take.
@@ -234,6 +239,11 @@ impl BrowserSurface {
                 .filter(|v| !v.is_empty() && v.len() <= 300)
                 .map(str::to_string),
             agent_ref,
+            typing: match found.get("typing").and_then(|v| v.as_str()) {
+                Some("secret") => Some(aidaemon_surfaces::Typing::Secret),
+                Some("text") => Some(aidaemon_surfaces::Typing::Text),
+                _ => None,
+            },
             rect: found.get("rect").and_then(|r| {
                 let parts: Vec<f64> = r.as_array()?.iter().filter_map(|v| v.as_f64()).collect();
                 let [x, y, w, h] = parts.as_slice() else {
@@ -449,6 +459,9 @@ impl SurfaceBackend for BrowserSurface {
                 produced += 1;
                 last_frame = std::time::Instant::now();
                 lock(&viewports).insert(target.clone(), (frame.css_w, frame.css_h));
+                if frame.new_page {
+                    sink.new_page();
+                }
                 let w = frame.css_w.round().max(1.0) as u32;
                 let h = frame.css_h.round().max(1.0) as u32;
                 if !sink.push(Codec::Jpeg, w, h, frame.data) {

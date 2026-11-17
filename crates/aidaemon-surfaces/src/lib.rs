@@ -35,7 +35,7 @@ pub use types::{
     Codec, Controller, ExclusiveGuard, Frame, FrameSink, HandoffPrep, InputEvent, KeyAction,
     MAX_TEXT_CHARS, MAX_TITLE_CHARS, Modifier, PointedAt, PointerAction, PointerButton, Size,
     StreamHandle, StreamParams, SurfaceCaps, SurfaceDescriptor, SurfaceError, SurfaceId,
-    SurfaceInfo, SurfaceKind, SurfaceObservation, clean_title, now_ms,
+    SurfaceInfo, SurfaceKind, SurfaceObservation, Typing, clean_title, now_ms,
 };
 
 use async_trait::async_trait;

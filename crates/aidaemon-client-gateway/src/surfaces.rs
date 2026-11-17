@@ -691,6 +691,9 @@ async fn pump_media(
     // One frame in flight: the next goes once the client acks this one.
     let mut in_flight: Option<u64> = None;
     let mut waiting = true;
+    // The page the last frame showed: on a new one, what had the keyboard
+    // is gone, so the device stops outlining it.
+    let mut shown_page: Option<u64> = None;
     // How the picture went, said in the log when the view ends.
     let mut tally = Tally {
         surface: surface_id.to_string(),
@@ -705,6 +708,19 @@ async fn pump_media(
         if waiting && in_flight.is_none() {
             let frame = live.frames.borrow_and_update().clone();
             if let Some(frame) = frame {
+                if shown_page.is_some_and(|page| page != frame.page) {
+                    send_header(
+                        socket,
+                        &MediaHeader::Focus {
+                            what: None,
+                            rect: None,
+                            label: None,
+                            typing: None,
+                        },
+                    )
+                    .await?;
+                }
+                shown_page = Some(frame.page);
                 let header = MediaHeader::Frame {
                     v: media::MEDIA_VERSION,
                     seq: frame.seq,
@@ -806,6 +822,10 @@ async fn pump_media(
                             send_header(socket, &MediaHeader::Focus {
                                 what: focused.as_ref().map(|f| f.what.clone()),
                                 rect: focused.as_ref().and_then(|f| f.rect),
+                                typing: focused.as_ref().and_then(|f| f.typing).map(|t| match t {
+                                    aidaemon_surfaces::Typing::Secret => media::FocusTyping::Secret,
+                                    aidaemon_surfaces::Typing::Text => media::FocusTyping::Text,
+                                }),
                                 label: focused.and_then(|f| f.text),
                             }).await?;
                         }

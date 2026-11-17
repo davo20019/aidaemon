@@ -317,6 +317,8 @@ pub struct Store {
     live_focus: Signal<Option<Option<String>>>,
     /// The focused field's place on the live view, as frame fractions.
     live_focus_rect: Signal<Option<[f32; 4]>>,
+    /// What typing does where the focus is (`None`: it takes none).
+    live_typing: Signal<Option<aidaemon_client_protocol::media::FocusTyping>>,
     /// Characters sent with the last Type, until the next tap.
     live_typed: Signal<Option<usize>>,
     /// The live view's frame socket, and which opening it belongs to.
@@ -379,6 +381,7 @@ impl Store {
             live_frame: signal(None),
             live_focus: signal(None),
             live_focus_rect: signal(None),
+            live_typing: signal(None),
             live_typed: signal(None),
             media: stored(None),
             media_epoch: stored(0),
@@ -515,6 +518,7 @@ impl Store {
         self.live_frame.set(None);
         self.live_focus.set(None);
         self.live_focus_rect.set(None);
+        self.live_typing.set(None);
         self.live_typed.set(None);
     }
 
@@ -584,6 +588,11 @@ impl Store {
         self.live_focus.get()
     }
 
+    /// What typing does where the focus is (tracked).
+    pub fn live_typing(&self) -> Option<aidaemon_client_protocol::media::FocusTyping> {
+        self.live_typing.get()
+    }
+
     pub fn live_frame(&self) -> Signal<Option<crate::ui::LiveFrame>> {
         self.live_frame
     }
@@ -634,6 +643,25 @@ impl Store {
             self.act(|c| c.finish_handoff(&id, done));
         }
         self.close_live();
+        self.say(if done {
+            "Handed back: the agent is carrying on"
+        } else {
+            "Told the agent not now: it goes on without this step"
+        });
+    }
+
+    /// Hide the live view (its X). In control of a screen the agent did
+    /// not ask for, control goes back first; a handoff keeps waiting, and
+    /// says where to pick it up again.
+    pub fn hide_live(&self) {
+        let waiting = self.live_surface().is_some_and(|s| s.handoff_pending);
+        if !waiting && self.live_controlling() {
+            self.live_give_back();
+        }
+        self.close_live();
+        if waiting {
+            self.say("Still waiting for you: open the live view again from the card");
+        }
     }
 
     fn media_send(&self, text: String) {
@@ -733,11 +761,14 @@ impl Store {
                     self.close_live();
                 }
             }
-            MediaEvent::Focus(words, rect) => {
-                self.live_focus_rect.set(
-                    rect.filter(|_| words.is_some())
-                        .map(|[x, y, w, h]| [x as f32, y as f32, w as f32, h as f32]),
-                );
+            MediaEvent::Focus {
+                words,
+                rect,
+                typing,
+            } => {
+                self.live_focus_rect
+                    .set(rect.map(|[x, y, w, h]| [x as f32, y as f32, w as f32, h as f32]));
+                self.live_typing.set(typing);
                 self.live_focus.set(Some(words));
             }
             MediaEvent::Ready | MediaEvent::Controller(_) => {}

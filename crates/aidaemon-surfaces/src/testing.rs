@@ -196,6 +196,7 @@ impl SurfaceBackend for MockSurface {
             selector: Some("#signin".into()),
             agent_ref: surface.agent_ref.clone(),
             rect: None,
+            typing: None,
         })
     }
 
@@ -206,6 +207,7 @@ impl SurfaceBackend for MockSurface {
             selector: Some("#username".into()),
             agent_ref: None,
             rect: Some([0.04, 0.4, 0.5, 0.05]),
+            typing: Some(crate::types::Typing::Text),
         }))
     }
 

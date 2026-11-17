@@ -490,10 +490,12 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
                         MediaEvent::Controller(controller)
                     }
                     Ok(MediaHeader::Closed { reason }) => MediaEvent::Closed(reason),
-                    Ok(MediaHeader::Focus { what, label, rect }) => MediaEvent::Focus(
-                        aidaemon_client_core::surfaces::focus_words(what, label),
+                    Ok(MediaHeader::Focus {
+                        what,
+                        label,
                         rect,
-                    ),
+                        typing,
+                    }) => aidaemon_client_core::surfaces::focus_event(what, label, rect, typing),
                     _ => continue,
                 },
                 _ => MediaEvent::Closed(text),

@@ -380,6 +380,7 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
         .expect("focus")
         .expect("the small field has the keyboard");
     assert_eq!(small.selector.as_deref(), Some("#user"), "{small:?}");
+    assert_eq!(small.typing, Some(aidaemon_surfaces::Typing::Text));
 
     for action in [PointerAction::Down, PointerAction::Up] {
         registry
@@ -401,6 +402,7 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
         .expect("focus")
         .expect("the tapped field has the keyboard");
     assert_eq!(focused.what, "a password field");
+    assert_eq!(focused.typing, Some(aidaemon_surfaces::Typing::Secret));
     let [_, y, w, h] = focused.rect.expect("the field's place on the frame");
     assert!(w > 0.5 && h > 0.2 && y < 0.1, "{:?}", focused.rect);
     registry
@@ -554,6 +556,8 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
         after > before,
         "the picture stopped after the page changed (frame {before} then {after})"
     );
+    let page = live.frames.borrow().as_ref().map_or(0, |f| f.page);
+    assert!(page > 0, "frames of the new page say so");
     registry.close_live(&live.live_id);
     let _ = tool
         .call_with(

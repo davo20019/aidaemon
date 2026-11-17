@@ -56,11 +56,28 @@ pub enum MediaHeader {
         /// Where it is, as fractions of the frame: `[x, y, w, h]`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rect: Option<[f64; 4]>,
+        /// What typing does there: absent when it takes none (a button, a
+        /// link), so a device opens its keyboard only for a field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typing: Option<FocusTyping>,
     },
     /// The session ended; the server closes the socket next.
     Closed { reason: String },
     #[serde(other)]
     #[schemars(skip)]
+    Unknown,
+}
+
+/// What typing does in the focused element.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusTyping {
+    /// It takes text that can be shown.
+    Text,
+    /// It takes a secret (a password): shown masked.
+    Secret,
+    /// A kind this device does not know: treated as a secret.
+    #[serde(other)]
     Unknown,
 }
 

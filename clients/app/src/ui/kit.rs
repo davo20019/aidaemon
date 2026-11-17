@@ -1853,6 +1853,17 @@ pub type KeySender = dyn Fn(bool, &str, &str, Vec<&'static str>);
 
 /// What the live view shows and does: the agent's browser tab, watched or
 /// controlled. Every closure reads or acts through the store.
+/// What typing does where the live view's focus is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveTyping {
+    /// It takes none (a button, a link, nothing focused).
+    None,
+    /// It takes text.
+    Text,
+    /// It takes a secret: what is typed shows masked.
+    Secret,
+}
+
 pub struct LiveScreen {
     pub open: std::rc::Rc<dyn Fn() -> bool>,
     pub title: std::rc::Rc<dyn Fn() -> String>,
@@ -1865,6 +1876,8 @@ pub struct LiveScreen {
     pub focus: std::rc::Rc<dyn Fn() -> Option<Option<String>>>,
     /// The focused field's place, as frame fractions `[x, y, w, h]`.
     pub focus_rect: std::rc::Rc<dyn Fn() -> Option<[f32; 4]>>,
+    /// What typing does where the focus is.
+    pub typing: std::rc::Rc<dyn Fn() -> LiveTyping>,
     /// Characters the last Type sent.
     pub typed: std::rc::Rc<dyn Fn() -> Option<usize>>,
     pub can_control: std::rc::Rc<dyn Fn() -> bool>,
@@ -2258,26 +2271,24 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     {
         let focus = screen.focus.clone();
         let focus_rect = screen.focus_rect.clone();
-        effect(move || match focus() {
-            Some(Some(_)) => {
-                if let Some(rect) = focus_rect() {
-                    keys_at.set(Some(rect));
+        let typing = screen.typing.clone();
+        effect(move || {
+            let known = focus().is_some();
+            match (typing(), focus_rect()) {
+                (LiveTyping::Text | LiveTyping::Secret, Some(rect)) => keys_at.set(Some(rect)),
+                // A button, a link or nothing: the keyboard has nothing to
+                // type into.
+                (LiveTyping::None, _) if known && keys_open.get_untracked() => {
+                    keys.blur();
+                    keys_at.set(None);
                 }
+                _ => {}
             }
-            Some(None) if keys_open.get_untracked() => {
-                keys.blur();
-                keys_at.set(None);
-            }
-            _ => {}
         });
     }
     let password = {
-        let focus = screen.focus.clone();
-        move || {
-            focus()
-                .flatten()
-                .is_some_and(|words| words.contains("password"))
-        }
+        let typing = screen.typing.clone();
+        move || typing() == LiveTyping::Secret
     };
     let unseen = {
         let key = screen.key.clone();
@@ -2379,9 +2390,12 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                     .into_element()
             }))
         }));
+    let in_control = controlling.clone();
     let picture = view()
         .relative()
         .overflow_hidden()
+        // In control, the picture is framed, as a remote session's screen.
+        .style_when(in_control, |s| s.border_2().border_color(colors::TAP_RING))
         .w(move || px(fitted().0))
         .h(move || px(fitted().1))
         .child(content)
@@ -2445,12 +2459,9 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                         move || c() && mouse
                     },
                     || {
-                        text(
-                            "This is the agent's browser, live. Your mouse and keyboard now drive \
-                             it: click, drag, scroll with the wheel, type and use shortcuts.",
-                        )
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::ON_LIGHTBOX)
+                        text("Your mouse and keyboard drive the page.")
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::ON_LIGHTBOX)
                     },
                 ))
                 .child(when(
@@ -2459,18 +2470,20 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                         move || c() && !mouse
                     },
                     || {
-                        text(
-                        "This is the agent's browser, live. Tap to click, drag to scroll, pinch \
-                         to zoom. Tap a box and your keyboard types into it.",
-                    )
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::ON_LIGHTBOX)
+                        text("Tap to click · drag to scroll · pinch to zoom")
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::ON_LIGHTBOX)
                     },
                 )),
         )
-        .child(viewer_btn(Glyph::Close, "Close", move || close()));
+        // Hides the view: a handoff keeps waiting (the card opens it again).
+        .child(viewer_btn(Glyph::Close, "Hide the live view", move || {
+            close()
+        }));
 
-    // Control and the handoff's answers.
+    // Control and the handoff's answers: one bar at the bottom, always
+    // there (never under the keyboard's room), whose main button says how
+    // to go back to the agent.
     let take = screen.take.clone();
     let give = screen.give_back.clone();
     let done = screen.done.clone();
@@ -2509,15 +2522,16 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 let (c, can) = (controlling.clone(), can_control.clone());
                 move || !c() && can()
             },
-            move || {
-                let take = take.clone();
-                viewer_text_btn("Take control", true, move || take())
+            {
+                let waiting = waiting.clone();
+                move || {
+                    let take = take.clone();
+                    // While the agent waits, Done is the main answer.
+                    viewer_text_btn("Take control", !waiting(), move || take())
+                }
             },
         ))
-        .child(when(controlling.clone(), move || {
-            let give = give.clone();
-            viewer_text_btn("Give back", false, move || give())
-        }))
+        // The agent asked: Done hands back and lets it carry on.
         .child(when(
             {
                 let w = waiting.clone();
@@ -2528,8 +2542,23 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 view()
                     .flex_row()
                     .gap_2()
-                    .child(viewer_text_btn("Done", true, move || done()))
+                    .child(viewer_text_btn(
+                        "Done, back to the agent",
+                        true,
+                        move || done(),
+                    ))
                     .child(viewer_text_btn("Not now", false, move || not_now()))
+            },
+        ))
+        // The owner took over on their own: Give back ends it.
+        .child(when(
+            {
+                let (c, w) = (controlling.clone(), waiting.clone());
+                move || c() && !w()
+            },
+            move || {
+                let give = give.clone();
+                viewer_text_btn("Give back to the agent", true, move || give())
             },
         ));
 
@@ -2540,14 +2569,18 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     };
     let focus = screen.focus.clone();
     let sent = screen.typed.clone();
-    let focus_line = text(move || match (focus(), sent(), keys_open.get()) {
-        (Some(Some(words)), _, false) => {
-            format!("{words} has the keyboard: tap Keyboard to type")
+    let typing_kind = screen.typing.clone();
+    let focus_line = text(move || {
+        let takes_text = typing_kind() != LiveTyping::None;
+        match (focus(), takes_text, sent(), keys_open.get()) {
+            (Some(Some(words)), true, Some(_), true) => format!("Typing into {words}"),
+            (Some(Some(words)), true, None, true) => format!("✓ Your keyboard types into {words}"),
+            (Some(Some(words)), true, _, false) => {
+                format!("{words} is selected: tap Keyboard to type")
+            }
+            (Some(Some(words)), false, ..) => format!("{words} is selected"),
+            _ => "Tap a box on the page and your keyboard opens".to_owned(),
         }
-        (Some(Some(words)), Some(_), true) => format!("Typing into {words}"),
-        (Some(Some(words)), None, true) => format!("✓ Your keyboard types into {words}"),
-        (Some(None), ..) => "Nothing to type into here: tap a box on the page".to_owned(),
-        (None, ..) => "Tap a box on the page and your keyboard opens".to_owned(),
     })
     .text_size(px(type_scale::SM))
     .font_weight(FontWeight::MEDIUM)
@@ -2560,8 +2593,8 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
             .gap_2()
             .child(when(
                 {
-                    let focus = screen.focus.clone();
-                    move || !keys_open.get() && matches!(focus(), Some(Some(_)))
+                    let typing = screen.typing.clone();
+                    move || !keys_open.get() && typing() != LiveTyping::None
                 },
                 // A press is a gesture, so the keyboard may open again.
                 move || viewer_text_btn("Keyboard", true, move || keys.focus()),
@@ -2604,8 +2637,6 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                             })
                             .child(picture),
                     )
-                    // The keyboard takes room: the answers wait below it.
-                    .child(when(move || !keys_open.get(), move || answers.clone()))
                     .child(when(
                         {
                             let c = controlling.clone();
@@ -2613,6 +2644,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                         },
                         move || typing.clone(),
                     ))
+                    .child(answers)
                     .child(view().h(px(8.0))),
             ),
     )

@@ -11,7 +11,9 @@
 //! On the desktops [`run`] (feature `native`) drives the socket; the browser
 //! drives the page's own WebSocket with the same messages.
 
-use aidaemon_client_protocol::media::{self, MediaClientMessage, MediaHeader, SurfaceInput};
+use aidaemon_client_protocol::media::{
+    self, FocusTyping, MediaClientMessage, MediaHeader, SurfaceInput,
+};
 use aidaemon_client_protocol::{SurfaceController, SurfaceTransport};
 use base64::Engine as _;
 
@@ -43,10 +45,14 @@ pub enum MediaEvent {
     },
     /// Who controls the surface now.
     Controller(SurfaceController),
-    /// Where the owner's typing goes now, in words ("Username, a text
-    /// field"; `None`: nothing takes typing) and its place on the frame
-    /// (`[x, y, w, h]` fractions).
-    Focus(Option<String>, Option<[f64; 4]>),
+    /// What has the focus now: in words ("Username, a text field"; `None`:
+    /// nothing), its place on the frame (`[x, y, w, h]` fractions), and
+    /// what typing does there (`None`: it takes none, as a button).
+    Focus {
+        words: Option<String>,
+        rect: Option<[f64; 4]>,
+        typing: Option<FocusTyping>,
+    },
     /// The view ended, and why.
     Closed(String),
 }
@@ -141,14 +147,32 @@ pub fn read(bytes: &[u8]) -> Option<MediaEvent> {
         },
         MediaHeader::Controller { controller } => MediaEvent::Controller(controller),
         MediaHeader::Closed { reason } => MediaEvent::Closed(reason),
-        MediaHeader::Focus { what, label, rect } => {
-            MediaEvent::Focus(focus_words(what, label), rect)
-        }
+        MediaHeader::Focus {
+            what,
+            label,
+            rect,
+            typing,
+        } => focus_event(what, label, rect, typing),
         MediaHeader::Unknown => return None,
     })
 }
 
 /// A focus report in words: "Username, a text field", "a button".
+/// A focus header as an event.
+pub fn focus_event(
+    what: Option<String>,
+    label: Option<String>,
+    rect: Option<[f64; 4]>,
+    typing: Option<FocusTyping>,
+) -> MediaEvent {
+    let words = focus_words(what, label);
+    MediaEvent::Focus {
+        rect: rect.filter(|_| words.is_some()),
+        typing: typing.filter(|_| words.is_some()),
+        words,
+    }
+}
+
 pub fn focus_words(what: Option<String>, label: Option<String>) -> Option<String> {
     match (label, what) {
         (Some(label), Some(what)) => Some(format!("{label}, {what}")),

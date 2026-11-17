@@ -3542,6 +3542,26 @@
         }
       ]
     },
+    "FocusTyping": {
+      "description": "What typing does in the focused element.",
+      "oneOf": [
+        {
+          "const": "text",
+          "description": "It takes text that can be shown.",
+          "type": "string"
+        },
+        {
+          "const": "secret",
+          "description": "It takes a secret (a password): shown masked.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "A kind this device does not know: treated as a secret.",
+          "type": "string"
+        }
+      ]
+    },
     "FoundModel": {
       "description": "A model connection already on this machine.",
       "properties": {
@@ -4167,6 +4187,17 @@
             "type": {
               "const": "focus",
               "type": "string"
+            },
+            "typing": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FocusTyping"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "What typing does there: absent when it takes none (a button, a\nlink), so a device opens its keyboard only for a field."
             },
             "what": {
               "type": [

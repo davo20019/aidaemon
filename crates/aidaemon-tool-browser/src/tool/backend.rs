@@ -210,6 +210,8 @@ pub struct ScreencastFrame {
     pub css_h: f64,
     /// Ack it with this.
     pub session: i64,
+    /// The first frame of a new document in the tab.
+    pub new_page: bool,
 }
 
 /// A page's live frames, until the page goes away or the cast stops.
@@ -1374,12 +1376,16 @@ impl PageHandle for ChromiumoxidePage {
             .await
             .map_err(|e| format!("Failed to follow the page: {e}"))?;
         let page = self.page.clone();
+        // The next frame after a restart is the new document's.
+        let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = moved.clone();
         let quality = i64::from(quality.clamp(10, 100));
         let (max_w, max_h) = (i64::from(max_w), i64::from(max_h));
         let restarts = navigations
             .filter(|event| futures::future::ready(event.frame.parent_id.is_none()))
             .then(move |_| {
                 let page = page.clone();
+                mark.store(true, std::sync::atomic::Ordering::Relaxed);
                 async move {
                     let again = StartScreencastParams::builder()
                         .format(StartScreencastFormat::Jpeg)
@@ -1398,16 +1404,20 @@ impl PageHandle for ChromiumoxidePage {
                     None
                 }
             });
-        let frames = events.filter_map(|event| async move {
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(AsRef::<str>::as_ref(&event.data))
-                .ok()?;
-            Some(ScreencastFrame {
-                data,
-                css_w: event.metadata.device_width,
-                css_h: event.metadata.device_height,
-                session: event.session_id,
-            })
+        let frames = events.filter_map(move |event| {
+            let moved = moved.clone();
+            async move {
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(AsRef::<str>::as_ref(&event.data))
+                    .ok()?;
+                Some(ScreencastFrame {
+                    data,
+                    css_w: event.metadata.device_width,
+                    css_h: event.metadata.device_height,
+                    session: event.session_id,
+                    new_page: moved.swap(false, std::sync::atomic::Ordering::Relaxed),
+                })
+            }
         });
         let frames =
             futures::stream::select(frames.map(Some), restarts).filter_map(futures::future::ready);
@@ -2220,6 +2230,7 @@ impl PageHandle for MockPage {
             css_w: 1280.0,
             css_h: 720.0,
             session: 1,
+            new_page: false,
         };
         Ok(Box::pin(
             futures::stream::iter(vec![frame]).chain(futures::stream::pending()),

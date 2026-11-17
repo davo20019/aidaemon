@@ -1279,7 +1279,9 @@ fn a_handoff_card_opens_the_live_view_and_watching_needs_no_card() -> Result<(),
     wait_sent_new("open_surface", before)?;
     app.wait_for("Connecting to the screen…")?;
     app.wait_for("Done")?;
-    app.press("label:Close")?;
+    // The X hides the view; the agent keeps waiting.
+    app.press("label:Hide the live view")?;
+    app.wait_for("Still waiting for you: open the live view again from the card")?;
     // Watching needs no card: the header offers the browser while it is
     // open in the conversation.
     let before = sent("open_surface");
