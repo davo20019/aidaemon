@@ -666,6 +666,7 @@ fn drag_handle(store: Store, reorder: Reorder, id: String) -> View {
         // On the web a claim alone leaves the touch to the browser, which
         // scrolls the sidebar and cancels the drag; a pan listener marks
         // the handle `touch-action: none` (nsh's `updateTouchAction`).
+        // Drop it once the fork carries longbridge/nsh#2220.
         .on_pan_start(|_: &PanEvent| {})
         .on_responder_grant(move |_: &ResponderEvent| {
             reorder.drag.set(Some((grant.clone(), 0.0)));
