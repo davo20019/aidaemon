@@ -107,9 +107,15 @@ async fn a_stream_stays_watched_until_its_view_closes() {
         .unwrap();
     let live_id = live.live_id.clone();
     drop(live);
-    assert!(mock.push_frame(&id, b"one"), "still watched before the socket subscribes");
+    assert!(
+        mock.push_frame(&id, b"one"),
+        "still watched before the socket subscribes"
+    );
     let mut later = registry.subscribe_live(&live_id).unwrap();
-    assert_eq!(&*later.frames.borrow_and_update().clone().unwrap().data, b"one");
+    assert_eq!(
+        &*later.frames.borrow_and_update().clone().unwrap().data,
+        b"one"
+    );
     registry.close_live(&live_id);
     assert_eq!(mock.streams_stopped(), 1);
 }

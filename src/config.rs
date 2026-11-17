@@ -1610,7 +1610,7 @@ fn default_surface_views() -> usize {
     8
 }
 fn default_surface_fps() -> u32 {
-    10
+    20
 }
 fn default_surface_width() -> u32 {
     1280

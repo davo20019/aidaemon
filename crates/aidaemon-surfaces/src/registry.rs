@@ -45,7 +45,10 @@ impl Default for SurfacesConfig {
             allow_control: true,
             control_anytime: true,
             max_live_sessions: 8,
-            stream_cap: StreamParams::default(),
+            stream_cap: StreamParams {
+                max_fps: 20,
+                ..StreamParams::default()
+            },
             disconnect_grace: Duration::from_secs(30),
             idle_release: Duration::from_secs(15 * 60),
         }

@@ -402,7 +402,12 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
     assert_eq!(pointed.selector.as_deref(), Some("#pw"));
     assert!(pointed.text.is_none(), "a field's value is never described");
     // The picture keeps up: a change after typing arrives as a new frame.
-    let before = live.frames.borrow_and_update().as_ref().map(|f| f.seq).unwrap_or(0);
+    let before = live
+        .frames
+        .borrow_and_update()
+        .as_ref()
+        .map(|f| f.seq)
+        .unwrap_or(0);
     registry
         .input(&live.live_id, &InputEvent::Text { text: "x".into() })
         .await
@@ -410,14 +415,22 @@ document.getElementById('pw').addEventListener('keydown', (e) => {
     let after = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             live.frames.changed().await.expect("stream open");
-            let seq = live.frames.borrow_and_update().as_ref().map(|f| f.seq).unwrap_or(0);
+            let seq = live
+                .frames
+                .borrow_and_update()
+                .as_ref()
+                .map(|f| f.seq)
+                .unwrap_or(0);
             if seq > before {
                 return seq;
             }
         }
     })
     .await;
-    assert!(after.is_ok(), "no new frame after typing: the picture stalled at {before}");
+    assert!(
+        after.is_ok(),
+        "no new frame after typing: the picture stalled at {before}"
+    );
     let observed = registry.observe(&surface.id).await.expect("observe");
     assert!(observed.password_field_present);
     registry.close_live(&live.live_id);

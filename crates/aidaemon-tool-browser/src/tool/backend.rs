@@ -255,6 +255,9 @@ pub struct KeyInput {
     pub text: Option<String>,
     pub modifiers: i64,
     pub windows_virtual_key_code: Option<i64>,
+    /// Editing commands the key runs (`selectAll`, `copy`, `paste`...):
+    /// Chrome takes a shortcut sent as a key event only with these.
+    pub commands: Vec<String>,
 }
 
 impl std::fmt::Debug for KeyInput {
@@ -1443,6 +1446,9 @@ impl PageHandle for ChromiumoxidePage {
             params = params
                 .windows_virtual_key_code(code)
                 .native_virtual_key_code(code);
+        }
+        if !event.commands.is_empty() {
+            params = params.commands(event.commands.clone());
         }
         let params = params.build().map_err(|e| format!("Bad key event: {e}"))?;
         self.page

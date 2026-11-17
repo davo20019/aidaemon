@@ -1786,6 +1786,9 @@ pub struct LiveFrame {
     pub h: u32,
 }
 
+/// A key going down (`true`) or up: `code`, `key` and the modifiers.
+pub type KeySender = dyn Fn(bool, &str, &str, Vec<&'static str>);
+
 /// What the live view shows and does: the agent's browser tab, watched or
 /// controlled. Every closure reads or acts through the store.
 pub struct LiveScreen {
@@ -1807,6 +1810,13 @@ pub struct LiveScreen {
     pub waiting: std::rc::Rc<dyn Fn() -> bool>,
     /// A press, move or release at a fraction of the picture.
     pub pointer: std::rc::Rc<dyn Fn(&'static str, f32, f32)>,
+    /// The same with a button (`left`, `right`, `middle`): mouse mode.
+    pub button_pointer: std::rc::Rc<dyn Fn(&'static str, f32, f32, &'static str)>,
+    /// A key going down (`true`) or up, by `code`, `key` and modifiers.
+    pub key_event: std::rc::Rc<KeySender>,
+    /// A mouse and keyboard drive the view, as in a remote desktop window;
+    /// otherwise touch (a tap clicks, a drag scrolls, a field types).
+    pub mouse: bool,
     /// Point the agent at a fraction of the picture (watching, not
     /// controlling): it gets what is there as the owner's message.
     pub point: std::rc::Rc<dyn Fn(f32, f32)>,
@@ -1941,6 +1951,114 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 }
             })
     };
+    // Mouse and keyboard, as in a remote desktop window: the pointer moves
+    // and hovers, presses and drags are the mouse's own, the wheel scrolls,
+    // a right click is a right click.
+    let mouse = screen.mouse;
+    let mouse_pad = {
+        let frac = move |x: f32, y: f32| {
+            let (w, h) = fitted();
+            ((x / w).clamp(0.0, 1.0), (y / h).clamp(0.0, 1.0))
+        };
+        let (down, drag, up, hover, menu) = (
+            screen.button_pointer.clone(),
+            screen.button_pointer.clone(),
+            screen.button_pointer.clone(),
+            screen.button_pointer.clone(),
+            screen.button_pointer.clone(),
+        );
+        let wheel = screen.wheel.clone();
+        let (c_claim, c_hover, c_menu, c_wheel) = (
+            controlling.clone(),
+            controlling.clone(),
+            controlling.clone(),
+            controlling.clone(),
+        );
+        view()
+            .absolute()
+            .inset_0()
+            .claim_touches(TouchClaim::on_start().ask(move |request: &ClaimRequest| {
+                if c_claim() {
+                    request.claim();
+                }
+            }))
+            .keep_touches(true)
+            .on_responder_grant(move |e: &ResponderEvent| {
+                let at = frac(e.location.x.0, e.location.y.0);
+                start.set(at);
+                down("down", at.0, at.1, "left");
+            })
+            .on_responder_move(move |e: &ResponderEvent| {
+                let (w, h) = fitted();
+                if w <= 0.0 || h <= 0.0 {
+                    return;
+                }
+                let (x0, y0) = start.get_untracked();
+                drag(
+                    "move",
+                    (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
+                    (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
+                    "left",
+                );
+            })
+            .on_responder_release(move |e: &ResponderEvent| {
+                let (w, h) = fitted();
+                let (x0, y0) = start.get_untracked();
+                let at = if w > 0.0 && h > 0.0 {
+                    (
+                        (x0 + e.gesture.delta.x.0 / w).clamp(0.0, 1.0),
+                        (y0 + e.gesture.delta.y.0 / h).clamp(0.0, 1.0),
+                    )
+                } else {
+                    (x0, y0)
+                };
+                up("up", at.0, at.1, "left");
+            })
+            .on_mouse_move(move |e: &MouseEvent| {
+                // A press drags through the responder; this is the hover.
+                if !c_hover() || e.pressed_button.is_some() {
+                    return;
+                }
+                let at = frac(e.position.x.0, e.position.y.0);
+                hover("move", at.0, at.1, "left");
+            })
+            .on_context_menu(move |e: &ContextMenuEvent| {
+                if !c_menu() {
+                    return;
+                }
+                let at = frac(e.position.x.0, e.position.y.0);
+                menu("down", at.0, at.1, "right");
+                menu("up", at.0, at.1, "right");
+            })
+            .on_wheel(move |e: &WheelEvent| {
+                if !c_wheel() {
+                    return;
+                }
+                let at = frac(e.position.x.0, e.position.y.0);
+                let (dx, dy) = match e.delta {
+                    WheelDelta::Points(p) => (p.x.0, p.y.0),
+                    WheelDelta::Lines(l) => (l.x * 40.0, l.y * 40.0),
+                };
+                wheel(at.0, at.1, dx, dy);
+            })
+    };
+    // The desktop app's keys go straight to the page while in control
+    // (the web app captures them in the page script instead).
+    #[cfg(not(target_arch = "wasm32"))]
+    if mouse {
+        for (keystroke, code, key, mods) in desktop_keys() {
+            let send = screen.key_event.clone();
+            let controlling = controlling.clone();
+            on_key(&keystroke, move |_| {
+                if controlling() {
+                    send(true, &code, &key, mods.clone());
+                    send(false, &code, &key, mods.clone());
+                }
+            });
+        }
+    }
+
+    let point_pad = pad.clone();
     let picture = view()
         .relative()
         .w(move || px(fitted().0))
@@ -2013,9 +2131,23 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         .child(when(
             {
                 let c = controlling.clone();
-                move || c() || pointing.get()
+                move || !mouse && (c() || pointing.get())
             },
             move || pad.clone(),
+        ))
+        .child(when(
+            {
+                let c = controlling.clone();
+                move || mouse && c()
+            },
+            move || mouse_pad.clone(),
+        ))
+        .child(when(
+            {
+                let c = controlling.clone();
+                move || mouse && !c() && pointing.get()
+            },
+            move || point_pad.clone(),
         ));
 
     let status_line = {
@@ -2049,14 +2181,34 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                 .gap_1()
                 .child(title)
                 .child(status_line)
-                .child(when(controlling.clone(), || {
-                    text(
+                .child(when(
+                    {
+                        let c = controlling.clone();
+                        move || c() && mouse
+                    },
+                    || {
+                        text(
+                            "This is the agent's browser, live. Your mouse and keyboard now drive \
+                             it: click, drag, scroll with the wheel, type and use shortcuts.",
+                        )
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::ON_LIGHTBOX)
+                    },
+                ))
+                .child(when(
+                    {
+                        let c = controlling.clone();
+                        move || c() && !mouse
+                    },
+                    || {
+                        text(
                         "This is the agent's browser, live. Tap to click, drag to scroll. Tap a \
                          box, then type below: it goes straight in.",
                     )
                     .text_size(px(type_scale::XS))
                     .text_color(colors::ON_LIGHTBOX)
-                })),
+                    },
+                )),
         )
         .child(viewer_btn(Glyph::Close, "Close", move || close()));
 
@@ -2250,8 +2402,148 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                             .child(picture),
                     )
                     .child(answers)
-                    .child(when(controlling, move || typing.clone()))
+                    .child(when(
+                        {
+                            let c = controlling.clone();
+                            move || c() && !mouse
+                        },
+                        move || typing.clone(),
+                    ))
                     .child(view().h(px(8.0))),
             ),
     )
+}
+
+/// The keys the desktop app sends straight to a page in mouse mode, each
+/// as `(keystroke, code, key, modifiers)`: letters, digits and punctuation
+/// with and without Shift (the US layout's), the named keys, and the
+/// editing shortcuts. Shortcuts the platform keeps (Command+Q) stay its own.
+#[cfg(not(target_arch = "wasm32"))]
+fn desktop_keys() -> Vec<(String, String, String, Vec<&'static str>)> {
+    let mut keys = Vec::new();
+    for c in 'a'..='z' {
+        let code = format!("Key{}", c.to_ascii_uppercase());
+        keys.push((c.to_string(), code.clone(), c.to_string(), vec![]));
+        keys.push((
+            format!("shift+{c}"),
+            code,
+            c.to_ascii_uppercase().to_string(),
+            vec!["shift"],
+        ));
+    }
+    let shifted_digits = [')', '!', '@', '#', '$', '%', '^', '&', '*', '('];
+    for d in 0..10u8 {
+        let c = char::from(b'0' + d);
+        let code = format!("Digit{c}");
+        keys.push((c.to_string(), code.clone(), c.to_string(), vec![]));
+        keys.push((
+            format!("shift+{c}"),
+            code,
+            shifted_digits[usize::from(d)].to_string(),
+            vec!["shift"],
+        ));
+    }
+    for (plain, shifted, code) in [
+        ('`', '~', "Backquote"),
+        ('-', '_', "Minus"),
+        ('=', '+', "Equal"),
+        ('[', '{', "BracketLeft"),
+        (']', '}', "BracketRight"),
+        ('\\', '|', "Backslash"),
+        (';', ':', "Semicolon"),
+        ('\'', '"', "Quote"),
+        (',', '<', "Comma"),
+        ('.', '>', "Period"),
+        ('/', '?', "Slash"),
+    ] {
+        keys.push((plain.to_string(), code.into(), plain.to_string(), vec![]));
+        keys.push((
+            format!("shift+{plain}"),
+            code.into(),
+            shifted.to_string(),
+            vec!["shift"],
+        ));
+    }
+    keys.push(("space".into(), "Space".into(), " ".into(), vec![]));
+    keys.push((
+        "shift+space".into(),
+        "Space".into(),
+        " ".into(),
+        vec!["shift"],
+    ));
+    for (name, code, key) in [
+        ("enter", "Enter", "Enter"),
+        ("escape", "Escape", "Escape"),
+        ("tab", "Tab", "Tab"),
+        ("backspace", "Backspace", "Backspace"),
+        ("delete", "Delete", "Delete"),
+        ("up", "ArrowUp", "ArrowUp"),
+        ("down", "ArrowDown", "ArrowDown"),
+        ("left", "ArrowLeft", "ArrowLeft"),
+        ("right", "ArrowRight", "ArrowRight"),
+        ("home", "Home", "Home"),
+        ("end", "End", "End"),
+        ("pageup", "PageUp", "PageUp"),
+        ("pagedown", "PageDown", "PageDown"),
+    ] {
+        keys.push((name.into(), code.into(), key.into(), vec![]));
+        if !matches!(name, "enter" | "escape") {
+            keys.push((
+                format!("shift+{name}"),
+                code.into(),
+                key.into(),
+                vec!["shift"],
+            ));
+        }
+    }
+    // Command on Apple platforms, Control elsewhere: what `mod` means.
+    let modifier = if cfg!(target_os = "macos") {
+        "meta"
+    } else {
+        "ctrl"
+    };
+    for c in ['a', 'c', 'v', 'x', 'z', 'y'] {
+        let code = format!("Key{}", c.to_ascii_uppercase());
+        keys.push((format!("mod+{c}"), code, c.to_string(), vec![modifier]));
+    }
+    keys.push((
+        "shift+mod+z".into(),
+        "KeyZ".into(),
+        "z".into(),
+        vec![modifier, "shift"],
+    ));
+    for (name, code) in [
+        ("left", "ArrowLeft"),
+        ("right", "ArrowRight"),
+        ("backspace", "Backspace"),
+    ] {
+        keys.push((format!("alt+{name}"), code.into(), code.into(), vec!["alt"]));
+        keys.push((
+            format!("mod+{name}"),
+            code.into(),
+            code.into(),
+            vec![modifier],
+        ));
+    }
+    keys
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod desktop_key_tests {
+    use nsh_core::keymap::Keystroke;
+    use nsh_core::platform::Os;
+
+    /// Every key the live view binds parses, and no platform keeps it.
+    #[test]
+    fn live_view_keys_parse_and_are_free_on_every_desktop() {
+        let keys = super::desktop_keys();
+        assert!(keys.len() > 100);
+        for (keystroke, ..) in &keys {
+            for (os, apple) in [(Os::MacOs, true), (Os::Windows, false), (Os::Linux, false)] {
+                let parsed = Keystroke::parse_with(keystroke, apple)
+                    .unwrap_or_else(|e| panic!("{keystroke:?}: {e:?}"));
+                assert_eq!(parsed.reserved(os), None, "{keystroke:?} on {os:?}");
+            }
+        }
+    }
 }

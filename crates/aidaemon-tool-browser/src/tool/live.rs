@@ -134,6 +134,9 @@ pub struct BrowserSurface {
     viewports: Arc<Mutex<HashMap<String, (f64, f64)>>>,
     /// A button held down on a tab (for drags).
     pressed: Mutex<HashMap<String, MouseButtonKind>>,
+    /// The last press per tab: when and where, and its click count, to tell
+    /// a double or triple click from separate ones.
+    last_press: Mutex<HashMap<String, (std::time::Instant, f64, f64, i64)>>,
     size: Size,
 }
 
@@ -151,6 +154,7 @@ impl BrowserSurface {
             ids: Mutex::new(HashMap::new()),
             viewports: Arc::new(Mutex::new(HashMap::new())),
             pressed: Mutex::new(HashMap::new()),
+            last_press: Mutex::new(HashMap::new()),
             size,
         }
     }
@@ -305,6 +309,40 @@ fn virtual_key(code: &str) -> Option<i64> {
         .map(|c| i64::from(u32::from(c.to_ascii_uppercase())))
 }
 
+/// The editing command a shortcut runs, for a page that only acts on a
+/// shortcut sent with its command: Command (or Control) with A, C, V, X, Z.
+fn shortcut_command(key: &str, mods: &[Modifier]) -> Option<&'static str> {
+    let command_key = mods
+        .iter()
+        .any(|m| matches!(m, Modifier::Meta | Modifier::Ctrl));
+    if !command_key {
+        return None;
+    }
+    let shift = mods.contains(&Modifier::Shift);
+    Some(match (key.to_ascii_lowercase().as_str(), shift) {
+        ("a", false) => "selectAll",
+        ("c", false) => "copy",
+        ("v", false) => "paste",
+        ("x", false) => "cut",
+        ("z", false) => "undo",
+        ("z", true) | ("y", false) => "redo",
+        _ => return None,
+    })
+}
+
+/// How many clicks a press makes: 2 or 3 when it follows the last one
+/// quickly and close by.
+fn click_count(last: Option<(std::time::Instant, f64, f64, i64)>, x: f64, y: f64) -> i64 {
+    match last {
+        Some((at, lx, ly, count))
+            if at.elapsed() < Duration::from_millis(500) && (lx - x).hypot(ly - y) < 6.0 =>
+        {
+            (count % 3) + 1
+        }
+        _ => 1,
+    }
+}
+
 /// What a key-down types, if anything.
 fn typed_text(key: &str, code: &str, mods: &[Modifier]) -> Option<String> {
     if mods
@@ -431,13 +469,21 @@ impl SurfaceBackend for BrowserSurface {
                     PointerButton::Right => MouseButtonKind::Right,
                     PointerButton::Middle => MouseButtonKind::Middle,
                 };
+                let (cx, cy) = (x * w, y * h);
+                let mut clicks = 1;
                 let (kind, button) = match action {
                     PointerAction::Down => {
                         lock(&self.pressed).insert(target.clone(), button);
+                        let mut last = lock(&self.last_press);
+                        clicks = click_count(last.get(&target).copied(), cx, cy);
+                        last.insert(target.clone(), (std::time::Instant::now(), cx, cy, clicks));
                         (MouseKind::Pressed, button)
                     }
                     PointerAction::Up | PointerAction::Cancel => {
                         let held = lock(&self.pressed).remove(&target).unwrap_or(button);
+                        clicks = lock(&self.last_press)
+                            .get(&target)
+                            .map_or(1, |(_, _, _, count)| *count);
                         (MouseKind::Released, held)
                     }
                     PointerAction::Move => (
@@ -450,10 +496,10 @@ impl SurfaceBackend for BrowserSurface {
                 };
                 page.dispatch_mouse(&MouseInput {
                     kind,
-                    x: x * w,
-                    y: y * h,
+                    x: cx,
+                    y: cy,
                     button,
-                    click_count: 1,
+                    click_count: clicks,
                     delta_x: 0.0,
                     delta_y: 0.0,
                     modifiers: 0,
@@ -495,6 +541,13 @@ impl SurfaceBackend for BrowserSurface {
                     },
                     modifiers: modifier_bits(mods),
                     windows_virtual_key_code: virtual_key(code),
+                    commands: if down {
+                        shortcut_command(key, mods)
+                            .map(|c| vec![c.to_string()])
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                 })
                 .await
                 .map_err(backend_error)
@@ -786,6 +839,22 @@ mod tests {
                 keeps_sign_in: Some(false)
             }
         );
+    }
+
+    #[test]
+    fn shortcuts_carry_their_editing_command_and_quick_presses_count_up() {
+        assert_eq!(shortcut_command("a", &[Modifier::Meta]), Some("selectAll"));
+        assert_eq!(shortcut_command("v", &[Modifier::Ctrl]), Some("paste"));
+        assert_eq!(
+            shortcut_command("z", &[Modifier::Meta, Modifier::Shift]),
+            Some("redo")
+        );
+        assert_eq!(shortcut_command("a", &[]), None);
+        let now = std::time::Instant::now();
+        assert_eq!(click_count(None, 1.0, 1.0), 1);
+        assert_eq!(click_count(Some((now, 1.0, 1.0, 1)), 2.0, 2.0), 2);
+        assert_eq!(click_count(Some((now, 1.0, 1.0, 2)), 1.0, 1.0), 3);
+        assert_eq!(click_count(Some((now, 1.0, 1.0, 1)), 90.0, 1.0), 1);
     }
 
     #[test]

@@ -144,6 +144,34 @@ function b64(bytes) {
  * each binary frame into a data: URI for the app and acks it, and passes
  * the other headers on as JSON. Nothing typed is kept here.
  */
+/**
+ * A live view driven by a mouse and keyboard: the page's keys go to the
+ * agent's browser while `event(down, code, key, mods)` says it took them
+ * (the owner is in control). Keys the browser keeps never arrive here.
+ */
+export class KeyCapture {
+  constructor(event) {
+    this.handler = (e) => {
+      if (e.isComposing) return;
+      const mods = [];
+      if (e.shiftKey) mods.push("shift");
+      if (e.ctrlKey) mods.push("ctrl");
+      if (e.altKey) mods.push("alt");
+      if (e.metaKey) mods.push("meta");
+      if (event(e.type === "keydown", e.code || "", e.key || "", mods.join(","))) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", this.handler, true);
+    window.addEventListener("keyup", this.handler, true);
+  }
+  stop() {
+    window.removeEventListener("keydown", this.handler, true);
+    window.removeEventListener("keyup", this.handler, true);
+  }
+}
+
 export class MediaSocket {
   constructor(url, ticket, event) {
     this.ws = new WebSocket(url);

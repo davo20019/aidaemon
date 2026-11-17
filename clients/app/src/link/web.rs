@@ -66,6 +66,12 @@ extern "C" {
     #[wasm_bindgen(method, js_name = close)]
     fn close_media(this: &MediaSocket);
 
+    type KeyCapture;
+    #[wasm_bindgen(constructor)]
+    fn new(event: &Closure<dyn FnMut(bool, String, String, String) -> bool>) -> KeyCapture;
+    #[wasm_bindgen(method, js_name = stop)]
+    fn stop_keys(this: &KeyCapture);
+
     type Socket;
     #[wasm_bindgen(constructor)]
     fn new(url: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
@@ -422,7 +428,32 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
         let _ = events_tx.unbounded_send((kind, text));
     });
     let socket = std::rc::Rc::new(MediaSocket::new(&url, &ticket, &on_event));
-    let keep = std::rc::Rc::new(std::cell::RefCell::new(Some(on_event)));
+    // With a mouse and keyboard, the page's keys go to the agent's browser
+    // while the owner is in control.
+    let keys = (!crate::ui::touch()).then(|| {
+        let on_key = Closure::<dyn FnMut(bool, String, String, String) -> bool>::new(
+            move |down: bool, code: String, key: String, mods: String| {
+                if !store.live_controlling() || code.is_empty() {
+                    return false;
+                }
+                let mods: Vec<&str> = mods
+                    .split(',')
+                    .filter_map(|m| match m {
+                        "shift" => Some("shift"),
+                        "ctrl" => Some("ctrl"),
+                        "alt" => Some("alt"),
+                        "meta" => Some("meta"),
+                        _ => None,
+                    })
+                    .collect();
+                store.live_key_event(down, &code, &key, &mods);
+                true
+            },
+        );
+        let capture = KeyCapture::new(&on_key);
+        (capture, on_key)
+    });
+    let keep = std::rc::Rc::new(std::cell::RefCell::new(Some((on_event, keys))));
     store.media_attached(
         epoch,
         crate::store::MediaLink {
@@ -432,7 +463,9 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
             }),
             close: Box::new(move || {
                 socket.close_media();
-                keep.borrow_mut().take();
+                if let Some((_, Some((capture, _)))) = keep.borrow_mut().take() {
+                    capture.stop_keys();
+                }
             }),
         },
     );

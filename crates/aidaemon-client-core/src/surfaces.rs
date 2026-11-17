@@ -94,6 +94,27 @@ pub fn pointer(action: &str, x: f32, y: f32) -> SurfaceInput {
     }
 }
 
+/// A press, move or release of `button` (`left`, `right`, `middle`).
+pub fn button_pointer(action: &str, x: f32, y: f32, button: &str) -> SurfaceInput {
+    SurfaceInput::Pointer {
+        action: action.to_string(),
+        x: f64::from(x.clamp(0.0, 1.0)),
+        y: f64::from(y.clamp(0.0, 1.0)),
+        button: Some(button.to_string()),
+    }
+}
+
+/// One key going down or up, by `KeyboardEvent.code` and `.key`, with
+/// modifiers (`shift`, `ctrl`, `alt`, `meta`).
+pub fn key_event(down: bool, code: &str, key: &str, mods: &[&str]) -> SurfaceInput {
+    SurfaceInput::Key {
+        action: if down { "down" } else { "up" }.to_string(),
+        code: code.to_string(),
+        key: key.to_string(),
+        mods: mods.iter().map(|m| (*m).to_string()).collect(),
+    }
+}
+
 /// A key pressed (down then up) by its `KeyboardEvent.code` and `.key`.
 pub fn key_press(code: &str, key: &str) -> [SurfaceInput; 2] {
     let event = |action: &str| SurfaceInput::Key {

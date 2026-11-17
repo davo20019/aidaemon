@@ -545,7 +545,9 @@ impl Store {
 
     /// Open the live view of `surface_id`; with `control`, take control.
     pub fn watch_surface(&self, surface_id: &str, control: bool) {
-        let effects = self.act(|c| c.open_surface(surface_id, control));
+        // A mouse wants a quicker picture than a finger.
+        let fps = if crate::ui::touch() { 10 } else { 20 };
+        let effects = self.act(|c| c.open_surface_at(surface_id, control, Some(fps)));
         for effect in effects {
             self.effect(effect);
         }
@@ -655,6 +657,26 @@ impl Store {
             self.live_typed.set(None);
         }
         self.live_input(aidaemon_client_core::surfaces::pointer(action, x, y));
+    }
+
+    /// A mouse press, move or release with its button.
+    pub fn live_mouse(&self, action: &'static str, x: f32, y: f32, button: &'static str) {
+        if action == "down" {
+            self.live_typed.set(None);
+        }
+        self.live_input(aidaemon_client_core::surfaces::button_pointer(
+            action, x, y, button,
+        ));
+    }
+
+    /// A key straight from this device's keyboard (mouse mode).
+    pub fn live_key_event(&self, down: bool, code: &str, key: &str, mods: &[&str]) {
+        if !self.live_controlling() {
+            return;
+        }
+        self.live_input(aidaemon_client_core::surfaces::key_event(
+            down, code, key, mods,
+        ));
     }
 
     pub fn live_wheel(&self, x: f32, y: f32, dx: f32, dy: f32) {

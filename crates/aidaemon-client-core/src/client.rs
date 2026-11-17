@@ -2310,6 +2310,17 @@ impl Client {
     /// Open a live view of `surface_id` (closing any other first); with
     /// `control`, take control too.
     pub fn open_surface(&mut self, surface_id: &str, control: bool) -> Vec<Effect> {
+        self.open_surface_at(surface_id, control, None)
+    }
+
+    /// [`Self::open_surface`] asking for up to `max_fps` frames a second
+    /// (a mouse wants a quicker picture than a finger; the daemon caps it).
+    pub fn open_surface_at(
+        &mut self,
+        surface_id: &str,
+        control: bool,
+        max_fps: Option<u32>,
+    ) -> Vec<Effect> {
         let mut effects = self.close_surface();
         self.control_error = None;
         self.live = Some(LiveView {
@@ -2328,6 +2339,7 @@ impl Client {
             },
             accept: StreamAccept {
                 codecs: vec!["jpeg".into()],
+                max_fps,
                 ..StreamAccept::default()
             },
         }));
@@ -2756,6 +2768,24 @@ mod tests {
         assert_eq!(effects, vec![Effect::CloseLive]);
         assert!(client.live.is_none());
         assert!(client.surfaces_of("app:s1").is_empty());
+    }
+
+    #[test]
+    fn a_view_asks_for_the_frame_rate_its_device_wants() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.open_surface_at("srf_1", true, Some(20));
+        let (_, command) = surface_command(&mut client);
+        assert!(matches!(
+            command,
+            Command::OpenSurface { accept, .. } if accept.max_fps == Some(20)
+        ));
+        client.open_surface("srf_1", false);
+        let (_, command) = surface_command(&mut client);
+        assert!(matches!(
+            command,
+            Command::OpenSurface { accept, .. } if accept.max_fps.is_none()
+        ));
     }
 
     #[test]
