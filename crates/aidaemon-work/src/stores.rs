@@ -951,6 +951,13 @@ pub trait WorkCoordinationStore: Send + Sync {
         Ok("shared".to_string())
     }
 
+    /// Whether the task's workspace policy was set on the task itself
+    /// (`set_task_workspace_policy`), rather than defaulted or inherited
+    /// from its worker profile.
+    async fn task_workspace_policy_is_explicit(&self, _task_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn create_task_workspace(
         &self,
         _workspace: &crate::traits::TaskWorkspace,

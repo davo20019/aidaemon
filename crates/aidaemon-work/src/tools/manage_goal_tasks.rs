@@ -334,7 +334,7 @@ impl Tool for ManageGoalTasksTool {
                     "workspace_policy": {
                         "type": "string",
                         "enum": ["shared", "isolated", "worktree"],
-                        "description": "shared, isolated, or Git worktree."
+                        "description": "shared (the scope given, or the whole workspace for cross-project work), isolated, or Git worktree."
                     },
                     "artifacts": {
                         "type": "array",

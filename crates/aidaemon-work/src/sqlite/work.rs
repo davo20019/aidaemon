@@ -1986,6 +1986,16 @@ impl<S: WorkDatabase> WorkCoordinationStore for S {
         .unwrap_or_else(|| "shared".to_string()))
     }
 
+    async fn task_workspace_policy_is_explicit(&self, task_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(workspace_policy_explicit, 0) FROM tasks WHERE id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(self.work_pool())
+        .await?
+        .is_some_and(|explicit| explicit == 1))
+    }
+
     async fn create_task_workspace(&self, workspace: &TaskWorkspace) -> anyhow::Result<()> {
         let mut tx = self.work_pool().begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
@@ -3050,6 +3060,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rebound.worker_instance_id, "specialist:task-lead:test");
+    }
+
+    /// Work aimed at the workspace container gets its own folder unless the
+    /// task was explicitly given the shared policy; the description's words
+    /// ("all my projects") never widen it to the container.
+    #[tokio::test]
+    async fn container_scope_is_the_explicit_shared_policy_not_the_task_words() {
+        let (store, _database) = test_store().await;
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let backend =
+            aidaemon_tools::execution::local_backend(&aidaemon_tools::execution::ExecutionConfig {
+                workspace_root: Some(workspace_root.path().to_string_lossy().into_owned()),
+                allow_outside_workspace: Some(false),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let goal = Goal::new_finite("synthetic workspace scope", "session-a");
+        store.create_goal(&goal).await.unwrap();
+        let worded = task(
+            &goal.id,
+            "Inspect all my projects in the projects folder",
+            None,
+        );
+        let explicit = task(&goal.id, "Update one synthetic dependency", None);
+        store.create_task(&worded).await.unwrap();
+        store.create_task(&explicit).await.unwrap();
+        assert!(
+            store
+                .set_task_workspace_policy(&explicit.id, "shared")
+                .await
+                .unwrap()
+        );
+
+        let mut policies = Vec::new();
+        for task in [&worded, &explicit] {
+            let attempt = store
+                .claim_task_with_lease(&task.id, "worker-a", None, 180)
+                .await
+                .unwrap()
+                .unwrap();
+            let workspace = crate::task_workspaces::provision_task_workspace(
+                &backend, &store, &task.id, &attempt, None,
+            )
+            .await
+            .unwrap();
+            policies.push((workspace.policy, workspace.root_path));
+        }
+        let container = aidaemon_tools::ExecutionBackend::workspace_root(&backend).to_string();
+        assert_eq!(policies[0].0, "isolated");
+        assert_ne!(policies[0].1, container);
+        assert_eq!(policies[1], ("shared".to_string(), container));
     }
 
     #[tokio::test]

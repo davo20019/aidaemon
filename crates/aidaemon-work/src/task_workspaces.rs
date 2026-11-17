@@ -23,34 +23,6 @@ fn short_component(value: &str) -> String {
         .collect()
 }
 
-fn task_needs_container_scope(description: &str) -> bool {
-    let lower = description.to_ascii_lowercase();
-    let explicitly_cross_project = [
-        "all my projects",
-        "all projects",
-        "across my projects",
-        "across all projects",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-    let container_named = lower.contains("projects workspace")
-        || lower.contains("projects folder")
-        || lower.contains("projects directory");
-    let words = lower
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let inspects_container = container_named
-        && ["inspect", "list", "scan", "search", "compare", "audit"]
-            .iter()
-            .any(|verb| words.contains(verb));
-
-    // Cross-project work needs the container for discovery even when later
-    // commands mutate individual children. Checkpointing still requires each
-    // mutation to resolve to one bounded child project.
-    explicitly_cross_project || inspects_container
-}
-
 fn safe_slug_component(value: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
@@ -151,8 +123,14 @@ where
         let requested_root = backend.resolve_path(requested_root).await?;
         let workspace_container = backend.workspace_root();
         let at_workspace_container = requested_root.as_str() == workspace_container.as_str();
-        let auto_isolate = requested_policy == "isolated"
-            || (at_workspace_container && !task_needs_container_scope(&task_description));
+        // Work aimed at the whole workspace container gets a folder of its
+        // own unless the task was explicitly given the shared policy: the
+        // container scope is a typed request by whoever created the task,
+        // never inferred from words like "all my projects".
+        let explicitly_shared = requested_policy == "shared"
+            && state.task_workspace_policy_is_explicit(task_id).await?;
+        let auto_isolate =
+            requested_policy == "isolated" || (at_workspace_container && !explicitly_shared);
         let resolved_root = if auto_isolate && at_workspace_container {
             workspace_container.join(isolated_workspace_slug(&task_description, task_id))
         } else {
@@ -334,7 +312,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{isolated_workspace_slug, short_component, task_needs_container_scope};
+    use super::{isolated_workspace_slug, short_component};
 
     #[test]
     fn workspace_components_are_bounded_and_safe() {
@@ -351,21 +329,5 @@ mod tests {
             ),
             "ai-engineering-site-43b2cf48bc97"
         );
-        assert!(!task_needs_container_scope(
-            "Create a website in the projects folder"
-        ));
-    }
-
-    #[test]
-    fn cross_project_discovery_keeps_container_scope() {
-        assert!(task_needs_container_scope(
-            "Inspect the projects workspace and list all projects"
-        ));
-        assert!(task_needs_container_scope(
-            "Inspect all projects and update their dependencies"
-        ));
-        assert!(!task_needs_container_scope(
-            "Create a website in the projects folder"
-        ));
     }
 }

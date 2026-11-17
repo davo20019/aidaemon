@@ -105,7 +105,7 @@
           "type": "string"
         },
         "workspace_policy": {
-          "description": "shared, isolated, or Git worktree.",
+          "description": "shared (the scope given, or the whole workspace for cross-project work), isolated, or Git worktree.",
           "enum": [
             "shared",
             "isolated",
