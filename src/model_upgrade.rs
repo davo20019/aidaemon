@@ -280,6 +280,15 @@ fn plan(
         .map(|m| m.id.as_str())
         .filter(|id| !declined.iter().any(|d| d == id))
         .collect();
+    // A model already configured here is never a target: moving the old
+    // model kept as a fallback onto the default would drop the fallback.
+    let configured: Vec<&String> = written
+        .default
+        .iter()
+        .chain(&written.fast)
+        .chain(&written.smart)
+        .chain(&written.fallback)
+        .collect();
     let mut moves = BTreeMap::new();
     let current = written
         .default
@@ -292,6 +301,7 @@ fn plan(
             continue;
         }
         if let Some(next) = successor(model, candidates.iter().copied())
+            && !configured.iter().any(|c| c.as_str() == next)
             && harness_keeps_up(model, next, vision)
         {
             moves.insert(model.clone(), next.to_string());
@@ -872,6 +882,19 @@ fast = "gpt-6-luna"
         assert_eq!(after.default.as_deref(), Some("claude-haiku-6"));
         assert_eq!(after.fallback, ["claude-haiku-5-5", "claude-sonnet-6"]);
         assert_eq!(written(&updated, Slot::Main), written(CONFIG, Slot::Main));
+    }
+
+    #[test]
+    fn the_old_model_kept_as_a_fallback_stays() {
+        let after_switch = r#"[provider]
+kind = "openai_chatgpt"
+
+[provider.models]
+default = "gpt-6.2-sol"
+fallback = ["gpt-6.1-sol", "gpt-6-luna"]
+"#;
+        let listed = offered(&["gpt-6.1-sol", "gpt-6.2-sol", "gpt-6-luna"]);
+        assert!(plan(&written(after_switch, Slot::Main), &listed, &[], &vision()).is_empty());
     }
 
     #[test]
