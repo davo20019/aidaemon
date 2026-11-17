@@ -66,11 +66,21 @@ impl KeyStore for FileKeyStore {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(device)?)?;
+        // The device's private key: created owner-only, never readable by
+        // another local user even for a moment.
+        let _ = std::fs::remove_file(&tmp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        {
+            use std::io::Write;
+            let mut file = options.open(&tmp)?;
+            file.write_all(serde_json::to_string_pretty(device)?.as_bytes())?;
+            file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())

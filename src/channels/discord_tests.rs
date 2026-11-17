@@ -257,6 +257,62 @@ async fn a_dynamic_bot_is_claimed_by_its_first_dm() {
     assert!(channel.is_authorized(STRANGER));
 }
 
+fn server_message(from: u64, text: &str, addressed: bool) -> ChannelEvent {
+    ChannelEvent::Message(
+        InboundMessage::new(
+            Conversation {
+                id: "100000000000000800".to_string(),
+                kind: ConversationKind::Group,
+            },
+            Sender {
+                id: from.to_string(),
+                display_name: Some("Jordan Lee".to_string()),
+                is_bot: false,
+            },
+            format!("m-{from}-{text}"),
+            text,
+        )
+        .with_addressed(addressed),
+    )
+}
+
+#[tokio::test]
+async fn a_claimed_dynamic_bot_is_not_claimed_again_by_another_dm() {
+    let mock = MockDiscord::start().await;
+    let (channel, harness) = channel(&mock, MockProvider::new(), vec![OWNER], vec![]).await;
+    channel
+        .handle_event(direct_message(STRANGER, "mine now"))
+        .await;
+    let refusal = mock
+        .wait_for(|r| r.path == "/channels/100000000000000700/messages")
+        .await;
+    assert_eq!(refusal.body["content"], "Unauthorized.");
+    assert!(channel.is_authorized(OWNER), "the owner keeps the bot");
+    assert!(!channel.is_authorized(STRANGER));
+    assert_eq!(harness.provider.call_count().await, 0);
+}
+
+#[tokio::test]
+async fn a_server_member_is_never_the_owner_of_a_dynamic_bot() {
+    let mock = MockDiscord::start().await;
+    let (channel, harness) = channel(&mock, MockProvider::new(), vec![OWNER], vec![]).await;
+    // An owner-only command from someone who merely shares a server.
+    channel
+        .handle_event(server_message(STRANGER, "/model synthetic-model", true))
+        .await;
+    let refusal = mock
+        .wait_for(|r| r.path == "/channels/100000000000000800/messages")
+        .await;
+    assert_eq!(refusal.body["content"], "Only the owner can use /model.");
+    // Nor does their chatter in a channel run a turn unless it addresses
+    // the bot.
+    channel
+        .handle_event(server_message(STRANGER, "anyone around?", false))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(harness.provider.call_count().await, 0);
+}
+
 #[tokio::test]
 async fn a_slash_command_fills_in_its_deferred_reply() {
     let mock = MockDiscord::start().await;

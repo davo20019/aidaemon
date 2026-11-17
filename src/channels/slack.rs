@@ -34,7 +34,10 @@ pub(crate) fn new_slack_bot(
             use_threads,
         },
         runtime.bot_deps(),
-        Arc::new(DaemonSlackHost { runtime }),
+        Arc::new(DaemonSlackHost {
+            runtime,
+            bot_token: bot_token.to_string(),
+        }),
     )
 }
 
@@ -63,6 +66,9 @@ async fn load_workspace_grants_from_config(
 /// The daemon's services behind one Slack bot.
 struct DaemonSlackHost {
     runtime: ChannelRuntimeDeps,
+    /// Which bot this is, to find its record when it was connected at
+    /// runtime.
+    bot_token: String,
 }
 
 impl DaemonSlackHost {
@@ -109,6 +115,27 @@ impl SlackHost for DaemonSlackHost {
         owner_ids: &[String],
     ) -> anyhow::Result<()> {
         let _write_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
+        // A bot connected at runtime lives in the database: its claim is
+        // saved on its own row (with no owner ids, its allowlist holds its
+        // owners), never in the config, where it would be lost or would
+        // overwrite the configured bot's access.
+        let dynamic = self
+            .runtime
+            .state
+            .get_dynamic_bots()
+            .await
+            .unwrap_or_default();
+        if dynamic
+            .iter()
+            .any(|bot| bot.channel_type == "slack" && bot.bot_token == self.bot_token)
+        {
+            self.runtime
+                .state
+                .update_dynamic_bot_allowed_users(&self.bot_token, allowed_ids)
+                .await?;
+            info!("Persisted Slack access IDs to the connected bot's record");
+            return Ok(());
+        }
         let content = tokio::fs::read_to_string(&self.runtime.config_path).await?;
         let mut doc: toml::Table = content.parse()?;
 

@@ -284,6 +284,13 @@ impl TelegramHost for DaemonTelegramHost {
         let cx = self.cx(tg);
         let bot = cx.bot.clone();
         let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
+        // Restarting the daemon and connecting or listing bots are the
+        // owner's: a connected bot is a new way in with an owner of its own.
+        if matches!(cmd, "/restart" | "/connect" | "/bots")
+            && determine_role(&cx.owner_user_ids, user_id) != UserRole::Owner
+        {
+            return HostCommand::Reply(format!("Only the owner can run {cmd}."));
+        }
         HostCommand::Reply(match cmd {
             "/restart" => {
                 let _ = bot.send_message(msg.chat.id, "Restarting...").await;
@@ -432,6 +439,21 @@ impl Cx<'_> {
     /// Persist the current allowed_user_ids list to config.toml.
     /// Handles both `[telegram]` and `[[telegram_bots]]` config formats.
     async fn persist_allowed_user_ids(&self, ids: &[u64]) -> anyhow::Result<()> {
+        // A bot connected at runtime lives in the database, not in the
+        // config: its claim is saved on its own row. Writing it to the config
+        // would lose it (no section) or overwrite the configured bot's list.
+        let dynamic = self.state.get_dynamic_bots().await.unwrap_or_default();
+        if dynamic
+            .iter()
+            .any(|bot| bot.channel_type == "telegram" && bot.bot_token == self.bot_token)
+        {
+            let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
+            self.state
+                .update_dynamic_bot_allowed_users(&self.bot_token, &ids)
+                .await?;
+            info!("Persisted allowed_user_ids to the connected bot's record");
+            return Ok(());
+        }
         let content = tokio::fs::read_to_string(&self.config_path).await?;
         let mut doc: toml::Table = content.parse()?;
 

@@ -616,21 +616,16 @@ impl SharedCommands {
         // changes or reveals something of the owner's (the model for every
         // chat, running work, history, cost, the daemon itself), so it is
         // the owner's: a guest in a shared chat does not get it.
-        if user_role != UserRole::Owner && !matches!(cmd, "/private" | "/tasks") {
+        // (`/cancel`, `/context`, `/readonly` and `/mode` say so themselves.)
+        if user_role != UserRole::Owner
+            && !matches!(
+                cmd,
+                "/private" | "/tasks" | "/cancel" | "/context" | "/readonly" | "/mode"
+            )
+        {
             let shared = matches!(
                 cmd,
-                "/model"
-                    | "/models"
-                    | "/auto"
-                    | "/cancel"
-                    | "/clear"
-                    | "/new"
-                    | "/status"
-                    | "/wipe"
-                    | "/cost"
-                    | "/context"
-                    | "/readonly"
-                    | "/mode"
+                "/model" | "/models" | "/auto" | "/clear" | "/new" | "/status" | "/wipe" | "/cost"
             ) || self.extensions.iter().any(|ext| ext.handles(cmd));
             return shared.then(|| format!("Only the owner can use {cmd}."));
         }

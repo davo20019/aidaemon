@@ -461,9 +461,21 @@ impl SecretStore for KeychainSecretStore {
         if self.keychain_disabled() {
             return self.env.delete(key);
         }
-        self.entry(key)?
-            .delete_credential()
-            .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", key, e))
+        // A secret stored while the keychain was unusable went to the env
+        // file (see `set`): removing it means removing that copy too, or a
+        // "disconnected" token would stay on disk.
+        let from_env = self.env.delete(key);
+        let from_keychain = self
+            .entry(key)
+            .and_then(|entry| Ok(entry.delete_credential()?))
+            .map_err(|e| anyhow::anyhow!("Failed to delete '{}' from OS keychain: {}", key, e));
+        match (from_keychain, from_env) {
+            (Ok(()), result) => result,
+            // No such keychain entry (or no keychain): the env copy was the
+            // one to remove.
+            (Err(_), Ok(())) if self.fell_back.load(std::sync::atomic::Ordering::SeqCst) => Ok(()),
+            (Err(error), _) => Err(error),
+        }
     }
 }
 
@@ -548,6 +560,23 @@ fn set_file_mode_0600(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write `body` to `path`, which is created owner-only when it does not
+/// exist yet: a new secrets file is never readable by other local users,
+/// not even for the moment before its mode is set.
+fn write_secret_file(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()
+}
+
 fn upsert_env_secret(env_path: &Path, field_name: &str, value: &str) -> anyhow::Result<()> {
     let _guard = env_file_lock()
         .lock()
@@ -585,7 +614,7 @@ fn upsert_env_secret(env_path: &Path, field_name: &str, value: &str) -> anyhow::
     if !body.is_empty() {
         body.push('\n');
     }
-    std::fs::write(env_path, body)?;
+    write_secret_file(env_path, &body)?;
     set_file_mode_0600(env_path)?;
     Ok(())
 }
@@ -614,7 +643,7 @@ fn remove_env_secret(env_path: &Path, field_name: &str) -> anyhow::Result<()> {
     if !body.is_empty() {
         body.push('\n');
     }
-    std::fs::write(env_path, body)?;
+    write_secret_file(env_path, &body)?;
     set_file_mode_0600(env_path)?;
     Ok(())
 }

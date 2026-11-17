@@ -473,7 +473,7 @@ fn persist_key_to_env_file(env_path: &Path, key: &str) -> anyhow::Result<()> {
     if !body.is_empty() {
         body.push('\n');
     }
-    std::fs::write(env_path, body)?;
+    write_secret_file(env_path, &body)?;
     set_file_mode_0600(env_path)?;
     Ok(())
 }
@@ -536,6 +536,23 @@ fn remove_if_exists(path: PathBuf) {
     {
         warn!(path = %path.display(), error = %e, "Failed to remove stale SQLite sidecar file");
     }
+}
+
+/// Write `body` to `path`, which is created owner-only when it does not
+/// exist yet: a new secrets file is never readable by other local users,
+/// not even for the moment before its mode is set.
+fn write_secret_file(path: &Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()
 }
 
 fn set_file_mode_0600(path: &Path) -> anyhow::Result<()> {

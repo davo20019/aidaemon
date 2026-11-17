@@ -46,6 +46,25 @@ const APPROVAL_REQUIRED_KEYS: &[&str] = &[
     "allowed_command_prefixes",
     "base_url", // Could redirect API traffic
     "trusted",  // Scheduler trusted flag
+    // Where the persona (part of every prompt) is read from, and headers
+    // sent with every model request.
+    "persona_file",
+    "extra_headers",
+];
+
+/// The top-level tables a change may touch without the owner's approval:
+/// how the agent talks and thinks, nothing about who may reach it, what it
+/// may do, what runs on this machine or where data goes. Every other table
+/// (channels and their allowlists, users, authority, terminal, MCP servers,
+/// OAuth endpoints, telemetry, updates, the database, ...) is the owner's
+/// call, including tables added later.
+const APPROVAL_FREE_TABLES: &[&str] = &[
+    "agent",
+    "provider",
+    "checkpoints",
+    "heartbeat",
+    "people",
+    "diagnostics",
 ];
 
 /// Placeholder shown instead of actual secret values.
@@ -2065,6 +2084,17 @@ impl ConfigManagerTool {
         if let Some(refusal) = Self::literal_secret_refusal(args) {
             return Ok(ConfigReply::refused(refusal));
         }
+        // The config expands `${NAME}` from the daemon's environment, which
+        // holds its secrets: a value written here must not pull one into a
+        // URL or any other setting.
+        if args.action == "set" && args.value.contains("${") {
+            return Ok(ConfigReply::refused(
+                "Nothing was changed: a value may not reference an environment variable \
+                 (`${...}`). Secrets take the value `keychain`; the owner can add an \
+                 environment reference by editing the config file themselves."
+                    .to_string(),
+            ));
+        }
         let unset = args.action == "unset";
         if args.key.is_empty() || (!unset && args.value.is_empty()) {
             return Ok(ConfigReply::refused(if unset {
@@ -2196,10 +2226,12 @@ impl ConfigManagerTool {
         // The Client Gateway opens a way to chat and answer approvals from
         // outside a channel: every key of its table is the owner's call.
         // Exposure publishes a gateway outside this machine: the same.
-        if matches!(
-            args.key.split(['.', '[']).next().map(str::trim),
-            Some("client_gateway" | "exposure")
-        ) {
+        // So is everything outside the few tables that only tune how the
+        // agent talks and thinks: an allowlist of free tables, so a table
+        // that grants access or sends data somewhere is never free because
+        // nobody listed it.
+        let table = args.key.split(['.', '[']).next().map(str::trim);
+        if !table.is_some_and(|table| APPROVAL_FREE_TABLES.contains(&table)) {
             return true;
         }
         let Ok(path) = ConfigPath::parse(&args.key) else {
@@ -3090,6 +3122,59 @@ token_file = "{}"
             tool.owner_approval(&json!({"action": "set", "key": "exposure.client_gateway.url", "value": "\"https://a.example.com\""})).await,
             OwnerApprovalNeed::Ask(_)
         ));
+    }
+
+    /// Only the tables that tune how the agent talks are free: where data
+    /// goes, who may reach the daemon and what runs on the machine ask.
+    #[tokio::test]
+    async fn a_change_outside_the_tuning_tables_asks_the_owner() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let tool = approving_tool(path);
+        for (key, value) in [
+            (
+                "telemetry.otlp_endpoint",
+                "\"https://collector.example.invalid\"",
+            ),
+            ("mcp.files.command", "\"node\""),
+            ("users.owner_ids.telegram", "[42]"),
+            (
+                "oauth.providers.acme.token_url",
+                "\"https://acme.example.invalid/token\"",
+            ),
+            ("terminal.permission_mode", "\"yolo\""),
+            ("search.searxng_url", "\"https://search.example.invalid\""),
+            ("agent.persona_file", "\"/tmp/persona.md\""),
+        ] {
+            assert!(
+                matches!(
+                    tool.owner_approval(&json!({"action": "set", "key": key, "value": value}))
+                        .await,
+                    OwnerApprovalNeed::Ask(_)
+                ),
+                "{key} must ask"
+            );
+        }
+        assert!(matches!(
+            tool.owner_approval(&json!({"action": "set", "key": "agent.name", "value": "\"Ada\""}))
+                .await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+    }
+
+    /// The config expands `${NAME}` from the daemon's environment: the tool
+    /// never writes such a reference.
+    #[tokio::test]
+    async fn a_value_naming_an_environment_variable_is_refused() {
+        let (_dir, path) = write_temp_config(PRIMARY_CONFIG);
+        let before = fs::read_to_string(&path).unwrap();
+        let tool = approving_tool(path.clone());
+        let mut args = test_args();
+        args.action = "set".into();
+        args.key = "agent.name".into();
+        args.value = "\"${AIDAEMON_ENCRYPTION_KEY}\"".into();
+        let reply = tool.change_value(&args).await.unwrap();
+        assert!(reply.text.contains("Nothing was changed"), "{}", reply.text);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 
     #[tokio::test]
