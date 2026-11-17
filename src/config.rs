@@ -1335,7 +1335,11 @@ fn default_allowed_prefixes() -> Vec<String> {
 pub struct WatchdogConfig {
     #[serde(default = "default_watchdog_enabled")]
     pub enabled: bool,
-    /// Seconds of no heartbeat before declaring stuck (default: 300 = 5 min).
+    /// Seconds a channel turn's heartbeat may go unstamped before the turn is
+    /// cancelled as hung (default: 300 = 5 min). The turn engine stamps it
+    /// every 15s while its run loop is polled, so this catches a wedged or
+    /// dropped turn loop, not a slow model or tool: those are bounded by
+    /// `llm_call_timeout_secs`, tool timeouts and the child progress clock.
     #[serde(default = "default_watchdog_stale_secs")]
     pub stale_threshold_secs: u64,
     /// Per-LLM-call timeout in seconds (default: 300 = 5 min).

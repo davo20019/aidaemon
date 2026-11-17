@@ -340,7 +340,8 @@ pub struct TurnDeps {
     pub sessions: Arc<dyn SessionChannelStore>,
     pub task_registry: Arc<TaskRegistry>,
     /// Heartbeat silence (seconds) after which a turn is cancelled as hung;
-    /// 0 never cancels.
+    /// 0 never cancels. The engine stamps the heartbeat on a timer while the
+    /// turn loop runs, so silence means the loop is wedged, not slow work.
     pub watchdog_stale_threshold_secs: u64,
     /// Who sees every turn (empty by default).
     pub watch: TurnWatch,
