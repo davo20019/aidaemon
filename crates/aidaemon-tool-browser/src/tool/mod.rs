@@ -2563,6 +2563,29 @@ impl Tool for BrowserTool {
 
 #[async_trait]
 impl aidaemon_tools::semantics::ToolSemantics for BrowserTool {
+    /// What a call sends out, for the outside-content check: opening a page
+    /// sends its URL (which can carry data in its path or query), and text
+    /// typed into a page or a script run on it is text the model composed.
+    fn call_outbound(&self, arguments: &str) -> aidaemon_core::Outbound {
+        let Ok(args) = serde_json::from_str::<Value>(arguments) else {
+            return aidaemon_core::Outbound::Composed;
+        };
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| action.trim().to_ascii_lowercase());
+        match action.as_deref() {
+            Some("navigate" | "new_tab") => match args.get("url").and_then(Value::as_str) {
+                Some(url) if !url.trim().is_empty() => {
+                    aidaemon_core::Outbound::Exact(vec![url.to_string()])
+                }
+                _ => aidaemon_core::Outbound::Nothing,
+            },
+            Some("fill" | "execute_js") => aidaemon_core::Outbound::Composed,
+            _ => aidaemon_core::Outbound::Nothing,
+        }
+    }
+
     fn dispatch_facts(&self) -> aidaemon_tools::semantics::ToolDispatchFacts {
         aidaemon_tools::semantics::ToolDispatchFacts {
             // The owner's answers are kept per call and per session by the
