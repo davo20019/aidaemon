@@ -25,7 +25,9 @@ chromium = [
     "dep:aidaemon-core",
     "dep:aidaemon-events",
     "dep:aidaemon-tools",
+    "dep:aidaemon-surfaces",
     "dep:anyhow",
+    "dep:base64",
     "dep:async-trait",
     "dep:chromiumoxide",
     "dep:futures",
@@ -45,8 +47,10 @@ aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", optional = true
 aidaemon-channels = { version = "0.20.0", path = "../aidaemon-channels", optional = true }
 aidaemon-events = { version = "0.20.0", path = "../aidaemon-events", optional = true }
 aidaemon-tools = { version = "0.20.0", path = "../aidaemon-tools", optional = true }
+aidaemon-surfaces = { version = "0.20.0", path = "../aidaemon-surfaces", optional = true }
 anyhow = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
+base64 = { version = "0.23", optional = true }
 chromiumoxide = { version = "0.9", default-features = false, optional = true }
 futures = { version = "0.3", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }

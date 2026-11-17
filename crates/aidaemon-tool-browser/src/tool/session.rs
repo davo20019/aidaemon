@@ -202,6 +202,50 @@ impl BrowserSessionRegistry {
             .insert(key, expires_at);
     }
 
+    /// Every tab of every session: `(session_id, tab, is_active)`, for the
+    /// live surfaces list.
+    pub async fn all_tabs(&self) -> Vec<(String, TabEntry, bool)> {
+        let sessions = self.sessions.lock().await;
+        let mut out = Vec::new();
+        for (session_id, state) in sessions.iter() {
+            for tab in &state.tabs {
+                out.push((
+                    session_id.clone(),
+                    tab.clone(),
+                    tab.target_id == state.active_target_id,
+                ));
+            }
+        }
+        out
+    }
+
+    /// One tab of a session.
+    pub async fn tab(&self, session_id: &str, target_id: &str) -> Option<TabEntry> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(session_id)?
+            .tabs
+            .iter()
+            .find(|tab| tab.target_id == target_id)
+            .cloned()
+    }
+
+    /// The lock that serializes a session's actions.
+    pub async fn action_lock(&self, session_id: &str) -> Option<Arc<Mutex<()>>> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|state| state.action_lock.clone())
+    }
+
+    /// Count the owner's use of a session as activity, so idle eviction does
+    /// not close a tab the owner is working in.
+    pub async fn touch(&self, session_id: &str) {
+        if let Some(state) = self.sessions.lock().await.get_mut(session_id) {
+            state.last_used_at = Instant::now();
+        }
+    }
+
     /// Update the cached URL for this session's active tab after an action has
     /// observed the live committed page URL. Approval prompts and `list_tabs`
     /// use this cache so they can show a secret-safe origin without touching the

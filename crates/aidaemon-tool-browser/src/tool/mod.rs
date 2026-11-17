@@ -21,6 +21,7 @@ use policy::BrowserRiskClass;
 
 mod backend;
 mod diagnostics;
+pub mod live;
 pub mod policy;
 mod session;
 #[cfg(test)]
@@ -41,6 +42,9 @@ use tokio::sync::OwnedMutexGuard;
 const LOCAL_SITE_ONCE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 const POINT_OF_ACTION_SENSITIVE: &str = "This can read or access private data on the page.";
+/// The extra warning when the owner typed into this tab (a sign-in).
+const OWNER_TYPED_HERE: &str =
+    "You typed into this page yourself; a script could read what you entered.";
 /// The warning on a card for a consequential click or fill.
 const POINT_OF_ACTION_CONSEQUENTIAL: &str =
     "This may submit forms, make purchases, delete data, or send messages.";
@@ -505,8 +509,13 @@ pub struct BrowserTool {
     /// Shared inbox for persisting screenshots for agent vision context.
     inbox_dir: PathBuf,
     /// Per-session page state, keyed by the call's typed
-    /// `ToolCallContext::session_id`.
-    sessions: BrowserSessionRegistry,
+    /// `ToolCallContext::session_id`. Shared with the live surfaces.
+    sessions: Arc<BrowserSessionRegistry>,
+    /// What the live surfaces and the tool share: tabs the owner holds or
+    /// typed into, and where to report tab changes.
+    live: Arc<live::LiveState>,
+    /// The viewport the browser opens with.
+    viewport: aidaemon_surfaces::Size,
     /// The owner's approvals of exact calls, delivered by the agent kernel
     /// (`record_owner_answer`) after the card `owner_approval_request` asked
     /// for, and consumed by the call. The tool never asks the owner itself.
@@ -622,6 +631,10 @@ impl BrowserTool {
         let nav_timeout = config.nav_timeout();
         let element_timeout = config.element_timeout();
         let action_timeout = config.action_timeout();
+        let viewport = aidaemon_surfaces::Size {
+            w: config.screenshot_width,
+            h: config.screenshot_height,
+        };
         let backend = ChromiumoxideBackend::new(config)?;
         let mode = backend.session_isolation();
         let (mode_label, shares_cookies) = match mode {
@@ -638,7 +651,9 @@ impl BrowserTool {
             execution_backend,
             media_tx,
             inbox_dir: inbox_dir.into(),
-            sessions: BrowserSessionRegistry::new(),
+            sessions: Arc::new(BrowserSessionRegistry::new()),
+            live: Arc::default(),
+            viewport,
             owner_answers: Default::default(),
             nav_timeout,
             element_timeout,
@@ -660,7 +675,9 @@ impl BrowserTool {
             media_tx,
             inbox_dir: std::env::temp_dir().join("aidaemon-browser-test-inbox"),
             execution_backend: aidaemon_tools::testing::active_execution_backend(),
-            sessions: BrowserSessionRegistry::new(),
+            sessions: Arc::new(BrowserSessionRegistry::new()),
+            live: Arc::default(),
+            viewport: aidaemon_surfaces::Size { w: 1280, h: 720 },
             owner_answers: Default::default(),
             nav_timeout: Duration::from_secs(30),
             element_timeout: Duration::from_secs(10),
@@ -685,6 +702,27 @@ impl BrowserTool {
     pub fn with_inbox_dir(mut self, inbox_dir: impl Into<PathBuf>) -> Self {
         self.inbox_dir = inbox_dir.into();
         self
+    }
+
+    /// This browser's tabs as live surfaces the owner can watch and control
+    /// from a paired app.
+    pub fn surface_backend(&self) -> Arc<live::BrowserSurface> {
+        Arc::new(live::BrowserSurface::new(
+            self.backend.clone(),
+            self.sessions.clone(),
+            self.live.clone(),
+            self.viewport,
+        ))
+    }
+
+    /// Delete the sign-ins the agent's own browser profile kept (the
+    /// owner's "Forget sign-ins"). Refused for a profile that is the
+    /// owner's own. Every open tab closes.
+    pub async fn forget_sign_ins(&self) -> Result<String, String> {
+        let done = self.backend.forget_sign_ins().await?;
+        self.sessions.invalidate_all_pages().await;
+        self.live.notify();
+        Ok(done)
     }
 
     /// Read the active tab's last-known URL (cached in the session registry)
@@ -802,6 +840,13 @@ impl BrowserTool {
         let mut warnings = Vec::new();
         if risk.sensitive {
             warnings.push(POINT_OF_ACTION_SENSITIVE.to_string());
+            let typed_here = match self.sessions.active_target_id(args.session_id).await {
+                Some(target) => self.live.owner_typed(&target),
+                None => false,
+            };
+            if typed_here {
+                warnings.push(OWNER_TYPED_HERE.to_string());
+            }
         }
         if risk.consequential {
             warnings.push(POINT_OF_ACTION_CONSEQUENTIAL.to_string());
@@ -933,6 +978,13 @@ impl BrowserTool {
                 .ensure_listeners(&page, session_id, &tab_id)
                 .await;
         }
+        // While the owner controls this session's tab the action waits for
+        // them; that time is the owner's, not the turn's work.
+        let _waiting = self
+            .live
+            .owner_holds(session_id)
+            .then(aidaemon_channels::owner_wait::OwnerWaitClock::begin_waiting)
+            .flatten();
         let guard = action_lock.lock_owned().await;
         Ok((page, guard))
     }
@@ -2493,7 +2545,10 @@ impl Tool for BrowserTool {
         let facts = facts.clone();
 
         let _ = status_tx;
-        let result = self.run_action(arguments, &facts).await?;
+        let result = self.run_action(arguments, &facts).await;
+        // Tabs may have opened, closed or moved: the live surfaces refresh.
+        self.live.notify();
+        let result = result?;
         Ok(ToolCallOutcome {
             output: result.text,
             metadata: ToolCallMetadata {

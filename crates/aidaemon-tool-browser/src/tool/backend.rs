@@ -149,6 +149,116 @@ pub trait PageHandle: Send + Sync {
         _store: BrowserDiagnosticsStore,
     ) {
     }
+
+    /// Start a live picture of the page (JPEG frames as the page paints).
+    /// Each frame must be acked with [`PageHandle::ack_screencast`] before the
+    /// next comes. Default: not supported.
+    async fn start_screencast(
+        &self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<ScreencastFrames, String> {
+        Err("this browser cannot stream its page".to_string())
+    }
+
+    /// The page may send its next frame.
+    async fn ack_screencast(&self, _session: i64) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stop_screencast(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// A pointer event at CSS pixel `(x, y)` of the viewport.
+    async fn dispatch_mouse(&self, _event: &MouseInput) -> Result<(), String> {
+        Err("this browser takes no pointer input".to_string())
+    }
+
+    async fn dispatch_key(&self, _event: &KeyInput) -> Result<(), String> {
+        Err("this browser takes no key input".to_string())
+    }
+
+    /// Type committed text where the focus is.
+    async fn insert_text(&self, _text: &str) -> Result<(), String> {
+        Err("this browser takes no text input".to_string())
+    }
+
+    /// The viewport's size in CSS pixels.
+    async fn viewport(&self) -> Result<(f64, f64), String> {
+        Err("viewport unknown".to_string())
+    }
+
+    /// The page's title, best effort.
+    async fn title(&self) -> Option<String> {
+        None
+    }
+}
+
+/// One live frame of a page.
+pub struct ScreencastFrame {
+    pub data: Vec<u8>,
+    /// The viewport in CSS pixels when it was painted.
+    pub css_w: f64,
+    pub css_h: f64,
+    /// Ack it with this.
+    pub session: i64,
+}
+
+/// A page's live frames, until the page goes away or the cast stops.
+pub type ScreencastFrames = std::pin::Pin<Box<dyn futures::Stream<Item = ScreencastFrame> + Send>>;
+
+/// What a pointer event does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    Pressed,
+    Released,
+    Moved,
+    Wheel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButtonKind {
+    None,
+    Left,
+    Middle,
+    Right,
+}
+
+/// A pointer event in the page's CSS pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MouseInput {
+    pub kind: MouseKind,
+    pub x: f64,
+    pub y: f64,
+    pub button: MouseButtonKind,
+    pub click_count: i64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    /// CDP modifier bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
+    pub modifiers: i64,
+}
+
+/// A key event. `text` is what a key-down types (a printable key).
+#[derive(Clone, PartialEq)]
+pub struct KeyInput {
+    pub down: bool,
+    pub code: String,
+    pub key: String,
+    pub text: Option<String>,
+    pub modifiers: i64,
+    pub windows_virtual_key_code: Option<i64>,
+}
+
+impl std::fmt::Debug for KeyInput {
+    // What was typed is never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyInput")
+            .field("down", &self.down)
+            .field("code", &self.code)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Lightweight description of a live browser target/tab, returned by
@@ -257,6 +367,35 @@ pub trait BrowserBackend: Send + Sync {
     /// all previously-minted page handles are stale and MUST be re-created
     /// (the tool layer invalidates the session registry's cached pages).
     async fn reconnect(&self) -> Result<(), String>;
+
+    /// Where sign-ins made in this browser go. Default: nowhere lasting.
+    async fn sign_in_store(&self) -> SignInStore {
+        SignInStore::NotKept
+    }
+
+    /// Move onto a profile that keeps sign-ins, when this browser can
+    /// (`sign_in_store` is `CanKeep`). `Ok(true)`: the browser restarted on
+    /// it and every open tab is gone.
+    async fn keep_sign_ins_now(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Delete the agent's own kept sign-ins. Refused for a profile or a
+    /// Chrome that is the owner's own.
+    async fn forget_sign_ins(&self) -> Result<String, String> {
+        Err("This browser keeps no sign-ins of its own.".to_string())
+    }
+}
+
+/// Where sign-ins made in the agent's browser go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInStore {
+    /// A lasting profile: a sign-in is there for later tasks.
+    Kept,
+    /// Ephemeral now, and allowed to move to the agent's own profile.
+    CanKeep,
+    /// Ephemeral, and kept nowhere.
+    NotKept,
 }
 
 /// Classify a backend/page error string as a transport/connection-class failure
@@ -326,8 +465,12 @@ pub struct ChromiumoxideBackend {
     /// Resolved session-isolation mode (computed once at construction). Controls
     /// whether each session's page is created in the default shared context
     /// (`Page` — shared cookies) or its own incognito browser context
-    /// (`BrowserContext` — isolated cookies).
-    session_isolation: SessionIsolation,
+    /// (`BrowserContext` — isolated cookies). Changes when the browser moves
+    /// onto the agent's own profile to keep sign-ins.
+    session_isolation: std::sync::Mutex<SessionIsolation>,
+    /// The agent's own profile, once in use (an ephemeral browser that moved
+    /// onto it to keep sign-ins, or found it from an earlier move).
+    active_profile: std::sync::Mutex<Option<String>>,
     config: BrowserSettings,
 }
 
@@ -340,7 +483,17 @@ impl ChromiumoxideBackend {
     /// error at startup rather than silently downgrading — honesty over a
     /// false claim of cookie isolation.
     pub fn new(config: BrowserSettings) -> Result<Self, String> {
-        let session_isolation = config.resolve_session_isolation()?;
+        let mut session_isolation = config.resolve_session_isolation()?;
+        // An ephemeral browser that moved onto the agent's own profile before
+        // starts on it again.
+        let active_profile = config
+            .agent_profile_dir
+            .clone()
+            .filter(|_| Self::may_keep_sign_ins(&config))
+            .filter(|dir| std::path::Path::new(&*shellexpand::tilde(dir)).is_dir());
+        if active_profile.is_some() {
+            session_isolation = SessionIsolation::Page;
+        }
         let headless = AtomicBool::new(config.headless);
         Ok(Self {
             browser: Arc::new(Mutex::new(None)),
@@ -348,14 +501,37 @@ impl ChromiumoxideBackend {
             handler_alive: Arc::new(AtomicBool::new(false)),
             connected_to_existing: Arc::new(Mutex::new(false)),
             headless,
-            session_isolation,
+            session_isolation: std::sync::Mutex::new(session_isolation),
+            active_profile: std::sync::Mutex::new(active_profile),
             config,
         })
     }
 
+    /// An ephemeral browser that the owner allowed to keep sign-ins, with no
+    /// isolation it would break.
+    fn may_keep_sign_ins(config: &BrowserSettings) -> bool {
+        config.keep_sign_ins
+            && config.user_data_dir.is_none()
+            && config.remote_debugging_port.is_none()
+            && config.session_isolation != Some(SessionIsolation::BrowserContext)
+            && config.agent_profile_dir.is_some()
+    }
+
     /// The resolved session-isolation mode this backend will use.
     pub fn session_isolation(&self) -> SessionIsolation {
-        self.session_isolation
+        *self
+            .session_isolation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn profile_in_use(&self) -> Option<String> {
+        self.config.user_data_dir.clone().or_else(|| {
+            self.active_profile
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
     }
 
     /// Check if a display is available for non-headless Chrome.
@@ -391,7 +567,7 @@ impl ChromiumoxideBackend {
             .as_ref()
             .ok_or_else(|| "Browser not initialized".to_string())?;
 
-        let (page, context_id) = match self.session_isolation {
+        let (page, context_id) = match self.session_isolation() {
             SessionIsolation::Page => (
                 browser
                     .new_page("about:blank")
@@ -560,7 +736,7 @@ impl ChromiumoxideBackend {
             builder = builder.arg("--headless=new");
         }
         // Use existing Chrome profile if configured (inherits cookies/sessions)
-        if let Some(ref user_data_dir) = self.config.user_data_dir {
+        if let Some(ref user_data_dir) = self.profile_in_use() {
             let expanded = shellexpand::tilde(user_data_dir);
             builder = builder.arg(format!("--user-data-dir={}", expanded));
             let profile = self.config.profile.as_deref().unwrap_or("Default");
@@ -798,6 +974,77 @@ impl BrowserBackend for ChromiumoxideBackend {
         }
         info!("reconnecting browser after a connection-class failure");
         self.launch_or_connect(&mut guard).await
+    }
+
+    async fn sign_in_store(&self) -> SignInStore {
+        if self.config.remote_debugging_port.is_some() || self.profile_in_use().is_some() {
+            SignInStore::Kept
+        } else if Self::may_keep_sign_ins(&self.config) {
+            SignInStore::CanKeep
+        } else {
+            SignInStore::NotKept
+        }
+    }
+
+    async fn keep_sign_ins_now(&self) -> Result<bool, String> {
+        if self.sign_in_store().await != SignInStore::CanKeep {
+            return Ok(false);
+        }
+        let Some(dir) = self.config.agent_profile_dir.clone() else {
+            return Ok(false);
+        };
+        let expanded = shellexpand::tilde(&dir).into_owned();
+        std::fs::create_dir_all(&expanded)
+            .map_err(|e| format!("Could not make the agent's browser profile: {e}"))?;
+        *self
+            .active_profile
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        *self
+            .session_isolation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = SessionIsolation::Page;
+        let closed = self.graceful_teardown().await;
+        info!(%closed, "browser moved onto the agent's own profile to keep sign-ins");
+        Ok(true)
+    }
+
+    async fn forget_sign_ins(&self) -> Result<String, String> {
+        if self.config.remote_debugging_port.is_some() {
+            return Err("The agent uses your own Chrome; sign out there.".to_string());
+        }
+        let Some(agent_dir) = self.config.agent_profile_dir.clone() else {
+            return Err("This browser keeps no sign-ins of its own.".to_string());
+        };
+        if self
+            .config
+            .user_data_dir
+            .as_ref()
+            .is_some_and(|dir| *dir != agent_dir)
+        {
+            return Err("The agent uses a Chrome profile you chose; sign out there.".to_string());
+        }
+        let closed = self.graceful_teardown().await;
+        let expanded = shellexpand::tilde(&agent_dir).into_owned();
+        if std::path::Path::new(&expanded).exists() {
+            std::fs::remove_dir_all(&expanded)
+                .map_err(|e| format!("Could not delete the agent's sign-ins: {e}"))?;
+        }
+        if self.config.user_data_dir.is_none() {
+            *self
+                .active_profile
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .session_isolation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = self
+                .config
+                .resolve_session_isolation()
+                .unwrap_or(SessionIsolation::Page);
+        }
+        info!(%closed, "forgot the agent's browser sign-ins");
+        Ok("Forgot every sign-in the agent's browser kept.".to_string())
     }
 }
 
@@ -1071,6 +1318,154 @@ impl PageHandle for ChromiumoxidePage {
         self.page.url().await.ok().flatten()
     }
 
+    async fn start_screencast(
+        &self,
+        max_w: u32,
+        max_h: u32,
+        quality: u8,
+    ) -> Result<ScreencastFrames, String> {
+        use base64::Engine as _;
+        use chromiumoxide::cdp::browser_protocol::page::{
+            EventScreencastFrame, StartScreencastFormat, StartScreencastParams,
+        };
+        let events = self
+            .page
+            .event_listener::<EventScreencastFrame>()
+            .await
+            .map_err(|e| format!("Failed to listen for frames: {e}"))?;
+        let params = StartScreencastParams::builder()
+            .format(StartScreencastFormat::Jpeg)
+            .quality(i64::from(quality.clamp(10, 100)))
+            .max_width(i64::from(max_w))
+            .max_height(i64::from(max_h))
+            .build();
+        self.page
+            .execute(params)
+            .await
+            .map_err(|e| format!("Failed to start the live view: {e}"))?;
+        let frames = events.filter_map(|event| async move {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(AsRef::<str>::as_ref(&event.data))
+                .ok()?;
+            Some(ScreencastFrame {
+                data,
+                css_w: event.metadata.device_width,
+                css_h: event.metadata.device_height,
+                session: event.session_id,
+            })
+        });
+        Ok(Box::pin(frames))
+    }
+
+    async fn ack_screencast(&self, session: i64) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::page::ScreencastFrameAckParams;
+        self.page
+            .execute(ScreencastFrameAckParams::new(session))
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to ack a frame: {e}"))
+    }
+
+    async fn stop_screencast(&self) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::page::StopScreencastParams;
+        self.page
+            .execute(StopScreencastParams::default())
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to stop the live view: {e}"))
+    }
+
+    async fn dispatch_mouse(&self, event: &MouseInput) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+        let kind = match event.kind {
+            MouseKind::Pressed => DispatchMouseEventType::MousePressed,
+            MouseKind::Released => DispatchMouseEventType::MouseReleased,
+            MouseKind::Moved => DispatchMouseEventType::MouseMoved,
+            MouseKind::Wheel => DispatchMouseEventType::MouseWheel,
+        };
+        let button = match event.button {
+            MouseButtonKind::None => MouseButton::None,
+            MouseButtonKind::Left => MouseButton::Left,
+            MouseButtonKind::Middle => MouseButton::Middle,
+            MouseButtonKind::Right => MouseButton::Right,
+        };
+        let mut params = DispatchMouseEventParams::builder()
+            .r#type(kind)
+            .x(event.x)
+            .y(event.y)
+            .modifiers(event.modifiers)
+            .button(button);
+        if matches!(event.kind, MouseKind::Pressed | MouseKind::Released) {
+            params = params.click_count(event.click_count);
+        }
+        if event.kind == MouseKind::Wheel {
+            params = params.delta_x(event.delta_x).delta_y(event.delta_y);
+        }
+        let params = params
+            .build()
+            .map_err(|e| format!("Bad pointer event: {e}"))?;
+        self.page
+            .execute(params)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to send a pointer event: {e}"))
+    }
+
+    async fn dispatch_key(&self, event: &KeyInput) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        let kind = match (event.down, event.text.is_some()) {
+            (true, true) => DispatchKeyEventType::KeyDown,
+            (true, false) => DispatchKeyEventType::RawKeyDown,
+            (false, _) => DispatchKeyEventType::KeyUp,
+        };
+        let mut params = DispatchKeyEventParams::builder()
+            .r#type(kind)
+            .code(event.code.clone())
+            .key(event.key.clone())
+            .modifiers(event.modifiers);
+        if let Some(text) = &event.text {
+            params = params.text(text.clone()).unmodified_text(text.clone());
+        }
+        if let Some(code) = event.windows_virtual_key_code {
+            params = params
+                .windows_virtual_key_code(code)
+                .native_virtual_key_code(code);
+        }
+        let params = params.build().map_err(|e| format!("Bad key event: {e}"))?;
+        self.page
+            .execute(params)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to send a key: {e}"))
+    }
+
+    async fn insert_text(&self, text: &str) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+        self.page
+            .execute(InsertTextParams::new(text))
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Failed to type: {e}"))
+    }
+
+    async fn viewport(&self) -> Result<(f64, f64), String> {
+        let metrics = self
+            .page
+            .layout_metrics()
+            .await
+            .map_err(|e| format!("Failed to read the viewport: {e}"))?;
+        let viewport = metrics.css_visual_viewport;
+        Ok((viewport.client_width, viewport.client_height))
+    }
+
+    async fn title(&self) -> Option<String> {
+        self.page.get_title().await.ok().flatten()
+    }
+
     async fn attach_diagnostics(
         &self,
         session_id: &str,
@@ -1182,6 +1577,17 @@ pub enum MockCall {
     IsVisible(String),
     /// Recorded by `is_element_enabled(selector)`.
     IsEnabled(String),
+    /// Recorded by `start_screencast`.
+    StartScreencast,
+    StopScreencast,
+    /// Recorded by `dispatch_mouse`: kind and CSS position (rounded).
+    Mouse(String, i64, i64),
+    /// Recorded by `dispatch_key`: down, code, and whether it typed text.
+    Key(bool, String, bool),
+    /// Recorded by `insert_text`: the number of characters only.
+    InsertText(usize),
+    /// Recorded when the browser moves onto a profile that keeps sign-ins.
+    KeepSignIns,
 }
 
 /// Which page operation a scripted connection-class error should fire on, used
@@ -1274,6 +1680,7 @@ pub struct MockBackend {
     element_state: Arc<Mutex<MockElementState>>,
     diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
     diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
+    sign_in_store: Arc<std::sync::Mutex<SignInStore>>,
 }
 
 /// Scripted, poll-counted element state for the `wait`-condition tests. Each
@@ -1333,6 +1740,7 @@ impl Default for MockBackend {
             element_state: Arc::new(Mutex::new(MockElementState::default())),
             diagnostic_console: Arc::new(Mutex::new(Vec::new())),
             diagnostic_network: Arc::new(Mutex::new(Vec::new())),
+            sign_in_store: Arc::new(std::sync::Mutex::new(SignInStore::NotKept)),
         }
     }
 }
@@ -1341,6 +1749,12 @@ impl Default for MockBackend {
 impl MockBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Where sign-ins go; `CanKeep` moves to `Kept` on `keep_sign_ins_now`.
+    pub fn with_sign_in_store(self, store: SignInStore) -> Self {
+        *self.sign_in_store.lock().unwrap() = store;
+        self
     }
 
     /// Override the value returned by `evaluate`. `Some(Value::Null)` mimics a
@@ -1725,6 +2139,63 @@ impl PageHandle for MockPage {
         self.url.clone()
     }
 
+    async fn start_screencast(
+        &self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<ScreencastFrames, String> {
+        self.record(MockCall::StartScreencast).await;
+        let frame = ScreencastFrame {
+            data: b"\xff\xd8mock-frame".to_vec(),
+            css_w: 1280.0,
+            css_h: 720.0,
+            session: 1,
+        };
+        Ok(Box::pin(
+            futures::stream::iter(vec![frame]).chain(futures::stream::pending()),
+        ))
+    }
+
+    async fn stop_screencast(&self) -> Result<(), String> {
+        self.record(MockCall::StopScreencast).await;
+        Ok(())
+    }
+
+    async fn dispatch_mouse(&self, event: &MouseInput) -> Result<(), String> {
+        self.record(MockCall::Mouse(
+            format!("{:?}", event.kind),
+            event.x.round() as i64,
+            event.y.round() as i64,
+        ))
+        .await;
+        Ok(())
+    }
+
+    async fn dispatch_key(&self, event: &KeyInput) -> Result<(), String> {
+        self.record(MockCall::Key(
+            event.down,
+            event.code.clone(),
+            event.text.is_some(),
+        ))
+        .await;
+        Ok(())
+    }
+
+    async fn insert_text(&self, text: &str) -> Result<(), String> {
+        self.record(MockCall::InsertText(text.chars().count()))
+            .await;
+        Ok(())
+    }
+
+    async fn viewport(&self) -> Result<(f64, f64), String> {
+        Ok((1280.0, 720.0))
+    }
+
+    async fn title(&self) -> Option<String> {
+        Some("Mock page".into())
+    }
+
     async fn attach_diagnostics(
         &self,
         session_id: &str,
@@ -1900,6 +2371,25 @@ impl BrowserBackend for MockBackend {
         self.connected.store(true, Ordering::Relaxed);
         self.handler_alive.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn sign_in_store(&self) -> SignInStore {
+        *self.sign_in_store.lock().unwrap()
+    }
+
+    async fn keep_sign_ins_now(&self) -> Result<bool, String> {
+        let moved = {
+            let mut store = self.sign_in_store.lock().unwrap();
+            let can = *store == SignInStore::CanKeep;
+            if can {
+                *store = SignInStore::Kept;
+            }
+            can
+        };
+        if moved {
+            self.record(MockCall::KeepSignIns).await;
+        }
+        Ok(moved)
     }
 }
 

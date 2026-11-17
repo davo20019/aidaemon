@@ -1536,6 +1536,12 @@ pub struct BrowserConfig {
     /// kept small). Clamped to 1..=300 by [`Self::action_timeout`]. Default: 30.
     #[serde(default = "default_action_timeout_secs")]
     pub action_timeout_secs: u64,
+    /// Keep the sign-ins you make in the agent's own browser profile
+    /// (`~/.aidaemon/chrome-profile`), so you sign in to a site once. Off:
+    /// the agent browses with a fresh profile each time and nothing is kept.
+    /// A `user_data_dir` you set yourself is used as it is either way.
+    #[serde(default = "default_true")]
+    pub keep_sign_ins: bool,
 }
 
 impl Default for BrowserConfig {
@@ -1552,6 +1558,7 @@ impl Default for BrowserConfig {
             nav_timeout_secs: default_nav_timeout_secs(),
             element_timeout_secs: default_element_timeout_secs(),
             action_timeout_secs: default_action_timeout_secs(),
+            keep_sign_ins: true,
         }
     }
 }
@@ -1566,12 +1573,18 @@ impl BrowserConfig {
             screenshot_width: self.screenshot_width,
             screenshot_height: self.screenshot_height,
             remote_debugging_port: self.remote_debugging_port,
-            user_data_dir: self.user_data_dir.clone(),
+            // The agent's own profile is dropped when sign-ins are not kept;
+            // a profile the owner named stays theirs.
+            user_data_dir: self.user_data_dir.clone().filter(|dir| {
+                self.keep_sign_ins || Some(dir) != default_browser_user_data_dir().as_ref()
+            }),
             profile: self.profile.clone(),
             session_isolation: self.session_isolation,
             nav_timeout_secs: self.nav_timeout_secs,
             element_timeout_secs: self.element_timeout_secs,
             action_timeout_secs: self.action_timeout_secs,
+            keep_sign_ins: self.keep_sign_ins,
+            agent_profile_dir: default_browser_user_data_dir(),
         }
     }
 

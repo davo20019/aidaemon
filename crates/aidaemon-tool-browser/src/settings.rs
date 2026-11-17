@@ -63,6 +63,16 @@ pub struct BrowserSettings {
     /// stable-DOM fallback for a non-navigating click is derived from this but
     /// kept small). Clamped to 1..=300 by [`Self::action_timeout`]. Default: 30.
     pub action_timeout_secs: u64,
+    /// Keep the sign-ins the owner makes when the agent hands them its
+    /// browser: the first handoff moves an ephemeral browser onto a
+    /// dedicated agent profile at `agent_profile_dir`, and later launches
+    /// use it. Never the owner's own Chrome profile. Ignored when
+    /// `user_data_dir` or `remote_debugging_port` is set (that browser keeps
+    /// its own sign-ins). Default: true.
+    pub keep_sign_ins: bool,
+    /// Where the agent's own profile lives (`~/.aidaemon/browser-profile` in
+    /// the daemon). `None`: sign-ins are never kept.
+    pub agent_profile_dir: Option<String>,
 }
 
 impl Default for BrowserSettings {
@@ -78,6 +88,8 @@ impl Default for BrowserSettings {
             nav_timeout_secs: 30,
             element_timeout_secs: 10,
             action_timeout_secs: 30,
+            keep_sign_ins: true,
+            agent_profile_dir: None,
         }
     }
 }

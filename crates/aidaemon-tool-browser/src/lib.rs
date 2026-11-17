@@ -20,3 +20,6 @@ mod tool;
 
 #[cfg(feature = "chromium")]
 pub use tool::{BrowserTool, policy};
+
+#[cfg(feature = "chromium")]
+pub use tool::live::BrowserSurface;
