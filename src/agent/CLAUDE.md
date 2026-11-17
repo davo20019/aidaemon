@@ -108,9 +108,10 @@ calls instead of checking them.
 - Egress is the `ToolAnnotations.egress` bit, derived per call from typed
   mutation effects (`call_annotations`).
 - A read can still carry data out through what it sends. A tool declares that
-  with `Outbound` (`call_outbound`): a string already present word for word in
-  a user message or tool result holds nothing the run composed and passes; any
-  other URL or a search query goes to the verifier after an untrusted read.
+  with `Outbound` (`call_outbound`): a string the user typed as a whole token
+  of their own message holds nothing the run composed and passes; a string
+  found only in a tool result, any other URL, or a search query goes to the
+  verifier after an untrusted read.
 - A call the verifier does not pass goes to the owner as a one-time card when
   the owner wrote the request in a private chat
   (`refused_check_may_ask_owner`); a decline binds the run through

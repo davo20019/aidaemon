@@ -126,8 +126,9 @@ pub enum Outbound {
     /// Nothing leaves.
     #[default]
     Nothing,
-    /// Exactly these strings leave. A string already present word for word
-    /// in what the user or a tool said holds no data the run composed.
+    /// Exactly these strings leave. A string the user typed as a whole token
+    /// holds no data the run composed; one found only in a tool result does
+    /// not count, since an untrusted page could name it.
     Exact(Vec<String>),
     /// Text the model composed, such as a search query.
     Composed,
