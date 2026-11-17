@@ -20,6 +20,10 @@ env:
   # integration suite needs. Match the daemon's own worker stack budget.
   RUST_MIN_STACK: "8388608"
 
+# Every job reads the repository and nothing else.
+permissions:
+  contents: read
+
 jobs:
   release-tag-guard:
     name: Release tag guard

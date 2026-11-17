@@ -87,7 +87,7 @@ install() {
     elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 -c "${TARBALL}.sha256" >/dev/null 2>&1 || err "Checksum verification failed!"
     else
-        warn "No sha256sum or shasum found — skipping checksum verification"
+        err "No sha256sum or shasum found: the download cannot be verified. Install one and run this again."
     fi
 
     info "Extracting..."
@@ -124,7 +124,8 @@ verify_sha256() {
     elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 -c "$1" >/dev/null 2>&1
     else
-        warn "No sha256sum or shasum found — skipping checksum verification"
+        warn "No sha256sum or shasum found: the download cannot be verified"
+        return 1
     fi
 }
 
