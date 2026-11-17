@@ -6,11 +6,13 @@ on:
   pull_request:
     branches: [master]
 
-# A newer push to a pull request supersedes the runs before it; master keeps
-# every run so each landed commit gets its own result.
+# One run per pull request at a time. A run in progress finishes, and only
+# the newest push waits behind it (GitHub drops any older pending run), so a
+# branch pushed every few minutes still gets results instead of a chain of
+# cancelled runs. Master keeps every run.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'push' && github.sha || 'pr' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
