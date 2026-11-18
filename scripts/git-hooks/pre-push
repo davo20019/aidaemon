@@ -40,7 +40,6 @@ touches() { grep -qE "$1" <<<"$changed"; }
 # Files with uncommitted edits (this session's or another's). They are not
 # being pushed, so a failure that sits only in them does not block.
 dirty="$(git status --porcelain --untracked-files=no | cut -c4- | sed 's/.* -> //' | sort -u)"
-dirty_code="$(grep -E '^(src|crates)/.*\.rs$|schema_goldens|public-api\.txt' <<<"$dirty" || true)"
 
 failed=()
 warned=()
@@ -71,7 +70,7 @@ run_whole() {
     echo "pre-push: $name"
     "$@" >"$log" 2>&1 && return
     show
-    if grep -qE "$scope" <<<"$dirty_code"; then warned+=("$name"); else failed+=("$name"); fi
+    if grep -qE "$scope" <<<"$dirty"; then warned+=("$name"); else failed+=("$name"); fi
 }
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
@@ -116,12 +115,18 @@ fi
 
 # Tool schemas: per-tool goldens and the catalog budget.
 if touches '^(src|crates)/.*\.rs$|schema_goldens'; then
-    run_whole "tool schema goldens" '.' env RUST_MIN_STACK=8388608 \
+    run_whole "tool schema goldens" '^(src|crates)/.*\.rs$|schema_goldens' env RUST_MIN_STACK=8388608 \
         cargo test -q --all-features --lib catalog_
 fi
 
 if touches '^clients/app/'; then
     run "app clippy" bash -c 'cd clients/app && cargo clippy --all-targets -- -D warnings'
+fi
+# The app's headless tests: the app draws what client-core and the protocol
+# decide, so a change there can break them without touching the app.
+if touches '^(clients/app/|crates/(aidaemon-)?client-(core|protocol)/)'; then
+    run_whole "app tests" '^(clients/app/|crates/(aidaemon-)?client-(core|protocol)/)' \
+        bash -c 'cd clients/app && cargo test -q'
 fi
 
 if ((${#warned[@]})); then
