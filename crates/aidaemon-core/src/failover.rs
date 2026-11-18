@@ -125,6 +125,12 @@ pub enum FailoverAction {
 /// [`crate::RequestOptions::fallback_when_unspent`] and the error proves
 /// the attempt used nothing: then it moves on to the next step.
 pub trait FailoverPolicy: Send + Sync {
+    /// Shape `request` for this step before its first attempt: it already
+    /// names the step's model ([`FailoverStep::model`]), so what is only
+    /// valid for another model (a reasoning signature, an encrypted
+    /// reasoning item) can be dropped here. Default: leave it as it is.
+    fn prepare_step(&self, _request: &mut ModelRequest) {}
+
     /// Whether to send `request` on this step at all. An error skips the
     /// attempt and is handled as its failure (for example, a model the app
     /// knows is out of credit). Default: send it.
@@ -284,6 +290,7 @@ impl Provider for Failover {
         let mut last = None;
         for step in &self.steps {
             let mut step_request = step.request(request);
+            self.policy.prepare_step(&mut step_request);
             let mut attempt = 0;
             let error = loop {
                 attempt += 1;
@@ -336,6 +343,7 @@ impl Provider for Failover {
             let mut last = None;
             for (index, step) in self.steps.iter().enumerate() {
                 let mut step_request = step.request(request);
+                self.policy.prepare_step(&mut step_request);
                 let mut attempt = 0;
                 let error = loop {
                     attempt += 1;
@@ -657,6 +665,47 @@ mod tests {
         assert!(
             matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "from the fallback")
         );
+    }
+
+    /// Marks each request with the model it was prepared for (1 for
+    /// `model-a`, 2 for any other).
+    struct TagModel;
+
+    impl FailoverPolicy for TagModel {
+        fn prepare_step(&self, request: &mut ModelRequest) {
+            request.max_output_tokens = Some(if request.model == "model-a" { 1 } else { 2 });
+        }
+
+        fn after_error(
+            &self,
+            _request: &ModelRequest,
+            _error: &ProviderError,
+            _attempt: u32,
+            _attempts: u32,
+        ) -> FailoverAction {
+            FailoverAction::Next
+        }
+    }
+
+    /// Each step's request is prepared for that step's own model, not the
+    /// one the caller asked for.
+    #[tokio::test]
+    async fn each_step_is_prepared_for_its_own_model() {
+        let first = Arc::new(ScriptedProvider::with_results(vec![Err(
+            ProviderError::Transient("down".into()),
+        )]));
+        let second = Arc::new(ScriptedProvider::new(vec![text("from the fallback")]));
+        let chain = Failover::new(vec![
+            FailoverStep::from_arc(first.clone()).model("model-a"),
+            FailoverStep::from_arc(second.clone()).model("model-b"),
+        ])
+        .policy(TagModel);
+        let events = collect(&chain).await;
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Done(r))) if r.text == "from the fallback")
+        );
+        assert_eq!(first.requests()[0].max_output_tokens, Some(1));
+        assert_eq!(second.requests()[0].max_output_tokens, Some(2));
     }
 
     /// A hung step is not retried, even when its policy would retry a

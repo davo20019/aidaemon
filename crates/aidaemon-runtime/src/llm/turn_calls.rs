@@ -184,6 +184,15 @@ fn with_default_options(
 }
 
 impl aidaemon_core::FailoverPolicy for DaemonRecovery {
+    /// A fallback step gets the conversation without the reasoning another
+    /// model produced: replayed reasoning is only valid for its own model.
+    fn prepare_step(&self, request: &mut aidaemon_core::ModelRequest) {
+        crate::chat_bridge::sdk_backed::drop_other_models_reasoning(
+            &mut request.messages,
+            &request.model,
+        );
+    }
+
     fn before_attempt(
         &self,
         request: &aidaemon_core::ModelRequest,
@@ -602,6 +611,10 @@ fn quota_failure(
 struct RecoveryHandle(Arc<DaemonRecovery>);
 
 impl aidaemon_core::FailoverPolicy for RecoveryHandle {
+    fn prepare_step(&self, request: &mut aidaemon_core::ModelRequest) {
+        self.0.prepare_step(request);
+    }
+
     fn before_attempt(
         &self,
         request: &aidaemon_core::ModelRequest,
@@ -756,6 +769,11 @@ pub async fn select_turn_model(
     if let Some(model) = session_pinned_model(host, snapshot, session_id).await {
         return (model, false);
     }
+    // A sub-agent's model was chosen when it was spawned (the parent's, its
+    // specialist's, or the tier the parent asked for): its turns keep it.
+    if host.depth() > 0 {
+        return (own_model().await, false);
+    }
     if is_override {
         return (own_model().await, false);
     }
@@ -769,11 +787,7 @@ pub async fn select_turn_model(
     if let Some(router) = router {
         return (router.select_for_profile(profile).to_string(), true);
     }
-    if host.depth() == 0 {
-        (snapshot.primary_model(), false)
-    } else {
-        (own_model().await, false)
-    }
+    (snapshot.primary_model(), false)
 }
 
 #[cfg(test)]
@@ -792,6 +806,53 @@ mod tests {
             answered_by: "synthetic-fallback".into(),
             resets_at,
         }
+    }
+
+    /// Live failover bug: the request was filtered once, for the model the
+    /// turn asked for, so a fallback model received that model's encrypted
+    /// reasoning. Each step now sends only reasoning its own model produced.
+    #[tokio::test]
+    async fn a_fallback_model_never_receives_the_failed_models_reasoning() {
+        use aidaemon_core::{Failover, FailoverStep, Provider as _};
+        use futures::StreamExt as _;
+        use serde_json::json;
+
+        let key = crate::chat_bridge::sdk_backed::PRODUCED_BY_KEY;
+        let messages = vec![json!({"role": "assistant", "content": "", "tool_calls": [{
+            "id": "c1", "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+            "extra_content": {"chatgpt_reasoning_items": ["sealed"], key: "model-a"},
+        }]})];
+        let request = crate::chat_bridge::sdk_backed::to_sdk_request(
+            "model-a",
+            &messages,
+            &[],
+            &super::ChatOptions::default(),
+        );
+        assert!(request.messages[0].tool_calls[0].provider_data.is_some());
+
+        let primary = Arc::new(ScriptedProvider::with_results(vec![Err(
+            aidaemon_core::ProviderError::Transient("down".into()),
+        )]));
+        let fallback = Arc::new(ScriptedProvider::new(vec![aidaemon_core::ModelResponse {
+            text: "from model-b".into(),
+            ..Default::default()
+        }]));
+        let chain = Failover::new(vec![
+            FailoverStep::from_arc(primary.clone()).model("model-a"),
+            FailoverStep::from_arc(fallback.clone()).model("model-b"),
+        ])
+        .policy(super::RecoveryHandle(Arc::new(recovery())));
+        let _events: Vec<_> = chain.stream(&request).collect().await;
+
+        let to_a = &primary.requests()[0].messages[0].tool_calls[0];
+        assert!(
+            to_a.provider_data.is_some(),
+            "model-a keeps its own reasoning"
+        );
+        let to_b = &fallback.requests()[0].messages[0].tool_calls[0];
+        assert_eq!(to_b.provider_data, None);
+        assert_eq!(to_b.name, "terminal");
     }
 
     #[test]

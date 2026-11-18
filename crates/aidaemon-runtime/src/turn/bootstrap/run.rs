@@ -1297,6 +1297,8 @@ pub async fn run_bootstrap(
     let model = match (digest_outcome.as_ref(), llm_router.as_ref()) {
         (Some(outcome), Some(router))
             if !routed
+                // A sub-agent keeps the model it was spawned with.
+                && agent.depth() == 0
                 && agent
                     .side_calls()
                     .decision_mode(crate::llm::decisions::Decision::ModelRoute)

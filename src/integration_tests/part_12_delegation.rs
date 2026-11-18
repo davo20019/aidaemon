@@ -1463,3 +1463,41 @@ async fn a_request_finished_by_the_parent_after_its_helper_shows_its_total() {
     assert!(total.ends_with(&format!(" {zone}).")), "{total}");
     assert!(!reply.contains("wasn't measured"), "{reply}");
 }
+
+/// A sub-agent runs on the model it was spawned with. With an autonomous
+/// primary model, `select_turn_model` used to hand every child turn the
+/// primary model, so a `model_tier: fast` child (or a specialist's model)
+/// silently ran on the primary one.
+#[tokio::test]
+async fn a_child_spawned_on_the_fast_tier_runs_on_the_fast_model() {
+    use crate::runtime_ports::{ChildAgentRequest, ChildAgentRuntime};
+    let harness = crate::testing::setup_test_agent_with_models(
+        MockProvider::with_responses(vec![MockProvider::text_response("Counted to 3.")]),
+        "gpt-6-synthetic",
+        "synthetic-fast",
+    )
+    .await
+    .unwrap();
+    let provider = harness.provider.clone();
+    let agent = Arc::new(harness.agent);
+    let mut request = ChildAgentRequest::new(
+        "Count to 3",
+        "Count to 3.",
+        ChannelContext::private("test"),
+        UserRole::Owner,
+    );
+    request.model_tier = Some(aidaemon_providers::routing::Tier::Fast);
+    agent.run_child(request).await.unwrap();
+    let models: Vec<String> = provider
+        .call_log
+        .lock()
+        .await
+        .iter()
+        .map(|call| call.model.clone())
+        .collect();
+    assert!(!models.is_empty());
+    assert!(
+        models.iter().all(|model| model == "synthetic-fast"),
+        "{models:?}"
+    );
+}
