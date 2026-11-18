@@ -1162,8 +1162,8 @@ fn stamp(at: impl Fn() -> u64 + 'static) -> Text {
     .text_color(colors::FAINT)
 }
 
-/// Under a reply: its time, Copy, and the provider and model that wrote
-/// it when the daemon said.
+/// Under a reply: the provider's mark and the model that wrote it when the
+/// daemon said, then its time and Copy.
 fn reply_footer(
     store: Store,
     content: impl Fn() -> String + Clone + 'static,
@@ -1175,35 +1175,33 @@ fn reply_footer(
         .items_center()
         .gap_2()
         .min_w(px(0.0))
-        .child(stamp(at))
+        .child(dynamic(move || {
+            let served = served()?;
+            Some(untracked(move || served_by(served)))
+        }))
+        .child(stamp(at).flex_shrink(0.0))
         // An icon, as chat apps keep it: the reply is what is read.
         .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
             set_clipboard(content());
             store.say("Copied the reply");
         }))
-        .child(dynamic(move || {
-            let served = served()?;
-            Some(untracked(move || served_by(served)))
-        }))
 }
 
-/// Which provider and model wrote a reply: the provider's mark when it has
-/// one, then "Provider · model", cut short on a narrow screen.
+/// Which model wrote a reply: the provider's mark when it has one, then
+/// the model, cut short on a narrow screen.
 fn served_by(served: ServedBy) -> View {
-    let label = format!("{} · {}", served.provider, served.model);
     let mut row = view()
         .flex_row()
         .items_center()
         .gap_1()
-        .flex_1()
+        .flex_shrink(1.0)
         .min_w(px(0.0));
     if let Some(glyph) = ui::provider_glyph(&served.preset) {
         row = row.child(ui::icon_inline(glyph).accessibility_elements_hidden(true));
     }
     row.child(
-        text(label)
+        text(served.model)
             .truncate()
-            .flex_1()
             .min_w(px(0.0))
             .text_size(px(type_scale::XS))
             .text_color(colors::FAINT),
