@@ -4487,6 +4487,15 @@ fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Op
     Some(parts.join("\n"))
 }
 
+/// The line a run's result starts with when another agent than the one
+/// asked for did the work.
+fn substituted_agent_note(asked: &str, ran: &str) -> String {
+    format!(
+        "[This run was done by `{ran}`, not `{asked}`: `{asked}` could not run it under this \
+         run's access rules. Attribute the work to `{ran}`.]"
+    )
+}
+
 /// Whether a run's call output says it never started (a refusal before
 /// launch, typed by this tool's own prefixes).
 fn run_did_not_start(output: &str) -> bool {
@@ -5687,7 +5696,16 @@ impl CliAgentTool {
                 if !started {
                     crate::helper_run::folders::release_request_folders(&made_folders, facts);
                 }
-                output
+                // Which agent did the work is the daemon's fact to state: a
+                // run that went to another agent than the one asked for says
+                // so first (live 2026-11-18: codex ran a run asked of claude
+                // and the reply said "Claude Code reported").
+                match (output, args.tool.as_deref()) {
+                    (Ok(text), Some(asked)) if started && !asked.eq_ignore_ascii_case(&tool) => {
+                        Ok(format!("{}\n{text}", substituted_agent_note(asked, &tool)))
+                    }
+                    (output, _) => output,
+                }
             }
             "check" => {
                 let task_id = args.task_id.as_ref().ok_or_else(|| {
@@ -7466,6 +7484,13 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("/w/other/notes.txt"), "{error}");
         assert!(apply_claude_confined_adapter(&mut launch.clone(), false, None, &[], &[]).is_err());
+    }
+
+    #[test]
+    fn a_run_done_by_another_agent_says_which_did_it() {
+        let note = substituted_agent_note("claude", "codex");
+        assert!(note.contains("done by `codex`, not `claude`"), "{note}");
+        assert!(!run_did_not_start(&note), "a substituted run still ran");
     }
 
     /// A write root that is a single file is measured itself: creating it,
