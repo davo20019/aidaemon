@@ -1170,16 +1170,25 @@ fn reply_footer(
     at: impl Fn() -> u64 + 'static,
     served: impl Fn() -> Option<ServedBy> + Clone + 'static,
 ) -> View {
-    view()
+    // What it is (model · time) and what can be done with it (Copy) are
+    // two groups: a dot inside the first, a wider gap between them.
+    let about = view()
         .flex_row()
         .items_center()
-        .gap_2()
+        .gap_1()
+        .flex_shrink(1.0)
         .min_w(px(0.0))
         .child(dynamic(move || {
             let served = served()?;
             Some(untracked(move || served_by(served)))
         }))
-        .child(stamp(at).flex_shrink(0.0))
+        .child(stamp(at).flex_shrink(0.0));
+    view()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .min_w(px(0.0))
+        .child(about)
         // An icon, as chat apps keep it: the reply is what is read.
         .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
             set_clipboard(content());
@@ -1188,7 +1197,7 @@ fn reply_footer(
 }
 
 /// Which model wrote a reply: the provider's mark when it has one, then
-/// the model, cut short on a narrow screen.
+/// the model, cut short on a narrow screen, and the dot before the time.
 fn served_by(served: ServedBy) -> View {
     let mut row = view()
         .flex_row()
@@ -1205,6 +1214,15 @@ fn served_by(served: ServedBy) -> View {
             .min_w(px(0.0))
             .text_size(px(type_scale::XS))
             .text_color(colors::FAINT),
+    )
+    // Kept when the model is cut short, so the time never reads as part
+    // of its name.
+    .child(
+        text("·")
+            .flex_shrink(0.0)
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT)
+            .accessibility_elements_hidden(true),
     )
 }
 
