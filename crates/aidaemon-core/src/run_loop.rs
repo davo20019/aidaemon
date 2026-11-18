@@ -53,6 +53,10 @@ pub(crate) struct Driver<'a> {
     /// The decline set was made for this segment, not given by the caller;
     /// it does not outlive the segment.
     own_declines: bool,
+    /// Settles what a nested call ([`crate::NestedCalls`]) needs while its
+    /// tool waits; `None` when the run has no resolver (the call then goes
+    /// unanswered).
+    resolver: Option<&'a dyn crate::agent::InterruptResolver>,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -150,7 +154,17 @@ impl<'a> Driver<'a> {
             base_elapsed_ms,
             own_declines,
             report_run_end: true,
+            resolver: None,
         }
+    }
+
+    /// Settle nested calls' interruptions with `resolver` while tools run.
+    pub(crate) fn with_resolver(
+        mut self,
+        resolver: &'a dyn crate::agent::InterruptResolver,
+    ) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// Apply what a resolution means for the run before the pending call is
@@ -177,18 +191,7 @@ impl<'a> Driver<'a> {
             }
             _ => return resolution,
         };
-        // A request without effects is remembered by its exact subject; a
-        // blank subject names no call, so it binds nothing.
-        let call_key;
-        let effects: &[EffectKey] = if !request.effects.is_empty() {
-            &request.effects
-        } else if request.subject.trim().is_empty() {
-            &[]
-        } else {
-            call_key = [EffectKey::named(EffectClass::Call, &request.subject)];
-            &call_key
-        };
-        for effect in effects {
+        for effect in &decline_keys(request) {
             if !self.state.declined.contains(effect) {
                 self.state.declined.push(effect.clone());
             }
@@ -997,7 +1000,7 @@ impl<'a> Driver<'a> {
             })
             .await?;
         }
-        let (receipt, mut output) = self.dispatch(&item, invocation).await;
+        let (receipt, mut output) = self.dispatch(&item, invocation, None).await;
         let paused = output.suspended.take().and_then(|child| {
             let interruption = child.pending.as_ref()?.interruption.clone();
             Some((interruption, child))
@@ -1129,6 +1132,141 @@ impl<'a> Driver<'a> {
         Verdict::Allow
     }
 
+    /// Judge one nested call and send the verdict to the tool waiting on
+    /// it.
+    async fn serve_nested(&self, ask: crate::nested::NestedAsk) {
+        let verdict = self.judge_nested(ask.call).await;
+        let _ = ask.reply.send(verdict);
+    }
+
+    /// A nested call is judged as the model's calls are ([`Self::decide`]):
+    /// an effect the owner already declined is refused before any hook,
+    /// then each hook decides, and an interruption is settled at once by
+    /// the run's resolver (the tool is waiting). It is never executed here,
+    /// so a hook that would answer in its place or rewrite it refuses it.
+    async fn judge_nested(&self, call: ToolCall) -> crate::NestedVerdict {
+        use crate::NestedVerdict;
+        let deny = |reason: String| NestedVerdict::Deny { reason };
+        let Some(tool) = self.agent.tools.get(&call.name) else {
+            return deny(format!("this run has no tool `{}`", call.name));
+        };
+        if let Err(reason) = self.check_call(tool.as_ref(), &call) {
+            return deny(format!("the call is not valid: {reason}"));
+        }
+        let info = ToolInfo {
+            annotations: tool.annotations_for(&call.arguments),
+            access: tool.access(&call.arguments),
+            effects: tool.effects(&call.arguments),
+            outbound: tool.outbound(&call.arguments),
+        };
+        // This run's declines and those of every run sharing its set,
+        // however recent.
+        let mut declined = self.state.declined.clone();
+        if let Some(shared) = self.state.shared_declines() {
+            shared.exchange(&mut declined);
+        }
+        if let Some(reason) = declined_reason(&declined, &info) {
+            return deny(reason);
+        }
+        let ctx = HookContext {
+            declined: &declined,
+            ..self.ctx()
+        };
+        let guard = self.guard(HookPoint::BeforeTool);
+        let mut waived: Vec<usize> = Vec::new();
+        let mut index = 0;
+        while let Some(hook) = self.agent.hooks.get(index) {
+            if waived.contains(&index) {
+                index += 1;
+                continue;
+            }
+            let answer = guard
+                .run(hook.as_ref(), hook.before_tool(&ctx, &call, &info))
+                .await
+                .unwrap_or_else(|| ToolDecision::Deny {
+                    reason: format!("the safety check `{}` gave no answer", hook.name()),
+                });
+            match answer {
+                ToolDecision::Allow => {}
+                ToolDecision::Rewrite { arguments } if arguments == call.arguments => {}
+                ToolDecision::Deny { reason } => {
+                    guard.decided(hook.name(), "deny", Some(&reason)).await;
+                    return deny(reason);
+                }
+                ToolDecision::Answer { .. } | ToolDecision::Rewrite { .. } => {
+                    let reason = format!(
+                        "the safety check `{}` would answer or change this call, which a program \
+                         acting on its own cannot take",
+                        hook.name()
+                    );
+                    guard.decided(hook.name(), "deny", Some(&reason)).await;
+                    return deny(reason);
+                }
+                ToolDecision::Interrupt { reason, kind } => {
+                    guard.decided(hook.name(), "interrupt", Some(&reason)).await;
+                    let Some(resolver) = self.resolver else {
+                        return NestedVerdict::Unanswered {
+                            reason: format!(
+                                "{OWNER_UNANSWERED} it needs an answer, and nobody can be asked \
+                                 in this run: {reason}"
+                            ),
+                        };
+                    };
+                    let mut interruption = Interruption {
+                        call: call.clone(),
+                        reason,
+                        kind,
+                        digest: None,
+                    };
+                    // The owner sees the question without secrets.
+                    self.scrubber().json(&mut interruption.call);
+                    self.scrubber().text(&mut interruption.reason);
+                    self.scrubber().json(&mut interruption.kind);
+                    match resolver.resolve(&self.state, &interruption).await {
+                        Some(Resolution::Approve) => waived.push(index),
+                        Some(Resolution::Unanswered { reason }) => {
+                            return NestedVerdict::Unanswered {
+                                reason: owner_marked(OWNER_UNANSWERED, reason),
+                            };
+                        }
+                        None => {
+                            return NestedVerdict::Unanswered {
+                                reason: format!(
+                                    "{OWNER_UNANSWERED} nobody settled what this call needed"
+                                ),
+                            };
+                        }
+                        Some(Resolution::OwnerDeclined { request, reason }) => {
+                            self.decline_nested(&request);
+                            return NestedVerdict::Declined {
+                                reason: owner_marked(OWNER_DECLINED, reason),
+                            };
+                        }
+                        Some(Resolution::Deny { reason }) => {
+                            if let InterruptKind::OwnerApproval(request) = &interruption.kind {
+                                self.decline_nested(request);
+                                return NestedVerdict::Declined {
+                                    reason: owner_marked(OWNER_DECLINED, reason),
+                                };
+                            }
+                            return deny(reason);
+                        }
+                    }
+                }
+            }
+            index += 1;
+        }
+        NestedVerdict::Allow
+    }
+
+    /// Remember an owner's decline of a nested call for this run and every
+    /// run sharing its declines: this run takes it in before its next call.
+    fn decline_nested(&self, request: &crate::approval::OwnerApprovalRequest) {
+        if let Some(shared) = self.state.shared_declines() {
+            shared.record(&decline_keys(request));
+        }
+    }
+
     /// Execute approved calls concurrently and record results in order.
     async fn flush(
         &mut self,
@@ -1153,13 +1291,28 @@ impl<'a> Driver<'a> {
             })
             .await?;
         }
-        let this = &*self;
-        let results = join_all(
-            items
-                .iter()
-                .map(|item| this.dispatch(item, Invocation::Call)),
-        )
-        .await;
+        let results = {
+            let this = &*self;
+            // While the batch runs, its tools may have calls they make on their
+            // own judged (`NestedCalls`): served here, beside the batch.
+            let (asks_tx, mut asks) = tokio::sync::mpsc::unbounded_channel();
+            let nested = crate::nested::NestedCalls::new(asks_tx);
+            let work = join_all(
+                items
+                    .iter()
+                    .map(|item| this.dispatch(item, Invocation::Call, Some(nested.clone()))),
+            );
+            drop(nested);
+            tokio::pin!(work);
+            let mut judging = futures::stream::FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    results = &mut work => break results,
+                    Some(ask) = asks.recv() => judging.push(this.serve_nested(ask)),
+                    Some(()) = judging.next(), if !judging.is_empty() => {}
+                }
+            }
+        };
         for (receipt, output) in results {
             let action = self.record(receipt, output).await?;
             track(action, nudge, stop);
@@ -1169,7 +1322,12 @@ impl<'a> Driver<'a> {
     }
 
     /// Run one tool with a timeout and cancellation, producing its receipt.
-    async fn dispatch(&self, item: &Approved, invocation: Invocation) -> (Receipt, ToolOutput) {
+    async fn dispatch(
+        &self,
+        item: &Approved,
+        invocation: Invocation,
+        nested: Option<crate::nested::NestedCalls>,
+    ) -> (Receipt, ToolOutput) {
         let call = &item.call;
         let tool = self
             .agent
@@ -1182,7 +1340,8 @@ impl<'a> Driver<'a> {
             .with_cancel(self.cancel.child_token())
             .with_declines(self.state.shared_declines().cloned().unwrap_or_default())
             .with_authority(self.run_authority())
-            .with_extensions(self.agent.extensions.clone());
+            .with_extensions(self.agent.extensions.clone())
+            .with_nested(nested);
         // A tool's own timeout hint replaces the default, but nothing may
         // outlive the run's remaining wall-clock budget.
         let per_tool = tool.timeout().unwrap_or(self.agent.limits.tool_timeout);
@@ -2260,6 +2419,28 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
 
 /// The refusal for a call with an effect the owner declined earlier in the
 /// run, if it has one.
+/// What an owner's decline of `request` binds: its effects, or, for a
+/// request without effects, its exact subject (a blank subject names no
+/// call and binds nothing).
+fn decline_keys(request: &crate::approval::OwnerApprovalRequest) -> Vec<EffectKey> {
+    if !request.effects.is_empty() {
+        request.effects.clone()
+    } else if request.subject.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![EffectKey::named(EffectClass::Call, &request.subject)]
+    }
+}
+
+/// `reason` marked as the owner's answer (`marker`), once.
+fn owner_marked(marker: &str, reason: String) -> String {
+    if reason.starts_with(marker) {
+        reason
+    } else {
+        format!("{marker} {reason}")
+    }
+}
+
 fn declined_reason(declined: &[EffectKey], info: &ToolInfo) -> Option<String> {
     let effect = info
         .effects

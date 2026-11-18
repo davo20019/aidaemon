@@ -469,6 +469,17 @@ pub aidaemon_core::ModelErrorDecision::Recover
 pub aidaemon_core::ModelErrorDecision::Recover::response: aidaemon_core::ModelResponse
 pub aidaemon_core::ModelErrorDecision::Retry
 pub aidaemon_core::ModelErrorDecision::Retry::after: core::time::Duration
+#[non_exhaustive] pub enum aidaemon_core::NestedVerdict
+pub aidaemon_core::NestedVerdict::Allow
+pub aidaemon_core::NestedVerdict::Declined
+pub aidaemon_core::NestedVerdict::Declined::reason: alloc::string::String
+pub aidaemon_core::NestedVerdict::Deny
+pub aidaemon_core::NestedVerdict::Deny::reason: alloc::string::String
+pub aidaemon_core::NestedVerdict::Unanswered
+pub aidaemon_core::NestedVerdict::Unanswered::reason: alloc::string::String
+impl aidaemon_core::NestedVerdict
+pub fn aidaemon_core::NestedVerdict::is_allowed(&self) -> bool
+pub fn aidaemon_core::NestedVerdict::reason(&self) -> core::option::Option<&str>
 pub enum aidaemon_core::Outbound
 pub aidaemon_core::Outbound::Composed
 pub aidaemon_core::Outbound::Exact(alloc::vec::Vec<alloc::string::String>)
@@ -943,6 +954,11 @@ pub aidaemon_core::ModelResponse::reasoning: core::option::Option<alloc::string:
 pub aidaemon_core::ModelResponse::text: alloc::string::String
 pub aidaemon_core::ModelResponse::tool_calls: alloc::vec::Vec<aidaemon_core::ToolCall>
 pub aidaemon_core::ModelResponse::usage: aidaemon_core::Usage
+pub struct aidaemon_core::NestedCalls
+impl aidaemon_core::NestedCalls
+pub async fn aidaemon_core::NestedCalls::authorize(&self, aidaemon_core::ToolCall) -> aidaemon_core::NestedVerdict
+impl core::fmt::Debug for aidaemon_core::NestedCalls
+pub fn aidaemon_core::NestedCalls::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct aidaemon_core::OwnerApprovalRequest
 pub aidaemon_core::OwnerApprovalRequest::card: core::option::Option<alloc::boxed::Box<aidaemon_core::ApprovalCard>>
 pub aidaemon_core::OwnerApprovalRequest::effects: alloc::vec::Vec<aidaemon_core::EffectKey>
@@ -1141,6 +1157,7 @@ pub aidaemon_core::ToolContext::call_id: alloc::string::String
 pub aidaemon_core::ToolContext::cancel: tokio_util::sync::cancellation_token::CancellationToken
 pub aidaemon_core::ToolContext::declines: core::option::Option<aidaemon_core::SharedDeclines>
 pub aidaemon_core::ToolContext::extensions: aidaemon_core::Extensions
+pub aidaemon_core::ToolContext::nested: core::option::Option<aidaemon_core::NestedCalls>
 pub aidaemon_core::ToolContext::run_id: aidaemon_core::RunId
 pub aidaemon_core::ToolContext::session_id: alloc::string::String
 pub aidaemon_core::ToolContext::turn: u32
@@ -1150,6 +1167,7 @@ pub fn aidaemon_core::ToolContext::with_authority(self, core::option::Option<aid
 pub fn aidaemon_core::ToolContext::with_cancel(self, tokio_util::sync::cancellation_token::CancellationToken) -> Self
 pub fn aidaemon_core::ToolContext::with_declines(self, aidaemon_core::SharedDeclines) -> Self
 pub fn aidaemon_core::ToolContext::with_extensions(self, aidaemon_core::Extensions) -> Self
+pub fn aidaemon_core::ToolContext::with_nested(self, core::option::Option<aidaemon_core::NestedCalls>) -> Self
 pub fn aidaemon_core::ToolContext::with_run(self, aidaemon_core::RunId, u32) -> Self
 pub struct aidaemon_core::ToolError(pub alloc::string::String)
 impl aidaemon_core::ToolError

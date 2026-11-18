@@ -289,6 +289,7 @@ impl sdk::Hook for DispatchGate {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     call_id: call.id.clone(),
+                    nested: None,
                 },
                 reply,
             }))
@@ -362,6 +363,7 @@ impl aidaemon_tools::OutcomeRunner for TurnDispatch {
                     name: tool.to_string(),
                     arguments,
                     call_id: ctx.call_id.clone(),
+                    nested: ctx.nested.clone(),
                 },
                 reply,
             }))

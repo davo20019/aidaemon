@@ -649,6 +649,11 @@ pub trait ToolDispatch: TurnHost {
             facts.trust_roots = Some(roots.to_vec());
             facts.trust_cwd = Some(cwd.to_string());
         }
+        // A tool driving another program has that program's requests judged
+        // by the run (`cli_agent`'s approval forwarding).
+        if let Some(nested) = ctx.nested {
+            facts.extensions.insert(nested.clone());
+        }
         // A child inherits this turn's authority, not a re-resolution.
         if dispatch.spawns_child_agents
             && let Some(turn_authority) = ctx.turn_authority

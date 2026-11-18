@@ -146,6 +146,7 @@ mod tests {
             turn_authority: None,
             trust_roots: None,
             lone_root_call: false,
+            nested: None,
         };
         use aidaemon_runtime::engine::dispatcher::ToolDispatch as _;
         let error = harness

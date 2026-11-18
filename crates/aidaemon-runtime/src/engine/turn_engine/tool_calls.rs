@@ -746,6 +746,7 @@ impl TurnEngine<'_> {
                     name: request.name.clone(),
                     arguments: request.arguments.clone(),
                     call_id: request.call_id.clone(),
+                    nested: None,
                 },
                 arguments: arguments.to_string(),
                 injected_dir: injected_dir.map(str::to_string),
@@ -1486,6 +1487,7 @@ impl TurnEngine<'_> {
             turn_authority,
             trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
             lone_root_call: self.depth() == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
+            nested: request.nested.as_ref(),
         }
     }
 

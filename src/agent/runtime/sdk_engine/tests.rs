@@ -3503,6 +3503,7 @@ async fn a_model_parent_authority_is_stripped_where_none_is_injected() {
             turn_authority,
             trust_roots: None,
             lone_root_call: false,
+            nested: None,
         };
         use aidaemon_runtime::engine::dispatcher::ToolDispatch as _;
         harness

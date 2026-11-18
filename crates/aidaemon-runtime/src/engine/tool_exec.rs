@@ -68,6 +68,10 @@ pub struct ToolExecCtx<'a> {
     /// fresh registry lookup, so a server reload mid-turn cannot swap in a
     /// tool nobody judged.
     pub mcp_tool: Option<&'a Arc<dyn aidaemon_tools::OutcomeTool>>,
+    /// The kernel's handle for judging calls the tool makes on its own
+    /// (a coding agent it drives asking to act), handed to the tool in its
+    /// call context's extensions.
+    pub nested: Option<&'a aidaemon_core::NestedCalls>,
 }
 
 /// No adapter (native or MCP) is registered under the requested name, so the

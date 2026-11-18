@@ -186,6 +186,10 @@ pub struct ToolContext {
     /// What this run may do, when a hook enforces it. A tool that starts
     /// another run must not let it do more.
     pub authority: Option<Authority>,
+    /// Has a call the tool makes on its own (a program it drives asks to
+    /// act) judged by the run's safeguards; see [`crate::NestedCalls`].
+    /// `None` outside a running batch.
+    pub nested: Option<crate::NestedCalls>,
 }
 
 impl ToolContext {
@@ -201,6 +205,7 @@ impl ToolContext {
             extensions: Extensions::default(),
             declines: None,
             authority: None,
+            nested: None,
         }
     }
 
@@ -227,6 +232,11 @@ impl ToolContext {
 
     pub fn with_authority(mut self, authority: Option<Authority>) -> Self {
         self.authority = authority;
+        self
+    }
+
+    pub fn with_nested(mut self, nested: Option<crate::NestedCalls>) -> Self {
+        self.nested = nested;
         self
     }
 }

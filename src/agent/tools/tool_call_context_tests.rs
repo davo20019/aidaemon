@@ -181,6 +181,7 @@ fn owner_ctx<'a>(
         turn_authority: Some(authority),
         trust_roots: Some((roots, PROJECT)),
         lone_root_call: false,
+        nested: None,
     }
 }
 
@@ -432,6 +433,7 @@ async fn workspace_root_and_mandate_fence_are_dispatcher_facts() {
         turn_authority: None,
         trust_roots: None,
         lone_root_call: false,
+        nested: None,
     };
     let facts = harness
         .agent
@@ -514,6 +516,7 @@ fn mandate_free_ctx() -> ToolExecCtx<'static> {
         turn_authority: None,
         trust_roots: None,
         lone_root_call: false,
+        nested: None,
     }
 }
 

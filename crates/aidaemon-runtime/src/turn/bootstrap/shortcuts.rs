@@ -75,6 +75,7 @@ pub async fn maybe_handle_stop_command(
                 turn_authority: None,
                 trust_roots: None,
                 lone_root_call: false,
+                nested: None,
             },
         )
         .await

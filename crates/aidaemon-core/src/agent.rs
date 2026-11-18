@@ -189,6 +189,7 @@ impl Agent {
         }
         let outcome = Driver::new(&self.inner, state, cancel.clone())
             .without_run_end()
+            .with_resolver(resolver)
             .drive(None)
             .await?;
         self.settle_interruptions(outcome, cancel, resolver).await
@@ -225,6 +226,7 @@ impl Agent {
         }
         let outcome = Driver::new(&self.inner, state, cancel.clone())
             .without_run_end()
+            .with_resolver(resolver)
             .drive(Some(resolution))
             .await?;
         self.settle_interruptions(outcome, cancel, resolver).await
@@ -243,6 +245,7 @@ impl Agent {
             self.check_owner(&outcome.state)?;
             outcome = Driver::new(&self.inner, outcome.state, cancel.clone())
                 .without_run_end()
+                .with_resolver(resolver)
                 .drive(Some(resolution))
                 .await?;
         }

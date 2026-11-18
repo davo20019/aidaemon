@@ -438,7 +438,7 @@ impl ExecutionBackend for LocalBackend {
         command
             .current_dir(cwd_host)
             .envs(request.env)
-            .stdin(if request.stdin.is_some() {
+            .stdin(if request.stdin.is_some() || request.keep_stdin {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -454,7 +454,13 @@ impl ExecutionBackend for LocalBackend {
         }
         configure_command_for_process_group(&mut command);
         let mut child = command.spawn()?;
-        if let (Some(stdin), Some(mut pipe)) = (request.stdin, child.stdin.take()) {
+        if request.keep_stdin {
+            // The caller writes for the process's life; what it gave up
+            // front goes first.
+            if let (Some(stdin), Some(pipe)) = (request.stdin, child.stdin.as_mut()) {
+                pipe.write_all(&stdin).await?;
+            }
+        } else if let (Some(stdin), Some(mut pipe)) = (request.stdin, child.stdin.take()) {
             tokio::spawn(async move {
                 let _ = pipe.write_all(&stdin).await;
             });

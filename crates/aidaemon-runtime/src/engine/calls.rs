@@ -56,6 +56,9 @@ pub struct KernelCall {
     pub name: String,
     pub arguments: Value,
     pub call_id: String,
+    /// The kernel's handle for judging calls the tool makes on its own
+    /// (`ToolContext::nested`): a program it drives asking to act.
+    pub nested: Option<sdk::NestedCalls>,
 }
 
 /// A dispatched call came back to the kernel; record it.

@@ -223,6 +223,11 @@ pub struct ExecutionRequest {
     pub env: BTreeMap<String, String>,
     pub env_remove: Vec<String>,
     pub stdin: Option<Vec<u8>>,
+    /// Leave the process's stdin open for the caller to write to over its
+    /// life ([`SpawnedProcess::take_stdin`]), after `stdin` when given. A
+    /// backend that cannot keep a pipe open spawns as without it, and
+    /// `take_stdin` returns `None`.
+    pub keep_stdin: bool,
 }
 
 impl ExecutionRequest {
@@ -233,6 +238,7 @@ impl ExecutionRequest {
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             stdin: None,
+            keep_stdin: false,
         }
     }
 
@@ -246,6 +252,7 @@ impl ExecutionRequest {
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             stdin: None,
+            keep_stdin: false,
         }
     }
 }
@@ -335,6 +342,12 @@ impl SpawnedProcess {
 
     pub fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.child.stderr.take()
+    }
+
+    /// The process's open stdin, when it was spawned with
+    /// [`ExecutionRequest::keep_stdin`] by a backend that keeps it.
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.stdin.take()
     }
 
     pub fn into_child(self) -> Child {
