@@ -141,6 +141,8 @@ const LAST_PROJECT_KEY: &str = "aidaemon.last_project";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
 const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
 const ENTER_QUEUES_KEY: &str = "aidaemon.enter-queues";
+/// How long after a send the composer's Stop ignores a press.
+const SEND_THEN_STOP_GUARD_MS: u64 = 1_000;
 /// The first approval card says how approvals work, once per device.
 const APPROVALS_TAUGHT_KEY: &str = "aidaemon.approvals-taught";
 
@@ -316,6 +318,11 @@ pub struct Store {
     /// While the agent works, Enter queues (sends after) and ⌘↩ tells it
     /// now, instead of the other way round (this device).
     enter_queues: Signal<bool>,
+    /// When this device last sent a message: the composer's Stop, which
+    /// takes Send's place the moment the box empties, ignores a press just
+    /// after it (a second tap of Send stopped the work it had just joined,
+    /// live 2026-11-18).
+    sent_at: Signal<u64>,
     /// The conversation whose name is being edited in the sidebar.
     renaming: Signal<Option<String>>,
     /// The conversation whose project is being chosen, and whether the
@@ -393,6 +400,7 @@ impl Store {
             composer_edit: signal(0),
             show_archived: signal(false),
             archived_open: signal(None),
+            sent_at: signal(0),
             enter_queues: signal(
                 nsh_core::storage::Storage::get_item(ENTER_QUEUES_KEY).as_deref() == Some("1"),
             ),
@@ -2443,6 +2451,7 @@ impl Store {
         let project = self.new_project.get_untracked();
         match self.act(|c| c.submit(key.as_deref(), &text, mid_run, project)) {
             Ok(true) => {
+                self.sent_at.set(now_ms());
                 Self::keep_draft(key.as_deref().unwrap_or(NEW), "");
                 self.drafts.update(|d| {
                     d.remove(key.as_deref().unwrap_or(NEW));
@@ -2582,6 +2591,15 @@ impl Store {
 
     pub fn stop(&self, session: &str) {
         self.act(|c| c.stop(session));
+    }
+
+    /// The composer's Stop: ignored within a second of a send from this
+    /// device, where it is most likely Send pressed again.
+    pub fn stop_from_composer(&self, session: &str) {
+        if now_ms().saturating_sub(self.sent_at.get_untracked()) < SEND_THEN_STOP_GUARD_MS {
+            return;
+        }
+        self.stop(session);
     }
 
     pub fn cancel(&self, task: &str) {

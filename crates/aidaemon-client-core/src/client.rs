@@ -400,6 +400,9 @@ pub struct Client {
     /// Messages sent while the work runs (to be read now or after), until
     /// accepted: the waiting list reads again then.
     queue_sends: BTreeSet<String>,
+    /// Stop requests in flight, by request id: the conversation each was
+    /// for, so its report lands there and not on every page.
+    stop_sends: BTreeMap<String, String>,
     /// The file undo in flight: its request and the file.
     revert_request: Option<(String, String)>,
     /// A project delete in flight, and the project's name.
@@ -572,6 +575,18 @@ impl Client {
     fn answer(&mut self, frame: &ServerFrame, cx: &Context, out: &mut Vec<Effect>) -> bool {
         let mine = |slot: &Option<String>, id: &str| slot.as_deref() == Some(id);
         match frame {
+            // A stop's report belongs to the conversation stopped: a note
+            // there, not the app-wide notice that followed the owner onto
+            // every other page until dismissed (live 2026-11-18).
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Stopped { report },
+            } if self.stop_sends.contains_key(request_id) => {
+                if let Some(session) = self.stop_sends.remove(request_id) {
+                    self.state.note(&session, report.clone());
+                }
+                return true;
+            }
             ServerFrame::Ack {
                 request_id,
                 result: CommandResult::Uploaded { attachment },
@@ -2290,9 +2305,10 @@ impl Client {
 
     pub fn stop(&mut self, session: &str) {
         self.stopping.insert(session.to_owned());
-        self.send(Command::StopTurn {
+        let id = self.send(Command::StopTurn {
             session_id: session.to_owned(),
         });
+        self.stop_sends.insert(id, session.to_owned());
     }
 
     pub fn cancel(&mut self, task: &str) {
@@ -3551,6 +3567,29 @@ mod tests {
                 |(_, c)| matches!(c, Command::ListQueued { session_id } if session_id == "app:a")
             ),
             "{sent:?}"
+        );
+    }
+
+    /// Live 2026-11-18: a stop's report became the app-wide notice and
+    /// showed on every other conversation until dismissed. It is a note in
+    /// the conversation that was stopped.
+    #[test]
+    fn a_stop_report_is_a_note_in_the_stopped_conversation() {
+        let mut client = Client::new();
+        let here = cx(Some("app:a"));
+        client.stop("app:a");
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"stopped","report":"Stopped: working on your message"}}}}"#
+            )),
+            &here,
+        );
+        assert_eq!(client.state.notice, None);
+        let lines = &client.state.sessions["app:a"].lines;
+        assert!(
+            matches!(lines.last(), Some(Line::Note { text, ended: None }) if text.contains("Stopped")),
+            "{lines:?}"
         );
     }
 

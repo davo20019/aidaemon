@@ -285,6 +285,13 @@ impl State {
         }
     }
 
+    /// A note from the client in conversation `session` (not a turn's end).
+    pub(crate) fn note(&mut self, session: &str, text: String) {
+        self.session(session)
+            .lines
+            .push(Line::Note { text, ended: None });
+    }
+
     fn apply_result(&mut self, result: CommandResult) {
         match result {
             CommandResult::Sessions { sessions, .. } => {

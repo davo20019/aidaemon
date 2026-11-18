@@ -1824,7 +1824,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                                             haptic(nsh_core::Haptic::Impact(
                                                 nsh_core::HapticImpact::Light,
                                             ));
-                                            store.stop(&id)
+                                            store.stop_from_composer(&id)
                                         };
                                         if terminal {
                                             ui::btn_icon(
