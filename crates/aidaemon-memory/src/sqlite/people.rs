@@ -294,8 +294,9 @@ impl PeopleStore for SqliteMemory {
 
         for r in &rows {
             let value: String = r.get("value");
-            // Try to parse month-day from various formats (e.g., "March 15", "03-15", "2000-03-15")
-            if let Some(upcoming_in) = days_until_date(&value, today)
+            // ISO dates only (`crate::dates`): a value in any other form
+            // is never guessed at.
+            if let Some(upcoming_in) = crate::dates::days_until_anniversary(&value, today)
                 && upcoming_in <= within_days as i64
                 && upcoming_in >= 0
             {

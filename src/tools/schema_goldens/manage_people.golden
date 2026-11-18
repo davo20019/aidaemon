@@ -240,6 +240,7 @@
           "type": "string"
         },
         "value": {
+          "description": "For category birthday or important_date: an ISO date, YYYY-MM-DD, or --MM-DD without a year",
           "type": "string"
         },
         "within_days": {

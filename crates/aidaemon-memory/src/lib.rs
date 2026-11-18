@@ -76,6 +76,7 @@
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod consolidation;
+pub mod dates;
 mod embed;
 pub mod embedding_index;
 /// The daemon's local embedder (fastembed), or deterministic

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 
@@ -248,60 +248,6 @@ fn parse_dt(s: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
-}
-
-/// Parse a date string and calculate days until it from today (wrapping year).
-fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
-    use chrono::NaiveDate;
-
-    let trimmed = value.trim();
-
-    // Try "YYYY-MM-DD"
-    if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-        let this_year = today.with_month(d.month())?.with_day(d.day())?;
-        let diff = (this_year - today).num_days();
-        return Some(if diff < 0 { diff + 365 } else { diff });
-    }
-
-    // Try "MM-DD" or "MM/DD"
-    for fmt in &["%m-%d", "%m/%d"] {
-        if let Ok(d) =
-            NaiveDate::parse_from_str(&format!("2000-{}", trimmed), &format!("2000-{}", fmt))
-        {
-            let this_year = today.with_month(d.month())?.with_day(d.day())?;
-            let diff = (this_year - today).num_days();
-            return Some(if diff < 0 { diff + 365 } else { diff });
-        }
-    }
-
-    // Try "Month DD" (e.g., "March 15")
-    let months = [
-        ("january", 1),
-        ("february", 2),
-        ("march", 3),
-        ("april", 4),
-        ("may", 5),
-        ("june", 6),
-        ("july", 7),
-        ("august", 8),
-        ("september", 9),
-        ("october", 10),
-        ("november", 11),
-        ("december", 12),
-    ];
-    let lower = trimmed.to_lowercase();
-    for (name, num) in &months {
-        if let Some(rest) = lower.strip_prefix(name) {
-            let rest = rest.trim().trim_start_matches([',', ' ']);
-            if let Ok(day) = rest.parse::<u32>() {
-                let this_year = today.with_month(*num)?.with_day(day)?;
-                let diff = (this_year - today).num_days();
-                return Some(if diff < 0 { diff + 365 } else { diff });
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]

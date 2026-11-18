@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Datelike;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -163,7 +162,7 @@ fn manage_people_schema() -> Value {
                 "person_name": { "type": "string", "description": "Person for add_fact/remove_fact/link" },
                 "category": { "type": "string", "description": "Fact category; avoid health/finance" },
                 "key": { "type": "string" },
-                "value": { "type": "string" },
+                "value": { "type": "string", "description": "For category birthday or important_date: an ISO date, YYYY-MM-DD, or --MM-DD without a year" },
                 "platform_id": { "type": "string" },
                 "display_name": { "type": "string" },
                 "fact_id": { "type": "integer" },
@@ -338,57 +337,6 @@ impl ManagePeopleTool {
             )
             .await?;
         Ok(format!("Personal memory: {}", result.concise_summary()))
-    }
-
-    fn days_until_date(value: &str, today: chrono::NaiveDate) -> Option<i64> {
-        use chrono::NaiveDate;
-        let trimmed = value.trim();
-
-        // Build the anniversary date directly from (current year, month, day)
-        // rather than mutating `today`. Mutating `today` breaks when today's
-        // day-of-month (e.g. the 31st) does not exist in the target month
-        // (e.g. June), causing `with_month` to return None for valid dates.
-        let anniversary_days = |month: u32, day: u32| -> Option<i64> {
-            let this_year = NaiveDate::from_ymd_opt(today.year(), month, day)?;
-            let diff = (this_year - today).num_days();
-            Some(if diff < 0 { diff + 365 } else { diff })
-        };
-
-        if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
-            return anniversary_days(d.month(), d.day());
-        }
-
-        if let Ok(d) = NaiveDate::parse_from_str(&format!("2000-{}", trimmed), "%Y-%m-%d") {
-            return anniversary_days(d.month(), d.day());
-        }
-        if let Ok(d) = NaiveDate::parse_from_str(&format!("2000/{}", trimmed), "%Y/%m/%d") {
-            return anniversary_days(d.month(), d.day());
-        }
-
-        let months = [
-            ("january", 1),
-            ("february", 2),
-            ("march", 3),
-            ("april", 4),
-            ("may", 5),
-            ("june", 6),
-            ("july", 7),
-            ("august", 8),
-            ("september", 9),
-            ("october", 10),
-            ("november", 11),
-            ("december", 12),
-        ];
-        let lower = trimmed.to_lowercase();
-        for (name, num) in &months {
-            if let Some(rest) = lower.strip_prefix(name) {
-                let rest = rest.trim().trim_start_matches([',', ' ']);
-                if let Ok(day) = rest.parse::<u32>() {
-                    return anniversary_days(*num, day);
-                }
-            }
-        }
-        None
     }
 
     async fn resolve_person(&self, args: &ManagePeopleArgs) -> anyhow::Result<Option<Person>> {
@@ -571,7 +519,7 @@ impl ManagePeopleTool {
             .iter()
             .filter(|f| f.category == "birthday" || f.category == "important_date")
             .filter_map(|f| {
-                Self::days_until_date(&f.value, today)
+                crate::dates::days_until_anniversary(&f.value, today)
                     .map(|d| (d, format!("{} {} ({})", f.category, f.value, f.key)))
             })
             .min_by_key(|(d, _)| *d);
@@ -624,7 +572,7 @@ impl ManagePeopleTool {
                 if fact.category != "birthday" && fact.category != "important_date" {
                     continue;
                 }
-                if let Some(days) = Self::days_until_date(&fact.value, today)
+                if let Some(days) = crate::dates::days_until_anniversary(&fact.value, today)
                     && days >= 0
                     && days <= within_days as i64
                 {
@@ -784,6 +732,11 @@ impl ManagePeopleTool {
             Some(v) => v,
             None => return Ok("Missing required field: value".to_string()),
         };
+        if crate::dates::is_date_fact_category(category)
+            && let Some(error) = crate::dates::date_argument_error(value)
+        {
+            anyhow::bail!("Not added: {error}");
+        }
 
         let person = match self.store.find_person_by_name(person_name).await? {
             Some(p) => p,
@@ -1112,6 +1065,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ambiguous_date_is_refused() {
+        let tool = setup_tool().await;
+        tool.call(&json!({"action": "add", "name": "Alice Rivera"}).to_string())
+            .await
+            .unwrap();
+        for value in ["05/03", "May 3", "05-03"] {
+            let refused = tool
+                .call(
+                    &json!({
+                        "action": "add_fact",
+                        "person_name": "Alice Rivera",
+                        "category": "birthday",
+                        "key": "birthday",
+                        "value": value
+                    })
+                    .to_string(),
+                )
+                .await;
+            let error = refused.expect_err(value).to_string();
+            assert!(error.contains("YYYY-MM-DD"), "{value}: {error}");
+        }
+        let added = tool
+            .call(
+                &json!({
+                    "action": "add_fact",
+                    "person_name": "Alice Rivera",
+                    "category": "birthday",
+                    "key": "birthday",
+                    "value": "--05-03"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(added.contains("Added fact"), "{added}");
+    }
+
+    #[tokio::test]
     async fn upcoming_lists_people_with_dates() {
         let tool = setup_tool().await;
 
@@ -1133,7 +1124,7 @@ mod tests {
         );
 
         let upcoming = chrono::Utc::now().date_naive() + chrono::Duration::days(2);
-        let date_value = upcoming.format("%m-%d").to_string();
+        let date_value = upcoming.format("--%m-%d").to_string();
         let add_fact_result = tool
             .call(
                 &json!({
