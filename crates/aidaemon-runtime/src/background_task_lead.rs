@@ -514,6 +514,14 @@ pub enum DispatchTriggerDisposition {
     Failed,
 }
 
+/// A scheduled run of a one-off goal (`schedule_task` makes a one-shot
+/// schedule a finite goal, a recurring one a continuous goal): its result is
+/// the answer the owner asked for at that time, so it is delivered then,
+/// quiet hours or not, like a reminder.
+pub fn owner_timed_one_off(is_scheduled_run: bool, goal_type: &str) -> bool {
+    is_scheduled_run && goal_type == "finite"
+}
+
 pub fn dispatch_trigger_disposition(
     task_lead_succeeded: bool,
     work_tasks: &[aidaemon_work::traits::Task],
@@ -3174,7 +3182,15 @@ pub fn spawn_background_task_lead(
             match enqueue_result {
                 Ok(true) => {
                     let local_hour = chrono::Timelike::hour(&chrono::Local::now());
-                    if !entry.should_deliver_at_local_hour(local_hour) {
+                    // A one-off run the owner set for a time is the answer
+                    // they asked for then, like a reminder: it goes out now,
+                    // quiet hours or not. Recurring and continuous work keeps
+                    // waiting for the morning (owner's choice, 2026-11-18). If
+                    // this attempt fails, the queued copy follows the usual
+                    // quiet-hours rule.
+                    let owner_timed_one_off =
+                        owner_timed_one_off(is_scheduled_run, &initial_goal.goal_type);
+                    if !owner_timed_one_off && !entry.should_deliver_at_local_hour(local_hour) {
                         // Persisted successfully; normal notification delivery
                         // will resume outside quiet hours.
                         if let Some(ref registry) = goal_token_registry {
@@ -3301,6 +3317,15 @@ mod tests {
             &*aidaemon_tools::testing::active_execution_backend(),
             configured,
         )
+    }
+
+    /// Owner's choice (2026-11-18): a one-off task scheduled for a time
+    /// reports then, even in quiet hours; recurring work waits for morning.
+    #[test]
+    fn only_a_scheduled_one_off_reports_in_quiet_hours() {
+        assert!(owner_timed_one_off(true, "finite"));
+        assert!(!owner_timed_one_off(true, "continuous"));
+        assert!(!owner_timed_one_off(false, "finite"));
     }
 
     #[test]
