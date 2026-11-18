@@ -496,16 +496,18 @@ impl DiagnoseTool {
                         first_error = Some(ev.clone());
                     }
                     if let Ok(data) = event.parse_data::<ErrorData>() {
-                        let lower = data.message.to_ascii_lowercase();
+                        // The provider bucket is the error's typed kind.
                         if matches!(
                             data.error_type,
                             ErrorType::LlmError | ErrorType::Timeout | ErrorType::RateLimit
-                        ) || lower.contains("rate limit")
-                            || lower.contains("provider")
-                            || lower.contains("429")
-                        {
+                        ) {
                             provider_errors.push(ev.clone());
                         }
+                        // Display only: which evidence lines the report lists
+                        // under "missing context". An error event carries no
+                        // typed not-found kind, and this bucket decides
+                        // nothing about the run.
+                        let lower = data.message.to_ascii_lowercase();
                         if lower.contains("no such file")
                             || lower.contains("not found")
                             || lower.contains("missing")
@@ -527,13 +529,12 @@ impl DiagnoseTool {
                 EventType::ApprovalDenied => approval_denied.push(ev),
                 EventType::DecisionPoint => {
                     if let Ok(data) = event.parse_data::<DecisionPointData>()
-                        && (matches!(
+                        && matches!(
                             data.decision_type,
                             DecisionType::RepetitiveCallDetection
                                 | DecisionType::ConsecutiveSameToolDetection
                                 | DecisionType::AlternatingPatternDetection
-                        ) || matches!(data.decision_type, DecisionType::StoppingCondition)
-                            && data.summary.to_ascii_lowercase().contains("stall"))
+                        )
                     {
                         loop_signals.push(ev);
                     }
@@ -542,13 +543,6 @@ impl DiagnoseTool {
                     if let Ok(data) = event.parse_data::<TaskEndData>()
                         && data.effective_outcome() == aidaemon_events::TaskOutcome::Failed
                     {
-                        if data
-                            .error
-                            .as_deref()
-                            .is_some_and(|e| e.to_ascii_lowercase().contains("stall"))
-                        {
-                            loop_signals.push(ev.clone());
-                        }
                         task_end_failed = Some((data, ev));
                     }
                 }

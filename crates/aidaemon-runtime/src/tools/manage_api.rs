@@ -403,39 +403,37 @@ impl ManageApiTool {
 
         let mut candidates = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for SearchResult {
-            url,
-            title,
-            snippet,
-            ..
-        } in results
-        {
+        for SearchResult { url, .. } in results {
             if !Self::result_host_matches_target(&url, target_host) {
                 continue;
             }
-            let lower = format!("{} {}", title, snippet).to_ascii_lowercase();
-            let inferred_kind = if lower.contains("openapi")
-                || lower.contains("swagger")
-                || url.to_ascii_lowercase().ends_with(".json")
-                || url.to_ascii_lowercase().ends_with(".yaml")
-                || url.to_ascii_lowercase().ends_with(".yml")
-            {
-                Some("openapi".to_string())
-            } else if lower.contains("graphql")
-                || url.to_ascii_lowercase().contains("/graphql")
-                || lower.contains("docs")
-                || lower.contains("reference")
-            {
-                Some("docs".to_string())
-            } else {
-                None
-            };
+            // The kind comes from the URL (a machine format: the spec's file
+            // extension or a `/graphql` endpoint), never from a page title
+            // or snippet; anything else is learned as docs.
+            let inferred_kind = Self::kind_from_url(&url);
             if seen.insert(url.clone()) {
                 candidates.push((url, inferred_kind));
             }
         }
 
         Ok(candidates)
+    }
+
+    /// The learn kind a candidate URL's path names, if any.
+    fn kind_from_url(url: &str) -> Option<String> {
+        let path = reqwest::Url::parse(url)
+            .map(|parsed| parsed.path().to_ascii_lowercase())
+            .unwrap_or_default();
+        if [".json", ".yaml", ".yml"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
+        {
+            Some("openapi".to_string())
+        } else if path.split('/').any(|segment| segment == "graphql") {
+            Some("docs".to_string())
+        } else {
+            None
+        }
     }
 
     async fn discover_learning_target(
@@ -601,18 +599,14 @@ impl ManageApiTool {
             )
             .await?;
 
-        let sync_args = json!({
-            "action": "verify",
-            "profile": service,
-        });
-        let sync_result = self
-            .manage_http_auth
-            .run(&sync_args.to_string(), &Self::inner_facts(args))
-            .await?;
-        let ready = !sync_result.contains("not ready for live API calls yet")
-            && !sync_result.contains("missing secure credentials");
+        // Readiness is the verify step's typed answer, never read back
+        // from its report.
+        let verified = self.manage_http_auth.verify_profile(service).await?;
 
-        Ok((format!("{}\n\n{}", upsert_result, sync_result), ready))
+        Ok((
+            format!("{}\n\n{}", upsert_result, verified.text),
+            verified.ready,
+        ))
     }
 
     async fn run_learning_stage(
@@ -1133,6 +1127,23 @@ mod tests {
         assert!(urls.contains(&"https://api.example.com/swagger.json".to_string()));
         assert!(urls.contains(&"https://api.example.com/docs".to_string()));
         assert!(urls.contains(&"https://api.example.com/graphql".to_string()));
+    }
+
+    #[test]
+    fn a_search_result_kind_comes_from_its_url_not_its_title() {
+        assert_eq!(
+            ManageApiTool::kind_from_url("https://api.example.com/v1/spec.yaml").as_deref(),
+            Some("openapi")
+        );
+        assert_eq!(
+            ManageApiTool::kind_from_url("https://api.example.com/graphql").as_deref(),
+            Some("docs")
+        );
+        // A page whose title says "OpenAPI docs" is not a spec by its words.
+        assert_eq!(
+            ManageApiTool::kind_from_url("https://example.com/blog/openapi-docs"),
+            None
+        );
     }
 
     #[test]

@@ -78,6 +78,19 @@ pub struct ManageHttpAuthTool {
     secrets: Arc<dyn SecretStore>,
 }
 
+/// What `verify` found for a manual profile: its report, and whether every
+/// field and credential a live call needs is present.
+pub struct ProfileVerification {
+    pub text: String,
+    pub ready: bool,
+}
+
+impl From<String> for ProfileVerification {
+    fn from(text: String) -> Self {
+        Self { text, ready: true }
+    }
+}
+
 impl ManageHttpAuthTool {
     const AUTH_PROFILE_COLLECTION_ID: &'static str = "auth_profile_collection:configured";
 
@@ -947,25 +960,28 @@ impl ManageHttpAuthTool {
         ))
     }
 
+    /// `verify` for `profile_name` with no probe, with its typed readiness.
+    pub async fn verify_profile(&self, profile_name: &str) -> anyhow::Result<ProfileVerification> {
+        let profile = Self::validate_profile_name(profile_name)?;
+        self.handle_verify(&profile, None, None, None).await
+    }
+
     async fn handle_verify(
         &self,
         profile_name: &str,
         url: Option<&str>,
         method: Option<&str>,
         timeout_secs: Option<u64>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ProfileVerification> {
         let mut doc = self.load_config_doc().await?;
         let Some(_) = Self::profile_table(&doc, profile_name) else {
             if self.is_oauth_managed_profile(profile_name).await? {
                 return Ok(format!(
                     "Profile '{}' is OAuth-managed. Use the OAuth connection tools to inspect it; this tool verifies manual profiles only.",
                     profile_name
-                ));
+                ).into());
             }
-            return Ok(format!(
-                "Manual auth profile '{}' was not found.",
-                profile_name
-            ));
+            return Ok(format!("Manual auth profile '{}' was not found.", profile_name).into());
         };
 
         let resolution = self.sync_manual_profile(&mut doc, profile_name).await?;
@@ -995,7 +1011,10 @@ impl ManageHttpAuthTool {
                     ));
                 }
             }
-            return Ok(lines.join("\n"));
+            return Ok(ProfileVerification {
+                text: lines.join("\n"),
+                ready: false,
+            });
         }
 
         let Some(url) = url.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -1004,18 +1023,21 @@ impl ManageHttpAuthTool {
                 profile_name,
                 Self::auth_type_name(&resolution.auth_type),
                 resolution.allowed_domains.join(", ")
-            ));
+            )
+            .into());
         };
 
         let verify_method = method.unwrap_or("GET").trim().to_ascii_uppercase();
         if !matches!(verify_method.as_str(), "GET" | "HEAD") {
-            return Ok("verify currently supports only GET or HEAD probes. Use http_request for other methods.".to_string());
+            return Ok("verify currently supports only GET or HEAD probes. Use http_request for other methods.".to_string().into());
         }
 
         let parsed_url = reqwest::Url::parse(url)
             .map_err(|err| anyhow::anyhow!("Invalid verify URL: {}", err))?;
         if parsed_url.scheme() != "https" {
-            return Ok("Verification probe blocked: only HTTPS URLs are allowed.".to_string());
+            return Ok("Verification probe blocked: only HTTPS URLs are allowed."
+                .to_string()
+                .into());
         }
         let request_host = parsed_url.host_str().unwrap_or("");
         let domain_ok = resolution
@@ -1026,7 +1048,8 @@ impl ManageHttpAuthTool {
             return Ok(format!(
                 "Verification probe blocked: '{}' is not in the allowed domains for profile '{}'.",
                 request_host, profile_name
-            ));
+            )
+            .into());
         }
 
         let client = reqwest::Client::builder()
@@ -1079,7 +1102,8 @@ impl ManageHttpAuthTool {
             return Ok(format!(
                 "Verification probe completed for '{}': {} {} (content-type: {}).",
                 profile_name, verify_method, status, content_type
-            ));
+            )
+            .into());
         }
 
         let body = response.text().await.unwrap_or_default();
@@ -1097,7 +1121,8 @@ impl ManageHttpAuthTool {
         Ok(format!(
             "Verification probe completed for '{}': {} {} (content-type: {}).\nBody preview:\n{}",
             profile_name, verify_method, status, content_type, snippet
-        ))
+        )
+        .into())
     }
 }
 
@@ -1255,6 +1280,7 @@ impl ManageHttpAuthTool {
                     args.timeout_secs,
                 )
                 .await
+                .map(|verified| verified.text)
             }
             other => Ok(format!(
                 "Unknown action '{}'. Use: list, describe, upsert, remove, verify.",
