@@ -54,7 +54,15 @@ pub trait ToolResultFit: TurnHost {
         // sanitized and wrapped from the call's typed trust, errors included:
         // a remote server can write its own error text. Capping comes first,
         // so a cut result is still one intact block.
-        let untrusted = scope.trust == aidaemon_core::SourceTrust::Untrusted;
+        // A call the tool rejected before any I/O read nothing: its text is
+        // the tool's own validation message, not data from outside. Wrapping
+        // it as untrusted told the model to ignore the fix it names (live
+        // 2026-11-18: read_file's "use start_line/end_line or tail_lines, not
+        // both" came back wrapped eight times and the run looped).
+        let rejected_before_io = result_metadata.contract_rejected
+            && result_metadata.invocation_stage
+                == aidaemon_tools::semantics::ToolInvocationStage::RejectedBeforeIo;
+        let untrusted = scope.trust == aidaemon_core::SourceTrust::Untrusted && !rejected_before_io;
         let result_text = if untrusted && !result_metadata.untrusted_verbatim {
             aidaemon_tools::sanitize::sanitize_external_content(&result_text)
         } else if !untrusted && !result_is_err && scope.facts.result_fit.strip_control_markers {

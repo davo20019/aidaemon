@@ -213,12 +213,10 @@ impl ReadFile {
             .get("tail_lines")
             .or_else(|| args.get("last_lines"))
             .or_else(|| args.get("last_n_lines"));
-        let has_tail = tail_value.is_some_and(|value| !value.is_null());
-        if has_tail && (has_start || has_end) {
-            return Ok(ToolCallOutcome::contract_rejection(
-                "read_file range modes are mutually exclusive: use start_line/end_line or tail_lines, not both",
-            ));
-        }
+        // An explicit start/end range wins over tail_lines when a call sends
+        // both: the schema no longer states the exclusion, and rejecting the
+        // pair looped a live run on the same call (2026-11-18).
+        let tail_value = tail_value.filter(|_| !(has_start || has_end));
         let requested_start = args.get("start_line").and_then(Value::as_u64);
         let requested_end = args.get("end_line").and_then(Value::as_u64);
         if requested_start.is_some_and(|line| line == 0)

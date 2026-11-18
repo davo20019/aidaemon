@@ -275,8 +275,11 @@ mod tests {
         assert!(!result.contains("| e"));
     }
 
+    /// A call that sends both an explicit range and tail_lines reads the
+    /// range: the schema no longer states the exclusion, and rejecting the
+    /// pair looped a live run on the same call (2026-11-18).
     #[tokio::test]
-    async fn conflicting_range_modes_fail_without_reading() {
+    async fn an_explicit_range_wins_over_tail_lines() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(f, "a\nb\nc\n").unwrap();
         let args = json!({
@@ -291,17 +294,10 @@ mod tests {
             .call_with_status_outcome(&args, None)
             .await
             .unwrap();
-        assert!(
-            outcome
-                .output
-                .contains("range modes are mutually exclusive")
-        );
-        assert!(outcome.metadata.contract_rejected);
-        assert_eq!(
-            outcome.metadata.outcome_status,
-            Some(crate::traits::ToolOutcomeStatus::Blocked)
-        );
-        assert!(outcome.metadata.read_file.is_none());
+        assert!(!outcome.metadata.contract_rejected, "{}", outcome.output);
+        assert!(outcome.output.contains("a"));
+        assert!(outcome.output.contains("b"));
+        assert!(!outcome.output.contains("| c"), "{}", outcome.output);
     }
 
     #[tokio::test]
