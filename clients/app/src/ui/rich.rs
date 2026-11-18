@@ -89,11 +89,20 @@ pub fn output(
     let term = component_ref::<Terminal>();
     let written: Rc<RefCell<String>> = Rc::default();
     let content = Rc::new(content);
-    // Writes what is new since the last write; a terminal not yet laid out
-    // is caught up when it is (its first resize).
+    // Its width in cells, from its last resize (0 before its first layout).
+    let cols: Rc<std::cell::Cell<u32>> = Rc::default();
+    // Writes what is new since the last write. Nothing is written while it
+    // is narrower than a double-width character: the emulator starts one
+    // cell wide before its first layout, and nsh's emulator panics on such
+    // a character there (`vt.rs`), which in the web build stops the whole
+    // app, its link included (live 2026-11-18: a delegated run's output
+    // froze the page until a reload). It is caught up on its next resize.
     let sync = {
-        let (written, content) = (written.clone(), content.clone());
+        let (written, content, cols) = (written.clone(), content.clone(), cols.clone());
         move || {
+            if cols.get() < 2 {
+                return;
+            }
             let now = untracked(|| content());
             let Some(api) = term.api::<TerminalApi>() else {
                 return;
@@ -129,7 +138,12 @@ pub fn output(
                 .line_height(px(LINE))
                 .scrollback(5000)
                 .accessibility_label(label.into())
-                .on_resize(move |_: &nsh_base::TerminalEvent| sync())
+                .on_resize(move |event: &nsh_base::TerminalEvent| {
+                    if let nsh_base::TerminalEvent::Resize(width, _) = event {
+                        cols.set(*width);
+                    }
+                    sync();
+                })
                 .component_ref(&term)
                 .size_full(),
         )
