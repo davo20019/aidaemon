@@ -1199,10 +1199,41 @@ fn connected_row(
             .accessibility_label("Change the main provider"),
         );
     } else if !provider.preset.is_empty() {
-        let preset = provider.preset.clone();
+        // A failover that can already answer is promoted as it is, after
+        // one question: its key (or sign-in) and models carry over. Only
+        // one that cannot (no key here) opens the form to get one.
+        let ready = matches!(
+            provider.credential,
+            CredentialState::KeyStored | CredentialState::NotNeeded | CredentialState::SignedIn
+        );
+        let choice = ProviderChoice {
+            preset: provider.preset.clone(),
+            base_url: provider.base_url.clone(),
+            primary_model: provider.hard_model.clone(),
+            fast_model: provider.quick_model.clone(),
+            smart_model: provider.hard_model.clone(),
+        };
+        let name = provider.name.clone();
         actions = actions.child(
             ui::btn("Make main", Variant::Outline, Size::Sm, move || {
-                form.open(Adding::Main, preset.clone(), at)
+                if !ready {
+                    form.open(Adding::Main, choice.preset.clone(), at);
+                    return;
+                }
+                let choice = choice.clone();
+                ui::now_or_later(
+                    format!("Make {name} the main provider?"),
+                    "It answers first from now on, with the key and models it already has. \
+                     It replaces the current main provider.",
+                    "Make main",
+                    "Cancel",
+                    move || {
+                        store.change_settings(SettingsChange::SwitchProvider {
+                            provider: choice,
+                            key: None,
+                        })
+                    },
+                );
             })
             .disabled(move || store.settings_busy())
             .accessibility_label(format!("Make {} the main provider", provider.name)),
