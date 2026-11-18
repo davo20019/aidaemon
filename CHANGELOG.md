@@ -7,14 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+
 ### Added
 
+- **Watch and take over the agent's browser.** A conversation's header opens a live view of the agent's browser: watch it work, take control, and give it back. On a phone it works like a browser: tap to click, drag to scroll, pinch to zoom, and type straight into the page with the phone's own keyboard, held upright or sideways; with a mouse and keyboard it works like a remote desktop window. When the agent needs you (a sign-in, a captcha), `hand_over` sends a take-over card on every channel (Open the live view, Done, Not now; one at a time per site, 30 minutes) and a link that opens the view. A tap with Point tells the agent what is at that spot, never a field's value. Sign-ins are kept on the agent's own browser profile until you forget them. Client protocol 1.30–1.34.
+- **Screens as live views.** `[surfaces] desktop` (off by default, macOS) shows this computer's displays the same way, and `aidaemon share-screen` pairs another computer once and shares its main display; the agent's desktop actions wait while you drive, and the computer says it is being controlled.
+- **Coding agents in a permission mode you choose.** Each coding agent runs in one of three modes, set per agent in Settings: checked by AIdaemon (the default: confined to the project folder, and anything beyond it asked and judged by your own rules), every command checked, or full access (which asks before it is set). Claude Code and Codex ask AIdaemon instead of refusing on their own, so your grants answer what they cover and a card asks the rest. Agents that speak the Agent Client Protocol are hosted over it: Antigravity CLI and Gemini CLI are built in, any other with `protocol = "acp"`. Settings shows whether each agent can work now (Ready, or Not usable with its reason and fix, and Check again), and work is never routed to one that cannot. SDK: the `aidaemon-coding-agents` crate (`aidaemon-sdk` feature `coding-agents`). Client protocol 1.36 and 1.38.
+- **A project's files in the app.** A coding conversation's details pane has a Files tab, and a project's page opens its folder: read-only, one folder at a time, git's changes marked, ignored files on request, secrets shown by name only. Pictures and PDFs preview (pictures zoom in place), and a file can go full screen. Client protocol 1.32.
+- **Models stay current.** Once a day the daemon checks each provider's model list and moves a model to the newest version of its own line (`gpt-6-sol` to `gpt-6.2-sol`, never another size, a snapshot or a preview). It first proves the new model with one tool call, keeps the old one as the first fallback, and tells you in your chat or the app. Pay-per-token providers are only told. `provider.auto_upgrade = false` turns it off, and a `/model` pin postpones it.
 - **See which model wrote a reply.** Under a reply in the app, after its time and Copy, the provider's mark and name and the model that wrote it ("ChatGPT · gpt-6.2-sol"). It is the model that actually answered: when a failover answered for the chosen model, the reply names the failover, and the reply is recorded under that model. Older replies show it too when their model is one a connected provider still lists. Client protocol 1.35: `served_by` (`preset`, `provider`, `model`) on `turn_completed` and history messages; `ClientHost::served_by`.
-
-## [0.20.0] - 2026-11-17
-
-### Added
-
+- **What each account has used and has left.** Settings shows a ChatGPT plan's 5-hour and weekly limits and an OpenRouter key's balance, each with a meter and its reset. Client protocol 1.37.
+- **Schedules in any time zone.** A time or a recurring schedule may name an IANA zone ("every weekday at 8am Europe/Madrid", "2030-07-15 09:00 Asia/Tokyo"), and it follows that zone's daylight saving. Automation cards show the schedule's zone and the runs in your time.
+- **Edit and resend a message.** Every message you sent has Copy, Edit and Send again under it. Edit puts its text and files back in the composer; both add a new message at the end, so nothing above is lost.
+- **Pull to refresh.** In the app, pull a list down past its top (the conversations, a conversation, Changes, Automations, Memory, System, Settings) to read everything again; on desktop, Cmd/Ctrl+R or the palette's Refresh. Back after 30 seconds or more away, the app reads everything again on its own, and the open conversation catches up on what it missed without showing anything twice.
+- **Archive conversations.** Archive or bring back a conversation from its menu. The archived are listed under Archived in the sidebar's filter and on each project's page, and a search looks through them too. Writing in an archived chat brings it back.
+- **Dictation in the web app**, through the browser's speech recognizer.
+- **Interrupted work finishes after a restart.** A chat whose last turn was cut off by a restart gets one continuation at startup, which uses the work already done and re-runs nothing whose effect is unknown.
+- **Settings ask in place.** A setting that needs a restart offers Restart now when it is saved, and a bar under Settings keeps offering it. A change the daemon needs you to approve is asked right on the Settings page. Switching the main provider keeps the old one as a failover with its key.
+- **An ARM64 Linux download** (daemon and app), which Homebrew on ARM Linux installs.
 - **A Windows download.** Releases carry `aidaemon-windows-x86_64.zip`: `aidaemon.exe` and `aidaemon-app.exe` side by side. Extract it and open the app; **Run it here** starts the daemon at logon.
 - **Missed runs are in an automation's history.** When the daemon was off and a recurring automation's run is past its catch-up window, the skipped run is now recorded (dated when it was due, "The daemon wasn't running when this was due.") besides the notice, so the app's last-run line reads "Last run due … · Missed" and its recent runs list it as Missed. A miss is not a failure: it never counts toward the failures that pause an automation (client protocol 1.28: run outcome `missed`; older clients read it as unknown).
 - **Pin, sort and delete projects in the app.** A project's menu (right click, long press) pins it to the top of the sidebar, so Home always shows it, moves it up or down, and deletes it after asking. In All projects each row has a handle that drags it into place. Pins and order are kept on each device, like conversation pins. Deleting a project moves its conversations, goals and runs to no project and unlinks its chat bots. Its folder on disk is left alone. Client protocol 1.27: `delete_project` and `project_deleted`.
@@ -40,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Decisions come from typed state, not wording.** The daemon no longer reads meaning into the words of your messages, model replies or tool output when it decides what to do. What you will notice: a schedule's time is read exactly or refused ("in 2 months" is no longer 2 minutes; "EST" asks for the zone's IANA name). A goal that starts with "remind me" is done by the agent, not sent back as text. A goal or task runs as written instead of sleeping on "in 5 minutes". A goal is picked only by its id or its exact objective. A remembered fact replaces only the fact with the same key (an allergy no longer replaces a favorite drink). Birthdays and important dates are stored as ISO dates, and old ones are converted. A tool that runs out of time can be retried instead of counting against it.
+- **A turn that fails over stays on the model that took over** for the rest of that turn, and a fallback model no longer receives the failed model's encrypted reasoning. A sub-agent keeps the model it was started with.
+- **A one-off task you scheduled for a time delivers then**, quiet hours or not, like a reminder; recurring work still waits for the morning.
+- **The agent's browser closes after 5 idle minutes**, and its page fills the window.
+- **`manage_config` asks only for a change it would write**, and changing a provider's main model through the agent asks you first.
+- **Gemini CLI is no longer looked for on its own**, since Google stopped personal sign-ins; one you add is still recognized. Antigravity CLI takes its place in the default order.
 - **Slack answers in a channel only when tagged.** An owner's untagged channel message used to run the agent like anyone's DM; now a channel or group message is answered only when it @mentions the bot, for owners too. An owner's untagged reply still continues a thread the bot is already answering in, and a typed `!command` still works. DMs are unchanged.
 - With no usable keychain (a headless server with no secret service), secrets are kept in the owner-only `.env` beside the database key instead of failing, and setup says so.
 - Widening `[authority]` from an app asks another device only when one exists (another paired device, or a chat); a lone device confirms it on a card that says so.
@@ -70,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Newer ChatGPT models refused every request with HTTP 400 over a tool schema, so each call fell back to the previous model.
+- Notices about updates, model upgrades and triggers reach your Telegram chat; they were queued and never delivered.
+- A message the running turn reads mid-turn shows in the app and gets a real answer.
+- A stop's report shows in the conversation that was stopped, and a second tap on Send no longer stops the work it just joined.
+- Dictation no longer brings back a message that was already sent.
+- In the web app, a delegated run's output no longer stopped the whole app until a reload.
+- An automation's card no longer shows a last run for a run that has not started.
+- The agent's browser kept no sign-ins and ignored its window size, because its flags reached Chrome in the wrong form.
 - A device that has just been paired can sign in right away: the device is saved before the pairing reads approved, so a quick sign-in is no longer refused.
 - **Pictures and files the agent sends stay in the conversation.** The app showed a screenshot or document the agent sent only until the page reloaded: the transcript kept a text note for documents and nothing for pictures. Now the delivery note carries the file (the copy the app keeps) and the caption the owner saw, so a reload, another device or a later visit shows it again; the note's text stays for the model and the turn's tools stay with its reply. SDK: `AssistantNoteSink::record_delivered_files`, `MediaTap::delivered` returns the kept copy, `AssistantResponseData::attachments`, `MessageAnnotation::DeliveredFiles`.
 - **Background fact extraction stores only what the user stated.** Each extracted fact must carry the user's stance and a verbatim quote from the user's message; a question ("do you know what kind of boat I own?") no longer becomes a stored fact, and facts the agent already saved during the turn are not stored a second time under another key.
@@ -109,6 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `install.sh` installs nothing it cannot verify.
+- An allowed terminal command covers that command only, not another program it launches (`env`, `xargs`, `find -exec`), a file it writes by redirection, or variables it sets.
+- Only the owner can claim a bot, and a claim made at runtime survives restarts. A Discord server member is never a bot's owner, and approvals and the shared slash commands are the owner's on every channel.
+- In the browser, a click is judged by what its target is (a form's submit, a button, a password or payment field), not by words in its selector. Approving one site covers buttons on that site only, and submitting a form or filling a password field asks every time.
+- A computer-use click is judged by the accessibility element under it; a dialog's default button asks every time.
+- What the browser and `http_request` send out is checked after outside content was read, like a fetch: a URL opened, text typed, a credential profile named in a URL. An exact string you did not type yourself goes to the verifier.
+- A reminder cannot be run as agent work, and writes to the people store are checked like `remember_fact`.
+- The app page may not be framed, and secret and token files are created readable by the owner only.
 - **MCP servers no longer receive session, role or channel details in tool arguments.**
 - **An MCP server's own hints (read-only, closed-world) no longer relax any safety check.**
 
