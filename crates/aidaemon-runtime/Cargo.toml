@@ -20,7 +20,7 @@ publish = false
 [features]
 # Test-only helpers that dependents' test builds need, as `cfg(test)` cannot
 # reach across a crate boundary.
-testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing"]
+testing = ["dep:tempfile", "aidaemon-core/testing", "aidaemon-events/testing", "aidaemon-decisions/testing", "aidaemon-tools/testing"]
 # SQLCipher: `state::SqliteStateStore` applies a database's encryption key.
 # The host links SQLite with SQLCipher (`libsqlite3-sys/bundled-sqlcipher`).
 encryption = []
