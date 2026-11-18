@@ -1224,7 +1224,11 @@ mod tests {
         assert_eq!(seconds("-0400"), -4 * 3600);
         assert_eq!(seconds("UTC"), 0);
         assert_eq!(seconds("UTC-03:00"), -3 * 3600);
-        if let Some(zone) = owner_zone_name() {
+        // The owner's IANA zone means "the owner's own clock". A host on UTC
+        // (CI runners) names its zone "UTC", which reads as offset zero first.
+        if let Some(zone) = owner_zone_name()
+            .filter(|zone| !matches!(zone.to_ascii_uppercase().as_str(), "UTC" | "GMT" | "Z"))
+        {
             assert_eq!(parse_timezone_offset(&zone).unwrap(), None);
         }
         assert!(parse_timezone_offset("EDT").is_err());
