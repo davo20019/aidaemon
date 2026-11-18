@@ -288,6 +288,16 @@ fn coding_agents(store: Store, agents: &[CodingAgent]) -> View {
 }
 
 fn coding_agent(store: Store, agent: &CodingAgent) -> View {
+    // One that is unavailable looks it: its name, mode and note dimmed and
+    // its mode not to be changed; its reason stays clear.
+    let available = agent.readiness != AgentReadiness::NotUsable;
+    let shown = move |content: View| {
+        if available {
+            content
+        } else {
+            ui::inactive(content)
+        }
+    };
     let mut title = view().flex_row().flex_wrap().items_center().gap_2().child(
         text(agent.program.clone())
             .text_size(px(ui::fit::body()))
@@ -296,7 +306,7 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
     if agent.name != agent.program {
         title = title.child(faint(agent.name.clone()));
     }
-    let title = view().gap_1().child(title).child(readiness(agent));
+    let title = view().gap_1().child(shown(title)).child(readiness(agent));
     let items: Vec<(String, String)> = agent
         .modes
         .iter()
@@ -329,6 +339,7 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
                     }
                 },
             )
+            .disabled(!available)
             .flex_1()
             .max_w(px(if ui::touch() { f32::MAX } else { 360.0 })),
         ),
@@ -337,7 +348,9 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
         row = row.child(muted("Not allowed to run delegated work yet."));
     }
     if !agent.note.is_empty() {
-        row = row.child(faint(agent.note.clone()).number_of_lines(3));
+        row = row.child(shown(
+            view().child(faint(agent.note.clone()).number_of_lines(3)),
+        ));
     }
     row
 }
@@ -349,9 +362,9 @@ fn readiness(agent: &CodingAgent) -> View {
         AgentReadiness::Ready => ui::status("Ready", Tone::Success),
         AgentReadiness::NotUsable => {
             let why = if agent.readiness_reason.is_empty() {
-                "Not usable".to_owned()
+                "Unavailable".to_owned()
             } else {
-                format!("Not usable: {}", agent.readiness_reason)
+                format!("Unavailable: {}", agent.readiness_reason)
             };
             let mut lines = view().gap_1().child(ui::status_message(why, Tone::Danger));
             if !agent.readiness_fix.is_empty() {

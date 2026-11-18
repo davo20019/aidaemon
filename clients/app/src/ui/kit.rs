@@ -72,7 +72,7 @@ pub fn switch_only(
                 .transition_transform()
                 .duration(motion::BASE)
         })
-        .disabled_style(|s| s.opacity(0.45))
+        .disabled_style(|s| s.opacity(super::controls::DISABLED_OPACITY))
         .on_change(move |next: &bool| change(*next))
 }
 
@@ -134,6 +134,7 @@ fn choice_sized(
         .placeholder(placeholder.clone())
         .searchable(searchable)
         .search_placeholder("Type to find one")
+        .disabled_style(|s| s.opacity(super::controls::DISABLED_OPACITY))
         .search_accessibility_label(format!("Find {label}"))
         .accessibility_label(label)
         .trigger(
@@ -509,7 +510,6 @@ pub fn meter(label: impl Into<SharedString>, share: f32) -> View {
     )
 }
 
-/// Asks before something that cannot be undone, in the platform's own
 /// Offers to do something now, in the platform's own alert: `title`,
 /// `detail`, then `action` or `later`. `then` runs only on `action`.
 pub fn now_or_later(
@@ -535,6 +535,7 @@ pub fn now_or_later(
     });
 }
 
+/// Asks before something that cannot be undone, in the platform's own
 /// alert: `title`, `detail`, then `action` (destructive) or Cancel.
 /// `then` runs only on `action`.
 pub fn confirm(

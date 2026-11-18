@@ -100,7 +100,7 @@ fn frame(variant: Variant, size: Size, scale: f32) -> nsh_base::ButtonElement {
         // A terminal draws no outline: the focused control is a band.
         .focus(focus_band)
         .active(move |s| s.scale(scale))
-        .disabled_style(|s| s.opacity(0.45));
+        .disabled_style(|s| s.opacity(DISABLED_OPACITY));
     let base = match fill(variant) {
         Some(color) => base.bg(color).hover(|s| s.opacity(0.88)),
         None => base
@@ -790,6 +790,14 @@ pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
                 .number_of_lines(2)
                 .text_color(colors::MUTED),
         )
+}
+
+/// How much of a control shows while it cannot be used.
+pub const DISABLED_OPACITY: f32 = 0.45;
+
+/// `content` shown as unavailable now: dimmed as a disabled control is.
+pub fn inactive(content: View) -> View {
+    content.opacity(DISABLED_OPACITY)
 }
 
 /// A status dot before a message in its tone's colour: a state the owner

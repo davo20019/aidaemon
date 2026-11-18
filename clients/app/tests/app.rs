@@ -500,7 +500,7 @@ fn each_coding_agent_says_whether_it_is_ready_and_check_again_asks() -> Result<(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
     ))]);
     app.wait_for("Ready")?;
-    app.wait_for("Not usable: Acme Coder is not signed in.")?;
+    app.wait_for("Unavailable: Acme Coder is not signed in.")?;
     app.wait_for("Run acme-coder login, then check again.")?;
     app.wait_for("Not checked yet")?;
     let before = nsh_app_aidaemon::settings_sent_ids().len();

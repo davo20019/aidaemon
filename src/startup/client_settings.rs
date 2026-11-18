@@ -1127,7 +1127,7 @@ impl SettingsHost {
             SettingsChange::CheckAgents => {
                 aidaemon_runtime::tools::agent_mode::check_all().await;
                 Ok(SettingsDone {
-                    message: "Asked each coding agent whether it can work.".to_string(),
+                    message: "Checked whether each coding agent is available.".to_string(),
                     applies: Some(Applies::Now),
                 })
             }

@@ -2248,7 +2248,7 @@ impl CliAgentTool {
                 crate::tools::agent_mode::recheck(tool_name).await
         {
             return Ok(format!(
-                "Blocked: {} (`{tool_name}`) can't do work now: {reason}{}",
+                "Blocked: {} (`{tool_name}`) is unavailable: {reason}{}",
                 coding_agent.name(),
                 fix.map(|fix| format!(" {fix}")).unwrap_or_default()
             ));
