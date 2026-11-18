@@ -510,6 +510,31 @@ pub fn meter(label: impl Into<SharedString>, share: f32) -> View {
 }
 
 /// Asks before something that cannot be undone, in the platform's own
+/// Offers to do something now, in the platform's own alert: `title`,
+/// `detail`, then `action` or `later`. `then` runs only on `action`.
+pub fn now_or_later(
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    action: impl Into<SharedString>,
+    later: impl Into<SharedString>,
+    then: impl FnOnce() + 'static,
+) {
+    let answer = alert_dialog()
+        .title(title.into())
+        .description(detail.into())
+        .cancel("later", later.into())
+        .action("go", action.into())
+        .show();
+    spawn(async move {
+        if answer
+            .await
+            .is_ok_and(|r| r.action.as_deref() == Some("go"))
+        {
+            then();
+        }
+    });
+}
+
 /// alert: `title`, `detail`, then `action` (destructive) or Cancel.
 /// `then` runs only on `action`.
 pub fn confirm(

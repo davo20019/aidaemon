@@ -38,7 +38,89 @@ pub fn page(store: Store) -> View {
     // The Providers tab's form, kept while the settings are read again.
     let form = ProviderForm::new();
     form.follow(store);
-    view().flex_1().min_w(px(0.0)).child(header(store)).child(
+    offer_restart_when_needed(store);
+    view()
+        .flex_1()
+        .min_w(px(0.0))
+        .child(header(store))
+        .child(page_body(store, filter, tab, open, form, terminal))
+        .child(pending_bar(store))
+}
+
+/// What a saved change still needs, if anything: (reload, restart).
+fn pending(store: Store) -> (bool, bool) {
+    match store.settings() {
+        SettingsRead::Ready(s) => (s.reload_pending, s.restart_pending),
+        _ => (false, false),
+    }
+}
+
+/// When a change lands that only a restart puts into effect, ask right
+/// away: whoever flipped the switch should not have to find a button.
+/// Only a change seen while the page is open asks; one already waiting
+/// when it opens is left to the bar.
+fn offer_restart_when_needed(store: Store) {
+    let before = std::cell::Cell::new(None::<bool>);
+    effect(move || {
+        let SettingsRead::Ready(settings) = store.settings() else {
+            return;
+        };
+        let now = settings.restart_pending;
+        if before.replace(Some(now)) == Some(false) && now {
+            untracked(move || {
+                ui::now_or_later(
+                    "Restart to finish?",
+                    "This change takes effect after aidaemon restarts, which takes a few \
+                     seconds. Work in progress stops; apps reconnect on their own.",
+                    "Restart now",
+                    "Later",
+                    move || apply(store, ApplyHow::Restart),
+                )
+            });
+        }
+    });
+}
+
+/// Pinned under the page, so it shows however far down the change was.
+fn pending_bar(store: Store) -> View {
+    view().child(dynamic(move || {
+        let (reload, needs_restart) = pending(store);
+        (reload || needs_restart).then(|| {
+            untracked(move || {
+                let bar = if needs_restart {
+                    ui::banner("Some changes need a restart to take effect.", Tone::Warning).child(
+                        ui::btn("Restart now", Variant::Primary, Size::Sm, move || {
+                            restart(store)
+                        }),
+                    )
+                } else {
+                    ui::banner("Some changes need a reload to take effect.", Tone::Info).child(
+                        ui::btn("Reload", Variant::Primary, Size::Sm, move || {
+                            apply(store, ApplyHow::Reload)
+                        }),
+                    )
+                };
+                view()
+                    .items_center()
+                    .px_4()
+                    .pb_2()
+                    .border_t_1()
+                    .border_color(colors::LINE)
+                    .child(bar)
+            })
+        })
+    }))
+}
+
+fn page_body(
+    store: Store,
+    filter: Signal<String>,
+    tab: Signal<usize>,
+    open: Signal<Vec<SharedString>>,
+    form: ProviderForm,
+    terminal: bool,
+) -> View {
+    view().flex_1().min_h(px(0.0)).child(
         scroll().flex_1().child(
             view().items_center().child(
                 view()
@@ -177,27 +259,6 @@ fn ready(
             "Saved to {}. Changes that widen what the assistant may do ask first.",
             settings.config_path
         )));
-    }
-    if settings.reload_pending {
-        page = page.child(
-            ui::banner("Some saved changes take effect on a reload.", Tone::Info).child(ui::btn(
-                "Reload",
-                Variant::Primary,
-                Size::Sm,
-                move || apply(store, ApplyHow::Reload),
-            )),
-        );
-    }
-    if settings.restart_pending {
-        page = page.child(
-            ui::banner(
-                "Some saved changes take effect after a restart.",
-                Tone::Warning,
-            )
-            .child(ui::btn("Restart", Variant::Primary, Size::Sm, move || {
-                restart(store)
-            })),
-        );
     }
     page = page.child(dynamic(move || {
         let waiting = store.settings_waiting();
