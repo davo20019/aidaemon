@@ -33,6 +33,11 @@ jobs:
           rustup toolchain install
           rustup target add ${{ matrix.target }}
 
+      # Intel Macs: ONNX Runtime from a pinned static library (see the script).
+      - name: ONNX Runtime (Intel Mac)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: scripts/onnxruntime-intel-mac.sh "$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
+
       - name: Build the daemon
         run: cargo build --release --target ${{ matrix.target }} --features "browser"
 
