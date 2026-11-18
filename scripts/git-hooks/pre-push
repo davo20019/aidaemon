@@ -64,14 +64,14 @@ run() {
 }
 
 # A check whose failures cannot be traced to a file (goldens, API snapshot):
-# blocks unless source files have uncommitted edits that may explain it.
+# blocks unless files matching $scope have uncommitted edits that may explain it.
 run_whole() {
-    local name="$1"
-    shift
+    local name="$1" scope="$2"
+    shift 2
     echo "pre-push: $name"
     "$@" >"$log" 2>&1 && return
     show
-    if [[ -n "$dirty_code" ]]; then warned+=("$name"); else failed+=("$name"); fi
+    if grep -qE "$scope" <<<"$dirty_code"; then warned+=("$name"); else failed+=("$name"); fi
 }
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
@@ -111,12 +111,12 @@ if ((${#doc_args[@]})); then
 fi
 
 if touches '^crates/aidaemon-core/'; then
-    run_whole "core public API" scripts/check-core-api.sh
+    run_whole "core public API" '^crates/aidaemon-core/' scripts/check-core-api.sh
 fi
 
 # Tool schemas: per-tool goldens and the catalog budget.
 if touches '^(src|crates)/.*\.rs$|schema_goldens'; then
-    run_whole "tool schema goldens" env RUST_MIN_STACK=8388608 \
+    run_whole "tool schema goldens" '.' env RUST_MIN_STACK=8388608 \
         cargo test -q --all-features --lib catalog_
 fi
 
