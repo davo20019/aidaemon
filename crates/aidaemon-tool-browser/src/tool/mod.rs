@@ -2190,8 +2190,8 @@ impl BrowserTool {
         true
     }
 
-    /// Close the browser once it sits idle (see [`Self::close_if_idle`]), for
-    /// as long as the tool lives. Needs a tokio runtime.
+    /// Close the browser once nothing used it for 5 minutes and the owner is on
+    /// none of its tabs, for as long as the tool lives. Needs a tokio runtime.
     pub fn start_idle_close(self: &Arc<Self>) {
         let tool = Arc::downgrade(self);
         tokio::spawn(async move {
