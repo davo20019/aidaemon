@@ -28,8 +28,8 @@ use crate::goal_dispatch::{
     SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
     auto_dispatch_scheduled_run_extension_budget, build_goal_failure_summary,
     build_goal_task_results_summary, clear_scheduled_run_state, effective_goal_daily_budget,
-    extract_file_paths_from_text, goal_has_scheduled_provenance, is_group_session,
-    persist_scheduled_run_state, truncate_goal_result_text, user_facing_task_description,
+    goal_has_scheduled_provenance, is_group_session, persist_scheduled_run_state,
+    truncate_goal_result_text, user_facing_task_description,
 };
 use crate::turn::notes as parent_delivery;
 
@@ -3234,31 +3234,10 @@ pub fn spawn_background_task_lead(
                         Ok(outcome) if outcome.sent => {
                             let _ = state.mark_notification_delivered(&notification_id).await;
 
-                            // Auto-send any files referenced in the completion message
-                            let file_paths = extract_file_paths_from_text(&msg);
-                            if let Some(hub_weak) = &hub
-                                && let Some(hub_arc) = hub_weak.upgrade()
-                            {
-                                for path in file_paths {
-                                    let filename = std::path::Path::new(&path)
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_else(|| "file".to_string());
-                                    let media = aidaemon_channels::hub::MediaMessage {
-                                        session_id: session_id.clone(),
-                                        caption: filename.clone(),
-                                        kind: aidaemon_channels::hub::MediaKind::Document {
-                                            file_path: path.clone(),
-                                            filename,
-                                        },
-                                        // Fire-and-forget: no delivery receipt awaited.
-                                        result_tx: None,
-                                    };
-                                    if let Err(e) = hub_arc.send_media(&session_id, &media).await {
-                                        warn!("Failed to auto-send goal file {}: {}", path, e);
-                                    }
-                                }
-                            }
+                            // Files reach the owner only as typed
+                            // deliverables (the executors' own send_file
+                            // receipts), never by scraping paths from the
+                            // completion prose.
                         }
                         Ok(_) => {}
                         Err(err) => {

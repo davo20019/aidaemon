@@ -1,5 +1,5 @@
 //! Goal and task dispatch helpers: wait-prefix parsing, scheduled-run
-//! provenance and state, the files a finished goal may send, and the
+//! provenance and state, and the
 //! user-facing goal and task result summaries.
 
 use std::sync::Arc;
@@ -11,67 +11,6 @@ use aidaemon_work::traits::{Goal, Task};
 pub use aidaemon_work::goal_tokens::{
     SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
-
-/// Blocked path patterns for auto-sent files (mirrors SendFileTool).
-const AUTO_SEND_BLOCKED_PATTERNS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".env",
-    "credentials",
-    ".key",
-    ".pem",
-    ".aws/credentials",
-    ".netrc",
-    ".docker/config.json",
-    "config.toml",
-];
-
-/// Extract absolute file paths from text (e.g. goal completion messages).
-/// Only returns paths that exist on disk and aren't security-sensitive.
-pub fn extract_file_paths_from_text(text: &str) -> Vec<String> {
-    // Unix paths, and Windows ones (`C:\Users\...`, `C:/Users/...`).
-    let re = regex::Regex::new(r"((?:[A-Za-z]:[\\/]|/)[\w./\\~-]+\.\w{1,10})").unwrap();
-    let mut paths = Vec::new();
-    for cap in re.captures_iter(text) {
-        let path_str = &cap[1];
-        let path = std::path::Path::new(path_str);
-
-        // Must exist and be a regular file
-        if !path.exists() || !path.is_file() {
-            continue;
-        }
-
-        // Check against blocked patterns, on `/`-separated text whatever
-        // the platform writes.
-        let path_display = path.to_string_lossy().replace('\\', "/");
-        let blocked = AUTO_SEND_BLOCKED_PATTERNS.iter().any(|pattern| {
-            if pattern.starts_with('.') || pattern.starts_with('/') {
-                path_display.contains(&format!("/{}", pattern))
-                    || path_display.contains(&format!("/{}/", pattern))
-            } else {
-                path.file_name()
-                    .map(|n| n.to_string_lossy() == *pattern)
-                    .unwrap_or(false)
-                    || path_display.contains(&format!("/{}", pattern))
-                    || path_display.contains(&format!("/{}/", pattern))
-            }
-        });
-        if blocked {
-            continue;
-        }
-
-        // Also block .key and .pem extensions
-        if let Some(ext) = path.extension() {
-            let ext = ext.to_string_lossy();
-            if ext == "key" || ext == "pem" {
-                continue;
-            }
-        }
-
-        paths.push(path_str.to_string());
-    }
-    paths
-}
 
 /// Check whether a session ID corresponds to a group/public channel (not a DM).
 /// Used to suppress noisy progress updates in shared channels.

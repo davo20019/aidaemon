@@ -14,6 +14,3 @@ mod response_analysis_tests;
 
 #[path = "policy/tool_scoping_tests.rs"]
 mod tool_scoping_tests;
-
-#[path = "tools/file_path_extraction_tests.rs"]
-mod file_path_extraction_tests;

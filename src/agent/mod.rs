@@ -258,9 +258,7 @@ pub(crate) use goal_dispatch::{
     SCHEDULED_AUTONOMOUS_BUDGET_EXTENSIONS, SCHEDULED_AUTONOMOUS_HARD_TOKEN_CAP,
 };
 #[cfg(test)]
-pub(crate) use goal_dispatch::{
-    build_goal_failure_summary, build_goal_task_results_summary, extract_file_paths_from_text,
-};
+pub(crate) use goal_dispatch::{build_goal_failure_summary, build_goal_task_results_summary};
 
 // A goal's background task lead lives in `aidaemon_runtime::background_task_lead`.
 #[path = "background_task_lead.rs"]
