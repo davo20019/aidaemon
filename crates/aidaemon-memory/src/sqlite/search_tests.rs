@@ -545,3 +545,67 @@ async fn punctuation_is_not_a_new_value_but_case_is() {
         "~/Projects"
     );
 }
+
+/// The owner's write supersedes only rows under the same canonical key: a
+/// fact under another key survives whatever words its value shares.
+#[tokio::test]
+async fn an_owner_write_never_supersedes_a_fact_under_another_key() {
+    let (memory, _file) = open().await;
+    for (key, value) in [
+        ("allergy", "green tea"),
+        ("favorite_drink", "green tea latte"),
+    ] {
+        memory
+            .upsert_fact("user", key, value, "agent", None, FactPrivacy::Private)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        active_at(&memory, "user", "allergy").await.unwrap().0,
+        "green tea"
+    );
+    assert_eq!(
+        active_at(&memory, "user", "favorite_drink")
+            .await
+            .unwrap()
+            .0,
+        "green tea latte"
+    );
+}
+
+#[tokio::test]
+async fn an_owner_write_retires_a_stale_row_under_the_same_canonical_key() {
+    let (memory, _file) = open().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (key, value) in [("dog name", "Mia"), ("Dog-Name", "Zoe")] {
+        sqlx::query(
+            "INSERT INTO facts (category, key, value, source, created_at, updated_at, privacy)
+             VALUES ('user', ?, ?, 'agent', ?, ?, 'private')",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(&now)
+        .bind(&now)
+        .execute(&memory.pool)
+        .await
+        .unwrap();
+    }
+    memory
+        .upsert_fact(
+            "user",
+            "dog_name",
+            "Max",
+            "agent",
+            None,
+            FactPrivacy::Private,
+        )
+        .await
+        .unwrap();
+    let active: Vec<String> = sqlx::query_scalar(
+        "SELECT value FROM facts WHERE category = 'user' AND superseded_at IS NULL",
+    )
+    .fetch_all(&memory.pool)
+    .await
+    .unwrap();
+    assert_eq!(active, vec!["Max".to_string()]);
+}

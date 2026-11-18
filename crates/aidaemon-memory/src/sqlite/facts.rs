@@ -34,30 +34,6 @@ fn lexical_relevant_facts(facts: &[Fact], query: &str, max: usize) -> Vec<Fact> 
         .collect()
 }
 
-/// Keywords that signal the user wants ALL facts, not a filtered subset.
-const EXHAUSTIVE_QUERY_MARKERS: &[&str] = &[
-    "everything you know",
-    "everything about me",
-    "all about me",
-    "all you know",
-    "tell me everything",
-    "complete list",
-    "full list",
-    "what do you know about me",
-    "what do you remember",
-    "list all",
-    "list everything",
-    "verify your memory",
-    "memory check",
-    "memory test",
-    "dump all",
-];
-
-fn is_exhaustive_query(query: &str) -> bool {
-    let q = query.to_lowercase();
-    EXHAUSTIVE_QUERY_MARKERS.iter().any(|m| q.contains(m))
-}
-
 /// Build a key-only embedding text for semantic dedup comparison.
 ///
 /// Focuses on category + readable key (no value) so that dedup detects
@@ -220,34 +196,6 @@ pub fn fact_source_rank(source: &str) -> u8 {
 /// "twitter_account"); below it, distinct values start to appear.
 pub(crate) const FACT_RESTATEMENT_MIN_SIMILARITY: f32 = 0.93;
 
-/// Whether the other fact's key or value holds one of `words` (lowercase,
-/// three letters or more) as a whole word: the conflict sweep's guard
-/// against superseding an unrelated fact ("tea" is not in "steam").
-fn shares_a_word(words: &std::collections::HashSet<String>, key: &str, value: &str) -> bool {
-    key.split(|c: char| !c.is_alphanumeric())
-        .chain(value.split(|c: char| !c.is_alphanumeric()))
-        .any(|w| w.len() >= 3 && words.contains(&w.to_ascii_lowercase()))
-}
-
-#[cfg(test)]
-mod shares_a_word_tests {
-    use super::shares_a_word;
-
-    #[test]
-    fn only_whole_words_count() {
-        let words: std::collections::HashSet<String> = ["tea", "car", "coffee"]
-            .iter()
-            .map(|w| w.to_string())
-            .collect();
-        assert!(shares_a_word(&words, "beverage", "coffee (cold brew)"));
-        assert!(shares_a_word(&words, "car_model", "a hatchback"));
-        assert!(shares_a_word(&words, "drink", "Green TEA"));
-        assert!(!shares_a_word(&words, "steam_account", "steamer"));
-        assert!(!shares_a_word(&words, "cardiologist", "Dr. Jordan Lee"));
-        assert!(!shares_a_word(&words, "teacher", "Alice Rivera"));
-    }
-}
-
 /// Categories whose keys name a person or their attributes, where a key that
 /// differs by an entity token must stay separate even at high similarity.
 pub fn fact_category_is_personal(category: &str) -> bool {
@@ -361,7 +309,7 @@ fn prefer_canonical_facts(
 ) -> Vec<Fact> {
     let query_lower = query.to_lowercase();
     let query_words = query_tokens(&query_lower);
-    if !query.trim().is_empty() && !is_exhaustive_query(query) {
+    if !query.trim().is_empty() {
         canonical.retain(|fact| {
             lexical_fallback_score(&query_lower, &query_words, fact) > 0.0
                 || fact.value.to_lowercase().contains(query_lower.trim())
@@ -1858,31 +1806,20 @@ impl FactStore for SqliteMemory {
 
         // ── Post-store conflict sweep ──────────────────────────────────
         //
-        // When the user explicitly stores a fact via remember_fact (source
-        // == "agent"), scan other active facts in the same category for
-        // semantically similar entries that represent stale/conflicting
-        // values for the same concept stored under a different key.
-        //
-        // Example: user says "my coffee is cappuccino" → stored as
-        // (preference, coffee_preference).  We also supersede
-        // (preference, beverage = "coffee (cold brew)") which is the same
-        // concept under a different key that escaped key-level dedup.
-        //
-        // Guards:
-        // - Only for source=="agent" (user-explicit, not consolidation/test)
-        // - Full-fact embedding similarity > 0.82 (stricter than key dedup)
-        // - Lexical overlap: at least one significant word from the new
-        //   fact's key or value must appear in the other fact's key or value
-        //   (prevents cross-concept supersession in the same category)
-        if source == "agent"
-            && let Some(ref new_emb_blob) = embedding_blob
-            && let Ok(new_vec) = self.embedding_service.decode(new_emb_blob)
-        {
+        // When the owner stores a fact through remember_fact (source ==
+        // "agent"), an active row in the same category whose key names the
+        // same attribute in canonical form ("dog name" / "dog_name" left by
+        // an older, uncanonicalized write) and holds another value is stale:
+        // it is superseded. Identity is the canonical key only. Facts under
+        // different keys are never superseded here, whatever words or
+        // embedding they share ("favorite_drink: green tea" must never
+        // retire "allergy: green tea").
+        if source == "agent" {
+            let canonical_written = canonicalize_fact_key(&key_for_write);
             let others = sqlx::query(
-                "SELECT id, key, value, embedding FROM facts
+                "SELECT id, key, value FROM facts
                          WHERE category = ? AND superseded_at IS NULL
-                           AND key != ?
-                           AND embedding IS NOT NULL",
+                           AND key != ?",
             )
             .bind(category_clean)
             .bind(&key_for_write)
@@ -1890,56 +1827,28 @@ impl FactStore for SqliteMemory {
             .await
             .unwrap_or_default();
 
-            // Build keyword set from the new fact's key + value for
-            // lexical overlap guard.  Only words ≥3 chars to skip
-            // noise like "a", "is", "my".
-            let new_words: std::collections::HashSet<String> = key_clean
-                .split(|c: char| !c.is_alphanumeric())
-                .chain(value.split(|c: char| !c.is_alphanumeric()))
-                .filter(|w| w.len() >= 3)
-                .map(|w| w.to_ascii_lowercase())
-                .collect();
-
             for row in &others {
                 let other_id: i64 = row.get("id");
                 let other_key: String = row.get("key");
                 let other_value: String = row.get("value");
-                let blob: Vec<u8> = row.get("embedding");
-
-                // Lexical overlap guard: at least one meaningful word
-                // from the new fact must appear in the other fact as a
-                // whole word ("tea" is not in "steam"), or an unrelated
-                // fact is superseded.
-                let has_overlap = shares_a_word(&new_words, &other_key, &other_value);
-                if !has_overlap {
+                if canonicalize_fact_key(&other_key) != canonical_written || other_value == value {
                     continue;
                 }
-
-                if let Ok(other_vec) = self.embedding_service.decode(&blob) {
-                    let sim = cosine_similarity(&new_vec, &other_vec);
-                    // High similarity on full-fact embedding (value-aware)
-                    // means these facts describe the same concept.  Only
-                    // supersede if the values actually differ (otherwise
-                    // it's a harmless duplicate that adds context).
-                    if sim > 0.82 && other_value != value {
-                        tracing::info!(
-                            category = category_clean,
-                            new_key = key_clean,
-                            new_value = value,
-                            conflicting_key = other_key.as_str(),
-                            conflicting_value = other_value.as_str(),
-                            similarity = sim,
-                            "Conflict sweep: superseding stale fact with different key"
-                        );
-                        let _ = sqlx::query(
-                            "UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced' WHERE id = ?",
-                        )
-                            .bind(&now)
-                            .bind(other_id)
-                            .execute(&self.pool)
-                            .await;
-                    }
-                }
+                tracing::info!(
+                    category = category_clean,
+                    new_key = key_clean,
+                    new_value = value,
+                    conflicting_key = other_key.as_str(),
+                    conflicting_value = other_value.as_str(),
+                    "Conflict sweep: superseding stale fact under the same canonical key"
+                );
+                let _ = sqlx::query(
+                    "UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced' WHERE id = ?",
+                )
+                .bind(&now)
+                .bind(other_id)
+                .execute(&self.pool)
+                .await;
             }
         }
 
@@ -1982,20 +1891,6 @@ impl FactStore for SqliteMemory {
         let all_facts: Vec<Fact> = rows.iter().map(Self::row_to_fact).collect();
 
         if all_facts.is_empty() || query.trim().is_empty() {
-            let mut facts = all_facts;
-            facts.truncate(max);
-            let canonical = self.canonical_personal_facts().await.unwrap_or_default();
-            return Ok(prefer_canonical_facts(canonical, facts, query, max));
-        }
-
-        // Exhaustive queries ("tell me everything", "what do you know about me")
-        // bypass semantic search and return all facts to avoid retrieval gaps.
-        if is_exhaustive_query(query) {
-            tracing::info!(
-                query = query,
-                total_facts = all_facts.len(),
-                "Exhaustive query detected — returning all facts without scoring"
-            );
             let mut facts = all_facts;
             facts.truncate(max);
             let canonical = self.canonical_personal_facts().await.unwrap_or_default();
