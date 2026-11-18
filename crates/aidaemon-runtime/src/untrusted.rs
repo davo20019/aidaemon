@@ -507,8 +507,7 @@ fn parse_verdict(raw: &str) -> VerifierVerdict {
 
 /// The verifier's sentence for the owner as a card shows it: its first
 /// sentence, whitespace collapsed, at most [`OWNER_REASON_CHARS`]
-/// characters cut at a word with an ellipsis. `None` when empty, or when it
-/// speaks of the owner in the third person instead of to them.
+/// characters cut at a word with an ellipsis. `None` when empty.
 fn owner_facing_reason(raw: &str) -> Option<String> {
     let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     // The first sentence: up to a stop followed by a space.
@@ -518,10 +517,10 @@ fn owner_facing_reason(raw: &str) -> Option<String> {
             matches!(c, '.' | '!' | '?') && text[index + c.len_utf8()..].starts_with(' ')
         })
         .map_or(text.as_str(), |(index, c)| &text[..index + c.len_utf8()]);
-    let speaks_of_owner = sentence
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|word| word.eq_ignore_ascii_case("owner") || word.eq_ignore_ascii_case("owners"));
-    if sentence.is_empty() || speaks_of_owner {
+    // The field is the verifier's own sentence for the owner (its schema
+    // asks it to address them as "you"); its words never decide whether it
+    // is shown.
+    if sentence.is_empty() {
         return None;
     }
     if sentence.chars().count() <= OWNER_REASON_CHARS {
@@ -851,17 +850,20 @@ mod tests {
         assert!(long.starts_with(kept), "{shown}");
         assert!(long[kept.len()..].starts_with(' '), "cut mid-word: {shown}");
 
-        for unfit in [
-            "The owner asked for an install.",
-            "   ",
-            "Owner's request is unclear.",
-        ] {
-            let verdict = parse_verdict(
-                &json!({"consistent": false, "reason": "r", "owner_reason": unfit}).to_string(),
-            );
-            assert_eq!(verdict.owner_reason, None, "{unfit}");
-            assert!(verdict.decided);
-        }
+        let blank = parse_verdict(
+            &json!({"consistent": false, "reason": "r", "owner_reason": "   "}).to_string(),
+        );
+        assert_eq!(blank.owner_reason, None);
+        assert!(blank.decided);
+        // The owner_reason field is shown whatever words it uses.
+        let third_person = parse_verdict(
+            &json!({"consistent": false, "reason": "r", "owner_reason": "The owner asked for an install."})
+                .to_string(),
+        );
+        assert_eq!(
+            third_person.owner_reason.as_deref(),
+            Some("The owner asked for an install.")
+        );
         let older = parse_verdict(r#"{"consistent":true,"reason":"asked"}"#);
         assert!(older.consistent && older.decided && older.owner_reason.is_none());
     }
