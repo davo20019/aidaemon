@@ -27,11 +27,15 @@ pub fn code(store: Store) -> View {
         let shown = open.get();
         Some(untracked(move || match shown {
             Some((root, path)) => file_diff(store, root, path, open),
-            None => view().flex_1().child(scroll().flex_1().child(
-                view().px_3().pt_2().pb_4().gap_2().child(dynamic(move || {
-                    let read = store.changes();
-                    Some(untracked(move || body(store, read, open)))
-                })),
+            None => view().flex_1().child(ui::refreshable(
+                scroll()
+                    .flex_1()
+                    .child(view().px_3().pt_2().pb_4().gap_2().child(dynamic(move || {
+                        let read = store.changes();
+                        Some(untracked(move || body(store, read, open)))
+                    }))),
+                move || store.pull_refreshing(),
+                move || store.pull_refresh(),
             )),
         }))
     }))

@@ -28,6 +28,9 @@ pub fn shell(store: Store) -> View {
     set_interval(std::time::Duration::from_secs(1), move || {
         store.advance_tick()
     });
+    // Back after a while away (a phone that froze the page, a minimized
+    // window), everything is read again.
+    effect(move || store.note_lifecycle(lifecycle()));
     let palette = signal(false);
     // Only entering and leaving setup remakes the page, not each step's news.
     let in_setup = computed(move || {
@@ -73,6 +76,9 @@ pub fn shell(store: Store) -> View {
     on_key_with("mod+shift+c", always(), move |_| copy_reply(store));
     if let Some(key) = SYSTEM_KEY {
         on_key(key, move |_| store.open_system());
+    }
+    if let Some(key) = REFRESH_KEY {
+        on_key(key, move |_| store.pull_refresh());
     }
     if terminal {
         // One meaning per state: stop the turn; else press twice to quit.
@@ -353,6 +359,11 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         )
         .group("View"),
     );
+    let refresh = CommandItem::new("refresh", "Refresh: read everything again").group("View");
+    items.push(match REFRESH_KEY {
+        Some(key) => refresh.shortcut(key),
+        None => refresh,
+    });
     items.push(CommandItem::new("memory", "Memory: what the daemon remembers").group("View"));
     items.push(CommandItem::new("settings", "Settings: change how the daemon runs").group("View"));
     items.push(
@@ -446,6 +457,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                     }
                                 }
                                 "system" => store.open_system(),
+                                "refresh" => store.pull_refresh(),
                                 "memory" => store.open_memory(),
                                 "automations" => store.open_automations(),
                                 "settings" => store.open_settings(),
@@ -513,6 +525,13 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
 const SYSTEM_KEY: Option<&str> = Some("mod+,");
 #[cfg(target_arch = "wasm32")]
 const SYSTEM_KEY: Option<&str> = None;
+
+/// Refresh's key. A browser keeps ⌘R to reload the page (which also
+/// refreshes), so the web build has none: a pull or the palette.
+#[cfg(not(target_arch = "wasm32"))]
+const REFRESH_KEY: Option<&str> = Some("mod+r");
+#[cfg(target_arch = "wasm32")]
+const REFRESH_KEY: Option<&str> = None;
 
 /// The details pane's key. A terminal sends Ctrl+I as Tab, so there it is
 /// Ctrl+O.

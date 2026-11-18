@@ -324,7 +324,6 @@ impl State {
 
     fn set_history(&mut self, session_id: &str, messages: Vec<HistoryMessage>) {
         let view = self.session(session_id);
-        // History is older than anything live: it goes first.
         let mut lines: Vec<Line> = Vec::with_capacity(messages.len());
         for m in messages {
             match m.role.as_str() {
@@ -352,8 +351,7 @@ impl State {
                 }
             }
         }
-        lines.append(&mut view.lines);
-        view.lines = lines;
+        view.lines = merge_history(lines, std::mem::take(&mut view.lines));
     }
 
     fn live_turn<'a>(&'a mut self, turn_id: &str) -> Option<&'a mut LiveTurn> {
@@ -621,6 +619,99 @@ fn short(id: &str) -> String {
     } else {
         id.to_string()
     }
+}
+
+/// A said message's identity across history and the live stream: who said
+/// it and its words (history has no event ids to match on).
+fn said(line: &Line) -> Option<(bool, &str)> {
+    match line {
+        Line::User { text, .. } => Some((true, text)),
+        Line::Assistant { text, .. } => Some((false, text)),
+        _ => None,
+    }
+}
+
+fn said_at(line: &Line) -> u64 {
+    match line {
+        Line::User { at_ms, .. } | Line::Assistant { at_ms, .. } => *at_ms,
+        _ => 0,
+    }
+}
+
+/// The transcript after a history read (`history`, the latest page, oldest
+/// first) meets what the client already shows (`shown`).
+///
+/// - Nothing said shown yet: history goes first, before anything live.
+/// - The newest shown message is in history: what history has after it is
+///   what this client missed (a frozen page, a dropped stream); it goes
+///   after, and the client's own notes and the live tool lines stay.
+///   Shown lines after that point that history also has are not doubled.
+/// - None shown is in history: the page is older than all of history's
+///   window (it was away long), so history replaces it; else (the read
+///   is older than what arrived live) history goes first.
+fn merge_history(history: Vec<Line>, shown: Vec<Line>) -> Vec<Line> {
+    if !shown.iter().any(|l| said(l).is_some()) {
+        let mut lines = history;
+        lines.extend(shown);
+        return lines;
+    }
+    // The newest shown message history also has, and where.
+    let found = shown.iter().enumerate().rev().find_map(|(i, line)| {
+        let key = said(line)?;
+        let at = history.iter().rposition(|h| said(h) == Some(key))?;
+        Some((i, at))
+    });
+    let Some((upto, at)) = found else {
+        let newest_shown = shown.iter().map(said_at).max().unwrap_or(0);
+        let oldest_read = history
+            .iter()
+            .map(said_at)
+            .filter(|&t| t > 0)
+            .min()
+            .unwrap_or(0);
+        if newest_shown > 0 && oldest_read > 0 && newest_shown < oldest_read {
+            return history;
+        }
+        let mut lines = history;
+        lines.extend(shown);
+        return lines;
+    };
+    let mut lines = shown;
+    let mut tail = lines.split_off(upto + 1);
+    // Notes already shown right after it were there before what was missed.
+    let notes = tail
+        .iter()
+        .take_while(|l| matches!(l, Line::Note { .. }))
+        .count();
+    lines.extend(tail.drain(..notes));
+    let missed: Vec<Line> = history.into_iter().skip(at + 1).collect();
+    let known: Vec<(bool, String)> = missed
+        .iter()
+        .filter_map(|l| said(l).map(|(u, t)| (u, t.to_owned())))
+        .collect();
+    lines.extend(missed);
+    // What was shown after that point: notes stay, messages history just
+    // brought are not doubled, and a tool line goes with its message.
+    let mut activity = None;
+    for line in tail {
+        match said(&line) {
+            Some((user, text)) => {
+                let doubled = known.iter().any(|(u, t)| *u == user && t == text);
+                if doubled {
+                    activity = None;
+                } else {
+                    lines.extend(activity.take());
+                    lines.push(line);
+                }
+            }
+            None if matches!(line, Line::Activity { .. }) => {
+                lines.extend(activity.replace(line));
+            }
+            None => lines.push(line),
+        }
+    }
+    lines.extend(activity);
+    lines
 }
 
 #[cfg(test)]
@@ -986,5 +1077,114 @@ mod tests {
         });
         assert_eq!(state.last_seq, Some(9));
         assert!(state.approvals.is_empty() && state.tasks.is_empty());
+    }
+
+    fn user(text: &str, at_ms: u64) -> Line {
+        Line::User {
+            text: text.into(),
+            origin: String::new(),
+            at_ms,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn reply(text: &str, at_ms: u64) -> Line {
+        Line::Assistant {
+            text: text.into(),
+            at_ms,
+            attachments: Vec::new(),
+            handed_off: false,
+            served_by: None,
+        }
+    }
+
+    fn note(text: &str) -> Line {
+        Line::Note {
+            text: text.into(),
+            ended: None,
+        }
+    }
+
+    fn words(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| match l {
+                Line::User { text, .. } => format!("u:{text}"),
+                Line::Assistant { text, .. } => format!("a:{text}"),
+                Line::Note { text, .. } => format!("n:{text}"),
+                Line::Activity { .. } => "tools".into(),
+            })
+            .collect()
+    }
+
+    /// The first read of a conversation goes before what arrived live.
+    #[test]
+    fn a_first_history_read_goes_before_live_lines() {
+        let merged = merge_history(vec![user("hi", 1), reply("hello", 2)], vec![note("x")]);
+        assert_eq!(words(&merged), ["u:hi", "a:hello", "n:x"]);
+    }
+
+    /// Reading again after a frozen page brings what was missed, after what
+    /// is shown, without doubling it or losing the client's own notes.
+    #[test]
+    fn a_history_read_again_adds_only_what_was_missed() {
+        let shown = vec![user("hi", 1), reply("hello", 2), note("Stopped.")];
+        let history = vec![
+            user("hi", 1),
+            reply("hello", 2),
+            user("and now?", 3),
+            reply("done", 4),
+        ];
+        let merged = merge_history(history, shown);
+        assert_eq!(
+            words(&merged),
+            ["u:hi", "a:hello", "n:Stopped.", "u:and now?", "a:done"]
+        );
+    }
+
+    /// A line that arrived live after the read stays; one the read also has
+    /// is not doubled, nor is its tool line.
+    #[test]
+    fn a_history_read_keeps_newer_live_lines_once() {
+        let tools = Line::Activity {
+            tools: vec!["search".into()],
+            secs: 2,
+            calls: Vec::new(),
+        };
+        let shown = vec![
+            user("hi", 1),
+            reply("hello", 2),
+            user("again", 3),
+            tools.clone(),
+            reply("found it", 4),
+            user("thanks", 5),
+        ];
+        let history = vec![
+            user("hi", 1),
+            reply("hello", 2),
+            user("again", 3),
+            tools,
+            reply("found it", 4),
+        ];
+        let merged = merge_history(history, shown);
+        assert_eq!(
+            words(&merged),
+            [
+                "u:hi",
+                "a:hello",
+                "u:again",
+                "tools",
+                "a:found it",
+                "u:thanks"
+            ]
+        );
+    }
+
+    /// Away longer than history's window: history replaces the stale page.
+    #[test]
+    fn a_page_older_than_the_whole_read_is_replaced() {
+        let shown = vec![user("old", 1), reply("older", 2)];
+        let history = vec![user("new", 10), reply("newer", 11)];
+        assert_eq!(words(&merge_history(history, shown)), ["u:new", "a:newer"]);
     }
 }

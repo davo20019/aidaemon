@@ -9,36 +9,42 @@ use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, t
 
 pub fn page(store: Store) -> View {
     let filter = signal(String::new());
-    view().flex_1().min_w(px(0.0)).child(header(store)).child(
-        scroll().flex_1().child(
-            view().items_center().child(
-                view()
-                    .w_full()
-                    .max_w(px(size::COLUMN))
-                    .px_4()
-                    .py_4()
-                    .gap_3()
-                    .child(
-                        text(
-                            "What your assistant remembers about you and uses in its answers. \
+    view()
+        .flex_1()
+        .min_w(px(0.0))
+        .child(header(store))
+        .child(ui::refreshable(
+            scroll().flex_1().child(
+                view().items_center().child(
+                    view()
+                        .w_full()
+                        .max_w(px(size::COLUMN))
+                        .px_4()
+                        .py_4()
+                        .gap_3()
+                        .child(
+                            text(
+                                "What your assistant remembers about you and uses in its answers. \
                                  Forget anything that is wrong or that it should not keep.",
+                            )
+                            .text_size(px(ui::fit::small()))
+                            .text_color(colors::MUTED),
                         )
-                        .text_size(px(ui::fit::small()))
-                        .text_color(colors::MUTED),
-                    )
-                    .child(
-                        ui::field("Filter memories", filter)
-                            .label("Filter memories")
-                            .w_full(),
-                    )
-                    .child(dynamic(move || {
-                        let read = store.memories();
-                        let query = filter.get().trim().to_lowercase();
-                        Some(untracked(move || body(store, read, &query)))
-                    })),
+                        .child(
+                            ui::field("Filter memories", filter)
+                                .label("Filter memories")
+                                .w_full(),
+                        )
+                        .child(dynamic(move || {
+                            let read = store.memories();
+                            let query = filter.get().trim().to_lowercase();
+                            Some(untracked(move || body(store, read, &query)))
+                        })),
+                ),
             ),
-        ),
-    )
+            move || store.pull_refreshing(),
+            move || store.pull_refresh(),
+        ))
 }
 
 fn header(store: Store) -> View {

@@ -433,7 +433,17 @@ pub struct Client {
     devices_request: Option<String>,
     /// Why the last device change was refused.
     pub devices_error: Option<String>,
+    /// The reads of a refresh the owner asked for (or the app's return),
+    /// until each is answered: the refresh indicator spins meanwhile.
+    refreshing: BTreeSet<String>,
+    /// When the app went out of sight (ms since the epoch), until it is
+    /// back.
+    away_since: Option<u64>,
 }
+
+/// Away at least this long, the app reads everything again on its return:
+/// a phone may have frozen the page, its socket's stream with it.
+pub const AWAY_REFRESH_MS: u64 = 30_000;
 
 impl Client {
     pub fn new() -> Self {
@@ -511,7 +521,9 @@ impl Client {
                     self.refresh_settings();
                 }
                 if let Some(id) = &cx.selected {
-                    self.load_history(id);
+                    // Held lines may have missed what was said meanwhile:
+                    // read it again (history merges, never doubles).
+                    self.read_history(id);
                     // Its changes too: whether it works on code, and what.
                     self.changes_of = None;
                     self.refresh_changes(cx.selected.as_deref());
@@ -521,6 +533,7 @@ impl Client {
             Update::Disconnected(disconnect) => {
                 // Changes in flight get no answer now.
                 self.settings_changes.clear();
+                self.refreshing.clear();
                 let retry = u64::try_from(disconnect.retry_in.as_millis()).unwrap_or(0);
                 // Only a connection that worked drops quietly: one that
                 // never came up is news at once.
@@ -543,6 +556,14 @@ impl Client {
 
     fn frame(&mut self, frame: ServerFrame, cx: &Context) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if let ServerFrame::Ack { request_id, .. }
+        | ServerFrame::Error {
+            request_id: Some(request_id),
+            ..
+        } = &frame
+        {
+            self.refreshing.remove(request_id);
+        }
         if let ServerFrame::Welcome { version, .. } = &frame {
             self.daemon_version = Some(*version);
         }
@@ -2066,22 +2087,84 @@ impl Client {
             .collect()
     }
 
-    /// Ask for `id`'s history the first time it is shown, when nothing of
-    /// it is held.
+    /// Ask for `id`'s history the first time it is shown (what arrived
+    /// live before then merges with it).
     pub fn load_history(&mut self, id: &str) {
-        let first = self.fetched.insert(id.to_owned());
-        let empty = self
-            .state
-            .sessions
-            .get(id)
-            .is_none_or(|v| v.lines.is_empty());
-        if first && empty {
-            self.send(Command::GetHistory {
-                session_id: id.to_owned(),
-                before: None,
-                limit: 50,
-            });
+        if !self.fetched.contains(id) {
+            self.read_history(id);
         }
+    }
+
+    /// Read `id`'s latest history now; it merges with what is shown.
+    fn read_history(&mut self, id: &str) -> String {
+        self.fetched.insert(id.to_owned());
+        self.send(Command::GetHistory {
+            session_id: id.to_owned(),
+            before: None,
+            limit: 50,
+        })
+    }
+
+    // ----- Refresh ----------------------------------------------------------
+
+    /// Read everything on screen again: the conversations, what is running
+    /// and waiting for approval, the open conversation, and each page read
+    /// before. For a pull to refresh, and the app's return after a while
+    /// away. `false` when offline (nothing to read from).
+    pub fn refresh_all(&mut self, cx: &Context) -> bool {
+        if !self.is_online() {
+            return false;
+        }
+        let mut reads = vec![
+            self.send(Command::GetSnapshot),
+            self.send(Command::ListSessions {
+                cursor: None,
+                limit: 200,
+            }),
+            self.send(Command::ListProjects),
+        ];
+        if let Some(id) = &cx.selected {
+            reads.push(self.read_history(id));
+            if self.queued.contains_key(id.as_str()) {
+                self.refresh_queued(id);
+            }
+            self.refresh_changes(cx.selected.as_deref());
+        }
+        self.refreshing.extend(reads);
+        self.refresh_system();
+        self.refresh_automations();
+        if self.memories.is_ready() {
+            self.refresh_memories();
+        }
+        if self.models.is_ready() {
+            self.refresh_models();
+        }
+        if self.devices.is_ready() {
+            self.refresh_devices();
+        }
+        if self.settings.is_ready() || cx.settings_open {
+            self.refresh_settings();
+        }
+        true
+    }
+
+    /// A refresh's reads are still out.
+    pub fn is_refreshing(&self) -> bool {
+        !self.refreshing.is_empty()
+    }
+
+    /// The app went out of sight (backgrounded, hidden, minimized).
+    pub fn went_away(&mut self, now_ms: u64) {
+        self.away_since.get_or_insert(now_ms);
+    }
+
+    /// The app is in sight again: after [`AWAY_REFRESH_MS`] or more away,
+    /// read everything again. `true` when it did.
+    pub fn came_back(&mut self, cx: &Context) -> bool {
+        let Some(since) = self.away_since.take() else {
+            return false;
+        };
+        cx.now_ms.saturating_sub(since) >= AWAY_REFRESH_MS && self.refresh_all(cx)
     }
 
     /// The owner opened `id`: its replies are read.
@@ -4082,5 +4165,96 @@ mod tests {
                 .iter()
                 .all(|(_, c)| !matches!(c, Command::SendMessage { .. }))
         );
+    }
+
+    fn reads(client: &mut Client) -> Vec<(String, Command)> {
+        client.take_outgoing()
+    }
+
+    /// A pull to refresh reads the conversations, what runs and waits, and
+    /// the open conversation's history, and spins until those answer.
+    #[test]
+    fn a_refresh_reads_the_screen_again_and_spins_until_answered() {
+        let mut client = Client::new();
+        assert!(!client.refresh_all(&cx(Some("app:s1"))), "offline");
+        client.update(Update::Connected, &cx(None));
+        reads(&mut client);
+        assert!(client.refresh_all(&cx(Some("app:s1"))));
+        assert!(client.is_refreshing());
+        let sent = reads(&mut client);
+        for want in [
+            "get_snapshot",
+            "list_sessions",
+            "list_projects",
+            "get_history",
+        ] {
+            assert!(
+                sent.iter()
+                    .any(|(_, c)| serde_json::to_value(c).unwrap()["type"] == want),
+                "{want} in {sent:?}"
+            );
+        }
+        for (id, command) in sent {
+            let result = match command {
+                Command::GetSnapshot => r#"{"type":"snapshot","seq":1,"state":{"sessions":[],"running_tasks":[],"pending_approvals":[]}}"#.to_owned(),
+                Command::GetHistory { .. } => {
+                    r#"{"type":"history","session_id":"app:s1","messages":[]}"#.to_owned()
+                }
+                Command::ListSessions { .. } => r#"{"type":"sessions","sessions":[]}"#.to_owned(),
+                Command::ListProjects => r#"{"type":"projects","projects":[]}"#.to_owned(),
+                _ => continue,
+            };
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
+                )),
+                &cx(Some("app:s1")),
+            );
+        }
+        assert!(!client.is_refreshing());
+    }
+
+    /// Back after a while away, the app reads everything again; a glance
+    /// away (another window for a moment) reads nothing.
+    #[test]
+    fn coming_back_after_a_while_refreshes_a_moment_does_not() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        reads(&mut client);
+        let at = |now_ms| Context {
+            now_ms,
+            ..Context::default()
+        };
+        client.went_away(1_000);
+        assert!(!client.came_back(&at(5_000)));
+        assert!(reads(&mut client).is_empty());
+        client.went_away(10_000);
+        client.went_away(20_000);
+        assert!(client.came_back(&at(10_000 + AWAY_REFRESH_MS)));
+        assert!(!reads(&mut client).is_empty());
+        assert!(!client.came_back(&at(100_000)), "once per return");
+    }
+
+    /// A reconnect reads the open conversation again even when it shows
+    /// lines: they may have missed what was said meanwhile.
+    #[test]
+    fn a_reconnect_reads_the_open_conversation_again() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(Some("app:s1")));
+        let history = |client: &mut Client| {
+            reads(client)
+                .into_iter()
+                .filter(|(_, c)| matches!(c, Command::GetHistory { .. }))
+                .count()
+        };
+        assert_eq!(history(&mut client), 1);
+        client.update(
+            frame(
+                r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:s1","event":{"type":"user_message","session_id":"app:s1","text":"hi","origin":"app"}}"#,
+            ),
+            &cx(Some("app:s1")),
+        );
+        client.update(Update::Connected, &cx(Some("app:s1")));
+        assert_eq!(history(&mut client), 1);
     }
 }

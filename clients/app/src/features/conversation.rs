@@ -867,11 +867,13 @@ fn transcript(store: Store, session: String) -> View {
     let unfolding = ui::Unfolding::provide();
     view()
         .flex_1()
-        .child(
+        .child(ui::refreshable(
             transcript_list(store, session, all, last_seen, unfolding)
                 .element_ref(&list)
                 .flex_1(),
-        )
+            move || store.pull_refreshing(),
+            move || store.pull_refresh(),
+        ))
         .child(when(
             move || {
                 let len = all.with(Vec::len);

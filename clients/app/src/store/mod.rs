@@ -164,6 +164,7 @@ pub struct MediaLink {
 #[derive(Clone, Copy)]
 struct Reads {
     connection: Memo<Connection>,
+    refreshing: Memo<bool>,
     setup: Memo<Option<SetupState>>,
     setup_busy: Memo<bool>,
     setup_error: Memo<Option<String>>,
@@ -206,6 +207,7 @@ impl Reads {
     fn new(client: Signal<Client>) -> Self {
         Self {
             connection: computed(move || client.with(|c| c.connection.clone())),
+            refreshing: computed(move || client.with(Client::is_refreshing)),
             setup: computed(move || client.with(|c| c.state.setup.clone())),
             setup_busy: computed(move || client.with(Client::setup_busy)),
             setup_error: computed(move || client.with(|c| c.setup_error.clone())),
@@ -369,6 +371,9 @@ pub struct Store {
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
+    /// A pull to refresh is under way: its indicator shows until the
+    /// reads answer (a refresh on the app's return shows none).
+    pulled: Signal<bool>,
 }
 
 impl Store {
@@ -436,6 +441,7 @@ impl Store {
             live_room_sent: stored(None),
             media: stored(None),
             media_epoch: stored(0),
+            pulled: signal(false),
         }
     }
 
@@ -496,6 +502,44 @@ impl Store {
         }
     }
 
+    // ----- Refresh ------------------------------------------------------------
+
+    /// Pulled to refresh (or asked from the keyboard or palette): read
+    /// everything on screen again.
+    pub fn pull_refresh(&self) {
+        if self.pulled.get_untracked() && self.reads.refreshing.get_untracked() {
+            return;
+        }
+        let cx = self.context();
+        let online = self.act(|client| client.refresh_all(&cx));
+        if !online {
+            self.say("Offline: it refreshes once the daemon is back");
+        }
+        self.pulled.set(online);
+    }
+
+    /// A pull's reads are still out (the indicator spins meanwhile).
+    pub fn pull_refreshing(&self) -> bool {
+        self.pulled.get() && self.reads.refreshing.get()
+    }
+
+    /// The app went out of sight, or came back: back after a while away,
+    /// it reads everything again (a phone may have frozen the page).
+    pub fn note_lifecycle(&self, lifecycle: nsh_core::platform::Lifecycle) {
+        use nsh_core::platform::Lifecycle;
+        match lifecycle {
+            Lifecycle::Background => {
+                let now = now_ms();
+                self.act(|client| client.went_away(now));
+            }
+            Lifecycle::Active => {
+                let cx = self.context();
+                self.act(|client| client.came_back(&cx));
+            }
+            Lifecycle::Inactive => {}
+        }
+    }
+
     // ----- What the link reports -----------------------------------------
 
     pub fn update(&self, update: Update) {
@@ -503,6 +547,9 @@ impl Store {
         let effects = self.act(|client| client.update(update, &cx));
         for effect in effects {
             self.effect(effect);
+        }
+        if self.pulled.get_untracked() && !self.reads.refreshing.get_untracked() {
+            self.pulled.set(false);
         }
         self.settle_here();
     }

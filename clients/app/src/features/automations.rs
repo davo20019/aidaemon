@@ -25,14 +25,16 @@ pub fn page(store: Store) -> View {
         .flex_1()
         .min_w(px(0.0))
         .child(header(store))
-        .child(
+        .child(ui::refreshable(
             scroll()
                 .flex_1()
                 .child(view().items_center().child(dynamic(move || {
                     let read = store.automations();
                     Some(untracked(move || body(store, read)))
                 }))),
-        )
+            move || store.pull_refreshing(),
+            move || store.pull_refresh(),
+        ))
 }
 
 fn header(store: Store) -> View {

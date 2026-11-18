@@ -77,7 +77,7 @@ pub fn sidebar(store: Store) -> View {
                 .child(ui::kbd(key_label("mod+n"))),
             )
         }))
-        .child(
+        .child(ui::refreshable(
             scroll().flex_1().child(
                 view()
                     .px_2()
@@ -123,7 +123,9 @@ pub fn sidebar(store: Store) -> View {
                         },
                     )),
             ),
-        )
+            move || store.pull_refreshing(),
+            move || store.pull_refresh(),
+        ))
         .child(pages(store))
         // The line shows only when something is wrong: the dot by the name
         // says connected or reconnecting.
