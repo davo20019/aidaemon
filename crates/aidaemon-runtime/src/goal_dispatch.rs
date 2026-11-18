@@ -255,8 +255,8 @@ pub fn build_goal_failure_summary(
         .or_else(|| goal.map(|g| g.description.clone()))
         .unwrap_or_else(|| "task lead exited without completing all tasks".to_string());
 
-    if summary.to_ascii_lowercase().starts_with("goal failed:") {
-        summary = summary["Goal failed:".len()..].trim().to_string();
+    if let Some(rest) = summary.strip_prefix(aidaemon_channels::presentation::GOAL_FAILED_LEAD) {
+        summary = rest.trim().to_string();
     }
 
     truncate_goal_result_text(&summary, 3500)
@@ -331,9 +331,13 @@ pub fn build_goal_task_results_summary(
             } else {
                 MAX_CHARS_PER_TASK_RESULT
             };
+            // The heading names the task; its full prompt stays in the
+            // task ledger, so a long instruction never becomes a chat card.
             format!(
                 "**{}**\n{}",
-                user_facing_task_description(&t.description),
+                aidaemon_tools::sanitize::short_goal_label(&user_facing_task_description(
+                    &t.description
+                )),
                 truncate_goal_result_text(result, cap)
             )
         })
@@ -356,9 +360,8 @@ pub fn build_goal_task_results_summary(
     }
 
     let mut summary = format!(
-        "{}/{} tasks completed.\n\n{}",
-        successful.len(),
-        tasks.len(),
+        "{}\n\n{}",
+        aidaemon_channels::presentation::task_count_line(successful.len(), tasks.len()),
         sections.join("\n\n")
     );
     if omitted > 0 {

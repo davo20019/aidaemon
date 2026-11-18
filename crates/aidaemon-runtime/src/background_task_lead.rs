@@ -2971,7 +2971,8 @@ pub fn spawn_background_task_lead(
                             (
                                 "completed",
                                 format!(
-                                    "Goal completed: {}",
+                                    "{} {}",
+                                    aidaemon_channels::presentation::GOAL_COMPLETED_LEAD,
                                     truncate_goal_result_text(&run.response, 4000)
                                 ),
                             )
@@ -3063,7 +3064,14 @@ pub fn spawn_background_task_lead(
                                 .and_then(|g| g.as_ref())
                                 .map(|g| g.description.chars().take(100).collect::<String>())
                                 .unwrap_or_default();
-                            ("completed", format!("Goal completed: {}", desc_preview))
+                            (
+                                "completed",
+                                format!(
+                                    "{} {}",
+                                    aidaemon_channels::presentation::GOAL_COMPLETED_LEAD,
+                                    desc_preview
+                                ),
+                            )
                         } else {
                             // No inline results sent — include full task results in notification.
                             let fallback_summary = match &result {
@@ -3115,7 +3123,8 @@ pub fn spawn_background_task_lead(
                                 (
                                     "completed",
                                     format!(
-                                        "Goal completed:\n\n{}",
+                                        "{}\n\n{}",
+                                        aidaemon_channels::presentation::GOAL_COMPLETED_LEAD,
                                         task_results_summary.chars().take(4000).collect::<String>()
                                     ),
                                 )
@@ -3125,7 +3134,8 @@ pub fn spawn_background_task_lead(
                     "failed" => (
                         "failed",
                         format!(
-                            "Goal failed: {}",
+                            "{} {}",
+                            aidaemon_channels::presentation::GOAL_FAILED_LEAD,
                             build_goal_failure_summary(
                                 final_goal.as_ref().ok().and_then(|g| g.as_ref()),
                                 &completed_tasks,
@@ -3145,7 +3155,8 @@ pub fn spawn_background_task_lead(
                     _ => (
                         "failed",
                         format!(
-                            "Goal failed: {}",
+                            "{} {}",
+                            aidaemon_channels::presentation::GOAL_FAILED_LEAD,
                             build_goal_failure_summary(
                                 final_goal.as_ref().ok().and_then(|g| g.as_ref()),
                                 &completed_tasks,

@@ -141,7 +141,8 @@ impl GoalCycle {
                 "failed" => (
                     "failed",
                     format!(
-                        "Goal failed: {}",
+                        "{} {}",
+                        aidaemon_channels::presentation::GOAL_FAILED_LEAD,
                         goal.description.chars().take(300).collect::<String>()
                     ),
                 ),

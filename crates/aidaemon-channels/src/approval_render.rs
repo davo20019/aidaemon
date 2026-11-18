@@ -467,6 +467,17 @@ fn normalized_goal_text(text: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Whether the normalized `summary` is the field `what`: the same text, or
+/// `<lead>: <what>`.
+fn summary_states(summary_normalized: &str, what: &str) -> bool {
+    let what = normalized_goal_text(what);
+    !what.is_empty()
+        && (summary_normalized == what
+            || summary_normalized
+                .strip_suffix(what.as_str())
+                .is_some_and(|lead| lead.ends_with(": ")))
+}
+
 fn readable_policy(value: &str) -> String {
     value.replace(" | ", "\n")
 }
@@ -484,9 +495,15 @@ fn mandate_card_body(
     let mut body = format!("{subject}\n{summary}\n");
     let summary_normalized = normalized_goal_text(summary);
     for (essential, text) in card.essentials() {
-        // The summary already names what it does.
-        if essential == Essential::What && summary_normalized.contains(&normalized_goal_text(text))
-        {
+        // An empty essential has nothing to show. The What line is left out
+        // only when the summary is that same field: the whole summary, or the
+        // objective after the summary's own `<lead>: ` (how the confirming
+        // tool writes it). Never containment, so an empty or partial value
+        // is never taken as already said.
+        if text.trim().is_empty() {
+            continue;
+        }
+        if essential == Essential::What && summary_states(&summary_normalized, text) {
             continue;
         }
         body.push_str(&format!("\n{}: {text}", essential.label()));
@@ -914,6 +931,38 @@ mod tests {
         assert!(!rendered.contains("Additional detail"), "{rendered}");
         let essentials_end = rendered.find("Ends:").unwrap();
         assert!(essentials_end < rendered.find("Details").unwrap());
+    }
+
+    #[test]
+    fn the_what_line_is_kept_unless_the_summary_is_that_field() {
+        let card = |what: &str| aidaemon_core::mandate_card::MandateConfirmationCard {
+            what: what.to_string(),
+            how_often: "Every hour".to_string(),
+            can_do: "Read only".to_string(),
+            tells_you_when: "it finds something".to_string(),
+            ends: "Only when you stop it".to_string(),
+            details: Vec::new(),
+        };
+        let render = |summary: &str, what: &str| {
+            build_goal_confirmation_pages(
+                summary,
+                &card(what).into_lines(),
+                GoalConfirmationStyle::Standard,
+            )
+            .join("\n")
+        };
+        // A What that is only part of the summary is still shown.
+        let partial = render("Watch the synthetic status page and the blog", "the blog");
+        assert!(partial.contains("\nWhat: the blog"), "{partial}");
+        // An empty What renders no empty line.
+        let empty = render("Watch the synthetic status page", "");
+        assert!(!empty.contains("\nWhat:"), "{empty}");
+        // The same field is said once.
+        let same = render(
+            "Watch the synthetic status page",
+            "Watch the synthetic status page",
+        );
+        assert_eq!(same.matches("synthetic status page").count(), 1, "{same}");
     }
 
     #[test]

@@ -249,12 +249,12 @@ pub fn timestamp_is_at_or_after(value: &str, lower_bound: &str) -> bool {
 /// must never accompany incomplete tasks — name what's missing instead.
 pub fn goal_completion_header(tasks: &[crate::traits::Task]) -> String {
     if tasks.is_empty() {
-        return "Goal completed:".to_string();
+        return aidaemon_channels::presentation::GOAL_COMPLETED_LEAD.to_string();
     }
     let total = tasks.len();
     let done = tasks.iter().filter(|t| t.status == "completed").count();
     if done == total {
-        return "Goal completed:".to_string();
+        return aidaemon_channels::presentation::GOAL_COMPLETED_LEAD.to_string();
     }
     let missing: Vec<String> = tasks
         .iter()

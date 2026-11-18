@@ -743,8 +743,9 @@ impl GoalCycle {
             }
 
             let msg = format!(
-                "Goal stalled: \"{}\" has {} pending task(s) but no active agent. \
+                "{} \"{}\" has {} pending task(s) but no active agent. \
                  You can re-trigger this by asking me about it again.",
+                aidaemon_channels::presentation::GOAL_STALLED_LEAD,
                 goal.description.chars().take(200).collect::<String>(),
                 eligible_tasks.len(),
             );

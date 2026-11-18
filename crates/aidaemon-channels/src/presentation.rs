@@ -13,10 +13,30 @@ static URL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"https?://[^\s<>]+").expect("valid outbound URL regex"));
 static LOCAL_PATH_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)(^|[\s(])((?:~/|/)[^\s,;]+)").expect("valid local path regex"));
-static TASK_COUNT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^\d+\s*/\s*\d+\s+tasks?\s+(?:completed|done)\.?$")
-        .expect("valid task-count regex")
-});
+/// The lead the daemon writes above a finished goal's results. The
+/// notification heading says the same, so the presenter drops it.
+pub const GOAL_COMPLETED_LEAD: &str = "Goal completed:";
+/// The lead the daemon writes above a failed goal's summary.
+pub const GOAL_FAILED_LEAD: &str = "Goal failed:";
+/// The lead the daemon writes above a stalled goal's notice.
+pub const GOAL_STALLED_LEAD: &str = "Goal stalled:";
+
+/// The count line the daemon writes above a goal's task results.
+pub fn task_count_line(done: usize, total: usize) -> String {
+    format!("{done}/{total} tasks completed.")
+}
+
+/// Whether `line` is the daemon's own [`task_count_line`]. A machine format
+/// the daemon writes, matched exactly, never a paraphrase.
+fn is_task_count_line(line: &str) -> bool {
+    let Some(counts) = line.strip_suffix(" tasks completed.") else {
+        return false;
+    };
+    let Some((done, total)) = counts.split_once('/') else {
+        return false;
+    };
+    done.parse::<usize>().is_ok() && total.parse::<usize>().is_ok()
+}
 
 /// Replace the daemon's internal markers (refusal prefixes, redaction
 /// placeholders, file-inbox paths) with what the owner reads instead. The
@@ -89,7 +109,7 @@ pub fn prepare_chat_message(text: &str) -> String {
 
         // Orchestration steps can contain the user's entire multi-paragraph
         // instruction. They are useful in the task ledger, not in a chat card.
-        if is_verbose_step_echo(trimmed) || is_probable_bold_task_prompt(trimmed) {
+        if is_verbose_step_echo(trimmed) {
             continue;
         }
 
@@ -239,13 +259,14 @@ fn concise_scheduled_outcome(text: &str) -> String {
     let without_urls = URL_RE.replace_all(text, "");
     let shortened = shorten_local_paths(&without_urls);
     for line in shortened.lines().map(str::trim) {
-        // Headings and lead-in labels ("Goal completed:") introduce the
-        // outcome; they are not it.
+        // The daemon's own structure around the outcome is not it: its
+        // status headings, its goal leads, its task-count line and the bold
+        // task headings the results summary writes.
         if line.is_empty()
             || has_status_heading(line)
-            || TASK_COUNT_RE.is_match(line)
+            || is_daemon_goal_lead(line)
+            || is_task_count_line(line)
             || (line.starts_with("**") && line.ends_with("**"))
-            || line.ends_with(':')
         {
             continue;
         }
@@ -304,20 +325,6 @@ fn is_verbose_step_echo(line: &str) -> bool {
         .is_some_and(|step| step.trim().chars().count() > MAX_INLINE_STEP_CHARS)
 }
 
-fn is_probable_bold_task_prompt(line: &str) -> bool {
-    if !line.starts_with("**") || !line.ends_with("**") || line.chars().count() <= 220 {
-        return false;
-    }
-    let lower = line.to_ascii_lowercase();
-    [
-        "create", "read", "write", "run", "deploy", "verify", "exactly",
-    ]
-    .iter()
-    .filter(|word| lower.contains(*word))
-    .count()
-        >= 3
-}
-
 fn style_known_label(line: &str) -> String {
     let trimmed = line.trim_start();
     if trimmed.starts_with("**") {
@@ -360,19 +367,21 @@ fn has_status_heading(message: &str) -> bool {
     .any(|prefix| first.starts_with(prefix))
 }
 
+/// Whether `line` is exactly one of the daemon's goal leads.
+fn is_daemon_goal_lead(line: &str) -> bool {
+    [GOAL_COMPLETED_LEAD, GOAL_FAILED_LEAD, GOAL_STALLED_LEAD].contains(&line)
+}
+
+/// `message` without the daemon's own goal lead that repeats the heading the
+/// presenter adds. Only the daemon's constants are recognized.
 fn trim_redundant_lead<'a>(notification_type: &str, message: &'a str) -> &'a str {
-    let prefixes: &[&str] = match notification_type {
-        "completed" => &["Goal completed:", "Goal completed.", "Completed:"],
-        "failed" => &["Goal failed:", "Run failed:", "Failed:"],
-        "stalled" => &["Goal stalled:", "Work stalled:"],
-        _ => &[],
+    let lead = match notification_type {
+        "completed" => GOAL_COMPLETED_LEAD,
+        "failed" => GOAL_FAILED_LEAD,
+        "stalled" => GOAL_STALLED_LEAD,
+        _ => return message,
     };
-    for prefix in prefixes {
-        if let Some(rest) = message.strip_prefix(prefix) {
-            return rest.trim();
-        }
-    }
-    message
+    message.strip_prefix(lead).map(str::trim).unwrap_or(message)
 }
 
 #[cfg(test)]
@@ -406,13 +415,33 @@ mod tests {
     }
 
     #[test]
-    fn long_bold_task_prompt_is_removed() {
-        let prompt = format!(
+    fn long_bold_lines_are_kept_whatever_their_words() {
+        let bold = format!(
             "**{}**",
             "Create, read, write, deploy, and verify exactly one post. ".repeat(8)
         );
-        let output = prepare_chat_message(&format!("Published the post.\n\n{prompt}\n\nHTTP 200."));
-        assert_eq!(output, "Published the post.\n\nHTTP 200.");
+        let output = prepare_chat_message(&format!("Published the post.\n\n{bold}\n\nHTTP 200."));
+        assert!(output.contains("Create, read, write"), "{output}");
+    }
+
+    #[test]
+    fn a_result_line_ending_in_a_colon_is_the_outcome_unless_the_daemon_wrote_it() {
+        let output = present_scheduled_run_notification(
+            "completed",
+            &format!(
+                "{GOAL_COMPLETED_LEAD}\n\n{}\n\nRemind me at 9:",
+                task_count_line(1, 1)
+            ),
+            false,
+            ScheduledRunProgress::Finished,
+        );
+        assert!(output.contains("Remind me at 9:"), "{output}");
+        assert!(!output.contains("tasks completed"), "{output}");
+        // A lead the daemon did not write is the message's own text.
+        assert_eq!(
+            present_notification("completed", "Completed: the backup"),
+            "✅ **Completed**\n\nCompleted: the backup"
+        );
     }
 
     #[test]
