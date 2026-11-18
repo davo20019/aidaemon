@@ -76,6 +76,18 @@ impl AgentAction {
     }
 }
 
+/// Allows every action as asked, unjudged: an agent in full access whose
+/// protocol still asks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllowAll;
+
+#[async_trait]
+impl ActionJudge for AllowAll {
+    async fn judge(&self, _action: AgentAction) -> Verdict {
+        Verdict::Allow
+    }
+}
+
 /// Decides each action a hosted coding agent asks for: the embedding
 /// agent's safeguards. It may wait for its owner's answer; the agent waits
 /// with it.

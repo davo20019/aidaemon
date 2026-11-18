@@ -80,6 +80,8 @@ pub struct RunRequest<'a> {
     /// Its approval requests can be answered: a judge is at hand and the
     /// process runs where its stdin can stay open.
     pub can_host: bool,
+    /// Its stdin can stay open for a host (a local process), judge or not.
+    pub stdin_open: bool,
 }
 
 /// A launch's arguments: `args[start..]` are the agent's own; what precedes

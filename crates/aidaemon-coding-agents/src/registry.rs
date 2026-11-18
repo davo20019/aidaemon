@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{CodingAgent, claude::ClaudeCode, codex::Codex, plain::PlainAgent};
+use crate::{CodingAgent, acp::AcpAgent, claude::ClaudeCode, codex::Codex, plain::PlainAgent};
 
 /// The coding agents an embedding agent knows, in the order it prefers
 /// them. A program none of them launches is a [`PlainAgent`].
@@ -17,13 +17,15 @@ impl CodingAgents {
         Self { agents: Vec::new() }
     }
 
-    /// The agents this crate ships: Claude Code and Codex (both hosted),
-    /// Gemini CLI, GitHub Copilot CLI and Aider (full access only).
+    /// The agents this crate ships: Claude Code and Codex (hosted by their
+    /// own protocols), Antigravity CLI and Gemini CLI (hosted over the Agent
+    /// Client Protocol), GitHub Copilot CLI and Aider (full access only).
     pub fn builtin() -> Self {
         Self::empty()
             .with(ClaudeCode)
-            .with(PlainAgent::gemini())
+            .with(AcpAgent::gemini())
             .with(Codex)
+            .with(AcpAgent::antigravity())
             .with(PlainAgent::copilot())
             .with(PlainAgent::aider())
     }
@@ -31,6 +33,13 @@ impl CodingAgents {
     /// Add `agent`; it is preferred after the ones already here.
     pub fn with(mut self, agent: impl CodingAgent + 'static) -> Self {
         self.agents.push(Arc::new(agent));
+        self
+    }
+
+    /// Add `agent` ahead of the ones already here: it is found first for
+    /// its program.
+    pub fn preferring(mut self, agent: impl CodingAgent + 'static) -> Self {
+        self.agents.insert(0, Arc::new(agent));
         self
     }
 
@@ -66,6 +75,7 @@ mod tests {
         assert_eq!(agents.for_program("claude").name(), "Claude Code");
         assert_eq!(agents.for_program("codex.exe").name(), "Codex");
         assert_eq!(agents.for_program("gemini").name(), "Gemini CLI");
+        assert_eq!(agents.for_program("agy").name(), "Antigravity CLI");
         let unknown = agents.for_program("synthetic-coder");
         assert_eq!(unknown.name(), "synthetic-coder");
         assert_eq!(unknown.modes(), &[PermissionMode::FullAccess]);
@@ -100,6 +110,7 @@ mod tests {
             ("claude", &["--add-dir", "/synthetic/elsewhere"]),
             ("claude", &["--verbose=true"]),
             ("gemini", &["--approval-mode", "auto_edit"]),
+            ("agy", &["acp", "--dangerously-skip-permissions"]),
             ("aider", &["--auto-commits"]),
             ("codex", &["sandbox"]),
         ] {
@@ -119,12 +130,27 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_the_owner_declares_is_found_first_for_its_program() {
+        let agents = CodingAgents::builtin().preferring(crate::acp::AcpAgent::custom(
+            "Synthetic Coder",
+            "synthetic-coder",
+            &[],
+        ));
+        let agent = agents.for_program("synthetic-coder");
+        assert_eq!(agent.name(), "Synthetic Coder");
+        assert_eq!(agent.default_mode(), Some(PermissionMode::EveryCommand));
+    }
+
+    #[test]
     fn every_builtin_agent_says_how_to_find_it() {
         let names: Vec<_> = CodingAgents::builtin()
             .all()
             .iter()
             .filter_map(|agent| agent.discovery().map(|found| found.name))
             .collect();
-        assert_eq!(names, ["claude", "gemini", "codex", "copilot", "aider"]);
+        assert_eq!(
+            names,
+            ["claude", "gemini", "codex", "agy", "copilot", "aider"]
+        );
     }
 }

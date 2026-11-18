@@ -34,25 +34,6 @@ impl PlainAgent {
         Self::new(program, program, None, None)
     }
 
-    /// Gemini CLI.
-    pub fn gemini() -> Self {
-        Self::new(
-            "Gemini CLI",
-            "gemini",
-            Some(Discovery {
-                name: "gemini",
-                command: "gemini",
-                args: &["--output-format", "stream-json"],
-                description: "Gemini CLI — Google's AI coding agent",
-            }),
-            Some(LaunchArguments {
-                flags: &["--debug", "-d"],
-                valued: &["--output-format", "-o", "--model", "-m"],
-                subcommands: &[],
-            }),
-        )
-    }
-
     /// GitHub Copilot CLI.
     pub fn copilot() -> Self {
         Self::new(

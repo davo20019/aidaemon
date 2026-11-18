@@ -109,6 +109,11 @@ pub struct CliToolConfig {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub max_output_chars: Option<usize>,
+    /// The protocol it speaks when it is not one the daemon already knows:
+    /// `"acp"` (the Agent Client Protocol) hosts it, every action it takes
+    /// asked first.
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 /// Max bytes for output buffer (1 MB) to prevent unbounded memory growth.
@@ -1351,6 +1356,21 @@ impl CliAgentTool {
         let mut tool_names: Vec<String> = tools.keys().cloned().collect();
         tool_names.sort();
 
+        // An agent the owner says speaks the Agent Client Protocol is
+        // hosted over it, ahead of any built-in agent for its program.
+        let mut coding_agents = aidaemon_coding_agents::CodingAgents::builtin();
+        for (name, tool_config) in &config.tools {
+            if tool_config.protocol.as_deref() == Some("acp") {
+                let program = std::path::Path::new(&tool_config.command)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&tool_config.command)
+                    .to_string();
+                coding_agents = coding_agents.preferring(
+                    aidaemon_coding_agents::acp::AcpAgent::custom(name, &program, &[]),
+                );
+            }
+        }
         let tool = CliAgentTool {
             context_facts: None,
             project_notes: None,
@@ -1370,7 +1390,7 @@ impl CliAgentTool {
             plan_store: OnceLock::new(),
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
-            coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
+            coding_agents,
         };
 
         // Load dynamic agents from DB
@@ -2313,6 +2333,7 @@ impl CliAgentTool {
                 read_paths: &canonical_read_paths,
                 write_paths: &canonical_write_paths,
                 can_host,
+                stdin_open: self.backend.kind() == aidaemon_tools::backend::BackendKind::Local,
             },
             &mut launch,
         ) {
@@ -2579,16 +2600,18 @@ impl CliAgentTool {
         // Its host answers its approval requests (judged by this run) and
         // sends it its task.
         let agent_host: Option<Arc<dyn aidaemon_coding_agents::AgentHost>> =
-            match (host_starter, nested, spawned.take_stdin()) {
-                (Some(starter), Some(nested), Some(stdin)) => Some(
-                    starter
-                        .start(
-                            stdin,
-                            Arc::new(crate::tools::agent_mode::DaemonJudge::new(nested)),
-                            &final_prompt,
-                        )
-                        .await,
-                ),
+            match (host_starter, spawned.take_stdin()) {
+                (Some(starter), Some(stdin)) => {
+                    // Full access: an agent whose protocol still asks is
+                    // allowed as it asks, unjudged.
+                    let judge: Arc<dyn aidaemon_coding_agents::ActionJudge> = match nested {
+                        Some(nested) => {
+                            Arc::new(crate::tools::agent_mode::DaemonJudge::new(nested))
+                        }
+                        None => Arc::new(aidaemon_coding_agents::AllowAll),
+                    };
+                    Some(starter.start(stdin, judge, &final_prompt).await)
+                }
                 _ => None,
             };
         let agent_host_for_task = agent_host.clone();
@@ -7343,6 +7366,7 @@ mod tests {
                 description: "Echo for test".to_string(),
                 timeout_secs: None,
                 max_output_chars: None,
+                protocol: None,
             },
         );
         let config = CliAgentsConfig {
@@ -7378,6 +7402,7 @@ mod tests {
                 description: "".to_string(),
                 timeout_secs: None,
                 max_output_chars: None,
+                protocol: None,
             },
         );
         let config = CliAgentsConfig {

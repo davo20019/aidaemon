@@ -20,6 +20,7 @@
 //! its arguments, environment and stdin ([`Launch`], [`Plan`]) and reads
 //! its output through the host ([`read_through`]).
 
+pub mod acp;
 mod action;
 mod agent;
 pub mod claude;
@@ -29,7 +30,7 @@ pub mod plain;
 mod registry;
 mod stdin;
 
-pub use action::{ActionJudge, AgentAction, TextEdit, Verdict};
+pub use action::{ActionJudge, AgentAction, AllowAll, TextEdit, Verdict};
 pub use agent::{
     AgentHost, CodingAgent, Discovery, HostAnswers, HostStarter, Launch, LaunchArguments, Plan,
     PromptPlacement, RunRequest, read_through,

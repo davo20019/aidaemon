@@ -265,6 +265,7 @@ mod tests {
             read_paths: &[],
             write_paths,
             can_host: false,
+            stdin_open: true,
         }
     }
 
