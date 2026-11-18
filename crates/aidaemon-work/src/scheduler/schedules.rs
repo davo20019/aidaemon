@@ -299,23 +299,43 @@ impl GoalCycle {
     }
 
     pub async fn fire_due_schedule(&self, mut schedule: GoalSchedule) -> anyhow::Result<()> {
-        // Guardrails (unknown policy/tz -> treat as coalesce/local-only).
-        if schedule.tz != "local" {
-            tracing::warn!(
-                schedule_id = %schedule.id,
-                goal_id = %schedule.goal_id,
-                tz = %schedule.tz,
-                "Skipping schedule with unsupported tz"
-            );
-            return Ok(());
-        }
-
         let now = chrono::Utc::now();
         let now_ts = now.to_rfc3339();
 
         let Some(mut goal) = self.state.get_goal(&schedule.goal_id).await? else {
             return Ok(());
         };
+
+        // A stored zone this cannot read is never guessed as the owner's
+        // clock: the schedule is paused and the owner told, once.
+        if let Err(error) = crate::schedule::ScheduleZone::from_stored(&schedule.tz) {
+            warn!(
+                schedule_id = %schedule.id,
+                goal_id = %schedule.goal_id,
+                tz = %schedule.tz,
+                %error,
+                "Paused a schedule whose stored time zone is unknown"
+            );
+            schedule.is_paused = true;
+            schedule.updated_at = now_ts.clone();
+            self.state.update_goal_schedule(&schedule).await?;
+            let msg = format!(
+                "Paused the schedule of \"{}\": its time zone '{}' is not one this can read. \
+                 Change its schedule to run it again.",
+                self.presenter.goal_label(&goal.description),
+                schedule.tz,
+            );
+            let entry = crate::traits::NotificationEntry::new(
+                &goal.id,
+                &goal.session_id,
+                "evergreen_alert",
+                &msg,
+            );
+            if let Err(error) = self.state.enqueue_notification(&entry).await {
+                warn!(goal_id = %goal.id, %error, "Failed to enqueue unknown-zone notice");
+            }
+            return Ok(());
+        }
 
         // Safety: only active orchestration goals should fire.
         if goal.domain != "orchestration" || goal.status != "active" {
@@ -331,9 +351,11 @@ impl GoalCycle {
             && let Ok(due) = chrono::DateTime::parse_from_rfc3339(&schedule.next_run_at)
         {
             let due = due.with_timezone(&chrono::Utc);
-            if let Some(window) = crate::schedule::catch_up_window(&schedule.cron_expr, due)
+            if let Some(window) =
+                crate::schedule::catch_up_window_in(&schedule.cron_expr, &schedule.tz, due)
                 && now - due > window
-                && let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr)
+                && let Ok(next) =
+                    crate::schedule::compute_next_run_in(&schedule.cron_expr, &schedule.tz)
             {
                 schedule.next_run_at = next.to_rfc3339();
                 schedule.updated_at = now_ts.clone();
@@ -455,7 +477,9 @@ impl GoalCycle {
             if schedule.is_one_shot {
                 // Keep the one-shot due, but avoid hot-looping while open work exists.
                 schedule.next_run_at = (now + chrono::Duration::minutes(5)).to_rfc3339();
-            } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
+            } else if let Ok(next) =
+                crate::schedule::compute_next_run_in(&schedule.cron_expr, &schedule.tz)
+            {
                 schedule.next_run_at = next.to_rfc3339();
             }
             schedule.updated_at = now_ts.clone();
@@ -498,7 +522,9 @@ impl GoalCycle {
             schedule.last_run_at = Some(now_ts.clone());
             schedule.next_run_at = if schedule.is_one_shot {
                 (now + chrono::Duration::hours(24)).to_rfc3339()
-            } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
+            } else if let Ok(next) =
+                crate::schedule::compute_next_run_in(&schedule.cron_expr, &schedule.tz)
+            {
                 next.to_rfc3339()
             } else {
                 (now + chrono::Duration::hours(24)).to_rfc3339()
@@ -543,7 +569,9 @@ impl GoalCycle {
             schedule.last_run_at = Some(now_ts.clone());
             schedule.next_run_at = if schedule.is_one_shot {
                 (now + chrono::Duration::minutes(15)).to_rfc3339()
-            } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
+            } else if let Ok(next) =
+                crate::schedule::compute_next_run_in(&schedule.cron_expr, &schedule.tz)
+            {
                 next.to_rfc3339()
             } else {
                 (now + chrono::Duration::hours(24)).to_rfc3339()
@@ -588,7 +616,9 @@ impl GoalCycle {
         let advanced_next_run = if schedule.is_one_shot {
             // Park one-shot far in the future; we delete it after successful task creation.
             (now + chrono::Duration::hours(24)).to_rfc3339()
-        } else if let Ok(next) = crate::schedule::compute_next_run(&schedule.cron_expr) {
+        } else if let Ok(next) =
+            crate::schedule::compute_next_run_in(&schedule.cron_expr, &schedule.tz)
+        {
             next.to_rfc3339()
         } else {
             warn!(schedule_id = %schedule.id, cron = %schedule.cron_expr, "Failed to compute next run for recurring schedule");

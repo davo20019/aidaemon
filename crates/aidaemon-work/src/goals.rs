@@ -333,7 +333,8 @@ pub struct GoalSchedule {
     pub goal_id: String,
     /// 5-field cron expression.
     pub cron_expr: String,
-    /// Timezone label. Currently only `local` is supported.
+    /// The zone `cron_expr` is read in: `local` (the owner's zone), an IANA
+    /// name, or a fixed offset; see `schedule::ScheduleZone::stored`.
     pub tz: String,
     /// User-provided schedule string (optional; for display/audit).
     pub original_schedule: Option<String>,

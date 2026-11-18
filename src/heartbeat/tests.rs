@@ -3179,3 +3179,117 @@ async fn test_run_now_after_a_blocked_run_starts_a_new_one() {
     let current = state.get_current_goal_run(&goal.id).await.unwrap().unwrap();
     assert_ne!(current.id, first.id);
 }
+
+/// A schedule stored in a named IANA zone fires on that zone's clock; one
+/// whose stored zone is unknown is paused and the owner told, never skipped
+/// in silence or run on the owner's clock.
+#[tokio::test]
+async fn test_a_named_zone_schedule_fires_and_an_unknown_zone_is_reported() {
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let sqlite_state = Arc::new(
+        SqliteStateStore::for_tests(
+            db_file.path().to_str().unwrap(),
+            100,
+            None,
+            Arc::new(EmbeddingService::deterministic()),
+        )
+        .await
+        .unwrap(),
+    );
+    let state: Arc<dyn StateStore> = sqlite_state.clone();
+    let now = chrono::Utc::now();
+    let now_ts = now.to_rfc3339();
+    let schedule_for = |goal: &Goal, tz: &str| GoalSchedule {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: goal.id.clone(),
+        cron_expr: "*/5 * * * *".to_string(),
+        tz: tz.to_string(),
+        original_schedule: Some("every 5m".to_string()),
+        fire_policy: "coalesce".to_string(),
+        is_one_shot: false,
+        is_paused: false,
+        last_run_at: None,
+        next_run_at: (now - chrono::Duration::minutes(1)).to_rfc3339(),
+        created_at: now_ts.clone(),
+        updated_at: now_ts.clone(),
+    };
+
+    let madrid_goal = Goal::new_continuous("Synthetic Madrid check", "session-1", None, None);
+    state.create_goal(&madrid_goal).await.unwrap();
+    state
+        .create_goal_schedule(&schedule_for(&madrid_goal, "Europe/Madrid"))
+        .await
+        .unwrap();
+
+    let unknown_goal =
+        Goal::new_continuous("Synthetic unknown-zone check", "session-1", None, None);
+    state.create_goal(&unknown_goal).await.unwrap();
+    let unknown = schedule_for(&unknown_goal, "local");
+    state.create_goal_schedule(&unknown).await.unwrap();
+    // A row from elsewhere (an older or newer build) with a zone this
+    // build cannot read.
+    sqlx::query("UPDATE goal_schedules SET tz = 'Mars/Olympus' WHERE id = ?")
+        .bind(&unknown.id)
+        .execute(&sqlite_state.pool())
+        .await
+        .unwrap();
+
+    let (_wake_tx, wake_rx) = mpsc::channel::<()>(1);
+    let mut coordinator =
+        HeartbeatCoordinator::new(state.clone(), 60, 3, wake_rx, None, None, None);
+    coordinator.tick().await.unwrap();
+
+    assert!(
+        !state
+            .get_tasks_for_goal(&madrid_goal.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the Madrid schedule fired"
+    );
+    let madrid = state
+        .get_schedules_for_goal(&madrid_goal.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(madrid.tz, "Europe/Madrid");
+    assert!(chrono::DateTime::parse_from_rfc3339(&madrid.next_run_at).unwrap() > now);
+
+    assert!(
+        state
+            .get_tasks_for_goal(&unknown_goal.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let paused = state
+        .get_schedules_for_goal(&unknown_goal.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(paused.is_paused, "an unreadable zone pauses the schedule");
+    let notices: Vec<_> = state
+        .get_pending_notifications(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.goal_id == unknown_goal.id)
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert!(
+        notices[0].message.contains("Mars/Olympus"),
+        "{}",
+        notices[0].message
+    );
+
+    // Said once: the paused schedule is no longer due.
+    coordinator.tick().await.unwrap();
+    let again = state
+        .get_pending_notifications(20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.goal_id == unknown_goal.id)
+        .count();
+    assert_eq!(again, 1);
+}

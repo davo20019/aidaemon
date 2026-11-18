@@ -403,6 +403,7 @@ impl ManageAutomationsTool {
                 .iter()
                 .map(|schedule| ScheduleSpec {
                     cron: schedule.cron_expr.clone(),
+                    zone: zone_label(&schedule.tz),
                     one_shot: schedule.is_one_shot,
                     next: aidaemon_work::schedule::owner_time_rfc3339(&schedule.next_run_at),
                     following: Vec::new(),
@@ -1395,16 +1396,17 @@ impl ManageAutomationsTool {
         let new_schedule = match when {
             None => None,
             Some(when) => {
-                let cron = match aidaemon_work::schedule::parse_schedule(when) {
-                    Ok(cron) => cron,
-                    Err(error) => {
-                        return Ok(negative(format!(
-                            "Couldn't read the time '{when}': {error}"
-                        )));
-                    }
-                };
-                let next = match aidaemon_work::schedule::compute_next_run_local(&cron) {
-                    Ok(next) => next,
+                let aidaemon_work::schedule::ParsedSchedule { cron, tz } =
+                    match aidaemon_work::schedule::parse_schedule_with_zone(when) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            return Ok(negative(format!(
+                                "Couldn't read the time '{when}': {error}"
+                            )));
+                        }
+                    };
+                let next = match aidaemon_work::schedule::compute_next_run_in(&cron, &tz) {
+                    Ok(next) => next.with_timezone(&chrono::Local),
                     Err(error) => {
                         return Ok(negative(format!(
                             "Couldn't compute the next run for '{when}': {error}"
@@ -1423,7 +1425,7 @@ impl ManageAutomationsTool {
                         "{title} {from}; to make it {to}, create it again with schedule_task or set_reminder and cancel this one."
                     )));
                 }
-                Some((when, cron, next, one_shot))
+                Some((when, cron, tz, next, one_shot))
             }
         };
         let snooze_to = match snooze {
@@ -1488,7 +1490,7 @@ impl ManageAutomationsTool {
             self.state.update_goal(&goal).await?;
             changed.push(format!("renamed it \"{new_name}\""));
         }
-        if let Some((when, cron, next, one_shot)) = new_schedule {
+        if let Some((when, cron, tz, next, one_shot)) = new_schedule {
             let fire_policy = schedules
                 .first()
                 .map(|schedule| schedule.fire_policy.clone())
@@ -1501,7 +1503,7 @@ impl ManageAutomationsTool {
                     id: uuid::Uuid::new_v4().to_string(),
                     goal_id: goal.id.clone(),
                     cron_expr: cron.clone(),
-                    tz: "local".to_string(),
+                    tz: tz.clone(),
                     original_schedule: Some(when.to_string()),
                     fire_policy,
                     is_one_shot: one_shot,
@@ -1514,6 +1516,7 @@ impl ManageAutomationsTool {
                 .await?;
             let spec = ScheduleSpec {
                 cron,
+                zone: zone_label(&tz),
                 one_shot,
                 next: Some(aidaemon_work::schedule::owner_time(&next)),
                 following: Vec::new(),
@@ -1894,6 +1897,14 @@ impl crate::tools::traits::ToolSemantics for ManageAutomationsTool {
             high_impact_write: false,
         }
     }
+}
+
+/// A stored schedule zone as the owner reads it beside a clock time;
+/// `None` for the owner's own zone (or one this cannot read).
+fn zone_label(tz: &str) -> Option<String> {
+    aidaemon_work::schedule::ScheduleZone::from_stored(tz)
+        .ok()
+        .and_then(|zone| zone.label())
 }
 
 #[cfg(test)]

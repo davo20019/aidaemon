@@ -4,8 +4,8 @@
 //! and evergreen goal scheduling.
 
 use chrono::{
-    DateTime, Datelike, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone,
-    Timelike, Utc,
+    DateTime, Datelike, FixedOffset, Local, LocalResult, NaiveDate, NaiveDateTime, Offset,
+    TimeZone, Timelike, Utc,
 };
 use croner::Cron;
 use regex::Regex;
@@ -209,9 +209,11 @@ fn parse_relative_duration(input: &str) -> anyhow::Result<Option<chrono::Duratio
     Ok(Some(total))
 }
 
-/// The zone a schedule's wall-clock time is read in.
+/// The zone a schedule's wall-clock time is read in. Stored in
+/// `goal_schedules.tz` as [`ScheduleZone::stored`]: `local` for the owner's
+/// zone, an IANA name, or a fixed offset (`UTC`, `+05:30`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum ScheduleZone {
+pub enum ScheduleZone {
     /// The owner's own clock (the system zone), with its daylight-saving rules.
     Owner,
     /// A numeric offset or UTC: no daylight saving.
@@ -235,17 +237,15 @@ impl ScheduleZone {
     /// twice (the fall-back hour) is the earlier of the two.
     fn resolve(&self, naive: NaiveDateTime) -> anyhow::Result<DateTime<Local>> {
         let resolved = match self {
-            // The owner's zone by its IANA rules when it has a name: the
-            // system clock's own lookup does not always report a fall-back
-            // time as ambiguous.
-            Self::Owner => {
-                match owner_zone_name().and_then(|name| name.parse::<chrono_tz::Tz>().ok()) {
-                    Some(tz) => tz
-                        .from_local_datetime(&naive)
-                        .map(|dt| dt.with_timezone(&Local)),
-                    None => Local.from_local_datetime(&naive),
-                }
-            }
+            // The owner's zone by its IANA rules when it has a name the
+            // system clock agrees with: the system clock's own lookup does
+            // not always report a fall-back time as ambiguous.
+            Self::Owner => match owner_tz() {
+                Some(tz) => tz
+                    .from_local_datetime(&naive)
+                    .map(|dt| dt.with_timezone(&Local)),
+                None => Local.from_local_datetime(&naive),
+            },
             Self::Fixed(offset) => offset
                 .from_local_datetime(&naive)
                 .map(|dt| dt.with_timezone(&Local)),
@@ -261,6 +261,38 @@ impl ScheduleZone {
                 naive.format("%Y-%m-%d %H:%M"),
                 self.name()
             ),
+        }
+    }
+
+    /// The zone a stored `goal_schedules.tz` names. `local` is the owner's
+    /// zone; anything else is read as a zone token, so a value this cannot
+    /// resolve is an error, never a silent fallback to the owner's clock.
+    pub fn from_stored(tz: &str) -> anyhow::Result<Self> {
+        if tz.trim() == LOCAL_TZ {
+            return Ok(Self::Owner);
+        }
+        parse_schedule_zone(tz)
+            .map_err(|error| anyhow::anyhow!("Stored schedule time zone '{tz}': {error}"))
+    }
+
+    /// The `goal_schedules.tz` value for this zone.
+    pub fn stored(&self) -> String {
+        match self {
+            Self::Owner => LOCAL_TZ.to_string(),
+            Self::Fixed(offset) if offset.local_minus_utc() == 0 => "UTC".to_string(),
+            Self::Fixed(offset) => offset.to_string(),
+            Self::Named(tz) => tz.name().to_string(),
+        }
+    }
+
+    /// How the owner reads this zone beside a schedule's clock time
+    /// ("Europe/Madrid", "UTC+05:30"); `None` for the owner's own zone.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::Owner => None,
+            Self::Fixed(offset) if offset.local_minus_utc() == 0 => Some("UTC".to_string()),
+            Self::Fixed(offset) => Some(format!("UTC{offset}")),
+            Self::Named(tz) => Some(tz.name().to_string()),
         }
     }
 
@@ -307,6 +339,50 @@ fn parse_day_time_with_optional_timezone(
     zone.resolve(naive).map(Some)
 }
 
+/// The `goal_schedules.tz` value for the owner's own zone.
+pub const LOCAL_TZ: &str = "local";
+
+/// A schedule as stored: its cron, read on the wall clock of `tz` (a
+/// `goal_schedules.tz` value, see [`ScheduleZone::stored`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedSchedule {
+    pub cron: String,
+    pub tz: String,
+}
+
+/// [`parse_schedule`], plus a recurring schedule with a trailing zone
+/// ("every weekday at 8am Europe/Madrid", "0 9 * * 1-5 America/Guayaquil"):
+/// its cron is then read on that zone's wall clock, daylight saving
+/// included. The zone follows the same rules as a one-time time's (an IANA
+/// name, a numeric offset or UTC; an abbreviation is refused). A one-time
+/// time already resolves its zone to an instant, so it is stored `local`.
+pub fn parse_schedule_with_zone(input: &str) -> anyhow::Result<ParsedSchedule> {
+    let first_error = match parse_schedule(input) {
+        Ok(cron) => {
+            return Ok(ParsedSchedule {
+                cron,
+                tz: LOCAL_TZ.to_string(),
+            });
+        }
+        Err(error) => error,
+    };
+    let trimmed = input.trim().trim_end_matches(['.', '!', '?']).trim();
+    let Some((rest, token)) = trimmed.rsplit_once(char::is_whitespace) else {
+        return Err(first_error);
+    };
+    let Ok(cron) = parse_schedule(rest.trim_end()) else {
+        return Err(first_error);
+    };
+    if is_one_shot_schedule(&cron) {
+        return Err(first_error);
+    }
+    let zone = parse_schedule_zone(token)?;
+    Ok(ParsedSchedule {
+        cron,
+        tz: zone.stored(),
+    })
+}
+
 /// The zone a time names after it: a numeric offset (`-05:00`, `+0530`),
 /// `UTC`/`GMT`/`Z`, or any IANA zone name (`Europe/Madrid`,
 /// `America/Guayaquil`; exact, or the same name in another letter case),
@@ -325,9 +401,6 @@ fn parse_schedule_zone(token: &str) -> anyhow::Result<ScheduleZone> {
         return Ok(ScheduleZone::Fixed(
             FixedOffset::east_opt(0).expect("zero offset"),
         ));
-    }
-    if owner_zone_name().is_some_and(|zone| zone.eq_ignore_ascii_case(token)) {
-        return Ok(ScheduleZone::Owner);
     }
     if let Some(caps) = NUMERIC.captures(&upper) {
         let hours: i32 = caps[2].parse()?;
@@ -912,6 +985,96 @@ mod following_runs_tests {
     }
 }
 
+/// The next run of `cron_expr` on the wall clock of a stored zone `tz`
+/// (`goal_schedules.tz`). `local` is exactly [`compute_next_run`]. In a
+/// named zone a fixed-time run that falls in the spring-forward gap runs at
+/// the first instant after the gap (8:30 in a 2:00-3:00 gap runs at 3:00),
+/// and one in the fall-back hour runs once, at the earlier instant.
+pub fn compute_next_run_in(cron_expr: &str, tz: &str) -> anyhow::Result<DateTime<Utc>> {
+    if tz.trim() == LOCAL_TZ {
+        return compute_next_run(cron_expr);
+    }
+    next_run_after_in(cron_expr, tz, Utc::now())
+}
+
+/// The first run of `cron_expr` after `after`, on the wall clock of the
+/// stored zone `tz` (see [`compute_next_run_in`]).
+pub fn next_run_after_in(
+    cron_expr: &str,
+    tz: &str,
+    after: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    fn next<Z: TimeZone>(
+        cron: &Cron,
+        cron_expr: &str,
+        after: DateTime<Z>,
+    ) -> anyhow::Result<DateTime<Utc>> {
+        cron.find_next_occurrence(&after, false)
+            .map(|at| at.with_timezone(&Utc))
+            .map_err(|e| anyhow::anyhow!("No next occurrence for '{}': {}", cron_expr, e))
+    }
+    let cron: Cron = cron_expr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse cron '{}': {}", cron_expr, e))?;
+    match ScheduleZone::from_stored(tz)? {
+        ScheduleZone::Owner => next(&cron, cron_expr, after.with_timezone(&Local)),
+        ScheduleZone::Fixed(offset) => next(&cron, cron_expr, after.with_timezone(&offset)),
+        ScheduleZone::Named(zone) => next(&cron, cron_expr, after.with_timezone(&zone)),
+    }
+}
+
+/// [`upcoming_runs`] for a schedule stored in zone `tz`, computed on that
+/// zone's wall clock and shown on the owner's.
+pub fn upcoming_runs_in(
+    cron_expr: &str,
+    tz: &str,
+    first: DateTime<Utc>,
+    one_shot: bool,
+    count: usize,
+) -> Vec<DateTime<Local>> {
+    fn runs<Z: TimeZone>(
+        cron_expr: &str,
+        first: DateTime<Z>,
+        one_shot: bool,
+        count: usize,
+    ) -> Vec<DateTime<Local>> {
+        upcoming_runs(cron_expr, &first, one_shot, count)
+            .iter()
+            .map(|at| at.with_timezone(&Local))
+            .collect()
+    }
+    match ScheduleZone::from_stored(tz) {
+        Ok(ScheduleZone::Fixed(offset)) => {
+            runs(cron_expr, first.with_timezone(&offset), one_shot, count)
+        }
+        Ok(ScheduleZone::Named(zone)) => {
+            runs(cron_expr, first.with_timezone(&zone), one_shot, count)
+        }
+        Ok(ScheduleZone::Owner) | Err(_) => {
+            runs(cron_expr, first.with_timezone(&Local), one_shot, count)
+        }
+    }
+}
+
+/// [`catch_up_window`] for a schedule stored in zone `tz`.
+pub fn catch_up_window_in(
+    cron_expr: &str,
+    tz: &str,
+    due: DateTime<Utc>,
+) -> Option<chrono::Duration> {
+    if tz.trim() == LOCAL_TZ {
+        return catch_up_window(cron_expr, due);
+    }
+    let after = next_run_after_in(cron_expr, tz, due).ok()?;
+    Some(window_for_period(after - due))
+}
+
+fn window_for_period(period: chrono::Duration) -> chrono::Duration {
+    (period / 2)
+        .max(chrono::Duration::minutes(5))
+        .min(chrono::Duration::hours(2))
+}
+
 /// How late a recurring run may start and still be worth starting: half its
 /// period, between 5 minutes and 2 hours. A daily 9:00 AM digest the daemon
 /// was off for is not sent at 11 PM; an hourly check missed by a few
@@ -920,12 +1083,7 @@ pub fn catch_up_window(cron_expr: &str, due: DateTime<Utc>) -> Option<chrono::Du
     let cron: Cron = cron_expr.parse().ok()?;
     let due_local = due.with_timezone(&Local);
     let after = cron.find_next_occurrence(&due_local, false).ok()?;
-    let period = after.with_timezone(&Utc) - due;
-    Some(
-        (period / 2)
-            .max(chrono::Duration::minutes(5))
-            .min(chrono::Duration::hours(2)),
-    )
+    Some(window_for_period(after.with_timezone(&Utc) - due))
 }
 
 #[cfg(test)]
@@ -961,6 +1119,16 @@ fn owner_zone_name() -> Option<String> {
             .or_else(|| iana_time_zone::get_timezone().ok())
     });
     NAME.clone()
+}
+
+/// The owner's zone as an IANA zone, when its name is one and it keeps the
+/// system clock's current offset (a `TZ` the name lookup misread is never
+/// used over the clock itself).
+fn owner_tz() -> Option<chrono_tz::Tz> {
+    let tz = owner_zone_name()?.parse::<chrono_tz::Tz>().ok()?;
+    let now = Utc::now();
+    (now.with_timezone(&tz).offset().fix() == now.with_timezone(&Local).offset().fix())
+        .then_some(tz)
 }
 
 /// The owner's zone as a short label at a given UTC offset.
@@ -1347,12 +1515,13 @@ mod tests {
         assert_eq!(seconds("-0400"), -4 * 3600);
         assert_eq!(seconds("UTC"), 0);
         assert_eq!(seconds("UTC-03:00"), -3 * 3600);
-        // The owner's IANA zone means "the owner's own clock". A host on UTC
-        // (CI runners) names its zone "UTC", which reads as offset zero first.
-        if let Some(zone) = owner_zone_name()
-            .filter(|zone| !matches!(zone.to_ascii_uppercase().as_str(), "UTC" | "GMT" | "Z"))
-        {
-            assert_eq!(parse_schedule_zone(&zone).unwrap(), ScheduleZone::Owner);
+        // The owner's own zone named is that named zone (same rules), so a
+        // schedule that names it keeps it if the owner's clock moves.
+        if let Some(zone) = owner_zone_name().filter(|zone| zone.contains('/')) {
+            match parse_schedule_zone(&zone).unwrap() {
+                ScheduleZone::Named(tz) => assert!(tz.name().eq_ignore_ascii_case(&zone)),
+                other => panic!("{zone}: {other:?}"),
+            }
         }
         // Any other IANA zone, exact or in another letter case.
         for (token, name) in [
@@ -1360,9 +1529,6 @@ mod tests {
             ("america/guayaquil", "America/Guayaquil"),
             ("EUROPE/MADRID", "Europe/Madrid"),
         ] {
-            if owner_zone_name().is_some_and(|zone| zone.eq_ignore_ascii_case(token)) {
-                continue;
-            }
             match parse_schedule_zone(token).unwrap() {
                 ScheduleZone::Named(tz) => assert_eq!(tz.name(), name),
                 other => panic!("{token}: {other:?}"),
@@ -1476,6 +1642,113 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("does not exist"), "{error}");
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// The runs after `after` of a schedule stored in `tz`, in UTC.
+    fn runs_after(cron: &str, tz: &str, after: DateTime<Utc>, count: usize) -> Vec<String> {
+        let first = next_run_after_in(cron, tz, after).unwrap();
+        upcoming_runs_in(cron, tz, first, false, count)
+            .iter()
+            .map(|run| run.with_timezone(&Utc).format("%a %m-%d %H:%M").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_recurring_schedule_with_a_zone_keeps_that_zone() {
+        let parsed = |input: &str| parse_schedule_with_zone(input).unwrap();
+        assert_eq!(
+            parsed("every weekday at 8am Europe/Madrid"),
+            ParsedSchedule {
+                cron: "0 8 * * 1-5".to_string(),
+                tz: "Europe/Madrid".to_string()
+            }
+        );
+        let daily = parsed("daily at 9:30 america/guayaquil");
+        assert_eq!(daily.cron, "30 9 * * *");
+        assert_eq!(daily.tz, "America/Guayaquil");
+        assert_eq!(parsed("0 9 * * 1-5 Asia/Tokyo").tz, "Asia/Tokyo");
+        assert_eq!(parsed("weekdays at 9am +05:30").tz, "+05:30");
+        assert_eq!(parsed("daily at 7am UTC").tz, "UTC");
+        assert_eq!(parsed("every weekday at 8am").tz, LOCAL_TZ);
+        let error = parse_schedule_with_zone("every weekday at 8am EST")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("America/New_York"), "{error}");
+        assert!(parse_schedule_with_zone("every weekday at 8am Mars/Olympus").is_err());
+        assert!(parse_schedule_with_zone("whenever the moon is full").is_err());
+    }
+
+    #[test]
+    fn weekday_runs_in_madrid_follow_its_clock_across_both_switches() {
+        // Madrid moves to CEST on Sun Mar 31 2030 and back on Sun Oct 27.
+        assert_eq!(
+            runs_after("0 8 * * 1-5", "Europe/Madrid", at(2030, 3, 27, 12, 0), 3),
+            vec!["Thu 03-28 07:00", "Fri 03-29 07:00", "Mon 04-01 06:00"]
+        );
+        assert_eq!(
+            runs_after("0 8 * * 1-5", "Europe/Madrid", at(2030, 10, 24, 12, 0), 3),
+            vec!["Fri 10-25 06:00", "Mon 10-28 07:00", "Tue 10-29 07:00"]
+        );
+        // A run in the skipped hour runs at the first instant after it; one
+        // in the repeated hour runs once, at the earlier instant.
+        assert_eq!(
+            runs_after("30 2 * * *", "Europe/Madrid", at(2030, 3, 30, 12, 0), 2),
+            vec!["Sun 03-31 01:00", "Mon 04-01 00:30"]
+        );
+        assert_eq!(
+            runs_after("30 2 * * *", "Europe/Madrid", at(2030, 10, 26, 12, 0), 2),
+            vec!["Sun 10-27 00:30", "Mon 10-28 01:30"]
+        );
+    }
+
+    #[test]
+    fn daily_runs_in_guayaquil_keep_one_offset_all_year() {
+        assert_eq!(
+            runs_after("30 9 * * *", "America/Guayaquil", at(2030, 3, 30, 0, 0), 2),
+            vec!["Sat 03-30 14:30", "Sun 03-31 14:30"]
+        );
+        assert_eq!(
+            runs_after("30 9 * * *", "America/Guayaquil", at(2030, 10, 26, 0, 0), 2),
+            vec!["Sat 10-26 14:30", "Sun 10-27 14:30"]
+        );
+        assert_eq!(
+            runs_after("0 9 * * *", "+05:30", at(2030, 7, 1, 0, 0), 1),
+            vec!["Mon 07-01 03:30"]
+        );
+    }
+
+    #[test]
+    fn a_local_schedule_is_computed_exactly_as_before() {
+        for cron in ["0 9 * * *", "0 8 * * 1-5", "15 9 12 3 *"] {
+            assert_eq!(
+                compute_next_run_in(cron, LOCAL_TZ).unwrap(),
+                compute_next_run(cron).unwrap()
+            );
+            let due = at(2030, 7, 1, 9, 0);
+            assert_eq!(
+                catch_up_window_in(cron, LOCAL_TZ, due),
+                catch_up_window(cron, due)
+            );
+        }
+        assert_eq!(
+            ScheduleZone::from_stored("local").unwrap(),
+            ScheduleZone::Owner
+        );
+    }
+
+    #[test]
+    fn a_stored_zone_this_cannot_read_is_an_error_not_the_owners_clock() {
+        for tz in ["Mars/Olympus", "EST", ""] {
+            assert!(ScheduleZone::from_stored(tz).is_err(), "{tz:?}");
+            assert!(compute_next_run_in("0 9 * * *", tz).is_err(), "{tz:?}");
+        }
+        for tz in ["Europe/Madrid", "UTC", "+05:30", "-04:00"] {
+            assert_eq!(ScheduleZone::from_stored(tz).unwrap().stored(), tz);
+        }
     }
 
     #[test]

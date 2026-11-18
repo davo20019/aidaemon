@@ -96,11 +96,18 @@ impl ScheduleOutcome {
     }
 }
 
+/// What makes two schedules the same: the cron and the zone it is read in.
+fn schedule_key(cron: &str, tz: &str) -> String {
+    format!("{} @ {}", cron.trim().to_ascii_lowercase(), tz.trim())
+}
+
 /// A validated request, before anything is stored.
 struct Plan {
     desc: String,
     session_id: String,
     cron: String,
+    /// The zone `cron` is read in, as stored (`local` for the owner's).
+    tz: String,
     original: String,
     is_one_shot: bool,
     next_local: chrono::DateTime<chrono::Local>,
@@ -123,9 +130,10 @@ impl Plan {
     fn approval_request(&self) -> aidaemon_core::OwnerApprovalRequest {
         // The next three runs (one for a one-time schedule), in the owner's
         // zone and format, so a wrong cadence or zone is caught here.
-        let mut runs = aidaemon_work::schedule::upcoming_runs(
+        let mut runs = aidaemon_work::schedule::upcoming_runs_in(
             &self.cron,
-            &self.next_local,
+            &self.tz,
+            self.next_local.with_timezone(&chrono::Utc),
             self.is_one_shot,
             UPCOMING_RUNS_SHOWN,
         )
@@ -135,6 +143,9 @@ impl Plan {
         .into_iter();
         let spec = aidaemon_work::automations::ScheduleSpec {
             cron: self.cron.clone(),
+            zone: aidaemon_work::schedule::ScheduleZone::from_stored(&self.tz)
+                .ok()
+                .and_then(|zone| zone.label()),
             one_shot: self.is_one_shot,
             next: runs.next(),
             following: runs.collect(),
@@ -250,12 +261,13 @@ impl ScheduledWork {
         // words were the schedule.
         let desc = raw_desc.to_string();
 
-        let cron = match aidaemon_work::schedule::parse_schedule(when) {
-            Ok(cron) => cron,
-            Err(error) => return Ok(Err(format!("Couldn't read the time '{when}': {error}"))),
-        };
-        let next_local = match aidaemon_work::schedule::compute_next_run_local(&cron) {
-            Ok(at) => at,
+        let aidaemon_work::schedule::ParsedSchedule { cron, tz } =
+            match aidaemon_work::schedule::parse_schedule_with_zone(when) {
+                Ok(parsed) => parsed,
+                Err(error) => return Ok(Err(format!("Couldn't read the time '{when}': {error}"))),
+            };
+        let next_local = match aidaemon_work::schedule::compute_next_run_in(&cron, &tz) {
+            Ok(at) => at.with_timezone(&chrono::Local),
             Err(error) => {
                 return Ok(Err(format!(
                     "Couldn't compute the next run for '{when}': {error}"
@@ -266,7 +278,7 @@ impl ScheduledWork {
 
         // The model repeating the same request must not create it twice.
         let target = canonical_description(&desc);
-        let target_crons = BTreeSet::from([cron.trim().to_ascii_lowercase()]);
+        let target_crons = BTreeSet::from([schedule_key(&cron, &tz)]);
         for existing in self.state.get_scheduled_goals().await.unwrap_or_default() {
             if existing.session_id != session_id
                 || !matches!(
@@ -283,7 +295,7 @@ impl ScheduledWork {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .map(|schedule| schedule.cron_expr.trim().to_ascii_lowercase())
+                .map(|schedule| schedule_key(&schedule.cron_expr, &schedule.tz))
                 .collect();
             if existing_crons == target_crons {
                 return Ok(Err(format!(
@@ -312,18 +324,22 @@ impl ScheduledWork {
             .map(str::to_string);
 
         let next_run = aidaemon_work::schedule::owner_time(&next_local);
-        let subject = json!({
+        let mut subject = json!({
             "action": "schedule_task",
             "task": desc,
             "schedule": cron,
             "one_shot": is_one_shot,
             "name": name,
-        })
-        .to_string();
+        });
+        if tz != aidaemon_work::schedule::LOCAL_TZ {
+            subject["tz"] = json!(tz);
+        }
+        let subject = subject.to_string();
         Ok(Ok(Plan {
             desc,
             session_id: session_id.to_string(),
             cron,
+            tz,
             original: when.to_string(),
             is_one_shot,
             next_local,
@@ -400,7 +416,7 @@ impl ScheduledWork {
                 id: uuid::Uuid::new_v4().to_string(),
                 goal_id: goal.id.clone(),
                 cron_expr: plan.cron.clone(),
-                tz: "local".to_string(),
+                tz: plan.tz.clone(),
                 original_schedule: Some(plan.original.clone()),
                 fire_policy: "coalesce".to_string(),
                 is_one_shot: plan.is_one_shot,

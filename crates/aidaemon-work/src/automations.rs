@@ -372,6 +372,9 @@ pub fn state_words(status: &str) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSpec {
     pub cron: String,
+    /// The zone the cron's clock times are in when it is not the owner's
+    /// ("Europe/Madrid"); `None` for the owner's zone.
+    pub zone: Option<String>,
     pub one_shot: bool,
     /// The next run, already in the owner's format.
     pub next: Option<String>,
@@ -421,6 +424,7 @@ pub fn cadence_words(schedule: &ScheduleSpec, zone: &str) -> String {
             None => "Once".to_string(),
         };
     }
+    let zone = schedule.zone.as_deref().unwrap_or(zone);
     let fields: Vec<&str> = schedule.cron.split_whitespace().collect();
     let [minute, hour, dom, month, dow] = fields.as_slice() else {
         return fallback();
@@ -539,6 +543,7 @@ pub fn scheduled_card(
 pub fn probe_card(kind: &str, target: &str, cron: &str, zone: &str) -> MandateConfirmationCard {
     let schedule = ScheduleSpec {
         cron: cron.to_string(),
+        zone: None,
         one_shot: false,
         next: None,
         following: Vec::new(),
@@ -560,6 +565,7 @@ mod tests {
     fn recurring(cron: &str) -> ScheduleSpec {
         ScheduleSpec {
             cron: cron.to_string(),
+            zone: None,
             one_shot: false,
             next: Some("Thu, Nov 13, 8:00 AM ET".to_string()),
             following: Vec::new(),
@@ -587,6 +593,7 @@ mod tests {
         }
         let once = ScheduleSpec {
             cron: "0 9 13 11 *".to_string(),
+            zone: None,
             one_shot: true,
             next: Some("Thu, Nov 13, 9:00 AM ET".to_string()),
             following: Vec::new(),
@@ -623,6 +630,7 @@ mod tests {
             Some("Check the oven."),
             &[ScheduleSpec {
                 cron: "5 14 12 11 *".to_string(),
+                zone: None,
                 one_shot: true,
                 next: Some("2:05 PM ET".to_string()),
                 following: Vec::new(),
@@ -641,6 +649,7 @@ mod tests {
     fn scheduled_card_shows_two_following_runs_but_not_for_one_shot() {
         let recurring = ScheduleSpec {
             cron: "0 8 * * 1-5".to_string(),
+            zone: None,
             one_shot: false,
             next: Some("Mon, Nov 17, 8:00 AM ET".to_string()),
             following: vec![
@@ -660,6 +669,7 @@ mod tests {
 
         let once = ScheduleSpec {
             cron: "0 9 13 11 *".to_string(),
+            zone: None,
             one_shot: true,
             next: Some("Thu, Nov 13, 9:00 AM ET".to_string()),
             following: Vec::new(),

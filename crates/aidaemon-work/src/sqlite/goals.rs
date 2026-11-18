@@ -813,12 +813,7 @@ impl<S: WorkDatabase> crate::traits::TaskStore for S {
 #[async_trait]
 impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
     async fn create_goal_schedule(&self, schedule: &GoalSchedule) -> anyhow::Result<()> {
-        if schedule.tz != "local" {
-            anyhow::bail!(
-                "Only tz='local' is supported for schedules (got tz='{}')",
-                schedule.tz
-            );
-        }
+        crate::schedule::ScheduleZone::from_stored(&schedule.tz)?;
 
         // Safety: schedules only apply to orchestration goals.
         let domain_row = sqlx::query("SELECT domain FROM goals WHERE id = ?")
@@ -921,7 +916,6 @@ impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
              FROM goal_schedules s
              JOIN goals g ON g.id = s.goal_id
              WHERE s.is_paused = 0
-               AND s.tz = 'local'
                AND s.next_run_at <= ?
                AND g.domain = 'orchestration'
                AND g.status = 'active'
@@ -953,11 +947,10 @@ impl<S: WorkDatabase> crate::traits::GoalScheduleStore for S {
     }
 
     async fn update_goal_schedule(&self, schedule: &GoalSchedule) -> anyhow::Result<()> {
-        if schedule.tz != "local" {
-            anyhow::bail!(
-                "Only tz='local' is supported for schedules (got tz='{}')",
-                schedule.tz
-            );
+        // A schedule that runs needs a zone this can read; one paused for an
+        // unreadable zone can still be saved.
+        if !schedule.is_paused {
+            crate::schedule::ScheduleZone::from_stored(&schedule.tz)?;
         }
 
         let now = chrono::Utc::now().to_rfc3339();
