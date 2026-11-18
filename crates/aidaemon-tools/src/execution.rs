@@ -1136,11 +1136,13 @@ fn parse_remote_metadata(value: &str) -> anyhow::Result<BackendMetadata> {
 }
 
 fn remote_success(operation: &str, output: ExecutionOutput) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        !output.timed_out,
-        "Remote {operation} timed out after {}ms",
-        output.duration_ms
-    );
+    if output.timed_out {
+        return Err(crate::ToolTimedOut(format!(
+            "Remote {operation} timed out after {}ms",
+            output.duration_ms
+        ))
+        .into());
+    }
     anyhow::ensure!(
         output.exit_code == 0,
         "Remote {operation} failed (exit {}): {}",

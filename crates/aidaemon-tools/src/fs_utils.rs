@@ -906,7 +906,9 @@ pub async fn run_cmd_backend(
         .execute(request, Duration::from_secs(timeout_secs))
         .await?;
     if output.timed_out {
-        anyhow::bail!("Command timed out after {}s", timeout_secs);
+        return Err(
+            crate::ToolTimedOut(format!("Command timed out after {}s", timeout_secs)).into(),
+        );
     }
     Ok(CommandOutput {
         exit_code: output.exit_code,

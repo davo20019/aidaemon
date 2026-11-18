@@ -49,6 +49,26 @@ impl std::fmt::Display for TargetNotFound {
 
 impl std::error::Error for TargetNotFound {}
 
+/// A call ran out of time (a command or remote operation the tool waited
+/// on). Another call may succeed, so the failure is retryable and does not
+/// count toward the tool's lockout; the type says so, never the words
+/// "timed out".
+#[derive(Debug)]
+pub struct ToolTimedOut(pub String);
+
+impl std::fmt::Display for ToolTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ToolTimedOut {}
+
+/// Whether a raised tool error is a typed [`ToolTimedOut`].
+pub fn timed_out(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ToolTimedOut>().is_some()
+}
+
 /// Whether a raised tool error says, by its type, that the call took no
 /// effect and another call may succeed ([`NothingSentError`],
 /// [`TargetNotFound`], and with checkpoints a checkpoint refused for an
@@ -421,3 +441,17 @@ macro_rules! core_tool {
     };
 }
 pub(crate) use core_tool;
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn a_timeout_is_known_by_its_type_through_context_not_its_words() {
+        let typed = anyhow::Error::new(ToolTimedOut("Command timed out after 5s".into()))
+            .context("search failed");
+        assert!(timed_out(&typed));
+        // The same words in an untyped error are not a timeout.
+        assert!(!timed_out(&anyhow::anyhow!("Command timed out after 5s")));
+    }
+}

@@ -594,11 +594,17 @@ impl TurnEngine<'_> {
                     // A raised error typed as having taken no effect (nothing
                     // sent, a path that does not exist, a checkpoint refused
                     // before the process ran) may succeed on another call.
-                    outcome_status: Some(if aidaemon_tools::failed_without_effect(&error) {
-                        aidaemon_tools::semantics::ToolOutcomeStatus::FailedRetryable
-                    } else {
-                        aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
-                    }),
+                    // A typed timeout is retryable too, and marked timed out.
+                    outcome_status: Some(
+                        if aidaemon_tools::failed_without_effect(&error)
+                            || aidaemon_tools::timed_out(&error)
+                        {
+                            aidaemon_tools::semantics::ToolOutcomeStatus::FailedRetryable
+                        } else {
+                            aidaemon_tools::semantics::ToolOutcomeStatus::FailedPermanent
+                        },
+                    ),
+                    timed_out: aidaemon_tools::timed_out(&error),
                     transport_error: Some(error.to_string()),
                     invocation_stage: if error
                         .downcast_ref::<crate::engine::tool_exec::UnknownToolError>()

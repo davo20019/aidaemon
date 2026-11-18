@@ -346,10 +346,11 @@ pub(crate) async fn run_confined(
     }
     let execution = backend.execute(request, CONFINED_TIER_TIMEOUT).await?;
     if execution.timed_out {
-        anyhow::bail!(
+        return Err(aidaemon_tools::ToolTimedOut(format!(
             "Command timed out after {}s",
             CONFINED_TIER_TIMEOUT.as_secs()
-        );
+        ))
+        .into());
     }
     Ok(ConfinedRun {
         output: fs_utils::CommandOutput {

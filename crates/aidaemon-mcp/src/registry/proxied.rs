@@ -147,7 +147,14 @@ impl OutcomeTool for RegisteredMcpTool {
                 .tool
                 .call_raw(args, None)
                 .await
-                .map_err(anyhow::Error::from)
+                // A server that did not answer in time is a typed timeout:
+                // retryable, never a lockout-counting failure.
+                .map_err(|error| match error {
+                    crate::McpError::Timeout { .. } => {
+                        anyhow::Error::new(aidaemon_tools::ToolTimedOut(error.to_string()))
+                    }
+                    error => anyhow::Error::from(error),
+                })
                 .and_then(|result| super::render::format_tool_call_result(&result));
             let elapsed = start.elapsed();
 

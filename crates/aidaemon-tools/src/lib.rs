@@ -111,7 +111,7 @@ pub use fs::{
 };
 pub use outcome::{
     CallValidator, KernelAdapter, NothingSentError, OutcomeRunner, OutcomeTool, TargetNotFound,
-    failed_without_effect,
+    ToolTimedOut, failed_without_effect, timed_out,
 };
 pub use path_class::PathClassifier;
 pub use search::{Glob, Grep};
