@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 36;
+pub const PROTOCOL_MINOR: u16 = 37;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1404,6 +1404,52 @@ pub struct ConnectedProvider {
     /// `provider.fallbacks[0].api_key`); empty for a sign-in.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub key_setting: String,
+    /// What it has used and has left, when its provider reports that
+    /// (protocol 1.37): a ChatGPT plan's limits, an OpenRouter balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+}
+
+/// What a provider reports of its account's use (protocol 1.37).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ProviderUsage {
+    /// The plan, as the provider names it ("plus", "pro"); empty when unsaid.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plan: String,
+    /// Rolling limits, shortest window first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<UsageWindow>,
+    /// Money spent and left, for an account billed from a balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<UsageBalance>,
+    /// When the daemon read it (ms since the epoch).
+    #[serde(default)]
+    pub read_at_ms: u64,
+}
+
+/// One rolling usage limit (protocol 1.37).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct UsageWindow {
+    /// How long the window is, in minutes (300: five hours; 10080: a week).
+    pub minutes: u32,
+    /// How much of it is used, 0 to 100.
+    pub used_percent: u8,
+    /// When it starts over (ms since the epoch), when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+}
+
+/// Money spent and left, in US cents (protocol 1.37).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct UsageBalance {
+    /// Spent so far.
+    pub used_cents: u64,
+    /// The most that may be spent; `None`: no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_cents: Option<u64>,
+    /// Left to spend; `None`: no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_cents: Option<u64>,
 }
 
 /// How a connected provider is signed in.

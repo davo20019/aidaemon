@@ -67,6 +67,7 @@ mod openai;
 pub mod routing;
 mod sse;
 mod transport;
+pub mod usage;
 mod xai;
 
 pub use anthropic::{

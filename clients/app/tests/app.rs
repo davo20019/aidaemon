@@ -268,7 +268,7 @@ fn the_agent_moves_the_view_and_says_why() -> Result<(), String> {
 }
 
 /// A daemon's settings, as `get_settings` answers.
-const SETTINGS: &str = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt"}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "offered_models": ["gpt-x", "gpt-astra-synthetic"], "quick_model": "gpt-x", "name": "OpenAI", "preset": "openai"}, {"credential": "key_stored", "failover": 1, "key_setting": "provider.fallbacks[1].api_key", "models": ["synthetic-a"], "name": "Anthropic", "preset": "anthropic"}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
+const SETTINGS: &str = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram:synthetic-user-1"], "created_at": "2026-01-01 00:00:00", "id": 3, "platform": "telegram"}], "chatgpt_signed_in": true, "checked": {"models": ["gpt-x", "gpt-y"], "preset": "openai", "suggested": "gpt-x"}, "config_path": "/home/synthetic/.aidaemon/config.toml", "connected": [{"credential": "signed_in", "models": ["synthetic-model-1"], "hard_model": "synthetic-strong", "quick_model": "synthetic-quick", "name": "OpenAI (ChatGPT subscription)", "preset": "openai_chatgpt", "usage": {"plan": "plus", "windows": [{"minutes": 300, "used_percent": 42}, {"minutes": 10080, "used_percent": 18}], "read_at_ms": 1700000000000}}, {"base_url": "https://api.example.com/v1", "credential": "key_in_file", "failover": 0, "key_setting": "provider.fallbacks[0].api_key", "models": ["gpt-x"], "offered_models": ["gpt-x", "gpt-astra-synthetic"], "quick_model": "gpt-x", "name": "OpenAI", "preset": "openai"}, {"credential": "key_stored", "failover": 1, "key_setting": "provider.fallbacks[1].api_key", "models": ["synthetic-a"], "name": "Anthropic", "preset": "anthropic", "usage": {"balance": {"used_cents": 350, "limit_cents": 1000, "remaining_cents": 650}, "read_at_ms": 1700000000000}}], "database_encrypted": true, "database_path": "/home/synthetic/.aidaemon/aidaemon.db", "groups": [{"name": "provider", "settings": [{"applies": "reload", "description": "The model most turns use.", "example": "\"openai/gpt-4o\"", "guarded": false, "key": "provider.models.default", "kind": "text", "secret_set": false, "value": "\"synthetic-model-1\""}, {"applies": "reload", "guarded": true, "key": "provider.api_key", "kind": "secret", "secret_set": true}]}], "mcp_servers": [{"command": "synthetic-mcp --root /tmp", "enabled": true, "from_config": false, "name": "files", "tools": ["read_file"]}], "notices": ["The database moves to /data/aidaemon.db at the next restart."], "providers": [{"billing": "per_token", "key_url": "https://platform.openai.com/api-keys", "model": "gpt-x", "name": "OpenAI", "needs_base_url": false, "needs_key": true, "preset": "openai"}], "reload_pending": true, "restart_pending": false}, "type": "settings"}"#;
 
 #[test]
 fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<(), String> {
@@ -290,7 +290,14 @@ fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<
         r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
     ))]);
     // No tabs to reach: the models per job are the page.
-    app.wait_for("Hard work: synthetic-strong · Quick jobs: synthetic-quick")?;
+    app.wait_for("synthetic-strong")?;
+    app.wait_for("synthetic-quick")?;
+    // What each account has used, where its provider says.
+    app.wait_for("Signed in to ChatGPT · Plus plan")?;
+    app.wait_for("5-hour limit")?;
+    app.wait_for("42% used")?;
+    app.wait_for("Weekly limit")?;
+    app.wait_for("$6.50 left of $10.00")?;
     app.wait_for("On this device")?;
     if app.shows("Connections") || app.shows("Advanced") {
         return Err("the terminal shows the settings tabs".into());
@@ -362,7 +369,8 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     // Providers name a model per job; a key in the file offers the keychain,
     // and a failover never offers the provider already in use.
     app.press("Models")?;
-    app.wait_for("Hard work: synthetic-strong · Quick jobs: synthetic-quick")?;
+    app.wait_for("synthetic-strong")?;
+    app.wait_for("synthetic-quick")?;
     app.wait_for("Key in config.toml")?;
     app.wait_for("Move to keychain")?;
     // Each provider's models per job are the owner's to pick, failovers

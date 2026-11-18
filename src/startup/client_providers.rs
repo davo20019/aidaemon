@@ -181,6 +181,7 @@ fn connected_of(
         } else {
             key_setting
         },
+        usage: None,
     }
 }
 

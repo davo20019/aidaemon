@@ -1118,6 +1118,23 @@ fn server_samples() -> Vec<ServerFrame> {
                         ],
                         credential: CredentialState::SignedIn,
                         key_setting: String::new(),
+                        usage: Some(ProviderUsage {
+                            plan: "plus".into(),
+                            windows: vec![
+                                UsageWindow {
+                                    minutes: 300,
+                                    used_percent: 42,
+                                    resets_at_ms: Some(1_700_000_100_000),
+                                },
+                                UsageWindow {
+                                    minutes: 10_080,
+                                    used_percent: 18,
+                                    resets_at_ms: None,
+                                },
+                            ],
+                            balance: None,
+                            read_at_ms: 1_700_000_000_000,
+                        }),
                     },
                     ConnectedProvider {
                         failover: Some(0),
@@ -1130,6 +1147,15 @@ fn server_samples() -> Vec<ServerFrame> {
                         offered_models: Vec::new(),
                         credential: CredentialState::KeyStored,
                         key_setting: "provider.fallbacks[0].api_key".into(),
+                        usage: Some(ProviderUsage {
+                            balance: Some(UsageBalance {
+                                used_cents: 350,
+                                limit_cents: Some(1_000),
+                                remaining_cents: Some(650),
+                            }),
+                            read_at_ms: 1_700_000_000_000,
+                            ..ProviderUsage::default()
+                        }),
                     },
                 ],
                 chatgpt_signed_in: true,

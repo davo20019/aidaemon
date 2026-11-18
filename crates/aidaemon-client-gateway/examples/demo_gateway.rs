@@ -21,9 +21,9 @@ use aidaemon_channels::turns::{TurnDeps, TurnWatch};
 use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
 use aidaemon_client_protocol::{
     Billing, CheckedKey, ConnectedProvider, CredentialState, FileChange, FileStatus,
-    HistoryMessage, MemoryItem, ProjectSummary, ProviderChoice, ProviderOption, RepoChanges,
-    SearchHit, SessionChanges, SessionSummary, Settings, SettingsChange, SignIn, SlashCommand,
-    ViewAction,
+    HistoryMessage, MemoryItem, ProjectSummary, ProviderChoice, ProviderOption, ProviderUsage,
+    RepoChanges, SearchHit, SessionChanges, SessionSummary, Settings, SettingsChange, SignIn,
+    SlashCommand, UsageWindow, ViewAction,
 };
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -802,6 +802,23 @@ impl ClientHost for Host {
                 } else {
                     "provider.api_key".into()
                 },
+                usage: (!option.needs_key).then(|| ProviderUsage {
+                    plan: "plus".into(),
+                    windows: vec![
+                        UsageWindow {
+                            minutes: 300,
+                            used_percent: 42,
+                            resets_at_ms: Some(now_ms() + 95 * 60_000),
+                        },
+                        UsageWindow {
+                            minutes: 10_080,
+                            used_percent: 18,
+                            resets_at_ms: Some(now_ms() + 4 * 86_400_000),
+                        },
+                    ],
+                    balance: None,
+                    read_at_ms: now_ms(),
+                }),
             }
         };
         let message = match change {
@@ -929,6 +946,7 @@ fn demo_settings() -> &'static std::sync::Mutex<Settings> {
                     offered_models: models.iter().map(|m| m.to_string()).collect(),
                     credential,
                     key_setting: key.into(),
+                    usage: None,
                 }
             };
         std::sync::Mutex::new(Settings {

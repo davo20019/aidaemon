@@ -16,6 +16,7 @@ pub(crate) mod migrations;
 pub mod nodes;
 pub mod oauth;
 pub(crate) mod prompt;
+pub(crate) mod provider_usage;
 pub mod resume_turns;
 pub mod runtime;
 pub(crate) mod settings_upkeep;

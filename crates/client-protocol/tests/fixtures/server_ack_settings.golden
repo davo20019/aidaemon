@@ -56,7 +56,22 @@
             "synthetic-model-3"
           ],
           "preset": "openai_chatgpt",
-          "quick_model": "synthetic-model-2"
+          "quick_model": "synthetic-model-2",
+          "usage": {
+            "plan": "plus",
+            "read_at_ms": 1700000000000,
+            "windows": [
+              {
+                "minutes": 300,
+                "resets_at_ms": 1700000100000,
+                "used_percent": 42
+              },
+              {
+                "minutes": 10080,
+                "used_percent": 18
+              }
+            ]
+          }
         },
         {
           "base_url": "https://api.example.com/v1",
@@ -67,7 +82,15 @@
             "gpt-x"
           ],
           "name": "OpenAI",
-          "preset": "openai"
+          "preset": "openai",
+          "usage": {
+            "balance": {
+              "limit_cents": 1000,
+              "remaining_cents": 650,
+              "used_cents": 350
+            },
+            "read_at_ms": 1700000000000
+          }
         }
       ],
       "database_encrypted": true,

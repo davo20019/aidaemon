@@ -2889,6 +2889,17 @@
         "quick_model": {
           "description": "The model it uses for quick jobs, chosen the same way (protocol 1.20).",
           "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What it has used and has left, when its provider reports that\n(protocol 1.37): a ChatGPT plan's limits, an OpenRouter balance."
         }
       },
       "required": [
@@ -5123,6 +5134,41 @@
         "billing",
         "needs_key"
       ],
+      "type": "object"
+    },
+    "ProviderUsage": {
+      "description": "What a provider reports of its account's use (protocol 1.37).",
+      "properties": {
+        "balance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageBalance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Money spent and left, for an account billed from a balance."
+        },
+        "plan": {
+          "description": "The plan, as the provider names it (\"plus\", \"pro\"); empty when unsaid.",
+          "type": "string"
+        },
+        "read_at_ms": {
+          "default": 0,
+          "description": "When the daemon read it (ms since the epoch).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "windows": {
+          "description": "Rolling limits, shortest window first.",
+          "items": {
+            "$ref": "#/$defs/UsageWindow"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "QueueInfo": {
@@ -7487,6 +7533,39 @@
         }
       ]
     },
+    "UsageBalance": {
+      "description": "Money spent and left, in US cents (protocol 1.37).",
+      "properties": {
+        "limit_cents": {
+          "description": "The most that may be spent; `None`: no cap.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "remaining_cents": {
+          "description": "Left to spend; `None`: no cap.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "used_cents": {
+          "description": "Spent so far.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "used_cents"
+      ],
+      "type": "object"
+    },
     "UsageDay": {
       "properties": {
         "day": {
@@ -7518,6 +7597,38 @@
         "input_tokens",
         "output_tokens",
         "requests"
+      ],
+      "type": "object"
+    },
+    "UsageWindow": {
+      "description": "One rolling usage limit (protocol 1.37).",
+      "properties": {
+        "minutes": {
+          "description": "How long the window is, in minutes (300: five hours; 10080: a week).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resets_at_ms": {
+          "description": "When it starts over (ms since the epoch), when the provider says.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "used_percent": {
+          "description": "How much of it is used, 0 to 100.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "minutes",
+        "used_percent"
       ],
       "type": "object"
     },

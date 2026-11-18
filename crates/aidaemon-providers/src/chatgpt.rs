@@ -387,6 +387,48 @@ impl ChatGpt {
         Ok(parse_model_listing(&body))
     }
 
+    /// The plan's usage limits as the backend reports them
+    /// (`GET .../backend-api/wham/usage`, what Codex's `/status` shows),
+    /// with a 401 refreshed once.
+    pub async fn usage(&self) -> Result<crate::usage::AccountUsage, ProviderError> {
+        let auth_error = |error: String| ProviderError::Auth(error);
+        let url = crate::usage::chatgpt_usage_url(&self.base_url);
+        let get = |credentials: ChatGptCredentials| {
+            self.client
+                .get(&url)
+                .timeout(Duration::from_secs(10))
+                .bearer_auth(credentials.access_token)
+                .header("chatgpt-account-id", credentials.account_id)
+                .header("originator", &self.originator)
+                .header("User-Agent", &self.user_agent)
+                .send()
+        };
+        let credentials = self.auth.credentials().await.map_err(auth_error)?;
+        let rejected = credentials.access_token.clone();
+        let mut response = get(credentials).await.map_err(map_reqwest_error)?;
+        if response.status().as_u16() == 401 {
+            let _ = response.bytes().await;
+            let credentials = self
+                .auth
+                .refresh_after_rejection(&rejected)
+                .await
+                .map_err(auth_error)?;
+            response = get(credentials).await.map_err(map_reqwest_error)?;
+        }
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_status(status, &headers, &body));
+        }
+        crate::usage::parse_chatgpt_usage(&body, SystemTime::now()).ok_or_else(|| {
+            ProviderError::InvalidRequest(format!(
+                "the usage answer had no limits: {}",
+                body_excerpt(&body)
+            ))
+        })
+    }
+
     async fn get_models(
         &self,
         credentials: &ChatGptCredentials,

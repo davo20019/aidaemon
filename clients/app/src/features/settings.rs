@@ -6,8 +6,8 @@
 
 use aidaemon_client_protocol::{
     Applies, ApplyHow, Billing, BotInfo, ConnectedProvider, CredentialState, DatabaseAction,
-    McpAction, McpServerInfo, ProviderChoice, ProviderOption, SecretText, Setting, SettingGroup,
-    SettingKind, Settings, SettingsChange,
+    McpAction, McpServerInfo, ProviderChoice, ProviderOption, ProviderUsage, SecretText, Setting,
+    SettingGroup, SettingKind, Settings, SettingsChange, UsageBalance,
 };
 use std::rc::Rc;
 
@@ -835,18 +835,152 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
 }
 
 /// Which model does which job: one key reaches every model of its
-/// provider, so the card names jobs, not a list to add to.
-fn models_by_job(provider: &ConnectedProvider) -> String {
+/// provider, so the card names jobs, not a list to add to. Each is a
+/// label and a model, shown as a row so a long id never breaks mid-name.
+fn models_by_job(provider: &ConnectedProvider) -> Vec<(&'static str, String)> {
     let (hard, quick) = (provider.hard_model.as_str(), provider.quick_model.as_str());
     match (hard.is_empty(), quick.is_empty()) {
-        (false, false) if hard == quick => format!("All work: {hard}"),
-        (false, false) => format!("Hard work: {hard} · Quick jobs: {quick}"),
-        (false, true) => format!("Hard work: {hard}"),
-        (true, false) => format!("Quick jobs: {quick}"),
+        (false, false) if hard == quick => vec![("All work", hard.to_string())],
+        (false, false) => vec![
+            ("Hard work", hard.to_string()),
+            ("Quick jobs", quick.to_string()),
+        ],
+        (false, true) => vec![("Hard work", hard.to_string())],
+        (true, false) => vec![("Quick jobs", quick.to_string())],
         // A daemon before protocol 1.20, or an address that decides.
-        (true, true) if provider.models.is_empty() => "The provider's own models".to_string(),
-        (true, true) => provider.models.join(", "),
+        (true, true) if provider.models.is_empty() => {
+            vec![("Models", "The provider's own".to_string())]
+        }
+        (true, true) => vec![("Models", provider.models.join(", "))],
     }
+}
+
+/// A label and its value on one line: the label in a fixed column.
+fn labeled_row(label: &'static str, value: String) -> View {
+    view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(
+            text(label)
+                .w(px(84.0))
+                .flex_shrink_0()
+                .text_size(px(ui::fit::small()))
+                .text_color(colors::MUTED),
+        )
+        .child(
+            text(value)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .text_size(px(ui::fit::small()))
+                .text_color(colors::TEXT),
+        )
+}
+
+/// A usage window's name: "5-hour limit", "Weekly limit".
+fn window_name(minutes: u32) -> String {
+    match minutes {
+        10_080 => "Weekly limit".to_string(),
+        1_440 => "Daily limit".to_string(),
+        m if m >= 1_440 && m % 1_440 == 0 => format!("{}-day limit", m / 1_440),
+        m if m >= 60 && m % 60 == 0 => format!("{}-hour limit", m / 60),
+        m => format!("{m}-minute limit"),
+    }
+}
+
+/// When a window starts over, in the viewer's time: "resets 1:40 PM",
+/// "resets tomorrow 9:05 AM", "resets Monday 9:05 AM".
+fn resets_words(at_ms: u64, now_ms: u64) -> String {
+    let day = ui::time::day_label(at_ms, now_ms);
+    let clock = ui::time::clock(at_ms);
+    match day.as_str() {
+        "Today" => format!("resets {clock}"),
+        "Tomorrow" => format!("resets tomorrow {clock}"),
+        _ => format!("resets {day} {clock}"),
+    }
+}
+
+/// Dollars from cents: "$6.50".
+fn dollars(cents: u64) -> String {
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+/// What a balance shows: the words, and how full its meter is (none
+/// without a cap).
+fn balance_words(balance: &UsageBalance) -> (String, Option<f32>) {
+    match (balance.limit_cents, balance.remaining_cents) {
+        (Some(limit), Some(left)) if limit > 0 => (
+            format!("{} left of {}", dollars(left), dollars(limit)),
+            Some(limit.saturating_sub(left) as f32 / limit as f32),
+        ),
+        _ => (
+            format!("{} spent · no cap set", dollars(balance.used_cents)),
+            None,
+        ),
+    }
+}
+
+/// A plan's name as people write it: "plus" → "Plus".
+fn plan_name(plan: &str) -> String {
+    let mut chars = plan.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// One usage line: its name, a figure on the right, and a meter.
+fn usage_line(name: String, figure: String, share: Option<f32>) -> View {
+    let mut line = view().gap_1().child(
+        view()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                text(name.clone())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .number_of_lines(1)
+                    .text_size(px(ui::fit::small()))
+                    .text_color(colors::TEXT),
+            )
+            .child(
+                text(figure)
+                    .number_of_lines(1)
+                    .text_size(px(ui::fit::small()))
+                    .text_color(colors::MUTED),
+            ),
+    );
+    if let Some(share) = share {
+        line = line.child(ui::meter(name, share));
+    }
+    line
+}
+
+/// What the provider's account has used and has left.
+fn usage_view(usage: &ProviderUsage) -> Option<View> {
+    if usage.windows.is_empty() && usage.balance.is_none() {
+        return None;
+    }
+    let now = crate::store::now_ms();
+    let mut block = view().gap_2().pt_1();
+    for window in &usage.windows {
+        let mut figure = format!("{}% used", window.used_percent);
+        if let Some(at) = window.resets_at_ms {
+            figure = format!("{figure} · {}", resets_words(at, now));
+        }
+        block = block.child(usage_line(
+            window_name(window.minutes),
+            figure,
+            Some(f32::from(window.used_percent) / 100.0),
+        ));
+    }
+    if let Some(balance) = &usage.balance {
+        let (figure, share) = balance_words(balance);
+        block = block.child(usage_line("Balance".to_string(), figure, share));
+    }
+    Some(block)
 }
 
 /// A TOML string holding `id`.
@@ -988,11 +1122,16 @@ fn connected_row(
         Some(index) => format!("Failover {}", index + 1),
     };
     let (credential, tone) = credential_words(provider.credential);
-    let models_line = models_by_job(&provider);
+    let credential: String = match provider.usage.as_ref().map(|u| u.plan.as_str()) {
+        Some(plan) if !plan.is_empty() => format!("{credential} · {} plan", plan_name(plan)),
+        _ => credential.to_string(),
+    };
+    let models_rows = models_by_job(&provider);
+    let usage = provider.usage.as_ref().and_then(usage_view);
     let mut actions = view().flex_row().flex_wrap().gap_2();
     if main {
         actions = actions.child(
-            ui::btn("Change provider", Variant::Ghost, Size::Sm, move || {
+            ui::btn("Change provider", Variant::Outline, Size::Sm, move || {
                 form.open(Adding::Main, String::new(), at)
             })
             .disabled(move || store.settings_busy())
@@ -1019,7 +1158,7 @@ fn connected_row(
     {
         let (hard, quick) = (provider.hard_model.clone(), provider.quick_model.clone());
         actions = actions.child(
-            ui::btn("Change models", Variant::Ghost, Size::Sm, move || {
+            ui::btn("Change models", Variant::Outline, Size::Sm, move || {
                 if form.modeling.get_untracked() == Some(at) {
                     form.modeling.set(None);
                     return;
@@ -1050,7 +1189,7 @@ fn connected_row(
                 if missing {
                     Variant::Primary
                 } else {
-                    Variant::Ghost
+                    Variant::Outline
                 },
                 Size::Sm,
                 move || {
@@ -1139,10 +1278,10 @@ fn connected_row(
                 .with(|r| r.as_deref() == Some(setting.as_str()))
         }
     };
-    let models = text(models_line)
-        .number_of_lines(2)
-        .text_size(px(ui::fit::small()))
-        .text_color(colors::TEXT);
+    let mut models = view().gap_1();
+    for (label, model) in models_rows {
+        models = models.child(labeled_row(label, model));
+    }
     view()
         .p_3()
         .gap_2()
@@ -1168,6 +1307,7 @@ fn connected_row(
         )
         .child(models)
         .child(ui::status(credential, tone))
+        .children(usage)
         .child(actions)
         .child(job_models)
         .child(when(editing, move || {
@@ -1942,4 +2082,45 @@ fn apply_section(store: Store) -> View {
                     restart(store)
                 })),
         )
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn windows_are_named_by_their_length() {
+        assert_eq!(window_name(300), "5-hour limit");
+        assert_eq!(window_name(10_080), "Weekly limit");
+        assert_eq!(window_name(1_440), "Daily limit");
+        assert_eq!(window_name(2_880), "2-day limit");
+        assert_eq!(window_name(45), "45-minute limit");
+    }
+
+    #[test]
+    fn a_balance_with_a_cap_fills_its_meter_and_one_without_does_not() {
+        let capped = UsageBalance {
+            used_cents: 350,
+            limit_cents: Some(1_000),
+            remaining_cents: Some(650),
+        };
+        let (words, share) = balance_words(&capped);
+        assert_eq!(words, "$6.50 left of $10.00");
+        assert!((share.unwrap() - 0.35).abs() < 1e-6);
+        let open = UsageBalance {
+            used_cents: 346,
+            limit_cents: None,
+            remaining_cents: None,
+        };
+        assert_eq!(
+            balance_words(&open),
+            ("$3.46 spent · no cap set".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn plans_read_as_people_write_them() {
+        assert_eq!(plan_name("plus"), "Plus");
+        assert_eq!(plan_name(""), "");
+    }
 }

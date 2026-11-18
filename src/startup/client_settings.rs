@@ -494,8 +494,10 @@ impl SettingsHost {
             .to_string();
         let (reload_pending, restart_pending) = *self.pending();
         let (sign_in, checked) = self.flow.shown().await;
+        let mut connected = client_providers::connected(&current);
+        super::provider_usage::fill(&current, &mut connected).await;
         Ok(Settings {
-            connected: client_providers::connected(&current),
+            connected,
             chatgpt_signed_in: client_providers::chatgpt_signed_in(),
             sign_in,
             checked,
