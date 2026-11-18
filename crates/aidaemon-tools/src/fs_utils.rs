@@ -526,30 +526,15 @@ pub fn resolve_projects_folder_alias(
     None
 }
 
-fn token_looks_like_named_project(raw: &str) -> bool {
-    let token = raw
-        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '`' || c == '\'' || c == '"')
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '.')
-        .trim_end_matches(['.', '!', '?'])
-        .to_ascii_lowercase();
-    if token.is_empty()
-        || token.contains("://")
-        || token.contains('/')
-        || token.contains('\\')
-        || token.len() < 3
-    {
-        return false;
-    }
-    if !token.chars().any(|c| c.is_ascii_alphabetic()) || token.chars().all(|c| c.is_ascii_digit())
-    {
-        return false;
-    }
-    token.contains('.')
-        || token.contains('-')
-        || token.contains('_')
-        || token.contains("project")
-        || token.starts_with("app")
-        || token.ends_with("app")
+/// Whether `token` can name a folder directly under a project root: one
+/// path component, not a URL. Which name it is never matters: the name is
+/// resolved against the folders that exist there.
+fn is_single_path_component(token: &str) -> bool {
+    !token.is_empty()
+        && token != "."
+        && token != ".."
+        && !token.contains("://")
+        && !token.contains(['/', '\\'])
 }
 
 pub fn resolve_named_project_root(
@@ -562,7 +547,7 @@ pub fn resolve_named_project_root(
         .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'))
         .trim_end_matches(['.', '!', '?'])
         .trim();
-    if !token_looks_like_named_project(token) {
+    if !is_single_path_component(token) {
         return None;
     }
 
@@ -1168,6 +1153,28 @@ mod tests {
         )
         .expect("resolved");
         assert_eq!(resolved, project);
+    }
+
+    #[test]
+    fn a_plain_project_name_resolves_by_the_folders_that_exist() {
+        // "widget" has no '.', '-', '_' or "app": it resolves because the
+        // folder is there, and a name with no folder resolves to nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let alias_root = dir.path().join("projects");
+        let project = alias_root.join("widget");
+        std::fs::create_dir_all(&project).unwrap();
+        let roots = [alias_root.to_string_lossy().to_string()];
+        let backend = crate::testing::active_execution_backend();
+        let resolved = resolve_named_project_root(&*backend, "widget", &roots).expect("resolved");
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            std::fs::canonicalize(&project).unwrap()
+        );
+        assert!(
+            resolve_named_project_root(&*backend, "synthetic-missing-project-7f3", &roots)
+                .is_none()
+        );
+        assert!(resolve_named_project_root(&*backend, "a/widget", &roots).is_none());
     }
 
     #[test]
