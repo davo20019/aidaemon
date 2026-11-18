@@ -1551,19 +1551,30 @@ impl CliAgentTool {
     /// folder, not to the contract's exact read paths), and `claude` is the
     /// built-in agent, not a stored one.
     fn claude_confinable(&self, facts: &ToolCallContext) -> bool {
-        facts
+        let host = facts
             .extensions
             .get::<aidaemon_core::NestedCalls>()
-            .is_some()
-            && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local
-            && crate::authority::parent_authority(facts)
-                .is_some_and(|authority| !authority.untrusted_context)
-            && self
-                .tools
-                .read()
-                .ok()
-                .and_then(|tools| tools.get("claude").map(|entry| !entry.is_dynamic))
-                .unwrap_or(false)
+            .is_some();
+        let local = self.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
+        let authority = crate::authority::parent_authority(facts);
+        let clean = authority.is_some_and(|authority| !authority.untrusted_context);
+        let built_in = self
+            .tools
+            .read()
+            .ok()
+            .and_then(|tools| tools.get("claude").map(|entry| !entry.is_dynamic))
+            .unwrap_or(false);
+        let confinable = host && local && clean && built_in;
+        info!(
+            confinable,
+            host,
+            local,
+            has_authority = authority.is_some(),
+            clean,
+            built_in,
+            "Whether a Claude Code run can be confined for this call"
+        );
+        confinable
     }
 
     fn configured_tool(&self, name: &str) -> Option<String> {
