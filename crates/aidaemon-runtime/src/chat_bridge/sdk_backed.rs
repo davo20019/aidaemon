@@ -574,6 +574,9 @@ pub fn to_sdk_error(error: &ProviderError) -> sdk::ProviderError {
         ProviderErrorKind::RateLimit => sdk::ProviderError::RateLimited {
             retry_after: error.retry_after_secs.map(std::time::Duration::from_secs),
         },
+        ProviderErrorKind::BadRequest if error.rejected_tools => {
+            sdk::ProviderError::InvalidTools(detail)
+        }
         ProviderErrorKind::BadRequest => match error.context_overflow {
             Some(limit) => sdk::ProviderError::ContextOverflow {
                 message: detail,
@@ -640,6 +643,10 @@ pub fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
         sdk::ProviderError::InvalidRequest(_) => ProviderErrorKind::BadRequest,
         sdk::ProviderError::ContextOverflow { limit, .. } => {
             out.context_overflow = Some(*limit);
+            ProviderErrorKind::BadRequest
+        }
+        sdk::ProviderError::InvalidTools(_) => {
+            out.rejected_tools = true;
             ProviderErrorKind::BadRequest
         }
         sdk::ProviderError::Malformed { parse, .. } => {

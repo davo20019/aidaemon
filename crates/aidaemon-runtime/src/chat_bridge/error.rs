@@ -23,6 +23,10 @@ pub struct ProviderError {
     /// tokens (`aidaemon_core::ProviderError::proves_nothing_spent`). False
     /// whenever that is not proven.
     pub spent_nothing: bool,
+    /// The provider refused the request's tool definitions
+    /// (`aidaemon_core::ProviderError::InvalidTools`): dropping media or
+    /// options cannot cure it, so recovery goes straight to another model.
+    pub rejected_tools: bool,
     /// The provider said the request exceeded the model's context window
     /// (`aidaemon_core::ProviderError::ContextOverflow`), with the window
     /// when it stated one. Typed, never re-read from `message`.
@@ -144,6 +148,7 @@ impl ProviderError {
             resets_at: None,
             fallback_failures: Vec::new(),
             spent_nothing: false,
+            rejected_tools: false,
             // The provider's own fields decide (`aidaemon_providers::context_overflow`).
             context_overflow: aidaemon_providers::context_overflow(status, body),
         }
@@ -161,6 +166,7 @@ impl ProviderError {
             resets_at: None,
             fallback_failures: Vec::new(),
             spent_nothing: false,
+            rejected_tools: false,
             context_overflow: None,
         }
     }
@@ -176,6 +182,7 @@ impl ProviderError {
             resets_at: None,
             fallback_failures: Vec::new(),
             spent_nothing: false,
+            rejected_tools: false,
             context_overflow: None,
         }
     }

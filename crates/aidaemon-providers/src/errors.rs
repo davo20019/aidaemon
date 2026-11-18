@@ -128,6 +128,29 @@ pub fn out_of_credit(status: u16, body: &str) -> bool {
             .is_some_and(|message| message.starts_with("Your credit balance is too low"))
 }
 
+/// Whether a rejection names the request's tool definitions as the part at
+/// fault: OpenAI's `error.param` (`tools[9].parameters`), or, when the
+/// backend sends only a message, its fixed "Invalid schema for 'tools["
+/// prefix.
+pub fn rejects_tools(body: &str) -> bool {
+    let value: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let param = value
+        .as_ref()
+        .and_then(|v| v.pointer("/error/param"))
+        .and_then(serde_json::Value::as_str);
+    if let Some(param) = param {
+        return param == "tools" || param.starts_with("tools[") || param.starts_with("tools.");
+    }
+    let message = value
+        .as_ref()
+        .and_then(|v| v.pointer("/error/message").or_else(|| v.get("message")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(body);
+    message
+        .trim_start()
+        .starts_with("Invalid schema for 'tools[")
+}
+
 /// The typed error for a non-success HTTP status and its body.
 pub fn error_for_status(status: u16, body: &str, detail: String) -> ProviderError {
     if out_of_credit(status, body) {
@@ -150,6 +173,7 @@ pub fn error_for_status(status: u16, body: &str, detail: String) -> ProviderErro
         },
         404 => ProviderError::NotFound(detail),
         408 => ProviderError::Transient(detail),
+        400..=499 if rejects_tools(body) => ProviderError::InvalidTools(detail),
         400..=499 => ProviderError::InvalidRequest(detail),
         500..=599 => ProviderError::Transient(detail),
         _ => ProviderError::Other(detail),
@@ -227,6 +251,30 @@ mod tests {
         ));
         assert!(matches!(
             error_for_status(400, "bad tool schema", "d".into()),
+            ProviderError::InvalidRequest(_)
+        ));
+        assert!(matches!(
+            error_for_status(
+                400,
+                r#"{"error":{"message":"Invalid schema","param":"tools[9].parameters"}}"#,
+                "d".into()
+            ),
+            ProviderError::InvalidTools(_)
+        ));
+        assert!(matches!(
+            error_for_status(
+                400,
+                "Invalid schema for 'tools[9].parameters': Unimplemented keys: [\"not\"].",
+                "d".into()
+            ),
+            ProviderError::InvalidTools(_)
+        ));
+        assert!(matches!(
+            error_for_status(
+                400,
+                r#"{"error":{"message":"bad image","param":"messages[2].content"}}"#,
+                "d".into()
+            ),
             ProviderError::InvalidRequest(_)
         ));
         assert!(matches!(

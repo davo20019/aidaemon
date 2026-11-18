@@ -284,6 +284,15 @@ impl aidaemon_core::FailoverPolicy for DaemonRecovery {
                 }
                 Next
             }
+            // Refused tool definitions: the same tools are refused again
+            // whatever media or options go with them, so another model.
+            ProviderRecoveryRoute::AdaptRequestOnce if daemon_error.rejected_tools => {
+                warn!(
+                    model,
+                    "Provider refused the tool definitions; trying the next model"
+                );
+                Next
+            }
             // A rejected request: drop media once, then advanced options once.
             ProviderRecoveryRoute::AdaptRequestOnce => {
                 if has_media(request) {
@@ -769,7 +778,7 @@ pub async fn select_turn_model(
 
 #[cfg(test)]
 mod tests {
-    use super::{QuotaFallback, owner_of, quota_note_due};
+    use super::{DaemonRecovery, QuotaFallback, owner_of, quota_note_due};
     use crate::llm::{ModelBackend, ProviderRuntimeTarget, SharedLlmRuntime};
     use aidaemon_core::testing::ScriptedProvider;
     use aidaemon_providers::routing::ProviderKind;
@@ -833,6 +842,50 @@ mod tests {
         let later = now + Duration::from_secs(7200);
         let next = fallback("synthetic-other", Some(later + Duration::from_secs(3600)));
         assert!(quota_note_due(session, &next, later));
+    }
+
+    fn recovery() -> DaemonRecovery {
+        DaemonRecovery {
+            billing_failed_models: Default::default(),
+            uncommitted_work: false,
+            provider_label: "synthetic",
+            attempted: std::sync::Mutex::new(Vec::new()),
+            quota: std::sync::Mutex::new(None),
+            failures: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn request_with_image() -> aidaemon_core::ModelRequest {
+        let mut message = aidaemon_core::Message::user("draw it in these colors");
+        message
+            .images
+            .push(aidaemon_core::Image::base64("image/png", "c3ludGhldGlj"));
+        aidaemon_core::ModelRequest {
+            model: "synthetic-primary".into(),
+            messages: vec![message],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refused_tool_definitions_go_to_the_next_model_without_a_text_only_retry() {
+        use aidaemon_core::{FailoverAction, FailoverPolicy, ProviderError};
+        let request = request_with_image();
+        let refused = ProviderError::InvalidTools(
+            "HTTP 400: Invalid schema for 'tools[9].parameters'".into(),
+        );
+        assert!(matches!(
+            recovery().after_error(&request, &refused, 1, 3),
+            FailoverAction::Next
+        ));
+        // Any other rejection of a request with media still tries text-only.
+        let other = ProviderError::InvalidRequest("HTTP 400: bad image".into());
+        match recovery().after_error(&request, &other, 1, 3) {
+            FailoverAction::RetryWith { request, .. } => {
+                assert!(request.messages.iter().all(|m| m.images.is_empty()));
+            }
+            action => panic!("expected a text-only retry, got {action:?}"),
+        }
     }
 
     #[test]

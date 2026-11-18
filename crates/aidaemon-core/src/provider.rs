@@ -141,6 +141,11 @@ pub enum ProviderError {
     Transient(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The provider refused the request's tool definitions (a schema it
+    /// does not compile). Dropping media or options cannot cure it: the
+    /// same tools are refused again, so only another model may answer.
+    #[error("invalid tool definitions: {0}")]
+    InvalidTools(String),
     #[error("authentication failed: {0}")]
     Auth(String),
     /// The account cannot pay for the request. `affordable_tokens` is the

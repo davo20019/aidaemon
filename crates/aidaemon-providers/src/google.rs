@@ -361,6 +361,23 @@ fn strip_unsupported_fields(value: &mut Value) {
     {
         map.insert("anyOf".into(), one_of);
     }
+    // Gemini's `type` is one name; a JSON-schema union with "null" is its
+    // `nullable` flag.
+    if let Some(Value::Array(types)) = map.get("type") {
+        let named: Vec<Value> = types
+            .iter()
+            .filter(|t| t.as_str() != Some("null"))
+            .cloned()
+            .collect();
+        let nullable = named.len() < types.len();
+        if let [single] = named.as_slice() {
+            let single = single.clone();
+            map.insert("type".into(), single);
+            if nullable {
+                map.insert("nullable".into(), Value::Bool(true));
+            }
+        }
+    }
     map.retain(|key, _| GEMINI_SCHEMA_FIELDS.contains(&key.as_str()));
     if let Some(Value::Object(properties)) = map.get_mut("properties") {
         for property in properties.values_mut() {
@@ -926,6 +943,17 @@ mod tests {
             messages,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_nullable_type_union_becomes_gemini_nullable() {
+        let mut schema = json!({"type": "object", "properties": {
+            "tail_lines": {"type": ["integer", "null"], "minimum": 1}
+        }});
+        strip_unsupported_fields(&mut schema);
+        let tail = &schema["properties"]["tail_lines"];
+        assert_eq!(tail["type"], "integer");
+        assert_eq!(tail["nullable"], true);
     }
 
     fn tool(name: &str, parameters: Value) -> ToolSpec {

@@ -644,19 +644,49 @@ fn build_tools(tools: &[ToolSpec]) -> Vec<Value> {
 
 /// A tool's parameters in the schema subset the backend compiles. Newer
 /// models compile every tool schema strictly and refuse the whole request
-/// over `uniqueItems` (HTTP 400, "Unimplemented keys"); the tool still
-/// checks its own arguments, so dropping the keyword loses nothing.
+/// over keywords outside that subset (HTTP 400, "Unimplemented keys"):
+/// `uniqueItems`, and `not` (which gpt-6.2 started refusing). The tool
+/// still checks its own arguments, so dropping them loses nothing. A
+/// combinator (`allOf`/`anyOf`/`oneOf`) left with only empty branches is
+/// dropped too. Property names are never filtered.
 fn tool_parameters(schema: &Value) -> Value {
+    sanitize_schema(schema, false)
+}
+
+const UNCOMPILED_KEYWORDS: [&str; 2] = ["uniqueItems", "not"];
+
+fn sanitize_schema(schema: &Value, names: bool) -> Value {
     match schema {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .filter(|(key, _)| key.as_str() != "uniqueItems")
-                .map(|(key, value)| (key.clone(), tool_parameters(value)))
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(tool_parameters).collect()),
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                if !names && UNCOMPILED_KEYWORDS.contains(&key.as_str()) {
+                    continue;
+                }
+                let child_names =
+                    !names && matches!(key.as_str(), "properties" | "$defs" | "definitions");
+                let value = sanitize_schema(value, child_names);
+                if !names
+                    && matches!(key.as_str(), "allOf" | "anyOf" | "oneOf")
+                    && value
+                        .as_array()
+                        .is_some_and(|branches| branches.iter().all(is_empty_object))
+                {
+                    continue;
+                }
+                out.insert(key.clone(), value);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| sanitize_schema(v, false)).collect())
+        }
         other => other.clone(),
     }
+}
+
+fn is_empty_object(value: &Value) -> bool {
+    value.as_object().is_some_and(Map::is_empty)
 }
 
 fn build_tool_choice(choice: &ToolChoice) -> Value {
@@ -1408,5 +1438,33 @@ mod tests {
         assert!(ids.get("uniqueItems").is_none());
         assert!(ids["items"].get("uniqueItems").is_none());
         assert_eq!(ids["maxItems"], 4);
+    }
+
+    #[test]
+    fn tool_schemas_drop_not_but_keep_a_property_named_not() {
+        let mut req = request(vec![Message::user("hi")]);
+        req.tools = vec![ToolSpec {
+            name: "read_file".into(),
+            description: "Read".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "not": {"type": "string"},
+                    "tail": {"type": "integer"},
+                    "start": {"type": "integer"}
+                },
+                "allOf": [
+                    {"not": {"required": ["tail", "start"]}},
+                    {"not": {"required": ["tail", "end"]}}
+                ],
+                "anyOf": [{"required": ["tail"]}, {"not": {"required": ["start"]}}]
+            }),
+        }];
+        let body = build_body(&req, None);
+        let params = &body["tools"][0]["parameters"];
+        assert!(params.get("allOf").is_none());
+        assert_eq!(params["properties"]["not"]["type"], "string");
+        assert_eq!(params["anyOf"], json!([{"required": ["tail"]}, {}]));
+        assert!(!params.to_string().contains("\"not\":{\"required"));
     }
 }
