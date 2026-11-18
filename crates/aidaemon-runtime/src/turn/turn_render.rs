@@ -119,24 +119,16 @@ pub fn render_turn(
     }
 }
 
-/// Shared learned-helplessness / budget-exhaustion failure-pattern predicate.
+/// Whether `message` is a reply its run wrote on failure: the typed
+/// [`MessageAnnotation::FailureNotice`](aidaemon_events::conversation::MessageAnnotation::FailureNotice)
+/// stamped when it was stored, never its wording.
 ///
-/// BOTH `render_current` (drops matching assistant text) and `render_archived`
-/// (excludes from winning-assistant selection, uses the terminal placeholder)
-/// call this so the lists cannot drift. This is the list previously inlined in
-/// `message_build.rs`'s `&Message → Value` conversion.
-pub fn is_failure_boilerplate(content: &str) -> bool {
-    let t = content.trim_start();
-    t.starts_with("I wasn't able to process that request.")
-        || t.starts_with("I wasn't able to complete this task.")
-        || t.starts_with("I made some progress but wasn't able to fully complete")
-        || t.starts_with("I seem to be stuck on this task.")
-        || t.starts_with("I've reached my processing limit")
-        || t.starts_with("This goal hit its daily processing budget")
-        || t.starts_with("This scheduled goal hit its daily processing budget")
-        || t.starts_with("This scheduled run hit its per-run processing budget")
-        || t.starts_with("I sent the requested file(s), but ran into issues")
-        || t.starts_with("I completed the main deliverable but wasn't able to finish")
+/// BOTH `render_current` (drops it) and `render_archived` (excludes it from
+/// winning-assistant selection, uses the terminal placeholder) call this.
+pub fn is_failure_notice(message: &Message) -> bool {
+    message
+        .annotations
+        .contains(&aidaemon_events::conversation::MessageAnnotation::FailureNotice)
 }
 
 fn retain_adjacent_tool_result(content: &str) -> String {
@@ -343,10 +335,7 @@ fn render_current(turn_messages: &[Message], options: &RenderOptions) -> Vec<Val
     {
         // Drop learned-helplessness / budget-exhaustion boilerplate so the
         // model never reads its own prior "I failed" text and gives up.
-        if m.role == "assistant"
-            && m.tool_calls_json.is_none()
-            && m.content.as_deref().is_some_and(is_failure_boilerplate)
-        {
+        if m.role == "assistant" && m.tool_calls_json.is_none() && is_failure_notice(m) {
             continue;
         }
 
@@ -465,7 +454,7 @@ fn render_archived(
             m.role == "assistant"
                 && m.content
                     .as_deref()
-                    .is_some_and(|c| !c.trim().is_empty() && !is_failure_boilerplate(c))
+                    .is_some_and(|c| !c.trim().is_empty() && !is_failure_notice(m))
         })
         .map(|(i, _)| i)
         .next_back();
@@ -588,7 +577,7 @@ fn render_archived(
                         }
                     }
                     push_with_source(&mut out, obj, m);
-                } else if m.content.as_deref().is_some_and(is_failure_boilerplate) {
+                } else if is_failure_notice(m) {
                     // Failure boilerplate: do not emit text, do not treat as a
                     // winning response. If it carries tool_calls, retain those.
                     emit_tool_call_only_assistant(&mut out, m, &result_ids);
@@ -1091,13 +1080,48 @@ mod tests {
         );
     }
 
+    fn failure_notice(c: &str) -> Message {
+        Message {
+            annotations: vec![aidaemon_events::conversation::MessageAnnotation::FailureNotice],
+            ..assistant(c)
+        }
+    }
+
+    #[test]
+    fn a_failure_reply_is_known_by_its_annotation_not_its_wording() {
+        // Any wording, any language: the typed annotation decides.
+        let turn = vec![
+            user("do it"),
+            failure_notice("La tarea se detuvo: se agotó el presupuesto."),
+        ];
+        let cur = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(!serde_json::to_string(&cur).unwrap().contains("presupuesto"));
+        // An ordinary reply that says it could not do something stays.
+        let turn = vec![
+            user("do it"),
+            assistant("I wasn't able to complete this task."),
+        ];
+        let cur = render_turn(
+            &turn,
+            RenderMode::Current,
+            RENDERER_VERSION,
+            &RenderOptions::default(),
+        );
+        assert!(serde_json::to_string(&cur).unwrap().contains("wasn't able"));
+    }
+
     #[test]
     fn current_mode_drops_learned_helplessness_but_archived_uses_placeholder() {
         let turn = vec![
             user("do it"),
             assistant_empty_with_tool_call(),
             tool("terminal", "c1", "exit 1"),
-            assistant("I wasn't able to complete this task."),
+            failure_notice("I wasn't able to complete this task."),
         ];
         let cur = render_turn(
             &turn,

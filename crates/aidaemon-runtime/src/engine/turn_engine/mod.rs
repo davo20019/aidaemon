@@ -1627,6 +1627,11 @@ impl TurnEngine<'_> {
                     Message::new_runtime(Uuid::new_v4().to_string(), session_id, "assistant");
                 assistant.content = Some(reply.clone());
                 assistant.turn_id = Some(turn_id.clone());
+                if task_outcome == TaskOutcome::Failed {
+                    assistant
+                        .annotations
+                        .push(aidaemon_events::conversation::MessageAnnotation::FailureNotice);
+                }
                 let input_tokens = Some(usage.input_tokens.min(u32::MAX as u64) as u32);
                 let output_tokens = Some(usage.output_tokens.min(u32::MAX as u64) as u32);
                 if scope.background_handoff.load(Ordering::Relaxed) {

@@ -53,6 +53,10 @@ pub enum MessageAnnotation {
         #[serde(default)]
         caption: String,
     },
+    /// An assistant reply written when its run failed (a budget stop, a
+    /// provider failure). Rendering leaves it out of later turns so the
+    /// model never reads its own earlier "I couldn't" and gives up.
+    FailureNotice,
 }
 
 pub use aidaemon_tools::semantics::{AttachmentProvenance, MessageAttachment};
@@ -180,7 +184,8 @@ fn annotation_appended_marker(annotation: &MessageAnnotation) -> Option<&'static
         | MessageAnnotation::WrappedUntrustedExternalData { .. }
         | MessageAnnotation::InboundFileAttachment { .. }
         | MessageAnnotation::IdentityCritical
-        | MessageAnnotation::DeliveredFiles { .. } => None,
+        | MessageAnnotation::DeliveredFiles { .. }
+        | MessageAnnotation::FailureNotice => None,
     }
 }
 

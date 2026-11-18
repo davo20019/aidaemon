@@ -1356,6 +1356,11 @@ impl TurnEngine<'_> {
             tool_calls_json: None,
             created_at: Utc::now(),
             importance: 0.3,
+            annotations: if outcome == TaskOutcome::Failed {
+                vec![aidaemon_events::conversation::MessageAnnotation::FailureNotice]
+            } else {
+                Vec::new()
+            },
             ..Message::runtime_defaults()
         };
         if let Err(append_error) = self

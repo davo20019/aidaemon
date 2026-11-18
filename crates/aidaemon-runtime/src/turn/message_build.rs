@@ -255,7 +255,7 @@ pub fn compact_immediate_parent_turn(turn_messages: &[Message]) -> Vec<Value> {
             return None;
         }
         let raw = message.content.as_deref().unwrap_or_default();
-        if raw.trim().is_empty() || crate::turn::turn_render::is_failure_boilerplate(raw) {
+        if raw.trim().is_empty() || crate::turn::turn_render::is_failure_notice(message) {
             return None;
         }
         let content = compact_parent_answer(raw, COMPACT_PARENT_ASSISTANT_CHARS);
