@@ -1055,19 +1055,64 @@ fn has_recursive_grep_scope_controls(command: &str) -> bool {
 /// flailing after the GUI loop correctly reported the screen locked).
 /// Read-only System Events queries (get name of every process, …) are allowed.
 fn is_system_events_ui_scripting(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    if !lower.contains("osascript") || !lower.contains("system events") {
-        return false;
+    // A command line is a machine format: the call is a segment whose
+    // program token is `osascript` (directly, or inside a nested shell's
+    // `-c` argument), and its AppleScript arguments name a System Events UI
+    // verb. Text that merely names osascript (an `echo`) is not a call.
+    osascript_script(command, 0).is_some_and(|script| {
+        script.contains("system events")
+            && [
+                "click",
+                "keystroke",
+                "key code",
+                "set value",
+                "perform action",
+            ]
+            .iter()
+            .any(|verb| script.contains(verb))
+    })
+}
+
+/// The lowercased arguments of an `osascript` call in `command`, looking
+/// one level into nested shell arguments.
+fn osascript_script(command: &str, depth: usize) -> Option<String> {
+    for segment in command.split([';', '|', '&', '\n']) {
+        let tokens = shell_words::split(segment).unwrap_or_else(|_| {
+            segment
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+        // Wrappers and `VAR=value` assignments before the program.
+        let Some(at) = tokens.iter().position(|token| {
+            !token.contains('=')
+                && !matches!(
+                    token.as_str(),
+                    "sudo" | "env" | "exec" | "command" | "nohup" | "time"
+                )
+        }) else {
+            continue;
+        };
+        let program = std::path::Path::new(&tokens[at])
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if program == "osascript" {
+            return Some(tokens[at + 1..].join(" ").to_ascii_lowercase());
+        }
+        let shell = matches!(
+            program.as_str(),
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
+        );
+        if shell && depth == 0 {
+            for nested in tokens.iter().skip(at + 1).filter(|t| !t.starts_with('-')) {
+                if let Some(script) = osascript_script(nested, depth + 1) {
+                    return Some(script);
+                }
+            }
+        }
     }
-    [
-        "click",
-        "keystroke",
-        "key code",
-        "set value",
-        "perform action",
-    ]
-    .iter()
-    .any(|verb| lower.contains(verb))
+    None
 }
 
 fn detect_unscoped_recursive_grep_segment(segment: &str) -> Option<(String, String)> {
@@ -11645,6 +11690,17 @@ mod tests {
         ));
         assert!(is_system_events_ui_scripting(
             r#"osascript -e 'tell application "System Events" to key code 36'"#
+        ));
+    }
+
+    #[test]
+    fn system_events_scripting_is_read_from_the_command_tokens() {
+        assert!(is_system_events_ui_scripting(
+            r#"bash -c "osascript -e 'tell application \"System Events\" to keystroke \"a\"'""#
+        ));
+        // Text that only names osascript is not a call to it.
+        assert!(!is_system_events_ui_scripting(
+            r#"echo "osascript can tell System Events to click""#
         ));
     }
 
