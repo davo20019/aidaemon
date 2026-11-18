@@ -72,6 +72,17 @@ extern "C" {
     #[wasm_bindgen(method, js_name = stop)]
     fn stop_keys(this: &KeyCapture);
 
+    #[wasm_bindgen(js_name = dictationAvailable)]
+    fn dictation_available_js() -> bool;
+    #[wasm_bindgen(js_name = Dictation)]
+    type DictationJs;
+    #[wasm_bindgen(constructor, js_class = "Dictation")]
+    fn new(lang: &str, interim: bool, event: &Closure<dyn FnMut(String, String)>) -> DictationJs;
+    #[wasm_bindgen(method, js_class = "Dictation", js_name = stop)]
+    fn stop_dictation(this: &DictationJs);
+    #[wasm_bindgen(method, js_class = "Dictation", js_name = abort)]
+    fn abort_dictation(this: &DictationJs);
+
     type Socket;
     #[wasm_bindgen(constructor)]
     fn new(url: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
@@ -120,6 +131,91 @@ pub async fn mark_up(url: &str, strokes: &str, width: f32, color: &str) -> Optio
 pub async fn take_picture(max_dimension: u32) -> Option<Vec<u8>> {
     let taken = JsFuture::from(take_picture_js(max_dimension)).await.ok()?;
     (!taken.is_null() && !taken.is_undefined()).then(|| js_sys::Uint8Array::new(&taken).to_vec())
+}
+
+/// Whether the page can recognize speech (the Web Speech API: Chrome,
+/// Edge and Safari have it; Firefox does not).
+pub fn dictation_available() -> bool {
+    dictation_available_js()
+}
+
+/// A dictation session on the page's Web Speech API, reporting as NSH's
+/// recognizer does. Dropping it aborts it.
+pub struct Dictation {
+    js: DictationJs,
+    events: mpsc::UnboundedReceiver<nsh_core::speech::SpeechEvent>,
+    // Called by the page until the session ends; kept as long as it can be.
+    _event: Closure<dyn FnMut(String, String)>,
+}
+
+impl Dictation {
+    pub fn start(request: nsh_core::speech::SpeechRequest) -> Self {
+        use nsh_core::speech::SpeechEvent;
+        let (tx, events) = mpsc::unbounded();
+        let event = Closure::<dyn FnMut(String, String)>::new(move |kind: String, text: String| {
+            // `kind` is one of the names `Dictation` in js/browser.js sends
+            // (a machine format of our own, not prose).
+            let event = match kind.as_str() {
+                "start" => SpeechEvent::Start,
+                "result" => SpeechEvent::Result {
+                    text,
+                    is_final: false,
+                },
+                "final" => SpeechEvent::Result {
+                    text,
+                    is_final: true,
+                },
+                "end" => SpeechEvent::End {
+                    error: speech_error(&text),
+                },
+                _ => return,
+            };
+            let _ = tx.unbounded_send(event);
+        });
+        let js = DictationJs::new(
+            request.lang.as_deref().unwrap_or(""),
+            request.interim,
+            &event,
+        );
+        Self {
+            js,
+            events,
+            _event: event,
+        }
+    }
+
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<nsh_core::speech::SpeechEvent>> {
+        let polled = self.events.poll_next_unpin(cx);
+        // Nothing comes after the end.
+        if let std::task::Poll::Ready(Some(nsh_core::speech::SpeechEvent::End { .. })) = &polled {
+            self.events.close();
+        }
+        polled
+    }
+
+    pub fn stop(&self) {
+        self.js.stop_dictation();
+    }
+}
+
+impl Drop for Dictation {
+    fn drop(&mut self) {
+        self.js.abort_dictation();
+    }
+}
+
+/// A Web Speech API error name as NSH names it; `None` when the session
+/// only ended or was aborted. Names are the API's own (a machine format).
+fn speech_error(name: &str) -> Option<nsh_core::speech::SpeechError> {
+    use nsh_core::speech::SpeechError;
+    match name {
+        "" | "aborted" => None,
+        "service-not-allowed" => Some(SpeechError::NotAllowed),
+        other => Some(SpeechError::from_name(other).unwrap_or(SpeechError::Failed)),
+    }
 }
 
 async fn text_of(promise: js_sys::Promise) -> Result<String, String> {

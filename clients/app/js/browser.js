@@ -341,3 +341,64 @@ export async function markUp(url, strokes, width, color, maxDimension) {
     return null;
   }
 }
+
+/** Whether the page can recognize speech (the Web Speech API). */
+export function dictationAvailable() {
+  return typeof (window.SpeechRecognition || window.webkitSpeechRecognition) === "function";
+}
+
+/**
+ * Dictation on the page's Web Speech API, reported as NSH's recognizer
+ * reports it: `event(kind, text)` hears "start", "result" (the whole
+ * transcript so far), "final" (the last one) and once "end" (the API's
+ * error name, or ""). After `abort` nothing more is reported.
+ */
+export class Dictation {
+  constructor(lang, interim, event) {
+    let ended = false;
+    this.send = (kind, text) => {
+      if (ended) return;
+      if (kind === "end") ended = true;
+      event(kind, text);
+    };
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+      setTimeout(() => this.send("end", "unavailable"));
+      return;
+    }
+    const r = new Recognition();
+    this.r = r;
+    r.continuous = true;
+    r.interimResults = interim;
+    if (lang) r.lang = lang;
+    let error = "";
+    let text = "";
+    r.onstart = () => this.send("start", "");
+    r.onresult = (e) => {
+      let heard = "";
+      for (const result of e.results) heard += result[0].transcript;
+      text = heard.replace(/\s+/g, " ").trim();
+      this.send("result", text);
+    };
+    r.onerror = (e) => {
+      error = e.error || "failed";
+    };
+    r.onend = () => {
+      if (text) this.send("final", text);
+      this.send("end", error);
+    };
+    try {
+      r.start();
+    } catch {
+      setTimeout(() => this.send("end", "failed"));
+    }
+  }
+  stop() {
+    this.r?.stop();
+  }
+  abort() {
+    // The app dropped the session: it hears nothing more.
+    this.send("end", "aborted");
+    this.r?.abort();
+  }
+}

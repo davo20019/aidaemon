@@ -2201,20 +2201,20 @@ fn file_path(uri: &str) -> String {
 
 /// The microphone: speaking writes into the composer, after what is
 /// already there, as the platform's recognizer hears it. Pressing it again
-/// stops listening (the last words are kept). Shown only where the
-/// platform recognizes speech.
+/// stops listening (the last words are kept). Shown only where speech can
+/// be recognized: the platform's recognizer, or the browser's.
 fn dictation(store: Store, terminal: bool) -> View {
     use std::{cell::RefCell, rc::Rc};
 
-    use nsh_core::element::SpeechRecognition;
+    use crate::link::Listening;
     use nsh_core::speech::{SpeechEvent, SpeechRequest};
 
     let available = signal(false);
     if !terminal {
-        spawn(async move { available.set(speech_available().await) });
+        spawn(async move { available.set(crate::link::can_listen().await) });
     }
     let listening = signal(false);
-    let session: Stored<Option<Rc<RefCell<SpeechRecognition>>>> = stored(None);
+    let session: Stored<Option<Rc<RefCell<Listening>>>> = stored(None);
     // The session outlives the button pressed to start it (the button
     // becomes Stop): it runs under the composer.
     let owner = Owner::current();
@@ -2234,7 +2234,7 @@ fn dictation(store: Store, terminal: bool) -> View {
         } else {
             format!("{} ", before.trim_end())
         };
-        let running = Rc::new(RefCell::new(recognize_speech(SpeechRequest::default())));
+        let running = Rc::new(RefCell::new(Listening::start(SpeechRequest::default())));
         session.replace(Some(running.clone()));
         listening.set(true);
         owner.run(|| {
@@ -2289,6 +2289,9 @@ fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
         ),
         SpeechError::AudioCapture => Some("No microphone could be used"),
         SpeechError::LanguageNotSupported => Some("Speech in this language is not recognized here"),
+        SpeechError::Network => {
+            Some("Listening stopped: speech recognition could not reach its service")
+        }
         _ => Some("Listening stopped: speech recognition failed"),
     }
 }

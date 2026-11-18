@@ -105,7 +105,7 @@ Say what happened and what to do next, in the owner's words: "Can't reach the da
 | All | A reply finishes, or an approval arrives, in another conversation while the app is in front | Toast: "Done: <conversation>" or "Needs you in <conversation>: <what>" |
 | System | A reply finishes while the app is in the background | "Done: <conversation>" notification; pressing it opens the conversation |
 | Composer | Files dragged from the desktop | The border turns accent and says "Drop to attach"; dropped files attach as the paperclip's do (a folder or unreadable file says so) |
-| Composer | Microphone (where the platform recognizes speech) | Speech writes into the composer after what is there as it is heard; the button becomes Stop listening (accent); a refusal says what to allow |
+| Composer | Microphone (where speech is recognized: the platform's recognizer on macOS and iOS, the Web Speech API in Chrome, Edge and Safari) | Speech writes into the composer after what is there as it is heard; the button becomes Stop listening (accent); a refusal says what to allow |
 | Steps | A tool's output | Shown in a terminal (`ui::output`): colours kept, 8 rows or 24 with Show more, scrolled back for the rest, Copy |
 | Settings | A value is edited | A TOML code editor (highlighted, brackets closed); Another setting suggests the known keys as its key is typed |
 | System | Token use | Stacked bars per day (in grey, out teal), oldest at the left; the day under the pointer is named under the chart |
