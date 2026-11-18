@@ -94,13 +94,13 @@ jobs:
             cross: false
             app: true
 
-          # TODO: Add linux-aarch64 when cross-compilation for fastembed/ONNX is resolved
-          # - target: aarch64-unknown-linux-gnu
-          #   os: ubuntu-latest
-          #   name: linux-aarch64
-          #   cross: true
-          #   # The app is not built under `cross` (its image has no GTK 4).
-          #   app: false
+          # Built natively on GitHub's ARM runner: cross-compiling fastembed's
+          # ONNX Runtime did not work, and the app needs GTK 4.14.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: linux-aarch64
+            cross: false
+            app: true
 
           - target: x86_64-apple-darwin
             os: macos-15
@@ -566,10 +566,12 @@ jobs:
           curl -sL "${BASE_URL}/aidaemon-macos-aarch64.tar.gz" -o macos-aarch64.tar.gz
           curl -sL "${BASE_URL}/aidaemon-macos-x86_64.tar.gz" -o macos-x86_64.tar.gz
           curl -sL "${BASE_URL}/aidaemon-linux-x86_64.tar.gz" -o linux-x86_64.tar.gz
+          curl -sL "${BASE_URL}/aidaemon-linux-aarch64.tar.gz" -o linux-aarch64.tar.gz
 
           echo "macos_arm64=$(sha256sum macos-aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "macos_x86_64=$(sha256sum macos-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "linux_x86_64=$(sha256sum linux-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum linux-aarch64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout tap
         uses: actions/checkout@v5
@@ -598,8 +600,13 @@ jobs:
             end
 
             on_linux do
-              url "https://github.com/davo20019/aidaemon/releases/download/vVERSION_PLACEHOLDER/aidaemon-linux-x86_64.tar.gz"
-              sha256 "SHA_LINUX_X86_64_PLACEHOLDER"
+              if Hardware::CPU.arm?
+                url "https://github.com/davo20019/aidaemon/releases/download/vVERSION_PLACEHOLDER/aidaemon-linux-aarch64.tar.gz"
+                sha256 "SHA_LINUX_ARM64_PLACEHOLDER"
+              else
+                url "https://github.com/davo20019/aidaemon/releases/download/vVERSION_PLACEHOLDER/aidaemon-linux-x86_64.tar.gz"
+                sha256 "SHA_LINUX_X86_64_PLACEHOLDER"
+              end
             end
 
             def install
@@ -618,6 +625,7 @@ jobs:
           sed -i "s/SHA_MACOS_ARM64_PLACEHOLDER/${{ steps.sha.outputs.macos_arm64 }}/g" Formula/aidaemon.rb
           sed -i "s/SHA_MACOS_X86_64_PLACEHOLDER/${{ steps.sha.outputs.macos_x86_64 }}/g" Formula/aidaemon.rb
           sed -i "s/SHA_LINUX_X86_64_PLACEHOLDER/${{ steps.sha.outputs.linux_x86_64 }}/g" Formula/aidaemon.rb
+          sed -i "s/SHA_LINUX_ARM64_PLACEHOLDER/${{ steps.sha.outputs.linux_arm64 }}/g" Formula/aidaemon.rb
 
       - name: Commit and push
         run: |

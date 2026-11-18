@@ -613,7 +613,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-24.04]
+        os: [macos-latest, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -677,9 +677,14 @@ jobs:
           nsh package --target web
           test -f .nsh/out/AIdaemon/index.html
 
+  # x86_64 and ARM64 Linux, the two Linux downloads.
   build-check:
-    name: Build check (release)
-    runs-on: ubuntu-latest
+    name: Build check (release, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
@@ -697,6 +702,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-release
+          key: ${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build release
