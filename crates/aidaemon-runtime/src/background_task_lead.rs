@@ -148,57 +148,11 @@ pub fn resolve_dispatch_project_scope(
     if scopes.len() > 1 {
         return None;
     }
-    if let Some(scope) = scopes.pop() {
-        return Some(scope);
-    }
-    // A public site URL is also durable target identity when its hostname is
-    // the exact name of a local project root. Scheduled missions commonly
-    // carry the URL but no filesystem path. Resolve that exact identity;
-    // otherwise recovery can inherit an empty synthetic task directory even
-    // though the authorized repository is locally available under the same
-    // hostname.
-    if scopes.is_empty() {
-        for raw in mission.split_whitespace() {
-            let candidate = raw.trim_matches(|ch: char| {
-                ch.is_ascii_whitespace()
-                    || matches!(
-                        ch,
-                        '`' | '\''
-                            | '"'
-                            | ','
-                            | ';'
-                            | '!'
-                            | '?'
-                            | '('
-                            | ')'
-                            | '['
-                            | ']'
-                            | '{'
-                            | '}'
-                    )
-            });
-            let Ok(url) = reqwest::Url::parse(candidate) else {
-                continue;
-            };
-            if !matches!(url.scheme(), "http" | "https") {
-                continue;
-            }
-            let Some(host) = url.host_str() else {
-                continue;
-            };
-            let host = host.strip_prefix("www.").unwrap_or(host);
-            if let Some(scope) =
-                aidaemon_tools::fs_utils::resolve_named_project_root(backend, host, alias_roots)
-            {
-                crate::turn::project_scope::push_project_scope(
-                    &mut scopes,
-                    scope.to_string_lossy().to_string(),
-                    8,
-                );
-            }
-        }
-    }
-    scopes.into_iter().next()
+    // A site the mission only names by URL picks no workspace: words in
+    // the mission are not a binding. A scheduled goal that works on a
+    // local project is bound to it with the typed `project_scope`
+    // (`scheduled_goal_runs` bind_workspace), which the dispatch reads first.
+    scopes.pop()
 }
 
 pub use aidaemon_work::scheduler::is_sqlite_busy_error;
@@ -3592,25 +3546,26 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_dispatch_resolves_exact_public_host_identity() {
+    fn a_url_in_the_mission_text_picks_no_workspace() {
         let root = tempfile::tempdir().expect("project root");
-        let blog = root.path().join("blog.aidaemon.ai");
-        let daemon = root.path().join("aidaemon");
+        let blog = root.path().join("blog.example.com");
         std::fs::create_dir_all(&blog).expect("blog directory");
-        std::fs::create_dir_all(&daemon).expect("daemon directory");
         std::fs::write(blog.join("package.json"), r#"{"name":"synthetic-blog"}"#)
             .expect("blog marker");
-        std::fs::write(
-            daemon.join("Cargo.toml"),
-            "[package]\nname='synthetic-daemon'\n",
-        )
-        .expect("daemon marker");
 
+        // A host named in prose is not a binding, even when a project of
+        // that name exists.
         let resolved = resolve_dispatch_project_scope(
-            "Independently manage the aidaemon blog at https://blog.aidaemon.ai/: publish and verify it.",
+            "Independently manage the synthetic blog at https://blog.example.com/: publish and verify it.",
             &[root.path().to_string_lossy().to_string()],
         );
-        assert_eq!(resolved.as_deref(), Some(blog.to_string_lossy().as_ref()));
+        assert_eq!(resolved, None);
+        // The typed binding on the goal is what selects it.
+        let context = serde_json::json!({ "project_scope": blog.to_string_lossy() }).to_string();
+        assert_eq!(
+            super::bound_project_scope_from_context(Some(&context)).as_deref(),
+            Some(blog.to_string_lossy().as_ref())
+        );
     }
 
     #[test]
