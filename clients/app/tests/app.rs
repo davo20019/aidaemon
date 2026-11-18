@@ -669,6 +669,9 @@ fn a_project_conversation_browses_its_files_read_only() -> Result<(), String> {
     ))]);
     app.wait_for("src/contact.rs")?;
     app.wait_for("Copy path")?;
+    // The answer is in (the path and Copy show while loading): the same read
+    // still unanswered is not sent again.
+    app.wait_for("fn main() {}")?;
     // Full screen: the file fills the window, read again; Exit puts it
     // back in the details pane, still open.
     let before = sent("read_project_file");
@@ -679,6 +682,7 @@ fn a_project_conversation_browses_its_files_read_only() -> Result<(), String> {
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_file","file":{{"project_id":"p-acme","path":"src/contact.rs","size_bytes":26,"version":"sha256:00","text":"fn send() {{}}\nfn main() {{}}\n","status":"modified"}}}}}}"#
     ))]);
+    app.wait_for("fn main() {}")?;
     app.press("label:Exit full screen")?;
     wait_sent_new("read_project_file", Some(id))?;
     app.wait_for("label:Full screen")?;
