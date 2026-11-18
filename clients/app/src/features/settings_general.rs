@@ -353,9 +353,9 @@ fn readiness(agent: &CodingAgent) -> View {
             } else {
                 format!("Not usable: {}", agent.readiness_reason)
             };
-            let mut lines = view().gap_1().child(ui::status(why, Tone::Danger));
+            let mut lines = view().gap_1().child(ui::status_message(why, Tone::Danger));
             if !agent.readiness_fix.is_empty() {
-                lines = lines.child(muted(agent.readiness_fix.clone()).number_of_lines(3));
+                lines = lines.child(muted(agent.readiness_fix.clone()).selectable(true));
             }
             lines
         }

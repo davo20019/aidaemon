@@ -792,6 +792,30 @@ pub fn status(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
         )
 }
 
+/// A status dot before a message in its tone's colour: a state the owner
+/// should act on (an agent that cannot work, and why). Unlike [`status`]
+/// it is never cut: the message is the reason, often with a link, shown
+/// whole and selectable.
+pub fn status_message(label: impl IntoReactive<SharedString>, tone: Tone) -> View {
+    view()
+        .flex_row()
+        .items_start()
+        .gap_1p5()
+        .child(
+            text(Glyph::Dot.symbol())
+                .text_size(px(8.0))
+                .text_color(tone.color()),
+        )
+        .child(
+            text(label)
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(fit::small()))
+                .selectable(true)
+                .text_color(tone.color()),
+        )
+}
+
 /// A keyboard key.
 pub fn kbd(keys: impl IntoReactive<SharedString>) -> View {
     // A touch screen has no keys to name: the hint would only take room.
