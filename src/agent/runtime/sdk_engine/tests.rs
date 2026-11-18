@@ -4176,7 +4176,7 @@ async fn judged_terminal_rules(
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    std::mem::forget(pool_file);
+    aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
     let (tx, rx) = mpsc::channel(1);
     drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(

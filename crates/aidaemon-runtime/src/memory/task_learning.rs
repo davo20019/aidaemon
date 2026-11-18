@@ -138,8 +138,8 @@ mod tests {
     ) {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
-        // The store keeps the file open; the file outlives the test.
-        std::mem::forget(file);
+        // The store keeps the file open; it is deleted when the test process exits.
+        aidaemon_tools::testing::delete_at_exit(file.into_temp_path().keep().unwrap());
         let embeddings = Arc::new(aidaemon_memory::embeddings::EmbeddingService::deterministic());
         let state = Arc::new(
             SqliteStateStore::for_tests(&path, 100, None, embeddings)

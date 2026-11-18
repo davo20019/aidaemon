@@ -6938,12 +6938,14 @@ mod turn_anchored_tests {
     use super::*;
     use serde_json::json;
 
-    /// Build an `EventStore` over a temp DB. The backing tempfile is leaked so
-    /// the open pool keeps a valid file for the lifetime of the test without
+    /// Build an `EventStore` over a temp DB. The backing file lives until the test
+    /// process exits (`delete_at_exit`), so the open pool keeps a valid file without
     /// the caller having to thread a guard through every helper.
     async fn test_event_store() -> EventStore {
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
-        let path = db_file.into_temp_path().keep().expect("keep temp db path");
+        let path = aidaemon_tools::testing::delete_at_exit(
+            db_file.into_temp_path().keep().expect("keep temp db path"),
+        );
         let db_url = format!("sqlite:{}", path.display());
         let pool = SqlitePool::connect(&db_url).await.expect("connect sqlite");
         EventStore::new(pool).await.expect("init event store")

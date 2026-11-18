@@ -13667,7 +13667,7 @@ mod tests {
     async fn card_chat_terminal(chat: &aidaemon_channels::testing::CardChat) -> TerminalTool {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         let state = Arc::new(work_store(&db_path).await);
         let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
         let tool = TerminalTool::new(
@@ -14960,7 +14960,7 @@ mod tests {
             pool,
         )
         .await;
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         tool
     }
 
@@ -15071,7 +15071,7 @@ mod tests {
         )
         .await
         .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 
         assert!(
             tool.is_allowed(original).await,
@@ -15109,7 +15109,7 @@ mod tests {
         )
         .await
         .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 
         let response = tool
             .call_with(
@@ -15147,7 +15147,7 @@ mod tests {
         )
         .await
         .with_confinement(aidaemon_tools::TerminalConfinement::Sandbox);
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 
         let args = serde_json::json!({"action":"run","command":"echo hi","detach":true});
         let trust = TerminalTrust {
@@ -15248,7 +15248,7 @@ mod tests {
             pool,
         )
         .await;
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         (tool, approval_rx)
     }
 

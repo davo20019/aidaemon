@@ -359,7 +359,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         let tool = test_tool(concrete.clone());
         let now = chrono::Utc::now();
         let ep = crate::traits::Episode {
@@ -424,7 +424,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         let tool = test_tool(concrete.clone());
         let now = chrono::Utc::now();
         for (session, summary) in [
@@ -502,7 +502,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         state
     }
 

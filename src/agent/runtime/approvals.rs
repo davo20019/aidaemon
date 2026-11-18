@@ -894,7 +894,7 @@ mod tests {
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
             .await
             .unwrap();
-        std::mem::forget(pool_file);
+        aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
@@ -1168,7 +1168,7 @@ mod tests {
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
             .await
             .unwrap();
-        std::mem::forget(pool_file);
+        aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         let confined: Arc<dyn crate::traits::Tool> = Arc::new(
@@ -1218,7 +1218,7 @@ mod tests {
     async fn approval_test_store() -> Arc<crate::state::SqliteStateStore> {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_str().unwrap().to_string();
-        std::mem::forget(db);
+        aidaemon_tools::testing::delete_at_exit(db.into_temp_path().keep().unwrap());
         Arc::new(
             crate::state::SqliteStateStore::for_tests(
                 &path,

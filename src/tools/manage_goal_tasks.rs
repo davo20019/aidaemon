@@ -32,8 +32,8 @@ mod tests {
         let goal = Goal::new_finite("Test goal", "test-session");
         state.create_goal(&goal).await.unwrap();
 
-        // We need to keep db_file alive, but for tests we'll leak it
-        std::mem::forget(db_file);
+        // The pool may reopen the file; delete it when the test process exits.
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         (state as Arc<dyn StateStore>, goal.id)
     }
 

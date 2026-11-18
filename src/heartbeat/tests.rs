@@ -693,8 +693,14 @@ async fn test_state_store() -> Arc<dyn StateStore> {
     // NamedTempFile were dropped here, the path would be unlinked and a
     // later (lazily-opened) pool connection would re-create an empty
     // database — surfacing as "no such table" under parallel test load on
-    // CI. keep() leaks the file, which is fine for short-lived test runs.
-    let (_db_file, db_path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
+    // CI. The file is deleted when the test process exits.
+    let db_path = aidaemon_tools::testing::delete_at_exit(
+        tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap(),
+    );
     let embedding_service = Arc::new(EmbeddingService::deterministic());
     Arc::new(
         SqliteStateStore::for_tests(db_path.to_str().unwrap(), 100, None, embedding_service)
@@ -1622,7 +1628,13 @@ async fn scheduled_lifecycle_reconciles_before_the_next_fire_is_due() {
 
 #[tokio::test]
 async fn escalated_goal_gets_one_automatic_recovery_run_whose_root_survives_dispatch() {
-    let (_db_file, db_path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
+    let db_path = aidaemon_tools::testing::delete_at_exit(
+        tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap(),
+    );
     let embedding_service = Arc::new(EmbeddingService::deterministic());
     let sqlite = Arc::new(
         SqliteStateStore::for_tests(db_path.to_str().unwrap(), 100, None, embedding_service)

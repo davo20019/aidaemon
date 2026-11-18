@@ -33,9 +33,16 @@ async fn open() -> (SqliteMemory, tempfile::NamedTempFile) {
 /// The corpus written once through the normal write path (slow: every
 /// write embeds and projects), with each fixture fact's recall count.
 fn template() -> &'static std::path::Path {
-    static TEMPLATE: std::sync::OnceLock<tempfile::TempPath> = std::sync::OnceLock::new();
+    static TEMPLATE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     TEMPLATE.get_or_init(|| {
-        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        // A static is never dropped, so a `TempPath` here was never deleted.
+        let path = aidaemon_tools::testing::delete_at_exit(
+            tempfile::NamedTempFile::new()
+                .unwrap()
+                .into_temp_path()
+                .keep()
+                .unwrap(),
+        );
         let target = path.to_path_buf();
         std::thread::spawn(move || {
             tokio::runtime::Runtime::new().unwrap().block_on(async {

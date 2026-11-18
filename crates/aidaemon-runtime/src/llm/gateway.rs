@@ -622,8 +622,8 @@ pub mod test_support {
     async fn event_store() -> Arc<EventStore> {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
-        // The pool keeps the file open; the file outlives the test.
-        std::mem::forget(file);
+        // The pool keeps the file open; it is deleted when the test process exits.
+        aidaemon_tools::testing::delete_at_exit(file.into_temp_path().keep().unwrap());
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect_with(
                 sqlx::sqlite::SqliteConnectOptions::new()

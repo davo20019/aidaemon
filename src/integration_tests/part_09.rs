@@ -99,7 +99,7 @@ async fn test_orchestration_goal_context_feed_forward() {
     assert!(facts[0].get("key").is_some());
     assert!(facts[0].get("value").is_some());
 
-    std::mem::forget(db_file);
+    aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 }
 
 #[tokio::test]
@@ -194,5 +194,5 @@ async fn test_orchestration_context_accumulation_end_to_end() {
     let results = ctx["task_results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "Both task results should be accumulated");
 
-    std::mem::forget(db_file);
+    aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 }

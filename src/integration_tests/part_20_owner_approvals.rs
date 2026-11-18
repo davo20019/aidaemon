@@ -88,7 +88,7 @@ async fn approvals_harness_with(
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    std::mem::forget(pool_file);
+    aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
     // The tools' own brokers must never be used: a card on them fails the
     // test (nobody answers, and the card count below stays on the agent's).
     let (tool_tx, _tool_rx) = tokio::sync::mpsc::channel(1);
@@ -1010,7 +1010,7 @@ async fn terminal_harness(
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    std::mem::forget(pool_file);
+    aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
     let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
     drop(tool_rx);
     let terminal = crate::tools::TerminalTool::new(

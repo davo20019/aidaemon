@@ -14,7 +14,7 @@ mod tests {
     async fn state() -> Arc<crate::state::SqliteStateStore> {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_str().unwrap().to_string();
-        std::mem::forget(db);
+        aidaemon_tools::testing::delete_at_exit(db.into_temp_path().keep().unwrap());
         let embeddings = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
         Arc::new(
             crate::state::SqliteStateStore::for_tests(&path, 100, None, embeddings)

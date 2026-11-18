@@ -140,3 +140,49 @@ pub fn active_execution_backend() -> crate::backend::SharedExecutionBackend {
         })
         .clone()
 }
+
+/// Test files that must outlive the helper that made them, deleted when the
+/// test process exits.
+static DELETE_AT_EXIT: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+static DELETE_AT_EXIT_REGISTERED: std::sync::Once = std::sync::Once::new();
+
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
+
+extern "C" fn delete_registered_files() {
+    // `try_lock`: a thread still pushing when the process exits must not
+    // deadlock the exit; its file is the only one left behind.
+    let Ok(mut paths) = DELETE_AT_EXIT.try_lock() else {
+        return;
+    };
+    for path in paths.drain(..) {
+        let _ = std::fs::remove_file(&path);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+}
+
+/// Keep a test file (a SQLite database a store's pool may reopen at any
+/// time) until the test process exits, then delete it and its SQLite
+/// sidecars. For a helper that returns only the store and cannot hand the
+/// temp-file guard back: `std::mem::forget` on the guard or a kept
+/// `TempPath` left a full database in the temp directory on every run.
+pub fn delete_at_exit(path: impl Into<std::path::PathBuf>) -> std::path::PathBuf {
+    let path = path.into();
+    DELETE_AT_EXIT_REGISTERED.call_once(|| {
+        // SAFETY: registers a plain `extern "C" fn` that never unwinds.
+        unsafe {
+            atexit(delete_registered_files);
+        }
+    });
+    DELETE_AT_EXIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.clone());
+    path
+}

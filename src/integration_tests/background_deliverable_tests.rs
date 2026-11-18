@@ -20,16 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-/// A media-capable test channel that records every `send_media` Document
-/// delivery and every text message, so the test can assert on real file
-/// delivery (not a text-only fallback).
-
 /// How many 200 ms polls a test waits for a background command to finish
 /// and its result to arrive: a minute. The commands start Python, which a
 /// loaded Windows runner took over 16 s to run and report (CI 2026-11-17);
 /// the wait ends as soon as the result is there.
 const DELIVERY_POLLS: usize = 300;
 
+/// A media-capable test channel that records every `send_media` Document
+/// delivery and every text message, so the test can assert on real file
+/// delivery (not a text-only fallback).
 #[derive(Default)]
 struct MediaCaptureChannel {
     documents: Mutex<Vec<(String /*filename*/, String /*caption*/)>>,
@@ -111,7 +110,7 @@ async fn make_terminal_with_hub(
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().display().to_string();
     // Keep the temp DB file alive for the test duration.
-    std::mem::forget(db_file);
+    aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
     let embedding_service = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
     let state = Arc::new(
         SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)

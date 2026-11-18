@@ -2260,7 +2260,9 @@ mod tests {
 
     async fn synthetic_event_store() -> aidaemon_events::EventStore {
         let db_file = tempfile::NamedTempFile::new().expect("temp db file");
-        let path = db_file.into_temp_path().keep().expect("keep temp db path");
+        let path = aidaemon_tools::testing::delete_at_exit(
+            db_file.into_temp_path().keep().expect("keep temp db path"),
+        );
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
             .await
             .expect("connect sqlite");

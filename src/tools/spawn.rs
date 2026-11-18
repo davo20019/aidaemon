@@ -745,7 +745,7 @@ mod child_runtime_tests {
     async fn notification_store() -> Arc<SqliteStateStore> {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().display().to_string();
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         let embedding_service = Arc::new(EmbeddingService::deterministic());
         Arc::new(
             SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)

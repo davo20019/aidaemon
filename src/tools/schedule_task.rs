@@ -25,7 +25,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         state
     }
 
