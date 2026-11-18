@@ -184,6 +184,7 @@ pub aidaemon_core::testing::ProviderError::ContextOverflow
 pub aidaemon_core::testing::ProviderError::ContextOverflow::limit: core::option::Option<u64>
 pub aidaemon_core::testing::ProviderError::ContextOverflow::message: alloc::string::String
 pub aidaemon_core::testing::ProviderError::InvalidRequest(alloc::string::String)
+pub aidaemon_core::testing::ProviderError::InvalidTools(alloc::string::String)
 pub aidaemon_core::testing::ProviderError::Malformed
 pub aidaemon_core::testing::ProviderError::Malformed::message: alloc::string::String
 pub aidaemon_core::testing::ProviderError::Malformed::parse: bool
@@ -481,6 +482,7 @@ pub aidaemon_core::ProviderError::ContextOverflow
 pub aidaemon_core::ProviderError::ContextOverflow::limit: core::option::Option<u64>
 pub aidaemon_core::ProviderError::ContextOverflow::message: alloc::string::String
 pub aidaemon_core::ProviderError::InvalidRequest(alloc::string::String)
+pub aidaemon_core::ProviderError::InvalidTools(alloc::string::String)
 pub aidaemon_core::ProviderError::Malformed
 pub aidaemon_core::ProviderError::Malformed::message: alloc::string::String
 pub aidaemon_core::ProviderError::Malformed::parse: bool
