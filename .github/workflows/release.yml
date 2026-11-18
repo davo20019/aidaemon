@@ -137,6 +137,11 @@ jobs:
           # The app's desktop backend links GTK 4 (see the `app` job in ci.yml).
           sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev clang
 
+      # Intel Macs: ONNX Runtime from a pinned static library (see the script).
+      - name: ONNX Runtime (Intel Mac)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: scripts/onnxruntime-intel-mac.sh "$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
+
       - name: Build (native)
         if: '!matrix.cross'
         run: cargo build --release --target ${{ matrix.target }} --features "browser"
