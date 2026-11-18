@@ -1546,10 +1546,18 @@ impl CliAgentTool {
 
     /// Whether a Claude Code run in this call can be confined in its own
     /// terms: the run can judge its prompts (the kernel's nested-call
-    /// handle is here), the process is local (its stdin stays open), the
-    /// turn read no untrusted content (Claude's reads are confined to a
-    /// folder, not to the contract's exact read paths), and `claude` is the
-    /// built-in agent, not a stored one.
+    /// handle is here), the process is local (its stdin stays open), and
+    /// `claude` is the built-in agent, not a stored one.
+    ///
+    /// A turn that read untrusted content may use it too (live 2026-11-18:
+    /// requiring a clean turn kept Claude out of nearly every real turn,
+    /// since a shell check before the delegation taints it). What guards
+    /// such a turn: its file tools read only inside the folder, its every
+    /// network host is a prompt judged as an egress by this tainted run,
+    /// and each command it runs is judged first. Its shell can still read
+    /// outside the folder (its sandbox confines writes), so what it reads
+    /// can leave only through a host the run allowed. Logged, with the
+    /// turn's taint, per call.
     fn claude_confinable(&self, facts: &ToolCallContext) -> bool {
         let host = facts
             .extensions
@@ -1564,7 +1572,7 @@ impl CliAgentTool {
             .ok()
             .and_then(|tools| tools.get("claude").map(|entry| !entry.is_dynamic))
             .unwrap_or(false);
-        let confinable = host && local && clean && built_in;
+        let confinable = host && local && built_in;
         info!(
             confinable,
             host,
