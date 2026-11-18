@@ -301,6 +301,19 @@ jobs:
           nsh --version
           nsh package --target web
 
+      # nsh package builds in its own workspace and ignores the app's [patch]:
+      # check it took nsh from the checkout the app pins (the fork's fixes).
+      - name: Check nsh came from the pinned checkout
+        working-directory: clients/app
+        run: |
+          set -euo pipefail
+          rev="$(grep -m1 -oE '^nsh-core = \{ git = "[^"]+", rev = "[0-9a-f]{7}' Cargo.toml | tail -c 8)"
+          if ! grep -qE "^nsh-core = \{ path = \".*/${rev}/crates/nsh-core\"" .nsh/rust/Cargo.toml; then
+            echo "::error::the web build did not use nsh at ${rev}:"
+            grep -n '^nsh-core' .nsh/rust/Cargo.toml || true
+            exit 1
+          fi
+
       - name: Package
         run: |
           set -euo pipefail
