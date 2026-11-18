@@ -332,6 +332,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aidaemon-coding-agents"
+version = "0.20.0"
+dependencies = [
+ "aidaemon-core",
+ "async-trait",
+ "dirs 7.0.0",
+ "serde_json",
+ "shell-words",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aidaemon-core"
 version = "0.20.0"
 dependencies = [
@@ -584,6 +598,7 @@ dependencies = [
  "aidaemon-agents",
  "aidaemon-channels",
  "aidaemon-client-gateway",
+ "aidaemon-coding-agents",
  "aidaemon-core",
  "aidaemon-decisions",
  "aidaemon-events",
@@ -643,6 +658,7 @@ dependencies = [
  "aidaemon-channel-slack",
  "aidaemon-channel-telegram",
  "aidaemon-channels",
+ "aidaemon-coding-agents",
  "aidaemon-core",
  "aidaemon-eval",
  "aidaemon-events",

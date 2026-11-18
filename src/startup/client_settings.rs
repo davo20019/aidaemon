@@ -694,15 +694,15 @@ impl SettingsHost {
                 DatabaseAction::Unknown => return Err("Unknown database action".to_string()),
             },
             SettingsChange::SetAgentMode { agent, mode } => {
-                let kind = aidaemon_runtime::tools::agent_mode::kind_of(agent)
+                let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
                 match agent_mode(*mode)? {
                     // Nothing it does is checked from then on.
-                    aidaemon_runtime::tools::agent_mode::AgentMode::FullAccess => ask(
+                    aidaemon_runtime::tools::agent_mode::PermissionMode::FullAccess => ask(
                         format!(
                             "Give {} full access: it runs on this machine with nothing asked, \
                              and your rules don't see what it does.",
-                            kind.program(agent)
+                            coding_agent.name()
                         ),
                         false,
                     ),
@@ -1123,11 +1123,12 @@ impl SettingsHost {
             }
             SettingsChange::SetAgentMode { agent, mode } => {
                 use aidaemon_runtime::tools::agent_mode;
-                let kind = agent_mode::kind_of(&agent)
+                let coding_agent = agent_mode::agent_named(&agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
-                agent_mode::set_mode(&*self.state, &agent, kind, agent_mode(mode)?).await?;
+                agent_mode::set_mode(&*self.state, &agent, &*coding_agent, agent_mode(mode)?)
+                    .await?;
                 Ok(SettingsDone {
-                    message: format!("{} now runs as you chose.", kind.program(&agent)),
+                    message: format!("{} now runs as you chose.", coding_agent.name()),
                     applies: Some(Applies::Now),
                 })
             }
@@ -1191,37 +1192,38 @@ fn group_of(key: &str) -> String {
 /// not know.
 fn agent_mode(
     mode: aidaemon_client_protocol::AgentMode,
-) -> Result<aidaemon_runtime::tools::agent_mode::AgentMode, String> {
+) -> Result<aidaemon_runtime::tools::agent_mode::PermissionMode, String> {
     use aidaemon_client_protocol::AgentMode as Wire;
-    use aidaemon_runtime::tools::agent_mode::AgentMode;
+    use aidaemon_runtime::tools::agent_mode::PermissionMode;
     match mode {
-        Wire::Checked => Ok(AgentMode::Checked),
-        Wire::EveryCommand => Ok(AgentMode::EveryCommand),
-        Wire::FullAccess => Ok(AgentMode::FullAccess),
+        Wire::Checked => Ok(PermissionMode::Checked),
+        Wire::EveryCommand => Ok(PermissionMode::EveryCommand),
+        Wire::FullAccess => Ok(PermissionMode::FullAccess),
         _ => Err("This mode is not known to this daemon".to_string()),
     }
 }
 
-/// The coding agents the daemon can delegate to, each with its mode.
+/// The coding agents the daemon can hand work to, each with its mode.
 async fn coding_agents(
     store: &(impl aidaemon_tools::services::SettingsStore + ?Sized),
 ) -> Vec<aidaemon_client_protocol::CodingAgent> {
     use aidaemon_client_protocol::AgentMode as Wire;
-    use aidaemon_runtime::tools::agent_mode::{self, AgentMode};
-    let wire = |mode: AgentMode| match mode {
-        AgentMode::Checked => Wire::Checked,
-        AgentMode::EveryCommand => Wire::EveryCommand,
-        AgentMode::FullAccess => Wire::FullAccess,
+    use aidaemon_runtime::tools::agent_mode::{self, PermissionMode};
+    let wire = |mode: PermissionMode| match mode {
+        PermissionMode::Checked => Wire::Checked,
+        PermissionMode::EveryCommand => Wire::EveryCommand,
+        PermissionMode::FullAccess => Wire::FullAccess,
     };
     let mut out = Vec::new();
     for info in agent_mode::agents() {
+        let agent = &info.agent;
         out.push(aidaemon_client_protocol::CodingAgent {
-            program: info.kind.program(&info.name),
-            mode: agent_mode::mode_of(store, &info.name, info.kind)
+            program: agent.name().to_string(),
+            mode: agent_mode::mode_of(store, &info.name, &**agent)
                 .await
                 .map(wire),
-            modes: info.kind.offered().iter().copied().map(wire).collect(),
-            note: info.kind.note().to_string(),
+            modes: agent.modes().iter().copied().map(wire).collect(),
+            note: agent.note().to_string(),
             name: info.name,
         });
     }
@@ -1339,16 +1341,17 @@ allowed_user_ids = [1]
     #[tokio::test]
     async fn a_coding_agents_mode_is_listed_set_and_full_access_asks() {
         use aidaemon_client_protocol::{AgentMode, CodingAgent};
-        use aidaemon_runtime::tools::agent_mode::{self, AgentInfo, AgentKind};
-        agent_mode::publish(Arc::new(|| {
+        use aidaemon_runtime::tools::agent_mode::{self, AgentInfo};
+        let registry = agent_mode::CodingAgents::builtin();
+        agent_mode::publish(Arc::new(move || {
             vec![
                 AgentInfo {
                     name: "synthetic-codex".into(),
-                    kind: AgentKind::Codex,
+                    agent: registry.for_program("codex"),
                 },
                 AgentInfo {
                     name: "synthetic-coder".into(),
-                    kind: AgentKind::Other,
+                    agent: registry.for_program("synthetic-coder"),
                 },
             ]
         }));

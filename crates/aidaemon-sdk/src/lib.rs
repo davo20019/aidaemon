@@ -177,6 +177,9 @@ pub use aidaemon_secrets as secrets;
 #[cfg(feature = "agents")]
 pub use aidaemon_agents as agents;
 
+#[cfg(feature = "coding-agents")]
+pub use aidaemon_coding_agents as coding_agents;
+
 #[cfg(feature = "sqlite")]
 pub use aidaemon_store_sqlite as store;
 

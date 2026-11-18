@@ -1,166 +1,64 @@
-//! How much a coding agent the daemon delegates to may do on its own, set
-//! by the owner per agent (Settings, Coding agents).
+//! The daemon's side of the coding agents it hands work to
+//! ([`aidaemon_coding_agents`]): where each agent's permission mode is kept,
+//! which agents the Settings page lists, and how a hosted agent's request
+//! is judged.
 //!
-//! - [`AgentMode::Checked`]: confined to the project folder by the agent's
-//!   own sandbox; whatever lies beyond it is asked first, and each request
-//!   is judged by the run as the model's own calls are (`cli_host`,
-//!   `codex_host`). The default for an agent the daemon can host.
-//! - [`AgentMode::EveryCommand`]: on the machine itself, every command and
-//!   file change (but the agent's own short list of read-only commands)
-//!   asked first and judged the same way.
-//! - [`AgentMode::FullAccess`]: on the machine itself, nothing asked; the
-//!   run's safeguards never see what it does. The owner's choice, made
-//!   with an approval.
-//!
-//! Checking needs an agent whose approval requests the daemon can answer
-//! (Claude Code and Codex today). Any other agent offers only full access,
-//! and runs no delegated work until the owner picks it.
+//! A request is judged as a call of the daemon's own tool for that action
+//! (a command is `terminal`, a write `write_file`, a network host a fetch
+//! from it), through the kernel's nested-call seam: the owner's grants
+//! answer what they cover, a card asks the rest, and a decline binds the
+//! run, exactly as for the model's own calls.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use aidaemon_coding_agents::{ActionJudge, AgentAction, ModeStore, Verdict};
+pub use aidaemon_coding_agents::{CodingAgent, CodingAgents, PermissionMode};
+use aidaemon_core::{NestedCalls, ToolCall};
 use aidaemon_tools::services::SettingsStore;
+use async_trait::async_trait;
+use serde_json::json;
 
-/// A coding agent's permission mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentMode {
-    Checked,
-    EveryCommand,
-    FullAccess,
-}
+/// The daemon's settings store, as the place modes are kept.
+pub struct SettingsModes<'a, S: ?Sized>(pub &'a S);
 
-impl AgentMode {
-    /// Its stored name (a machine format of the daemon's own).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Checked => "checked",
-            Self::EveryCommand => "every_command",
-            Self::FullAccess => "full_access",
-        }
+#[async_trait]
+impl<S: SettingsStore + ?Sized> ModeStore for SettingsModes<'_, S> {
+    async fn load(&self, key: &str) -> Option<String> {
+        self.0.get_setting(key).await.ok().flatten()
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "checked" => Some(Self::Checked),
-            "every_command" => Some(Self::EveryCommand),
-            "full_access" => Some(Self::FullAccess),
-            _ => None,
-        }
-    }
-
-    /// Whether the agent's requests reach the run (it must be hosted).
-    pub fn is_checked(self) -> bool {
-        !matches!(self, Self::FullAccess)
+    async fn save(&self, key: &str, value: &str) -> Result<(), String> {
+        self.0
+            .set_setting(key, value)
+            .await
+            .map_err(|error| format!("The mode could not be saved: {error}"))
     }
 }
 
-/// The program an agent launches, as far as its modes go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentKind {
-    ClaudeCode,
-    Codex,
-    /// One whose approval requests the daemon cannot answer.
-    Other,
-}
-
-impl AgentKind {
-    /// From the file name of the program an entry launches (`claude`,
-    /// `codex`; a machine format: an executable's name).
-    pub fn of_program(file_name: &str) -> Self {
-        let name = file_name.to_ascii_lowercase();
-        match name.trim_end_matches(".exe") {
-            "claude" => Self::ClaudeCode,
-            "codex" => Self::Codex,
-            _ => Self::Other,
-        }
-    }
-
-    /// Its name in plain words.
-    pub fn program(self, fallback: &str) -> String {
-        match self {
-            Self::ClaudeCode => "Claude Code".to_string(),
-            Self::Codex => "Codex".to_string(),
-            Self::Other => fallback.to_string(),
-        }
-    }
-
-    /// The modes it can run in, safest first.
-    pub fn offered(self) -> &'static [AgentMode] {
-        match self {
-            Self::ClaudeCode | Self::Codex => &[
-                AgentMode::Checked,
-                AgentMode::EveryCommand,
-                AgentMode::FullAccess,
-            ],
-            Self::Other => &[AgentMode::FullAccess],
-        }
-    }
-
-    /// Its mode when the owner chose none: checked when it can be.
-    pub fn default_mode(self) -> Option<AgentMode> {
-        match self {
-            Self::ClaudeCode | Self::Codex => Some(AgentMode::Checked),
-            Self::Other => None,
-        }
-    }
-
-    /// Why some modes are not offered; empty when all are.
-    pub fn note(self) -> &'static str {
-        match self {
-            Self::ClaudeCode | Self::Codex => "",
-            Self::Other => {
-                "AIDaemon can't check this agent's actions, so it can only run with full access."
-            }
-        }
-    }
-}
-
-fn setting_key(agent: &str) -> String {
-    format!("cli_agent_mode:{agent}")
-}
-
-/// The mode `agent` runs in: the owner's choice when it is one its kind
-/// offers, else its kind's default.
+/// The mode the agent named `name` runs in.
 pub async fn mode_of(
     store: &(impl SettingsStore + ?Sized),
-    agent: &str,
-    kind: AgentKind,
-) -> Option<AgentMode> {
-    let stored = store
-        .get_setting(&setting_key(agent))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| AgentMode::parse(&value))
-        .filter(|mode| kind.offered().contains(mode));
-    stored.or_else(|| kind.default_mode())
+    name: &str,
+    agent: &dyn CodingAgent,
+) -> Option<PermissionMode> {
+    aidaemon_coding_agents::mode_of(&SettingsModes(store), name, agent).await
 }
 
-/// Store the owner's choice of `mode` for `agent`. Refused when its kind
-/// does not offer it.
+/// Keep the owner's choice of `mode` for the agent named `name`.
 pub async fn set_mode(
     store: &(impl SettingsStore + ?Sized),
-    agent: &str,
-    kind: AgentKind,
-    mode: AgentMode,
+    name: &str,
+    agent: &dyn CodingAgent,
+    mode: PermissionMode,
 ) -> Result<(), String> {
-    if !kind.offered().contains(&mode) {
-        return Err(format!(
-            "{} can't run in that mode: {}",
-            kind.program(agent),
-            kind.note()
-        ));
-    }
-    store
-        .set_setting(&setting_key(agent), mode.as_str())
-        .await
-        .map_err(|error| format!("The mode could not be saved: {error}"))
+    aidaemon_coding_agents::set_mode(&SettingsModes(store), name, agent, mode).await
 }
 
-/// One agent the daemon can delegate to, as the Settings page shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One agent the daemon can hand work to, by its name among its tools.
+#[derive(Clone)]
 pub struct AgentInfo {
     pub name: String,
-    pub kind: AgentKind,
+    pub agent: Arc<dyn CodingAgent>,
 }
 
 /// Lists one `cli_agent` tool's agents; empty once the tool is gone.
@@ -179,7 +77,7 @@ pub fn publish(lister: Lister) {
     }
 }
 
-/// The agents the daemon can delegate to now, by name, each once.
+/// The agents the daemon can hand work to now, by name, each once.
 pub fn agents() -> Vec<AgentInfo> {
     let listers = registry()
         .lock()
@@ -197,88 +95,171 @@ pub fn agents() -> Vec<AgentInfo> {
     agents
 }
 
-/// The kind of the agent named `agent` now, when there is one.
-pub fn kind_of(agent: &str) -> Option<AgentKind> {
+/// The agent named `name` now, when there is one.
+pub fn agent_named(name: &str) -> Option<Arc<dyn CodingAgent>> {
     agents()
         .into_iter()
-        .find(|info| info.name == agent)
-        .map(|info| info.kind)
+        .find(|info| info.name == name)
+        .map(|info| info.agent)
+}
+
+/// Judges a hosted agent's requests through the run's nested-call seam.
+pub struct DaemonJudge {
+    nested: NestedCalls,
+}
+
+impl DaemonJudge {
+    pub fn new(nested: NestedCalls) -> Self {
+        Self { nested }
+    }
+}
+
+/// The daemon call an action is judged as: the daemon tool whose judgment
+/// applies, with arguments its schema takes.
+pub fn daemon_call(action: &AgentAction) -> ToolCall {
+    let id = format!("coding-agent-{}", uuid::Uuid::new_v4());
+    let (tool, arguments) = match action {
+        AgentAction::RunCommand {
+            command,
+            working_dir,
+        } => {
+            let mut arguments = json!({"action": "run", "command": command});
+            if let Some(dir) = working_dir {
+                arguments["working_dir"] = json!(dir);
+            }
+            ("terminal", arguments)
+        }
+        AgentAction::WriteFile { path, content } => {
+            ("write_file", json!({"path": path, "content": content}))
+        }
+        AgentAction::EditFile {
+            path,
+            edits,
+            replace_all,
+        } => match edits.as_slice() {
+            [edit] => (
+                "edit_file",
+                json!({
+                    "path": path,
+                    "old_text": edit.old_text,
+                    "new_text": edit.new_text,
+                    "replace_all": replace_all,
+                }),
+            ),
+            edits => (
+                "edit_file",
+                json!({
+                    "path": path,
+                    "edits": edits
+                        .iter()
+                        .map(|edit| json!({"old_text": edit.old_text, "new_text": edit.new_text}))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+        },
+        AgentAction::ReadFile { path } => ("read_file", json!({"path": path})),
+        AgentAction::Search {
+            pattern,
+            glob,
+            path,
+        } => {
+            let mut arguments = json!({});
+            if let Some(pattern) = pattern {
+                arguments["pattern"] = json!(pattern);
+            }
+            if let Some(glob) = glob {
+                arguments["glob"] = json!(glob);
+            }
+            if let Some(path) = path {
+                arguments["path"] = json!(path);
+            }
+            ("search_files", arguments)
+        }
+        AgentAction::Fetch { url } => ("web_fetch", json!({"url": url})),
+        // An egress to that host, judged as a fetch from it.
+        AgentAction::ReachHost { host } => {
+            ("web_fetch", json!({"url": format!("https://{host}/")}))
+        }
+    };
+    ToolCall::new(id, tool, arguments)
+}
+
+#[async_trait]
+impl ActionJudge for DaemonJudge {
+    async fn judge(&self, action: AgentAction) -> Verdict {
+        self.nested.authorize(daemon_call(&action)).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Default)]
-    struct Settings(std::sync::Mutex<std::collections::HashMap<String, String>>);
-
-    #[async_trait::async_trait]
-    impl SettingsStore for Settings {
-        async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
-            Ok(self.0.lock().unwrap().get(key).cloned())
-        }
-        async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
-            self.0
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_string());
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn an_agent_the_daemon_can_host_is_checked_until_the_owner_says_otherwise() {
-        let store = Settings::default();
-        assert_eq!(
-            mode_of(&store, "codex", AgentKind::Codex).await,
-            Some(AgentMode::Checked)
-        );
-        set_mode(&store, "codex", AgentKind::Codex, AgentMode::FullAccess)
-            .await
-            .unwrap();
-        assert_eq!(
-            mode_of(&store, "codex", AgentKind::Codex).await,
-            Some(AgentMode::FullAccess)
-        );
-        // Each agent has its own.
-        assert_eq!(
-            mode_of(&store, "claude", AgentKind::ClaudeCode).await,
-            Some(AgentMode::Checked)
-        );
-    }
-
-    #[tokio::test]
-    async fn an_agent_it_cannot_check_runs_nothing_until_given_full_access() {
-        let store = Settings::default();
-        assert_eq!(mode_of(&store, "aider", AgentKind::Other).await, None);
-        assert!(
-            set_mode(&store, "aider", AgentKind::Other, AgentMode::Checked)
-                .await
-                .is_err()
-        );
-        set_mode(&store, "aider", AgentKind::Other, AgentMode::FullAccess)
-            .await
-            .unwrap();
-        assert_eq!(
-            mode_of(&store, "aider", AgentKind::Other).await,
-            Some(AgentMode::FullAccess)
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stored_mode_its_kind_does_not_offer_is_ignored() {
-        let store = Settings::default();
-        store
-            .set_setting(&setting_key("aider"), "checked")
-            .await
-            .unwrap();
-        assert_eq!(mode_of(&store, "aider", AgentKind::Other).await, None);
-    }
+    use aidaemon_coding_agents::TextEdit;
 
     #[test]
-    fn the_kind_is_read_from_the_program_name() {
-        assert_eq!(AgentKind::of_program("claude"), AgentKind::ClaudeCode);
-        assert_eq!(AgentKind::of_program("codex.exe"), AgentKind::Codex);
-        assert_eq!(AgentKind::of_program("aider"), AgentKind::Other);
+    fn each_action_is_the_daemon_tool_whose_judgment_applies() {
+        let call = daemon_call(&AgentAction::RunCommand {
+            command: "touch probe.txt".into(),
+            working_dir: Some("/w/synthetic".into()),
+        });
+        assert_eq!(call.name, "terminal");
+        assert_eq!(
+            call.arguments,
+            json!({"action": "run", "command": "touch probe.txt", "working_dir": "/w/synthetic"})
+        );
+        let call = daemon_call(&AgentAction::WriteFile {
+            path: "/w/a.md".into(),
+            content: "x".into(),
+        });
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.arguments, json!({"path": "/w/a.md", "content": "x"}));
+        let call = daemon_call(&AgentAction::EditFile {
+            path: "/w/a.md".into(),
+            edits: vec![TextEdit {
+                old_text: "a".into(),
+                new_text: "b".into(),
+            }],
+            replace_all: false,
+        });
+        assert_eq!(call.name, "edit_file");
+        assert_eq!(call.arguments["old_text"], "a");
+        let call = daemon_call(&AgentAction::ReadFile {
+            path: "/etc/synthetic.conf".into(),
+        });
+        assert_eq!(call.name, "read_file");
+        let call = daemon_call(&AgentAction::Search {
+            pattern: None,
+            glob: Some("*.rs".into()),
+            path: None,
+        });
+        assert_eq!(call.name, "search_files");
+        assert_eq!(call.arguments, json!({"glob": "*.rs"}));
+        let call = daemon_call(&AgentAction::ReachHost {
+            host: "example.com".into(),
+        });
+        assert_eq!(call.name, "web_fetch");
+        assert_eq!(call.arguments, json!({"url": "https://example.com/"}));
+    }
+
+    #[tokio::test]
+    async fn the_judge_asks_the_run() {
+        let (nested, asked) = aidaemon_core::testing::nested_calls(|call| {
+            if call.name == "terminal" {
+                Verdict::Declined {
+                    reason: "[OWNER DECLINED] not today".into(),
+                }
+            } else {
+                Verdict::Allow
+            }
+        });
+        let judge = DaemonJudge::new(nested);
+        let verdict = judge
+            .judge(AgentAction::RunCommand {
+                command: "rm -rf /w/x".into(),
+                working_dir: None,
+            })
+            .await;
+        assert!(matches!(verdict, Verdict::Declined { .. }));
+        assert_eq!(asked.lock().unwrap()[0].name, "terminal");
     }
 }

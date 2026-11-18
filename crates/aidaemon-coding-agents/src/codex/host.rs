@@ -1,28 +1,23 @@
-//! A delegated Codex run's approval requests, answered by the run that
-//! delegated to it.
+//! A hosted Codex: `codex app-server`, its approval requests answered by
+//! the judge.
 //!
-//! `codex exec` cannot ask anyone: run confined with `approval_policy =
-//! "never"`, a command at the edge of its sandbox just fails inside it, and
-//! nothing typed says which action was refused. `codex app-server` is the
-//! same agent behind a JSON-RPC protocol on stdin/stdout, and it sends its
-//! host a typed request before it leaves its sandbox:
-//! `item/commandExecution/requestApproval` (a command to run outside it, or
-//! a network host), `item/fileChange/requestApproval` (a patch outside its
-//! writable roots) and `item/permissions/requestApproval` (wider access for
-//! the rest of the turn). Each becomes a nested call of the daemon's own
-//! tool for that action, judged by the run exactly as the model's own calls
-//! are ([`aidaemon_core::NestedCalls`]). A decision that would stay with the
-//! agent ("for this session", a policy amendment) is never sent back: a
-//! grant stays the daemon's.
+//! `codex exec` cannot ask anyone. `codex app-server` is the same agent
+//! behind a JSON-RPC protocol on stdin/stdout, and it sends its host a
+//! typed request before it acts beyond what it may do on its own:
+//! `item/commandExecution/requestApproval` (a command, or a network host),
+//! `item/fileChange/requestApproval` (a patch) and
+//! `item/permissions/requestApproval` (wider access for the rest of its
+//! turn). Each becomes an [`AgentAction`] for the judge. A decision that
+//! would stay with the agent ("for this session", a policy amendment) is
+//! never sent back.
 //!
 //! The process runs with its own `CODEX_HOME` ([`CodexHome`]), holding only
-//! a link to the owner's sign-in: the owner's `config.toml` (its sandbox
-//! mode and approval policy), its command rules, MCP servers, plugins and
-//! trusted projects never reach a delegated run.
+//! a link to the owner's sign-in: the owner's `config.toml`, command rules,
+//! MCP servers, plugins and trusted projects never reach a delegated run.
 //!
-//! Its notifications are translated into the `codex exec --json` events the
-//! rest of `cli_agent` already reads ([`translate`]), so the run's result,
-//! progress and end are judged the same way for both launch modes.
+//! Its notifications are translated into the `codex exec --json` events an
+//! `exec` run writes, so the embedding agent reads both launches the same
+//! way.
 //!
 //! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18).
 
@@ -30,12 +25,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use aidaemon_core::{NestedCalls, NestedVerdict, ToolCall};
+use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 
-use crate::tools::cli_host::HostAnswers;
+use crate::stdin::Stdin;
+use crate::{ActionJudge, AgentAction, AgentHost, HostAnswers, HostStarter, Verdict};
 
 /// Features turned off in a hosted run: each reaches outside the sandbox
 /// without a request this host sees (connectors, plugins, a browser, the
@@ -71,12 +66,6 @@ needs, request escalated permissions for it (with a one-line justification) \
 instead of reporting the failure. A declined request is final: do not retry \
 it another way.";
 
-/// The arguments that launch `codex app-server` for a run the adapters
-/// already confined as `codex exec` (`args[start..]` are Codex's own; what
-/// precedes them is an `env` launcher's). The confinement carries over
-/// unchanged (`-c` profile entries, the sandbox mode, the model); the
-/// approval policy becomes `on-request`, answered by this host. `Err` names
-/// an argument with no app-server equivalent, and the run stays on `exec`.
 /// When a hosted Codex asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asks {
@@ -91,7 +80,10 @@ pub enum Asks {
 }
 
 impl Asks {
-    /// Codex's name for the policy (a machine format of its protocol).
+    /// Codex's name for the thread's policy (a machine format of its
+    /// protocol). `untrusted` is accepted only here: Codex 0.170 refuses it
+    /// as a launch setting ("no longer supported"), so the launch says
+    /// `on-request` and the thread narrows it (live probe, 2026-11-18).
     fn policy(self) -> &'static str {
         match self {
             Self::BeyondSandbox => "on-request",
@@ -100,6 +92,11 @@ impl Asks {
     }
 }
 
+/// The arguments that launch `codex app-server` for a run already shaped
+/// as `codex exec` (`args[start..]` are Codex's own; what precedes them is
+/// a launcher's). The confinement carries over (`-c` profile entries, the
+/// sandbox mode, the model); the approval policy becomes `asks`'s. `Err`
+/// names an argument with no app-server equivalent.
 pub fn app_server_args(args: &[String], start: usize, asks: Asks) -> Result<Vec<String>, String> {
     let toml = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     let mut out: Vec<String> = args[..start.min(args.len())].to_vec();
@@ -168,7 +165,7 @@ pub fn app_server_args(args: &[String], start: usize, asks: Asks) -> Result<Vec<
     }
     out.extend([
         "-c".to_string(),
-        format!("approval_policy=\"{}\"", asks.policy()),
+        "approval_policy=\"on-request\"".to_string(),
         "-c".to_string(),
         "approvals_reviewer=\"user\"".to_string(),
     ]);
@@ -188,8 +185,7 @@ pub struct CodexHome {
 
 impl CodexHome {
     /// `Err` when the owner's sign-in is not a file this can link (no
-    /// `auth.json`, or links unsupported here); the run then stays on
-    /// `exec`.
+    /// `auth.json`, or links unsupported here).
     pub fn prepare() -> Result<Self, String> {
         let source = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
@@ -261,18 +257,9 @@ fn error_reply_line(id: &Value, message: &str) -> String {
     line
 }
 
-fn event(value: Value) -> String {
-    value.to_string()
-}
-
-/// The daemon call a command approval asks for: a network host is judged
-/// as a fetch from it (an egress to it); a command as the daemon's own
-/// `terminal` running it. `Err` is refused.
-pub fn command_call(
-    id: &str,
-    params: &Value,
-    working_dir: Option<&str>,
-) -> Result<ToolCall, String> {
+/// The action a command approval asks for: a network host to reach, or a
+/// command to run. `Err` is refused.
+pub fn command_action(params: &Value, working_dir: Option<&str>) -> Result<AgentAction, String> {
     if params.get("kind").and_then(Value::as_str) == Some("writeStdin") {
         return Err("input to a command already running is not forwarded".to_string());
     }
@@ -280,22 +267,23 @@ pub fn command_call(
         .pointer("/networkApprovalContext/host")
         .and_then(Value::as_str)
     {
-        return Ok(ToolCall::new(
-            id,
-            "web_fetch",
-            json!({"url": format!("https://{host}/")}),
-        ));
+        return Ok(AgentAction::ReachHost {
+            host: host.to_string(),
+        });
     }
     let command = params
         .get("command")
         .and_then(Value::as_str)
         .filter(|command| !command.trim().is_empty())
         .ok_or("its approval request names no command")?;
-    let mut arguments = json!({"action": "run", "command": unwrap_shell(command)});
-    if let Some(dir) = params.get("cwd").and_then(Value::as_str).or(working_dir) {
-        arguments["working_dir"] = json!(dir);
-    }
-    Ok(ToolCall::new(id, "terminal", arguments))
+    Ok(AgentAction::RunCommand {
+        command: unwrap_shell(command),
+        working_dir: params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .or(working_dir)
+            .map(str::to_string),
+    })
 }
 
 /// The script inside Codex's shell wrapper (`/bin/zsh -lc '<script>'`), so
@@ -326,7 +314,6 @@ struct FileChange {
 
 #[derive(Default)]
 struct HostState {
-    thread_id: Option<String>,
     usage: Option<Value>,
     /// The changes of each `fileChange` item, by item id: its approval
     /// request names only the item.
@@ -336,12 +323,34 @@ struct HostState {
     completed: Option<bool>,
 }
 
+/// Starts a [`CodexHost`].
+pub struct CodexHostStarter {
+    pub working_dir: Option<String>,
+    pub asks: Asks,
+}
+
+#[async_trait]
+impl HostStarter for CodexHostStarter {
+    /// The handshake goes in first; the task follows once its thread is
+    /// started.
+    async fn start(
+        self: Box<Self>,
+        stdin: ChildStdin,
+        judge: Arc<dyn ActionJudge>,
+        prompt: &str,
+    ) -> Arc<dyn AgentHost> {
+        let host = CodexHost::new(stdin, judge, self.working_dir, prompt, self.asks);
+        host.stdin.write(&initialize_line()).await;
+        Arc::new(host)
+    }
+}
+
 /// Hosts one `codex app-server` process for its run: starts its thread and
 /// turn, answers its approval requests, and translates what it reports.
 #[derive(Clone)]
 pub struct CodexHost {
-    stdin: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
-    nested: NestedCalls,
+    stdin: Stdin,
+    judge: Arc<dyn ActionJudge>,
     working_dir: Option<String>,
     prompt: Arc<str>,
     asks: Asks,
@@ -351,61 +360,18 @@ pub struct CodexHost {
 impl CodexHost {
     pub fn new(
         stdin: ChildStdin,
-        nested: NestedCalls,
+        judge: Arc<dyn ActionJudge>,
         working_dir: Option<String>,
         prompt: &str,
         asks: Asks,
     ) -> Self {
         Self {
-            stdin: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
-            nested,
+            stdin: Stdin::new(stdin),
+            judge,
             working_dir,
             prompt: Arc::from(prompt),
             asks,
             state: Arc::default(),
-        }
-    }
-
-    /// What it answered so far.
-    pub fn answers(&self) -> HostAnswers {
-        self.state
-            .lock()
-            .map(|state| state.answers.clone())
-            .unwrap_or_default()
-    }
-
-    /// Whether its turn completed (not failed, interrupted, or never
-    /// reached): the process exits 0 either way once its stdin closes.
-    pub fn turn_completed(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|state| state.completed == Some(true))
-    }
-
-    /// Handle one stdout line; returns the `codex exec --json` events it
-    /// stands for (none for most). An approval request is answered in its
-    /// own task, so its output keeps being read while the owner decides.
-    pub async fn on_line(&self, line: &str) -> Vec<String> {
-        let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
-            return vec![line.to_string()];
-        };
-        let method = message.get("method").and_then(Value::as_str);
-        let id = message.get("id");
-        match (method, id) {
-            (Some(method), Some(id)) => {
-                let host = self.clone();
-                let method = method.to_string();
-                let id = id.clone();
-                let params = message.get("params").cloned().unwrap_or(Value::Null);
-                tokio::spawn(async move { host.answer(&method, &id, &params).await });
-                Vec::new()
-            }
-            (None, Some(id)) => self.on_response(id, &message).await,
-            (Some(method), None) => {
-                let params = message.get("params").cloned().unwrap_or(Value::Null);
-                self.on_notification(method, &params).await
-            }
-            (None, None) => Vec::new(),
         }
     }
 
@@ -418,8 +384,8 @@ impl CodexHost {
             if let Ok(mut state) = self.state.lock() {
                 state.completed = Some(false);
             }
-            self.close().await;
-            return vec![event(json!({"type": "error", "message": text}))];
+            self.stdin.close().await;
+            return vec![json!({"type": "error", "message": text}).to_string()];
         }
         match id.as_u64() {
             Some(INITIALIZE_ID) => {
@@ -435,22 +401,19 @@ impl CodexHost {
                     params["cwd"] = json!(dir);
                 }
                 lines.push_str(&request_line(THREAD_START_ID, "thread/start", params));
-                self.write(&lines).await;
+                self.stdin.write(&lines).await;
             }
             Some(THREAD_START_ID) => {
                 let thread_id = message
                     .pointer("/result/thread/id")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if let Ok(mut state) = self.state.lock() {
-                    state.thread_id = Some(thread_id.clone());
-                }
+                    .unwrap_or_default();
                 let params = json!({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": &*self.prompt}],
                 });
-                self.write(&request_line(TURN_START_ID, "turn/start", params))
+                self.stdin
+                    .write(&request_line(TURN_START_ID, "turn/start", params))
                     .await;
             }
             _ => {}
@@ -466,11 +429,12 @@ impl CodexHost {
                 .unwrap_or_default()
                 .to_string()
         };
+        let event = |value: Value| vec![value.to_string()];
         match method {
-            "thread/started" => vec![event(
-                json!({"type": "thread.started", "thread_id": text("/thread/id")}),
-            )],
-            "turn/started" => vec![event(json!({"type": "turn.started"}))],
+            "thread/started" => {
+                event(json!({"type": "thread.started", "thread_id": text("/thread/id")}))
+            }
+            "turn/started" => event(json!({"type": "turn.started"})),
             "item/started" | "item/completed" => {
                 let item = params.get("item").unwrap_or(&Value::Null);
                 if item.get("type").and_then(Value::as_str) == Some("fileChange") {
@@ -482,7 +446,7 @@ impl CodexHost {
                     "item.completed"
                 };
                 exec_item(item)
-                    .map(|item| vec![event(json!({"type": kind, "item": item}))])
+                    .map(|item| event(json!({"type": kind, "item": item})))
                     .unwrap_or_default()
             }
             "thread/tokenUsage/updated" => {
@@ -492,9 +456,7 @@ impl CodexHost {
                 Vec::new()
             }
             "error" if params.get("willRetry").and_then(Value::as_bool) != Some(true) => {
-                vec![event(
-                    json!({"type": "error", "message": text("/error/message")}),
-                )]
+                event(json!({"type": "error", "message": text("/error/message")}))
             }
             "turn/completed" => {
                 let status = text("/turn/status");
@@ -507,27 +469,25 @@ impl CodexHost {
                     state.usage.clone()
                 };
                 // Its turn is over: closing stdin lets it exit.
-                self.close().await;
+                self.stdin.close().await;
                 if completed {
                     let usage = usage.unwrap_or(Value::Null);
                     let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-                    vec![event(json!({
+                    event(json!({
                         "type": "turn.completed",
                         "usage": {
                             "input_tokens": count("inputTokens"),
                             "cached_input_tokens": count("cachedInputTokens"),
                             "output_tokens": count("outputTokens"),
                         },
-                    }))]
+                    }))
                 } else {
                     let message = params
                         .pointer("/turn/error/message")
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("the turn ended {status}"));
-                    vec![event(
-                        json!({"type": "turn.failed", "error": {"message": message}}),
-                    )]
+                    event(json!({"type": "turn.failed", "error": {"message": message}}))
                 }
             }
             _ => Vec::new(),
@@ -562,20 +522,15 @@ impl CodexHost {
     }
 
     async fn answer(&self, method: &str, id: &Value, params: &Value) {
-        let call_id = format!("codex-approval-{}", id.to_string().trim_matches('"'));
+        let decision = |verdict: &Verdict| json!({"decision": if verdict.is_allowed() { "accept" } else { "decline" }});
         let (label, verdict, reply) = match method {
             "item/commandExecution/requestApproval" => {
-                let label = command_label(params);
-                let verdict = match command_call(&call_id, params, self.working_dir.as_deref()) {
-                    Ok(call) => self.nested.authorize(call).await,
-                    Err(reason) => NestedVerdict::Deny { reason },
+                let (label, verdict) = match command_action(params, self.working_dir.as_deref()) {
+                    Ok(action) => (action.label(), self.judge.judge(action).await),
+                    Err(reason) => ("command".to_string(), Verdict::Deny { reason }),
                 };
-                let decision = if verdict.is_allowed() {
-                    "accept"
-                } else {
-                    "decline"
-                };
-                (label, verdict, json!({"decision": decision}))
+                let reply = decision(&verdict);
+                (label, verdict, reply)
             }
             "item/fileChange/requestApproval" => {
                 let changes = self
@@ -588,26 +543,22 @@ impl CodexHost {
                     })
                     .unwrap_or_default();
                 let label = format!(
-                    "file change: {}",
+                    "write: {}",
                     changes
                         .iter()
                         .map(|change| change.path.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                let verdict = self.authorize_changes(&call_id, &changes).await;
-                let decision = if verdict.is_allowed() {
-                    "accept"
-                } else {
-                    "decline"
-                };
-                (label, verdict, json!({"decision": decision}))
+                let verdict = self.judge_changes(&changes).await;
+                let reply = decision(&verdict);
+                (label, verdict, reply)
             }
             // Wider access for the rest of its turn is never granted here:
             // each action it then needs is asked one by one instead.
             "item/permissions/requestApproval" => (
                 "wider access for the turn".to_string(),
-                NestedVerdict::Deny {
+                Verdict::Deny {
                     reason: "a delegated run's access is not widened for its whole turn"
                         .to_string(),
                 },
@@ -615,15 +566,16 @@ impl CodexHost {
             ),
             other => {
                 tracing::info!(method = %other, "A coding agent's request this host does not serve");
-                self.write(&error_reply_line(id, "not supported by this host"))
+                self.stdin
+                    .write(&error_reply_line(id, "not supported by this host"))
                     .await;
                 return;
             }
         };
         if let Ok(mut state) = self.state.lock() {
             match verdict {
-                NestedVerdict::Allow => {}
-                NestedVerdict::Declined { .. } => state.answers.declined.push(label),
+                Verdict::Allow => {}
+                Verdict::Declined { .. } => state.answers.declined.push(label),
                 _ => state.answers.refused.push(label),
             }
         }
@@ -632,47 +584,83 @@ impl CodexHost {
             allowed = verdict.is_allowed(),
             "Answered a coding agent's permission prompt"
         );
-        self.write(&reply_line(id, reply)).await;
+        self.stdin.write(&reply_line(id, reply)).await;
     }
 
-    /// Every file a patch changes is judged as the daemon's `write_file` of
-    /// it; the patch is accepted only when all are allowed.
-    async fn authorize_changes(&self, call_id: &str, changes: &[FileChange]) -> NestedVerdict {
+    /// Every file a patch changes is judged as a write of it; the patch is
+    /// accepted only when all are allowed.
+    async fn judge_changes(&self, changes: &[FileChange]) -> Verdict {
         if changes.is_empty() {
-            return NestedVerdict::Deny {
+            return Verdict::Deny {
                 reason: "its file-change request names no file".to_string(),
             };
         }
-        for (index, change) in changes.iter().enumerate() {
-            let call = ToolCall::new(
-                format!("{call_id}-{index}"),
-                "write_file",
-                json!({"path": change.path, "content": change.diff}),
-            );
-            let verdict = self.nested.authorize(call).await;
+        for change in changes {
+            let verdict = self
+                .judge
+                .judge(AgentAction::WriteFile {
+                    path: change.path.clone(),
+                    content: change.diff.clone(),
+                })
+                .await;
             if !verdict.is_allowed() {
                 return verdict;
             }
         }
-        NestedVerdict::Allow
-    }
-
-    async fn write(&self, line: &str) {
-        let mut stdin = self.stdin.lock().await;
-        if let Some(pipe) = stdin.as_mut()
-            && (pipe.write_all(line.as_bytes()).await.is_err() || pipe.flush().await.is_err())
-        {
-            *stdin = None;
-        }
-    }
-
-    async fn close(&self) {
-        self.stdin.lock().await.take();
+        Verdict::Allow
     }
 }
 
-/// An app-server item as `codex exec --json` writes it, for the items the
-/// rest of `cli_agent` reads; `None` for the others.
+#[async_trait]
+impl AgentHost for CodexHost {
+    /// Returns the `codex exec --json` events a line stands for (none for
+    /// most).
+    async fn on_line(&self, line: &str) -> Vec<String> {
+        let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+            return vec![line.to_string()];
+        };
+        let method = message.get("method").and_then(Value::as_str);
+        let id = message.get("id");
+        match (method, id) {
+            (Some(method), Some(id)) => {
+                let host = self.clone();
+                let method = method.to_string();
+                let id = id.clone();
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                tokio::spawn(async move { host.answer(&method, &id, &params).await });
+                Vec::new()
+            }
+            (None, Some(id)) => self.on_response(id, &message).await,
+            (Some(method), None) => {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                self.on_notification(method, &params).await
+            }
+            (None, None) => Vec::new(),
+        }
+    }
+
+    fn answers(&self) -> HostAnswers {
+        self.state
+            .lock()
+            .map(|state| state.answers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Its process exits 0 once its stdin closes, whatever its turn did.
+    fn unfinished(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .is_ok_and(|state| state.completed == Some(true))
+    }
+
+    async fn close(&self) {
+        self.stdin.close().await;
+    }
+}
+
+/// An app-server item as `codex exec --json` writes it, for the items an
+/// `exec` run's reader uses; `None` for the others.
 fn exec_item(item: &Value) -> Option<Value> {
     let id = item.get("id").cloned().unwrap_or(Value::Null);
     let status = item.get("status").cloned().unwrap_or(Value::Null);
@@ -707,48 +695,6 @@ fn exec_item(item: &Value) -> Option<Value> {
         }
         _ => None,
     }
-}
-
-/// A command approval said as the owner reads it.
-fn command_label(params: &Value) -> String {
-    if let Some(host) = params
-        .pointer("/networkApprovalContext/host")
-        .and_then(Value::as_str)
-    {
-        return format!("network: {host}");
-    }
-    let command = params
-        .get("command")
-        .and_then(Value::as_str)
-        .map(unwrap_shell)
-        .unwrap_or_default();
-    let command = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!(
-        "command: {}",
-        aidaemon_events::text::truncate_str(&command, 160)
-    )
-}
-
-/// The process's stdout, read by `host` and replaced by the `codex exec
-/// --json` events it stands for. Its stdin closes at the end.
-pub fn translate<R>(stdout: R, host: CodexHost) -> tokio::io::DuplexStream
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            for mut out in host.on_line(&line).await {
-                out.push('\n');
-                if writer.write_all(out.as_bytes()).await.is_err() {
-                    return;
-                }
-            }
-        }
-        host.close().await;
-    });
-    reader
 }
 
 #[cfg(test)]
@@ -798,14 +744,17 @@ mod tests {
     }
 
     #[test]
-    fn an_env_launcher_is_kept_and_an_unknown_argument_keeps_the_run_on_exec() {
+    fn an_env_launcher_is_kept_and_an_unknown_argument_is_refused() {
         let args = strings(&["FOO=1", "codex", "exec", "--sandbox", "read-only"]);
         let out = app_server_args(&args, 2, Asks::EveryCommand).unwrap();
         assert_eq!(&out[..3], &strings(&["FOO=1", "codex", "app-server"])[..]);
-        assert!(config_values(&out).contains(&"sandbox_mode=\"read-only\""));
-        // Every command is asked; no proxy (its sandbox is read-only).
-        assert!(config_values(&out).contains(&"approval_policy=\"untrusted\""));
-        assert!(!config_values(&out).contains(&"features.network_proxy.enabled=true"));
+        let config = config_values(&out);
+        assert!(config.contains(&"sandbox_mode=\"read-only\""));
+        // The launch says `on-request` (Codex refuses `untrusted` there);
+        // the thread asks for every command. No proxy: its sandbox is
+        // read-only.
+        assert!(config.contains(&"approval_policy=\"on-request\""));
+        assert!(!config.contains(&"features.network_proxy.enabled=true"));
 
         let args = strings(&["exec", "--output-schema", "s.json"]);
         assert!(app_server_args(&args, 0, Asks::BeyondSandbox).is_err());
@@ -813,27 +762,31 @@ mod tests {
     }
 
     #[test]
-    fn a_command_approval_is_the_terminal_command_it_runs_or_the_host_it_reaches() {
+    fn a_command_approval_is_the_command_it_runs_or_the_host_it_reaches() {
         let params = json!({
             "kind": "command",
             "command": "/bin/zsh -lc 'touch $HOME/probe.txt'",
             "cwd": "/w/project",
         });
-        let call = command_call("a", &params, None).unwrap();
-        assert_eq!(call.name, "terminal");
-        assert_eq!(call.arguments["command"], "touch $HOME/probe.txt");
-        assert_eq!(call.arguments["working_dir"], "/w/project");
-
+        assert_eq!(
+            command_action(&params, None).unwrap(),
+            AgentAction::RunCommand {
+                command: "touch $HOME/probe.txt".into(),
+                working_dir: Some("/w/project".into()),
+            }
+        );
         let params = json!({
             "command": "curl https://example.com",
             "networkApprovalContext": {"host": "example.com", "protocol": "https"},
         });
-        let call = command_call("b", &params, Some("/w")).unwrap();
-        assert_eq!(call.name, "web_fetch");
-        assert_eq!(call.arguments["url"], "https://example.com/");
-
-        assert!(command_call("c", &json!({"kind": "writeStdin"}), None).is_err());
-        assert!(command_call("d", &json!({}), None).is_err());
+        assert_eq!(
+            command_action(&params, Some("/w")).unwrap(),
+            AgentAction::ReachHost {
+                host: "example.com".into()
+            }
+        );
+        assert!(command_action(&json!({"kind": "writeStdin"}), None).is_err());
+        assert!(command_action(&json!({}), None).is_err());
     }
 
     #[test]
@@ -867,10 +820,35 @@ mod tests {
         assert!(exec_item(&json!({"type": "reasoning", "id": "r"})).is_none());
     }
 
+    /// Answers by a rule, and keeps what it was asked.
+    struct Judge {
+        rule: fn(&AgentAction) -> Verdict,
+        asked: Mutex<Vec<AgentAction>>,
+    }
+
+    impl Judge {
+        fn new(rule: fn(&AgentAction) -> Verdict) -> Arc<Self> {
+            Arc::new(Self {
+                rule,
+                asked: Mutex::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ActionJudge for Judge {
+        async fn judge(&self, action: AgentAction) -> Verdict {
+            let verdict = (self.rule)(&action);
+            self.asked.lock().unwrap().push(action);
+            verdict
+        }
+    }
+
     /// A fake `codex app-server` on the other end of real pipes: the host
-    /// starts the thread and turn, a command approval is judged by the run
-    /// and answered, its result reads as `codex exec --json` events, and the
+    /// starts the thread and turn, a command approval is judged and
+    /// answered, its result reads as `codex exec --json` events, and the
     /// end of the turn closes stdin.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_run_is_started_answered_translated_and_closed_over_the_pipes() {
         use std::process::Stdio;
@@ -883,18 +861,17 @@ mod tests {
             .expect("cat");
         let stdin = child.stdin.take().unwrap();
         let echoed = child.stdout.take().unwrap();
-        let (nested, asked) = aidaemon_core::testing::nested_calls(|call| {
-            if call.arguments["command"] == "rm -rf /w/other" {
-                NestedVerdict::Declined {
+        let judge = Judge::new(|action| match action {
+            AgentAction::RunCommand { command, .. } if command == "rm -rf /w/other" => {
+                Verdict::Declined {
                     reason: format!("{} by the owner", aidaemon_core::OWNER_DECLINED),
                 }
-            } else {
-                NestedVerdict::Allow
             }
+            _ => Verdict::Allow,
         });
         let host = CodexHost::new(
             stdin,
-            nested,
+            judge.clone(),
             Some("/w".to_string()),
             "fix it",
             Asks::BeyondSandbox,
@@ -931,7 +908,13 @@ mod tests {
         host.on_line(r#"{"id":1,"method":"item/commandExecution/requestApproval","params":{"command":"rm -rf /w/other","itemId":"i2"}}"#).await;
         let reply: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(reply["result"]["decision"], "decline");
-        assert_eq!(asked.lock().unwrap()[0].arguments["command"], "npm install");
+        assert_eq!(
+            judge.asked.lock().unwrap()[0],
+            AgentAction::RunCommand {
+                command: "npm install".into(),
+                working_dir: Some("/w".into()),
+            }
+        );
 
         let message = host
             .on_line(r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"All set."}}}"#)
@@ -939,6 +922,7 @@ mod tests {
         assert_eq!(message.len(), 1);
         assert!(message[0].contains("\"agent_message\""));
         host.on_line(r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":2}}}}"#).await;
+        assert!(host.unfinished());
         let end = host
             .on_line(
                 r#"{"method":"turn/completed","params":{"turn":{"id":"u","status":"completed"}}}"#,
@@ -947,7 +931,7 @@ mod tests {
         let end: Value = serde_json::from_str(&end[0]).unwrap();
         assert_eq!(end["type"], "turn.completed");
         assert_eq!(end["usage"]["input_tokens"], 10);
-        assert!(host.turn_completed());
+        assert!(!host.unfinished());
         // The end of its turn closed stdin: `cat` reads end-of-file and exits.
         assert!(sent.next_line().await.unwrap().is_none());
         assert!(child.wait().await.unwrap().success());
@@ -959,6 +943,35 @@ mod tests {
         assert!(answers.refused.is_empty());
     }
 
+    /// Every command is asked on the thread, where Codex accepts it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_command_asks_on_the_thread() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = CodexHost::new(
+            child.stdin.take().unwrap(),
+            Judge::new(|_| Verdict::Allow),
+            None,
+            "p",
+            Asks::EveryCommand,
+        );
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        host.on_line(r#"{"id":1,"result":{}}"#).await;
+        sent.next_line().await.unwrap();
+        let thread_start: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(thread_start["params"]["approvalPolicy"], "untrusted");
+        host.close().await;
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_file_change_is_judged_per_file_from_its_item() {
         use std::process::Stdio;
@@ -967,12 +980,12 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .expect("cat");
-        let (nested, asked) = aidaemon_core::testing::nested_calls(|_| NestedVerdict::Deny {
+        let judge = Judge::new(|_| Verdict::Deny {
             reason: "outside the task".to_string(),
         });
         let host = CodexHost::new(
             child.stdin.take().unwrap(),
-            nested,
+            judge.clone(),
             None,
             "p",
             Asks::BeyondSandbox,
@@ -985,14 +998,18 @@ mod tests {
         )
         .await;
         {
-            let asked = asked.lock().unwrap();
-            assert_eq!(asked.len(), 1);
-            assert_eq!(asked[0].name, "write_file");
-            assert_eq!(asked[0].arguments["path"], "/etc/hosts");
+            let asked = judge.asked.lock().unwrap();
+            assert_eq!(
+                *asked,
+                vec![AgentAction::WriteFile {
+                    path: "/etc/hosts".into(),
+                    content: "+x".into(),
+                }]
+            );
         }
         assert_eq!(
             host.answers().refused,
-            vec!["file change: /etc/hosts".to_string()]
+            vec!["write: /etc/hosts".to_string()]
         );
         host.close().await;
         let _ = child.wait().await;

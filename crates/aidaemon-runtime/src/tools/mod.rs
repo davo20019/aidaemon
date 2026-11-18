@@ -4,8 +4,6 @@
 pub mod agent_mode;
 pub mod cli_agent;
 mod cli_agent_left_running;
-pub mod cli_host;
-pub mod codex_host;
 pub mod command_patterns;
 #[cfg(feature = "computer_use")]
 pub mod computer_use;
