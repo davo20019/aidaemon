@@ -25,7 +25,6 @@ use aidaemon_work::goal_tokens;
 pub mod harness_eval;
 mod health;
 mod heartbeat;
-mod llm_markers;
 mod llm_runtime;
 mod logging;
 mod mandates {

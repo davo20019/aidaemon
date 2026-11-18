@@ -1,7 +1,6 @@
 //! After a run: what it teaches memory, whether it stalled and why, and the
 //! user-facing words for a run that ran out of budget.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -10,7 +9,7 @@ use std::sync::LazyLock;
 
 use aidaemon_events::TaskOutcome;
 
-use crate::turn::loop_utils::{MAX_CONSECUTIVE_SAME_TOOL, semantic_failure_limit};
+use crate::turn::loop_utils::MAX_CONSECUTIVE_SAME_TOOL;
 
 #[derive(Clone)]
 pub struct LearningContext {
@@ -121,135 +120,6 @@ pub fn spawn_learning(
             tracing::warn!("Learning failed: {}", e);
         }
     });
-}
-
-/// Classify the stall cause from recent errors for actionable guidance.
-pub fn classify_stall(
-    learning_ctx: &LearningContext,
-    deferred_no_tool_error_marker: &str,
-    tool_failure_count: &HashMap<String, usize>,
-) -> (&'static str, &'static str) {
-    let any_locked = tool_failure_count
-        .iter()
-        .any(|(name, count)| *count >= semantic_failure_limit(name));
-    if any_locked {
-        return (
-            "Tool Locked Out",
-            "I ran into repeated errors with a command and got locked out. Try rephrasing or specifying the exact command to use.",
-        );
-    }
-
-    let recent_errors: String = learning_ctx
-        .errors
-        .iter()
-        .rev()
-        .take(5)
-        .map(|(e, _)| e.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if recent_errors.contains("rate limit") || recent_errors.contains("429") {
-        (
-            "Rate Limited",
-            "Automatic provider recovery remained rate-limited.",
-        )
-    } else if recent_errors.contains("timed out") || recent_errors.contains("timeout") {
-        (
-            "Timeout",
-            "Automatic recovery still exceeded the current response-time limits.",
-        )
-    } else if recent_errors.contains("network") || recent_errors.contains("connection") {
-        (
-            "Network Error",
-            "Automatic recovery could not get a working network connection.",
-        )
-    } else if is_tool_policy_block(&recent_errors) {
-        (
-            "Tool Policy Block",
-            "A step was blocked by safety policy. Try adjusting the request or running the blocked command yourself.",
-        )
-    } else if is_edit_target_drift(&recent_errors) {
-        (
-            "Edit Target Drift",
-            "The edit target kept changing after automatic re-read and retry recovery.",
-        )
-    } else if looks_like_provider_server_error(&recent_errors) {
-        (
-            "Server Error",
-            "Automatic provider recovery remained blocked by server errors.",
-        )
-    } else if recent_errors.contains("unknown tool") {
-        (
-            "Unknown Tool",
-            "Automatic tool-resolution recovery could not find a working capability.",
-        )
-    } else if recent_errors.contains("unauthorized")
-        || recent_errors.contains("api key")
-        || recent_errors.contains("authentication failed")
-        || recent_errors.contains("invalid auth")
-    {
-        (
-            "Authentication",
-            "There may be an issue with API credentials. Check your provider configuration.",
-        )
-    } else if recent_errors.contains(deferred_no_tool_error_marker) {
-        (
-            "Deferred No-Tool Loop",
-            "Automatic tool and model recovery did not produce an executable step.",
-        )
-    } else {
-        (
-            "Stuck",
-            "The available in-run recovery strategies were exhausted.",
-        )
-    }
-}
-
-fn is_tool_policy_block(recent_errors: &str) -> bool {
-    recent_errors.contains("not in the safe command list")
-        || recent_errors.contains("safe command list")
-        || recent_errors.contains("use 'terminal' for this command")
-        || recent_errors.contains("requires approval")
-        || recent_errors.contains("not allowed")
-}
-
-fn is_edit_target_drift(recent_errors: &str) -> bool {
-    recent_errors.contains("text not found in")
-        || recent_errors.contains("text not found")
-        || recent_errors.contains("search string not found")
-        || recent_errors.contains("needle not found")
-}
-
-fn looks_like_provider_server_error(recent_errors: &str) -> bool {
-    const PROVIDER_SERVER_PATTERNS: &[&str] = &[
-        "internal server error",
-        "bad gateway",
-        "service unavailable",
-        "gateway timeout",
-        "status code 500",
-        "status code: 500",
-        "status 500",
-        "http 500",
-        "status code 502",
-        "status code: 502",
-        "status 502",
-        "http 502",
-        "status code 503",
-        "status code: 503",
-        "status 503",
-        "http 503",
-    ];
-    if PROVIDER_SERVER_PATTERNS
-        .iter()
-        .any(|needle| recent_errors.contains(needle))
-    {
-        return true;
-    }
-
-    let mentions_provider = ["provider", "openai", "anthropic", "api", "llm"]
-        .iter()
-        .any(|needle| recent_errors.contains(needle));
-    mentions_provider && recent_errors.contains("server error")
 }
 
 /// Graceful response when task token budget is exhausted.
@@ -854,65 +724,6 @@ mod tests {
             MAX_CONSECUTIVE_SAME_TOOL,
             25
         ));
-    }
-
-    fn ctx_with_single_error(error: &str) -> LearningContext {
-        LearningContext {
-            user_text: "do something".to_string(),
-            memory_persistence_allowed: true,
-            intent_domains: vec![],
-            tool_calls: learned(vec![]),
-            errors: vec![(error.to_string(), false)],
-            first_error: None,
-            recovery_actions: vec![],
-            start_time: Utc::now(),
-            completed_naturally: false,
-            task_outcome: None,
-        }
-    }
-
-    #[test]
-    fn test_classify_stall_prefers_tool_policy_block() {
-        let ctx = ctx_with_single_error(
-            "Command 'npm install tailwindcss' is not in the safe command list. Use 'terminal' for this command.",
-        );
-        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
-        assert_eq!(label, "Tool Policy Block");
-        assert!(suggestion.contains("safety policy"));
-    }
-
-    #[test]
-    fn test_classify_stall_detects_edit_target_drift() {
-        let ctx = ctx_with_single_error(
-            "Text not found in ~/projects/oaxaca-mezcal-tours/src/components/ContactForm.jsx. The old_text did not match.",
-        );
-        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
-        assert_eq!(label, "Edit Target Drift");
-        assert!(suggestion.contains("re-read"));
-    }
-
-    #[test]
-    fn test_classify_stall_ignores_generic_5000_values() {
-        let ctx = ctx_with_single_error("Exceeded 5000 characters while building summary.");
-        let (label, _) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
-        assert_eq!(label, "Stuck");
-    }
-
-    #[test]
-    fn test_classify_stall_detects_provider_server_status_codes() {
-        let ctx = ctx_with_single_error("OpenAI API returned status code 503 Service Unavailable.");
-        let (label, _) = classify_stall(&ctx, "deferred-no-tool", &HashMap::new());
-        assert_eq!(label, "Server Error");
-    }
-
-    #[test]
-    fn test_classify_stall_detects_tool_lockout_from_counts() {
-        let ctx = make_learning_ctx();
-        let mut tool_failure_count = HashMap::new();
-        tool_failure_count.insert("terminal".to_string(), semantic_failure_limit("terminal"));
-        let (label, suggestion) = classify_stall(&ctx, "deferred-no-tool", &tool_failure_count);
-        assert_eq!(label, "Tool Locked Out");
-        assert!(suggestion.contains("locked out"));
     }
 
     #[test]

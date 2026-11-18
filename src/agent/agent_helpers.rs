@@ -1,96 +1,13 @@
 //! Free-function helpers extracted from `agent/mod.rs` (Phase 5 decoupling).
 //!
 //! Pure relocation — no logic changes. Groups status/heartbeat helpers, tool-arg
-//! summarization, resume-checkpoint rendering and detection, project-scope and
-//! filesystem-reference cue detection, untrusted-external-reference tool
-//! filtering, and the intent-gate decision merge.
-
-#[cfg(test)]
-use super::contains_keyword_as_words;
+//! summarization and resume-checkpoint rendering.
 
 #[cfg(test)]
 pub use aidaemon_runtime::turn::helpers::touch_heartbeat;
 
 #[cfg(test)]
 pub(in crate::agent) use aidaemon_runtime::turn::tool_summary::summarize_tool_args;
-
-/// Legacy intent-gate test fixture. Production routing is model-directed.
-#[cfg(test)]
-#[derive(Debug, Clone, Default)]
-pub(in crate::agent) struct IntentGateDecision {
-    /// Heuristics armed the tool requirement: the request references the
-    /// filesystem, local execution, auth/integration management, or a
-    /// connected API and cannot be satisfied by a text-only reply.
-    pub(in crate::agent) needs_tools: Option<bool>,
-}
-
-#[cfg(test)]
-pub(in crate::agent) fn user_text_references_filesystem_path(user_text: &str) -> bool {
-    let user_text = crate::channels::attachments::user_authored_text(user_text);
-    if user_text.trim().is_empty() {
-        return false;
-    }
-
-    for raw in user_text.as_str().split_whitespace() {
-        let token = raw
-            .trim_matches(|c: char| {
-                c.is_ascii_whitespace()
-                    || matches!(
-                        c,
-                        '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
-                    )
-            })
-            .trim_end_matches(['.', '!', '?']);
-        if token.is_empty() {
-            continue;
-        }
-        if crate::tools::fs_utils::resolve_structural_filesystem_reference(
-            &*crate::execution::active_execution_backend(),
-            token,
-            &[],
-        )
-        .is_some()
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-#[cfg(test)]
-pub(in crate::agent) fn user_explicitly_requests_local_file_inspection(user_text: &str) -> bool {
-    if user_text_references_filesystem_path(user_text) {
-        return true;
-    }
-
-    let lower = user_text.to_ascii_lowercase();
-    let mentions_local_subject = [
-        "file",
-        "files",
-        "repo",
-        "repository",
-        "codebase",
-        "directory",
-        "folder",
-        "workspace",
-        "local file",
-        "local files",
-        "current repo",
-        "this repo",
-        "the repo",
-    ]
-    .iter()
-    .any(|kw| contains_keyword_as_words(&lower, kw));
-    let mentions_inspection_verb = [
-        "read", "open", "inspect", "look in", "look at", "search", "scan", "check", "review",
-        "show", "list", "find", "grep", "compare",
-    ]
-    .iter()
-    .any(|kw| contains_keyword_as_words(&lower, kw));
-
-    mentions_local_subject && mentions_inspection_verb
-}
 
 #[cfg(test)]
 mod tests {

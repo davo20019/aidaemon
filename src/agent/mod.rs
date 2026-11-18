@@ -49,30 +49,6 @@ use crate::types::{ChannelContext, UserRole};
 #[cfg(test)]
 use crate::traits::Task;
 
-#[cfg(test)]
-const DEFERRED_NO_TOOL_ERROR_MARKER: &str = "deferred-action no-tool loop";
-#[path = "response_analysis.rs"]
-mod response_analysis;
-#[cfg(test)]
-use response_analysis::looks_like_incomplete_retry_plan;
-#[cfg(test)]
-use response_analysis::sanitize_response_analysis;
-#[cfg(test)]
-use response_analysis::{reply_defers_file_access, user_text_references_file};
-#[path = "intent/keywords.rs"]
-mod intent_keywords;
-#[path = "intent/intent_routing.rs"]
-mod intent_routing;
-#[path = "intent/relational_prefilter.rs"]
-#[cfg(test)]
-pub mod relational_prefilter;
-#[allow(unused_imports)]
-use intent_routing::contains_keyword_as_words;
-#[cfg(test)]
-use intent_routing::infer_intent_gate;
-// Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
-#[allow(unused_imports)]
-pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
 /// Validation state lives in `aidaemon-runtime`.
 #[cfg(test)]
 mod validation_state {
@@ -91,8 +67,6 @@ pub(crate) use execution_state::TargetScope;
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;
 }
-#[cfg(test)]
-use post_task::LearningContext;
 
 #[cfg(feature = "computer_use")]
 mod computer_use;
@@ -227,13 +201,7 @@ pub use policy_metrics::PolicyAutotuneSnapshot;
 #[path = "agent_helpers.rs"]
 mod agent_helpers;
 #[cfg(test)]
-pub(in crate::agent) use agent_helpers::IntentGateDecision;
-#[cfg(test)]
 pub use agent_helpers::touch_heartbeat;
-#[cfg(test)]
-pub(in crate::agent) use agent_helpers::{
-    user_explicitly_requests_local_file_inspection, user_text_references_filesystem_path,
-};
 
 /// The agent is `aidaemon_runtime::agent::Agent`; the daemon builds it
 /// from its config (`construct.rs`) with its own host ports.

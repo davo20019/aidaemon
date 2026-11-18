@@ -64,32 +64,6 @@ fn truncate_impl(s: &str, max_chars: usize, suffix: &str) -> String {
     format!("{}{}", truncated, suffix)
 }
 
-/// Whether `keyword` appears in `text` as whole words (case-insensitive,
-/// surrounding punctuation ignored), so "send" matches "Send it!" but not
-/// "sender".
-pub fn contains_keyword_as_words(text: &str, keyword: &str) -> bool {
-    let normalize = |w: &str| -> String {
-        w.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\'')
-            .to_lowercase()
-    };
-    let text_words: Vec<String> = text
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    let kw_words: Vec<String> = keyword
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty())
-        .collect();
-    if kw_words.is_empty() {
-        return false;
-    }
-    text_words
-        .windows(kw_words.len())
-        .any(|window| window == kw_words.as_slice())
-}
-
 /// Returns the largest byte index ≤ `byte_limit` that falls on a UTF-8 char boundary.
 ///
 /// Use this when you need to slice a string by approximate byte length without panicking.

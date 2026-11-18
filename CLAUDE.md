@@ -178,21 +178,18 @@ Do not assume the config file is the only source of connected channels.
 
 ## Keyword Matching Rule
 
-For natural-language keyword or phrase matching, use word-boundary matching via
-`contains_keyword_as_words()` from `src/agent/intent/intent_routing.rs` (also
-re-exported through `agent` helpers). Avoid substring matching for user/LLM text.
+Decisions come from typed state and structured signals (receipts, outcome
+metadata, annotations, typed errors, schema fields), never from matching words
+in user, model or tool prose. Keyword or substring matching is kept only for:
 
-Examples:
+- exact command words (`/clear`, a CLI flag);
+- markers the daemon itself writes (`[SYSTEM]`, `[UNTRUSTED EXTERNAL DATA`,
+  tool-call protocol tokens), preferably through a shared constant;
+- machine formats: shell command lines (tokenized where cheap), URLs, paths,
+  JSON, DOM class/id markers;
+- external text with no structured signal, narrowed and commented with why.
 
-```rust
-contains_keyword_as_words("deploy the app", "deploy");      // true
-contains_keyword_as_words("check deployed sites", "deploy"); // false
-contains_keyword_as_words("set up monitoring", "set up");    // true
-```
-
-Substring matching with `.contains()` is appropriate for structural markers and
-protocol fragments such as `[tool_use:`, `[tool_call:`, `[INTENT_GATE]`, or for
-long fixed phrases where substring overlap is not a concern.
+Each kept match says which of these it is in a comment next to it.
 
 ## Runtime Invariants
 

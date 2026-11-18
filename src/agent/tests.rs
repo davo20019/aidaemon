@@ -9,8 +9,5 @@ mod goal_delivery_tests;
 #[path = "runtime/goal_failure_tests.rs"]
 mod goal_failure_tests;
 
-#[path = "response_analysis_tests.rs"]
-mod response_analysis_tests;
-
 #[path = "policy/tool_scoping_tests.rs"]
 mod tool_scoping_tests;
