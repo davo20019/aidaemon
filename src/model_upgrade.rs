@@ -83,6 +83,48 @@ struct UpgradeState {
     /// Newer models told about on a pay-per-token provider.
     #[serde(default)]
     suggestions: Vec<Suggestion>,
+    /// Newer models found but not used: the harness does not know them
+    /// yet, or they failed their trial call.
+    #[serde(default)]
+    held: Vec<Held>,
+}
+
+/// Why a newer model was found but not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HeldReason {
+    /// The harness would treat it worse (see [`harness_keeps_up`]); a
+    /// release of aidaemon that knows it is needed.
+    NeedsUpdate,
+    /// Its trial call failed; tried again on the next check.
+    FailedTrial,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Held {
+    slot: Slot,
+    kind_name: String,
+    from: String,
+    to: String,
+    reason: HeldReason,
+    at_ms: u64,
+}
+
+impl UpgradeState {
+    /// Remember a held model once per model and reason.
+    fn hold(&mut self, slot: Slot, kind: ProviderKind, from: &str, to: &str, reason: HeldReason) {
+        if self.held.iter().any(|h| h.to == to && h.reason == reason) {
+            return;
+        }
+        self.held.push(Held {
+            slot,
+            kind_name: maker(kind).to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            reason,
+            at_ms: now_ms(),
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,6 +218,25 @@ pub(crate) fn notices(config_path: &Path) -> Vec<String> {
             switch.from
         ));
     }
+    for held in state.held.iter().filter(|h| h.at_ms >= since) {
+        let label = match held.slot {
+            Slot::Main => "main model".to_string(),
+            Slot::Fallback(_) => format!("{} backup", held.kind_name),
+        };
+        notices.push(match held.reason {
+            HeldReason::NeedsUpdate => format!(
+                "A newer {} model is out: {} (in use: {}). This version of aidaemon does \
+                 not know it well enough to switch safely, so the {label} stays on {}; \
+                 updating aidaemon lets it move.",
+                held.kind_name, held.to, held.from, held.from
+            ),
+            HeldReason::FailedTrial => format!(
+                "A newer {} model is out: {} (in use: {}), but it failed a test call, so \
+                 the {label} stays on {}. The daily check tries it again.",
+                held.kind_name, held.to, held.from, held.from
+            ),
+        });
+    }
     for suggestion in state.suggestions.iter().filter(|s| s.at_ms >= since) {
         notices.push(format!(
             "A newer {} model is out: {} (in use: {}). It may cost more per message; \
@@ -268,13 +329,21 @@ fn harness_keeps_up(old: &str, new: &str, vision: &VisionConfig) -> bool {
     }
 }
 
-/// For each written model with an allowed newer version, the model it moves to.
+/// What a check finds for one provider's written models.
+#[derive(Debug, Default, PartialEq)]
+struct Plan {
+    /// Each model with an allowed newer version, and the model it moves to.
+    moves: BTreeMap<String, String>,
+    /// Newer versions the harness would treat worse: not used.
+    held: BTreeMap<String, String>,
+}
+
 fn plan(
     written: &WrittenModels,
     offered: &[Offered],
     declined: &[String],
     vision: &VisionConfig,
-) -> BTreeMap<String, String> {
+) -> Plan {
     let candidates: Vec<&str> = offered
         .iter()
         .map(|m| m.id.as_str())
@@ -289,7 +358,7 @@ fn plan(
         .chain(&written.smart)
         .chain(&written.fallback)
         .collect();
-    let mut moves = BTreeMap::new();
+    let mut found = Plan::default();
     let current = written
         .default
         .iter()
@@ -297,17 +366,22 @@ fn plan(
         .chain(&written.smart)
         .chain(&written.fallback);
     for model in current {
-        if moves.contains_key(model) {
+        if found.moves.contains_key(model) || found.held.contains_key(model) {
             continue;
         }
-        if let Some(next) = successor(model, candidates.iter().copied())
-            && !configured.iter().any(|c| c.as_str() == next)
-            && harness_keeps_up(model, next, vision)
-        {
-            moves.insert(model.clone(), next.to_string());
+        let Some(next) = successor(model, candidates.iter().copied()) else {
+            continue;
+        };
+        if configured.iter().any(|c| c.as_str() == next) {
+            continue;
+        }
+        if harness_keeps_up(model, next, vision) {
+            found.moves.insert(model.clone(), next.to_string());
+        } else {
+            found.held.insert(model.clone(), next.to_string());
         }
     }
-    moves
+    found
 }
 
 fn slot_table_mut(
@@ -697,7 +771,16 @@ impl ModelUpgrader {
                 configured = ?written,
                 "Model upgrade check: the provider's models"
             );
-            let moves = plan(&written, &offered, &state.declined, &vision);
+            let Plan { moves, held } = plan(&written, &offered, &state.declined, &vision);
+            for (from, to) in &held {
+                info!(
+                    ?slot,
+                    %from,
+                    %to,
+                    "A newer model is out, but this aidaemon does not know it well enough to switch (another trust tier, no vision or a smaller window); an update is needed"
+                );
+                state.hold(*slot, provider.kind, from, to, HeldReason::NeedsUpdate);
+            }
             if moves.is_empty() {
                 info!(
                     ?slot,
@@ -738,7 +821,8 @@ impl ModelUpgrader {
                         proven.insert(from.clone(), to.clone());
                     }
                     Err(error) => {
-                        warn!(%from, %to, %error, "A newer model failed its trial; not switching")
+                        warn!(%from, %to, %error, "A newer model failed its trial; not switching");
+                        state.hold(*slot, provider.kind, from, to, HeldReason::FailedTrial);
                     }
                 }
             }
@@ -775,6 +859,10 @@ impl ModelUpgrader {
 
         for (slot, kind, proven, default, offered) in &switched {
             info!(?slot, ?proven, "Switched to newer models");
+            // A model now in use is no longer held back.
+            state
+                .held
+                .retain(|h| !proven.values().any(|to| to == &h.to));
             if let Some(from) = default
                 && let Some(to) = proven.get(from)
             {
@@ -853,7 +941,7 @@ fast = "gpt-6-luna"
     #[test]
     fn the_default_moves_and_the_old_one_leads_the_fallbacks() {
         let listed = offered(&["gpt-6-sol", "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6-luna"]);
-        let moves = plan(&written(CONFIG, Slot::Main), &listed, &[], &vision());
+        let moves = plan(&written(CONFIG, Slot::Main), &listed, &[], &vision()).moves;
         assert_eq!(
             moves,
             BTreeMap::from([("gpt-6-sol".to_string(), "gpt-6.2-sol".to_string())])
@@ -875,7 +963,7 @@ fast = "gpt-6-luna"
         let fallback = written(CONFIG, Slot::Fallback(0));
         assert_eq!(fallback.default.as_deref(), Some("claude-haiku-5-5"));
         let listed = offered(&["claude-haiku-6", "claude-sonnet-6", "claude-opus-6"]);
-        let moves = plan(&fallback, &listed, &[], &vision());
+        let moves = plan(&fallback, &listed, &[], &vision()).moves;
         assert_eq!(moves.len(), 2);
         let updated = apply(CONFIG, Slot::Fallback(0), &moves).unwrap();
         let after = written(&updated, Slot::Fallback(0));
@@ -894,21 +982,88 @@ default = "gpt-6.2-sol"
 fallback = ["gpt-6.1-sol", "gpt-6-luna"]
 "#;
         let listed = offered(&["gpt-6.1-sol", "gpt-6.2-sol", "gpt-6-luna"]);
-        assert!(plan(&written(after_switch, Slot::Main), &listed, &[], &vision()).is_empty());
+        assert_eq!(
+            plan(&written(after_switch, Slot::Main), &listed, &[], &vision()),
+            Plan::default()
+        );
     }
 
     #[test]
     fn a_declined_model_is_not_offered_again() {
         let listed = offered(&["gpt-6.2-sol"]);
         let declined = vec!["gpt-6.2-sol".to_string()];
-        assert!(plan(&written(CONFIG, Slot::Main), &listed, &declined, &vision()).is_empty());
+        assert_eq!(
+            plan(&written(CONFIG, Slot::Main), &listed, &declined, &vision()),
+            Plan::default()
+        );
     }
 
     #[test]
-    fn a_model_the_harness_would_treat_worse_is_not_offered() {
-        // An unknown family is Guided where the old one is Autonomous.
-        assert!(!harness_keeps_up("grok-4", "grok-5", &vision()));
-        assert!(harness_keeps_up("gpt-6-sol", "gpt-6.2-sol", &vision()));
+    fn a_model_the_harness_would_treat_worse_is_held_and_shown() {
+        // A later version of a known family needs no code change.
+        assert!(harness_keeps_up("grok-4", "grok-5", &vision()));
+        assert!(harness_keeps_up("gpt-6-sol", "gpt-7-sol", &vision()));
+        // Below the frontier version of its family: another trust tier.
+        assert!(!harness_keeps_up(
+            "gemini-2.5-pro",
+            "gemini-2-pro",
+            &vision()
+        ));
+
+        // A newer version the harness would treat worse (here: no vision
+        // where the old one had it) is held, not moved.
+        let config = r#"[provider]
+kind = "openai_chatgpt"
+
+[provider.models]
+default = "gpt-6-sol"
+"#;
+        let listed = offered(&["gpt-7-sol"]);
+        let no_vision_for_7 = VisionConfig {
+            model_patterns: vec!["gpt-6-sol".into()],
+            ..vision()
+        };
+        let found = plan(&written(config, Slot::Main), &listed, &[], &no_vision_for_7);
+        assert!(found.moves.is_empty());
+        assert_eq!(
+            found.held,
+            BTreeMap::from([("gpt-6-sol".to_string(), "gpt-7-sol".to_string())])
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut state = UpgradeState::default();
+        state.hold(
+            Slot::Main,
+            ProviderKind::OpenaiChatgpt,
+            "gpt-6-sol",
+            "gpt-7-sol",
+            HeldReason::NeedsUpdate,
+        );
+        // Held once per model and reason.
+        state.hold(
+            Slot::Main,
+            ProviderKind::OpenaiChatgpt,
+            "gpt-6-sol",
+            "gpt-7-sol",
+            HeldReason::NeedsUpdate,
+        );
+        state.hold(
+            Slot::Fallback(0),
+            ProviderKind::Anthropic,
+            "claude-opus-5-5",
+            "claude-opus-6",
+            HeldReason::FailedTrial,
+        );
+        assert_eq!(state.held.len(), 2);
+        save_state(&config_path, &state);
+        let shown = notices(&config_path);
+        assert!(shown.iter().any(|n| n.contains("gpt-7-sol")
+            && n.contains("updating aidaemon")
+            && n.contains("main model stays on gpt-6-sol")));
+        assert!(shown.iter().any(|n| n.contains("claude-opus-6")
+            && n.contains("failed a test call")
+            && n.contains("Anthropic backup")));
     }
 
     #[test]

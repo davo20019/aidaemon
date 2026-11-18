@@ -5,6 +5,7 @@
 
 pub mod execution;
 pub mod metrics;
+pub mod model_family;
 pub mod recall_guardrails;
 pub mod signals;
 pub mod trust_tier;

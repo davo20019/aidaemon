@@ -324,7 +324,15 @@ pub fn known_context_budget(model: &str) -> Option<usize> {
     KNOWN_CONTEXT_WINDOWS
         .iter()
         .find(|(prefix, _)| name.starts_with(prefix))
-        .map(|(_, window)| window / 100 * 85)
+        .map(|(_, window)| *window)
+        // A later version of a listed family has at least its window.
+        .or_else(|| {
+            crate::policy::model_family::closest_family_pattern(
+                KNOWN_CONTEXT_WINDOWS.iter().map(|(p, w)| (*p, *w)),
+                &name,
+            )
+        })
+        .map(|window| window / 100 * 85)
 }
 
 fn default_context_budget() -> usize {
@@ -426,9 +434,11 @@ impl VisionConfig {
             return false;
         }
         let model_lower = model.to_ascii_lowercase();
-        self.model_patterns
-            .iter()
-            .any(|pattern| model_lower.contains(&pattern.to_ascii_lowercase()))
+        // A family version such as `gpt-6` also covers later versions.
+        self.model_patterns.iter().any(|pattern| {
+            model_lower.contains(&pattern.to_ascii_lowercase())
+                || crate::policy::model_family::covers_later_version(pattern, &model_lower)
+        })
     }
 
     pub fn mime_allowed(&self, mime: &str) -> bool {
@@ -461,9 +471,11 @@ impl AudioConfig {
 
     pub fn model_supports_audio(&self, model: &str) -> bool {
         let model_lower = model.to_ascii_lowercase();
-        self.model_patterns
-            .iter()
-            .any(|pattern| model_lower.contains(&pattern.to_ascii_lowercase()))
+        // A family version such as `gpt-6` also covers later versions.
+        self.model_patterns.iter().any(|pattern| {
+            model_lower.contains(&pattern.to_ascii_lowercase())
+                || crate::policy::model_family::covers_later_version(pattern, &model_lower)
+        })
     }
 }
 
@@ -911,6 +923,26 @@ pub enum IterationLimitConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_later_version_of_a_known_family_keeps_its_window_and_vision() {
+        assert_eq!(known_context_budget("gpt-7-sol"), Some(272_000 / 100 * 85));
+        assert_eq!(
+            known_context_budget("openai/gpt-6.2-sol"),
+            Some(272_000 / 100 * 85)
+        );
+        assert_eq!(known_context_budget("grok-5"), Some(256_000 / 100 * 85));
+        assert_eq!(known_context_budget("gpt-4o"), None);
+        let vision = VisionConfig {
+            enabled: true,
+            max_image_bytes: 1,
+            mime_types: Vec::new(),
+            model_patterns: default_vision_model_patterns(),
+        };
+        assert!(vision.model_supports_vision("gpt-7-sol"));
+        assert!(vision.model_supports_vision("claude-opus-7"));
+        assert!(!vision.model_supports_vision("gpt-oss-120b"));
+    }
 
     #[test]
     fn decisions_backend_typesafe_parses() {

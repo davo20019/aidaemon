@@ -46,7 +46,9 @@ impl TrustTierSetting {
 
 /// Model-id substrings that mark frontier families. Matched against the
 /// lowercased id so provider prefixes ("anthropic/", "us.anthropic.") and
-/// version suffixes pass through.
+/// version suffixes pass through. A family version such as `gpt-6` or
+/// `gemini-3` also covers every later version of that family
+/// ([`super::model_family`]), so a new release needs no entry here.
 const AUTONOMOUS_FAMILY_MARKERS: &[&str] = &[
     "claude-",
     "gpt-4",
@@ -66,7 +68,10 @@ pub fn classify_model_trust(model: &str, setting: TrustTierSetting) -> ModelTrus
         TrustTierSetting::Auto => {}
     }
     let id = model.to_ascii_lowercase();
-    if AUTONOMOUS_FAMILY_MARKERS.iter().any(|f| id.contains(f)) {
+    if AUTONOMOUS_FAMILY_MARKERS
+        .iter()
+        .any(|f| id.contains(f) || super::model_family::covers_later_version(f, &id))
+    {
         return ModelTrustTier::Autonomous;
     }
     // OpenAI o-series ids are too short for substring matching: require the
@@ -110,7 +115,12 @@ mod tests {
             "openrouter/openai/o3",
             "gemini-2.5-pro",
             "gemini-3-pro-preview",
+            "gemini-4-hydrogen",
+            "google/gemini-4-argon",
+            "gpt-7-sol",
+            "claude-opus-7",
             "grok-4",
+            "grok-5",
             "xai/grok-3-mini",
         ] {
             assert_eq!(
