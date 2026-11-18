@@ -45,6 +45,27 @@ impl FactStance {
     }
 }
 
+/// Whom a proposed fact is about, as the extractor reads the user's
+/// message. An owner identity fact (the user's own name) is stored only when
+/// it is [`Owner`]: a name the user merely mentions ("Tell Jordan hi") is
+/// [`Other`]. Missing or unknown values are [`Unstated`].
+///
+/// [`Owner`]: FactSubject::Owner
+/// [`Other`]: FactSubject::Other
+/// [`Unstated`]: FactSubject::Unstated
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactSubject {
+    /// The user states it about themselves.
+    Owner,
+    /// It is about someone or something else.
+    Other,
+    /// No subject given, or one this schema does not know.
+    #[default]
+    #[serde(other)]
+    Unstated,
+}
+
 /// A fact proposed by progressive extraction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineFact {
@@ -59,6 +80,10 @@ pub struct InlineFact {
     /// Missing or non-string reads as empty, which is never stored.
     #[serde(default, deserialize_with = "lenient_string")]
     pub evidence: String,
+    /// Whom the fact is about. Missing, null or unknown values read as
+    /// [`FactSubject::Unstated`].
+    #[serde(default, deserialize_with = "lenient_subject")]
+    pub subject: FactSubject,
     /// The key of an already-stored fact this proposal carries the same
     /// information as. A restatement is never stored again.
     #[serde(default, deserialize_with = "lenient_key")]
@@ -89,6 +114,13 @@ pub struct InlineFact {
 }
 
 fn lenient_stance<'de, D: Deserializer<'de>>(deserializer: D) -> Result<FactStance, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default())
+}
+
+fn lenient_subject<'de, D: Deserializer<'de>>(deserializer: D) -> Result<FactSubject, D::Error> {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value
         .and_then(|value| serde_json::from_value(value).ok())
@@ -143,6 +175,14 @@ pub fn admissibility(fact: &InlineFact, user_text: &str) -> Result<(), Inadmissi
         return Err(Inadmissible::EvidenceNotInUserText);
     }
     Ok(())
+}
+
+/// Whether `quote` is a non-empty citation of `source`: it occurs in it
+/// after [`normalize_quote`]. Validates a citation against its source; it
+/// does not interpret what the words mean.
+pub(crate) fn quote_occurs_in(quote: &str, source: &str) -> bool {
+    let quote = normalize_quote(quote);
+    !quote.is_empty() && normalize_quote(source).contains(&quote)
 }
 
 /// Lowercase, typographic quotes folded to ASCII, whitespace runs collapsed,
@@ -337,7 +377,7 @@ impl ProgressiveExtractor {
     pub async fn propose(&self, exchange: &Exchange<'_>) -> anyhow::Result<Vec<InlineFact>> {
         let _permit = self.permits.acquire().await?;
         let system = ["You extract durable facts from conversations. Only extract facts that would be useful to remember long-term. \
-                        Return a JSON array of objects with 'category', 'key', 'value', 'stance', 'evidence', and optional 'restates', 'updates', 'graph' or 'personal_memory' fields.\n\n\
+                        Return a JSON array of objects with 'category', 'key', 'value', 'stance', 'evidence', 'subject', and optional 'restates', 'updates', 'graph' or 'personal_memory' fields.\n\n\
                         STANCE (required): how the USER's message relates to the fact. One of: \
                         \"asserted\" (the user states it), \"asked\" (the user asks whether it is so), \
                         \"presupposed\" (the user's question or request assumes it without stating it), \
@@ -345,6 +385,8 @@ impl ProgressiveExtractor {
                         a question never asserts its own premise.\n\
                         EVIDENCE (required): an exact, verbatim quote copied from the USER's message that states the fact. \
                         Never quote the assistant, never paraphrase. If you cannot quote the user stating it, do not propose it.\n\
+                        SUBJECT (required): \"owner\" when the fact is about the user themself, \"other\" when it is about anyone or anything else. \
+                        A name the user mentions, addresses or asks about is \"other\"; only the user's own statement of their own name is \"owner\".\n\
                         RESTATES (optional): when an ALREADY STORED list is given, set this to the key of the stored entry \
                         that carries the same information as your proposal; such proposals are not stored again.\n\
                         UPDATES (optional): when the user gives a listed entry's attribute a new value, set this to that entry's key.\n\n\
@@ -363,11 +405,12 @@ impl ProgressiveExtractor {
                         Do not infer entity types from fact category/key names, invent entities, or add a relationship unless both endpoints are present.\n\n\
                         If nothing is worth remembering, return an empty array: []\n\n\
                         Examples:\n\
-                        - \"My dog's name is Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Mia\",\"stance\":\"asserted\",\"evidence\":\"My dog's name is Mia\"}]\n\
-                        - \"Actually my dog's name is Max, not Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Max\",\"stance\":\"asserted\",\"evidence\":\"my dog's name is Max\"}]\n\
-                        - \"I prefer dark mode\" → [{\"category\":\"preference\",\"key\":\"ui_theme\",\"value\":\"Prefers dark mode\",\"stance\":\"asserted\",\"evidence\":\"I prefer dark mode\"}]\n\
+                        - \"My dog's name is Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Mia\",\"stance\":\"asserted\",\"evidence\":\"My dog's name is Mia\",\"subject\":\"owner\"}]\n\
+                        - \"Actually my dog's name is Max, not Mia\" → [{\"category\":\"user\",\"key\":\"dog_name\",\"value\":\"Max\",\"stance\":\"asserted\",\"evidence\":\"my dog's name is Max\",\"subject\":\"owner\"}]\n\
+                        - \"I prefer dark mode\" → [{\"category\":\"preference\",\"key\":\"ui_theme\",\"value\":\"Prefers dark mode\",\"stance\":\"asserted\",\"evidence\":\"I prefer dark mode\",\"subject\":\"owner\"}]\n\
                         - \"My sister Alice lives in Tokyo, not Paris\" → emit personal_memory entities for Alice and Tokyo plus a LIVES_IN relationship, with stance \"asserted\" and evidence \"My sister Alice lives in Tokyo\"; do not create sister_location\n\
                         - \"Do you know what kind of car I drive?\" → [] (a question: the user asks, and only presupposes owning a car)\n\
+                        - \"Tell Jordan hi from me\" → [] (Jordan is someone the user mentions, never the user's name)\n\
                         - \"How's the weather?\" → []\n\n\
                         IMPORTANT: Return ONLY the JSON array, no other text.\n\n", FACT_LIFETIME_INSTRUCTION].concat();
         let system = match exchange.project {
@@ -460,7 +503,8 @@ impl ProgressiveExtractor {
             return Vec::new();
         }
         let first_seen_at = exchange.stated_at;
-        // One snapshot of active facts, to suppress recall restatements.
+        // One snapshot of active facts, to skip a fact already stored under
+        // another category.
         let existing_facts = store.get_facts(None).await.unwrap_or_default();
         let mut written: Vec<Value> = Vec::new();
         for fact in facts {
@@ -501,28 +545,14 @@ impl ProgressiveExtractor {
                 );
                 continue;
             }
-            // Identity facts (user.name etc.) must be evidenced by the
-            // user's own words: a name merely mentioned is not the user's.
-            if identity_fact_lacks_user_evidence(
-                &fact.category,
-                &fact.key,
-                &fact.value,
-                exchange.user_text,
-            ) {
+            // An owner identity fact (the user's own name) needs the
+            // extractor's typed statement that the user said it about
+            // themselves: admissibility already proved the quote is theirs.
+            if identity_fact_lacks_self_statement(&fact) {
                 warn!(
                     key = fact.key,
-                    value = fact.value,
-                    "Skipping user identity fact without evidence in the user's message"
-                );
-                continue;
-            }
-            // The assistant recalling a stored fact is not new information.
-            if is_redundant_recall_fact(&fact.key, &fact.value, exchange.user_text, &existing_facts)
-            {
-                debug!(
-                    key = fact.key,
-                    value = fact.value,
-                    "Skipping recall-restatement of a fact already in memory"
+                    subject = ?fact.subject,
+                    "Skipping user identity fact the user did not state about themselves"
                 );
                 continue;
             }
@@ -661,28 +691,35 @@ fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
     }
 }
 
-/// Identity-class `user` fact keys that require first-person evidence in the
-/// user's own message before they may be persisted.
+/// Identity-class `user` fact keys: the owner's own name.
 const USER_IDENTITY_KEYS: &[&str] = &["name", "full_name", "first_name", "last_name", "nickname"];
 
-/// Returns true when an extracted `user` identity fact (e.g. `name`) has no
-/// supporting evidence in the user's own words.
-///
-/// Guards against the extraction model misattributing a third-party name
-/// (someone merely mentioned in conversation) — or a hallucinated one — as
-/// the user's identity, which then poisons every future prompt that injects
-/// the user profile.
+/// Whether `category`/`key` names the owner's identity (canonical keys).
+fn is_owner_identity_key(category: &str, key: &str) -> bool {
+    category.trim().eq_ignore_ascii_case("user")
+        && USER_IDENTITY_KEYS.contains(&key.trim().to_ascii_lowercase().as_str())
+}
+
+/// True when a proposed owner identity fact (e.g. `user.name`) lacks the
+/// extractor's typed statement that the user gave it about themselves
+/// ([`FactSubject::Owner`]), or its value is empty. A name the user only
+/// mentions ("Tell Jordan hi") never becomes the owner's.
+pub fn identity_fact_lacks_self_statement(fact: &InlineFact) -> bool {
+    is_owner_identity_key(&fact.category, &fact.key)
+        && (fact.subject != FactSubject::Owner || fact.value.trim().chars().count() <= 1)
+}
+
+/// Consolidation's identity guard: its extractor returns no evidence span or
+/// subject, so an owner identity value must at least appear in the owner's
+/// own messages. Progressive extraction uses
+/// [`identity_fact_lacks_self_statement`] instead.
 pub fn identity_fact_lacks_user_evidence(
     category: &str,
     key: &str,
     value: &str,
     user_text: &str,
 ) -> bool {
-    if !category.trim().eq_ignore_ascii_case("user") {
-        return false;
-    }
-    let key_norm = key.trim().to_ascii_lowercase();
-    if !USER_IDENTITY_KEYS.contains(&key_norm.as_str()) {
+    if !is_owner_identity_key(category, key) {
         return false;
     }
     let value_norm = value.trim().to_lowercase();
@@ -708,58 +745,6 @@ fn normalize_fact_key_for_match(key: &str) -> String {
         }
     }
     out.trim_matches('_').to_string()
-}
-
-/// True when an extracted fact is merely the assistant recalling/restating a
-/// fact we already store — not new information the user provided this turn.
-///
-/// Progressive extraction is fed the assistant's reply as well as the user's
-/// message, so on a recall turn ("what's my DB port?" → "You prefer port 54329")
-/// it would otherwise re-extract `54329` and persist it AGAIN — often under a
-/// different category than the original — duplicating the fact and letting
-/// "forgotten" facts resurface every time they're recalled.
-///
-/// Fires when the value is absent from the user's message (so it came from the
-/// assistant, not the user) AND an active fact already holds that exact value,
-/// under EITHER the same canonical key OR — for a distinctive multi-word value —
-/// any key. The second case catches recall duplication where the extractor
-/// invents a fresh key for a value it just recalled (e.g. "yerba mate" recalled
-/// as `late_night_coding_beverage` / `beverage` when it's already stored as
-/// `programming_beverage`).
-///
-/// The distinctive-value gate (≥2 word tokens) keeps this safe: a common
-/// single-word value like "blue" or "daily" re-appearing under a new key is left
-/// alone, since it may legitimately describe a different attribute. Corrections
-/// (the value differs) and user-stated values are never dropped.
-fn is_redundant_recall_fact(
-    fact_key: &str,
-    fact_value: &str,
-    user_message: &str,
-    existing: &[Fact],
-) -> bool {
-    let value_norm = fact_value.trim().to_lowercase();
-    if value_norm.is_empty() {
-        return false;
-    }
-    // If the user actually stated the value this turn, treat it as new/affirmed.
-    if user_message.to_lowercase().contains(&value_norm) {
-        return false;
-    }
-    let key_norm = normalize_fact_key_for_match(fact_key);
-    let value_is_distinctive = value_norm
-        .split_whitespace()
-        .filter(|w| w.len() >= 2)
-        .count()
-        >= 2;
-    existing.iter().any(|f| {
-        if f.superseded_at.is_some() {
-            return false;
-        }
-        if f.value.trim().to_lowercase() != value_norm {
-            return false;
-        }
-        normalize_fact_key_for_match(&f.key) == key_norm || value_is_distinctive
-    })
 }
 
 /// True when an active fact already holds this exact canonical key and value
@@ -826,108 +811,11 @@ mod tests {
     }
 
     #[test]
-    fn redundant_recall_fact_blocks_restatement_of_known_fact() {
-        // The live bug: recalling the port ("You prefer port 54329") must NOT
-        // re-store it, especially under a different category.
-        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
-        assert!(is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "what database port did I tell you I prefer?",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_user_stated_value() {
-        // User states the value this turn → legitimately new/affirmed, keep it.
-        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "my local dev db port is 54329",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_correction_to_new_value() {
-        // Different value (a correction) is never suppressed, even if the user
-        // didn't restate it verbatim.
-        let existing = vec![active_fact("preference", "local_dev_db_port", "54329")];
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "9090",
-            "actually change my dev db port",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_blocks_distinctive_value_under_new_key() {
-        // The yerba-mate case: recalled value re-extracted under a fresh key.
-        // "yerba mate" is distinctive (2 words) → suppress the duplicate.
-        let existing = vec![active_fact(
-            "preference",
-            "programming_beverage",
-            "yerba mate",
-        )];
-        assert!(is_redundant_recall_fact(
-            "late_night_coding_beverage",
-            "yerba mate",
-            "what do I sip on during late-night coding sessions?",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_common_value_under_new_key() {
-        // A common single-word value ("blue") under a different key may describe a
-        // genuinely different attribute → must NOT be suppressed.
-        let existing = vec![active_fact("user", "car_color", "blue")];
-        assert!(!is_redundant_recall_fact(
-            "laptop_color",
-            "blue",
-            "my laptop matches my car",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_allows_genuinely_new_fact() {
-        // No existing fact with this key → it's new information.
-        let existing = vec![active_fact("preference", "ui_theme", "dark")];
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "the assistant mentioned a port",
-            &existing,
-        ));
-    }
-
-    #[test]
-    fn redundant_recall_fact_ignores_superseded_existing() {
-        // A superseded duplicate must not anchor the guard.
-        let mut superseded = active_fact("preference", "local_dev_db_port", "54329");
-        superseded.superseded_at = Some(chrono::Utc::now());
-        assert!(!is_redundant_recall_fact(
-            "local_dev_db_port",
-            "54329",
-            "what is my port?",
-            &[superseded],
-        ));
-    }
-
-    #[test]
     fn progressive_skips_fact_the_agent_already_stored_this_turn() {
         // The agent saved it via remember_fact; extraction re-files the same
         // user-stated key/value under its own category guess. Must not duplicate,
-        // even though the user stated the value (the recall guard allows that).
+        // even though the user stated the value.
         let existing = vec![active_fact("test", "qa_color", "teal")];
-        let user_text = "remember qa_color=teal";
-        assert!(!is_redundant_recall_fact(
-            "qa_color", "teal", user_text, &existing
-        ));
         assert!(duplicates_active_fact_in_other_category(
             "technical",
             "qa-color",
@@ -969,56 +857,13 @@ mod tests {
     }
 
     #[test]
-    fn identity_guard_blocks_unevidenced_user_name() {
+    fn consolidation_identity_guard_blocks_unevidenced_user_name() {
         // Third-party or hallucinated name not present in the user's words.
         assert!(identity_fact_lacks_user_evidence(
             "user",
             "name",
             "Jordan Lee",
             "Tell me about the grant applicant and their nationality"
-        ));
-    }
-
-    #[test]
-    fn identity_guard_allows_first_person_name() {
-        assert!(!identity_fact_lacks_user_evidence(
-            "user",
-            "name",
-            "Jordan Lee",
-            "Hi, my name is Jordan Lee and I live in Lisbon"
-        ));
-        // Case-insensitive match.
-        assert!(!identity_fact_lacks_user_evidence(
-            "user",
-            "Name",
-            "jordan lee",
-            "I'm Jordan Lee"
-        ));
-    }
-
-    #[test]
-    fn identity_guard_ignores_non_identity_facts() {
-        // Other user facts are not gated (dog_name is not the user's identity).
-        assert!(!identity_fact_lacks_user_evidence(
-            "user",
-            "dog_name",
-            "Mia",
-            "what's the weather?"
-        ));
-        // Non-user categories are never gated.
-        assert!(!identity_fact_lacks_user_evidence(
-            "project",
-            "name",
-            "aidaemon",
-            "unrelated text"
-        ));
-    }
-
-    #[test]
-    fn identity_guard_blocks_trivial_values() {
-        assert!(identity_fact_lacks_user_evidence("user", "name", "x", "x"));
-        assert!(identity_fact_lacks_user_evidence(
-            "user", "name", " ", "anything"
         ));
     }
 
@@ -1341,6 +1186,40 @@ mod tests {
         let personal = store.personal.lock().unwrap();
         assert_eq!(personal.len(), 1);
         assert!(personal[0].direct_user_statement);
+    }
+
+    #[tokio::test]
+    async fn a_name_the_user_only_mentions_never_becomes_their_name() {
+        let store = RecordingFacts::default();
+        let user = "Tell Jordan hi from me when you see him";
+        // The quote is the user's and the stance asserted; the subject is
+        // someone else, or not given at all.
+        for subject in [r#","subject":"other""#, ""] {
+            let reply = format!(
+                r#"[{{"category":"user","key":"name","value":"Jordan","stance":"asserted","evidence":"Tell Jordan hi"{subject}}}]"#
+            );
+            let (written, _) = propose_and_write(&store, &exchange(user, &[]), &reply).await;
+            assert!(written.is_empty(), "{subject}: {written:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_users_own_name_is_stored_from_a_self_statement() {
+        let store = RecordingFacts::default();
+        let user = "Hi there, my name is Alice Rivera";
+        let reply = r#"[{"category":"user","key":"name","value":"Alice Rivera","stance":"asserted","evidence":"my name is Alice Rivera","subject":"owner"}]"#;
+        let (written, _) = propose_and_write(&store, &exchange(user, &[]), reply).await;
+        assert_eq!(written.len(), 1, "{written:?}");
+    }
+
+    #[tokio::test]
+    async fn a_paraphrased_correction_of_a_stored_value_is_kept() {
+        // The value is not in the user's words; the quote and stance are.
+        let store = RecordingFacts::default();
+        let user = "Please switch my dev database port to the Postgres default";
+        let reply = r#"[{"category":"preference","key":"local_dev_db_port","value":"Dev database uses port 5432","stance":"asserted","evidence":"switch my dev database port to the Postgres default","subject":"owner"}]"#;
+        let (written, _) = propose_and_write(&store, &exchange(user, &[]), reply).await;
+        assert_eq!(written.len(), 1, "{written:?}");
     }
 
     fn agent_fact(key: &str, value: &str, updated_at: DateTime<Utc>) -> Fact {

@@ -300,9 +300,10 @@ fn owner_history(session: &str, start: DateTime<Utc>) -> Vec<Event> {
     // Fact provenance, starting before any user message.
     h.remember(json!({"category": "profile", "key": "no_user", "value": "anything"}));
     h.user("Alice Rivera works at Acme Corp and lives in Lisbon");
-    h.remember(json!({"category": "profile", "key": "city", "value": "LISBON"}));
+    h.remember(json!({"category": "profile", "key": "city", "value": "LISBON", "evidence": "lives in Lisbon"}));
     h.remember(json!({"facts": [
-        {"category": "profile", "key": "employer", "value": "acme corp"},
+        {"category": "profile", "key": "employer", "value": "acme corp", "evidence": "works at Acme Corp"},
+        {"category": "profile", "key": "misquoted", "value": "acme corp", "evidence": "my employer is Acme Corp"},
         {"category": "profile", "key": "derived_one", "value": "not in the message"},
         {"category": "profile", "value": "entry without a key"}
     ]}));

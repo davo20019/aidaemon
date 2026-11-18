@@ -58,7 +58,14 @@ pub enum TraceEvent {
     },
     /// A message from the user. A host leaves out the ones it wrote itself
     /// (continuations of a run, for example).
-    UserMessage { content: String, at: DateTime<Utc> },
+    UserMessage {
+        content: String,
+        at: DateTime<Utc>,
+        /// The owner wrote it: their role, not a mandate worker, and not
+        /// wrapped untrusted external data. Only such a message can make a
+        /// remembered fact owner-stated.
+        owner_authored: bool,
+    },
     /// A check the run went through.
     DecisionPoint(DecisionPoint),
 }
@@ -891,28 +898,37 @@ impl TaskLearner {
         }
     }
 
-    /// Mark each fact written by the remember tool as stated by the user
-    /// (their last message contains the value) or derived.
+    /// Mark each fact written by the remember tool as stated by the owner
+    /// or derived. Owner-stated (`user_stated`, rank 2) needs the call's
+    /// typed `evidence`: a quote the model gives as the owner's words, found
+    /// in the last user message, which the owner wrote. A value that merely
+    /// occurs in the message ("blue" in "I don't like blue", or in pasted
+    /// text) proves nothing; without such a quote the fact is `derived`.
     async fn stamp_fact_provenance(&self, trace: &[TraceEvent]) {
-        let mut last_user_message: Option<(&str, DateTime<Utc>)> = None;
+        let mut last_user_message: Option<(&str, DateTime<Utc>, bool)> = None;
         for event in trace {
             match event {
-                TraceEvent::UserMessage { content, at } => {
-                    last_user_message = Some((content, *at));
+                TraceEvent::UserMessage {
+                    content,
+                    at,
+                    owner_authored,
+                } => {
+                    last_user_message = Some((content, *at, *owner_authored));
                 }
                 TraceEvent::ToolCalled {
                     name,
                     arguments: Some(arguments),
                     ..
                 } if name == REMEMBER_FACT_TOOL => {
-                    for (category, key, value) in remembered_facts(arguments) {
+                    for fact in remembered_facts(arguments) {
                         let mut source = "derived";
                         let mut source_excerpt = None;
                         let mut first_seen_at = None;
-                        if let Some((message, at)) = last_user_message {
-                            let lower_value = value.to_lowercase();
-                            if lower_value.len() > 3
-                                && message.to_lowercase().contains(&lower_value)
+                        if let Some((message, at, owner_authored)) = last_user_message {
+                            if owner_authored
+                                && fact.evidence.as_deref().is_some_and(|evidence| {
+                                    crate::progressive::quote_occurs_in(evidence, message)
+                                })
                             {
                                 source = "user_stated";
                             }
@@ -922,8 +938,8 @@ impl TaskLearner {
                         let _ = self
                             .stores
                             .stamp_fact_provenance(
-                                &category,
-                                &key,
+                                &fact.category,
+                                &fact.key,
                                 source,
                                 first_seen_at,
                                 source_excerpt.as_deref(),
@@ -937,12 +953,28 @@ impl TaskLearner {
     }
 }
 
-/// The `(category, key, value)` entries of a remember call: its `facts`
-/// list when it has one, otherwise the call's own fields.
-fn remembered_facts(arguments: &Value) -> Vec<(String, String, String)> {
+/// One fact of a remember call, with the quote the model gave as the
+/// owner's words, if any.
+struct RememberedFact {
+    category: String,
+    key: String,
+    evidence: Option<String>,
+}
+
+/// The facts of a remember call: its `facts` list when it has one,
+/// otherwise the call's own fields. An entry without its own `evidence`
+/// takes the call's.
+fn remembered_facts(arguments: &Value) -> Vec<RememberedFact> {
+    let text =
+        |value: &Value, name: &str| value.get(name).and_then(Value::as_str).map(str::to_string);
+    let call_evidence = text(arguments, "evidence");
     let entry = |fact: &Value| {
-        let field = |name: &str| fact.get(name).and_then(Value::as_str).map(str::to_string);
-        Some((field("category")?, field("key")?, field("value")?))
+        text(fact, "value")?;
+        Some(RememberedFact {
+            category: text(fact, "category")?,
+            key: text(fact, "key")?,
+            evidence: text(fact, "evidence").or_else(|| call_evidence.clone()),
+        })
     };
     match arguments.get("facts").and_then(Value::as_array) {
         Some(facts) => facts.iter().filter_map(entry).collect(),
@@ -1285,6 +1317,7 @@ mod tests {
             trace.push(TraceEvent::UserMessage {
                 content: "still there?".into(),
                 at: Utc::now(),
+                owner_authored: true,
             });
         }
         trace.push(returned("t1", "terminal", true));
@@ -1445,10 +1478,12 @@ mod tests {
                 TraceEvent::UserMessage {
                     content: "Alice Rivera lives in Lisbon".into(),
                     at,
+                    owner_authored: true,
                 },
                 remember(
                     serde_json::json!({"facts": [
-                        {"category": "profile", "key": "city", "value": "LISBON"}
+                        {"category": "profile", "key": "city", "value": "LISBON",
+                         "evidence": "lives in Lisbon"}
                     ]}),
                     "remember_fact",
                 ),
@@ -1472,6 +1507,63 @@ mod tests {
             assert_eq!(rows[1].1, "derived");
             assert_eq!(rows[1].2, None);
             assert_eq!(rows[2].1, "agent");
+        }
+
+        /// A value found in the owner's message is not their statement of
+        /// it: only a quote of their words, in a message they wrote, is.
+        #[tokio::test]
+        async fn only_an_owner_quote_makes_a_remembered_fact_owner_stated() {
+            let cases = [
+                // The value occurs in the message, but no quote was given.
+                ("I don't like blue at all", true, None),
+                // The quote is not in the message.
+                (
+                    "I don't like blue at all",
+                    true,
+                    Some("my favorite color is blue"),
+                ),
+                // The quote is in the message, which the owner did not write.
+                (
+                    "My favorite color is blue",
+                    false,
+                    Some("favorite color is blue"),
+                ),
+            ];
+            for (message, owner_authored, evidence) in cases {
+                let (pool, memory) = memory().await;
+                let mut call = serde_json::json!(
+                    {"category": "preference", "key": "favorite_color", "value": "blue"}
+                );
+                if let Some(evidence) = evidence {
+                    call["evidence"] = evidence.into();
+                }
+                let trace = vec![
+                    TraceEvent::UserMessage {
+                        content: message.into(),
+                        at: Utc::now(),
+                        owner_authored,
+                    },
+                    remember(call, "remember_fact"),
+                ];
+                memory
+                    .upsert_fact(
+                        "preference",
+                        "favorite_color",
+                        "blue",
+                        "agent",
+                        None,
+                        crate::records::FactPrivacy::Global,
+                    )
+                    .await
+                    .unwrap();
+                TaskLearner::new(stores(&memory)).learn(&trace, &[]).await;
+                let source: String =
+                    sqlx::query_scalar("SELECT source FROM facts WHERE key = 'favorite_color'")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(source, "derived", "{message} / {evidence:?}");
+            }
         }
 
         #[tokio::test]

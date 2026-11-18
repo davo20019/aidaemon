@@ -451,12 +451,23 @@ fn trace_events(events: &[Event]) -> Vec<TraceEvent> {
             }
             EventType::UserMessage => {
                 let data = event.parse_data::<UserMessageData>().ok()?;
+                // Typed provenance: the owner's role, not a mandate worker,
+                // and not wrapped untrusted external data.
+                let owner_authored = data.user_role.as_deref() == Some("owner")
+                    && data.execution_origin.is_none()
+                    && !data.annotations.iter().any(|annotation| {
+                        matches!(
+                            annotation,
+                            MessageAnnotation::WrappedUntrustedExternalData { .. }
+                        )
+                    });
                 (!data
                     .annotations
                     .contains(&MessageAnnotation::InternalContinuation))
                 .then_some(TraceEvent::UserMessage {
                     content: data.content,
                     at: event.created_at,
+                    owner_authored,
                 })
             }
             EventType::DecisionPoint => {

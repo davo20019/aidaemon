@@ -102,7 +102,6 @@ manage_people.name
 manage_people.notes
 manage_people.platform_id
 manage_people.relationship
-manage_people.value
 manage_skills.approve
 manage_skills.draft_id
 manage_skills.dry_run
@@ -112,6 +111,7 @@ manage_skills.url
 remember_fact.category
 remember_fact.facts
 remember_fact.facts[].category
+remember_fact.facts[].evidence
 remember_fact.facts[].key
 remember_fact.facts[].scope
 remember_fact.key

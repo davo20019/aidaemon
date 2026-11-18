@@ -442,7 +442,7 @@
         "profile",
         "after_continuation",
         "seeded value",
-        "user_stated",
+        "derived",
         "2026-03-01T10:00:01+00:00",
         "Alice Rivera works at Acme Corp and lives in Lisbon",
         "0"
@@ -451,7 +451,7 @@
         "profile",
         "friend_city",
         "seeded value",
-        "user_stated",
+        "derived",
         "2026-03-01T10:00:11+00:00",
         "Jordan Lee mudó a Quito. ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñand...",
         "0"
@@ -1064,7 +1064,7 @@
         "profile",
         "after_continuation",
         "seeded value",
-        "user_stated",
+        "derived",
         "2026-03-01T10:00:01+00:00",
         "Alice Rivera works at Acme Corp and lives in Lisbon",
         "0"
@@ -1073,7 +1073,7 @@
         "profile",
         "friend_city",
         "seeded value",
-        "user_stated",
+        "derived",
         "2026-03-01T10:00:11+00:00",
         "Jordan Lee mudó a Quito. ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñandú añejo ñand...",
         "0"

@@ -14,6 +14,10 @@
           "description": "Forget category/key; value is ignored.",
           "type": "boolean"
         },
+        "evidence": {
+          "description": "The owner's own words stating this fact, copied verbatim from their message. Omit when they did not state it (inferred, asked, negated, or from a tool, file or page).",
+          "type": "string"
+        },
         "facts": {
           "items": {
             "properties": {
@@ -23,6 +27,9 @@
               "delete": {
                 "description": "Forget this fact; value is ignored.",
                 "type": "boolean"
+              },
+              "evidence": {
+                "type": "string"
               },
               "key": {
                 "type": "string"

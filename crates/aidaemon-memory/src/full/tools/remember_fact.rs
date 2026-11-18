@@ -95,6 +95,21 @@ static SCOPE_SCHEMA: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
     })
 });
 
+/// The `evidence` parameter, shared by the single fact and `facts` entries.
+/// The learner reads it after the run: a quote found in the owner's own
+/// message marks the fact as stated by the owner, anything else as derived
+/// (see `TaskLearner`'s provenance stamping).
+static EVIDENCE_SCHEMA: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
+    json!({
+        "type": "string",
+        "description": "The owner's own words stating this fact, copied verbatim from their message. Omit when they did not state it (inferred, asked, negated, or from a tool, file or page)."
+    })
+});
+
+/// The `evidence` of a `facts` entry: as [`EVIDENCE_SCHEMA`], described once.
+static ENTRY_EVIDENCE_SCHEMA: std::sync::LazyLock<Value> =
+    std::sync::LazyLock::new(|| json!({"type": "string"}));
+
 /// The `scope` of a `facts` entry: as [`SCOPE_SCHEMA`], described once.
 static ENTRY_SCOPE_SCHEMA: std::sync::LazyLock<Value> =
     std::sync::LazyLock::new(|| json!({"type": "string", "enum": ["project", "personal"]}));
@@ -159,6 +174,7 @@ impl Tool for RememberFactTool {
                         "description": "Forget category/key; value is ignored."
                     },
                     "scope": SCOPE_SCHEMA.clone(),
+                    "evidence": EVIDENCE_SCHEMA.clone(),
                     "facts": {
                         "type": "array",
                         "items": {
@@ -178,7 +194,8 @@ impl Tool for RememberFactTool {
                                     "type": "boolean",
                                     "description": "Forget this fact; value is ignored."
                                 },
-                                "scope": ENTRY_SCOPE_SCHEMA.clone()
+                                "scope": ENTRY_SCOPE_SCHEMA.clone(),
+                                "evidence": ENTRY_EVIDENCE_SCHEMA.clone()
                             },
                             "required": ["category", "key"]
                         }
