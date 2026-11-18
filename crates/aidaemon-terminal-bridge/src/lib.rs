@@ -404,6 +404,31 @@ impl ReviewDiffBase {
     }
 }
 
+/// A reviewer's verdict. The prompt asks for exactly `approve` or
+/// `needs_changes`; anything else, or none, is `NeedsChanges`, so an
+/// unclear review never passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewVerdict {
+    Approve,
+    NeedsChanges,
+}
+
+impl ReviewVerdict {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("approve") => Self::Approve,
+            _ => Self::NeedsChanges,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::NeedsChanges => "needs_changes",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ReviewResponseCandidate {
     verdict: Option<String>,
@@ -1972,11 +1997,7 @@ fn parse_review_output_payload(
         return Err(message);
     };
 
-    let requested_verdict = candidate
-        .verdict
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
+    let requested_verdict = ReviewVerdict::parse(candidate.verdict.as_deref());
     let blocking = normalize_review_items(candidate.blocking.unwrap_or_default());
     let risks = normalize_review_items(candidate.risks.unwrap_or_default());
     let suggestions = normalize_review_items(candidate.suggestions.unwrap_or_default());
@@ -1987,19 +2008,16 @@ fn parse_review_output_payload(
             Some("critical" | "high" | "medium")
         )
     });
-    let mut verdict = if requested_verdict.contains("needs") || requested_verdict.contains("change")
-    {
-        "needs_changes".to_string()
-    } else if (requested_verdict.contains("approve") || requested_verdict.contains("pass"))
-        && blocking.is_empty()
-        && risks.is_empty()
-        && !has_non_low_findings
-    {
-        "approve".to_string()
-    } else if !blocking.is_empty() || !risks.is_empty() || has_non_low_findings {
-        "needs_changes".to_string()
-    } else {
-        "approve".to_string()
+    // The reviewer's own verdict, read by exact value, can only be
+    // tightened by its lists: an approve that names blocking items, risks
+    // or a medium-or-worse finding is not an approve.
+    let verdict = match requested_verdict {
+        ReviewVerdict::Approve
+            if blocking.is_empty() && risks.is_empty() && !has_non_low_findings =>
+        {
+            ReviewVerdict::Approve
+        }
+        _ => ReviewVerdict::NeedsChanges,
     };
 
     let mut summary = candidate.summary.unwrap_or_default();
@@ -2014,24 +2032,13 @@ fn parse_review_output_payload(
     }
     summary = truncate_with_note(summary.trim(), REVIEW_SUMMARY_MAX_CHARS);
 
-    if verdict == "approve" && (!blocking.is_empty() || !risks.is_empty() || has_non_low_findings) {
-        let lower = meaningful.to_ascii_lowercase();
-        if lower.contains("must fix")
-            || lower.contains("blocking")
-            || lower.contains("needs changes")
-            || lower.contains("do not approve")
-        {
-            verdict = "needs_changes".to_string();
-        }
-    }
-
     Ok(json!({
         "kind":"review_result",
         "request_id": request_id,
         "reviewer": reviewer,
         "scope": scope.as_str(),
         "diff_base": diff_base.as_str(),
-        "verdict": verdict,
+        "verdict": verdict.as_str(),
         "findings": findings,
         "blocking": blocking,
         "risks": risks,
@@ -2053,6 +2060,7 @@ fn build_review_prompt(
     prompt.push_str("{\"verdict\":\"approve|needs_changes\",\"summary\":\"...\",\"findings\":[{\"severity\":\"critical|high|medium|low\",\"file\":\"path/to/file\",\"line\":123,\"issue\":\"...\",\"fix\":\"...\"}],\"blocking\":[\"...\"],\"risks\":[\"...\"],\"suggestions\":[\"...\"]}\n");
     prompt.push_str("Rules:\n");
     prompt.push_str("- Prefer concrete findings over generic advice.\n");
+    prompt.push_str("- \"verdict\" is exactly \"approve\" or \"needs_changes\"; any other value, or none, counts as \"needs_changes\".\n");
     prompt.push_str("- If there is any meaningful risk, use verdict \"needs_changes\".\n");
     prompt.push_str("- Put actionable issues in findings with file + line when possible.\n");
     prompt.push_str("- Use concise, specific issue and fix text (no fluff).\n");
@@ -7440,6 +7448,42 @@ mod tests {
             payload.pointer("/findings/0/line").and_then(Value::as_u64),
             Some(42)
         );
+    }
+
+    #[test]
+    fn a_review_verdict_is_read_by_exact_value_and_never_defaults_to_approve() {
+        let verdict_of = |raw: &str| {
+            parse_review_output_payload(
+                "codex",
+                "rvw_verdict",
+                ReviewScope::Diff,
+                ReviewDiffBase::WorkingTree,
+                raw,
+            )
+            .expect("structured payload")
+            .get("verdict")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        };
+        let empty = r#""blocking":[],"risks":[],"suggestions":[],"findings":[]"#;
+        for (verdict, want) in [
+            ("approve", "approve"),
+            ("needs_changes", "needs_changes"),
+            // Prose in the field is not a verdict, whatever words it has.
+            ("do not approve", "needs_changes"),
+            ("approved, pass", "needs_changes"),
+            ("lgtm", "needs_changes"),
+        ] {
+            let raw = format!(r#"{{"verdict":"{verdict}","summary":"Synthetic review",{empty}}}"#);
+            assert_eq!(verdict_of(&raw).as_deref(), Some(want), "{verdict}");
+        }
+        // No verdict at all is not an approve.
+        let raw = format!(r#"{{"summary":"Synthetic review",{empty}}}"#);
+        assert_eq!(verdict_of(&raw).as_deref(), Some("needs_changes"));
+        // An approve that lists a blocking item is not an approve.
+        let raw =
+            r#"{"verdict":"approve","summary":"Synthetic","blocking":["Fix the synthetic race"]}"#;
+        assert_eq!(verdict_of(raw).as_deref(), Some("needs_changes"));
     }
 
     #[test]
