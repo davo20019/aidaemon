@@ -14,7 +14,7 @@ env:
   # The app (clients/app) toolchain: the web bundle needs the nsh CLI and the
   # wasm-bindgen CLI matching the app's wasm-bindgen crate.
   NSH_VERSION: "0.5.1"
-  NSH_LINUX_SHA256: "a422bbe5dc2a7ae3ff308ee56e05d73d5becc81f57adf11447fc570dcee65e0f"
+  NSH_LINUX_SHA256: "f34729e613196ca122d956deb543a92f319e053ff17dfc09ba04a6ec2fb79c74"
   WASM_BINDGEN_CLI_VERSION: "0.2.130"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the

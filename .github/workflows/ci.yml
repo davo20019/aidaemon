@@ -643,7 +643,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       NSH_VERSION: "0.5.1"
-      NSH_LINUX_SHA256: "a422bbe5dc2a7ae3ff308ee56e05d73d5becc81f57adf11447fc570dcee65e0f"
+      NSH_LINUX_SHA256: "f34729e613196ca122d956deb543a92f319e053ff17dfc09ba04a6ec2fb79c74"
       WASM_BINDGEN_CLI_VERSION: "0.2.130"
     steps:
       - uses: actions/checkout@v5
