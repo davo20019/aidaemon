@@ -179,6 +179,8 @@ pub struct ProgramEnd {
     /// Actions the agent's own permission check refused, as the agent
     /// typed them (tool and target).
     pub refused: Vec<String>,
+    /// Actions it asked to take that the owner declined when asked.
+    pub declined: Vec<String>,
 }
 
 /// How a CLI agent's run ended: an error exit failed, a stop by the runtime
@@ -198,6 +200,16 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
             RunEnd::Failed(RunFailure::Exited {
                 code: end.exit_code,
             }),
+            RunEvidence::default(),
+        );
+    }
+    // The owner declined what it asked to do and nothing changed: the
+    // owner's answer, never a failure.
+    if !end.declined.is_empty() && !end.changed_something {
+        return (
+            RunEnd::Stopped(Some(RunFailure::Declined {
+                steps: end.declined.clone(),
+            })),
             RunEvidence::default(),
         );
     }
@@ -379,6 +391,7 @@ mod tests {
             changed_something: false,
             step: "Install WordPress in claude-wordpress-7".to_string(),
             refused: Vec::new(),
+            declined: Vec::new(),
         };
         let (end, _) = program_phase(&refused);
         assert!(matches!(
@@ -441,6 +454,17 @@ mod tests {
             ..refused.clone()
         };
         assert_eq!(program_phase(&changed).0, RunEnd::Succeeded);
+        // The owner declined it when asked: the owner's answer.
+        let declined = ProgramEnd {
+            declined: vec!["Bash: touch notes.txt".to_string()],
+            ..refused.clone()
+        };
+        assert_eq!(
+            program_phase(&declined).0,
+            RunEnd::Stopped(Some(RunFailure::Declined {
+                steps: vec!["Bash: touch notes.txt".to_string()]
+            }))
+        );
         // An error exit is still that.
         let errored = ProgramEnd {
             exit_code: Some(1),

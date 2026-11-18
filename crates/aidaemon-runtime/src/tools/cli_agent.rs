@@ -2421,6 +2421,7 @@ impl CliAgentTool {
         spec: &crate::helper_run::HelperSpec,
         grant_session: &str,
         project: Option<&aidaemon_core::ProjectRef>,
+        nested: Option<aidaemon_core::NestedCalls>,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic) = {
@@ -2526,6 +2527,18 @@ impl CliAgentTool {
                      arguments allowed for {agent}. Remove it with manage_cli_agents, or the \
                      owner can define this agent under [cli_agents.tools] in config.toml."
                 ));
+            }
+        }
+        // Claude Code built in and run inside a kernel turn asks its host
+        // for permission instead of denying on its own: each prompt is
+        // judged by this run (`cli_host`).
+        let host_nested =
+            nested.filter(|_| tool_name.eq_ignore_ascii_case("claude") && !is_dynamic);
+        if host_nested.is_some() {
+            for pair in crate::tools::cli_host::CLAUDE_HOST_FLAGS.chunks(2) {
+                if !args.iter().any(|arg| arg == pair[0]) {
+                    args.extend(pair.iter().map(|arg| arg.to_string()));
+                }
             }
         }
 
@@ -2755,8 +2768,17 @@ impl CliAgentTool {
         let delegated_task_id_owned = delegated_task_id.map(|task_id| task_id.to_string());
 
         let mut command_args = args.clone();
-        command_args.push(final_prompt.clone());
+        if host_nested.is_none() {
+            command_args.push(final_prompt.clone());
+        }
         let mut request = ExecutionRequest::argv(command.clone(), command_args);
+        if host_nested.is_some() {
+            // The task goes in as the first stream-json message; stdin stays
+            // open for the host's answers.
+            request.stdin =
+                Some(crate::tools::cli_host::claude_prompt_line(&final_prompt).into_bytes());
+            request.keep_stdin = true;
+        }
         if tool_name.eq_ignore_ascii_case("claude") {
             request.env_remove.push("CLAUDECODE".to_string());
         }
@@ -2814,6 +2836,16 @@ impl CliAgentTool {
         };
         let process_handle = spawned.handle().clone();
         let pid = process_handle.display_id();
+        let claude_host = host_nested.and_then(|nested| {
+            spawned.take_stdin().map(|stdin| {
+                crate::tools::cli_host::ClaudeHost::new(
+                    stdin,
+                    nested,
+                    canonical_working_dir.clone(),
+                )
+            })
+        });
+        let claude_host_for_task = claude_host.clone();
         let stdout = match spawned.take_stdout() {
             Some(stdout) => stdout,
             None => {
@@ -2998,6 +3030,13 @@ impl CliAgentTool {
                                     }
                                 }
 
+                                // A permission prompt is answered by the run
+                                // (in its own task); the end of its turn
+                                // closes its stdin.
+                                if let Some(host) = claude_host_for_task.as_ref() {
+                                    host.on_line(&text).await;
+                                }
+
                                 // Check for infinite loop pattern
                                 if loop_detector.add_line(&text) && !loop_detected {
                                     loop_detected = true;
@@ -3167,6 +3206,10 @@ impl CliAgentTool {
                     changed_something,
                     step: task_context.clone(),
                     refused: agent_refused_actions(&stdout_buf_writer.lock().await),
+                    declined: claude_host_for_task
+                        .as_ref()
+                        .map(|host| host.answers().declined)
+                        .unwrap_or_default(),
                 });
             let _ = end_record_for_task.set(CliRunEnd {
                 end: run_phase.clone(),
@@ -5439,6 +5482,10 @@ impl CliAgentTool {
                             &spec,
                             &grant_session,
                             facts.project.as_ref(),
+                            facts
+                                .extensions
+                                .get::<aidaemon_core::NestedCalls>()
+                                .cloned(),
                         )
                         .await
                     {

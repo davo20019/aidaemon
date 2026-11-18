@@ -405,6 +405,63 @@ mod tests {
         );
     }
 
+    /// A stand-in for Claude Code over real pipes: it reads its task, asks
+    /// once, echoes the host's answer, ends its turn, then reports whether
+    /// its stdin closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prompt_is_answered_over_the_pipe_and_the_turn_end_closes_stdin() {
+        use tokio::io::AsyncBufReadExt;
+        let script = r#"read task
+echo '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch notes.txt"}}}'
+read answer
+printf '{"type":"echo","answer":%s}\n' "$answer"
+echo '{"type":"result","subtype":"success"}'
+if read more; then echo '{"type":"stdin_open"}'; else echo '{"type":"stdin_closed"}'; fi
+"#;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(claude_prompt_line("Create notes.txt").as_bytes())
+            .await
+            .unwrap();
+        let (nested, asked) = aidaemon_core::testing::nested_calls(|call| {
+            if call.name == "terminal" {
+                NestedVerdict::Declined {
+                    reason: "[OWNER DECLINED] not today".into(),
+                }
+            } else {
+                NestedVerdict::Allow
+            }
+        });
+        let host = ClaudeHost::new(stdin, nested, Some("/w/synthetic".into()));
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            host.on_line(&line).await;
+            seen.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        child.wait().await.unwrap();
+        let echo = seen.iter().find(|event| event["type"] == "echo").unwrap();
+        assert_eq!(echo["answer"]["type"], "control_response");
+        assert_eq!(echo["answer"]["response"]["request_id"], "r1");
+        assert_eq!(echo["answer"]["response"]["response"]["behavior"], "deny");
+        assert!(seen.iter().any(|event| event["type"] == "stdin_closed"));
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked[0].name, "terminal");
+        assert_eq!(asked[0].arguments["command"], "touch notes.txt");
+        assert_eq!(
+            host.answers().declined,
+            vec!["Bash: touch notes.txt".to_string()]
+        );
+    }
+
     #[test]
     fn the_prompt_goes_in_as_a_user_message() {
         let line: Value = serde_json::from_str(claude_prompt_line("Fix the tests").trim()).unwrap();

@@ -198,3 +198,24 @@ impl<P: Provider> Provider for StreamingProvider<P> {
 pub fn tool_context() -> crate::ToolContext {
     crate::ToolContext::new("test:synthetic-session", "call-1")
 }
+
+/// A [`crate::NestedCalls`] that answers every call with `judge`, for
+/// testing a tool that has calls judged without a whole run. Each call it
+/// was asked about is kept in the returned list. Needs a Tokio runtime.
+pub fn nested_calls(
+    judge: impl Fn(&ToolCall) -> crate::NestedVerdict + Send + 'static,
+) -> (crate::NestedCalls, Arc<Mutex<Vec<ToolCall>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::nested::NestedAsk>();
+    let asked: Arc<Mutex<Vec<ToolCall>>> = Arc::default();
+    let seen = asked.clone();
+    tokio::spawn(async move {
+        while let Some(ask) = rx.recv().await {
+            let verdict = judge(&ask.call);
+            if let Ok(mut seen) = seen.lock() {
+                seen.push(ask.call);
+            }
+            let _ = ask.reply.send(verdict);
+        }
+    });
+    (crate::NestedCalls::new(tx), asked)
+}
