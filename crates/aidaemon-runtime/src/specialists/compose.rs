@@ -217,8 +217,18 @@ pub fn compose_executor_prompt_from_registry(
     project_scope: Option<&str>,
     can_spawn: bool,
 ) -> String {
-    let mut all_dirs = extract_directory_paths(parent_mission);
-    for dir in extract_directory_paths(task_description) {
+    // The typed project scope comes first; absolute paths the mission and
+    // task name follow (paths are a machine format, read as such).
+    let mut all_dirs: Vec<String> = project_scope
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    for dir in extract_directory_paths(parent_mission)
+        .into_iter()
+        .chain(extract_directory_paths(task_description))
+    {
         if !all_dirs.contains(&dir) {
             all_dirs.push(dir);
         }
@@ -376,10 +386,7 @@ pub fn build_executor_handoff(
         task_id: task_id.to_string(),
         mission: mission.to_string(),
         task_description: task_description.to_string(),
-        target_scope: crate::turn::execution_state::TargetScope {
-            allowed_targets,
-            hard_fail_outside_scope: project_scope.is_some(),
-        },
+        target_scope: crate::turn::execution_state::TargetScope { allowed_targets },
         expected_targets,
         allowed_tools: Some(
             tools
@@ -563,9 +570,18 @@ pub mod legacy {
         task_id: Option<&str>,
         project_scope: Option<&str>,
     ) -> String {
-        // Extract directory paths from both parent mission and task description
-        let mut all_dirs = extract_directory_paths(parent_mission);
-        for dir in extract_directory_paths(task_description) {
+        // The typed project scope first, then the paths the mission and
+        // task name.
+        let mut all_dirs: Vec<String> = project_scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        for dir in extract_directory_paths(parent_mission)
+            .into_iter()
+            .chain(extract_directory_paths(task_description))
+        {
             if !all_dirs.contains(&dir) {
                 all_dirs.push(dir);
             }
@@ -915,8 +931,49 @@ mod tests {
         );
         assert!(prompt.contains("## Task Contract"));
         assert!(prompt.contains("task_id: task-123"));
-        assert!(prompt.contains("allowed targets (hard boundary): /tmp/demo"));
+        assert!(prompt.contains("- project scope: /tmp/demo"));
+        assert!(!prompt.contains("hard boundary"));
         assert!(prompt.contains("report_blocker"));
+    }
+
+    /// Paths only named in the mission are said as that: no project scope,
+    /// no "stop outside it" rule built on a scope nobody gave.
+    #[test]
+    fn a_task_without_a_project_scope_names_its_paths_as_hints() {
+        let prompt = legacy::build_executor_prompt(
+            "patch /tmp/demo/src/main.rs",
+            "fix the regression in /tmp/demo",
+            2,
+            4,
+            false,
+            Some("task-123"),
+            None,
+        );
+        assert!(
+            prompt.contains("- paths the task names: /tmp/demo"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("project scope"));
+        assert!(!prompt.contains("outside the project scope"));
+    }
+
+    /// The typed project scope leads the working directory, even when the
+    /// mission names no path.
+    #[test]
+    fn the_project_scope_leads_the_working_directory() {
+        let prompt = legacy::build_executor_prompt(
+            "tidy the notes",
+            "tidy them",
+            1,
+            4,
+            false,
+            None,
+            Some("/w/synthetic"),
+        );
+        assert!(
+            prompt.contains("All files for this task are in: /w/synthetic"),
+            "{prompt}"
+        );
     }
 
     #[test]

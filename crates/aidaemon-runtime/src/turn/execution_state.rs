@@ -56,8 +56,6 @@ pub enum ExecutionPersistence {
 pub struct TargetScope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_targets: Vec<ToolTargetHint>,
-    #[serde(default)]
-    pub hard_fail_outside_scope: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

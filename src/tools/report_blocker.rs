@@ -427,7 +427,6 @@ mod tests {
                     )
                     .unwrap(),
                 ],
-                hard_fail_outside_scope: true,
             },
             expected_targets: Vec::new(),
             allowed_tools: None,

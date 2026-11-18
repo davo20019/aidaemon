@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use aidaemon_events::traits::ToolTargetHint;
+use aidaemon_events::traits::{ToolTargetHint, ToolTargetHintKind};
 use aidaemon_work::goals::Task;
 
 use crate::turn::execution_state::TargetScope;
@@ -133,15 +133,28 @@ impl ExecutorHandoff {
             format!("- task_id: {}", self.task_id),
         ];
 
-        if !self.target_scope.allowed_targets.is_empty() {
-            let allowed = self
-                .target_scope
+        // Each target is said as what it is: the project scope the task was
+        // given (typed), or paths its mission and task name. Neither is
+        // enforced here: what the executor may touch is its authority.
+        let joined = |kind: Option<ToolTargetHintKind>| {
+            self.target_scope
                 .allowed_targets
                 .iter()
+                .filter(|target| match kind {
+                    Some(kind) => target.kind == kind,
+                    None => target.kind != ToolTargetHintKind::ProjectScope,
+                })
                 .map(|target| target.value.as_str())
                 .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("- allowed targets (hard boundary): {allowed}"));
+                .join(", ")
+        };
+        let project_scope = joined(Some(ToolTargetHintKind::ProjectScope));
+        if !project_scope.is_empty() {
+            lines.push(format!("- project scope: {project_scope}"));
+        }
+        let named = joined(None);
+        if !named.is_empty() {
+            lines.push(format!("- paths the task names: {named}"));
         }
 
         if !self.expected_targets.is_empty() {
@@ -163,10 +176,12 @@ impl ExecutorHandoff {
             ));
         }
 
-        lines.push(
-            "- If finishing requires acting outside the allowed targets, stop and use report_blocker."
-                .to_string(),
-        );
+        if !project_scope.is_empty() {
+            lines.push(
+                "- If finishing requires changing anything outside the project scope, stop and use report_blocker."
+                    .to_string(),
+            );
+        }
         lines.push(
             "- You may complete this single task only. Do not claim the overall goal is done."
                 .to_string(),

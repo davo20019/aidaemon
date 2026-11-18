@@ -3925,7 +3925,6 @@ impl CliAgentTool {
             task_description: prompt.to_string(),
             target_scope: TargetScope {
                 allowed_targets: expected_targets.clone(),
-                hard_fail_outside_scope: working_dir.is_some(),
             },
             expected_targets,
             allowed_tools: Some(vec![format!("cli_agent:{tool_name}")]),
