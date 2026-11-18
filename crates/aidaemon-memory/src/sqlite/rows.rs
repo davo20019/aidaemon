@@ -1124,7 +1124,9 @@ impl SqliteMemory {
                     0.0
                 }
             } else {
-                // Fall back to text matching
+                // A row with no vector yet: fall back to text matching. Kept:
+                // error text is external tool output with no structured
+                // signal, and the row gets a vector on the next backfill.
                 if solution
                     .error_pattern
                     .to_lowercase()

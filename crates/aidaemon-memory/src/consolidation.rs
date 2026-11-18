@@ -370,7 +370,10 @@ struct Candidate {
 }
 
 /// When the owner last said `value`: the latest owner message in the batch
-/// that contains it, else the batch's oldest message. The store lets an
+/// that contains it, else the batch's oldest message. Kept text matching:
+/// the consolidation extractor returns no evidence span, and this only
+/// places a timestamp; a miss falls back to the oldest time, which can only
+/// make a write weaker, never stronger. The store lets an
 /// automated write past a deleted fact only on evidence newer than the
 /// deletion, so a value that cannot be placed counts as the oldest the
 /// batch holds, never as "now".
@@ -657,7 +660,9 @@ pub fn parse_consolidation_response(text: &str) -> anyhow::Result<Vec<ExtractedF
         anyhow::bail!("all {malformed} memory facts were malformed");
     }
 
-    // Filter out facts with empty/meaningless values to prevent hallucination
+    // Filter out facts with empty/meaningless values to prevent hallucination.
+    // Kept text matching: the extractor JSON has no typed "absent" marker,
+    // and these whole-field tokens are its placeholders, never prose.
     let facts = facts
         .into_iter()
         .filter(|f| {

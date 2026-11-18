@@ -105,6 +105,10 @@ fn inverse(value: &str) -> Option<&'static str> {
     }
 }
 
+/// The person a legacy free-text name fact names. Kept text matching: these
+/// rows predate structured personal memory and carry no typed entities, so a
+/// compound value ("Alice and Jordan", "A & B") is the only sign it names
+/// two people, and such a value is left for review rather than guessed.
 fn legacy_person_name(value: &str) -> Option<(String, Vec<String>)> {
     let mut display = value.trim().to_string();
     if display.is_empty() || display.to_ascii_lowercase().contains(" and ") || display.contains('&')
@@ -145,6 +149,9 @@ fn legacy_person_name(value: &str) -> Option<(String, Vec<String>)> {
     (!canonical.is_empty()).then_some((canonical, aliases))
 }
 
+/// The people a legacy free-text list names. Kept text matching for the
+/// same reason as [`legacy_person_name`]: rows from before structured
+/// memory, with no typed entities to read instead.
 fn split_legacy_people(value: &str) -> Vec<String> {
     value
         .replace(" & ", ",")
@@ -157,7 +164,9 @@ fn split_legacy_people(value: &str) -> Vec<String> {
 }
 
 /// A value that carries nothing to store. An extraction pass that emits a
-/// placeholder for "absent" is not stating a value either.
+/// placeholder for "absent" is not stating a value either. Kept text
+/// matching: extractor JSON has no typed "absent" marker, and these exact
+/// whole-value tokens are that protocol's placeholders, never prose.
 fn is_placeholder_value(value: &str) -> bool {
     let value = value.trim();
     value.is_empty()
@@ -2111,6 +2120,8 @@ impl SqliteMemory {
             let key: String = row.get("key");
             let value: String = row.get("value");
             let normalized_key = predicate(&key);
+            // Legacy free text has no typed entities: a compound name is
+            // queued for review (see `legacy_person_name`).
             if matches!(normalized_key.as_str(), "name" | "full_name")
                 && (value.to_lowercase().contains(" and ") || value.contains('&'))
             {
