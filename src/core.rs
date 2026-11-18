@@ -530,6 +530,7 @@ pub async fn run(
     let notify_session_ids = startup_runtime::collect_notify_session_ids(
         &config,
         channel_bundle.telegram_bots.first().map(|bot| bot.as_ref()),
+        hub.session_map(),
     )
     .await;
     startup_runtime::spawn_trigger_event_listener(startup_runtime::TriggerListenerDependencies {

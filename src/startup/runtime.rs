@@ -759,10 +759,13 @@ pub(crate) fn spawn_dashboard_or_health_server(
 /// The owner chats that get daemon-wide notices (updates, model upgrades,
 /// trigger events), as the session ids the hub routes: a Telegram chat's
 /// session carries its bot's namespace (`<bot>:<chat id>`), so a bare user
-/// id is never routed.
+/// id is never routed. An owner's private chat with the first bot is routed
+/// to that bot even before they write to it (the hub otherwise learns a
+/// route from the first message).
 pub(crate) async fn collect_notify_session_ids(
     config: &AppConfig,
     first_telegram_bot: Option<&crate::channels::TelegramBot>,
+    session_map: &SessionMap,
 ) -> Vec<String> {
     let mut session_ids = Vec::new();
 
@@ -782,6 +785,14 @@ pub(crate) async fn collect_notify_session_ids(
                 }),
                 _ => bare,
             };
+            if let Some(bot) = first_telegram_bot {
+                let channel = bot.channel_name().await;
+                session_map
+                    .write()
+                    .await
+                    .entry(session_id.clone())
+                    .or_insert(channel);
+            }
             session_ids.push(session_id);
         }
     }
