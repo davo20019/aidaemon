@@ -28,8 +28,6 @@ pub struct LearningContext {
     #[allow(dead_code)] // Reserved for duration-based learning
     pub start_time: chrono::DateTime<Utc>,
     pub completed_naturally: bool,
-    pub explicit_positive_signals: u32,
-    pub explicit_negative_signals: u32,
     /// Semantic outcome emitted at task end; authoritative for learning when set.
     pub task_outcome: Option<TaskOutcome>,
 }
@@ -100,8 +98,6 @@ impl LearningContext {
             }),
             recovery_actions: self.recovery_actions,
             completed_naturally: self.completed_naturally,
-            explicit_positive_signals: self.explicit_positive_signals,
-            explicit_negative_signals: self.explicit_negative_signals,
             succeeded: self.task_outcome.map(|outcome| outcome.task_success()),
         }
     }
@@ -704,8 +700,6 @@ mod tests {
             recovery_actions: vec![],
             start_time: Utc::now(),
             completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: None,
         };
         let result = graceful_budget_response(&ctx, 500_000);
@@ -739,8 +733,6 @@ mod tests {
             recovery_actions: vec![],
             start_time: Utc::now(),
             completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: None,
         };
         let result = graceful_budget_response(&ctx, 500_000);
@@ -762,8 +754,6 @@ mod tests {
             recovery_actions: vec![],
             start_time: Utc::now(),
             completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: None,
         };
 
@@ -791,8 +781,6 @@ mod tests {
             recovery_actions: vec![],
             start_time: Utc::now(),
             completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: None,
         }
     }
@@ -879,8 +867,6 @@ mod tests {
             recovery_actions: vec![],
             start_time: Utc::now(),
             completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: None,
         }
     }
@@ -941,8 +927,6 @@ mod tests {
             recovery_actions: vec![],
             start_time: Utc::now(),
             completed_naturally: true,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: Some(aidaemon_events::TaskOutcome::Partial),
         };
         assert!(!aidaemon_events::TaskOutcome::Partial.task_success());

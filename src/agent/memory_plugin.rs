@@ -418,8 +418,6 @@ pub(super) mod test_support {
             recovery_actions: Vec::new(),
             start_time: chrono::Utc::now(),
             completed_naturally: false,
-            explicit_positive_signals: 0,
-            explicit_negative_signals: 0,
             task_outcome: None,
         }
     }

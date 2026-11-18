@@ -94,7 +94,7 @@ impl DecisionLayer {
     }
 
     /// A layer over a ready backend, for tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_decider(decider: Arc<dyn Decider>, modes: DecisionModes) -> Self {
         Self {
             backend: Backend::Decider(decider),

@@ -420,8 +420,6 @@ async fn build_isolated_mandate_bootstrap(
         recovery_actions: Vec::new(),
         start_time: Utc::now(),
         completed_naturally: false,
-        explicit_positive_signals: 0,
-        explicit_negative_signals: 0,
         task_outcome: None,
     };
     let mut turn_context = TurnContext {
@@ -474,16 +472,17 @@ async fn build_isolated_mandate_bootstrap(
     })))
 }
 
-/// Whether an owner message asks to resume an interrupted task. The
-/// keyword check decides unless the decision layer is on, an interrupted
-/// task exists, and the backend answers with a calibrated confidence of 0.8
-/// or more. In shadow mode the decision runs beside the turn, recorded only.
+/// Whether an owner message asks to resume an interrupted task: only the
+/// decision layer's typed `Decision::Resume`, acted on when it is on, an
+/// interrupted task exists, and the backend answers yes. With the decision
+/// off, in shadow mode (recorded beside the turn only), or with no answer,
+/// the message is a new request; the interrupted task's turns are still in
+/// the conversation the model reads. Wording never resumes.
 async fn wants_resume(agent: &dyn TurnHost, session_id: &str, user_text: &str) -> bool {
     use crate::llm::decisions::Decision;
-    let keyword = crate::turn::resume::is_resume_request(user_text);
     let mode = agent.side_calls().decision_mode(Decision::Resume);
     if mode == crate::settings::DecisionMode::Off {
-        return keyword;
+        return false;
     }
     // Typed state first: with no interrupted task there is nothing to ask.
     let Some(active) = agent
@@ -493,7 +492,7 @@ async fn wants_resume(agent: &dyn TurnHost, session_id: &str, user_text: &str) -
         .ok()
         .flatten()
     else {
-        return keyword;
+        return false;
     };
     let description = active
         .parse_data::<aidaemon_events::TaskStartData>()
@@ -528,7 +527,7 @@ async fn wants_resume(agent: &dyn TurnHost, session_id: &str, user_text: &str) -
                 )
                 .await;
         });
-        return keyword;
+        return false;
     }
     let outcome = agent
         .side_calls()
@@ -544,7 +543,7 @@ async fn wants_resume(agent: &dyn TurnHost, session_id: &str, user_text: &str) -
     outcome
         .acted("resume")
         .and_then(aidaemon_decisions::Answer::p_yes)
-        .map_or(keyword, |p| p >= 0.5)
+        .is_some_and(|p| p >= 0.5)
 }
 
 /// Stores the turn digest's identity flag on the user message, so
@@ -829,27 +828,8 @@ pub async fn run_bootstrap(
         recovery_actions: Vec::new(),
         start_time: Utc::now(),
         completed_naturally: false,
-        explicit_positive_signals: 0,
-        explicit_negative_signals: 0,
         task_outcome: None,
     };
-    if let Some((label, is_positive)) =
-        crate::policy::signals::detect_explicit_outcome_signal(user_text)
-    {
-        if is_positive {
-            learning_ctx.explicit_positive_signals =
-                learning_ctx.explicit_positive_signals.saturating_add(1);
-        } else {
-            learning_ctx.explicit_negative_signals =
-                learning_ctx.explicit_negative_signals.saturating_add(1);
-        }
-        info!(
-            session_id,
-            task_id = %task_id,
-            signal = label,
-            "Detected explicit outcome signal in user input"
-        );
-    }
 
     // Bootstrap tool exposure happens before per-task model selection. Use the
     // runtime primary model's trust tier to decide whether policy filtering is

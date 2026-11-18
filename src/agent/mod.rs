@@ -73,13 +73,6 @@ use intent_routing::infer_intent_gate;
 // Re-export for use outside the `agent` subtree (e.g. `tools/browser/policy`).
 #[allow(unused_imports)]
 pub(crate) use intent_routing::contains_keyword_as_words as keyword_match;
-/// Policy signals live in `aidaemon-runtime`.
-#[cfg(test)]
-mod policy_signals {
-    pub(super) use aidaemon_runtime::policy::signals::*;
-}
-#[cfg(test)]
-use policy_signals::is_short_user_correction;
 /// Validation state lives in `aidaemon-runtime`.
 #[cfg(test)]
 mod validation_state {

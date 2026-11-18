@@ -207,20 +207,6 @@ delivered through this session when it completes.";
 }
 
 #[test]
-fn test_is_short_user_correction_detects_simple_correction() {
-    assert!(is_short_user_correction("You did send me the pdf"));
-    assert!(is_short_user_correction("that's right"));
-}
-
-#[test]
-fn test_is_short_user_correction_ignores_new_action_requests() {
-    assert!(!is_short_user_correction(
-        "You did send me the pdf, can you make it nicer?"
-    ));
-    assert!(!is_short_user_correction("Please regenerate the PDF"));
-}
-
-#[test]
 fn test_classify_stall_detects_deferred_no_tool_loop() {
     let learning_ctx = LearningContext {
         user_text: "Can you make the PDF nicer?".to_string(),
@@ -232,8 +218,6 @@ fn test_classify_stall_detects_deferred_no_tool_loop() {
         recovery_actions: vec![],
         start_time: Utc::now(),
         completed_naturally: false,
-        explicit_positive_signals: 0,
-        explicit_negative_signals: 0,
         task_outcome: None,
     };
 

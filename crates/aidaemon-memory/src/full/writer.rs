@@ -34,23 +34,17 @@ pub struct RunLearning {
     pub first_error: Option<String>,
     pub recovery_actions: Vec<String>,
     pub completed_naturally: bool,
-    pub explicit_positive_signals: u32,
-    pub explicit_negative_signals: u32,
     /// The run's own verdict on its task, when it has one: authoritative.
     pub succeeded: Option<bool>,
 }
 
 impl RunLearning {
-    /// Whether the run's task succeeded: its verdict, else the user's
-    /// explicit signals, else a natural completion with every error
-    /// recovered.
+    /// Whether the run's task succeeded: its typed verdict, else a natural
+    /// completion with every error recovered. The words of the next user
+    /// message are never a verdict on this task.
     pub fn task_success(&self) -> bool {
         if let Some(succeeded) = self.succeeded {
             succeeded
-        } else if self.explicit_negative_signals > 0 {
-            false
-        } else if self.explicit_positive_signals > 0 {
-            true
         } else {
             let unrecovered = self.errors.iter().filter(|(_, recovered)| !recovered);
             self.completed_naturally && unrecovered.count() == 0

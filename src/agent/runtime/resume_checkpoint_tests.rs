@@ -4,13 +4,26 @@ use crate::testing::{MockProvider, setup_test_agent};
 use crate::types::{ChannelContext, UserRole};
 use serde_json::json;
 
-#[test]
-fn test_is_resume_request_detects_continue_variants() {
-    assert!(is_resume_request("continue"));
-    assert!(is_resume_request("Continue with next phase"));
-    assert!(is_resume_request("resume the previous task"));
-    assert!(is_resume_request("next phase"));
-    assert!(!is_resume_request("How do I continue learning Rust?"));
+/// Resume is the decision layer's typed answer; wording alone never
+/// resumes (see `wants_resume`).
+fn resume_decided_yes(harness: &crate::testing::TestHarness) {
+    use aidaemon_decisions::ConfidenceSource;
+    use aidaemon_decisions::testing::ScriptedDecider;
+    use aidaemon_runtime::settings::{DecisionMode, DecisionModes};
+    let decider =
+        std::sync::Arc::new(ScriptedDecider::new(ConfidenceSource::Calibrated).always(0.95));
+    harness.agent.side_calls().set_decisions(Some(
+        aidaemon_runtime::llm::decide::DecisionLayer::with_decider(
+            decider,
+            DecisionModes {
+                turn_digest: DecisionMode::Off,
+                resume: DecisionMode::On,
+                recall_filter: DecisionMode::Off,
+                model_route: DecisionMode::Off,
+                command_risk_second: DecisionMode::Off,
+            },
+        ),
+    ));
 }
 
 #[tokio::test]
@@ -220,6 +233,7 @@ async fn test_continue_injects_resume_checkpoint_and_closes_orphan_task() {
         Some("exec:exec-orphan-1:2:system_info:call_pending")
     );
 
+    resume_decided_yes(&harness);
     let reply = harness
         .agent
         .handle_message(

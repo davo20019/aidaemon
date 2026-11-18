@@ -5,108 +5,6 @@ use serde_json::Value;
 use aidaemon_memory::render::{
     CriticalFactSummary, build_critical_facts_prompt_block, extract_critical_fact_summary,
 };
-use aidaemon_tools::text::contains_keyword_as_words;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CriticalFactQuery {
-    OwnerName,
-    AssistantName,
-}
-
-pub fn detect_critical_fact_query(user_text: &str) -> Option<CriticalFactQuery> {
-    let lower = user_text
-        .trim()
-        .trim_end_matches(['?', '!', '.'])
-        .trim()
-        .to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-
-    // Multi-part questions should NOT be handled deterministically.
-    // Questions like "What's my name, what do I like, and what's my dog's name?"
-    // need the full LLM with context to answer comprehensively.
-    let comma_count = lower.matches(',').count();
-    let question_mark_count = lower.matches('?').count();
-    let has_conjunction_joining = lower.contains(" and what")
-        || lower.contains(" and who")
-        || lower.contains(" and tell")
-        || lower.contains(" and my");
-    if comma_count >= 2 || question_mark_count >= 2 || has_conjunction_joining {
-        return None;
-    }
-
-    let asks_owner_name = matches!(
-        lower.as_str(),
-        "what is my name" | "what's my name" | "who am i" | "tell me my name" | "my full name"
-    );
-    if asks_owner_name {
-        return Some(CriticalFactQuery::OwnerName);
-    }
-
-    let asks_assistant_name = matches!(
-        lower.as_str(),
-        "what is your name"
-            | "what's your name"
-            | "who are you"
-            | "what should i call you"
-            | "what is your bot name"
-            | "what's your bot name"
-    );
-    if asks_assistant_name {
-        return Some(CriticalFactQuery::AssistantName);
-    }
-
-    None
-}
-
-#[cfg(test)]
-pub fn deterministic_reply_for_critical_query(
-    query: CriticalFactQuery,
-    summary: &CriticalFactSummary,
-) -> String {
-    match query {
-        CriticalFactQuery::OwnerName => summary.owner_name.as_ref().map_or_else(
-            || {
-                "I don't have your name saved in critical memory yet. Tell me \"my name is ...\" and I'll pin it.".to_string()
-            },
-            |name| format!("Your name is {}.", name),
-        ),
-        CriticalFactQuery::AssistantName => summary.assistant_name.as_ref().map_or_else(
-            || "I don't have a pinned assistant name in critical memory right now.".to_string(),
-            |name| format!("My name is {}.", name),
-        ),
-    }
-}
-
-pub fn text_relates_to_critical_identity(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-
-    if detect_critical_fact_query(&lower).is_some() {
-        return true;
-    }
-
-    contains_keyword_as_words(&lower, "my name is")
-        || contains_keyword_as_words(&lower, "call me")
-        || contains_keyword_as_words(&lower, "i am")
-        || contains_keyword_as_words(&lower, "owner name")
-        || contains_keyword_as_words(&lower, "bot name")
-        || contains_keyword_as_words(&lower, "assistant name")
-        || contains_keyword_as_words(&lower, "wife")
-        || contains_keyword_as_words(&lower, "husband")
-        || contains_keyword_as_words(&lower, "spouse")
-        || contains_keyword_as_words(&lower, "daughter")
-        || contains_keyword_as_words(&lower, "son")
-        || contains_keyword_as_words(&lower, "children")
-        || lower.contains(" is myself")
-        || (lower.contains("[user]") && lower.contains("name:"))
-        || (lower.contains("[user]") && lower.contains("name ="))
-        || (lower.contains("saved fact") && lower.contains("name"))
-        || (lower.contains("remembered:") && lower.contains("name"))
-}
 
 /// Execution tools blocked when delegation mode is active.
 /// Keep spawn_agent available for task-lead orchestration.
@@ -190,42 +88,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_critical_fact_queries() {
-        assert_eq!(
-            detect_critical_fact_query("What's my name?"),
-            Some(CriticalFactQuery::OwnerName)
-        );
-        assert_eq!(
-            detect_critical_fact_query("What is your bot name?"),
-            Some(CriticalFactQuery::AssistantName)
-        );
-    }
-
-    #[test]
-    fn multi_part_questions_bypass_deterministic_resolver() {
-        // Multi-part questions should go to the LLM for comprehensive answers
-        assert_eq!(
-            detect_critical_fact_query(
-                "What's my name, what programming languages do I love, and what's my dog's name?"
-            ),
-            None
-        );
-        assert_eq!(
-            detect_critical_fact_query("What's my name and what do I do for work?"),
-            None
-        );
-        assert_eq!(
-            detect_critical_fact_query("Who am I? What do I like? Where do I live?"),
-            None
-        );
-        // Single-part questions still work
-        assert_eq!(
-            detect_critical_fact_query("What's my name?"),
-            Some(CriticalFactQuery::OwnerName)
-        );
-    }
-
-    #[test]
     fn extracts_critical_fact_summary() {
         let facts = vec![
             make_fact("user", "name", "Test Owner"),
@@ -235,22 +97,6 @@ mod tests {
         let summary = extract_critical_fact_summary(&facts);
         assert_eq!(summary.owner_name.as_deref(), Some("Test Owner"));
         assert_eq!(summary.assistant_name.as_deref(), Some("TestBot"));
-    }
-
-    #[test]
-    fn deterministic_reply_uses_critical_facts() {
-        let summary = CriticalFactSummary {
-            owner_name: Some("Test Owner".to_string()),
-            assistant_name: Some("TestBot".to_string()),
-        };
-        assert_eq!(
-            deterministic_reply_for_critical_query(CriticalFactQuery::OwnerName, &summary),
-            "Your name is Test Owner."
-        );
-        assert_eq!(
-            deterministic_reply_for_critical_query(CriticalFactQuery::AssistantName, &summary),
-            "My name is TestBot."
-        );
     }
 
     #[test]
@@ -283,14 +129,5 @@ mod tests {
     fn critical_facts_block_empty_summary_renders_nothing() {
         let block = build_critical_facts_prompt_block(&CriticalFactSummary::default());
         assert!(block.is_none(), "no pinned facts → no block: {:?}", block);
-    }
-
-    #[test]
-    fn detects_identity_related_text_snippets() {
-        assert!(text_relates_to_critical_identity("my name is David"));
-        assert!(text_relates_to_critical_identity(
-            "Saved fact [user] name: David"
-        ));
-        assert!(!text_relates_to_critical_identity("run the tests"));
     }
 }

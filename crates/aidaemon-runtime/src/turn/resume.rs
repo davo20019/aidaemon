@@ -121,43 +121,6 @@ impl ResumeCheckpoint {
     }
 }
 
-pub fn normalize_for_resume_intent(text: &str) -> String {
-    text.split_whitespace()
-        .map(|part| part.trim_matches(|c: char| c.is_ascii_punctuation()))
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn is_resume_request(text: &str) -> bool {
-    let normalized = normalize_for_resume_intent(text);
-    if normalized.is_empty() {
-        return false;
-    }
-
-    const EXACT: &[&str] = &[
-        "continue",
-        "resume",
-        "keep going",
-        "go on",
-        "carry on",
-        "next phase",
-        "next step",
-    ];
-    if EXACT.contains(&normalized.as_str()) {
-        return true;
-    }
-
-    normalized.starts_with("continue ")
-        || normalized.starts_with("resume ")
-        || normalized.starts_with("keep going ")
-        || normalized.starts_with("go on ")
-        || normalized.starts_with("carry on ")
-        || normalized.starts_with("next phase ")
-        || normalized.starts_with("next step ")
-}
-
 pub async fn build_resume_checkpoint(
     host: &dyn TurnHost,
     session_id: &str,
