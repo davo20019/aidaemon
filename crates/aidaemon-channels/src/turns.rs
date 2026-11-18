@@ -40,7 +40,31 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(3);
 /// before the reply is sent.
 const STATUS_DRAIN: Duration = Duration::from_secs(3);
 const CANCELLED: &str = "Task cancelled";
-const INACTIVITY_PREFIX: &str = "Task auto-cancelled due to inactivity";
+
+/// How a turn that produced no reply ended, as the runner itself observed
+/// it: never read back from an error's text.
+enum TurnStop {
+    /// The owner (or a new message) cancelled the turn.
+    Cancelled,
+    /// The stale watchdog stopped a turn that made no progress.
+    Inactive { minutes: u64 },
+    /// The agent returned an error.
+    Agent(anyhow::Error),
+}
+
+impl std::fmt::Display for TurnStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str(CANCELLED),
+            Self::Inactive { minutes } => write!(
+                f,
+                "Task auto-cancelled due to inactivity ({minutes} minute{} without progress).",
+                if *minutes == 1 { "" } else { "s" }
+            ),
+            Self::Agent(error) => write!(f, "{error}"),
+        }
+    }
+}
 
 /// One authorized message, ready to run.
 pub struct Turn {
@@ -873,14 +897,10 @@ impl TurnRunner {
                         heartbeat: Some(heartbeat.clone()),
                         ingress_timing: timing.clone(),
                     }),
-                )) => result,
-                _ = cancel.cancelled() => Err(anyhow::anyhow!(CANCELLED)),
+                )) => result.map_err(TurnStop::Agent),
+                _ = cancel.cancelled() => Err(TurnStop::Cancelled),
                 stale_mins = wait_for_stale_heartbeat(heartbeat.clone(), stale_secs, 4), if stale_secs > 0 => {
-                    Err(anyhow::anyhow!(
-                        "{INACTIVITY_PREFIX} ({} minute{} without progress).",
-                        stale_mins,
-                        if stale_mins == 1 { "" } else { "s" }
-                    ))
+                    Err(TurnStop::Inactive { minutes: stale_mins })
                 },
             };
             working.cancel();
@@ -977,22 +997,25 @@ impl TurnRunner {
                     surface.turn_ended(end).await;
                     None
                 }
-                Err(error) => {
-                    let message = error.to_string();
-                    if message == CANCELLED {
-                        info!("Task #{} cancelled", task_id);
-                    } else if message.starts_with(INACTIVITY_PREFIX) {
-                        info!("Task #{} auto-cancelled by stale watchdog", task_id);
-                        let _ = surface.say(&format!("⚠️ {message}")).await;
-                    } else {
-                        warn!("Agent error: {}", error);
-                        let _ = surface.say(&format!("Error: {message}")).await;
+                Err(stop) => {
+                    let message = stop.to_string();
+                    let cancelled = matches!(stop, TurnStop::Cancelled);
+                    match &stop {
+                        TurnStop::Cancelled => info!("Task #{} cancelled", task_id),
+                        TurnStop::Inactive { .. } => {
+                            info!("Task #{} auto-cancelled by stale watchdog", task_id);
+                            let _ = surface.say(&format!("⚠️ {message}")).await;
+                        }
+                        TurnStop::Agent(error) => {
+                            warn!("Agent error: {}", error);
+                            let _ = surface.say(&format!("Error: {message}")).await;
+                        }
                     }
                     if let Some(card) = &card {
                         card.close(surface.as_ref()).await;
                     }
                     surface
-                        .turn_ended(if message == CANCELLED {
+                        .turn_ended(if cancelled {
                             TurnEnd::Cancelled
                         } else {
                             TurnEnd::Failed
@@ -1003,7 +1026,7 @@ impl TurnRunner {
                             session_id: &session_id,
                             turn: task_id,
                             platform: surface.platform(),
-                            end: if message == CANCELLED {
+                            end: if cancelled {
                                 TurnEnd::Cancelled
                             } else {
                                 TurnEnd::Failed
@@ -1013,14 +1036,14 @@ impl TurnRunner {
                             error: Some(&message),
                         });
                     }
-                    Some(message)
+                    Some((message, cancelled))
                 }
             };
 
             drop(over_when_dropped);
 
-            if let Some(error) = error.as_ref() {
-                let status = if error == CANCELLED {
+            if let Some((error, cancelled)) = error.as_ref() {
+                let status = if *cancelled {
                     aidaemon_events::TaskStatus::Cancelled
                 } else {
                     aidaemon_events::TaskStatus::Failed
@@ -1036,7 +1059,11 @@ impl TurnRunner {
             // Finalize and drain together, so a message arriving meanwhile is
             // either drained here or runs directly, never stranded.
             let Some(queued) = registry
-                .finalize_and_drain(task_id, &session_id, error.as_deref())
+                .finalize_and_drain(
+                    task_id,
+                    &session_id,
+                    error.as_ref().map(|(message, _)| message.as_str()),
+                )
                 .await
             else {
                 self.forget_queued_notices(&session_id);
@@ -1395,6 +1422,17 @@ pub async fn wait_for_stale_heartbeat(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn how_a_turn_stopped_is_typed_not_read_from_its_text() {
+        // An agent error that reads like a cancel is still an agent error.
+        let stop = super::TurnStop::Agent(anyhow::anyhow!(super::CANCELLED));
+        assert!(!matches!(stop, super::TurnStop::Cancelled));
+        assert_eq!(
+            super::TurnStop::Inactive { minutes: 1 }.to_string(),
+            "Task auto-cancelled due to inactivity (1 minute without progress)."
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
