@@ -156,7 +156,7 @@ fn page_body(
     form: ProviderForm,
     terminal: bool,
 ) -> View {
-    view().flex_1().min_h(px(0.0)).child(
+    view().flex_1().min_h(px(0.0)).child(ui::refreshable(
         scroll().flex_1().child(
             view().items_center().child(
                 view()
@@ -202,7 +202,9 @@ fn page_body(
                     })),
             ),
         ),
-    )
+        move || store.pull_refreshing(),
+        move || store.pull_refresh(),
+    ))
 }
 
 fn header(store: Store) -> View {
