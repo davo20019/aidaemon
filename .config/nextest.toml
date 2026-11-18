@@ -25,3 +25,10 @@ failure-output = "immediate"
 # Slow tests too: on Windows some take 30 s where they take under one
 # elsewhere.
 status-level = "slow"
+
+# The full-stack tests run real shell commands one after another; on a
+# Windows runner each shell start can take seconds, and a whole test ran
+# 80-120 s. They get 4 minutes there; elsewhere they take a few seconds.
+[[profile.windows-ci.overrides]]
+filter = 'test(/integration_tests::test_full_stack_/)'
+slow-timeout = { period = "20s", terminate-after = 12 }

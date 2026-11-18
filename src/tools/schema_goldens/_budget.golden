@@ -19,7 +19,7 @@ manage_mandates 4215 1054
 manage_mcp 971 243
 manage_memories 1359 340
 manage_node_monitors 3130 783
-manage_people 3858 965
+manage_people 3966 992
 manage_skills 820 205
 mandate_review 3694 924
 node_restart 766 192
@@ -28,7 +28,7 @@ read_channel_history 944 236
 read_file 1121 281
 read_node_health 670 168
 read_node_sensors 473 119
-remember_fact 1146 287
+remember_fact 1387 347
 report_blocker 1599 400
 schedule_task 769 193
 search_files 677 170
@@ -46,5 +46,5 @@ use_skill 483 121
 web_fetch 647 162
 web_search 1326 332
 write_file 1068 267
-TOTAL 78950 19738 (47 tools)
-PER_CALL 33780 8445 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 28 deferred)
+TOTAL 79299 19825 (47 tools)
+PER_CALL 34021 8506 (15 core: terminal remember_fact manage_memories set_reminder schedule_task manage_automations search_history web_fetch web_search read_file write_file edit_file search_files spawn_agent track_requirements; 28 deferred)

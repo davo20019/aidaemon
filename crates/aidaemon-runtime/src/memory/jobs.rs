@@ -115,7 +115,7 @@ fn goal_identity(text: &str) -> String {
 ///   is not resurrected: nothing is filed.
 /// - An open (observed or active) personal goal with the identical
 ///   description, or the most similar one by embedding at
-///   [`SAME_GOAL_MIN_SIMILARITY`] or more, gets a provenance note.
+///   `SAME_GOAL_MIN_SIMILARITY` or more, gets a provenance note.
 /// - Otherwise a new observation is recorded. Completed and abandoned goals
 ///   are never compared by similarity, so "Run a marathon in 2027" is filed
 ///   even though "Run a marathon in 2026" was completed.
