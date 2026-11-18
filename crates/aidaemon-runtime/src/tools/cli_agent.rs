@@ -29,11 +29,10 @@ use aidaemon_channels::ports::OutboundRouter;
 use aidaemon_core::card::Step;
 use aidaemon_events::text::{truncate_str, truncate_with_note};
 use aidaemon_tools::backend::SharedExecutionBackend;
-use aidaemon_tools::daemon_guard::detect_daemonization_primitives;
 use aidaemon_tools::permission_bypass::strip_permission_bypass_flags;
 #[cfg(test)]
 use aidaemon_tools::permission_bypass::without_permission_bypass;
-use aidaemon_tools::semantics::{ApprovalResponse, UserRole};
+use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::status::StatusUpdate;
 use aidaemon_tools::text::floor_char_boundary;
 use aidaemon_tools::{BackendFileType, BackendPath, ExecutionRequest, ProcessHandle};
@@ -707,9 +706,6 @@ pub struct CliAgentTool {
     default_max_output: usize,
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,
-    /// The owner's approvals of exact detached/background runs, delivered by
-    /// the agent kernel (`record_owner_answer`) and consumed by the run.
-    owner_answers: Arc<aidaemon_tools::owner_answers::OwnerAnsweredCalls>,
     hub: OnceLock<Weak<dyn OutboundRouter>>,
     /// The runtime's run records: an agent left running in the background is
     /// a run there, shown on its turn's card. Wired via [`Self::set_runs`].
@@ -1432,10 +1428,6 @@ impl CliAgentTool {
         compatible.into_iter().next()
     }
 
-    fn is_owner_role(user_role: Option<UserRole>) -> bool {
-        user_role == Some(UserRole::Owner)
-    }
-
     /// Normalize a working directory for lock/key comparisons.
     /// Uses canonical paths when possible so aliases like `/repo` and `/repo/`
     /// map to the same lock key.
@@ -1485,94 +1477,6 @@ impl CliAgentTool {
             .unwrap_or(false);
         if should_remove {
             claims.remove(dir);
-        }
-    }
-
-    /// The detached/background markers in a run's prompt and system
-    /// instruction, in the order found, without repeats.
-    fn daemonization_hits(prompt: &str, system_instruction: Option<&str>) -> Vec<&'static str> {
-        let mut hits = detect_daemonization_primitives(prompt);
-        if let Some(system_instruction) = system_instruction {
-            for hit in detect_daemonization_primitives(system_instruction) {
-                if !hits.contains(&hit) {
-                    hits.push(hit);
-                }
-            }
-        }
-        hits
-    }
-
-    /// A `run` call whose own prompt (not one recovered from stored task
-    /// context) or system instruction carries detached/background markers,
-    /// with that prompt.
-    fn daemonizing_run(arguments: &Value) -> Option<(CliAgentArgs, String)> {
-        let args: CliAgentArgs = serde_json::from_value(arguments.clone()).ok()?;
-        if args.action.as_deref().unwrap_or("run") != "run" {
-            return None;
-        }
-        let prompt = args.run_prompt()?;
-        if Self::daemonization_hits(&prompt, args.system_instruction.as_deref()).is_empty() {
-            return None;
-        }
-        Some((args, prompt))
-    }
-
-    /// The exact run an owner approval of a daemonizing run covers: the
-    /// requested agent, prompt and system instruction. The card and the run
-    /// derive it from the same arguments, so an approval never covers a
-    /// different run.
-    fn daemonization_subject(
-        requested_tool: Option<&str>,
-        prompt: &str,
-        system_instruction: Option<&str>,
-    ) -> String {
-        json!({
-            "action": "run",
-            "tool": requested_tool,
-            "prompt": prompt,
-            "system_instruction": system_instruction,
-        })
-        .to_string()
-    }
-
-    /// The owner's card for a run whose prompt asks for detached/background
-    /// execution, for this exact run.
-    fn daemonization_request(
-        &self,
-        requested_tool: Option<&str>,
-        prompt: &str,
-        system_instruction: Option<&str>,
-        hits: &[&str],
-    ) -> aidaemon_core::OwnerApprovalRequest {
-        let tool_name = requested_tool.unwrap_or("default");
-        let prompt_preview: String = prompt.chars().take(180).collect();
-        let summary = format!(
-            "cli_agent '{}' requested detached/background execution markers: {}. Prompt preview: {}",
-            tool_name,
-            hits.join(", "),
-            prompt_preview
-        );
-        let warnings = vec![
-            format!(
-                "Execution target: {} ({}) workspace {}",
-                self.backend.kind().as_str(),
-                self.backend.id(),
-                self.backend.workspace_root()
-            ),
-            format!("Daemonization primitives detected: {}", hits.join(", ")),
-            "Detached/background processes may survive cancellation and continue running."
-                .to_string(),
-        ];
-        aidaemon_core::OwnerApprovalRequest {
-            card: None,
-            effects: vec![aidaemon_core::EffectKey::named(
-                aidaemon_core::EffectClass::Process,
-                &format!("cli_agent:{tool_name}"),
-            )],
-            summary,
-            subject: Self::daemonization_subject(requested_tool, prompt, system_instruction),
-            risk: aidaemon_core::ApprovalRisk::Critical,
-            warnings,
         }
     }
 
@@ -1674,7 +1578,6 @@ impl CliAgentTool {
             default_max_output,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
-            owner_answers: Default::default(),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),
@@ -4746,46 +4649,6 @@ impl Tool for CliAgentTool {
         "cli_agent"
     }
 
-    /// A daemonizing run's card authorizes only that run.
-    fn approval_card_kind(
-        &self,
-        _request: &aidaemon_core::OwnerApprovalRequest,
-    ) -> aidaemon_tools::semantics::ApprovalKind {
-        aidaemon_tools::semantics::ApprovalKind::CommandOnce
-    }
-
-    /// Keep the owner's approval of a daemonizing run for that exact run in
-    /// its session; the run consumes it.
-    async fn record_owner_answer(
-        &self,
-        call: &crate::tools::traits::ApprovalCall<'_>,
-        facts: &ToolCallContext,
-        response: Option<ApprovalResponse>,
-    ) {
-        if !matches!(
-            response,
-            Some(
-                ApprovalResponse::AllowOnce
-                    | ApprovalResponse::AllowSession
-                    | ApprovalResponse::AllowAlways
-            )
-        ) {
-            return;
-        }
-        let Some(session) = facts.session() else {
-            return;
-        };
-        let Some((args, prompt)) = Self::daemonizing_run(call.arguments) else {
-            return;
-        };
-        let subject = Self::daemonization_subject(
-            args.tool.as_deref(),
-            &prompt,
-            args.system_instruction.as_deref(),
-        );
-        self.owner_answers.approve(session, &subject);
-    }
-
     fn description(&self) -> &str {
         "Delegate a task to a CLI-based AI coding agent running on this machine"
     }
@@ -4974,9 +4837,6 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
             manages_own_timeout: true,
             goal_context: crate::tools::traits::GoalContext::BackgroundDelivery,
             checkpoints_writes: true,
-            // The owner's approval of a daemonizing run is kept for that
-            // run alone (`record_owner_answer`), never as a session grant.
-            keeps_own_grants: true,
             // A CLI agent's run is a helper run like a sub-agent's: it
             // inherits the turn's authority, narrowed by its declaration
             // ([`crate::helper_run::helper_authority`]).
@@ -4992,33 +4852,6 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
             },
             ..Default::default()
         }
-    }
-
-    /// A run whose prompt asks for detached/background execution asks the
-    /// owner, for that exact run. A caller who is not the owner, or a call
-    /// with no session, is refused by the run itself, so nothing is asked.
-    /// Every other call is left to the approval policy.
-    async fn owner_approval_request(
-        &self,
-        call: &crate::tools::traits::ApprovalCall<'_>,
-        facts: &ToolCallContext,
-    ) -> crate::tools::traits::OwnerApprovalNeed {
-        if call.refused {
-            return crate::tools::traits::OwnerApprovalNeed::NotNeeded;
-        }
-        let Some((args, prompt)) = Self::daemonizing_run(call.arguments) else {
-            return crate::tools::traits::OwnerApprovalNeed::Unjudged;
-        };
-        if !Self::is_owner_role(facts.user_role) || facts.session().is_none() {
-            return crate::tools::traits::OwnerApprovalNeed::Unjudged;
-        }
-        let hits = Self::daemonization_hits(&prompt, args.system_instruction.as_deref());
-        crate::tools::traits::OwnerApprovalNeed::Ask(self.daemonization_request(
-            args.tool.as_deref(),
-            &prompt,
-            args.system_instruction.as_deref(),
-            &hits,
-        ))
     }
 
     fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
@@ -5428,39 +5261,6 @@ impl CliAgentTool {
                     }
                 }
 
-                let daemon_hits =
-                    Self::daemonization_hits(&prompt, args.system_instruction.as_deref());
-                if !daemon_hits.is_empty() {
-                    if !Self::is_owner_role(args.call_role) {
-                        return Ok(format!(
-                            "Blocked: daemonization primitives detected in cli_agent prompt ({}) and only owners can approve detached/background execution.",
-                            daemon_hits.join(", ")
-                        ));
-                    }
-                    if session_id.trim().is_empty() {
-                        return Ok(
-                            "Blocked: daemonization primitives require owner approval in an interactive session, but no session_id was provided."
-                                .to_string(),
-                        );
-                    }
-                    // The kernel asked the owner about this exact run
-                    // (`owner_approval_request`) and delivered the approval
-                    // (`record_owner_answer`); a decline never reaches here.
-                    let subject = Self::daemonization_subject(
-                        args.tool.as_deref(),
-                        &prompt,
-                        args.system_instruction.as_deref(),
-                    );
-                    let approved = facts
-                        .session()
-                        .is_some_and(|session| self.owner_answers.take(session, &subject));
-                    if !approved {
-                        return Ok(format!(
-                            "Blocked: daemonization primitives detected in cli_agent prompt ({}); detached/background execution requires the owner's approval of this exact run through the agent kernel, and none was given.",
-                            daemon_hits.join(", ")
-                        ));
-                    }
-                }
                 // Goal-scoped cli_agent runs should not detach immediately:
                 // the goal/task lead is already running in the background, and
                 // returning early makes results easy to drop.
@@ -6016,7 +5816,6 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            owner_answers: Default::default(),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),
@@ -6059,7 +5858,6 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            owner_answers: Default::default(),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),
@@ -6367,133 +6165,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_daemonization_prompt_blocked_for_non_owner() {
-        let (tool, _db) = setup_echo_tool().await;
-        let result = tool
-            .call_with_status_under_contract(
-                r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &"}"#,
-                None,
-                false,
-                false,
-                &crate::tools::traits::ToolCallContext {
-                    session_id: "sess1".into(),
-                    user_role: Some(aidaemon_tools::semantics::UserRole::Guest),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            result.contains("Blocked: daemonization primitives"),
-            "Expected daemonization guard block, got: {}",
-            result
-        );
-    }
-
-    fn owner_facts(session: &str) -> crate::tools::traits::ToolCallContext {
-        crate::tools::traits::ToolCallContext {
-            session_id: session.into(),
-            user_role: Some(aidaemon_tools::semantics::UserRole::Owner),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn daemonizing_run_asks_the_owner_through_the_kernel_once() {
+    async fn a_prompt_naming_tmux_or_nohup_is_not_judged_by_its_words() {
+        // The delegated agent's prompt is prose: only commands the daemon
+        // itself runs are scanned (terminal), so the run starts for a guest
+        // and asks nobody.
         use crate::tools::traits::{ApprovalCall, OwnerApprovalNeed};
         let (tool, _db) = setup_echo_tool().await;
-        let args = json!({"action":"run","tool":"echo","prompt":"nohup echo hi &"});
-        let call = ApprovalCall::as_sent(&args);
-
-        let OwnerApprovalNeed::Ask(request) = tool
-            .owner_approval_request(&call, &owner_facts("sess1"))
-            .await
-        else {
-            panic!("a daemonizing owner run must ask");
-        };
-        assert_eq!(request.risk, aidaemon_core::ApprovalRisk::Critical);
-        assert!(request.summary.contains("detached/background"));
-        assert!(matches!(
-            tool.approval_card_kind(&request),
-            aidaemon_tools::semantics::ApprovalKind::CommandOnce
-        ));
-        assert!(tool.dispatch_facts().keeps_own_grants);
-
-        // A plain run, a non-owner, or no session: the tool has no card.
-        let plain = json!({"action":"run","tool":"echo","prompt":"echo hi"});
-        assert!(matches!(
-            tool.owner_approval_request(&ApprovalCall::as_sent(&plain), &owner_facts("sess1"))
-                .await,
-            OwnerApprovalNeed::Unjudged
-        ));
-        let guest = crate::tools::traits::ToolCallContext {
+        let raw = r#"{"action":"run","tool":"echo","prompt":"Explain how screen, tmux and nohup & differ"}"#;
+        let facts = crate::tools::traits::ToolCallContext {
             session_id: "sess1".into(),
             user_role: Some(aidaemon_tools::semantics::UserRole::Guest),
             ..Default::default()
         };
-        assert!(matches!(
-            tool.owner_approval_request(&call, &guest).await,
-            OwnerApprovalNeed::Unjudged
-        ));
-        assert!(matches!(
-            tool.owner_approval_request(&call, &owner_facts("")).await,
-            OwnerApprovalNeed::Unjudged
-        ));
-    }
-
-    #[tokio::test]
-    async fn daemonizing_run_runs_only_with_a_kernel_approval_of_that_run() {
-        use crate::tools::traits::ApprovalCall;
-        let (tool, _db) = setup_echo_tool().await;
-        let raw = r#"{"action":"run","tool":"echo","prompt":"nohup echo hi &"}"#;
-        let args: Value = serde_json::from_str(raw).unwrap();
-        let facts = owner_facts("sess1");
-        let run = || tool.call_with_status_under_contract(raw, None, false, false, &facts);
-
-        // Never approved: refused, and the tool asks nobody itself.
-        let result = run().await.unwrap();
-        assert!(result.contains("through the agent kernel"), "{result}");
-
-        // A decline or a timeout keeps nothing.
-        tool.record_owner_answer(
-            &ApprovalCall::as_sent(&args),
-            &facts,
-            Some(ApprovalResponse::Deny),
-        )
-        .await;
-        tool.record_owner_answer(&ApprovalCall::as_sent(&args), &facts, None)
-            .await;
-        let result = run().await.unwrap();
-        assert!(result.contains("through the agent kernel"), "{result}");
-
-        // An approval of a different run, or in another session, covers nothing.
-        let other = json!({"action":"run","tool":"echo","prompt":"nohup echo other &"});
-        tool.record_owner_answer(
-            &ApprovalCall::as_sent(&other),
-            &facts,
-            Some(ApprovalResponse::AllowOnce),
-        )
-        .await;
-        tool.record_owner_answer(
-            &ApprovalCall::as_sent(&args),
-            &owner_facts("sess2"),
-            Some(ApprovalResponse::AllowOnce),
-        )
-        .await;
-        let result = run().await.unwrap();
-        assert!(result.contains("through the agent kernel"), "{result}");
-
-        // The approved run runs once.
-        tool.record_owner_answer(
-            &ApprovalCall::as_sent(&args),
-            &facts,
-            Some(ApprovalResponse::AllowOnce),
-        )
-        .await;
-        let result = run().await.unwrap();
+        let result = tool
+            .call_with_status_under_contract(raw, None, false, false, &facts)
+            .await
+            .unwrap();
         assert!(!result.contains("Blocked"), "{result}");
-        let result = run().await.unwrap();
-        assert!(result.contains("through the agent kernel"), "{result}");
+        let args: Value = serde_json::from_str(raw).unwrap();
+        assert!(!matches!(
+            tool.owner_approval_request(&ApprovalCall::as_sent(&args), &facts)
+                .await,
+            OwnerApprovalNeed::Ask(_)
+        ));
     }
 
     #[tokio::test]
@@ -7813,7 +7507,6 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            owner_answers: Default::default(),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),
@@ -7877,7 +7570,6 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            owner_answers: Default::default(),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),
@@ -8034,7 +7726,6 @@ mod tests {
             default_max_output: 10000,
             max_concurrent: 3,
             concurrency_limiter: Arc::new(Semaphore::new(3)),
-            owner_answers: Default::default(),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),
