@@ -672,6 +672,21 @@ impl ManageAutomationsTool {
             }
         };
         let mut runs = self.state.get_goal_runs(&goal_id).await?;
+        // A run whose root task has not started is waiting for its time, not
+        // running: a one-shot reminder opens its run when it is set and
+        // its task starts when it is due (live 2026-11-18: the card read
+        // "Running, last run 11:20 PM" for a reminder due at 11:26 PM).
+        let mut waiting = Vec::new();
+        for run in &runs {
+            let task = match run.root_task_id.as_deref() {
+                Some(task_id) if run_may_be_waiting(run) => self.state.get_task(task_id).await?,
+                _ => None,
+            };
+            if run_is_waiting(run, task.as_ref()) {
+                waiting.push(run.id.clone());
+            }
+        }
+        runs.retain(|run| !waiting.contains(&run.id));
         runs.truncate(RECENT_RUNS);
         Ok(runs
             .into_iter()
@@ -1907,6 +1922,20 @@ fn zone_label(tz: &str) -> Option<String> {
         .and_then(|zone| zone.label())
 }
 
+/// Whether `run` is open but not under way: its root task has not
+/// started, so it waits for its time (a one-shot reminder opens its run
+/// when it is set). Its card shows no "last run" until it starts.
+fn run_is_waiting(
+    run: &aidaemon_work::goals::GoalRun,
+    root_task: Option<&aidaemon_work::goals::Task>,
+) -> bool {
+    run_may_be_waiting(run) && root_task.is_some_and(|task| task.started_at.is_none())
+}
+
+fn run_may_be_waiting(run: &aidaemon_work::goals::GoalRun) -> bool {
+    matches!(run.status.as_str(), "running" | "pending") && run.root_task_id.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1954,6 +1983,44 @@ mod tests {
             edit: None,
             held_after_failures: Some(held),
         }
+    }
+
+    /// Live 2026-11-18: a reminder set at 11:20 PM for 11:26 PM showed
+    /// "Running, last run 11:20 PM" until it fired. A run whose task has
+    /// not started is waiting, not a last run; once the task starts it is.
+    #[test]
+    fn a_run_whose_task_has_not_started_is_waiting() {
+        let mut run = GoalRun::new("goal-1", "project-1", "scheduled");
+        run.status = "running".to_string();
+        run.root_task_id = Some("task-1".to_string());
+        let mut task = aidaemon_work::goals::Task {
+            id: "task-1".to_string(),
+            goal_id: "goal-1".to_string(),
+            description: "Deliver the reminder".to_string(),
+            status: "pending".to_string(),
+            priority: "medium".to_string(),
+            task_order: 0,
+            parallel_group: None,
+            depends_on: None,
+            agent_id: None,
+            context: None,
+            result: None,
+            error: None,
+            blocker: None,
+            idempotent: true,
+            retry_count: 0,
+            max_retries: 0,
+            created_at: "2026-11-18T04:20:44Z".to_string(),
+            started_at: None,
+            completed_at: None,
+        };
+        assert!(run_is_waiting(&run, Some(&task)));
+        task.started_at = Some("2026-11-18T04:26:13Z".to_string());
+        assert!(!run_is_waiting(&run, Some(&task)));
+        run.status = "completed".to_string();
+        task.started_at = None;
+        assert!(!run_is_waiting(&run, Some(&task)));
+        assert!(!run_is_waiting(&run, None));
     }
 
     #[test]
