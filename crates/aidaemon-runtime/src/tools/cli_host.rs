@@ -213,6 +213,9 @@ fn response_line(_request_id: &str, response: Value) -> String {
 pub struct HostAnswers {
     /// Actions the owner declined.
     pub declined: Vec<String>,
+    /// Actions a safeguard refused, for an agent that does not report its
+    /// own refusals (Codex; Claude Code lists them in `permission_denials`).
+    pub refused: Vec<String>,
 }
 
 /// Answers one Claude Code process's prompts for its run.

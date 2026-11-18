@@ -2675,7 +2675,9 @@ impl CliAgentTool {
         // Claude Code built in and run inside a kernel turn asks its host
         // for permission instead of denying on its own: each prompt is
         // judged by this run (`cli_host`).
-        let host_nested = nested.filter(|_| agent_kind.eq_ignore_ascii_case("claude"));
+        let host_nested = nested
+            .clone()
+            .filter(|_| agent_kind.eq_ignore_ascii_case("claude"));
         if host_nested.is_some() {
             for pair in crate::tools::cli_host::CLAUDE_HOST_FLAGS.chunks(2) {
                 if !args.iter().any(|arg| arg == pair[0]) {
@@ -2735,6 +2737,38 @@ impl CliAgentTool {
                 return Ok(format!(
                     "Blocked: CLI delegation was not started because {error}. Select an agent with a registered native sandbox adapter or provide a narrower access manifest."
                 ));
+            }
+        }
+        // Codex confined for a read-write run asks this run before it
+        // leaves its sandbox (`codex_host`): the same confinement, launched
+        // as `codex app-server` with its own `CODEX_HOME`. A read-only run
+        // is never widened, so it stays on `exec`, as does a launch the
+        // app-server has no equivalent for.
+        let mut codex_hosting: Option<(
+            aidaemon_core::NestedCalls,
+            crate::tools::codex_host::CodexHome,
+        )> = None;
+        if enforce_native_access
+            && workspace_mode == CliWorkspaceMode::ReadWrite
+            && agent_kind.eq_ignore_ascii_case("codex")
+            && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local
+            && let Some(nested) = nested
+        {
+            let start = if is_env_launcher(&command) {
+                env_wrapped_program_index(&args).map_or(0, |index| index + 1)
+            } else {
+                0
+            };
+            let hosted =
+                crate::tools::codex_host::app_server_args(&args, start).and_then(|hosted| {
+                    crate::tools::codex_host::CodexHome::prepare().map(|home| (hosted, home))
+                });
+            match hosted {
+                Ok((hosted, home)) => {
+                    args = hosted;
+                    codex_hosting = Some((nested, home));
+                }
+                Err(reason) => info!(%reason, "A Codex run stays on exec"),
             }
         }
         // A repository-wide diff is useful only when this invocation starts
@@ -2921,7 +2955,7 @@ impl CliAgentTool {
         let delegated_task_id_owned = delegated_task_id.map(|task_id| task_id.to_string());
 
         let mut command_args = args.clone();
-        if host_nested.is_none() {
+        if host_nested.is_none() && codex_hosting.is_none() {
             command_args.push(final_prompt.clone());
         }
         let mut request = ExecutionRequest::argv(command.clone(), command_args);
@@ -2931,6 +2965,16 @@ impl CliAgentTool {
             request.stdin =
                 Some(crate::tools::cli_host::claude_prompt_line(&final_prompt).into_bytes());
             request.keep_stdin = true;
+        }
+        if let Some((_, home)) = codex_hosting.as_ref() {
+            // The handshake goes in first; the task follows once its thread
+            // is started, and stdin stays open for the host's answers.
+            request.stdin = Some(crate::tools::codex_host::initialize_line().into_bytes());
+            request.keep_stdin = true;
+            request.env.insert(
+                "CODEX_HOME".to_string(),
+                home.path().to_string_lossy().into_owned(),
+            );
         }
         if tool_name.eq_ignore_ascii_case("claude") {
             request.env_remove.push("CLAUDECODE".to_string());
@@ -2999,6 +3043,21 @@ impl CliAgentTool {
             })
         });
         let claude_host_for_task = claude_host.clone();
+        let (codex_host, codex_home) = match codex_hosting {
+            Some((nested, home)) => (
+                spawned.take_stdin().map(|stdin| {
+                    crate::tools::codex_host::CodexHost::new(
+                        stdin,
+                        nested,
+                        canonical_working_dir.clone(),
+                        &final_prompt,
+                    )
+                }),
+                Some(home),
+            ),
+            None => (None, None),
+        };
+        let codex_host_for_task = codex_host.clone();
         let stdout = match spawned.take_stdout() {
             Some(stdout) => stdout,
             None => {
@@ -3015,6 +3074,12 @@ impl CliAgentTool {
                 }
                 return Err(anyhow::anyhow!(error));
             }
+        };
+        // A hosted Codex's protocol is read by its host and replaced by the
+        // `codex exec --json` events it stands for.
+        let stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match codex_host.clone() {
+            Some(host) => Box::new(crate::tools::codex_host::translate(stdout, host)),
+            None => Box::new(stdout),
         };
         let stderr = match spawned.take_stderr() {
             Some(stderr) => stderr,
@@ -3111,6 +3176,8 @@ impl CliAgentTool {
         }
         tokio::spawn(async move {
             let _slot_permit = slot_permit_for_task;
+            // Removed once the run is over.
+            let _codex_home = codex_home;
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut stderr_reader = BufReader::new(stderr).lines();
             let mut last_progress = Instant::now();
@@ -3320,6 +3387,12 @@ impl CliAgentTool {
                     Err(_) => None,
                 }
             };
+            // A hosted Codex exits 0 once its stdin closes, whatever its
+            // turn did: a turn that did not complete is a failed run.
+            let exit_code = match (exit_code, codex_host_for_task.as_ref()) {
+                (Some(0), Some(host)) if !host.turn_completed() => Some(1),
+                (code, _) => code,
+            };
             // What the agent left running, read once it has exited (and,
             // when the runtime stopped it, after its group was signalled).
             // Reported, never stopped. Only a local process can be read.
@@ -3358,10 +3431,23 @@ impl CliAgentTool {
                     expects_change,
                     changed_something,
                     step: task_context.clone(),
-                    refused: agent_refused_actions(&stdout_buf_writer.lock().await),
+                    refused: agent_refused_actions(&stdout_buf_writer.lock().await)
+                        .into_iter()
+                        .chain(
+                            codex_host_for_task
+                                .as_ref()
+                                .map(|host| host.answers().refused)
+                                .unwrap_or_default(),
+                        )
+                        .collect(),
                     declined: claude_host_for_task
                         .as_ref()
                         .map(|host| host.answers().declined)
+                        .or_else(|| {
+                            codex_host_for_task
+                                .as_ref()
+                                .map(|host| host.answers().declined)
+                        })
                         .unwrap_or_default(),
                 });
             let _ = end_record_for_task.set(CliRunEnd {
