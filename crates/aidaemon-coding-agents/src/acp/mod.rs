@@ -61,13 +61,17 @@ impl AcpAgent {
         }
     }
 
-    /// Gemini CLI (`gemini --acp`). Not looked for on its own: since
-    /// 2026-06-18 Google serves it only to enterprise licences and paid API
-    /// keys, not to personal Google sign-ins (which it refuses a session).
-    /// An owner with such an account adds a `gemini` agent, and it is
-    /// recognized and hosted as this.
+    /// Gemini CLI (`gemini --acp`). Since 2026-06-18 Google serves it only
+    /// to enterprise licences and paid API keys: a personal sign-in is
+    /// refused a session, which its readiness check reports.
     pub fn gemini() -> Self {
         Self {
+            discovery: Some(Discovery {
+                name: "gemini",
+                command: "gemini",
+                args: &["--acp"],
+                description: "Gemini CLI — Google's AI coding agent",
+            }),
             arguments: Some(LaunchArguments {
                 flags: &["--acp", "--experimental-acp", "--debug", "-d"],
                 valued: &["--model", "-m"],
@@ -117,6 +121,13 @@ impl CodingAgent for AcpAgent {
             PermissionMode::EveryCommand => can_host,
             PermissionMode::Checked => false,
         }
+    }
+
+    /// A session it opens (no prompt sent), or its own reason not to.
+    fn readiness_probe(&self) -> Option<crate::Probe> {
+        Some(crate::Probe::AcpSession {
+            serve: self.serve.clone(),
+        })
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {

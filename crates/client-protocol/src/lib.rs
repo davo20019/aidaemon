@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 37;
+pub const PROTOCOL_MINOR: u16 = 38;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1349,6 +1349,32 @@ pub struct CodingAgent {
     /// Why some modes are not offered, in plain words; empty when all are.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Whether it can do work now, as it last answered (protocol 1.38).
+    #[serde(default)]
+    pub readiness: AgentReadiness,
+    /// For one that is not usable: why, in its own words when it gave them,
+    /// and how the owner fixes it (protocol 1.38).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub readiness_reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub readiness_fix: String,
+}
+
+/// Whether a coding agent can do work now (protocol 1.38).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReadiness {
+    /// It answered that it is ready.
+    Ready,
+    /// It answered that it is not (not signed in, not served for this
+    /// account): the daemon does not hand it work.
+    NotUsable,
+    /// It has not been asked, or could not say.
+    #[default]
+    Unchecked,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// How much a coding agent may do on its own (protocol 1.36).
@@ -1659,6 +1685,9 @@ pub enum SettingsChange {
         agent: String,
         mode: AgentMode,
     },
+    /// Ask every coding agent again whether it can do work now (protocol
+    /// 1.38).
+    CheckAgents,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

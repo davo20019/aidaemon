@@ -211,6 +211,24 @@ impl CodingAgent for ClaudeCode {
         mode == PermissionMode::FullAccess || can_host
     }
 
+    /// `claude auth status` answers with typed JSON (`loggedIn`).
+    fn readiness_probe(&self) -> Option<crate::Probe> {
+        Some(crate::Probe::Status {
+            args: vec!["auth".into(), "status".into()],
+            read: |_, stdout| match serde_json::from_str::<Value>(stdout.trim())
+                .ok()
+                .and_then(|status| status.get("loggedIn").and_then(Value::as_bool))
+            {
+                Some(true) => crate::Readiness::Ready,
+                Some(false) => crate::Readiness::NotUsable {
+                    reason: "Claude Code isn't signed in on this machine.".into(),
+                    fix: Some("Run `claude auth login` on this machine.".into()),
+                },
+                None => crate::Readiness::Unchecked,
+            },
+        })
+    }
+
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
         let args = &mut launch.args;
         basics(args);

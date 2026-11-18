@@ -30,7 +30,10 @@
             "full_access"
           ],
           "name": "codex",
-          "program": "Codex"
+          "program": "Codex",
+          "readiness": "not_usable",
+          "readiness_fix": "Run `codex login` on this machine.",
+          "readiness_reason": "Codex isn't signed in on this machine."
         },
         {
           "modes": [
@@ -38,7 +41,8 @@
           ],
           "name": "aider",
           "note": "AIDaemon cannot check this agent's actions.",
-          "program": "Aider"
+          "program": "Aider",
+          "readiness": "unchecked"
         }
       ],
       "config_path": "/home/synthetic/.aidaemon/config.toml",

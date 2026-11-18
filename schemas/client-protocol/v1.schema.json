@@ -60,6 +60,26 @@
         }
       ]
     },
+    "AgentReadiness": {
+      "description": "Whether a coding agent can do work now (protocol 1.38).",
+      "oneOf": [
+        {
+          "const": "ready",
+          "description": "It answered that it is ready.",
+          "type": "string"
+        },
+        {
+          "const": "not_usable",
+          "description": "It answered that it is not (not signed in, not served for this\naccount): the daemon does not hand it work.",
+          "type": "string"
+        },
+        {
+          "const": "unchecked",
+          "description": "It has not been asked, or could not say.",
+          "type": "string"
+        }
+      ]
+    },
     "Applies": {
       "description": "When a saved change takes effect.",
       "oneOf": [
@@ -1129,6 +1149,18 @@
         },
         "program": {
           "description": "The program it launches, in plain words (\"Claude Code\", \"Codex\").",
+          "type": "string"
+        },
+        "readiness": {
+          "$ref": "#/$defs/AgentReadiness",
+          "default": "unchecked",
+          "description": "Whether it can do work now, as it last answered (protocol 1.38)."
+        },
+        "readiness_fix": {
+          "type": "string"
+        },
+        "readiness_reason": {
+          "description": "For one that is not usable: why, in its own words when it gave them,\nand how the owner fixes it (protocol 1.38).",
           "type": "string"
         }
       },
@@ -6311,6 +6343,19 @@
             "kind",
             "agent",
             "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ask every coding agent again whether it can do work now (protocol\n1.38).",
+          "properties": {
+            "kind": {
+              "const": "check_agents",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
           ],
           "type": "object"
         }

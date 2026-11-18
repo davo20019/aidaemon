@@ -27,6 +27,7 @@ pub mod claude;
 pub mod codex;
 mod mode;
 pub mod plain;
+mod readiness;
 mod registry;
 mod stdin;
 
@@ -36,4 +37,5 @@ pub use agent::{
     PromptPlacement, RunRequest, read_through,
 };
 pub use mode::{ModeStore, PermissionMode, mode_of, set_mode};
+pub use readiness::{Probe, Readiness, check};
 pub use registry::CodingAgents;

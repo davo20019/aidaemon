@@ -53,6 +53,12 @@ pub trait CodingAgent: Send + Sync {
     /// cannot run as asked, in words for the owner).
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String>;
 
+    /// How to ask whether it can do work now (signed in, served by its
+    /// provider), without a task. `None`: it cannot be asked.
+    fn readiness_probe(&self) -> Option<crate::Probe> {
+        None
+    }
+
     /// The actions its own permission check refused, from the record it
     /// writes at the end of a run (`stdout` is its whole output, as the
     /// embedding agent reads it). Empty when it keeps none.

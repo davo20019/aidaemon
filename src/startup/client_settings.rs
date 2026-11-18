@@ -695,6 +695,7 @@ impl SettingsHost {
                 DatabaseAction::Cancel => SettingsGate::Free,
                 DatabaseAction::Unknown => return Err("Unknown database action".to_string()),
             },
+            SettingsChange::CheckAgents => SettingsGate::Free,
             SettingsChange::SetAgentMode { agent, mode } => {
                 let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
@@ -1123,6 +1124,13 @@ impl SettingsHost {
                     applies: Some(Applies::Restart),
                 })
             }
+            SettingsChange::CheckAgents => {
+                aidaemon_runtime::tools::agent_mode::check_all().await;
+                Ok(SettingsDone {
+                    message: "Asked each coding agent whether it can work.".to_string(),
+                    applies: Some(Applies::Now),
+                })
+            }
             SettingsChange::SetAgentMode { agent, mode } => {
                 use aidaemon_runtime::tools::agent_mode;
                 let coding_agent = agent_mode::agent_named(&agent)
@@ -1216,10 +1224,28 @@ async fn coding_agents(
         PermissionMode::EveryCommand => Wire::EveryCommand,
         PermissionMode::FullAccess => Wire::FullAccess,
     };
+    use aidaemon_client_protocol::AgentReadiness;
+    // An agent not asked yet is asked now (the page shows its answer).
+    agent_mode::ensure_checked().await;
     let mut out = Vec::new();
     for info in agent_mode::agents() {
         let agent = &info.agent;
+        let (readiness, readiness_reason, readiness_fix) =
+            match agent_mode::readiness_of(&info.name) {
+                agent_mode::Readiness::Ready => {
+                    (AgentReadiness::Ready, String::new(), String::new())
+                }
+                agent_mode::Readiness::NotUsable { reason, fix } => {
+                    (AgentReadiness::NotUsable, reason, fix.unwrap_or_default())
+                }
+                agent_mode::Readiness::Unchecked => {
+                    (AgentReadiness::Unchecked, String::new(), String::new())
+                }
+            };
         out.push(aidaemon_client_protocol::CodingAgent {
+            readiness,
+            readiness_reason,
+            readiness_fix,
             program: agent.name().to_string(),
             mode: agent_mode::mode_of(store, &info.name, &**agent)
                 .await
@@ -1350,10 +1376,17 @@ allowed_user_ids = [1]
                 AgentInfo {
                     name: "synthetic-codex".into(),
                     agent: registry.for_program("codex"),
+                    command: "/synthetic/bin/codex".into(),
+                    prefix: Vec::new(),
+                    // Not asked: it does not run here.
+                    local: false,
                 },
                 AgentInfo {
                     name: "synthetic-coder".into(),
                     agent: registry.for_program("synthetic-coder"),
+                    command: "/synthetic/bin/synthetic-coder".into(),
+                    prefix: Vec::new(),
+                    local: false,
                 },
             ]
         }));
@@ -1362,6 +1395,10 @@ allowed_user_ids = [1]
         let codex: &CodingAgent = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
         assert_eq!(codex.program, "Codex");
         assert_eq!(codex.mode, Some(AgentMode::Checked));
+        assert_eq!(
+            codex.readiness,
+            aidaemon_client_protocol::AgentReadiness::Unchecked
+        );
         assert_eq!(codex.modes.len(), 3);
         let other = agents.iter().find(|a| a.name == "synthetic-coder").unwrap();
         assert_eq!(other.mode, None);
@@ -1385,6 +1422,23 @@ allowed_user_ids = [1]
         let agents = coding_agents(&*host.state).await;
         let codex = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
         assert_eq!(codex.mode, Some(AgentMode::EveryCommand));
+        // One whose run could not sign in shows why, until asked again.
+        agent_mode::mark_not_usable(
+            "synthetic-codex",
+            "It couldn't sign in on its last run.",
+            Some("Sign in again."),
+        );
+        let agents = coding_agents(&*host.state).await;
+        let codex = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
+        assert_eq!(
+            codex.readiness,
+            aidaemon_client_protocol::AgentReadiness::NotUsable
+        );
+        assert_eq!(codex.readiness_fix, "Sign in again.");
+        assert_eq!(
+            host.gate(&SettingsChange::CheckAgents).await.unwrap(),
+            SettingsGate::Free
+        );
         // A mode its kind does not offer is refused.
         let refused = SettingsChange::SetAgentMode {
             agent: "synthetic-coder".into(),

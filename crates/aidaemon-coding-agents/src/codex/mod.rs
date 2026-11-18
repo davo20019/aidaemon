@@ -195,6 +195,22 @@ impl CodingAgent for Codex {
         mode != PermissionMode::EveryCommand || can_host
     }
 
+    /// `codex login status` exits 0 when signed in, 1 when not (verified
+    /// with an empty `CODEX_HOME`, 0.170.0).
+    fn readiness_probe(&self) -> Option<crate::Probe> {
+        Some(crate::Probe::Status {
+            args: vec!["login".into(), "status".into()],
+            read: |code, _| match code {
+                Some(0) => crate::Readiness::Ready,
+                Some(1) => crate::Readiness::NotUsable {
+                    reason: "Codex isn't signed in on this machine.".into(),
+                    fix: Some("Run `codex login` on this machine.".into()),
+                },
+                _ => crate::Readiness::Unchecked,
+            },
+        })
+    }
+
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
         if !request.enforce {
             return Ok(Plan::plain());

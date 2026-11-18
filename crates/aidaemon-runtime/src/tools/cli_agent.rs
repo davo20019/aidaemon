@@ -1180,6 +1180,9 @@ impl CliAgentTool {
         let Some(agent) = self.agent_named(name) else {
             return false;
         };
+        if !crate::tools::agent_mode::readiness_of(name).is_usable() {
+            return false;
+        }
         crate::tools::agent_mode::mode_of(&*self.state, name, &*agent)
             .await
             .is_some_and(|mode| agent.can_run(mode, read_only, can_host))
@@ -1398,6 +1401,7 @@ impl CliAgentTool {
         // The Settings page lists these agents with their modes.
         let listed = Arc::downgrade(&tool.tools);
         let registry = tool.coding_agents.clone();
+        let local = tool.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
         crate::tools::agent_mode::publish(Arc::new(move || {
             listed
                 .upgrade()
@@ -1405,15 +1409,32 @@ impl CliAgentTool {
                     tools.read().ok().map(|tools| {
                         tools
                             .iter()
-                            .map(|(name, entry)| crate::tools::agent_mode::AgentInfo {
-                                name: name.clone(),
-                                agent: registry.for_program(&entry_program(entry)),
+                            .map(|(name, entry)| {
+                                // A launcher's own arguments, through the
+                                // program it runs.
+                                let prefix = is_env_launcher(&entry.command)
+                                    .then(|| env_wrapped_program_index(&entry.args))
+                                    .flatten()
+                                    .map(|index| entry.args[..=index].to_vec())
+                                    .unwrap_or_default();
+                                crate::tools::agent_mode::AgentInfo {
+                                    name: name.clone(),
+                                    agent: registry.for_program(&entry_program(entry)),
+                                    command: entry.command.clone(),
+                                    prefix,
+                                    local,
+                                }
                             })
                             .collect()
                     })
                 })
                 .unwrap_or_default()
         }));
+        // Each agent says whether it can work, in the background (never
+        // under test: it would ask the agents installed on the machine).
+        if cfg!(not(test)) {
+            tokio::spawn(crate::tools::agent_mode::check_all());
+        }
 
         tool
     }
@@ -2220,6 +2241,18 @@ impl CliAgentTool {
                 program = coding_agent.name()
             ));
         };
+        // One that last said it cannot work is asked again first (it may
+        // have been signed in since); still not usable, it is not started.
+        if !crate::tools::agent_mode::readiness_of(tool_name).is_usable()
+            && let aidaemon_coding_agents::Readiness::NotUsable { reason, fix } =
+                crate::tools::agent_mode::recheck(tool_name).await
+        {
+            return Ok(format!(
+                "Blocked: {} (`{tool_name}`) can't do work now: {reason}{}",
+                coding_agent.name(),
+                fix.map(|fix| format!(" {fix}")).unwrap_or_default()
+            ));
+        }
         info!(agent = %tool_name, mode = mode.as_str(), "A coding agent runs in its mode");
         // Full access: nothing is asked; the owner chose it.
         let nested = nested.filter(|_| mode != PermissionMode::FullAccess);
@@ -2975,6 +3008,13 @@ impl CliAgentTool {
                 exit_code,
             );
             auth_failed_for_task.store(auth_failed, Ordering::Release);
+            if auth_failed {
+                crate::tools::agent_mode::mark_not_usable(
+                    &tool_name_owned,
+                    "It couldn't sign in on its last run.",
+                    None,
+                );
+            }
             let (run_phase, run_evidence) =
                 crate::helper_run::program_phase(&crate::helper_run::ProgramEnd {
                     exit_code,

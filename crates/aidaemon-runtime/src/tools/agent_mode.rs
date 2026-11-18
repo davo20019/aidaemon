@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aidaemon_coding_agents::{ActionJudge, AgentAction, ModeStore, Verdict};
-pub use aidaemon_coding_agents::{CodingAgent, CodingAgents, PermissionMode};
+pub use aidaemon_coding_agents::{CodingAgent, CodingAgents, PermissionMode, Readiness};
 use aidaemon_core::{NestedCalls, ToolCall};
 use aidaemon_tools::services::SettingsStore;
 use async_trait::async_trait;
@@ -59,6 +59,13 @@ pub async fn set_mode(
 pub struct AgentInfo {
     pub name: String,
     pub agent: Arc<dyn CodingAgent>,
+    /// How it is launched: the command, and what precedes the agent's own
+    /// arguments (a launcher's: `env FOO=1 codex`), for asking it whether
+    /// it can work.
+    pub command: String,
+    pub prefix: Vec<String>,
+    /// It runs on this machine (only such an agent is asked).
+    pub local: bool,
 }
 
 /// Lists one `cli_agent` tool's agents; empty once the tool is gone.
@@ -101,6 +108,87 @@ pub fn agent_named(name: &str) -> Option<Arc<dyn CodingAgent>> {
         .into_iter()
         .find(|info| info.name == name)
         .map(|info| info.agent)
+}
+
+fn readiness_cache() -> &'static Mutex<std::collections::HashMap<String, Readiness>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Readiness>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+/// Whether the agent named `name` can do work, as it last answered
+/// (`Unchecked` before it is asked).
+pub fn readiness_of(name: &str) -> Readiness {
+    readiness_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(name).cloned())
+        .unwrap_or(Readiness::Unchecked)
+}
+
+fn remember(name: &str, readiness: Readiness) {
+    tracing::info!(agent = %name, ?readiness, "A coding agent says whether it can work");
+    if let Ok(mut cache) = readiness_cache().lock() {
+        cache.insert(name.to_string(), readiness);
+    }
+}
+
+/// Ask one agent now (its own probe; one that cannot be asked, or does not
+/// run here, is unchecked).
+async fn ask(info: &AgentInfo) -> Readiness {
+    match info.agent.readiness_probe() {
+        Some(probe) if info.local => {
+            aidaemon_coding_agents::check(&probe, &info.command, &info.prefix, None).await
+        }
+        _ => Readiness::Unchecked,
+    }
+}
+
+/// Ask the agent named `name` again, and keep its answer.
+pub async fn recheck(name: &str) -> Readiness {
+    let Some(info) = agents().into_iter().find(|info| info.name == name) else {
+        return Readiness::Unchecked;
+    };
+    let readiness = ask(&info).await;
+    remember(name, readiness.clone());
+    readiness
+}
+
+/// Ask every agent again, all at once, and keep their answers.
+pub async fn check_all() {
+    let checks = agents().into_iter().map(|info| async move {
+        let readiness = ask(&info).await;
+        remember(&info.name, readiness);
+    });
+    futures::future::join_all(checks).await;
+}
+
+/// Ask the agents not asked yet.
+pub async fn ensure_checked() {
+    let unasked: Vec<AgentInfo> = agents()
+        .into_iter()
+        .filter(|info| {
+            readiness_cache()
+                .lock()
+                .is_ok_and(|cache| !cache.contains_key(&info.name))
+        })
+        .collect();
+    let checks = unasked.into_iter().map(|info| async move {
+        let readiness = ask(&info).await;
+        remember(&info.name, readiness);
+    });
+    futures::future::join_all(checks).await;
+}
+
+/// Its last run could not sign in (the run's own typed signal): not usable
+/// until it is asked again and answers otherwise.
+pub fn mark_not_usable(name: &str, reason: &str, fix: Option<&str>) {
+    remember(
+        name,
+        Readiness::NotUsable {
+            reason: reason.to_string(),
+            fix: fix.map(str::to_string),
+        },
+    );
 }
 
 /// Judges a hosted agent's requests through the run's nested-call seam.
@@ -239,6 +327,19 @@ mod tests {
         });
         assert_eq!(call.name, "web_fetch");
         assert_eq!(call.arguments, json!({"url": "https://example.com/"}));
+    }
+
+    #[test]
+    fn an_agent_is_unchecked_until_it_answers_and_a_failed_sign_in_marks_it() {
+        assert_eq!(readiness_of("synthetic-never-asked"), Readiness::Unchecked);
+        mark_not_usable(
+            "synthetic-signed-out",
+            "It couldn't sign in on its last run.",
+            None,
+        );
+        assert!(!readiness_of("synthetic-signed-out").is_usable());
+        remember("synthetic-signed-out", Readiness::Ready);
+        assert!(readiness_of("synthetic-signed-out").is_usable());
     }
 
     #[tokio::test]

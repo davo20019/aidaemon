@@ -19,8 +19,8 @@ impl CodingAgents {
 
     /// The agents this crate ships: Claude Code and Codex (hosted by their
     /// own protocols), Antigravity CLI and Gemini CLI (hosted over the Agent
-    /// Client Protocol; Gemini CLI only when the owner adds it), GitHub
-    /// Copilot CLI and Aider (full access only).
+    /// Client Protocol), GitHub Copilot CLI and Aider (full access only).
+    /// Whether each can do work now is its readiness check's to say.
     pub fn builtin() -> Self {
         Self::empty()
             .with(ClaudeCode)
@@ -76,9 +76,7 @@ mod tests {
         assert_eq!(agents.for_program("claude").name(), "Claude Code");
         assert_eq!(agents.for_program("codex.exe").name(), "Codex");
         assert_eq!(agents.for_program("agy").name(), "Antigravity CLI");
-        // Recognized when added, though never looked for on its own.
         assert_eq!(agents.for_program("gemini").name(), "Gemini CLI");
-        assert!(agents.for_program("gemini").discovery().is_none());
         let unknown = agents.for_program("synthetic-coder");
         assert_eq!(unknown.name(), "synthetic-coder");
         assert_eq!(unknown.modes(), &[PermissionMode::FullAccess]);
@@ -152,6 +150,9 @@ mod tests {
             .iter()
             .filter_map(|agent| agent.discovery().map(|found| found.name))
             .collect();
-        assert_eq!(names, ["claude", "codex", "agy", "copilot", "aider"]);
+        assert_eq!(
+            names,
+            ["claude", "codex", "agy", "gemini", "copilot", "aider"]
+        );
     }
 }
