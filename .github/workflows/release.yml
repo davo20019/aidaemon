@@ -276,6 +276,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-18 llvm-18
+          # nsh package also compiles native crates (glib-sys and the rest of
+          # the GTK 4 stack), as the Linux app job does.
+          sudo apt-get install -y libgtk-4-dev clang pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
 
       - name: Install nsh CLI
         run: |

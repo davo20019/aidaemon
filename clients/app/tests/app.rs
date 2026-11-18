@@ -968,24 +968,24 @@ fn above(screen: &nsh_testing::Screen, first: &str, second: &str) -> bool {
     matches!((at(first), at(second)), (Some(a), Some(b)) if a < b)
 }
 
+/// Long-presses `target` until its menu shows `item`. On a loaded
+/// runner a press landing while a just-reordered list redraws can be
+/// lost, and the menu opens a frame or more later.
+fn open_menu(app: &mut Headless, target: &str, item: &str) -> Result<(), String> {
+    for _ in 0..3 {
+        app.long_press(target)?;
+        if app
+            .wait_until(item, std::time::Duration::from_secs(3), |s| s.shows(item))
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    app.wait_for(item)
+}
+
 #[test]
 fn projects_can_be_pinned_dragged_into_order_and_deleted() -> Result<(), String> {
-    /// Long-presses `target` until its menu shows `item`. On a loaded
-    /// runner a press landing while a just-reordered list redraws can be
-    /// lost, and the menu opens a frame or more later.
-    fn open_menu(app: &mut Headless, target: &str, item: &str) -> Result<(), String> {
-        for _ in 0..3 {
-            app.long_press(target)?;
-            if app
-                .wait_until(item, std::time::Duration::from_secs(3), |s| s.shows(item))
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        app.wait_for(item)
-    }
-
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     app.wait_for("What can I help you with?")?;
@@ -1445,7 +1445,7 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
     app.wait_for("Archived")?;
     app.press("Cancel")?;
     // Archiving says so, and Undo on the note takes it back.
-    app.long_press("Write the newsletter >> nth=0")?;
+    open_menu(&mut app, "Write the newsletter >> nth=0", "Archive")?;
     let before = sent("archive_session");
     app.press("Archive")?;
     wait_sent_new("archive_session", before)?;
