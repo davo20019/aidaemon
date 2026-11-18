@@ -510,6 +510,30 @@ pub fn meter(label: impl Into<SharedString>, share: f32) -> View {
     )
 }
 
+/// Asks yes or no in the platform's own alert: `then(true)` on `yes`,
+/// `then(false)` on `no`; dismissed without an answer, neither runs.
+pub fn yes_or_no(
+    title: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    yes: impl Into<SharedString>,
+    no: impl Into<SharedString>,
+    then: impl FnOnce(bool) + 'static,
+) {
+    let answer = alert_dialog()
+        .title(title.into())
+        .description(detail.into())
+        .cancel("no", no.into())
+        .action("yes", yes.into())
+        .show();
+    spawn(async move {
+        match answer.await.ok().and_then(|r| r.action) {
+            Some(id) if id.as_ref() == "yes" => then(true),
+            Some(id) if id.as_ref() == "no" => then(false),
+            _ => {}
+        }
+    });
+}
+
 /// Offers to do something now, in the platform's own alert: `title`,
 /// `detail`, then `action` or `later`. `then` runs only on `action`.
 pub fn now_or_later(

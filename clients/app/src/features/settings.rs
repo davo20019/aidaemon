@@ -5,9 +5,9 @@
 //! lands. Guarded changes wait for an approval, shown like any other.
 
 use aidaemon_client_protocol::{
-    Applies, ApplyHow, Billing, BotInfo, ConnectedProvider, CredentialState, DatabaseAction,
-    McpAction, McpServerInfo, ProviderChoice, ProviderOption, ProviderUsage, SecretText, Setting,
-    SettingGroup, SettingKind, Settings, SettingsChange, UsageBalance,
+    Applies, ApplyHow, ApprovalDecision, Billing, BotInfo, ConnectedProvider, CredentialState,
+    DatabaseAction, McpAction, McpServerInfo, ProviderChoice, ProviderOption, ProviderUsage,
+    SecretText, Setting, SettingGroup, SettingKind, Settings, SettingsChange, UsageBalance,
 };
 use std::rc::Rc;
 
@@ -39,6 +39,7 @@ pub fn page(store: Store) -> View {
     let form = ProviderForm::new();
     form.follow(store);
     offer_restart_when_needed(store);
+    ask_approvals_in_place(store);
     view()
         .flex_1()
         .min_w(px(0.0))
@@ -59,6 +60,41 @@ fn pending(store: Store) -> (bool, bool) {
 /// away: whoever flipped the switch should not have to find a button.
 /// Only a change seen while the page is open asks; one already waiting
 /// when it opens is left to the bar.
+/// A change the daemon asks this device to approve is asked here, where it
+/// was made, in the same alert as the app's own questions: the answer goes
+/// to the daemon's approval, so its card in the conversation list is
+/// answered too and nothing is asked twice. Each is asked once; one
+/// dismissed stays waiting (the banner above counts it).
+fn ask_approvals_in_place(store: Store) {
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    effect(move || {
+        for approval in store.settings_asking_here() {
+            if asked.borrow().contains(&approval.id) {
+                continue;
+            }
+            asked.borrow_mut().push(approval.id.clone());
+            let mut detail = approval.summary.clone();
+            for warning in &approval.warnings {
+                detail.push_str("\n\n");
+                detail.push_str(warning);
+            }
+            let id = approval.id.clone();
+            untracked(move || {
+                ui::yes_or_no("Allow this change?", detail, "Allow", "Deny", move |yes| {
+                    store.resolve(
+                        &id,
+                        if yes {
+                            ApprovalDecision::ApproveOnce
+                        } else {
+                            ApprovalDecision::Deny
+                        },
+                    )
+                })
+            });
+        }
+    });
+}
+
 fn offer_restart_when_needed(store: Store) {
     let before = std::cell::Cell::new(None::<bool>);
     effect(move || {
@@ -1199,9 +1235,10 @@ fn connected_row(
             .accessibility_label("Change the main provider"),
         );
     } else if !provider.preset.is_empty() {
-        // A failover that can already answer is promoted as it is, after
-        // one question: its key (or sign-in) and models carry over. Only
-        // one that cannot (no key here) opens the form to get one.
+        // A failover that can already answer is promoted as it is: its key
+        // (or sign-in) and models carry over, and the daemon's approval card
+        // is the one question asked. Only one that cannot (no key here)
+        // opens the form to get one.
         let ready = matches!(
             provider.credential,
             CredentialState::KeyStored | CredentialState::NotNeeded | CredentialState::SignedIn
@@ -1213,27 +1250,16 @@ fn connected_row(
             fast_model: provider.quick_model.clone(),
             smart_model: provider.hard_model.clone(),
         };
-        let name = provider.name.clone();
         actions = actions.child(
             ui::btn("Make main", Variant::Outline, Size::Sm, move || {
                 if !ready {
                     form.open(Adding::Main, choice.preset.clone(), at);
                     return;
                 }
-                let choice = choice.clone();
-                ui::now_or_later(
-                    format!("Make {name} the main provider?"),
-                    "It answers first from now on, with the key and models it already has. \
-                     It replaces the current main provider.",
-                    "Make main",
-                    "Cancel",
-                    move || {
-                        store.change_settings(SettingsChange::SwitchProvider {
-                            provider: choice,
-                            key: None,
-                        })
-                    },
-                );
+                store.change_settings(SettingsChange::SwitchProvider {
+                    provider: choice.clone(),
+                    key: None,
+                });
             })
             .disabled(move || store.settings_busy())
             .accessibility_label(format!("Make {} the main provider", provider.name)),

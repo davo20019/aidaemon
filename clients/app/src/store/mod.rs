@@ -177,6 +177,8 @@ struct Reads {
     settings_unsupported: Memo<bool>,
     settings_waiting: Memo<usize>,
     search: Memo<SearchRead>,
+    /// The settings approvals this device answers itself, in order.
+    settings_asking_here: Memo<Vec<String>>,
     changes: Memo<ChangesRead>,
     folder: Memo<FolderRead>,
     file: Memo<FileRead>,
@@ -218,6 +220,15 @@ impl Reads {
             settings_waiting: computed(move || client.with(|c| c.settings_waiting.len())),
             search: computed(move || client.with(|c| c.search.clone())),
             changes: computed(move || client.with(|c| c.changes.clone())),
+            settings_asking_here: computed(move || {
+                client.with(|c| {
+                    c.settings_waiting
+                        .iter()
+                        .filter(|(_, other_device)| !**other_device)
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                })
+            }),
             folder: computed(move || client.with(|c| c.files_dir.clone())),
             file: computed(move || client.with(|c| c.files_file.clone())),
             draft_files: computed(move || client.with(|c| c.draft_files.clone())),
@@ -1321,6 +1332,16 @@ impl Store {
         }
         let (mut pinned, rest): (Vec<_>, Vec<_>) =
             ids.into_iter().partition(|id| self.is_project_pinned(id));
+    /// The waiting settings approvals this device may answer itself (the
+    /// daemon asks no other device for them): Settings asks them in place.
+    pub fn settings_asking_here(&self) -> Vec<Approval> {
+        let ids = self.reads.settings_asking_here.get();
+        self.approvals()
+            .into_iter()
+            .filter(|a| ids.contains(&a.id))
+            .collect()
+    }
+
         pinned.extend(rest);
         pinned
     }
