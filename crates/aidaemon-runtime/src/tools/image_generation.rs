@@ -389,38 +389,6 @@ fn truncate_error_body(body: &str) -> String {
     format!("{prefix}…")
 }
 
-fn prompt_claims_reference_images(prompt: &str) -> bool {
-    let normalized = prompt.to_ascii_lowercase();
-    [
-        "attached image",
-        "attached photo",
-        "attached picture",
-        "attached reference",
-        "provided image",
-        "provided photo",
-        "provided picture",
-        "shared image",
-        "shared photo",
-        "shared picture",
-        "reference image",
-        "reference photo",
-        "reference picture",
-        "input image",
-        "edit this image",
-        "edit this photo",
-        "same face",
-        "keep her face",
-        "keep his face",
-        "preserve her face",
-        "preserve his face",
-        "preserve the face",
-        "preserve bella's face",
-        "preserve bella’s face",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
 /// Stable agent-facing image generation tool.
 pub struct GenerateImageTool {
     backend: Arc<dyn ImageGenerationBackend>,
@@ -632,14 +600,6 @@ impl GenerateImageTool {
             Ok(references) => references,
             Err(error) => return Ok(error_outcome(error, self.call_semantics(arguments))),
         };
-        if references.is_empty() && prompt_claims_reference_images(prompt) {
-            return Ok(error_outcome(
-                ImageGenerationError::permanent(
-                    "The prompt asks to use or preserve reference images, but no actual image resources were supplied. Call generate_image again with reference_image_resource_ids containing the exact IDs from the relevant [Resource: res_…] lines; put the identity-critical face image first.",
-                ),
-                self.call_semantics(arguments),
-            ));
-        }
 
         if let Some(status_tx) = status_tx {
             let chunk = if references.is_empty() {
@@ -1005,6 +965,25 @@ mod tests {
         assert_eq!(outcome.metadata.attachments.len(), 1);
         assert!(outcome.output.contains("Backend: alternate_provider"));
         assert!(outcome.output.contains("Model: alternate-image-model"));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_about_a_reference_face_without_ids_still_generates() {
+        // The prompt's words never refuse a call; the schema asks the model
+        // for reference ids and a call without them is text-only.
+        let temp = tempfile::tempdir().expect("create temp inbox");
+        let tool = GenerateImageTool::new(
+            Arc::new(AlternateProviderBackend),
+            temp.path().to_path_buf(),
+        );
+        let outcome = tool
+            .call_with_status_outcome(
+                &json!({"prompt": "Keep the same face as the reference image of Mia"}).to_string(),
+                None,
+            )
+            .await
+            .expect("generate without references");
+        assert_eq!(outcome.metadata.attachments.len(), 1);
     }
 
     #[tokio::test]
@@ -1385,41 +1364,5 @@ mod tests {
         let rate_limit = chatgpt_image_http_error(429, "limit");
         assert_eq!(rate_limit.kind, ImageGenerationErrorKind::Retryable);
         assert_eq!(rate_limit.http_status, Some(429));
-    }
-
-    #[tokio::test]
-    async fn tool_refuses_silent_text_only_generation_for_reference_prompt() {
-        let temp = tempfile::tempdir().expect("create temp inbox");
-        let backend = Arc::new(CapturingBackend::default());
-        let captured = backend.requests.clone();
-        let tool = GenerateImageTool::new(backend, temp.path().to_path_buf());
-
-        let outcome = tool
-            .call_with_status_outcome(
-                &json!({
-                    "prompt": "Use the two attached reference photos and preserve Bella's face exactly"
-                })
-                .to_string(),
-                None,
-            )
-            .await
-            .expect("return missing-reference error");
-
-        assert_eq!(
-            outcome.metadata.outcome_status,
-            Some(ToolOutcomeStatus::FailedPermanent)
-        );
-        assert!(
-            outcome
-                .output
-                .contains("no actual image resources were supplied")
-        );
-        assert!(outcome.output.contains("reference_image_resource_ids"));
-        assert!(
-            captured
-                .lock()
-                .expect("read captured backend requests")
-                .is_empty()
-        );
     }
 }
