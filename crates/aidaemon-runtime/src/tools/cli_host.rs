@@ -111,6 +111,17 @@ pub fn daemon_call(
     let missing = |field: &str| format!("its `{}` request names no {field}", prompt.tool_name);
     let arguments = match prompt.tool_name.as_str() {
         "Bash" => {
+            // Leaving its sandbox is never granted, whatever the command
+            // (its launch settings forbid it too).
+            if input
+                .get("dangerouslyDisableSandbox")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Err(
+                    "a command may not run outside the coding agent's sandbox here".to_string(),
+                );
+            }
             let command = text("command").ok_or_else(|| missing("command"))?;
             let mut arguments = json!({"action": "run", "command": command});
             if let Some(dir) = working_dir {
@@ -147,6 +158,12 @@ pub fn daemon_call(
             })
         }
         "WebFetch" => json!({"url": text("url").ok_or_else(|| missing("URL"))?}),
+        // Its sandbox asks before a command reaches a network host: judged
+        // as a fetch from that host (an egress to it).
+        "SandboxNetworkAccess" => {
+            let host = text("host").ok_or_else(|| missing("host"))?;
+            json!({"url": format!("https://{host}/")})
+        }
         other => {
             return Err(format!(
                 "AIDaemon has no rule for the coding agent's `{other}` tool, so it was not allowed"
@@ -366,6 +383,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fetch.name, "web_fetch");
+        let network = daemon_call(
+            &prompt("SandboxNetworkAccess", json!({"host": "example.com"})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(network.name, "web_fetch");
+        assert_eq!(network.arguments, json!({"url": "https://example.com/"}));
+        // Asking to leave its sandbox is refused before anything is judged.
+        assert!(
+            daemon_call(
+                &prompt(
+                    "Bash",
+                    json!({"command": "touch /w/x", "dangerouslyDisableSandbox": true})
+                ),
+                None
+            )
+            .is_err()
+        );
         assert!(daemon_call(&prompt("mcp__synthetic__send", json!({})), None).is_err());
         assert!(daemon_call(&prompt("Bash", json!({})), None).is_err());
     }

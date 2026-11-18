@@ -478,6 +478,85 @@ fn apply_scoped_cli_adapter(
     Ok(())
 }
 
+/// Confine one Claude Code run the way the access contract asks, in
+/// Claude Code's own terms (verified live against 2.1.327, 2026-11-18):
+/// `--restricted` loads no user, project or local settings (so no allow
+/// rule of the owner's skips the run's judgment) and confines its file
+/// tools to the working directory; its shell runs in its own sandbox,
+/// which writes only there and asks before each network host, and may not
+/// be turned off for a command; read-only runs get only the read tools.
+/// Every prompt it raises is judged by the run (`cli_host`), so this is
+/// only for a run whose prompts reach a host. Every read and write path
+/// must lie inside the working directory: the confinement is the folder.
+fn apply_claude_confined_adapter(
+    args: &mut Vec<String>,
+    read_only: bool,
+    working_dir: Option<&str>,
+    read_paths: &[String],
+    write_paths: &[String],
+) -> Result<(), String> {
+    let Some(working_dir) = working_dir else {
+        return Err("a confined Claude Code run needs a working directory".to_string());
+    };
+    let root = std::path::Path::new(working_dir);
+    if let Some(outside) = read_paths
+        .iter()
+        .chain(write_paths)
+        .find(|path| !std::path::Path::new(path).starts_with(root))
+    {
+        return Err(format!(
+            "a confined Claude Code run reaches only its working directory {working_dir}, and {outside} is outside it"
+        ));
+    }
+    const DROPS_VALUE: [&str; 8] = [
+        "--permission-mode",
+        "--tools",
+        "--allowedTools",
+        "--allowed-tools",
+        "--settings",
+        "--setting-sources",
+        "--add-dir",
+        "--mcp-config",
+    ];
+    let mut confined = Vec::with_capacity(args.len().saturating_add(10));
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        let name = argument.split('=').next().unwrap_or(argument);
+        if DROPS_VALUE.contains(&name) {
+            index += if argument.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if matches!(name, "--restricted" | "--strict-mcp-config") {
+            index += 1;
+            continue;
+        }
+        confined.push(argument.clone());
+        index += 1;
+    }
+    let tools = if read_only {
+        "Read,Glob,Grep"
+    } else {
+        "Bash,Read,Edit,Write,Glob,Grep"
+    };
+    let settings = json!({"sandbox": {
+        "enabled": true,
+        "autoAllowBashIfSandboxed": false,
+        "allowUnsandboxedCommands": false,
+    }});
+    confined.extend([
+        "--restricted".to_string(),
+        "--strict-mcp-config".to_string(),
+        "--permission-mode".to_string(),
+        "manual".to_string(),
+        "--tools".to_string(),
+        tools.to_string(),
+        "--settings".to_string(),
+        settings.to_string(),
+    ]);
+    *args = confined;
+    Ok(())
+}
+
 fn permission_profile_path_key(path: &str) -> Result<&str, String> {
     if path.contains(['\n', '\r', '=']) {
         Err(format!(
@@ -1465,6 +1544,28 @@ impl CliAgentTool {
         }
     }
 
+    /// Whether a Claude Code run in this call can be confined in its own
+    /// terms: the run can judge its prompts (the kernel's nested-call
+    /// handle is here), the process is local (its stdin stays open), the
+    /// turn read no untrusted content (Claude's reads are confined to a
+    /// folder, not to the contract's exact read paths), and `claude` is the
+    /// built-in agent, not a stored one.
+    fn claude_confinable(&self, facts: &ToolCallContext) -> bool {
+        facts
+            .extensions
+            .get::<aidaemon_core::NestedCalls>()
+            .is_some()
+            && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local
+            && crate::authority::parent_authority(facts)
+                .is_some_and(|authority| !authority.untrusted_context)
+            && self
+                .tools
+                .read()
+                .ok()
+                .and_then(|tools| tools.get("claude").map(|entry| !entry.is_dynamic))
+                .unwrap_or(false)
+    }
+
     fn configured_tool(&self, name: &str) -> Option<String> {
         self.tools
             .read()
@@ -2440,6 +2541,7 @@ impl CliAgentTool {
         grant_session: &str,
         project: Option<&aidaemon_core::ProjectRef>,
         nested: Option<aidaemon_core::NestedCalls>,
+        claude_confinable: bool,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic) = {
@@ -2586,7 +2688,18 @@ impl CliAgentTool {
             }
         }
         if enforce_native_access {
-            let adapter_result = if workspace_mode == CliWorkspaceMode::ReadOnly {
+            let adapter_result = if tool_name.eq_ignore_ascii_case("claude")
+                && claude_confinable
+                && host_nested.is_some()
+            {
+                apply_claude_confined_adapter(
+                    &mut args,
+                    workspace_mode == CliWorkspaceMode::ReadOnly,
+                    canonical_working_dir.as_deref(),
+                    &canonical_read_paths,
+                    &canonical_write_paths,
+                )
+            } else if workspace_mode == CliWorkspaceMode::ReadOnly {
                 apply_read_only_cli_adapter(&command, &mut args)
             } else {
                 apply_scoped_cli_adapter(
@@ -5361,11 +5474,21 @@ impl CliAgentTool {
 
         match action {
             "run" => {
+                // Claude Code asked for by name runs under the contract when
+                // it can be confined in its own terms (`apply_claude_confined_adapter`).
+                let claude_confinable = self.claude_confinable(facts);
+                let confined_claude = args
+                    .tool
+                    .as_deref()
+                    .filter(|name| name.eq_ignore_ascii_case("claude") && claude_confinable)
+                    .and_then(|name| self.configured_tool(name));
                 let mut tool = if !enforce_native_access {
                     args.tool
                         .as_deref()
                         .and_then(|name| self.configured_tool(name))
                         .or_else(|| self.default_tool_name())
+                } else if confined_claude.is_some() {
+                    confined_claude
                 } else if read_only_run {
                     args.tool
                         .as_deref()
@@ -5504,6 +5627,7 @@ impl CliAgentTool {
                                 .extensions
                                 .get::<aidaemon_core::NestedCalls>()
                                 .cloned(),
+                            claude_confinable,
                         )
                         .await
                     {
@@ -7268,6 +7392,70 @@ mod tests {
     // -----------------------------------------------------------------------
     // Auth error detection tests
     // -----------------------------------------------------------------------
+
+    /// A Claude Code run under the access contract is confined in its own
+    /// terms: no settings of the owner's, file tools held to the folder,
+    /// its shell sandboxed with no way out, read tools only when read-only;
+    /// the launch's own permission flags are replaced, never kept.
+    #[test]
+    fn a_claude_run_under_the_contract_is_confined_to_its_folder() {
+        let launch = strings(&[
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "acceptEdits",
+            "--allowedTools=Bash(rm *)",
+            "--add-dir",
+            "/",
+            "--verbose",
+        ]);
+        let mut args = launch.clone();
+        apply_claude_confined_adapter(
+            &mut args,
+            false,
+            Some("/w/synthetic"),
+            &strings(&["/w/synthetic/src"]),
+            &strings(&["/w/synthetic/notes.txt"]),
+        )
+        .unwrap();
+        let joined = args.join(" ");
+        assert!(!joined.contains("acceptEdits"), "{joined}");
+        assert!(!joined.contains("rm *"), "{joined}");
+        assert!(!args.iter().any(|arg| arg == "--add-dir"), "{joined}");
+        for flag in ["--restricted", "--strict-mcp-config"] {
+            assert!(args.iter().any(|arg| arg == flag), "{flag}: {joined}");
+        }
+        let value = |flag: &str| {
+            let at = args.iter().position(|arg| arg == flag).unwrap();
+            args[at + 1].clone()
+        };
+        assert_eq!(value("--permission-mode"), "manual");
+        assert_eq!(value("--tools"), "Bash,Read,Edit,Write,Glob,Grep");
+        let settings: Value = serde_json::from_str(&value("--settings")).unwrap();
+        assert_eq!(settings["sandbox"]["enabled"], true);
+        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
+        assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], false);
+        assert!(args.iter().any(|arg| arg == "stream-json"));
+
+        let mut read_only = launch.clone();
+        apply_claude_confined_adapter(&mut read_only, true, Some("/w/synthetic"), &[], &[])
+            .unwrap();
+        let at = read_only.iter().position(|arg| arg == "--tools").unwrap();
+        assert_eq!(read_only[at + 1], "Read,Glob,Grep");
+
+        let mut outside = launch.clone();
+        let error = apply_claude_confined_adapter(
+            &mut outside,
+            false,
+            Some("/w/synthetic"),
+            &[],
+            &strings(&["/w/other/notes.txt"]),
+        )
+        .unwrap_err();
+        assert!(error.contains("/w/other/notes.txt"), "{error}");
+        assert!(apply_claude_confined_adapter(&mut launch.clone(), false, None, &[], &[]).is_err());
+    }
 
     /// A write root that is a single file is measured itself: creating it,
     /// or rewriting it, is a change.
