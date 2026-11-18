@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::background_run::BackgroundRun;
 use crate::spawn::{ConversationRequest, ConversationRuntime};
+use crate::tools::cli_agent_left_running as left_running;
 use crate::tools::traits::{
     DynamicCliAgent, Message, Tool, ToolArgumentContractViolation, ToolCallAccessManifest,
     ToolCallContext, ToolCallMetadata, ToolCallOutcome, ToolCallSemantics, ToolCapabilities,
@@ -534,6 +535,8 @@ struct RunningCliAgent {
     delegated_task_id: Option<String>,
     /// Working directory for git diff capture
     working_dir: Option<String>,
+    /// What the agent left running, set once it has exited.
+    left_running: Arc<OnceLock<left_running::LeftRunning>>,
 }
 
 /// Finalized background CLI task output retained briefly so `action="check"`
@@ -1325,6 +1328,14 @@ impl CliAgentTool {
         );
         if let Some(diff) = diff_section {
             final_result.push_str(&diff);
+        }
+        if let Some(section) = agent
+            .left_running
+            .get()
+            .and_then(left_running::LeftRunning::result_section)
+        {
+            final_result.push_str("\n\n");
+            final_result.push_str(&section);
         }
         final_result
     }
@@ -2702,6 +2713,12 @@ impl CliAgentTool {
         if tool_name.eq_ignore_ascii_case("claude") {
             request.env_remove.push("CLAUDECODE".to_string());
         }
+        // Every process the agent starts inherits the run's tag, so the
+        // ones still running after it ends can be found and reported.
+        let run_tag = Uuid::new_v4().to_string();
+        request
+            .env
+            .insert(left_running::RUN_TAG_VAR.to_string(), run_tag.clone());
         if let Some(ref dir) = canonical_working_dir {
             request.cwd = Some(BackendPath::new(dir));
         }
@@ -2838,6 +2855,9 @@ impl CliAgentTool {
         let run_for_task = run_slot.clone();
         let end_record: Arc<OnceLock<CliRunEnd>> = Arc::default();
         let end_record_for_task = end_record.clone();
+        let left_running_slot: Arc<OnceLock<left_running::LeftRunning>> = Arc::default();
+        let left_running_for_task = left_running_slot.clone();
+        let run_tag_for_task = run_tag.clone();
         let backend_for_receipt = self.backend.clone();
         let watched_for_task = watched_roots.clone();
         let expects_change = !watched_roots.is_empty();
@@ -3061,6 +3081,25 @@ impl CliAgentTool {
                     Err(_) => None,
                 }
             };
+            // What the agent left running, read once it has exited (and,
+            // when the runtime stopped it, after its group was signalled).
+            // Reported, never stopped. Only a local process can be read.
+            let left = match process_handle_for_task.local_pid() {
+                Some(agent_pid) => {
+                    left_running::find_left_running(run_tag_for_task.clone(), Some(agent_pid)).await
+                }
+                None => left_running::LeftRunning::default(),
+            };
+            if !left.is_empty() {
+                info!(
+                    task_id = %task_id_for_notify,
+                    run_tag = %run_tag_for_task,
+                    count = left.total,
+                    pids = ?left.processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+                    "CLI agent left processes running after its run ended"
+                );
+            }
+            let _ = left_running_for_task.set(left.clone());
             // How the run ended, from what the runtime observed of it (its
             // exit status, whether the runtime stopped it, whether its write
             // roots changed), by the rule every helper run is judged by. Its
@@ -3146,7 +3185,12 @@ impl CliAgentTool {
                         "authentication failed",
                     );
                 }
-                let persisted_output = completion.persisted_output;
+                // The agent's own report, then what it left running.
+                let agent_report = completion.persisted_output;
+                let persisted_output = match left.result_section() {
+                    Some(section) => format!("{agent_report}\n\n{section}"),
+                    None => agent_report.clone(),
+                };
                 let (structured_response, structured_error) = if success {
                     (completion.response, completion.error)
                 } else {
@@ -3201,7 +3245,7 @@ impl CliAgentTool {
                         Some(run) => Some(run.finish(phase, run_evidence.clone()).await),
                         None => None,
                     };
-                    let notification_summary: String = persisted_output.chars().take(500).collect();
+                    let notification_summary: String = agent_report.chars().take(500).collect();
                     let diff_section = if let Some(ref dir) = notify_working_dir {
                         CliAgentTool::capture_git_diff(&backend_for_completion, dir)
                             .await
@@ -3212,9 +3256,12 @@ impl CliAgentTool {
                     // The result alone: the run's card says what it was and
                     // how it ended, with its measured time.
                     let body = format!(
-                        "{}{}",
+                        "{}{}{}",
                         notification_summary.trim(),
-                        diff_section.unwrap_or_default()
+                        diff_section.unwrap_or_default(),
+                        left.owner_line()
+                            .map(|line| format!("\n\n{line}"))
+                            .unwrap_or_default()
                     );
                     let notification_type = if success { "completed" } else { "failed" };
 
@@ -3495,6 +3542,7 @@ impl CliAgentTool {
                 session_id: session_id.to_string(),
                 delegated_task_id: delegated_task_id_owned.clone(),
                 working_dir: working_dir_owned,
+                left_running: left_running_slot.clone(),
             };
             self.running.lock().await.insert(task_id.clone(), agent);
             // The reaper / cancel paths own the claim now (no await between
@@ -3524,6 +3572,20 @@ impl CliAgentTool {
                 // of this arm still awaits diff capture and persistence).
                 drop(claim_guard.take());
 
+                // What the agent left running: a line for the owner now, a
+                // section in the result for the model.
+                let left = left_running_slot.get().cloned().unwrap_or_default();
+                if let (Some(line), Some(tx)) = (left.owner_line(), status_tx.as_ref()) {
+                    let _ = tx.try_send(StatusUpdate::ToolProgress {
+                        name: tool_name.to_string(),
+                        chunk: line,
+                    });
+                }
+                let with_left = |text: String| match left.result_section() {
+                    Some(section) => format!("{text}\n\n{section}"),
+                    None => text,
+                };
+
                 // Check if killed due to infinite loop
                 if was_loop_killed {
                     let display_output = display_buf.lock().await.clone();
@@ -3551,7 +3613,7 @@ impl CliAgentTool {
                         });
                     }
 
-                    return Ok(format!(
+                    return Ok(with_left(format!(
                         "ERROR: CLI agent '{}' was automatically killed - INFINITE LOOP DETECTED.\n\n\
                          The same output line repeated {} times in the last 100 lines.\n\
                          This is a known bug in some CLI agent versions where they get stuck.\n\n\
@@ -3560,7 +3622,7 @@ impl CliAgentTool {
                         tool_name,
                         loop_count.unwrap_or(0),
                         last_lines
-                    ));
+                    )));
                 }
 
                 // Authentication/setup failures are failures even when a CLI
@@ -3647,13 +3709,13 @@ impl CliAgentTool {
                         mark_never_started();
                     }
                     // On error, show the display buffer which includes stderr
-                    let error_msg = format_cli_agent_failure(
+                    let error_msg = with_left(format_cli_agent_failure(
                         tool_name,
                         exit_code,
                         &display_output,
                         max_output,
                         diff_section.as_deref(),
-                    );
+                    ));
 
                     if let Some(task_id) = delegated_task_id {
                         self.persist_delegated_cli_result(task_id, None, Some(&error_msg))
@@ -3671,10 +3733,10 @@ impl CliAgentTool {
                     }
                     if end.end.phase() != crate::run_state::RunPhase::Succeeded {
                         let why = end.end.line(&end.evidence).unwrap_or_default();
-                        let error_msg = format!(
+                        let error_msg = with_left(format!(
                             "ERROR: CLI agent '{tool_name}' did not do its work. {why}\n\n\
                              Its report:\n{result_text}"
-                        );
+                        ));
                         if let Some(task_id) = delegated_task_id {
                             self.persist_delegated_cli_result(task_id, None, Some(&error_msg))
                                 .await;
@@ -3688,6 +3750,7 @@ impl CliAgentTool {
                 if let Some(diff) = diff_section {
                     final_result.push_str(&diff);
                 }
+                let final_result = with_left(final_result);
                 if let Some(task_id) = delegated_task_id {
                     self.persist_delegated_cli_result(task_id, Some(final_result.as_str()), None)
                         .await;
@@ -3742,6 +3805,7 @@ impl CliAgentTool {
                     session_id: session_id.to_string(),
                     delegated_task_id: delegated_task_id_owned.clone(),
                     working_dir: working_dir_owned,
+                    left_running: left_running_slot.clone(),
                 };
                 self.running.lock().await.insert(task_id.clone(), agent);
                 // The reaper / cancel paths own the claim now (no await
@@ -6162,6 +6226,39 @@ mod tests {
             "Expected 'test output 42' in output, got: {}",
             result
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_process_the_agent_leaves_running_is_reported_not_stopped() {
+        // A double-forked sleep outlives the agent. On macOS `/bin/sleep`
+        // hides its environment, so this also proves the process-group
+        // path; on Linux both its tag and its group find it.
+        let (tool, _db) = setup_bash_tool().await;
+        let seconds = 3000 + (std::process::id() % 900);
+        let prompt = format!("(sleep {seconds} >/dev/null 2>&1 &); echo started");
+        let result = tool
+            .call(&json!({"action": "run", "tool": "bash-agent", "prompt": prompt}).to_string())
+            .await
+            .unwrap();
+        let pids: Vec<u32> = result
+            .lines()
+            .filter(|line| line.ends_with(&format!("sleep {seconds}")))
+            .filter_map(|line| line.strip_prefix("- pid ")?.split(':').next()?.parse().ok())
+            .collect();
+        // It is still alive: reported, not stopped.
+        let alive: Vec<bool> = pids
+            .iter()
+            // SAFETY: signal 0 only checks that the pid exists.
+            .map(|pid| unsafe { libc::kill(*pid as libc::pid_t, 0) } == 0)
+            .collect();
+        for pid in &pids {
+            // SAFETY: kills only the sleep this test's agent started.
+            unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(result.contains("## Left running"), "{result}");
+        assert_eq!(pids.len(), 1, "{result}");
+        assert_eq!(alive, vec![true]);
     }
 
     #[tokio::test]

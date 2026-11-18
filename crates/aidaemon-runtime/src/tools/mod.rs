@@ -2,6 +2,7 @@
 //! automation surfaces), so they live where those crates meet.
 
 pub mod cli_agent;
+mod cli_agent_left_running;
 pub mod command_patterns;
 #[cfg(feature = "computer_use")]
 pub mod computer_use;
