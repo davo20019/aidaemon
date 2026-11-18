@@ -8,7 +8,7 @@
 // Seam.  These tests assert on the converted message SEQUENCE element-wise (not
 // on serialized JSON request bodies). The seam is `MockProvider.call_log` — each
 // `MockChatCall.messages` is exactly the `Vec<Value>` the agent handed the
-// provider for that LLM call, i.e. the output of `message_build_phase`. The
+// provider for that LLM call, i.e. the output of `message_build`. The
 // OpenAI-compatible adapter is a faithful passthrough of this sequence (count /
 // order / roles preserved inline — proven element-wise in
 // `providers::openai_compatible` Pillar A tests
@@ -64,34 +64,7 @@ async fn pillar_b_cross_turn_archived_prefix_is_byte_identical() {
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
         MockProvider::text_response("Fourth answer."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_cross_turn_archived";
 
@@ -192,34 +165,7 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
         MockProvider::text_response("Second answer."),
         MockProvider::text_response("Third answer."),
         MockProvider::text_response("Fourth answer."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_fact_between_turns";
 
@@ -335,7 +281,7 @@ async fn pillar_b_fact_storage_between_turns_leaves_core_and_archived_identical(
 /// first model response triggers the retry rebuild, which rewrites the
 /// current-turn region and emits `Prefix mutation reason=empty_response_retry`.
 /// The build path's mutator attribution is unit-proven in
-/// `message_build_phase` tests; here we confirm the full loop still drives a
+/// `message_build` tests; here we confirm the full loop still drives a
 /// mutator path (the empty-response retry) and recovers, exercising the same
 /// build seam end-to-end. The element-wise stable-region extension within a task
 /// is asserted via call_log: the second (retry) call's stable prefix is not
@@ -442,26 +388,7 @@ async fn pillar_b_identity_statement_in_archived_turn_survives_verbatim() {
         MockProvider::text_response("Understood, noted."),
         MockProvider::text_response("Okay."),
         MockProvider::text_response("Sure."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment("answer", false, false, &[], "new_request", "none"),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation"), MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
     let session = "pillar_b_identity_archived";
 

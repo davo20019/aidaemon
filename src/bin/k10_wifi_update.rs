@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
-        eprintln!("Usage: k10_wifi_update <serial-port> <wifi-ssid> <wifi-password> [<wifi-ssid> <wifi-password>]...");
+        eprintln!(
+            "Usage: k10_wifi_update <serial-port> <wifi-ssid> <wifi-password> [<wifi-ssid> <wifi-password>]..."
+        );
         std::process::exit(2);
     }
     let pairs = args[2..].chunks(2).collect::<Vec<_>>();
@@ -55,13 +57,12 @@ fn main() -> anyhow::Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
-    if let Ok(text) = std::str::from_utf8(&received) {
-        if let Some(reason) = text
+    if let Ok(text) = std::str::from_utf8(&received)
+        && let Some(reason) = text
             .lines()
             .find_map(|line| line.trim().strip_prefix("WIFI_UPDATE_REJECTED:"))
-        {
-            anyhow::bail!("K10 rejected the Wi-Fi update: {reason}");
-        }
+    {
+        anyhow::bail!("K10 rejected the Wi-Fi update: {reason}");
     }
     anyhow::bail!("K10 did not confirm the Wi-Fi update before the deadline")
 }

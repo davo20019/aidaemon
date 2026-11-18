@@ -1,0 +1,35 @@
+name: context_tally
+description: >
+  Ten shard logs of ~1.9k tokens each, each with one failure count halfway
+  down; the answer is their sum. Live, the model stands in for one with a
+  10k-token window (`context_cap`), so early results must leave the window
+  before the last are read: whatever replaces them (a stub, a summary, a
+  drop) has to keep the counts or the model has to re-read. Aimed at the
+  context budgeters.
+tags: ["kit:shards", "context_cap:10000"]
+input: >
+  Ten shard logs are at logs/shard-1.log through logs/shard-10.log. Each one
+  reports how many requests failed in its window. Read all ten and tell me
+  the total number of failed requests across the shards.
+limits:
+  max_turns: 30
+script:
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-1.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-2.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-3.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-4.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-5.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-6.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-7.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-8.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-9.log } }]
+  - tool_calls: [{ name: read_shard, arguments: { path: logs/shard-10.log } }]
+  - text: 113 requests failed across the ten shards.
+expect:
+  status: completed
+  final_text_contains: ["113"]
+  tool_call_counts: { read_shard: 10 }
+  no_failed_receipts: true
+live_expect:
+  status: completed
+  final_text_contains: ["113"]

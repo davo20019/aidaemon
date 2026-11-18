@@ -1,362 +1,54 @@
-use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::{json, Value};
-use tracing::info;
+//! `manage_mcp` lives in `aidaemon_mcp::registry::manage`; its tests on the
+//! daemon's assembled store stay here.
 
-use crate::mcp::McpRegistry;
-use crate::tools::command_risk::{PermissionMode, RiskLevel};
-use crate::tools::terminal::ApprovalRequest;
-use crate::tools::ApprovalBroker;
-use crate::traits::{
-    semantics_for_exact_read_actions, Tool, ToolCallSemantics, ToolCapabilities,
-    ToolMutationEffects,
-};
-use crate::types::ApprovalResponse;
-
-/// Allowed commands for MCP server spawning.
-const ALLOWED_COMMANDS: &[&str] = &["npx", "uvx", "node", "python", "python3"];
-
-pub struct ManageMcpTool {
-    registry: McpRegistry,
-    approval_tx: ApprovalBroker,
-}
-
-impl ManageMcpTool {
-    pub fn new(registry: McpRegistry, approval_tx: ApprovalBroker) -> Self {
-        Self {
-            registry,
-            approval_tx,
-        }
-    }
-
-    async fn request_approval(
-        &self,
-        session_id: &str,
-        description: &str,
-    ) -> anyhow::Result<ApprovalResponse> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.approval_tx
-            .send(ApprovalRequest {
-                command: description.to_string(),
-                session_id: session_id.to_string(),
-                risk_level: RiskLevel::High,
-                warnings: vec!["This will spawn an external MCP server process".to_string()],
-                permission_mode: PermissionMode::Default,
-                response_tx,
-                kind: crate::types::ApprovalKind::CommandOnce,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("Approval channel closed"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(300), response_rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => {
-                tracing::warn!(description, "Approval response channel closed");
-                Err(anyhow::anyhow!("Approval response channel closed"))
-            }
-            Err(_) => {
-                tracing::warn!(description, "Approval request timed out (300s)");
-                Err(anyhow::anyhow!("Approval request timed out after 300s"))
-            }
-        }
-    }
-
-    async fn handle_add(
-        &self,
-        session_id: &str,
-        name: &str,
-        command: &str,
-        args: Vec<String>,
-    ) -> anyhow::Result<String> {
-        // Validate command against whitelist
-        if !ALLOWED_COMMANDS.contains(&command) {
-            return Ok(format!(
-                "Command '{}' is not allowed. Allowed commands: {}",
-                command,
-                ALLOWED_COMMANDS.join(", ")
-            ));
-        }
-
-        // Request user approval with unverified package warning
-        let args_display = args.join(" ");
-        let description = format!(
-            "Add MCP server '{}' ({} {})\n\
-             \u{26a0} WARNING: This will download and execute an unverified package. \
-             Only approve if you trust the source.",
-            name, command, args_display
-        );
-        let response = self.request_approval(session_id, &description).await?;
-        match response {
-            ApprovalResponse::Deny => {
-                return Ok("MCP server addition denied by user.".to_string());
-            }
-            ApprovalResponse::AllowOnce
-            | ApprovalResponse::AllowSession
-            | ApprovalResponse::AllowAlways => {}
-        }
-
-        let config = crate::config::McpServerConfig {
-            command: command.to_string(),
-            args,
-            env: std::collections::HashMap::new(),
-        };
-
-        match self.registry.add_server(name, config, true).await {
-            Ok(tool_names) => {
-                info!(server = name, tools = ?tool_names, "MCP server added");
-                Ok(format!(
-                    "MCP server '{}' added successfully.\nRegistered tools: {}",
-                    name,
-                    tool_names.join(", ")
-                ))
-            }
-            Err(e) => Ok(format!(
-                "Failed to add MCP server '{}': {}\n\
-                 Possible fixes:\n\
-                 - Install the package: npm install -g <package> or pip install <package>\n\
-                 - Check the command and arguments are correct\n\
-                 - Try running the command manually to see detailed errors",
-                name, e
-            )),
-        }
-    }
-
-    async fn handle_list(&self) -> anyhow::Result<String> {
-        let servers = self.registry.list_servers_with_status().await?;
-        if servers.is_empty() {
-            return Ok("No MCP servers registered.".to_string());
-        }
-
-        let mut output = String::from("Registered MCP servers:\n\n");
-        for server in &servers {
-            let status = if server.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            let source = if server.db_id.is_some() {
-                "dynamic"
-            } else {
-                "static"
-            };
-            output.push_str(&format!(
-                "**{}** (`{} {}`)\n",
-                server.name,
-                server.command,
-                server.args.join(" ")
-            ));
-            output.push_str(&format!("  Status: {} ({})\n", status, source));
-            output.push_str(&format!("  Tools: {}\n", server.tool_names.join(", ")));
-            if !server.env_keys.is_empty() {
-                output.push_str(&format!("  Env keys: {}\n", server.env_keys.join(", ")));
-            }
-            output.push_str(&format!("  Triggers: {}\n", server.triggers.join(", ")));
-            output.push('\n');
-        }
-        Ok(output)
-    }
-
-    async fn handle_remove(&self, name: &str) -> anyhow::Result<String> {
-        match self.registry.remove_server(name).await {
-            Ok(()) => Ok(format!("MCP server '{}' removed successfully.", name)),
-            Err(e) => Ok(format!("Failed to remove MCP server '{}': {}", name, e)),
-        }
-    }
-
-    async fn handle_set_env(&self, name: &str, key: &str, value: &str) -> anyhow::Result<String> {
-        match self.registry.set_server_env(name, key, value).await {
-            Ok(()) => Ok(format!(
-                "Environment variable '{}' stored securely in OS keychain for server '{}'.\n\
-                 Use the 'restart' action to apply the new configuration.",
-                key, name
-            )),
-            Err(e) => Ok(format!(
-                "Failed to store env var '{}' for server '{}': {}",
-                key, name, e
-            )),
-        }
-    }
-
-    async fn handle_restart(&self, name: &str) -> anyhow::Result<String> {
-        match self.registry.restart_server(name).await {
-            Ok(tool_names) => Ok(format!(
-                "MCP server '{}' restarted successfully.\nTools: {}",
-                name,
-                tool_names.join(", ")
-            )),
-            Err(e) => Ok(format!("Failed to restart MCP server '{}': {}", name, e)),
-        }
-    }
-
-    async fn handle_enable(&self, name: &str) -> anyhow::Result<String> {
-        match self.registry.enable_server(name).await {
-            Ok(tool_names) => Ok(format!(
-                "MCP server '{}' enabled successfully.\nTools: {}",
-                name,
-                tool_names.join(", ")
-            )),
-            Err(e) => Ok(format!("Failed to enable MCP server '{}': {}", name, e)),
-        }
-    }
-
-    async fn handle_disable(&self, name: &str) -> anyhow::Result<String> {
-        match self.registry.disable_server(name).await {
-            Ok(()) => Ok(format!("MCP server '{}' disabled successfully.", name)),
-            Err(e) => Ok(format!("Failed to disable MCP server '{}': {}", name, e)),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct ManageMcpArgs {
-    action: String,
-    name: Option<String>,
-    command: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
-    key: Option<String>,
-    value: Option<String>,
-    #[serde(default)]
-    _session_id: String,
-}
-
-fn manage_mcp_schema() -> Value {
-    json!({
-        "name": "manage_mcp",
-        "description": "Manage MCP servers at runtime. set_env stores env vars in OS keychain, never in chat.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["add", "list", "remove", "set_env", "restart", "enable", "disable"]
-                },
-                "name": { "type": "string", "description": "Server name" },
-                "command": {
-                    "type": "string",
-                    "description": "Spawn command (add). Allowed: npx, uvx, node, python, python3"
-                },
-                "args": { "type": "array", "items": { "type": "string" }, "description": "Command args (add)" },
-                "key": { "type": "string", "description": "Env var name (set_env)" },
-                "value": { "type": "string", "description": "Env var value (set_env); stored in keychain" }
-            },
-            "required": ["action"],
-            "additionalProperties": false
-        }
-    })
-}
-
-#[async_trait]
-impl Tool for ManageMcpTool {
-    fn name(&self) -> &str {
-        "manage_mcp"
-    }
-
-    fn description(&self) -> &str {
-        "Add, remove, list, configure, and enable/disable MCP (Model Context Protocol) servers at runtime"
-    }
-
-    fn schema(&self) -> Value {
-        manage_mcp_schema()
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        semantics_for_exact_read_actions(arguments, &["list"], ToolMutationEffects::CONFIGURATION)
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: true,
-            needs_approval: true,
-            idempotent: false,
-            high_impact_write: true,
-        }
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: ManageMcpArgs = serde_json::from_str(arguments)
-            .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
-
-        match args.action.as_str() {
-            "add" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' is required for add action"))?;
-                let command = args
-                    .command
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'command' is required for add action"))?;
-                self.handle_add(&args._session_id, name, command, args.args)
-                    .await
-            }
-            "list" => self.handle_list().await,
-            "remove" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' is required for remove action"))?;
-                self.handle_remove(name).await
-            }
-            "set_env" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' is required for set_env action"))?;
-                let key = args
-                    .key
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'key' is required for set_env action"))?;
-                let value = args
-                    .value
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'value' is required for set_env action"))?;
-                self.handle_set_env(name, key, value).await
-            }
-            "restart" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' is required for restart action"))?;
-                self.handle_restart(name).await
-            }
-            "enable" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' is required for enable action"))?;
-                self.handle_enable(name).await
-            }
-            "disable" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("'name' is required for disable action"))?;
-                self.handle_disable(name).await
-            }
-            other => Ok(format!(
-                "Unknown action '{}'. Valid actions: add, list, remove, set_env, restart, enable, disable",
-                other
-            )),
-        }
-    }
-}
+pub use aidaemon_mcp::registry::manage::ManageMcpTool;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
-    #[test]
-    fn schema_fits_payload_budget() {
-        // Pillar C of 2026-06-06-cross-turn-prefix-stability-design.md:
-        // admin-tool schemas ride in EVERY provider call; this ceiling is the
-        // per-tool payload budget. If you trip this assert by adding features,
-        // compress the description text — do not raise the ceiling without
-        // updating the Pillar C implementation plan.
-        let bytes = serde_json::to_string(&manage_mcp_schema()).unwrap().len();
-        assert!(
-            bytes <= 850,
-            "manage_mcp schema is {bytes} bytes, budget is 850"
+    #[tokio::test]
+    async fn restart_asks_with_the_command_it_will_run() {
+        use crate::traits::OwnerApprovalNeed;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let embeddings =
+            std::sync::Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
+        let state = std::sync::Arc::new(
+            crate::state::SqliteStateStore::for_tests(
+                db.path().to_str().unwrap(),
+                100,
+                None,
+                embeddings,
+            )
+            .await
+            .unwrap(),
         );
+        let registry = crate::testing::fake_mcp_registry(state).await;
+        let tool = ManageMcpTool::new(registry);
+
+        let OwnerApprovalNeed::Ask(request) = tool.respawn_approval("restart", "fake").await else {
+            panic!("restarting a running server must ask");
+        };
+        let subject: Value = serde_json::from_str(&request.subject).unwrap();
+        assert_eq!(subject["action"], "restart");
+        assert_eq!(subject["name"], "fake");
+        assert!(
+            subject["command"]
+                .as_str()
+                .unwrap()
+                .contains("fake_mcp_server")
+        );
+        assert!(request.summary.starts_with("Restart MCP server 'fake'"));
+
+        // Nothing would start: no card.
+        assert!(matches!(
+            tool.respawn_approval("restart", "missing").await,
+            OwnerApprovalNeed::NotNeeded
+        ));
+        assert!(matches!(
+            tool.respawn_approval("enable", "fake").await,
+            OwnerApprovalNeed::NotNeeded
+        ));
     }
 }

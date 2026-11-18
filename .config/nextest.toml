@@ -1,0 +1,34 @@
+# cargo-nextest settings. CI runs every suite through nextest archives split
+# into shards: one process per test, so a test that hangs fails on its own
+# instead of holding the whole run until the job's time limit.
+
+[profile.ci]
+fail-fast = false
+# Reported as slow after 60 s, stopped and failed after 5 min.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# Each failure as it happens, and again at the end of the run.
+failure-output = "immediate-final"
+# One retry: a test that passes on it is reported FLAKY in the summary, not
+# hidden. Process-per-test exposes exit-time races cargo test never saw
+# (e.g. a heap-corruption abort after a passing terminal test).
+retries = 1
+
+
+[profile.windows-ci]
+# Report every failure, not just the first.
+fail-fast = false
+# A test still running after 20 s is reported as slow; after 120 s it is
+# stopped and fails.
+slow-timeout = { period = "20s", terminate-after = 6 }
+# Each failure's output as it happens, so a cancelled run still shows why.
+failure-output = "immediate"
+# Slow tests too: on Windows some take 30 s where they take under one
+# elsewhere.
+status-level = "slow"
+
+# The full-stack tests run real shell commands one after another; on a
+# Windows runner each shell start can take seconds, and a whole test ran
+# 80-120 s. They get 4 minutes there; elsewhere they take a few seconds.
+[[profile.windows-ci.overrides]]
+filter = 'test(/integration_tests::test_full_stack_/)'
+slow-timeout = { period = "20s", terminate-after = 12 }

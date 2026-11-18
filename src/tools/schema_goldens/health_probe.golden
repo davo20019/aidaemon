@@ -1,0 +1,92 @@
+{
+  "description": "Create and monitor scheduled health probes.",
+  "name": "health_probe",
+  "schema": {
+    "description": "Create and monitor scheduled health probes.",
+    "name": "health_probe",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "create",
+            "list",
+            "run_now",
+            "status"
+          ],
+          "type": "string"
+        },
+        "config": {
+          "additionalProperties": false,
+          "properties": {
+            "expected_body": {
+              "description": "Expected body text",
+              "type": "string"
+            },
+            "expected_exit_code": {
+              "description": "Expected exit code",
+              "type": "integer"
+            },
+            "expected_status": {
+              "description": "Expected HTTP status",
+              "type": "integer"
+            },
+            "max_age_secs": {
+              "description": "Max file age",
+              "type": "integer"
+            },
+            "method": {
+              "type": "string"
+            },
+            "timeout_secs": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "consecutive_failures_alert": {
+          "description": "Failures before alert",
+          "type": "integer"
+        },
+        "description": {
+          "type": "string"
+        },
+        "hours": {
+          "description": "History window for status",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "latency_threshold_ms": {
+          "description": "Latency warning threshold",
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "schedule": {
+          "description": "Natural schedule or 5-field cron",
+          "type": "string"
+        },
+        "target": {
+          "description": "URL, host:port, command, or path",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "http",
+            "port",
+            "command",
+            "file"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

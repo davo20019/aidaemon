@@ -1,0 +1,116 @@
+{
+  "description": "Create and govern explicit, time-bounded temperature or humidity monitors for the owner; a direct owner request needs no separate monitoring authorization or mandate.",
+  "name": "manage_node_monitors",
+  "schema": {
+    "description": "Create, list, inspect, pause, resume, or cancel deterministic environmental monitors. Create only after an explicit owner request in a private Channel. A direct owner request is sufficient: do not create a mandate or a separate monitoring authorization. The Node's existing report_sensor grant is the only Node authorization required. Every monitor expires. V1 supports temperature and humidity only; it never activates a camera, microphone, or actuator.",
+    "name": "manage_node_monitors",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Use create for normal direct owner requests. Use create_linked only when the current owner message explicitly requests linkage to an exact existing mandate ID.",
+          "enum": [
+            "create",
+            "create_linked",
+            "list",
+            "get",
+            "history",
+            "pause",
+            "resume",
+            "cancel"
+          ],
+          "type": "string"
+        },
+        "capability_id": {
+          "description": "Create only.",
+          "enum": [
+            "sensor.environment.temperature",
+            "sensor.environment.humidity"
+          ],
+          "type": "string"
+        },
+        "clear_threshold": {
+          "description": "Create only: hysteresis recovery point; <= threshold for above, >= for below.",
+          "type": "number"
+        },
+        "comparison": {
+          "description": "Create only.",
+          "enum": [
+            "above",
+            "below"
+          ],
+          "type": "string"
+        },
+        "duration_minutes": {
+          "description": "Create only: required monitor lifetime.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "duration_seconds": {
+          "description": "Create only: continuous crossing time before alerting.",
+          "maximum": 86400,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit": {
+          "description": "History only; defaults to 100.",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mandate_id": {
+          "description": "Required only for create_linked and ignored by ordinary create. Use create_linked only when the current owner message explicitly names an exact existing, confirmed, active mandate ID. Never use a goal ID, requirement ID, inferred ID, or a mandate created merely to authorize monitoring; direct owner requests need no mandate.",
+          "type": "string"
+        },
+        "monitor_id": {
+          "description": "Required for get, history, pause, resume, and cancel.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Create only: short owner-facing monitor name.",
+          "type": "string"
+        },
+        "node": {
+          "description": "Create only: exact Node display name. Omit only when one eligible Node exists.",
+          "type": "string"
+        },
+        "offline_after_seconds": {
+          "description": "Create only: optional Node check-in alert interval. Values shorter than stale_after_seconds are safely normalized to stale_after_seconds.",
+          "maximum": 86400,
+          "minimum": 30,
+          "type": "integer"
+        },
+        "repeat_seconds": {
+          "description": "Create only: 0 sends one alert per incident; otherwise repeat interval.",
+          "maximum": 604800,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "send_recovery": {
+          "description": "Create only: send an alert when the condition recovers.",
+          "type": "boolean"
+        },
+        "since_hours": {
+          "description": "History only; defaults to 24.",
+          "maximum": 720,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "stale_after_seconds": {
+          "description": "Create only: optional missing-reading alert interval.",
+          "maximum": 86400,
+          "minimum": 30,
+          "type": "integer"
+        },
+        "threshold": {
+          "description": "Create only: Celsius or percent relative humidity alert point.",
+          "type": "number"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

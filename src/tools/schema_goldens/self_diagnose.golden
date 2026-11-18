@@ -1,0 +1,46 @@
+{
+  "description": "Diagnose why a PREVIOUS agent task failed or behaved inefficiently. The diagnose action also reports per-task LLM telemetry (latency p50/p95/max, model fallbacks/retries, and est-vs-actual input-token drift) so you can tell whether slowness came from the model/provider vs the harness. ONLY use when the user explicitly asks why something failed/was slow or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.).",
+  "name": "self_diagnose",
+  "schema": {
+    "description": "Diagnose why a PREVIOUS agent task failed or behaved inefficiently. The diagnose action also reports per-task LLM telemetry (latency p50/p95/max, model fallbacks/retries, and est-vs-actual input-token drift) so you can tell whether slowness came from the model/provider vs the harness. ONLY use when the user explicitly asks why something failed/was slow or requests diagnostics. Do NOT call during normal task execution (code generation, file operations, etc.).",
+    "name": "self_diagnose",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "list_tasks",
+            "timeline",
+            "diagnose",
+            "compare"
+          ],
+          "type": "string"
+        },
+        "failures_only": {
+          "description": "For list_tasks, filter to failed tasks (default true).",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "List limit (default 10, max 50).",
+          "type": "integer"
+        },
+        "task_id": {
+          "description": "Target task ID for timeline/diagnose.",
+          "type": "string"
+        },
+        "task_id_a": {
+          "description": "First task ID for compare.",
+          "type": "string"
+        },
+        "task_id_b": {
+          "description": "Second task ID for compare.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

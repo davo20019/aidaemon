@@ -1,0 +1,108 @@
+{
+  "description": "Report a genuine external boundary or operational failure that remains unresolved after bounded recovery. A command or tool failure alone is not a blocker: inspect current state, try safe in-scope recovery, and rerun the original verification first.",
+  "name": "report_blocker",
+  "schema": {
+    "description": "Report a genuine external boundary or operational failure that remains unresolved after bounded recovery. A command or tool failure alone is not a blocker: inspect current state, try safe in-scope recovery, and rerun the original verification first.",
+    "name": "report_blocker",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "blocker_class": {
+          "enum": [
+            "owner_input",
+            "missing_authority",
+            "external_dependency",
+            "ambiguous_external_effect",
+            "safety_boundary",
+            "recovery_exhausted"
+          ],
+          "type": "string"
+        },
+        "consequence_if_not_provided": {
+          "type": "string"
+        },
+        "dependency_repair": {
+          "description": "For missing_authority: true only for a minimal reversible local repair of a path named by failed required-workflow evidence.",
+          "type": "boolean"
+        },
+        "exact_need": {
+          "type": "string"
+        },
+        "external_effect_state": {
+          "enum": [
+            "none",
+            "confirmed_no_effect",
+            "confirmed_effect",
+            "ambiguous"
+          ],
+          "type": "string"
+        },
+        "next_step": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "enum": [
+            "blocked",
+            "partial_done_blocked",
+            "needs_approval",
+            "reduce_scope",
+            "abandon"
+          ],
+          "type": "string"
+        },
+        "partial_work": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "recovery_attempts": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "action",
+              "outcome",
+              "evidence"
+            ],
+            "type": "object"
+          },
+          "maxItems": 5,
+          "type": "array"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "blocker_class",
+        "external_effect_state",
+        "recovery_attempts"
+      ],
+      "type": "object"
+    }
+  }
+}

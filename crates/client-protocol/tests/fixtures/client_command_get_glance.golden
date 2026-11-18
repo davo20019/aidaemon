@@ -1,0 +1,7 @@
+{
+  "command": {
+    "type": "get_glance"
+  },
+  "request_id": "5d0c2b1e-0009",
+  "type": "command"
+}

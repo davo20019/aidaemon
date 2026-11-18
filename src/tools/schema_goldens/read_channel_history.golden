@@ -1,0 +1,31 @@
+{
+  "description": "Read recent messages from a Slack channel's conversation history. ALWAYS use this tool when the user asks about what was discussed, takeaways, what happened, key topics, or any question about channel conversations. This reads ALL messages in the channel, not just messages sent to you. The channel_id is auto-detected — you can call this with no arguments.",
+  "name": "read_channel_history",
+  "schema": {
+    "description": "Read recent messages from a Slack channel's conversation history. ALWAYS use this tool when the user asks about what was discussed, takeaways, what happened, key topics, or any question about channel conversations. This reads ALL messages in the channel, not just messages sent to you. The channel_id is auto-detected — you can call this with no arguments.",
+    "name": "read_channel_history",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "channel_id": {
+          "description": "Slack channel ID to read from. Defaults to current channel.",
+          "type": "string"
+        },
+        "latest": {
+          "description": "End of time range. Same formats as oldest.",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "description": "Number of messages to fetch (default 50, max 200)",
+          "type": "integer"
+        },
+        "oldest": {
+          "description": "Start of time range. Accepts relative like '2d', '1w', '3h', ISO 8601, or unix timestamp.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "message": "Finish signing in at https://auth.example.invalid",
+    "turn_id": "b9e1-4",
+    "type": "user_action_required"
+  },
+  "seq": 6,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

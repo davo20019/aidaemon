@@ -1,0 +1,66 @@
+{
+  "description": "A site-scoped browser click is asked (protocol 1.34): its typed card is kept for the screen to draw.",
+  "frames": [
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "approval": {
+          "card": {
+            "action": {
+              "kind": "click_on_site",
+              "site": "https://shop.acme.example",
+              "target": "button#checkout"
+            }
+          },
+          "detail": "button#checkout",
+          "id": "a1",
+          "kind": "command",
+          "options": [
+            "approve_once",
+            "approve_session",
+            "deny"
+          ],
+          "requested_at_ms": 1767225601000,
+          "risk": "medium",
+          "session_id": "app:synthetic-1",
+          "summary": "Your assistant wants to click a button on https://shop.acme.example in the browser."
+        },
+        "type": "approval_requested"
+      },
+      "seq": 1,
+      "session_id": "app:synthetic-1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {
+      "a1": {
+        "card": {
+          "action": {
+            "kind": "click_on_site",
+            "site": "https://shop.acme.example",
+            "target": "button#checkout"
+          }
+        },
+        "detail": "button#checkout",
+        "id": "a1",
+        "kind": "command",
+        "options": [
+          "approve_once",
+          "approve_session",
+          "deny"
+        ],
+        "requested_at_ms": 1767225601000,
+        "risk": "medium",
+        "session_id": "app:synthetic-1",
+        "summary": "Your assistant wants to click a button on https://shop.acme.example in the browser."
+      }
+    },
+    "last_seq": 1,
+    "notice": null,
+    "order": [],
+    "sessions": {},
+    "tasks": {},
+    "view_request": null
+  }
+}

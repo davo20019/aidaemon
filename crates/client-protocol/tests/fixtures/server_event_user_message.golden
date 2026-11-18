@@ -1,0 +1,12 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "origin": "app",
+    "session_id": "app:6c1f",
+    "text": "Post the synthetic report for Alice Rivera",
+    "type": "user_message"
+  },
+  "seq": 3,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

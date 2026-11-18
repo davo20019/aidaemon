@@ -1,0 +1,10 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "text": "Posting",
+    "turn_id": "b9e1-4",
+    "type": "turn_delta"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

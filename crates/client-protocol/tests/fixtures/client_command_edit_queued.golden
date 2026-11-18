@@ -1,0 +1,10 @@
+{
+  "command": {
+    "message_id": 7,
+    "session_id": "app:6c1f",
+    "text": "Also check the footer",
+    "type": "edit_queued"
+  },
+  "request_id": "5d0c2b1e-0025",
+  "type": "command"
+}

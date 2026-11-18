@@ -1,0 +1,50 @@
+[package]
+name = "aidaemon-eval"
+description = "Scenario-based eval kit for aidaemon agents; implementation crate of the aidaemon SDK, no stability promise (use it through aidaemon-sdk)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-eval"
+readme = "README.md"
+keywords = ["agent", "eval", "llm", "testing", "scenarios"]
+categories = ["development-tools::testing", "development-tools"]
+# Integration tests need dev-dependencies that are not published with the crate;
+# planning notes and the API snapshot stay in the repository.
+exclude = ["tests/", "benches/", "examples/"]
+publish = false
+
+[features]
+# Small synthetic tools, a deny-destructive hook and a ready-made factory
+# used by the shipped `scenarios/` directory.
+examples = []
+
+[dependencies]
+aidaemon-core = { version = "0.20.0", path = "../aidaemon-core", features = ["testing"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
+thiserror = "2"
+
+[dev-dependencies]
+aidaemon-eval = { path = ".", features = ["examples"] }
+aidaemon-policies = { path = "../aidaemon-policies" }
+aidaemon-providers = { path = "../aidaemon-providers" }
+# The daemon's context budgeting, for `live_budgeters`.
+aidaemon-runtime = { path = "../aidaemon-runtime" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# The shipped scenarios against a live model, one policy on at a time.
+[[example]]
+name = "live_policies"
+required-features = ["examples"]
+
+# The daemon's turn on each context budgeter, against a live model.
+[[example]]
+name = "live_budgeters"
+required-features = ["examples"]

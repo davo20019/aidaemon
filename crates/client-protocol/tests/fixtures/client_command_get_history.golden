@@ -1,0 +1,10 @@
+{
+  "command": {
+    "before": "m-120",
+    "limit": 30,
+    "session_id": "app:6c1f",
+    "type": "get_history"
+  },
+  "request_id": "5d0c2b1e-0006",
+  "type": "command"
+}

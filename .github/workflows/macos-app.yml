@@ -1,0 +1,63 @@
+name: macOS app (test build)
+
+# A test package of the macOS download, built on demand: AIdaemon.app with
+# the daemon inside, in a disk image, signed and notarized when the signing
+# secrets are set (ad hoc signed otherwise). Releases build the same in
+# release.yml.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dmg:
+    name: AIdaemon.dmg (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: macos-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-15
+            name: macos-x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      - name: Build the daemon
+        run: cargo build --release --target ${{ matrix.target }} --features "browser"
+
+      - name: Build the app
+        run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path clients/app/Cargo.toml
+
+      - name: Signing
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPSTORE_API_KEY_P8_BASE64: ${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_API_ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: scripts/ci-macos-signing.sh >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)-test.${GITHUB_RUN_NUMBER}"
+          scripts/package-macos-dmg.sh \
+            target/${{ matrix.target }}/release/aidaemon \
+            clients/app/target/${{ matrix.target }}/release/aidaemon-app \
+            "$version" "AIdaemon-${{ matrix.name }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIdaemon-${{ matrix.name }}-dmg
+          path: AIdaemon-${{ matrix.name }}.dmg

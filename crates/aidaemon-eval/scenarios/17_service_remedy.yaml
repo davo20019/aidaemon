@@ -1,0 +1,32 @@
+name: service_remedy
+description: >
+  A site setup whose build fails because the local container engine is
+  stopped; starting it is within the agent's authority. A good run starts
+  the engine, builds again and gives the URL; a bad one reports the task
+  blocked without trying (live 2026-11-12: a DDEV setup reported "can't
+  connect to Docker" and the owner had to ask for OrbStack to be started).
+  With dedicated service tools claude-haiku-5-5 passes 5/5 with and
+  without `OBSTACLE_GUIDANCE` (2026-11-12).
+tags: ["kit:service"]
+instructions: >
+  You are an assistant running on the owner's laptop, with tools for its
+  local services and development sites.
+input: >
+  In parallel, set up two local DDEV sites for a high school, one Drupal
+  (project `school`) and one WordPress (project `school-wp`), and tell me
+  how long it took and each homepage URL.
+script:
+  - tool_calls: [{ name: build_site, arguments: { project: school } }]
+  - tool_calls: [{ name: check_service, arguments: { service: orbstack } }]
+  - tool_calls: [{ name: start_service, arguments: { service: orbstack } }]
+  - tool_calls: [{ name: build_site, arguments: { project: school } }, { name: build_site, arguments: { project: school-wp } }]
+  - text: Both are up, at https://school.ddev.site and https://school-wp.ddev.site (OrbStack was stopped; I started it first).
+expect:
+  status: completed
+  tools_used: [start_service]
+  receipt_statuses: { build_site: [failed, succeeded, succeeded] }
+  final_text_contains: [school.ddev.site, school-wp.ddev.site]
+live_expect:
+  status: completed
+  tools_used: [start_service, build_site]
+  final_text_contains: [school.ddev.site, school-wp.ddev.site]

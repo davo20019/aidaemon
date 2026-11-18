@@ -1,0 +1,18 @@
+{
+  "description": "Check which development tools and runtimes are available, their versions, and what config files exist. Use this instead of running multiple 'which' and '--version' commands.",
+  "name": "check_environment",
+  "schema": {
+    "description": "Check which development tools and runtimes are available, their versions, and what config files exist. Use this instead of running multiple 'which' and '--version' commands.",
+    "name": "check_environment",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Directory to check for config files (default: current directory)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

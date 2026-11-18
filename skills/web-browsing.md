@@ -25,7 +25,8 @@ ALWAYS use the `browser` tool — never use `terminal` with curl/wget.
 4. `browser` → screenshot to confirm result
 
 ### Rules
-- Always take a screenshot after navigation so you can see what loaded.
+- Always take a screenshot after navigation so you can see what loaded. A screenshot is kept for you, not sent to the owner.
+- When the owner asked for a screenshot, send only the one they asked for: capture it with `deliver: true` once you know the page is the right one, or send a kept capture with send_file.
 - If a page requires scrolling, use execute_js to scroll down and screenshot again.
 - Chain multiple browser actions in sequence — the session persists between calls.
 - If the page requires login, tell the user and ask for credentials or suggest using an existing Chrome profile.

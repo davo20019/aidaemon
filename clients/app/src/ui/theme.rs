@@ -1,0 +1,290 @@
+//! The app's look as tokens: a quiet graphite workbench (paper in light
+//! appearance), one teal accent for the agent's own activity, and status
+//! roles that always travel with a word or a glyph, never colour alone.
+//!
+//! Colours are [`AdaptiveColor`]s, so light and dark switch natively. In a
+//! terminal they are read as meanings (a neutral is the terminal's
+//! foreground, a saturated one its accent of that hue), so the same tokens
+//! work there.
+
+use nsh_core::element::{AdaptiveColor, Rgba, rgb, rgba};
+
+/// `#rrggbb` at `alpha`.
+const fn rgb_a(hex: u32, alpha: f32) -> Rgba {
+    rgba(hex << 8 | (alpha * 255.0 + 0.5) as u32)
+}
+
+const fn tone(light: Rgba, dark: Rgba) -> AdaptiveColor {
+    AdaptiveColor {
+        light: light.to_hsla(),
+        dark: dark.to_hsla(),
+    }
+}
+
+/// Surfaces, text and lines.
+pub mod colors {
+    use super::{AdaptiveColor, rgb, rgb_a, tone};
+
+    /// What dims the page behind a drawer or a sheet.
+    pub const SCRIM: AdaptiveColor = tone(rgb_a(0x000000, 0.32), rgb_a(0x000000, 0.55));
+    /// Behind a picture opened over the page: near black in both modes.
+    pub const LIGHTBOX: AdaptiveColor = tone(rgb_a(0x000000, 0.96), rgb_a(0x000000, 0.96));
+    /// The live view's backdrop: fully opaque, so the page behind never
+    /// reads as part of the agent's screen.
+    pub const LIVE_BACKDROP: AdaptiveColor = tone(rgb(0x000000), rgb(0x000000));
+    /// The ring that marks where the owner tapped on the live view.
+    pub const TAP_RING: AdaptiveColor = tone(rgb(0x3b82f6), rgb(0x60a5fa));
+    /// A round control over [`LIGHTBOX`] and the glyph on it.
+    pub const LIGHTBOX_CONTROL: AdaptiveColor = tone(rgb_a(0xffffff, 0.14), rgb_a(0xffffff, 0.14));
+    pub const ON_LIGHTBOX: AdaptiveColor = tone(rgb(0xffffff), rgb(0xffffff));
+    /// A word on a filled [`ON_LIGHTBOX`] pill.
+    pub const LIGHTBOX_INK: AdaptiveColor = tone(rgb(0x111214), rgb(0x111214));
+    /// No colour: a fill that is not there.
+    pub const TRANSPARENT: AdaptiveColor = tone(rgb_a(0x000000, 0.0), rgb_a(0x000000, 0.0));
+
+    /// The window behind everything.
+    pub const BACKGROUND: AdaptiveColor = tone(rgb(0xf7f7f5), rgb(0x0f1012));
+    /// The sidebar and the inspector: a step away from the page.
+    pub const SIDEBAR: AdaptiveColor = tone(rgb(0xefefec), rgb(0x141518));
+    /// A card, a popup.
+    pub const SURFACE: AdaptiveColor = tone(rgb(0xffffff), rgb(0x1a1b1f));
+    /// The composer: a white card on the light page; in dark, no fill
+    /// (the page shows through, the edge draws the field).
+    pub const COMPOSER: AdaptiveColor = tone(rgb(0xffffff), rgb_a(0x000000, 0.0));
+    /// A surface inside a surface: code, quoted tool output.
+    pub const INSET: AdaptiveColor = tone(rgb(0xf1f1ee), rgb(0x0c0d0f));
+    /// Hover wash on rows and quiet buttons.
+    pub const HOVER: AdaptiveColor = tone(rgb(0xe8e8e4), rgb(0x22242a));
+    /// Pressed and selected rows.
+    pub const SELECTED: AdaptiveColor = tone(rgb(0xdfdfda), rgb(0x2a2c33));
+    /// Borders of surfaces and controls.
+    pub const BORDER: AdaptiveColor = tone(rgb(0xdcdcd6), rgb(0x2a2c31));
+    /// The edge of what is typed in or chosen from (fields, selects, the
+    /// composer) and of what floats (popups, menus): 3:1 or more on the
+    /// page and on a surface, so the control is found without its text.
+    pub const EDGE: AdaptiveColor = tone(rgb(0x83868c), rgb(0x6e7178));
+    /// Hairlines between rows and regions.
+    pub const LINE: AdaptiveColor = tone(rgb(0xe6e6e1), rgb(0x202227));
+    /// Body text.
+    pub const TEXT: AdaptiveColor = tone(rgb(0x16171a), rgb(0xeceef1));
+    /// Secondary text.
+    pub const MUTED: AdaptiveColor = tone(rgb(0x5d6168), rgb(0x9196a0));
+    /// Quiet text: timestamps, counts, hints.
+    pub const FAINT: AdaptiveColor = tone(rgb(0x63676e), rgb(0x80858f));
+    /// The agent's colour: running work, links, the focus ring, the caret.
+    pub const ACCENT: AdaptiveColor = tone(rgb(0x0b7a6e), rgb(0x45d2bf));
+    /// The main action's fill.
+    pub const PRIMARY: AdaptiveColor = tone(rgb(0x16171a), rgb(0xeceef1));
+    /// Text on [`PRIMARY`].
+    pub const ON_PRIMARY: AdaptiveColor = tone(rgb(0xffffff), rgb(0x111214));
+    /// Text on a status fill.
+    pub const ON_STATUS: AdaptiveColor = tone(rgb(0xffffff), rgb(0x0f1012));
+    /// The user's own messages.
+    pub const BUBBLE: AdaptiveColor = tone(rgb(0xe9e9e5), rgb(0x23252b));
+    /// Done, approved.
+    pub const SUCCESS: AdaptiveColor = tone(rgb(0x1d7f45), rgb(0x55d68a));
+    /// Needs a look.
+    pub const WARNING: AdaptiveColor = tone(rgb(0xa45d00), rgb(0xf5b84a));
+    /// Failed, denied, destructive.
+    pub const DANGER: AdaptiveColor = tone(rgb(0xc2332f), rgb(0xff6b66));
+    /// Information.
+    pub const INFO: AdaptiveColor = tone(rgb(0x2f5fd0), rgb(0x83a9ff));
+}
+
+/// Soft fills behind status text (badges, banners, tool rows).
+pub mod tints {
+    use super::{AdaptiveColor, rgb_a, tone};
+
+    pub const ACCENT: AdaptiveColor = tone(rgb_a(0x0b7a6e, 0.10), rgb_a(0x45d2bf, 0.13));
+    pub const SUCCESS: AdaptiveColor = tone(rgb_a(0x1d7f45, 0.10), rgb_a(0x55d68a, 0.13));
+    pub const WARNING: AdaptiveColor = tone(rgb_a(0xa45d00, 0.11), rgb_a(0xf5b84a, 0.14));
+    pub const DANGER: AdaptiveColor = tone(rgb_a(0xc2332f, 0.10), rgb_a(0xff6b66, 0.14));
+    pub const INFO: AdaptiveColor = tone(rgb_a(0x2f5fd0, 0.10), rgb_a(0x83a9ff, 0.14));
+    pub const NEUTRAL: AdaptiveColor = tone(rgb_a(0x16171a, 0.06), rgb_a(0xeceef1, 0.08));
+}
+
+/// What a status means, whatever it is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Neutral,
+    Accent,
+    Success,
+    Warning,
+    Danger,
+    Info,
+}
+
+impl Tone {
+    pub const fn color(self) -> AdaptiveColor {
+        match self {
+            Self::Neutral => colors::MUTED,
+            Self::Accent => colors::ACCENT,
+            Self::Success => colors::SUCCESS,
+            Self::Warning => colors::WARNING,
+            Self::Danger => colors::DANGER,
+            Self::Info => colors::INFO,
+        }
+    }
+
+    pub const fn tint(self) -> AdaptiveColor {
+        match self {
+            Self::Neutral => tints::NEUTRAL,
+            Self::Accent => tints::ACCENT,
+            Self::Success => tints::SUCCESS,
+            Self::Warning => tints::WARNING,
+            Self::Danger => tints::DANGER,
+            Self::Info => tints::INFO,
+        }
+    }
+}
+
+/// Corner radii, largest surfaces softest; nested shapes concentric.
+pub mod radius {
+    /// Dialogs, the composer, cards.
+    pub const SURFACE: f32 = 12.0;
+    /// Controls: buttons, inputs, rows.
+    pub const CONTROL: f32 = 7.0;
+    /// Small parts: badges, keys.
+    pub const SMALL: f32 = 4.0;
+}
+
+/// The type scale, in points.
+pub mod text {
+    /// Labels, metadata.
+    pub const XS: f32 = 11.0;
+    /// Secondary and dense rows.
+    pub const SM: f32 = 12.5;
+    /// Body and controls.
+    pub const BASE: f32 = 13.5;
+    /// Reading text (messages, the composer): the size chat apps read at,
+    /// a step clear of the controls' 13.5.
+    pub const READ: f32 = 15.5;
+    /// Page and empty-state titles: clearly above reading text.
+    pub const TITLE: f32 = 20.0;
+    /// Line heights for each.
+    pub const LH_SM: f32 = 17.0;
+    pub const LH_BASE: f32 = 19.0;
+    pub const LH_READ: f32 = 24.0;
+}
+
+/// Sizes of the desktop and web family.
+pub mod size {
+    /// Control heights.
+    pub const CONTROL_SM: f32 = 26.0;
+    pub const CONTROL_MD: f32 = 32.0;
+    /// A sidebar row.
+    pub const ROW: f32 = 30.0;
+    /// The sidebar's width.
+    pub const SIDEBAR: f32 = 280.0;
+    /// The inspector's width.
+    pub const INSPECTOR: f32 = 320.0;
+    /// The conversation's readable column.
+    pub const COLUMN: f32 = 760.0;
+    /// Icon glyph box.
+    pub const ICON: f32 = 16.0;
+}
+
+/// A touch screen (a phone or a tablet, a mobile browser included): touch
+/// targets of 44 pt or more, 16 pt reading text, bigger icons.
+pub fn touch() -> bool {
+    matches!(
+        nsh_core::element::idiom(),
+        nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
+    )
+}
+
+/// Sizes that follow the input: pointer (desktop, web, terminal) or touch.
+pub mod fit {
+    use super::touch;
+
+    /// Reading text (messages, the composer). 16 on touch, which also keeps
+    /// mobile browsers from zooming into the composer.
+    pub fn read() -> f32 {
+        if touch() { 16.0 } else { super::text::READ }
+    }
+    pub fn read_lh() -> f32 {
+        if touch() { 25.0 } else { super::text::LH_READ }
+    }
+    /// Inline code inside reading text (`a/path`, `fn_name`): 0.875 of it,
+    /// GitHub's ratio for mono in prose, so a span's background (which
+    /// spans only its own font's ascent to descent) fills the line's text
+    /// band instead of sitting short and low as a fixed 13 does.
+    pub fn read_code() -> f32 {
+        read() * 0.875
+    }
+    /// Room inside inline code's background at each end, so the chip
+    /// does not stop at its first and last letter; also its room on top,
+    /// where a monospaced font's box ends at the capitals but reaches
+    /// well below the baseline, which left the chip sitting low.
+    pub fn read_code_pad() -> f32 {
+        read() * 0.25
+    }
+    /// A page's or an empty state's title: on a phone, clearly above the
+    /// 16 pt reading text.
+    pub fn title() -> f32 {
+        if touch() { 22.0 } else { super::text::TITLE }
+    }
+    /// Body and control text.
+    pub fn body() -> f32 {
+        if touch() { 15.0 } else { super::text::BASE }
+    }
+    /// Secondary text.
+    pub fn small() -> f32 {
+        if touch() { 13.0 } else { super::text::SM }
+    }
+    /// A bar at the top of a pane.
+    pub fn bar() -> f32 {
+        if touch() { 52.0 } else { 44.0 }
+    }
+    /// A list row.
+    pub fn row() -> f32 {
+        if touch() { 52.0 } else { super::size::ROW }
+    }
+    /// An icon's slot and glyph.
+    pub fn icon_slot() -> f32 {
+        if touch() { 22.0 } else { super::size::ICON }
+    }
+    pub fn icon_glyph() -> f32 {
+        if touch() { 18.0 } else { super::text::BASE }
+    }
+}
+
+/// Monospace for code, identifiers and keys.
+pub const MONO: &str = "monospace";
+
+#[cfg(test)]
+mod tests {
+    use super::AdaptiveColor;
+    use super::colors::*;
+
+    fn ratio(a: AdaptiveColor, b: AdaptiveColor) -> (f32, f32) {
+        (
+            a.light.contrast_ratio(b.light),
+            a.dark.contrast_ratio(b.dark),
+        )
+    }
+
+    fn at_least(a: AdaptiveColor, b: AdaptiveColor, floor: f32, what: &str) {
+        let (light, dark) = ratio(a, b);
+        assert!(light >= floor, "{what}: light {light:.2} under {floor}");
+        assert!(dark >= floor, "{what}: dark {dark:.2} under {floor}");
+    }
+
+    /// Text reads at 4.5:1 on every surface it sits on, and the edges of
+    /// fields and popups at 3:1 (WCAG 1.4.3 and 1.4.11), in both themes.
+    #[test]
+    fn text_and_edges_keep_their_contrast() {
+        for (name, back) in [
+            ("page", BACKGROUND),
+            ("sidebar", SIDEBAR),
+            ("surface", SURFACE),
+        ] {
+            at_least(TEXT, back, 4.5, &format!("text on {name}"));
+            at_least(MUTED, back, 4.5, &format!("muted on {name}"));
+            at_least(FAINT, back, 4.5, &format!("faint on {name}"));
+            at_least(ACCENT, back, 4.5, &format!("accent on {name}"));
+            at_least(EDGE, back, 3.0, &format!("edge on {name}"));
+        }
+        at_least(ON_PRIMARY, PRIMARY, 4.5, "text on the main action");
+    }
+}

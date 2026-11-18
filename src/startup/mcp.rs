@@ -10,7 +10,7 @@ pub async fn setup_mcp_registry(
     config: &AppConfig,
     state: Arc<dyn McpRegistryStore>,
 ) -> anyhow::Result<McpRegistry> {
-    let mcp_registry = mcp::McpRegistry::new(state);
+    let mcp_registry = mcp::McpRegistry::new(state, crate::config::secret_store().clone());
 
     for (name, mcp_config) in &config.mcp {
         match mcp_registry

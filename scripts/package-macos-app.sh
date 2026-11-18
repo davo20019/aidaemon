@@ -16,6 +16,9 @@
 #   scripts/package-macos-app.sh --build         # cargo build --release --features computer_use-macos first
 #   scripts/package-macos-app.sh --build --debug # fast DEBUG build (no release opt) — for local/dev
 #
+# AIDAEMON_EXTRA_FEATURES adds cargo features to --build, e.g.
+#   AIDAEMON_EXTRA_FEATURES=slack scripts/package-macos-app.sh --build
+#
 # See COMPUTER_USE_MACOS.md for the full walkthrough.
 set -euo pipefail
 
@@ -41,15 +44,16 @@ for arg in "$@"; do
 done
 
 if [ "$DO_BUILD" = "1" ]; then
+  BUILD_FEATURES="computer_use-macos${AIDAEMON_EXTRA_FEATURES:+,$AIDAEMON_EXTRA_FEATURES}"
   if [ "$PROFILE" = "debug" ]; then
     # Fast dev path: skip release optimization/LTO. Compiles far quicker; the
     # binary runs slower, which is fine for local iteration.
     echo "Building DEBUG (fast, local/dev) with computer_use-macos..."
-    ( cd "$PROJECT_DIR" && cargo build --features computer_use-macos )
+    ( cd "$PROJECT_DIR" && cargo build --features "$BUILD_FEATURES" )
     PROFILE="debug"
   else
     echo "Building release with computer_use-macos..."
-    ( cd "$PROJECT_DIR" && cargo build --release --features computer_use-macos )
+    ( cd "$PROJECT_DIR" && cargo build --release --features "$BUILD_FEATURES" )
     PROFILE="release"
   fi
 fi
@@ -141,7 +145,7 @@ bootstrap_agent() {
       return 0
     fi
     if [ "$attempt" != "5" ]; then
-      sleep 0.2
+      sleep "$attempt"
     fi
   done
   printf '%s\n' "$bootstrap_output" >&2
@@ -149,9 +153,24 @@ bootstrap_agent() {
   return 1
 }
 
+# `bootout` returns before launchd finishes removing the service while the
+# daemon drains; a bootstrap in that window fails with "5: Input/output error".
+wait_for_unload() {
+  local waited=0
+  while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do
+    if [ "$waited" -ge 60 ]; then
+      echo "warning: $LABEL still registered after 30s; bootstrapping anyway" >&2
+      return 0
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+}
+
 # (Re)load the launchd agent.
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$(id -u)/$LABEL"
+  wait_for_unload
   bootstrap_agent
   echo "Reloaded existing launchd agent."
 else

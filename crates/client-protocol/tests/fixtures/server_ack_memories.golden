@@ -1,0 +1,17 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "memories": [
+      {
+        "category": "preference",
+        "id": "41",
+        "key": "coffee",
+        "source": "conversation",
+        "updated_ms": 1767225000000,
+        "value": "Alice Rivera takes her coffee black"
+      }
+    ],
+    "type": "memories"
+  },
+  "type": "ack"
+}

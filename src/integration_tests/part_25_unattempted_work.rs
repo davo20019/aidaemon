@@ -1,0 +1,675 @@
+// ==================== An instruction is carried out, not reported on ====================
+//
+// Live 2026-11-13: after `/clear`, "install Drupal and WordPress with ddev"
+// was declared as two installs, the run only listed the sites a past run had
+// made, re-declared the installs blocked, and answered with their state. The
+// run declared work and attempted none of it: the closeout sends it back once
+// to do the work or ask the owner (typed `needs_owner`), and judges that from
+// receipts, never from the reply. A question about state still answers
+// directly.
+
+/// A read-only listing, as `ddev list` is typed: an observation, never an
+/// attempt at the work.
+struct SyntheticSiteList;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for SyntheticSiteList {
+    fn name(&self) -> &str {
+        "synthetic_site_list"
+    }
+
+    fn description(&self) -> &str {
+        "Lists the synthetic sites"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "synthetic_site_list",
+            "description": "Lists the synthetic sites",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output(
+            "synthetic-wp paused; synthetic-drupal paused".to_string(),
+        ))
+    }
+}
+
+impl crate::traits::ToolSemantics for SyntheticSiteList {
+    fn capabilities(&self) -> crate::traits::ToolCapabilities {
+        crate::traits::ToolCapabilities {
+            read_only: true,
+            idempotent: true,
+            ..Default::default()
+        }
+    }
+}
+
+async fn unattempted_work_harness(
+    provider: MockProvider,
+) -> crate::testing::TestHarness {
+    let probe: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticSiteList);
+    setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![probe], None)
+        .await
+        .unwrap()
+}
+
+async fn unattempted_work_task_end(
+    harness: &crate::testing::TestHarness,
+    session: &str,
+) -> crate::events::TaskEndData {
+    harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::TaskEnd], 5)
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|event| event.parse_data::<crate::events::TaskEndData>().ok())
+        .expect("task end")
+}
+
+async fn ask_owner_turn(harness: &crate::testing::TestHarness, session: &str, text: &str) -> String {
+    harness
+        .agent
+        .handle_message(
+            session,
+            text,
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap()
+}
+
+fn install_items(status: &str) -> serde_json::Value {
+    json!([
+        {"text": "Install Drupal in ~/projects/synthetic-drupal", "status": status, "mutation_effects": ["local_workspace_write"]},
+        {"text": "Install WordPress in ~/projects/synthetic-wp", "status": status, "mutation_effects": ["local_workspace_write"]},
+        {"text": "Send a screenshot of each homepage", "status": status, "mutation_effects": ["external_delivery"]}
+    ])
+}
+
+/// The run reports on earlier sites instead of installing: it is sent back
+/// once, asks the owner through `needs_owner`, and ends partial with that
+/// question as its reply. It is never a completed request.
+#[tokio::test]
+async fn a_report_on_earlier_work_does_not_complete_an_instruction_to_do_it() {
+    let session = "unattempted-work-asks";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": install_items("pending")}).to_string(),
+        ),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": install_items("deferred"), "outcome": "blocked"}).to_string(),
+        ),
+        MockProvider::text_response(
+            "Both sites are present but paused, so their timings and screenshots remain unverified.",
+        ),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": install_items("deferred"), "outcome": "needs_owner"}).to_string(),
+        ),
+        MockProvider::text_response(
+            "Those sites already exist. Install new ones, or report on the existing ones?",
+        ),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(
+        &harness,
+        session,
+        "Install Drupal and WordPress with ddev in ~/projects, time them, and send a screenshot of each homepage.",
+    )
+    .await;
+
+    assert_eq!(
+        reply,
+        "Those sites already exist. Install new ones, or report on the existing ones?"
+    );
+    assert_eq!(harness.provider.call_count().await, 6);
+    let end = unattempted_work_task_end(&harness, session).await;
+    assert_eq!(end.status, crate::events::TaskStatus::Completed);
+    assert_eq!(
+        end.effective_outcome(),
+        crate::events::TaskOutcome::Partial
+    );
+    let held = harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::DecisionPoint], 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::DecisionPointData>().ok())
+        .any(|point| point.metadata["condition"] == "declared_work_unattempted");
+    assert!(held, "the stop must be held for the unattempted work");
+}
+
+/// A run that still attempts nothing after the one pass stops unmet with the
+/// typed reason, not as a success.
+#[tokio::test]
+async fn unattempted_work_after_the_pass_stops_with_a_typed_reason() {
+    let session = "unattempted-work-stops";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": install_items("pending")}).to_string(),
+        ),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": install_items("deferred"), "outcome": "partial"}).to_string(),
+        ),
+        MockProvider::text_response("The sites from earlier are there."),
+        MockProvider::text_response("The sites from earlier are still there."),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Install Drupal and WordPress with ddev.").await;
+
+    assert_eq!(
+        reply,
+        "The sites from earlier are still there.\n\nI didn't start these parts: \
+         Install Drupal in ~/projects/synthetic-drupal; Install WordPress in \
+         ~/projects/synthetic-wp; Send a screenshot of each homepage."
+    );
+    assert_eq!(harness.provider.call_count().await, 4);
+    let end = unattempted_work_task_end(&harness, session).await;
+    assert_eq!(
+        end.effective_outcome(),
+        crate::events::TaskOutcome::Partial
+    );
+}
+
+/// A status question declares no work: it is answered directly, with no
+/// pass, and succeeds.
+#[tokio::test]
+async fn a_status_question_is_still_answered_directly() {
+    let session = "unattempted-work-status-question";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::text_response("Both sites exist and are paused."),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Are my DDEV sites up?").await;
+
+    assert_eq!(reply, "Both sites exist and are paused.");
+    assert_eq!(harness.provider.call_count().await, 2);
+    let end = unattempted_work_task_end(&harness, session).await;
+    assert_eq!(
+        end.effective_outcome(),
+        crate::events::TaskOutcome::Succeeded
+    );
+}
+
+// Live 2026-11-13: Drupal and WordPress were declared as two installs, one
+// helper was launched naming the Drupal item, and the launch handed the turn
+// off: WordPress was never started and nothing said why. Each declared item
+// is judged on its own; one nothing took on is launched or asked about
+// before a handoff ends the turn.
+
+/// A notifying launch that hands the turn to the background and names the
+/// declared items its job takes on.
+fn item_launcher(name: &str, line: &str, items: Vec<usize>) -> crate::testing::MockTool {
+    crate::testing::MockTool::new(name, "Starts a synthetic install in the background", line)
+        .with_metadata(crate::traits::ToolCallMetadata {
+            outcome_status: Some(crate::traits::ToolOutcomeStatus::Backgrounded),
+            background_started: true,
+            background_handoff: true,
+            completion_notifications_enabled: true,
+            checklist_items: items,
+            ..crate::traits::ToolCallMetadata::default()
+        })
+        .with_finish(
+            crate::traits::ToolCallOutcome::from_output(String::new())
+                .handed_to_background()
+                .finish
+                .unwrap(),
+        )
+}
+
+async fn launch_harness(provider: MockProvider) -> crate::testing::TestHarness {
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(item_launcher(
+            "launch_drupal",
+            "Started in the background: the Drupal install.",
+            vec![0],
+        )),
+        Arc::new(item_launcher(
+            "launch_wordpress",
+            "Started in the background: the WordPress install.",
+            vec![1],
+        )),
+    ];
+    setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap()
+}
+
+fn two_installs(first: &str, second: &str) -> serde_json::Value {
+    json!({"items": [
+        {"text": "Install Drupal in ~/projects/synthetic-drupal", "status": first, "mutation_effects": ["local_workspace_write"]},
+        {"text": "Install WordPress in ~/projects/synthetic-wp", "status": second, "mutation_effects": ["local_workspace_write"]}
+    ]})
+}
+
+async fn held_for_unattempted_work(harness: &crate::testing::TestHarness, session: &str) -> bool {
+    harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::DecisionPoint], 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::DecisionPointData>().ok())
+        .any(|point| point.metadata["condition"] == "declared_work_unattempted")
+}
+
+/// One of two declared installs launched: the handoff is held once, the
+/// second install is launched, and only then does the turn hand off.
+#[tokio::test]
+async fn a_handoff_is_held_until_every_declared_item_is_taken_on() {
+    let session = "unattempted-item-launched";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &two_installs("background", "pending").to_string(),
+        ),
+        MockProvider::tool_call_response("launch_drupal", "{}"),
+        MockProvider::tool_call_response("launch_wordpress", "{}"),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = launch_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Install Drupal and WordPress in parallel.").await;
+
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(!reply.contains("didn't start"), "{reply}");
+}
+
+/// After the one pass the second install is still not taken on: the turn
+/// hands off, and that item ends with its typed reason, "not attempted",
+/// named in the reply.
+#[tokio::test]
+async fn an_item_still_untaken_after_the_pass_ends_not_attempted() {
+    let session = "unattempted-item-left";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &two_installs("background", "pending").to_string(),
+        ),
+        MockProvider::tool_call_response("launch_drupal", "{}"),
+        MockProvider::text_response("The Drupal install is underway."),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = launch_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Install Drupal and WordPress in parallel.").await;
+
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(
+        reply.ends_with("I didn't start this part: Install WordPress in ~/projects/synthetic-wp."),
+        "{reply}"
+    );
+    let end = unattempted_work_task_end(&harness, session).await;
+    assert_eq!(
+        end.effective_outcome(),
+        crate::events::TaskOutcome::Partial
+    );
+}
+
+/// A step that comes after the job (commit once the tests pass) is not yet
+/// due at the handoff: past the pass the turn hands off to the job, whose
+/// continuation carries it, and the reply does not say it wasn't started
+/// (live 2026-11-15: "I didn't start these parts: Commit on this branch").
+#[tokio::test]
+async fn a_step_after_the_job_is_left_to_its_continuation() {
+    let session = "unattempted-step-after-job";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": [
+                {"text": "Run the synthetic test suite", "status": "background", "mutation_effects": ["local_workspace_write"]},
+                {"text": "Commit the synthetic change on this branch", "status": "pending", "mutation_effects": ["local_workspace_write"]}
+            ]})
+            .to_string(),
+        ),
+        MockProvider::tool_call_response("launch_drupal", "{}"),
+        MockProvider::tool_call_response("launch_drupal", r#"{"again":true}"#),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let harness = launch_harness(provider).await;
+    let reply = ask_owner_turn(
+        &harness,
+        session,
+        "Run the synthetic tests and commit the change once they pass.",
+    )
+    .await;
+
+    assert_eq!(harness.provider.call_count().await, 3);
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(!reply.contains("didn't start"), "{reply}");
+    assert!(reply.starts_with("Started in the background"), "{reply}");
+}
+
+/// `partial` with nothing in its way and its items still open goes on
+/// once: no failure, refusal or missing resource was recorded (live
+/// 2026-11-15: a coding run stopped mid-change after two edits).
+#[tokio::test]
+async fn a_partial_verdict_with_nothing_in_the_way_goes_on_once() {
+    let session = "partial-without-obstacle";
+    let items = |status: &str| {
+        json!([
+            {"text": "Add the synthetic edit handler", "status": status, "mutation_effects": ["local_workspace_write"]},
+            {"text": "Test the synthetic edit handler", "status": status, "mutation_effects": ["local_workspace_write"]}
+        ])
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": items("in_progress")}).to_string(),
+        ),
+        MockProvider::tool_call_response("apply_synthetic_edit", "{}"),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": items("in_progress"), "outcome": "partial"}).to_string(),
+        ),
+        MockProvider::text_response("I started the change, but it is incomplete."),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": items("done"), "outcome": "done"}).to_string(),
+        ),
+        MockProvider::text_response("The edit handler is added and tested."),
+        MockProvider::text_response("UNREACHED"),
+    ]);
+    let edit: Arc<dyn crate::traits::Tool> = Arc::new(
+        crate::testing::MockTool::new("apply_synthetic_edit", "Edits the synthetic repo", "edited")
+            .with_metadata(crate::traits::ToolCallMetadata {
+                outcome_status: Some(crate::traits::ToolOutcomeStatus::Succeeded),
+                checklist_items: vec![0, 1],
+                ..crate::traits::ToolCallMetadata::default()
+            }),
+    );
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![edit], None)
+        .await
+        .unwrap();
+    let reply = ask_owner_turn(&harness, session, "Add the synthetic edit handler with tests.").await;
+
+    assert_eq!(reply, "The edit handler is added and tested.");
+    let sent_back = harness
+        .agent
+        .event_store()
+        .query_events_by_types(session, &[crate::events::EventType::DecisionPoint], 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.parse_data::<crate::events::DecisionPointData>().ok())
+        .any(|point| point.metadata["condition"] == "partial_without_obstacle");
+    assert!(sent_back);
+}
+
+/// An edit as `edit_file` declares it: a local source write to a path.
+struct SyntheticEdit;
+
+#[async_trait::async_trait]
+impl crate::traits::Tool for SyntheticEdit {
+    fn name(&self) -> &str {
+        "apply_synthetic_edit"
+    }
+
+    fn description(&self) -> &str {
+        "Edits a synthetic file"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "apply_synthetic_edit",
+            "description": "Edits a synthetic file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": false}
+        })
+    }
+
+    async fn execute(
+        &self,
+        _arguments: &str,
+        _facts: &crate::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::traits::ToolCallOutcome> {
+        Ok(crate::traits::ToolCallOutcome::from_output("Edited the file.".to_string()))
+    }
+}
+
+impl crate::traits::ToolSemantics for SyntheticEdit {
+    fn call_semantics(&self, arguments: &str) -> crate::traits::ToolCallSemantics {
+        let path = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|args| args.get("path").and_then(|p| p.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        crate::traits::ToolCallSemantics::mutation_with(
+            crate::traits::ToolMutationEffects::LOCAL_SOURCE_WRITE,
+        )
+        .with_target_hint(aidaemon_tools::semantics::ToolTargetHintKind::Path, path)
+    }
+}
+
+/// Live 2026-11-15 (dloornext): a run wrote, tested and committed its
+/// change with plain edits (they name no checklist item), its items linked
+/// to the owner's units and marked done, and its reply still said "I didn't
+/// start these parts" for both units.
+#[tokio::test]
+async fn finished_edits_for_the_owners_units_are_never_reported_unstarted() {
+    let session = "owner-units-finished-edits";
+    let items = |status: &str| {
+        json!({"items": [
+            {"text": "Add the synthetic reading-time helper and show it under each title", "status": status, "mutation_effects": ["local_workspace_write"], "owner_units": [0], "targets": ["app/lib/reading-time.ts"]},
+            {"text": "Add a node test for the synthetic helper", "status": status, "mutation_effects": ["local_workspace_write"], "owner_units": [1]},
+            {"text": "Run the synthetic typecheck and test", "status": status, "requires_observation": true, "owner_units": [0, 1]}
+        ]})
+        .to_string()
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &items("in_progress")),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"/tmp/synthetic-site/app/lib/reading-time.ts"}"#),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"tests/reading-time.test.mjs"}"#),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &{
+                let mut done: serde_json::Value = serde_json::from_str(&items("completed")).unwrap();
+                done["outcome"] = json!("done");
+                done.to_string()
+            },
+        ),
+        MockProvider::text_response("Reading time is added and tested."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[
+        ("Add an estimated reading time under each post's title", true),
+        ("Add a node test for the helper", true),
+    ])]);
+    let edit: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticEdit);
+    let probe: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticSiteList);
+    let harness =
+        setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![edit, probe], None)
+            .await
+            .unwrap();
+    let reply = ask_owner_turn(&harness, session, "Add a reading time with a test.").await;
+    assert!(!reply.contains("didn't start"), "{reply}");
+    assert_eq!(reply, "Reading time is added and tested.");
+}
+
+/// Live 2026-11-15 (dloornext, again): one checklist item linked one of
+/// the owner's units; the others, linked by none, were done by the run's
+/// own edits and must not read "didn't start".
+#[tokio::test]
+async fn a_unit_no_item_links_is_covered_by_the_runs_edits() {
+    let session = "owner-units-partly-linked";
+    let items = |status: &str| {
+        json!({"items": [
+            {"text": "Add the synthetic helper and show it under each title", "status": status, "mutation_effects": ["local_workspace_write"]},
+            {"text": "Add a node test for the synthetic helper", "status": status, "mutation_effects": ["local_workspace_write"], "owner_units": [1]}
+        ]})
+    };
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &items("in_progress").to_string()),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"/tmp/synthetic-site/app/lib/helper.ts"}"#),
+        MockProvider::tool_call_response("apply_synthetic_edit", r#"{"path":"/tmp/synthetic-site/tests/helper.test.mjs"}"#),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &{
+                let mut done = items("completed");
+                done["outcome"] = json!("done");
+                done.to_string()
+            },
+        ),
+        MockProvider::text_response("The helper and its test are added."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[
+        ("Add an estimated reading time under each post's title", true),
+        ("Add a node test for the helper", true),
+    ])]);
+    let edit: Arc<dyn crate::traits::Tool> = Arc::new(SyntheticEdit);
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, vec![edit], None)
+        .await
+        .unwrap();
+    let reply = ask_owner_turn(&harness, session, "Add a reading time with a test.").await;
+    assert!(!reply.contains("didn't start"), "{reply}");
+}
+
+/// Live 2026-11-15 (dloornext, RSS): a change request, a few reads, then a
+/// reply promising to look further ("I'll check both…") and no tool call.
+/// Nothing was changed: the run goes back once to do the work or ask.
+#[tokio::test]
+async fn a_promise_after_reads_on_a_change_request_goes_back_once() {
+    let session = "owner-units-promise";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::text_response("Two things need checking first. I'll check both."),
+        MockProvider::text_response("Asked to go on."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[
+        ("Add a feed for every language the site supports", true),
+    ])]);
+    let harness = unattempted_work_harness(provider).await;
+    let _reply = ask_owner_turn(&harness, session, "Add a feed for every language.").await;
+    assert!(held_for_unattempted_work(&harness, session).await);
+}
+
+// ==================== The request is the owner's words ====================
+//
+// Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing
+// Drupal and the other one WordPress for a Claude company. Both use ddev. At
+// ~/projects/. Tell me how long it takes for them to finish. They should send
+// a screenshot of the homepage." The run declared only checks and screenshots
+// of existing sites, met that checklist, and never asked whether to install
+// new ones. The request contract is compiled from the owner's message apart
+// from the executor, and a change the owner asked for that only a look covers
+// was not attempted.
+
+fn owner_units_of_the_live_request() -> crate::traits::ProviderResponse {
+    MockProvider::owner_units(&[
+        ("Install Drupal with ddev in ~/projects", true),
+        ("Install WordPress with ddev in ~/projects", true),
+        ("Homepage screenshot of each site", false),
+        ("How long each took", false),
+    ])
+}
+
+fn screenshot_checks(outcome: Option<&str>) -> String {
+    let mut args = json!({"items": [
+        {"text": "Capture your Drupal homepage screenshot", "status": "completed", "requires_observation": true, "owner_units": [2]},
+        {"text": "Capture your WordPress homepage screenshot", "status": "completed", "requires_observation": true, "owner_units": [2]}
+    ]});
+    if let Some(outcome) = outcome {
+        args["outcome"] = json!(outcome);
+    }
+    args.to_string()
+}
+
+/// The run plans checks of the sites that exist, meets its own checklist
+/// and answers: it is held for the owner's installs, and asks the owner the
+/// one question through `needs_owner`.
+#[tokio::test]
+async fn a_change_request_answered_only_with_checks_is_held_for_the_owners_units() {
+    let session = "owner-units-held";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &screenshot_checks(None)),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::tool_call_response("track_requirements", &screenshot_checks(Some("done"))),
+        MockProvider::text_response("Both sites are up; here are their homepages."),
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &screenshot_checks(Some("needs_owner")),
+        ),
+        MockProvider::text_response(
+            "Those sites exist. Install new ones, or check the existing ones?",
+        ),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![owner_units_of_the_live_request()]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(
+        &harness,
+        session,
+        "Have two parallel agents. One installing Drupal and the other one WordPress. Both use ddev. At ~/projects/. Tell me how long it takes for them to finish. They should send a screenshot of the homepage.",
+    )
+    .await;
+
+    assert_eq!(
+        reply,
+        "Those sites exist. Install new ones, or check the existing ones?"
+    );
+    assert!(held_for_unattempted_work(&harness, session).await);
+    // The run read the owner's units, numbered, from its first call on.
+    let calls = harness.provider.call_log.lock().await;
+    let first = serde_json::to_string(&calls[0].messages).unwrap();
+    assert!(first.contains("[What the owner asked for]"), "{first}");
+    assert!(first.contains("Install WordPress with ddev in ~/projects"));
+    // The demand named the owner's install, in the owner's words.
+    let demand = serde_json::to_string(&calls[4].messages).unwrap();
+    assert!(
+        demand.contains("Install Drupal with ddev in ~/projects"),
+        "{demand}"
+    );
+}
+
+/// "Screenshot my existing Drupal site" asks for no change: the check is
+/// the work, and the run answers without being held.
+#[tokio::test]
+async fn a_request_to_check_is_satisfied_by_a_check() {
+    let session = "owner-units-check";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response(
+            "track_requirements",
+            &json!({"items": [
+                {"text": "Capture your Drupal homepage screenshot", "status": "pending", "requires_observation": true, "owner_units": [0]}
+            ]})
+            .to_string(),
+        ),
+        MockProvider::tool_call_response("synthetic_site_list", "{}"),
+        MockProvider::text_response("Your Drupal site is up; here is its homepage."),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[(
+        "Screenshot of my existing Drupal site",
+        false,
+    )])]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Screenshot my existing Drupal site.").await;
+
+    assert_eq!(reply, "Your Drupal site is up; here is its homepage.");
+    assert!(!held_for_unattempted_work(&harness, session).await);
+}

@@ -7,17 +7,24 @@
 // produced file and deliver it directly via `send_media` (Document), guarded by
 // a process-scoped deliver-once ledger.
 
+use crate::testing::CallWithFacts;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::PermissionMode;
 use crate::tools::terminal::{ApprovalRequest, TerminalTool};
-use crate::traits::{Channel, ChannelCapabilities, Tool};
+use crate::traits::{HubChannel, ChannelCapabilities};
 use crate::types::{MediaKind, MediaMessage};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+/// How many 200 ms polls a test waits for a background command to finish
+/// and its result to arrive: a minute. The commands start Python, which a
+/// loaded Windows runner took over 16 s to run and report (CI 2026-11-17);
+/// the wait ends as soon as the result is there.
+const DELIVERY_POLLS: usize = 300;
 
 /// A media-capable test channel that records every `send_media` Document
 /// delivery and every text message, so the test can assert on real file
@@ -46,7 +53,7 @@ impl MediaCaptureChannel {
 }
 
 #[async_trait]
-impl Channel for MediaCaptureChannel {
+impl HubChannel for MediaCaptureChannel {
     fn name(&self) -> String {
         "media_test".to_string()
     }
@@ -103,10 +110,10 @@ async fn make_terminal_with_hub(
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().display().to_string();
     // Keep the temp DB file alive for the test duration.
-    std::mem::forget(db_file);
-    let embedding_service = Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+    aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
+    let embedding_service = Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
     let state = Arc::new(
-        SqliteStateStore::new(&db_path, 100, None, embedding_service)
+        SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
             .await
             .unwrap(),
     );
@@ -117,7 +124,7 @@ async fn make_terminal_with_hub(
     let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
 
     let tool = Arc::new(
-        TerminalTool::new(
+        TerminalTool::new(crate::execution::active_execution_backend(),
             vec!["*".to_string()],
             approval_tx,
             1, // 1-second initial timeout — moves long commands to background fast
@@ -126,7 +133,7 @@ async fn make_terminal_with_hub(
             pool,
         )
         .await
-        .with_state(state.clone() as Arc<dyn StateStore>)
+        .with_stores(state.clone(), state.clone())
         .with_delivery_dirs(inbox_dir, outbox_dirs),
     );
 
@@ -138,7 +145,7 @@ async fn make_terminal_with_hub(
         .await
         .insert(session_id.to_string(), "media_test".to_string());
     let hub = Arc::new(ChannelHub::new(
-        vec![channel.clone() as Arc<dyn Channel>],
+        vec![channel.clone() as Arc<dyn HubChannel>],
         session_map,
     ));
     let outbound: Arc<dyn crate::runtime_ports::OutboundRouter> = hub.clone();
@@ -162,7 +169,7 @@ async fn empty_stdout_background_command_delivers_result_file() {
         std::env::temp_dir().join(format!("bgd_probe_results_{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&result_path);
     let script = format!(
-        "import time\noutput_path = \"{}\"\ntime.sleep(2)\nwith open(output_path, \"w\") as f:\n    f.write(\"latency: 42ms\\n\")\n",
+        "import time\noutput_path = r\"{}\"\ntime.sleep(2)\nwith open(output_path, \"w\") as f:\n    f.write(\"latency: 42ms\\n\")\n",
         result_path.display()
     );
     std::fs::write(&script_path, script).unwrap();
@@ -178,12 +185,10 @@ async fn empty_stdout_background_command_delivers_result_file() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [result_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have been moved to background: {response}"
@@ -191,7 +196,7 @@ async fn empty_stdout_background_command_delivers_result_file() {
 
     // Wait for completion + deliverable delivery.
     let mut delivered = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         if channel.document_count().await >= 1 {
             delivered = true;
             break;
@@ -263,12 +268,10 @@ async fn reaped_command_without_produced_file_sends_honest_failure() {
         "command": command,
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "write_paths": [missing_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have been moved to background: {response}"
@@ -322,7 +325,7 @@ async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
     std::fs::write(
         &script_path,
         format!(
-            "import pathlib, time\ntime.sleep(2)\npathlib.Path('{}').write_text('a')\npathlib.Path('{}').write_text('b')\n",
+            "import pathlib, time\ntime.sleep(2)\npathlib.Path(r'{}').write_text('a')\npathlib.Path(r'{}').write_text('b')\n",
             a_path.display(),
             b_path.display()
         ),
@@ -343,19 +346,17 @@ async fn ambiguous_background_outputs_report_ambiguity_without_autosend() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [a_path.to_string_lossy(), b_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have detached: {response}"
     );
 
     let mut got_ambiguity = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         let texts = channel.texts().await;
         if texts.iter().any(|t| t.to_lowercase().contains("multiple") && t.to_lowercase().contains("output")) {
             got_ambiguity = true;
@@ -386,7 +387,7 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     let result_path =
         std::env::temp_dir().join(format!("bgd_retry_results_{}.txt", std::process::id()));
     let script = format!(
-        "import time\noutput_path = \"{}\"\ntime.sleep(2)\nopen(output_path, 'w').write('retry ok\\n')\n",
+        "import time\noutput_path = r\"{}\"\ntime.sleep(2)\nopen(output_path, 'w').write('retry ok\\n')\n",
         result_path.display()
     );
     std::fs::write(&script_path, script).unwrap();
@@ -402,15 +403,13 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [result_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(response.contains("Moved to background (pid="));
 
     let mut got_failure = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         let texts = channel.texts().await;
         if texts.iter().any(|t| t.to_lowercase().contains("couldn't deliver")) {
             got_failure = true;
@@ -422,11 +421,11 @@ async fn failed_media_send_does_not_poison_deliver_once_ledger() {
     assert_eq!(channel.document_count().await, 0);
 
     channel.fail_next_media_sends(false);
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(response.contains("Moved to background (pid="));
 
     let mut delivered = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         if channel.document_count().await == 1 {
             delivered = true;
             break;
@@ -453,7 +452,7 @@ async fn nonzero_background_command_with_file_reports_failure_without_autosend()
     std::fs::write(
         &script_path,
         format!(
-            "import pathlib, sys, time\ntime.sleep(2)\npathlib.Path('{}').write_text('partial')\nsys.exit(7)\n",
+            "import pathlib, sys, time\ntime.sleep(2)\npathlib.Path(r'{}').write_text('partial')\nsys.exit(7)\n",
             result_path.display()
         ),
     )
@@ -472,19 +471,17 @@ async fn nonzero_background_command_with_file_reports_failure_without_autosend()
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [result_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(
         response.contains("Moved to background (pid="),
         "command should have detached: {response}"
     );
 
     let mut got_failure = false;
-    for _ in 0..80 {
+    for _ in 0..DELIVERY_POLLS {
         let texts = channel.texts().await;
         if texts.iter().any(|t| t.to_lowercase().contains("exit code 7") && t.to_lowercase().contains("not sending")) {
             got_failure = true;
@@ -517,7 +514,7 @@ async fn reaped_script_declared_missing_output_reports_honest_failure() {
     std::fs::write(
         &script_path,
         format!(
-            "import time\noutput_path = '{}'\ntime.sleep(30)\n# intended output path is declared but never written\n",
+            "import time\noutput_path = r'{}'\ntime.sleep(30)\n# intended output path is declared but never written\n",
             missing_path.display()
         ),
     )
@@ -532,12 +529,10 @@ async fn reaped_script_declared_missing_output_reports_honest_failure() {
         "working_dir": std::env::temp_dir().to_string_lossy(),
         "read_paths": [script_path.to_string_lossy()],
         "write_paths": [missing_path.to_string_lossy()],
-        "_session_id": session_id,
-        "_user_role": "Owner",
     })
     .to_string();
 
-    let response = tool.call(&call).await.unwrap();
+    let response = tool.call_with(&call, crate::testing::call_facts(session_id)).await.unwrap();
     assert!(response.contains("Moved to background (pid="));
 
     let reaped = tool

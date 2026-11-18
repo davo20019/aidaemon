@@ -30,21 +30,14 @@ async fn test_orchestration_uniform_models_no_routing() {
 async fn test_orchestration_simple_falls_through_to_full_loop() {
     // The request goes through the full agent loop.
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         // 1st call: deferral text, bounced by the deferred-action gate
         MockProvider::text_response("I'll check the system info and get back to you."),
         // 2nd call: full agent loop — tool call
         MockProvider::tool_call_response("system_info", "{}"),
         // 3rd call: full agent loop — final response
         MockProvider::text_response("Your system is running macOS."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -113,6 +106,7 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
     // Simple tasks now use the full agent loop with all tools available.
     // Verify the agent can complete a simple task through the full loop.
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         // 1st call: deferral text, bounced by the deferred-action gate
         MockProvider::text_response("I'll run the diagnostics and get back to you."),
         // 2nd call: deferred-action retry produces a real tool call
@@ -123,15 +117,7 @@ async fn test_orchestration_simple_uses_full_loop_with_all_tools() {
         MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
         MockProvider::text_response("Diagnostics complete. All systems normal."),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent_orchestrator(provider).await.unwrap();
 
     let response = harness
@@ -283,25 +269,7 @@ async fn test_structural_continuation_projects_exact_prior_exchange() {
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response("There are 3 R's in strawberry."),
         MockProvider::text_response("Yes — strawberry has 3 R's."),
-    ])
-    .with_task_assessments(vec![
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "new_request",
-            "none",
-        ),
-        MockProvider::semantic_task_assessment(
-            "answer",
-            false,
-            false,
-            &[],
-            "continuation",
-            "conversation_history",
-        ),
-    ]);
+    ]).with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let first = harness
@@ -471,15 +439,7 @@ async fn test_zero_tool_fabricated_mutation_claim_is_blocked() {
         MockProvider::text_response(
             "I could not verify the deletion because no command was run.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "change",
-        true,
-        false,
-        &["local_source_write"],
-        "new_request",
-        "local_workspace",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -545,20 +505,13 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
     let fabrication =
         "I've initiated a deep analysis using a specialized review agent. I'll return shortly.";
     let provider = MockProvider::with_responses(vec![
+        MockProvider::observation_checklist(),
         MockProvider::text_response(fabrication),
         MockProvider::tool_call_response("system_info", "{}"),
         MockProvider::text_response(
             "I could not start a specialist agent, so no delegated review is running.",
         ),
-    ])
-    .with_task_assessments(vec![MockProvider::semantic_task_assessment(
-        "check",
-        false,
-        true,
-        &[],
-        "new_request",
-        "host_local",
-    )]);
+    ]);
     let harness = setup_test_agent(provider).await.unwrap();
 
     let response = harness
@@ -578,94 +531,8 @@ async fn test_zero_tool_fabricated_delegation_claim_is_blocked() {
         !response.contains("I've initiated"),
         "fabricated zero-tool delegation claim was accepted: {response}"
     );
-    let calls = harness.provider.call_log.lock().await;
-    assert_eq!(calls.len(), 3);
-    assert!(calls[1].options.tool_choice == crate::traits::ToolChoiceMode::Required);
+    // The ledger closeout demanded real work for the open check; the model
+    // used a tool and answered from its receipt.
+    assert_eq!(harness.provider.call_count().await, 4);
 }
 
-/// The efficacy-analysis payoff: a supervision gate fire is persisted as a
-/// `GateTelemetry` decision point whose `task_id` matches the turn's `TaskEnd`
-/// event (which already carries a `TaskOutcome`). That shared key is what lets
-/// "which gates help vs hurt" be a query — join gate fires → task outcome —
-/// instead of manual log archaeology.
-///
-/// Rather than depend on which supervision gate the loop happens to select
-/// (gate selection is loop-internal and evolves), this drives a real turn to
-/// produce a genuine `TaskEnd` + `task_id` + `TaskOutcome`, then records a
-/// gate fire against that same real `task_id` and asserts they join.
-#[tokio::test]
-async fn test_gate_fire_event_joins_to_task_end_by_task_id() {
-    use crate::events::{DecisionPointData, DecisionType, EventEmitter, EventType, TaskEndData};
-
-    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
-        "It is running on the host operating system.",
-    )]);
-    let harness = setup_test_agent(provider).await.unwrap();
-    let session_id = "test_session";
-
-    harness
-        .agent
-        .handle_message(
-            session_id,
-            "What operating system is this running on?",
-            None,
-            UserRole::Owner,
-            ChannelContext::private("test"),
-            None,
-        )
-        .await
-        .unwrap();
-
-    let event_store = crate::events::EventStore::new(harness.state.pool())
-        .await
-        .expect("event store from harness pool");
-    let events = event_store
-        .query_recent_events(session_id, 200)
-        .await
-        .expect("recent events");
-
-    // The real turn emitted a TaskEnd carrying a task_id and a TaskOutcome —
-    // the join target an analyst correlates gate fires against.
-    let task_end = events
-        .iter()
-        .filter(|e| e.event_type == EventType::TaskEnd)
-        .find_map(|e| e.parse_data::<TaskEndData>().ok())
-        .expect("turn emitted a TaskEnd event");
-    let real_task_id = task_end.task_id.clone();
-    assert!(
-        task_end.outcome.is_some(),
-        "TaskEnd must carry a TaskOutcome for the gate-fire join to be meaningful"
-    );
-
-    // Record a supervision gate fire against that same real task_id.
-    let emitter = EventEmitter::new(harness.agent.event_store().clone(), session_id.to_string());
-    harness
-        .agent
-        .supervision_gate_enforced(
-            "mutation_contract_block",
-            "gemma-3-27b-it",
-            &emitter,
-            &real_task_id,
-            4,
-        )
-        .await;
-
-    // The gate fire is queryable and joins to the TaskEnd by task_id.
-    let events = event_store
-        .query_recent_events(session_id, 200)
-        .await
-        .expect("recent events after gate fire");
-    let joined = events
-        .iter()
-        .filter_map(|e| e.parse_data::<DecisionPointData>().ok())
-        .any(|d| {
-            d.decision_type == DecisionType::GateTelemetry
-                && d.metadata.get("code").and_then(serde_json::Value::as_str)
-                    == Some("supervision_gate_fire")
-                && d.task_id == real_task_id
-        });
-    assert!(
-        joined,
-        "gate fire did not persist with the real task_id {real_task_id} for the TaskEnd join"
-    );
-}

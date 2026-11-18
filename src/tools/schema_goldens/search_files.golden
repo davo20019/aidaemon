@@ -1,0 +1,30 @@
+{
+  "description": "Search for files by name pattern or content regex",
+  "name": "search_files",
+  "schema": {
+    "description": "Search for files by name pattern (glob) and/or content (regex). Use this instead of terminal find/grep. Automatically skips .git, node_modules, target, etc.",
+    "name": "search_files",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "glob": {
+          "description": "Filename glob pattern (e.g., '*.rs', '*.ts', 'Cargo.*')",
+          "type": "string"
+        },
+        "max_results": {
+          "description": "Maximum results to return (default: 50, max: 200)",
+          "type": "integer"
+        },
+        "path": {
+          "description": "Directory to search in (default: current directory)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regex pattern to search file contents for",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

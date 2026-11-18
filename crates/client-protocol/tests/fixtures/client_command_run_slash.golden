@@ -1,0 +1,9 @@
+{
+  "command": {
+    "command": "tasks",
+    "session_id": "app:6c1f",
+    "type": "run_slash"
+  },
+  "request_id": "5d0c2b1e-0008",
+  "type": "command"
+}

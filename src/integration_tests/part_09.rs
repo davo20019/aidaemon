@@ -1,3 +1,4 @@
+use crate::traits::ToolCalls as _;
 // ======================== Phase 4: Learning Integration Tests ========================
 
 #[tokio::test]
@@ -10,9 +11,9 @@ async fn test_orchestration_goal_context_feed_forward() {
 
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(&db_path, 100, None, embedding_service)
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let state: Arc<SqliteStateStore> = Arc::new(
+        SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
             .await
             .unwrap(),
     );
@@ -98,7 +99,7 @@ async fn test_orchestration_goal_context_feed_forward() {
     assert!(facts[0].get("key").is_some());
     assert!(facts[0].get("value").is_some());
 
-    std::mem::forget(db_file);
+    aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 }
 
 #[tokio::test]
@@ -107,13 +108,13 @@ async fn test_orchestration_context_accumulation_end_to_end() {
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::tools::manage_goal_tasks::ManageGoalTasksTool;
-    use crate::traits::Tool;
+    
 
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path().to_str().unwrap().to_string();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
     let state: Arc<dyn StateStore> = Arc::new(
-        SqliteStateStore::new(&db_path, 100, None, embedding_service)
+        SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
             .await
             .unwrap(),
     );
@@ -193,6 +194,5 @@ async fn test_orchestration_context_accumulation_end_to_end() {
     let results = ctx["task_results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "Both task results should be accumulated");
 
-    std::mem::forget(db_file);
+    aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
 }
-

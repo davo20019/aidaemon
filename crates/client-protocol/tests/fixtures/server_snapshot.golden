@@ -1,0 +1,139 @@
+{
+  "seq": 42,
+  "state": {
+    "live_turns": [
+      {
+        "session_id": "app:synthetic-1",
+        "started_at_ms": 1700000000000,
+        "status": {
+          "activity": "run",
+          "kind": "tool_started",
+          "name": "terminal",
+          "summary": "cargo test -q"
+        },
+        "streamed": "Reading the synthetic notes",
+        "tools": [
+          "terminal"
+        ],
+        "turn_id": "turn-7"
+      }
+    ],
+    "pending_approvals": [
+      {
+        "card": {
+          "action": {
+            "detail": "{\"method\":\"POST\"}",
+            "kind": "use",
+            "what": "send a request to h.example.invalid"
+          },
+          "asked_by": "Report helper",
+          "impact": {
+            "kind": "sends"
+          },
+          "reason": {
+            "check_says": "The page asked for this, not you.",
+            "kind": "read_outside_content"
+          }
+        },
+        "channel": "telegram",
+        "detail": "POST https://h.example.invalid/report",
+        "expires_at_ms": 1767225900000,
+        "id": "a-7f3e-1",
+        "kind": "command",
+        "options": [
+          "approve_once",
+          "approve_always",
+          "deny"
+        ],
+        "requested_at_ms": 1767225600000,
+        "risk": "high",
+        "session_id": "app:6c1f",
+        "summary": "Your assistant wants to post the synthetic report to h.example.invalid",
+        "warnings": [
+          "Sends data outside this computer."
+        ]
+      },
+      {
+        "card": {
+          "action": {
+            "keeps_sign_in": true,
+            "kind": "take_over",
+            "site": "login.acme.example",
+            "surface_id": "srf_7d1c",
+            "what": "Sign in to your Acme account"
+          }
+        },
+        "id": "a-7f3e-2",
+        "kind": "handoff",
+        "options": [
+          "approve_once",
+          "deny"
+        ],
+        "requested_at_ms": 1767225600000,
+        "risk": "low",
+        "session_id": "app:6c1f",
+        "summary": "Sign in to login.acme.example, then press Done."
+      },
+      {
+        "card": {
+          "action": {
+            "kind": "click_on_site",
+            "site": "https://shop.acme.example",
+            "target": "button#checkout"
+          }
+        },
+        "detail": "button#checkout",
+        "id": "a-7f3e-3",
+        "kind": "command",
+        "options": [
+          "approve_once",
+          "approve_session",
+          "deny"
+        ],
+        "requested_at_ms": 1767225600000,
+        "risk": "medium",
+        "session_id": "app:6c1f",
+        "summary": "Your assistant wants to click a button on https://shop.acme.example in the browser."
+      }
+    ],
+    "running_tasks": [
+      {
+        "description": "Working on your message",
+        "id": "b9e1-4",
+        "number": 4,
+        "session_id": "app:6c1f",
+        "started_at_ms": 1767225600000,
+        "state": "running"
+      }
+    ],
+    "sessions": [
+      {
+        "channel": "app",
+        "id": "app:6c1f",
+        "last_activity_ms": 1767225600000,
+        "project_id": "project-acme",
+        "title": "Synthetic report for Alice Rivera",
+        "writable": true
+      }
+    ],
+    "surfaces": [
+      {
+        "controller": {
+          "device": "Synthetic phone",
+          "device_id": "dev-phone-1",
+          "kind": "owner"
+        },
+        "handoff_pending": true,
+        "height": 720,
+        "id": "srf_7d1c",
+        "interactive": true,
+        "kind": "browser_tab",
+        "session_id": "app:6c1f",
+        "site": "login.acme.example",
+        "title": "Sign in - Acme",
+        "width": 1280
+      }
+    ]
+  },
+  "type": "snapshot"
+}

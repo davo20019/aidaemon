@@ -1,0 +1,289 @@
+use serde::{Deserialize, Serialize};
+
+use aidaemon_tools::semantics::ToolCapabilities;
+
+pub use aidaemon_providers::routing::ModelProfile;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyLevel {
+    Quick,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    Auto,
+    AskOnce,
+    AskAlways,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPolicy {
+    pub model_profile: ModelProfile,
+    pub verify_level: VerifyLevel,
+    pub approval_mode: ApprovalMode,
+    pub context_budget: usize,
+    pub tool_budget: usize,
+    pub policy_rev: u32,
+    #[serde(default)]
+    pub escalation_reasons: Vec<String>,
+}
+
+impl ExecutionPolicy {
+    pub fn for_profile(profile: ModelProfile) -> Self {
+        match profile {
+            ModelProfile::Cheap => Self {
+                model_profile: ModelProfile::Cheap,
+                verify_level: VerifyLevel::Quick,
+                approval_mode: ApprovalMode::Auto,
+                context_budget: 24_000,
+                tool_budget: 20,
+                policy_rev: 1,
+                escalation_reasons: Vec::new(),
+            },
+            ModelProfile::Balanced => Self {
+                model_profile: ModelProfile::Balanced,
+                verify_level: VerifyLevel::Quick,
+                approval_mode: ApprovalMode::AskOnce,
+                context_budget: 28_000,
+                tool_budget: 35,
+                policy_rev: 1,
+                escalation_reasons: Vec::new(),
+            },
+            ModelProfile::Strong => Self {
+                model_profile: ModelProfile::Strong,
+                verify_level: VerifyLevel::Full,
+                approval_mode: ApprovalMode::AskAlways,
+                context_budget: 40_000,
+                tool_budget: 60,
+                policy_rev: 1,
+                escalation_reasons: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyBundle {
+    pub policy: ExecutionPolicy,
+    pub risk_score: f32,
+    pub uncertainty_score: f32,
+    pub confidence: f32,
+}
+
+impl PolicyBundle {
+    pub fn from_scores(risk_score: f32, uncertainty_score: f32, confidence: f32) -> Self {
+        let profile = profile_for_risk(risk_score, uncertainty_score);
+        Self {
+            policy: ExecutionPolicy::for_profile(profile),
+            risk_score: clamp01(risk_score),
+            uncertainty_score: clamp01(uncertainty_score),
+            confidence: clamp01(confidence),
+        }
+    }
+
+    /// Merge semantic, evidence-derived uncertainty after task assessment.
+    /// This never changes approval authority. Material multi-source inquiries
+    /// receive full verification and enough context/tool runway to close their
+    /// evidence obligations rather than being optimized as a quick lookup.
+    pub fn apply_epistemic_uncertainty(&mut self, score: f32) -> bool {
+        let score = clamp01(score);
+        if score <= self.uncertainty_score {
+            return false;
+        }
+        self.uncertainty_score = score;
+        self.confidence = self.confidence.min(1.0 - score);
+        if score >= 0.55 {
+            let strong = ExecutionPolicy::for_profile(ModelProfile::Strong);
+            self.policy.model_profile = ModelProfile::Strong;
+            self.policy.verify_level = VerifyLevel::Full;
+            self.policy.context_budget = self.policy.context_budget.max(strong.context_budget);
+            self.policy.tool_budget = self.policy.tool_budget.max(strong.tool_budget);
+            self.policy.policy_rev = self.policy.policy_rev.saturating_add(1);
+            if !self
+                .policy
+                .escalation_reasons
+                .iter()
+                .any(|reason| reason == "material_evidence_inquiry")
+            {
+                self.policy
+                    .escalation_reasons
+                    .push("material_evidence_inquiry".to_string());
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UncertaintySignals {
+    pub missing_required_slot: bool,
+    pub missing_target_project: bool,
+    pub missing_target_file: bool,
+    pub missing_target_environment: bool,
+    pub missing_expected_output: bool,
+    pub missing_rollback_path: bool,
+    pub conflicting_constraints: bool,
+    pub ambiguous_wording: bool,
+    pub prior_immediate_failure: bool,
+}
+
+#[cfg(test)]
+pub fn score_uncertainty(signals: UncertaintySignals) -> f32 {
+    let mut score = 0.0f32;
+    if signals.missing_required_slot {
+        score += 0.35;
+    }
+    if signals.missing_target_project {
+        score += 0.12;
+    }
+    if signals.missing_target_file {
+        score += 0.10;
+    }
+    if signals.missing_target_environment {
+        score += 0.12;
+    }
+    if signals.missing_expected_output {
+        score += 0.10;
+    }
+    if signals.missing_rollback_path {
+        score += 0.08;
+    }
+    if signals.conflicting_constraints {
+        score += 0.25;
+    }
+    if signals.ambiguous_wording {
+        score += 0.20;
+    }
+    if signals.prior_immediate_failure {
+        score += 0.20;
+    }
+    clamp01(score)
+}
+
+pub fn score_risk_from_capabilities(caps: &[ToolCapabilities]) -> f32 {
+    if caps.is_empty() {
+        return 0.25;
+    }
+
+    let mut aggregate = 0.0f32;
+    for cap in caps {
+        let mut local = 0.0f32;
+        if !cap.read_only {
+            local += 0.12;
+        }
+        if cap.external_side_effect {
+            local += 0.18;
+        }
+        if cap.needs_approval {
+            local += 0.07;
+        }
+        if !cap.idempotent {
+            local += 0.05;
+        }
+        if cap.high_impact_write {
+            local += 0.20;
+        }
+        aggregate += local;
+    }
+    let avg = aggregate / caps.len() as f32;
+    clamp01(0.12 + avg)
+}
+
+pub fn profile_for_risk(risk_score: f32, uncertainty_score: f32) -> ModelProfile {
+    let composite = clamp01((risk_score * 0.7) + (uncertainty_score * 0.3));
+    if composite < 0.34 {
+        // Open-source default: floor automatic routing at Balanced for better
+        // reliability. Cheap remains available as an explicit lower-budget preset.
+        ModelProfile::Balanced
+    } else if composite < 0.67 {
+        ModelProfile::Balanced
+    } else {
+        ModelProfile::Strong
+    }
+}
+
+fn clamp01(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_profile_defaults_match_plan() {
+        let cheap = ExecutionPolicy::for_profile(ModelProfile::Cheap);
+        assert_eq!(cheap.context_budget, 24_000);
+        assert_eq!(cheap.tool_budget, 20);
+        assert_eq!(cheap.verify_level, VerifyLevel::Quick);
+        assert_eq!(cheap.approval_mode, ApprovalMode::Auto);
+
+        let balanced = ExecutionPolicy::for_profile(ModelProfile::Balanced);
+        assert_eq!(balanced.context_budget, 28_000);
+        assert_eq!(balanced.tool_budget, 35);
+        assert_eq!(balanced.verify_level, VerifyLevel::Quick);
+        assert_eq!(balanced.approval_mode, ApprovalMode::AskOnce);
+
+        let strong = ExecutionPolicy::for_profile(ModelProfile::Strong);
+        assert_eq!(strong.context_budget, 40_000);
+        assert_eq!(strong.tool_budget, 60);
+        assert_eq!(strong.verify_level, VerifyLevel::Full);
+        assert_eq!(strong.approval_mode, ApprovalMode::AskAlways);
+    }
+
+    #[test]
+    fn uncertainty_weights() {
+        let score = score_uncertainty(UncertaintySignals {
+            missing_required_slot: true,
+            missing_target_project: false,
+            missing_target_file: false,
+            missing_target_environment: false,
+            missing_expected_output: false,
+            missing_rollback_path: false,
+            conflicting_constraints: true,
+            ambiguous_wording: false,
+            prior_immediate_failure: false,
+        });
+        assert!((score - 0.60).abs() < 0.001);
+    }
+
+    #[test]
+    fn slot_gaps_raise_uncertainty_for_risky_work() {
+        let score = score_uncertainty(UncertaintySignals {
+            missing_required_slot: false,
+            missing_target_project: true,
+            missing_target_file: false,
+            missing_target_environment: true,
+            missing_expected_output: true,
+            missing_rollback_path: true,
+            conflicting_constraints: false,
+            ambiguous_wording: false,
+            prior_immediate_failure: false,
+        });
+        assert!(score > 0.35, "expected slot gaps to increase uncertainty");
+    }
+
+    #[test]
+    fn low_risk_auto_routing_floors_at_balanced() {
+        assert_eq!(profile_for_risk(0.05, 0.0), ModelProfile::Balanced);
+        assert_eq!(profile_for_risk(0.20, 0.10), ModelProfile::Balanced);
+        assert_eq!(profile_for_risk(0.95, 0.95), ModelProfile::Strong);
+    }
+
+    #[test]
+    fn epistemic_uncertainty_enables_full_verification_without_changing_authority() {
+        let mut bundle = PolicyBundle::from_scores(0.1, 0.0, 1.0);
+        let approval = bundle.policy.approval_mode;
+        assert!(bundle.apply_epistemic_uncertainty(0.7));
+        assert_eq!(bundle.uncertainty_score, 0.7);
+        assert_eq!(bundle.confidence, 0.3);
+        assert_eq!(bundle.policy.model_profile, ModelProfile::Strong);
+        assert_eq!(bundle.policy.verify_level, VerifyLevel::Full);
+        assert_eq!(bundle.policy.approval_mode, approval);
+        assert!(bundle.policy.tool_budget >= 60);
+    }
+}

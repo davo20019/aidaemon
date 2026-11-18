@@ -1,0 +1,38 @@
+{
+  "description": "Write or create a file with given content",
+  "name": "write_file",
+  "schema": {
+    "description": "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting. ALWAYS prefer write_file over terminal heredocs (cat > file << EOF) — heredocs trigger the approval flow.",
+    "name": "write_file",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "Content to write to the file",
+          "type": "string"
+        },
+        "create_dirs": {
+          "description": "Create parent directories if they don't exist (default: true)",
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "Write mode. \"overwrite\" (default) replaces the file (a backup is kept). \"append\" adds to the end of the file without a backup — use it to build a large file in chunks across multiple calls instead of emitting everything in one call (which can exceed the output token limit).",
+          "enum": [
+            "overwrite",
+            "append"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to write to (supports ~ expansion)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    }
+  }
+}

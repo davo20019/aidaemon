@@ -1,0 +1,15 @@
+[package]
+name = "aidaemon-parity-agent"
+description = "The parity example: an agent assembled only from the SDK crates, run through the shared behavior suite with three memory systems"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Only SDK crates, plus the runtime and JSON every agent needs.
+[dependencies]
+aidaemon-sdk = { path = "../../crates/aidaemon-sdk", features = ["testing", "channels", "memory"] }
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

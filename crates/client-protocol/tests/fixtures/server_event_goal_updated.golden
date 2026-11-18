@@ -1,0 +1,15 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "goal": {
+      "description": "Water the plants every Monday",
+      "id": "g-1",
+      "session_id": "app:6c1f",
+      "status": "active"
+    },
+    "type": "goal_updated"
+  },
+  "seq": 11,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

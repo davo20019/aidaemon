@@ -1,0 +1,157 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "settings": {
+      "bots": [
+        {
+          "allowed_user_ids": [
+            "telegram:synthetic-user-1"
+          ],
+          "created_at": "2026-01-01 00:00:00",
+          "id": 3,
+          "platform": "telegram"
+        }
+      ],
+      "chatgpt_signed_in": true,
+      "checked": {
+        "models": [
+          "gpt-x",
+          "gpt-y"
+        ],
+        "preset": "openai",
+        "suggested": "gpt-x"
+      },
+      "coding_agents": [
+        {
+          "mode": "checked",
+          "modes": [
+            "checked",
+            "every_command",
+            "full_access"
+          ],
+          "name": "codex",
+          "program": "Codex",
+          "readiness": "not_usable",
+          "readiness_fix": "Run `codex login` on this machine.",
+          "readiness_reason": "Codex isn't signed in on this machine."
+        },
+        {
+          "modes": [
+            "full_access"
+          ],
+          "name": "aider",
+          "note": "AIDaemon cannot check this agent's actions.",
+          "program": "Aider",
+          "readiness": "unchecked"
+        }
+      ],
+      "config_path": "/home/synthetic/.aidaemon/config.toml",
+      "connected": [
+        {
+          "credential": "signed_in",
+          "hard_model": "synthetic-model-1",
+          "models": [
+            "synthetic-model-1"
+          ],
+          "name": "OpenAI (ChatGPT subscription)",
+          "offered_models": [
+            "synthetic-model-1",
+            "synthetic-model-2",
+            "synthetic-model-3"
+          ],
+          "preset": "openai_chatgpt",
+          "quick_model": "synthetic-model-2",
+          "usage": {
+            "plan": "plus",
+            "read_at_ms": 1700000000000,
+            "windows": [
+              {
+                "minutes": 300,
+                "resets_at_ms": 1700000100000,
+                "used_percent": 42
+              },
+              {
+                "minutes": 10080,
+                "used_percent": 18
+              }
+            ]
+          }
+        },
+        {
+          "base_url": "https://api.example.com/v1",
+          "credential": "key_stored",
+          "failover": 0,
+          "key_setting": "provider.fallbacks[0].api_key",
+          "models": [
+            "gpt-x"
+          ],
+          "name": "OpenAI",
+          "preset": "openai",
+          "usage": {
+            "balance": {
+              "limit_cents": 1000,
+              "remaining_cents": 650,
+              "used_cents": 350
+            },
+            "read_at_ms": 1700000000000
+          }
+        }
+      ],
+      "database_encrypted": true,
+      "database_path": "/home/synthetic/.aidaemon/aidaemon.db",
+      "groups": [
+        {
+          "name": "provider",
+          "settings": [
+            {
+              "applies": "reload",
+              "description": "The model most turns use.",
+              "example": "\"openai/gpt-4o\"",
+              "guarded": false,
+              "key": "provider.models.default",
+              "kind": "text",
+              "secret_set": false,
+              "value": "\"synthetic-model-1\""
+            },
+            {
+              "applies": "reload",
+              "guarded": true,
+              "key": "provider.api_key",
+              "kind": "secret",
+              "secret_set": true
+            }
+          ]
+        }
+      ],
+      "mcp_servers": [
+        {
+          "command": "synthetic-mcp --root /tmp",
+          "enabled": true,
+          "from_config": false,
+          "name": "files",
+          "tools": [
+            "read_file"
+          ]
+        }
+      ],
+      "notices": [
+        "The database moves to /data/aidaemon.db at the next restart."
+      ],
+      "providers": [
+        {
+          "billing": "per_token",
+          "key_url": "https://platform.openai.com/api-keys",
+          "model": "gpt-x",
+          "name": "OpenAI",
+          "needs_base_url": false,
+          "needs_key": true,
+          "preset": "openai"
+        }
+      ],
+      "reload_pending": true,
+      "restart_pending": false
+    },
+    "type": "settings"
+  },
+  "type": "ack"
+}

@@ -1,0 +1,9 @@
+{
+  "command": {
+    "cursor": "50",
+    "limit": 20,
+    "type": "list_sessions"
+  },
+  "request_id": "5d0c2b1e-0005",
+  "type": "command"
+}

@@ -1,0 +1,18 @@
+{
+  "request_id": "sensor_fixture_001",
+  "sample_uptime_ms": 43000,
+  "readings": [
+    {
+      "capability_id": "sensor.environment.temperature",
+      "capability_version": 1,
+      "value": 22.75,
+      "unit": "celsius"
+    },
+    {
+      "capability_id": "sensor.environment.humidity",
+      "capability_version": 1,
+      "value": 48.5,
+      "unit": "percent_rh"
+    }
+  ]
+}

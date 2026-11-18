@@ -1,0 +1,11 @@
+{
+  "command": {
+    "note": "This one",
+    "surface_id": "srf_7d1c",
+    "type": "point_at",
+    "x": 0.5,
+    "y": 0.25
+  },
+  "request_id": "5d0c2b1e-002d",
+  "type": "command"
+}

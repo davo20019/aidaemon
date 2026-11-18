@@ -1,0 +1,32 @@
+{
+  "description": "Generate or edit an image. When the request refers to attached, shared, previous, or reference images—or asks to preserve visual identity—pass their exact IDs in reference_image_resource_ids, with the identity-critical image first. Without them, generation is text-only. The result is attached; use send_file with its resource_id to deliver it.",
+  "name": "generate_image",
+  "schema": {
+    "description": "Generate or edit an image. When the request refers to attached, shared, previous, or reference images—or asks to preserve visual identity—pass their exact IDs in reference_image_resource_ids, with the identity-critical image first. Without them, generation is text-only. The result is attached; use send_file with its resource_id to deliver it.",
+    "name": "generate_image",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {
+          "description": "Complete image brief: subject, composition, style, lighting, colors, and required text.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "reference_image_resource_ids": {
+          "description": "Ordered image resource IDs. Include referenced attachments and put the identity-critical image first.",
+          "items": {
+            "pattern": "^res_[A-Za-z0-9_-]+$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,19 +1,18 @@
-
 mod scheduler_flaw_test {
+    use chrono::{Duration, Utc};
     use std::sync::Arc;
-    use chrono::{Utc, Duration};
 
     use crate::memory::embeddings::EmbeddingService;
     use crate::state::SqliteStateStore;
     use crate::traits::{Goal, GoalSchedule, StateStore};
 
     #[tokio::test]
-    async fn test_scheduler_ignores_utc_timezone() {
+    async fn a_schedule_takes_a_named_or_fixed_zone_and_refuses_an_unknown_one() {
         // 1. Setup isolated state store
         let db_file = tempfile::NamedTempFile::new().unwrap();
-        let embedding_service = Arc::new(EmbeddingService::new().unwrap());
+        let embedding_service = Arc::new(EmbeddingService::deterministic());
         let state: Arc<dyn StateStore> = Arc::new(
-            SqliteStateStore::new(
+            SqliteStateStore::for_tests(
                 db_file.path().to_str().unwrap(),
                 100,
                 None,
@@ -27,9 +26,9 @@ mod scheduler_flaw_test {
         let goal = Goal::new_continuous("UTC Test Goal", "test-session", None, None);
         state.create_goal(&goal).await.unwrap();
 
-        // 3. Attempt to create a schedule with explicit "UTC" timezone.
-        // The current code rejects non-"local" timezones at creation time,
-        // so this should fail with an appropriate error.
+        // 3. A schedule may be stored in UTC or a named IANA zone; a zone
+        // this cannot read is refused at creation, never run on the owner's
+        // clock.
         let now = Utc::now();
         let now_ts = now.to_rfc3339();
         let due_ts = (now - Duration::minutes(5)).to_rfc3339();
@@ -38,7 +37,7 @@ mod scheduler_flaw_test {
             id: uuid::Uuid::new_v4().to_string(),
             goal_id: goal.id.clone(),
             cron_expr: "* * * * *".to_string(),
-            tz: "UTC".to_string(), // <--- This is the key. Current code expects "local".
+            tz: "UTC".to_string(),
             original_schedule: Some("every minute".to_string()),
             fire_policy: "always_fire".to_string(),
             is_one_shot: false,
@@ -49,19 +48,24 @@ mod scheduler_flaw_test {
             updated_at: now_ts,
         };
 
-        // UTC timezone is rejected at creation time, not at tick time.
-        // The create_goal_schedule call should return an error.
-        let result = state.create_goal_schedule(&schedule).await;
-        assert!(
-            result.is_err(),
-            "UTC timezone should be rejected at schedule creation time"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("tz='local'"),
-            "Error message should mention tz='local' requirement, got: {}",
-            err_msg
-        );
+        state.create_goal_schedule(&schedule).await.unwrap();
+        let madrid = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            tz: "Europe/Madrid".to_string(),
+            ..schedule.clone()
+        };
+        state.create_goal_schedule(&madrid).await.unwrap();
+
+        let unknown = GoalSchedule {
+            id: uuid::Uuid::new_v4().to_string(),
+            tz: "Mars/Olympus".to_string(),
+            ..schedule
+        };
+        let err_msg = state
+            .create_goal_schedule(&unknown)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("Mars/Olympus"), "{err_msg}");
     }
 }
-

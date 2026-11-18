@@ -1,0 +1,18 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "setup": {
+      "channel": {
+        "bot": "@synthetic_bot",
+        "connected": true,
+        "platform": "telegram"
+      },
+      "model": "OpenAI (ChatGPT subscription) · gpt-synthetic",
+      "on_server": false,
+      "step": "channel"
+    },
+    "type": "setup_updated"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

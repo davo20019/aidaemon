@@ -1,0 +1,54 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "setup": {
+      "channels": [
+        {
+          "help_url": "https://t.me/BotFather",
+          "name": "Telegram",
+          "needs_app_token": false,
+          "platform": "telegram"
+        }
+      ],
+      "checked": {
+        "models": [
+          "synthetic/model-1",
+          "synthetic/model-2"
+        ],
+        "preset": "openrouter",
+        "suggested": "synthetic/model-1"
+      },
+      "found": [
+        {
+          "billing": "plan",
+          "name": "OpenAI (ChatGPT subscription) · gpt-synthetic",
+          "preset": "openai_chatgpt",
+          "source": "ChatGPT sign-in on this computer",
+          "works": true
+        }
+      ],
+      "notices": [
+        "Secrets are kept in /home/synthetic/.aidaemon/.env (no keychain here)."
+      ],
+      "on_server": true,
+      "providers": [
+        {
+          "billing": "per_token",
+          "key_url": "https://openrouter.ai/keys",
+          "model": "synthetic/model-1",
+          "name": "OpenRouter",
+          "needs_base_url": false,
+          "needs_key": true,
+          "preset": "openrouter"
+        }
+      ],
+      "sign_in": {
+        "paste": true,
+        "url": "https://auth.example.invalid/authorize?state=synthetic"
+      },
+      "step": "model"
+    },
+    "type": "setup"
+  },
+  "type": "ack"
+}

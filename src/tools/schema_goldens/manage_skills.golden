@@ -1,0 +1,63 @@
+{
+  "description": "Manage skills: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources. API guides: manage_api.",
+  "name": "manage_skills",
+  "schema": {
+    "description": "Manage skills: add, add_inline, list, remove, remove_all, enable, disable, browse, install, update, review. Bundled files via skill_resources. API guides: manage_api.",
+    "name": "manage_skills",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "Action",
+          "enum": [
+            "add",
+            "add_inline",
+            "list",
+            "remove",
+            "remove_all",
+            "enable",
+            "disable",
+            "browse",
+            "install",
+            "update",
+            "review"
+          ],
+          "type": "string"
+        },
+        "approve": {
+          "type": "boolean"
+        },
+        "content": {
+          "description": "Inline markdown (add_inline)",
+          "type": "string"
+        },
+        "draft_id": {
+          "type": "integer"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "names": {
+          "description": "Names (remove_all)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "query": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

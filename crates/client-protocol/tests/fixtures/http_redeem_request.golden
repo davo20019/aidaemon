@@ -1,0 +1,11 @@
+{
+  "code": "K7Q2-9FZD",
+  "device_kind": "web",
+  "device_name": "Synthetic Phone",
+  "offer_id": "of-1",
+  "public_key": "BOr9...",
+  "scopes": [
+    "observe",
+    "approve"
+  ]
+}

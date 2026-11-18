@@ -10,9 +10,9 @@ async fn test_executor_activity_logging() {
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = db_file.path().to_str().unwrap().to_string();
         let embedding_service =
-            Arc::new(crate::memory::embeddings::EmbeddingService::new().unwrap());
+            Arc::new(crate::memory::embeddings::EmbeddingService::deterministic());
         let state = Arc::new(
-            crate::state::SqliteStateStore::new(&db_path, 100, None, embedding_service)
+            crate::state::SqliteStateStore::for_tests(&db_path, 100, None, embedding_service)
                 .await
                 .unwrap(),
         );
@@ -46,7 +46,7 @@ async fn test_executor_activity_logging() {
         };
         state.create_task(&task).await.unwrap();
 
-        std::mem::forget(db_file);
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
         state
     };
 

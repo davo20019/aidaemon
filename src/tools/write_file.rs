@@ -1,297 +1,18 @@
-use async_trait::async_trait;
-use serde_json::{json, Value};
+//! Tests of `write_file` (`aidaemon-tools`, worded and given its policy in
+//! `startup::tool_config`) on the daemon's execution backend.
 
-use crate::execution::{active_execution_backend, WriteMode};
-use crate::traits::{
-    DurableReplayDecision, Tool, ToolCallSemantics, ToolCapabilities, ToolMutationEffects,
-    ToolRole, ToolTargetHintKind,
-};
+#[cfg(test)]
+use crate::traits::{DurableReplayDecision, Tool};
+#[cfg(test)]
+use serde_json::json;
 
-use super::fs_utils;
-
-pub struct WriteFileTool;
-
-const MAX_CONTENT_SIZE: usize = 1024 * 1024; // 1MB
-
-#[async_trait]
-impl Tool for WriteFileTool {
-    fn name(&self) -> &str {
-        "write_file"
-    }
-
-    fn description(&self) -> &str {
-        "Write or create a file with given content"
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "name": "write_file",
-            "description": "Write content to a file, creating it if it doesn't exist. Use this instead of terminal echo/cat for file creation. Creates a backup of existing files before overwriting. ALWAYS prefer write_file over terminal heredocs (cat > file << EOF) — heredocs trigger the approval flow.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to write to (supports ~ expansion)"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Content to write to the file"
-                    },
-                    "create_dirs": {
-                        "type": "boolean",
-                        "description": "Create parent directories if they don't exist (default: true)"
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["overwrite", "append"],
-                        "description": "Write mode. \"overwrite\" (default) replaces the file (a backup is kept). \"append\" adds to the end of the file without a backup — use it to build a large file in chunks across multiple calls instead of emitting everything in one call (which can exceed the output token limit)."
-                    }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }
-        })
-    }
-
-    fn tool_role(&self) -> ToolRole {
-        ToolRole::Action
-    }
-
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities {
-            read_only: false,
-            external_side_effect: false,
-            needs_approval: false,
-            idempotent: false,
-            // Not high-impact: creates backups before overwriting, user-scoped
-            // file system only, and dedicated file tools are intentionally
-            // available without terminal approval. Sensitive paths are blocked
-            // before writing.
-            high_impact_write: false,
-        }
-    }
-
-    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|args| {
-                for key in ["path", "file_path", "file", "filename"] {
-                    if let Some(path) = args.get(key).and_then(|value| value.as_str()) {
-                        return Some(path.to_string());
-                    }
-                }
-                None
-            })
-            .unwrap_or_default();
-
-        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
-            .with_target_hint(ToolTargetHintKind::Path, path)
-    }
-
-    async fn call(&self, arguments: &str) -> anyhow::Result<String> {
-        let args: Value = serde_json::from_str(arguments)?;
-        // Parameter aliasing: models often use "file_path" or "file" instead of "path"
-        let path_str = args["path"]
-            .as_str()
-            .or_else(|| args["file_path"].as_str())
-            .or_else(|| args["file"].as_str())
-            .or_else(|| args["filename"].as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
-        let content = args["content"]
-            .as_str()
-            .or_else(|| args["data"].as_str())
-            .or_else(|| args["text"].as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: content"))?;
-        let create_dirs = args["create_dirs"].as_bool().unwrap_or(true);
-
-        if content.len() > MAX_CONTENT_SIZE {
-            anyhow::bail!(
-                "Content too large: {} bytes (max {})",
-                content.len(),
-                MAX_CONTENT_SIZE
-            );
-        }
-
-        let backend = active_execution_backend();
-        let path = backend.resolve_path(path_str).await?;
-
-        // Block sensitive paths
-        if fs_utils::is_sensitive_path(std::path::Path::new(path.as_str())) {
-            anyhow::bail!("Cannot write to sensitive path: {}", path_str);
-        }
-
-        // Create parent dirs if requested
-        if create_dirs {
-            if let Some(parent) = path.parent() {
-                backend.create_dir_all(&parent).await?;
-            }
-        } else if let Some(parent) = path.parent() {
-            if !backend
-                .metadata(&parent)
-                .await
-                .is_ok_and(|metadata| metadata.is_dir())
-            {
-                anyhow::bail!(
-                    "Parent directory does not exist: {}. Set create_dirs=true to create it.",
-                    parent
-                );
-            }
-        }
-
-        // Write mode: "overwrite" (default, replaces with backup) or "append"
-        // (additive, no backup — lets the model build a large file in chunks
-        // instead of one oversized generation).
-        let mode = args["mode"].as_str().unwrap_or("overwrite");
-        if mode != "overwrite" && mode != "append" {
-            anyhow::bail!(
-                "Invalid mode: \"{}\" (expected \"overwrite\" or \"append\")",
-                mode
-            );
-        }
-
-        if mode == "append" {
-            let existing_size = backend
-                .metadata(&path)
-                .await
-                .map(|metadata| metadata.len)
-                .unwrap_or(0);
-            backend
-                .write(&path, content.as_bytes(), WriteMode::Append, create_dirs)
-                .await?;
-
-            let appended = content.len();
-            let appended_lines = content.lines().count();
-            let total = existing_size + appended as u64;
-            return Ok(format!(
-                "Appended {} bytes ({} lines) to {} (now {} bytes total). \
-                 To add more, call write_file again with mode=\"append\". \
-                 When the file is complete, deliver it with send_file instead of pasting it inline.",
-                appended, appended_lines, path_str, total
-            ));
-        }
-
-        // Backup existing file
-        let existing_metadata = backend.metadata(&path).await.ok();
-        let existed = existing_metadata.is_some();
-        let old_size = if existed {
-            let size = existing_metadata
-                .as_ref()
-                .map_or(0, |metadata| metadata.len);
-            // Create backup
-            let backup_extension = format!(
-                "{}.bak",
-                path.extension().map(str::to_string).unwrap_or_default()
-            );
-            let backup = path.with_extension(&backup_extension);
-            // Only keep one backup
-            let _ = backend.copy(&path, &backup).await;
-            Some(size)
-        } else {
-            None
-        };
-
-        backend
-            .write(&path, content.as_bytes(), WriteMode::Overwrite, create_dirs)
-            .await?;
-
-        let new_size = content.len();
-        let line_count = content.lines().count();
-
-        let action = if existed { "Updated" } else { "Created" };
-        let size_info = if let Some(old) = old_size {
-            format!(" (was {} bytes, backup saved)", old)
-        } else {
-            String::new()
-        };
-
-        let diagnostics =
-            fs_utils::post_write_diagnostics(std::path::Path::new(path.as_str())).await;
-
-        Ok(format!(
-            "{} {}\n{} bytes, {} lines{}{}",
-            action, path_str, new_size, line_count, size_info, diagnostics
-        ))
-    }
-
-    async fn durable_replay_decision(&self, arguments: &str) -> DurableReplayDecision {
-        let Ok(args) = serde_json::from_str::<Value>(arguments) else {
-            return DurableReplayDecision::Replay;
-        };
-        // Appending the same bytes twice is not safe. Keep the durable receipt
-        // authoritative for append calls; callers must issue a new operation.
-        if args["mode"].as_str().unwrap_or("overwrite") != "overwrite" {
-            return DurableReplayDecision::Replay;
-        }
-        let Some(path_str) = args["path"]
-            .as_str()
-            .or_else(|| args["file_path"].as_str())
-            .or_else(|| args["file"].as_str())
-            .or_else(|| args["filename"].as_str())
-        else {
-            return DurableReplayDecision::Replay;
-        };
-        let Some(content) = args["content"]
-            .as_str()
-            .or_else(|| args["data"].as_str())
-            .or_else(|| args["text"].as_str())
-        else {
-            return DurableReplayDecision::Replay;
-        };
-
-        let backend = active_execution_backend();
-        let path = match backend.resolve_path(path_str).await {
-            Ok(path) => path,
-            Err(error) => {
-                return DurableReplayDecision::Block {
-                    reason: format!(
-                        "the prior file-write target can no longer be resolved safely: {error}"
-                    ),
-                }
-            }
-        };
-        match backend.read(&path).await {
-            Ok(current) if current == content.as_bytes() => DurableReplayDecision::Replay,
-            Ok(_) => DurableReplayDecision::Block {
-                reason: format!(
-                    "the file at {path_str} exists but no longer matches the successful write receipt; inspect and reconcile the current content before overwriting it"
-                ),
-            },
-            Err(read_error) => {
-                let Some(parent) = path.parent() else {
-                    return DurableReplayDecision::Block {
-                        reason: format!(
-                            "the prior file-write target could not be inspected: {read_error}"
-                        ),
-                    };
-                };
-                match backend.read_dir(&parent).await {
-                    Ok(entries) if entries.iter().all(|entry| entry.path != path) => {
-                        DurableReplayDecision::Reexecute {
-                            reason: format!(
-                                "the exact overwrite target {path_str} is absent, so the prior successful receipt no longer satisfies current state"
-                            ),
-                        }
-                    }
-                    Ok(_) => DurableReplayDecision::Block {
-                        reason: format!(
-                            "the file at {path_str} still exists but could not be read; refusing to overwrite unreconciled current state"
-                        ),
-                    },
-                    Err(parent_error) => DurableReplayDecision::Block {
-                        reason: format!(
-                            "the prior file-write target and its parent could not be inspected safely: {read_error}; {parent_error}"
-                        ),
-                    },
-                }
-            }
-        }
-    }
-}
+#[cfg(test)]
+use super::WriteFileTool;
 
 #[cfg(test)]
 mod durable_replay_tests {
     use super::*;
+    use crate::traits::ToolSemantics;
 
     #[tokio::test]
     async fn overwrite_receipt_reconciles_exact_current_file_state() {
@@ -302,7 +23,7 @@ mod durable_replay_tests {
             "content": "expected content\n"
         })
         .to_string();
-        let tool = WriteFileTool;
+        let tool = WriteFileTool::new(crate::execution::active_execution_backend());
 
         assert!(matches!(
             tool.durable_replay_decision(&arguments).await,
@@ -333,7 +54,9 @@ mod durable_replay_tests {
         .to_string();
 
         assert_eq!(
-            WriteFileTool.durable_replay_decision(&arguments).await,
+            WriteFileTool::new(crate::execution::active_execution_backend())
+                .durable_replay_decision(&arguments)
+                .await,
             DurableReplayDecision::Replay
         );
     }
@@ -342,15 +65,75 @@ mod durable_replay_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::ToolCalls as _;
+    use crate::traits::ToolSemantics;
+
+    #[test]
+    fn git_config_targets_are_configuration_egress() {
+        let tool = WriteFileTool::new(crate::execution::active_execution_backend());
+        let ann = |path: &str| {
+            tool.call_annotations_in(
+                &json!({"path": path}).to_string(),
+                &crate::traits::TrustRoots::new(&[]),
+            )
+        };
+        let config = ann("/tmp/aidaemon-test/repo/.git/config");
+        assert!(config.egress && !config.read_only);
+        assert!(ann("/tmp/aidaemon-test/repo/.gitattributes").egress);
+        let plain = ann("/tmp/aidaemon-test/repo/src/lib.rs");
+        assert!(!plain.egress && !plain.read_only);
+    }
 
     #[test]
     fn test_schema_has_required_fields() {
-        let tool = WriteFileTool;
+        let tool = WriteFileTool::new(crate::execution::active_execution_backend());
         let schema = tool.schema();
         assert_eq!(schema["name"], "write_file");
         assert!(!schema["description"].as_str().unwrap().is_empty());
         assert!(schema["parameters"]["properties"]["path"].is_object());
         assert!(schema["parameters"]["properties"]["content"].is_object());
+    }
+
+    #[tokio::test]
+    async fn write_file_allows_unrelated_project_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "title = \"a\"\n").unwrap();
+        let args =
+            json!({"path": config.to_str().unwrap(), "content": "title = \"b\"\n"}).to_string();
+        WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        let args = json!({"path": config.to_str().unwrap()}).to_string();
+        let read = crate::tools::ReadFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        assert!(read.contains("title = \"b\""), "{read}");
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_the_daemons_own_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("daemon-config.toml");
+        std::fs::write(&config, "[provider]\nname = \"synthetic\"\n").unwrap();
+        let paths = crate::tools::DaemonPaths::new(vec![config.clone()]);
+        let args = json!({"path": config.to_str().unwrap(), "content": "x = 1"}).to_string();
+        let err = crate::tools::guarded_call_protecting(
+            paths,
+            &WriteFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sensitive"), "got: {err}");
+        assert!(
+            std::fs::read_to_string(&config)
+                .unwrap()
+                .contains("synthetic")
+        );
     }
 
     #[tokio::test]
@@ -363,7 +146,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Created"));
         assert!(result.contains("13 bytes"));
 
@@ -383,17 +169,26 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Updated"));
         assert!(result.contains("backup saved"));
 
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "new content");
 
-        // Verify backup exists
-        let backup = file_path.with_extension("txt.bak");
+        // The backup lives under the daemon's data dir, not beside the file.
+        let backup = crate::tools::fs_utils::local_backup_path(
+            &crate::tools::file_policy::file_backup_root().unwrap(),
+            &file_path,
+        )
+        .unwrap();
         let backup_content = tokio::fs::read_to_string(&backup).await.unwrap();
         assert_eq!(backup_content, "old content");
+        assert!(!file_path.with_extension("txt.bak").exists());
+        let _ = tokio::fs::remove_file(&backup).await;
     }
 
     #[tokio::test]
@@ -404,7 +199,11 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = crate::tools::guarded_call(
+            &WriteFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sensitive"));
     }
@@ -420,7 +219,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Created"));
     }
 
@@ -434,7 +236,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Created"));
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "hello");
@@ -449,14 +254,16 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Parent directory"));
     }
 
     #[test]
     fn test_write_file_capabilities_match_no_approval_tool_guidance() {
-        let caps = WriteFileTool.capabilities();
+        let caps = WriteFileTool::new(crate::execution::active_execution_backend()).capabilities();
         assert!(
             !caps.needs_approval,
             "write_file is documented as a dedicated file tool that does not require approval"
@@ -475,7 +282,10 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Appended"), "result was: {result}");
         // Continuation hint must tell the model how to add more.
         assert!(result.contains("mode=\"append\""), "result was: {result}");
@@ -496,7 +306,10 @@ mod tests {
             "mode": "append"
         })
         .to_string();
-        WriteFileTool.call(&args).await.unwrap();
+        WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
 
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "first\nsecond\n");
@@ -517,7 +330,9 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid mode"));
         assert!(!file_path.exists(), "invalid mode must not write the file");
@@ -532,7 +347,11 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await;
+        let result = crate::tools::guarded_call(
+            &WriteFileTool::new(crate::execution::active_execution_backend()),
+            &args,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("sensitive"));
     }
@@ -549,9 +368,38 @@ mod tests {
         })
         .to_string();
 
-        let result = WriteFileTool.call(&args).await.unwrap();
+        let result = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
         assert!(result.contains("Updated"));
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "new");
+    }
+
+    #[test]
+    fn declares_write_of_the_absolute_path() {
+        let dir = format!("/tmp/aidaemon-test/{}", uuid::Uuid::new_v4());
+        let path = format!("{dir}/notes/../acme.md");
+        for key in ["path", "file_path"] {
+            let effects = WriteFileTool::new(crate::execution::active_execution_backend())
+                .call_effects(&json!({key: path}).to_string());
+            assert!(effects.complete, "{key}");
+            assert_eq!(
+                effects.keys,
+                vec![
+                    aidaemon_tools::command_effects::path_effect(
+                        aidaemon_core::EffectClass::Write,
+                        &format!("{dir}/acme.md"),
+                        None
+                    )
+                    .unwrap()
+                ]
+            );
+        }
+        // A relative path has no known working directory here.
+        let relative = WriteFileTool::new(crate::execution::active_execution_backend())
+            .call_effects(&json!({"path": "acme.md"}).to_string());
+        assert_eq!(relative, aidaemon_core::CallEffects::unknown());
     }
 }

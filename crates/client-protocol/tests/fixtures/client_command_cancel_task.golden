@@ -1,0 +1,8 @@
+{
+  "command": {
+    "task_id": "b9e1-4",
+    "type": "cancel_task"
+  },
+  "request_id": "5d0c2b1e-0004",
+  "type": "command"
+}

@@ -1,0 +1,435 @@
+use async_trait::async_trait;
+use serde_json::{Value, json};
+
+use crate::OutcomeTool as Tool;
+use crate::backend::SharedExecutionBackend;
+use crate::semantics::{ToolCapabilities, ToolRole};
+use crate::{BackendPath, ExecutionRequest};
+
+/// Where the daemon's process says its config file is.
+pub const RUNTIME_CONFIG_PATH_ENV_KEY: &str = "AIDAEMON_RUNTIME_CONFIG_PATH";
+/// Where the daemon's process says its env file is.
+pub const RUNTIME_ENV_FILE_ENV_KEY: &str = "AIDAEMON_RUNTIME_ENV_FILE";
+/// The daemon's working directory.
+pub const RUNTIME_WORKDIR_ENV_KEY: &str = "AIDAEMON_RUNTIME_WORKDIR";
+
+pub struct CheckEnvironmentTool {
+    backend: SharedExecutionBackend,
+}
+
+impl CheckEnvironmentTool {
+    pub fn new(backend: SharedExecutionBackend) -> Self {
+        Self { backend }
+    }
+}
+
+/// Runtimes/tools to check with their version flags.
+const TOOLS_TO_CHECK: &[(&str, &str)] = &[
+    ("rustc", "--version"),
+    ("cargo", "--version"),
+    ("node", "--version"),
+    ("npm", "--version"),
+    ("npx", "--version"),
+    ("bun", "--version"),
+    ("deno", "--version"),
+    ("python3", "--version"),
+    ("python", "--version"),
+    ("pip3", "--version"),
+    ("pip", "--version"),
+    ("go", "version"),
+    ("java", "-version"),
+    ("javac", "-version"),
+    ("ruby", "--version"),
+    ("php", "--version"),
+    ("docker", "--version"),
+    ("docker-compose", "--version"),
+    ("git", "--version"),
+    ("make", "--version"),
+    ("cmake", "--version"),
+    ("gcc", "--version"),
+    ("g++", "--version"),
+    ("clang", "--version"),
+];
+
+/// Config files to look for.
+const CONFIG_FILES: &[(&str, &str)] = &[
+    (".nvmrc", "Node version"),
+    (".node-version", "Node version"),
+    (".python-version", "Python version"),
+    (".ruby-version", "Ruby version"),
+    (".tool-versions", "asdf versions"),
+    ("Dockerfile", "Docker"),
+    ("docker-compose.yml", "Docker Compose"),
+    ("docker-compose.yaml", "Docker Compose"),
+    (".env", "Environment variables"),
+    (".env.local", "Local environment"),
+    ("rust-toolchain.toml", "Rust toolchain"),
+    ("rust-toolchain", "Rust toolchain"),
+    (".editorconfig", "Editor config"),
+    (".prettierrc", "Prettier"),
+    (".eslintrc.json", "ESLint"),
+    ("tsconfig.json", "TypeScript"),
+];
+
+#[async_trait]
+impl Tool for CheckEnvironmentTool {
+    fn name(&self) -> &str {
+        "check_environment"
+    }
+
+    fn description(&self) -> &str {
+        "Check which development tools and runtimes are available, their versions, and what config files exist. Use this instead of running multiple 'which' and '--version' commands."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "name": "check_environment",
+            "description": self.description(),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to check for config files (default: current directory)"
+                    }
+                },
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: &str,
+        _facts: &crate::semantics::ToolCallContext,
+    ) -> anyhow::Result<crate::semantics::ToolCallOutcome> {
+        let output: anyhow::Result<String> = async move {
+            let args: Value = serde_json::from_str(arguments)?;
+            let path_str = args["path"].as_str().unwrap_or(".");
+            let backend = self.backend.clone();
+            let check_dir = backend.resolve_path(path_str).await?;
+
+            let mut output = String::new();
+            output.push_str("## Execution Environment\n\n");
+            output.push_str(&format!(
+                "  Backend             {} ({})\n  Workspace           {}\n\n",
+                backend.kind().as_str(),
+                backend.id(),
+                backend.workspace_root()
+            ));
+
+            if let Some(runtime_context) = format_daemon_runtime_context(std::env::var) {
+                output.push_str("## Local Daemon Control Plane\n\n");
+                output.push_str(&runtime_context);
+                output.push('\n');
+            }
+
+            // Check tools in parallel
+            output.push_str("## Available Tools\n\n");
+
+            let mut handles = Vec::new();
+            for (tool, flag) in TOOLS_TO_CHECK {
+                let tool = tool.to_string();
+                let flag = flag.to_string();
+                let backend = backend.clone();
+                handles.push(tokio::spawn(async move {
+                    check_tool(backend, &tool, &flag).await
+                }));
+            }
+
+            let results = futures::future::join_all(handles).await;
+            let mut found = Vec::new();
+            let mut not_found = Vec::new();
+
+            for (i, result) in results.into_iter().enumerate() {
+                let (tool_name, _) = TOOLS_TO_CHECK[i];
+                match result {
+                    Ok(Some((path, version))) => found.push((tool_name, path, version)),
+                    Ok(None) => not_found.push(tool_name),
+                    Err(_) => not_found.push(tool_name),
+                }
+            }
+
+            for (name, path, version) in &found {
+                output.push_str(&format!(
+                    "  {} {}\n    path: {}\n",
+                    pad_right(name, 18),
+                    version,
+                    path
+                ));
+            }
+
+            if !not_found.is_empty() {
+                output.push_str(&format!("\nNot found: {}\n", not_found.join(", ")));
+            }
+
+            // Check config files
+            let configs = check_config_files(backend, &check_dir).await;
+            if !configs.is_empty() {
+                output.push_str("\n## Config Files\n\n");
+                for (file, desc, content) in &configs {
+                    output.push_str(&format!("  {} ({})", file, desc));
+                    if let Some(c) = content {
+                        output.push_str(&format!(" → {}", c));
+                    }
+                    output.push('\n');
+                }
+            }
+
+            Ok(output)
+        }
+        .await;
+        output.map(crate::semantics::ToolCallOutcome::from_output)
+    }
+}
+
+impl crate::semantics::ToolSemantics for CheckEnvironmentTool {
+    fn dispatch_facts(&self) -> crate::semantics::ToolDispatchFacts {
+        crate::semantics::ToolDispatchFacts {
+            same_tool_streak: crate::semantics::SameToolStreak::Versatile,
+            project_dir_argument: crate::semantics::ProjectDirArgument::SearchRoot,
+            evidence: crate::semantics::EvidenceSource::HostInfo,
+            semantic_scope: Some(crate::semantics::ToolSemanticScope::HostLocal),
+            low_signal_result: true,
+            ..Default::default()
+        }
+    }
+
+    fn tool_role(&self) -> ToolRole {
+        ToolRole::Universal
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: true,
+            external_side_effect: false,
+            needs_approval: false,
+            idempotent: true,
+            high_impact_write: false,
+        }
+    }
+}
+
+fn pad_right(s: &str, width: usize) -> String {
+    if s.len() >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - s.len()))
+    }
+}
+
+fn format_daemon_runtime_context<F>(mut lookup: F) -> Option<String>
+where
+    F: FnMut(&'static str) -> Result<String, std::env::VarError>,
+{
+    let mut lines = Vec::new();
+
+    if let Ok(workdir) = lookup(RUNTIME_WORKDIR_ENV_KEY)
+        && !workdir.trim().is_empty()
+    {
+        lines.push(format!("  Working dir         {}", workdir));
+    }
+
+    if let Ok(config_path) = lookup(RUNTIME_CONFIG_PATH_ENV_KEY)
+        && !config_path.trim().is_empty()
+    {
+        lines.push(format!("  Config path         {}", config_path));
+    }
+
+    if let Ok(env_path) = lookup(RUNTIME_ENV_FILE_ENV_KEY)
+        && !env_path.trim().is_empty()
+    {
+        lines.push(format!("  Env file            {}", env_path));
+    }
+
+    let secret_backend = match lookup("AIDAEMON_NO_KEYCHAIN") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some("env-file / environment"),
+        _ => Some("OS keychain"),
+    };
+    if let Some(backend) = secret_backend {
+        lines.push(format!("  Secret backend      {}", backend));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("{}\n", lines.join("\n")))
+    }
+}
+
+async fn check_tool(
+    backend: SharedExecutionBackend,
+    name: &str,
+    flag: &str,
+) -> Option<(String, String)> {
+    let executable = backend.resolve_executable(name).await.ok()??;
+    let request = ExecutionRequest::argv(executable.as_str(), vec![flag.to_string()]);
+    match backend
+        .execute(request, std::time::Duration::from_secs(5))
+        .await
+    {
+        Ok(out) => {
+            if out.exit_code == 0 {
+                // Some tools output to stderr (java -version)
+                let stdout = out.stdout_lossy();
+                let stderr = out.stderr_lossy();
+                let version_str = if stdout.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else {
+                    stdout.trim().to_string()
+                };
+                // Take first line only
+                Some((
+                    executable.to_string(),
+                    version_str
+                        .lines()
+                        .next()
+                        .unwrap_or(&version_str)
+                        .to_string(),
+                ))
+            } else {
+                Some((
+                    executable.to_string(),
+                    "(installed, version unknown)".to_string(),
+                ))
+            }
+        }
+        Err(_) => Some((
+            executable.to_string(),
+            "(installed, version check timed out)".to_string(),
+        )),
+    }
+}
+
+async fn check_config_files(
+    backend: SharedExecutionBackend,
+    dir: &BackendPath,
+) -> Vec<(String, String, Option<String>)> {
+    let mut configs = Vec::new();
+
+    for (file, desc) in CONFIG_FILES {
+        let path = dir.join(file);
+        if backend.metadata(&path).await.is_ok() {
+            // Read small config files for their content
+            let content = if *file == ".nvmrc"
+                || *file == ".node-version"
+                || *file == ".python-version"
+                || *file == ".ruby-version"
+                || *file == "rust-toolchain"
+            {
+                backend
+                    .read(&path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .map(|content| content.trim().to_string())
+            } else {
+                None
+            };
+            configs.push((file.to_string(), desc.to_string(), content));
+        }
+    }
+
+    configs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::ToolCalls as _;
+
+    #[test]
+    fn test_format_daemon_runtime_context() {
+        let vars = std::collections::HashMap::from([
+            (
+                RUNTIME_WORKDIR_ENV_KEY.to_string(),
+                "/daemon/root".to_string(),
+            ),
+            (
+                RUNTIME_CONFIG_PATH_ENV_KEY.to_string(),
+                "/daemon/root/config.toml".to_string(),
+            ),
+            (
+                RUNTIME_ENV_FILE_ENV_KEY.to_string(),
+                "/daemon/root/.env".to_string(),
+            ),
+            ("AIDAEMON_NO_KEYCHAIN".to_string(), "1".to_string()),
+        ]);
+
+        let rendered = format_daemon_runtime_context(|key| {
+            vars.get(key).cloned().ok_or(std::env::VarError::NotPresent)
+        })
+        .expect("runtime context");
+
+        assert!(rendered.contains("/daemon/root"));
+        assert!(rendered.contains("/daemon/root/config.toml"));
+        assert!(rendered.contains("/daemon/root/.env"));
+        assert!(rendered.contains("env-file / environment"));
+    }
+
+    #[test]
+    fn test_pad_right() {
+        assert_eq!(pad_right("git", 10), "git       ");
+        assert_eq!(pad_right("docker-compose", 10), "docker-compose");
+    }
+
+    #[test]
+    fn test_schema_has_required_fields() {
+        let tool = CheckEnvironmentTool::new(crate::testing::active_execution_backend());
+        let schema = tool.schema();
+        assert_eq!(schema["name"], "check_environment");
+        assert!(!schema["description"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_environment_runs() {
+        let args = json!({}).to_string();
+        let result = CheckEnvironmentTool::new(crate::testing::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        // Should at least find git (we're in a git repo)
+        assert!(result.contains("Available Tools"));
+    }
+
+    #[tokio::test]
+    async fn test_check_environment_with_config_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".nvmrc"), "18.17.0").unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:18").unwrap();
+
+        let args = json!({"path": dir.path().to_str().unwrap()}).to_string();
+        let result = CheckEnvironmentTool::new(crate::testing::active_execution_backend())
+            .call(&args)
+            .await
+            .unwrap();
+        assert!(result.contains(".nvmrc"));
+        assert!(result.contains("18.17.0"));
+        assert!(result.contains("Dockerfile"));
+    }
+
+    #[tokio::test]
+    async fn test_check_tool_git() {
+        let result = check_tool(
+            crate::testing::active_execution_backend(),
+            "git",
+            "--version",
+        )
+        .await;
+        assert!(result.is_some());
+        let (path, version) = result.unwrap();
+        assert!(path.contains("git"));
+        assert!(version.contains("git"));
+    }
+
+    #[tokio::test]
+    async fn test_check_tool_nonexistent() {
+        let result = check_tool(
+            crate::testing::active_execution_backend(),
+            "nonexistent_tool_xyz_12345",
+            "--version",
+        )
+        .await;
+        assert!(result.is_none());
+    }
+}

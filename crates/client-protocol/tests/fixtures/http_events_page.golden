@@ -1,0 +1,17 @@
+{
+  "frames": [
+    {
+      "at_ms": 1767225600000,
+      "event": {
+        "origin": "telegram",
+        "session_id": "app:6c1f",
+        "turn_id": "b9e1-5",
+        "type": "turn_started"
+      },
+      "seq": 43,
+      "session_id": "app:6c1f",
+      "type": "event"
+    }
+  ],
+  "next_since": 43
+}

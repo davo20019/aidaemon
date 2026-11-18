@@ -1,0 +1,10 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "surface_id": "srf_remote_1",
+    "ticket": "tkt_synthetic_0002",
+    "type": "screen_shared",
+    "url": "/client/v1/surfaces/provide/srf_remote_1/ws"
+  },
+  "type": "ack"
+}

@@ -1,0 +1,26 @@
+name: tool_round_trip
+description: The model calls a read-only tool, reads the result, then answers.
+input: What's the weather in Springfield?
+script:
+  - tool_calls:
+      - { id: w1, name: get_weather, arguments: { city: Springfield } }
+  - text: It is sunny and 21C in Springfield.
+expect:
+  status: completed
+  final_text_contains: [sunny, springfield]
+  tools_used: [get_weather]
+  tools_not_used: [delete_file]
+  tools_in_order: [get_weather]
+  tool_call_counts: { get_weather: 1 }
+  receipt_statuses: { get_weather: [succeeded] }
+  no_failed_receipts: true
+  max_turns: 2
+live_expect:
+  status: completed
+  final_text_contains: [sunny]
+  tools_used: [get_weather]
+  tools_not_used: [delete_file]
+  tool_call_counts: { get_weather: 1 }
+  receipt_statuses: { get_weather: [succeeded] }
+  no_failed_receipts: true
+  max_turns: 2

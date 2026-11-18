@@ -1,0 +1,124 @@
+{
+  "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). To run several sub-agents at the same time, give them all in one call as `tasks` (up to 6, 3 running at once); you receive every result, each with when it ran. Do NOT delegate trivial one-shot reads (a single read_file, a single web_search) — handle those directly. The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist delegates further only when its `tools` include spawn_agent), so reference files by path and do not paste prior tool output. A sub-agent works with your own access on this computer: it can run the programs installed here and the services they start (containers, local dev sites), which a `cli_agent` run's sandbox cannot.",
+  "name": "spawn_agent",
+  "schema": {
+    "description": "Delegate a focused task to a fresh sub-agent. PREFER delegation when the work is multi-step (research → synthesize, code → test, fetch → analyze), matches a named specialist (see the `specialist` enum: code, browser_verifier, research, review, artifact_writer, comms_draft, ...), benefits from a fresh context window, or should keep running while you do other work (background=true: its result goes to the user's chat, not back to you, so never use it for work you need to combine). To run several sub-agents at the same time, give them all in one call as `tasks` (up to 6, 3 running at once); you receive every result, each with when it ran. Do NOT delegate trivial one-shot reads (a single read_file, a single web_search) — handle those directly. The sub-agent starts with a fresh context and the same tools unless its specialist narrows them (a named specialist delegates further only when its `tools` include spawn_agent), so reference files by path and do not paste prior tool output. A sub-agent works with your own access on this computer: it can run the programs installed here and the services they start (containers, local dev sites), which a `cli_agent` run's sandbox cannot.",
+    "name": "spawn_agent",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "description": "Optional: read_only lets the child only observe: every call that could change something is refused, including any command that runs a program or script (python, node, a build). Leave it out when the task runs code or changes files. It can never exceed your own access.",
+          "enum": [
+            "read_only",
+            "write"
+          ],
+          "type": "string"
+        },
+        "background": {
+          "default": false,
+          "description": "When true, spawn the sub-agent in the background and return immediately. The result will be delivered through the parent session when the sub-agent finishes. Use this for long-running tasks where the user doesn't need to wait.",
+          "type": "boolean"
+        },
+        "checklist_items": {
+          "description": "The zero-based indices of your track_requirements items this sub-agent does. With background=true they show as running in the background until it ends, then as done or failed by its result. To retry a step an earlier sub-agent didn't finish, name the same items: the new run takes the step over, and the earlier try shows as history, not as a failure.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "mission": {
+          "description": "Optional: the wider goal this work serves, for the sub-agent's own context. Left out, it is the title.",
+          "type": "string"
+        },
+        "model_tier": {
+          "description": "Optional: fast for simple lookups, smart for hard reasoning. Omit to use the same model as this agent.",
+          "enum": [
+            "fast",
+            "primary",
+            "smart"
+          ],
+          "type": "string"
+        },
+        "new_folders": {
+          "description": "When the work makes something new in a folder of its own (a fresh install, a new project), that folder's absolute path. It is created empty before the child starts, and the child may write in it. The call fails if it already exists and names the next free folder, so pick that one (in title, task, scope and here) or ask the owner; never send a fresh install into a folder that holds something.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "owner_units": {
+          "description": "The owner's units of work (numbered in \"What the owner asked for\") this sub-agent carries out. It takes on your checklist's own items for those units, so name them even when you also give checklist_items.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "precedence": {
+          "description": "Give this whenever scope overlaps a running child's: whose change stands if both change the same lines there. this_child: this child's. running_siblings: the children already running. shared: neither, and each such change is put to you to decide. Omitted, it is shared. No child ever overwrites another's lines without one of these deciding it.",
+          "enum": [
+            "this_child",
+            "running_siblings",
+            "shared"
+          ],
+          "type": "string"
+        },
+        "scope": {
+          "description": "Optional: the files or directories this child will change. Given (here or as new_folders), the child may write only there; anything else it would change is put to the owner. When several children will write, give them disjoint scopes so they do not collide. If a scope must overlap a running child's, say who wins there with precedence.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "specialist": {
+          "description": "Optional. Pick the specialist profile matching this task. Omit to use the broad executor profile.",
+          "enum": [
+            "code",
+            "browser_verifier",
+            "artifact_writer",
+            "research",
+            "review",
+            "comms_draft",
+            "executor",
+            "generic"
+          ],
+          "type": "string"
+        },
+        "task": {
+          "description": "The specific task or question the sub-agent should accomplish. Keep it self-contained but concise: state the goal, success criteria, and any non-obvious constraints. Do NOT paste file contents, prior tool output, or conversation excerpts — give file paths and let the sub-agent read them itself. Ask only for the work and what it found: the daemon measures every helper's time (start, finish, and since the owner's request) on its own record, so a helper never times itself or reports a duration. What the owner asked to receive from a piece of work (its screenshot, its file) is that work's own deliverable: ask for it in the task of the helper doing the work, which delivers it when its run ends, never in a separate helper that collects and sends what other helpers made.",
+          "type": "string"
+        },
+        "task_id": {
+          "description": "Task ID to associate with this executor (used by task leads to connect executor work to task tracking)",
+          "type": "string"
+        },
+        "tasks": {
+          "description": "Several independent sub-agents to run in parallel, instead of mission and task. Each entry is an object with its own mission and task and any of the other fields above; fields given beside tasks apply to every entry unless it sets its own. All entries share background.",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 6,
+          "minItems": 1,
+          "type": "array"
+        },
+        "title": {
+          "description": "What this sub-agent does, in a few plain words the owner reads on its card and approval cards: the task itself, as the owner would say it, and, when the work creates or works in a folder, that folder's name, so the owner sees where it goes from the start (e.g. 'Count the lines in numbers.txt', 'Install Drupal in claude-drupal-6'). It names the work, not the sub-agent doing it, and is never a sentence.",
+          "type": "string"
+        },
+        "tools": {
+          "description": "Optional: the only tools this child may use. Any other call is refused, and it can never gain a tool you lack.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  }
+}

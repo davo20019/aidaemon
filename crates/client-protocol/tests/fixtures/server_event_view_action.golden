@@ -1,0 +1,13 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "action": {
+      "approval_id": "a-7f3e-1",
+      "kind": "show_approval"
+    },
+    "reason": "You asked what is waiting",
+    "type": "view_action"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

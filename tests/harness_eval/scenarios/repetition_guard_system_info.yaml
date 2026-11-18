@@ -1,0 +1,39 @@
+name: repetition_guard_system_info
+description: Repeated identical system_info calls trigger repetition guard redirects
+input: Run system checks repeatedly
+setup:
+  session_id: eval_repetition_01
+script:
+  - tool_calls:
+      - name: no_such_tool
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - tool_calls:
+      - name: system_info
+        arguments: "{}"
+  - text: "The repeated checks returned the same system information; further identical calls were blocked."
+expect:
+  ext:
+    guard_fired:
+      - RepetitiveCallDetection
+    llm_calls_min: 4

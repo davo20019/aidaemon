@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "conflict",
+    "message": "This approval was already answered: approved_once",
+    "retryable": false
+  },
+  "request_id": "5d0c2b1e-0003",
+  "type": "error"
+}

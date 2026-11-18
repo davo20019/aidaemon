@@ -1,0 +1,274 @@
+//! Which tools a turn is offered: the registered roster (schema-checked),
+//! the MCP tools a message calls for, the session-static roster the core
+//! prompt names, and the per-turn narrowing by execution policy
+//! ([`ToolRoster`], on any [`TurnHost`]).
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+
+use aidaemon_channels::context::ChannelContext;
+use aidaemon_events::traits::AgentRole;
+use aidaemon_tools::semantics::{ToolCapabilities, UserRole};
+use serde_json::{Value, json};
+
+use crate::host::TurnHost;
+use crate::policy::execution::{ApprovalMode, ExecutionPolicy};
+use crate::policy::metrics::POLICY_METRICS;
+use crate::turn::helpers::tool_name_from_definition;
+
+fn validate_required_fields_contract(parameters: &Value) -> Result<(), String> {
+    let properties = parameters
+        .get("properties")
+        .ok_or_else(|| "missing parameters.properties".to_string())?
+        .as_object()
+        .ok_or_else(|| "parameters.properties must be an object".to_string())?;
+
+    if let Some(required) = parameters.get("required") {
+        let required_items = required
+            .as_array()
+            .ok_or_else(|| "parameters.required must be an array".to_string())?;
+        for item in required_items {
+            let key = item
+                .as_str()
+                .ok_or_else(|| "parameters.required entries must be strings".to_string())?;
+            if !properties.contains_key(key) {
+                return Err(format!(
+                    "parameters.required references unknown property '{}'",
+                    key
+                ));
+            }
+        }
+    }
+
+    if let Some(additional) = parameters.get("additionalProperties")
+        && !additional.is_boolean()
+    {
+        return Err("parameters.additionalProperties must be a boolean".to_string());
+    }
+
+    Ok(())
+}
+
+/// Whether an OpenAI-format tool definition meets the schema contract every
+/// offered tool must: a named, described function with an object parameters
+/// schema whose `required` keys exist.
+pub fn validate_tool_definition_contract(def: &Value) -> Result<(), String> {
+    let func = def
+        .get("function")
+        .ok_or_else(|| "missing function object".to_string())?;
+    let name = func
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .ok_or_else(|| "missing function.name".to_string())?;
+    if name.is_empty() {
+        return Err("function.name must be non-empty".to_string());
+    }
+    if func
+        .get("description")
+        .and_then(|d| d.as_str())
+        .is_none_or(|d| d.trim().is_empty())
+    {
+        return Err(format!("tool '{}' is missing function.description", name));
+    }
+    let parameters = func
+        .get("parameters")
+        .ok_or_else(|| format!("tool '{}' is missing function.parameters", name))?;
+    if parameters.get("type").and_then(|t| t.as_str()) != Some("object") {
+        return Err(format!("tool '{}' must use object parameters schema", name));
+    }
+    validate_required_fields_contract(parameters)?;
+    Ok(())
+}
+
+/// Push `tool`'s definition onto `defs` when it meets the schema contract;
+/// count and log it otherwise.
+fn push_checked_definition(defs: &mut Vec<Value>, name: &str, schema: Value, source: &str) {
+    let candidate = json!({
+        "type": "function",
+        "function": schema
+    });
+    match validate_tool_definition_contract(&candidate) {
+        Ok(()) => defs.push(candidate),
+        Err(reason) => {
+            POLICY_METRICS
+                .tool_schema_contract_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                tool = %name,
+                error = %reason,
+                "Dropping {source} definition that violates schema contract"
+            );
+        }
+    }
+}
+
+/// The tools a turn of the host is offered.
+#[async_trait::async_trait]
+pub trait ToolRoster: TurnHost {
+    /// OpenAI-format definitions plus capabilities of the registered,
+    /// available tools only. Query-independent: no MCP matching, no per-turn
+    /// policy. The shared source of [`Self::tool_definitions_with_capabilities`]
+    /// and [`Self::session_static_tool_roster`].
+    fn registered_tool_definitions_with_capabilities(
+        &self,
+    ) -> (Vec<Value>, HashMap<String, ToolCapabilities>) {
+        let mut defs: Vec<Value> = Vec::new();
+        let mut capabilities: HashMap<String, ToolCapabilities> = HashMap::new();
+        for tool in self.tools() {
+            if !tool.is_available() {
+                continue;
+            }
+            let name = tool.name().to_string();
+            capabilities.insert(name.clone(), tool.capabilities());
+            push_checked_definition(&mut defs, &name, tool.schema(), "tool");
+        }
+        (defs, capabilities)
+    }
+
+    /// The registered tools plus the MCP tools `user_message` calls for.
+    async fn tool_definitions_with_capabilities(
+        &self,
+        user_message: &str,
+    ) -> (Vec<Value>, HashMap<String, ToolCapabilities>) {
+        let (mut defs, mut capabilities) = self.registered_tool_definitions_with_capabilities();
+        for tool in self.mcp_tools_matching(user_message).await {
+            let name = tool.name().to_string();
+            // The server's own hints, as for a daemon tool (a daemon tool of
+            // the same name keeps its capabilities).
+            capabilities
+                .entry(name.clone())
+                .or_insert_with(|| tool.capabilities());
+            push_checked_definition(&mut defs, &name, tool.schema(), "MCP tool");
+        }
+        (defs, capabilities)
+    }
+
+    /// Drop from `defs` and `capabilities` the tools not offered on a turn of
+    /// `session_id` (each tool's `offered_in_session`).
+    fn retain_offered_in_session(
+        &self,
+        defs: &mut Vec<Value>,
+        capabilities: &mut HashMap<String, ToolCapabilities>,
+        session_id: &str,
+    ) {
+        let withheld: HashSet<&str> = self
+            .tools()
+            .iter()
+            .filter(|tool| !tool.offered_in_session(session_id))
+            .map(|tool| tool.name())
+            .collect();
+        if withheld.is_empty() {
+            return;
+        }
+        defs.retain(|def| {
+            tool_name_from_definition(def).is_none_or(|name| !withheld.contains(name))
+        });
+        capabilities.retain(|name, _| !withheld.contains(name.as_str()));
+    }
+
+    /// Whether a tool named `name` is registered.
+    fn has_registered_tool(&self, name: &str) -> bool {
+        self.tools().iter().any(|tool| tool.name() == name)
+    }
+
+    /// The session-static roster the core prompt names: `(name, serialized
+    /// definition)`, sorted by name. Built from the registered tools with
+    /// only the session-static narrowing (a workspace grant's allowlist,
+    /// channel visibility, the memory plugin's own tools, desktop control);
+    /// no MCP matching and no per-turn policy. Non-owners get no tools unless
+    /// the context carries an active workspace grant.
+    fn session_static_tool_roster(
+        &self,
+        user_role: UserRole,
+        channel_ctx: &ChannelContext,
+    ) -> Vec<(String, String)> {
+        let workspace_grant = channel_ctx.active_workspace_grant(user_role);
+        if user_role != UserRole::Owner && workspace_grant.is_none() {
+            return Vec::new();
+        }
+
+        let (mut defs, _caps) = self.registered_tool_definitions_with_capabilities();
+
+        if let Some(grant) = workspace_grant {
+            defs.retain(|definition| {
+                tool_name_from_definition(definition).is_some_and(|name| grant.allows_tool(name))
+            });
+        }
+
+        // Channel-visibility class is session-static and so stays in the
+        // core: each tool's `channel_reach` says where it may be offered.
+        let mut no_caps = HashMap::new();
+        crate::turn::helpers::restrict_to_channel_reach(
+            &mut defs,
+            &mut no_caps,
+            channel_ctx.visibility,
+            |name| self.registered_tool_facts(name).channel_reach,
+        );
+        // Daemon memory tools follow the active memory plugin, as on turns.
+        let owned_memory_tools = self.memory_plugin().owned_daemon_tools();
+        defs = defs
+            .into_iter()
+            .filter_map(|d| {
+                let offer = tool_name_from_definition(&d)
+                    .map(|name| crate::turn::memory::daemon_tool_offer(name, owned_memory_tools));
+                match offer {
+                    Some(crate::turn::memory::DaemonToolOffer::Hidden) => None,
+                    Some(crate::turn::memory::DaemonToolOffer::GoalActions) => {
+                        Some(crate::turn::memory::goal_actions_view(&d))
+                    }
+                    _ => Some(d),
+                }
+            })
+            .collect();
+        let mut roster: Vec<(String, String)> = defs
+            .iter()
+            .filter_map(|d| {
+                let name = tool_name_from_definition(d)?.to_string();
+                // serde_json keeps each schema's construction-site key order,
+                // so this is stable for a given tool version.
+                Some((name, d.to_string()))
+            })
+            .collect();
+        roster.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        roster
+    }
+
+    /// `defs` narrowed to what `policy` allows. The only narrowing is
+    /// typed: with `ApprovalMode::Auto` a tool that always needs approval
+    /// is left out, unless it is core (`Offering::Core`, or a task lead's
+    /// delegation tools). The size of the offer is the kernel's business
+    /// (core tools plus `load_tools` for the rest), never a count cut here.
+    fn filter_tool_definitions_for_policy(
+        &self,
+        defs: &[Value],
+        capabilities: &HashMap<String, ToolCapabilities>,
+        policy: &ExecutionPolicy,
+    ) -> Vec<Value> {
+        if !matches!(policy.approval_mode, ApprovalMode::Auto) {
+            return defs.to_vec();
+        }
+        let task_lead = matches!(self.role(), AgentRole::TaskLead);
+        let core: HashSet<&str> = self
+            .tools()
+            .iter()
+            .filter(|tool| {
+                let facts = tool.dispatch_facts();
+                facts.offering.always_sent() || (task_lead && facts.task_lead_delegation)
+            })
+            .map(|tool| tool.name())
+            .collect();
+        defs.iter()
+            .filter(|def| {
+                let Some(name) = tool_name_from_definition(def) else {
+                    return true;
+                };
+                let caps = capabilities.get(name).copied().unwrap_or_default();
+                core.contains(name) || caps.read_only || !caps.needs_approval
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+impl<H: TurnHost + ?Sized> ToolRoster for H {}

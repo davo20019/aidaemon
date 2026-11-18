@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [master]
 
+# One run per pull request at a time. A run in progress finishes, and only
+# the newest push waits behind it (GitHub drops any older pending run), so a
+# branch pushed every few minutes still gets results instead of a chain of
+# cancelled runs. Master keeps every run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'push' && github.sha || 'pr' }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CODEX_CLI_VERSION: "0.151.0"
@@ -13,6 +21,10 @@ env:
   # default 2 MiB test-thread stack sits within a few percent of what the
   # integration suite needs. Match the daemon's own worker stack budget.
   RUST_MIN_STACK: "8388608"
+
+# Every job reads the repository and nothing else.
+permissions:
+  contents: read
 
 jobs:
   release-tag-guard:
@@ -69,9 +81,123 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Agent behavior lives in crates; src/ holds wiring and the product
+      # shell. Fails on a new src/ module or logic landing in src/agent.
+      - name: App boundary
+        run: python3 scripts/check-app-boundary.py
+
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      # Registry plus the compiled dependencies (workspace crates are
+      # dropped before saving). Saved from master only, so pull requests
+      # restore it without evicting each other from the 10 GB cache budget.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt, clippy
+          prefix-key: v3-check
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-features -- -D warnings
+
+      - name: Clippy (SDK crates)
+        run: >-
+          cargo clippy -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
+          -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
+          -p aidaemon-channel-discord -p aidaemon-parity-agent -p aidaemon-client-core -p aidaemon-surfaces
+          --all-targets --all-features -- -D warnings
+
+  core-api:
+    name: Core public API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned together: cargo-public-api reads rustdoc JSON, whose format
+      # changes between nightlies. Bump both deliberately.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-01
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api@0.52.0
+
+      - name: Diff aidaemon-core public API against the snapshot
+        run: scripts/check-core-api.sh
+
+  # Docs must build without warnings for every SDK crate, one crate at a time
+  # (a workspace-wide `cargo doc` unifies features and hides per-crate breakage).
+  sdk-docs:
+    name: SDK docs (-D warnings)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      # Registry plus compiled dependencies (rustdoc reuses their metadata),
+      # saved from master only.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-docs
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: cargo doc per crate
+        run: |
+          set -euo pipefail
+          for crate in aidaemon-core aidaemon-providers aidaemon-tools aidaemon-tool-browser \
+            aidaemon-store-sqlite aidaemon-mcp aidaemon-agents aidaemon-policies \
+            aidaemon-eval aidaemon-memory aidaemon-decisions aidaemon-events \
+            aidaemon-work aidaemon-runtime aidaemon-skills aidaemon-secrets aidaemon-nodes aidaemon-terminal-bridge aidaemon-client-protocol aidaemon-client-gateway aidaemon-channels aidaemon-channel-telegram \
+            aidaemon-channel-slack aidaemon-channel-discord aidaemon-macros aidaemon-sdk aidaemon-surfaces; do
+            echo "::group::cargo doc $crate"
+            cargo doc --no-deps --all-features -p "$crate"
+            echo "::endgroup::"
+          done
+
+  # The SDK crates declare `rust-version` in [workspace.package]. This job
+  # builds them on exactly that toolchain, read from the manifest so the two
+  # cannot drift. Library targets only: dev-dependencies may need newer Rust.
+  msrv:
+    name: MSRV (SDK crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read rust-version
+        id: msrv
+        run: |
+          v="$(sed -nE 's/^rust-version = "([0-9.]+)"/\1/p' Cargo.toml | head -1)"
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Install Linux dependencies
         run: |
@@ -84,42 +210,281 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-check-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-check-v2-
+          key: ${{ runner.os }}-cargo-msrv-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-v1-
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: cargo check on the MSRV
+        # rust-toolchain.toml outranks the default the step above set.
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: >-
+          cargo check --locked --all-features
+          -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-memory
+          -p aidaemon-decisions -p aidaemon-events -p aidaemon-work -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
+          -p aidaemon-channels -p aidaemon-channel-telegram
+          -p aidaemon-channel-slack -p aidaemon-channel-discord -p aidaemon-macros
+          -p aidaemon-sdk
 
-      - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
-
-  test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14]
+  # Semver check of the public-contract tier against the last published
+  # version on crates.io. Before the first publish there is no baseline, so a
+  # crate that is not on crates.io yet is skipped with a notice instead of
+  # failing; once 0.20.0 is out the check is live with no workflow change.
+  semver:
+    name: Semver (public contract)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
 
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
+      - name: Check each public-contract crate
+        run: |
+          set -euo pipefail
+          # aidaemon-channels and aidaemon-memory are in the tier by their
+          # `channel` module and traits; the check covers the whole crate.
+          for crate in aidaemon-core aidaemon-sdk aidaemon-channels aidaemon-memory; do
+            status="$(curl -s -o /dev/null -w '%{http_code}' \
+              -A 'aidaemon-ci (https://github.com/davo20019/aidaemon)' \
+              "https://crates.io/api/v1/crates/$crate")"
+            if [ "$status" = "404" ]; then
+              echo "::notice::$crate is not on crates.io yet; no semver baseline, skipping."
+              continue
+            elif [ "$status" != "200" ]; then
+              echo "::error::crates.io lookup for $crate returned HTTP $status"
+              exit 1
+            fi
+            cargo semver-checks check-release -p "$crate"
+          done
+
+  # Windows builds and passes the suite like macOS and Linux; a failure
+  # here blocks a merge.
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    timeout-minutes: 90
+    # Builds the daemon once, and its test binaries into a nextest archive
+    # the three test runners below share, so they compile nothing.
+    env:
+      # Line numbers in panics, not full debug info: faster links and a
+      # smaller test archive.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      # Saved even when the job fails (it still may, on Windows), or every
+      # round compiles from nothing.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+          cache-on-failure: true
+
+      # SQLCipher links OpenSSL. vcpkg's build of it is kept between runs.
+      - uses: actions/cache@v4
+        id: openssl
+        with:
+          path: C:\vcpkg\installed\x64-windows-static-md
+          key: vcpkg-openssl-x64-windows-static-md-v1
+
+      - name: Install OpenSSL
+        if: steps.openssl.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: vcpkg install openssl:x64-windows-static-md
+
+      - name: Point the build at OpenSSL
+        shell: pwsh
+        run: |
+          "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # The daemon first: what a Windows download needs. Every error a round
+      # can show, not just the first crate's.
+      - name: Build
+        run: cargo build --locked --keep-going
+
+      - name: Install cargo-nextest
+        if: always()
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Archive the tests
+        if: always()
+        run: cargo nextest archive --lib --locked --archive-file windows-tests.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-tests
+          path: windows-tests.tar.zst
+          retention-days: 1
+
+  windows-app:
+    name: Windows app build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    # Its own workspace and build folder: alongside the daemon's build, not
+    # after it.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-app
+          workspaces: clients/app
+          cache-on-failure: true
+
+      - name: Build the app
+        run: cargo build --locked --manifest-path clients/app/Cargo.toml
+
+  windows-test:
+    name: Windows tests ${{ matrix.partition }}/3
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # A third of the archived tests each, one process per test with a time
+    # limit (.config/nextest.toml), so a hang fails alone.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    steps:
+      # The tests read fixtures from the source tree.
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-tests
+
+      - name: Test
+        run: cargo nextest run --archive-file windows-tests.tar.zst --workspace-remap . --profile windows-ci --partition hash:${{ matrix.partition }}/3
+
+  # The Linux and macOS suites: one job per OS compiles every test binary once
+  # (the daemon and the SDK crates together) into a nextest archive, and
+  # test-run below runs it in shards on separate runners. The job id stays
+  # `test` so rust-cache keeps the key master has already saved.
+  test:
+    name: Test build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      # Line numbers in panics, not full debug info: faster links and a
+      # smaller archive to hand to the shards.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v5
+
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      # Registry plus the compiled dependencies (workspace crates are
+      # dropped before saving). Saved from master only, so pull requests
+      # restore it without evicting each other from the 10 GB cache budget.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v3-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # What `cargo test --all-features` at the root and the SDK crate list
+      # ran before, built once. Doctests are not in an archive; test-extras
+      # runs them.
+      - name: Archive the tests
+        run: >-
+          cargo nextest archive --locked --all-features --archive-file tests-${{ runner.os }}.tar.zst
+          -p aidaemon
+          -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
+          -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
+          -p aidaemon-channel-discord -p aidaemon-client-core -p aidaemon-surfaces
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ runner.os }}
+          path: tests-${{ runner.os }}.tar.zst
+          retention-days: 1
+
+  test-run:
+    name: Tests ${{ matrix.os }} ${{ matrix.partition }}/${{ matrix.of }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    # Fewer macOS shards: hosted macOS runners are scarce, and a job that
+    # waits too long for one is cancelled.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, partition: 1, of: 3 }
+          - { os: ubuntu-latest, partition: 2, of: 3 }
+          - { os: ubuntu-latest, partition: 3, of: 3 }
+          - { os: macos-latest, partition: 1, of: 2 }
+          - { os: macos-latest, partition: 2, of: 2 }
+    steps:
+      # The tests read fixtures from the source tree.
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
       - name: Install Codex sandbox adapter
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           npm install --global "@openai/codex@${CODEX_CLI_VERSION}"
           codex --version
 
       - name: Configure Linux sandbox namespaces
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
@@ -131,25 +496,22 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-      - name: Install macOS dependencies
-        if: matrix.os == 'macos-14'
-        run: brew install ffmpeg
-
-      - name: Free disk space (ubuntu)
-        if: matrix.os == 'ubuntu-latest'
+      # The SDK shell's Linux sandbox. Ubuntu 24.04 runners restrict
+      # unprivileged user namespaces through AppArmor
+      # (kernel.apparmor_restrict_unprivileged_userns=1), which makes bwrap
+      # fail with "setting up uid map: Permission denied"; the step above
+      # lifts that restriction.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          df -h
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            --unshare-pid --unshare-net --die-with-parent --new-session true
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-test-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-v2-
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
 
       - name: Cache fastembed model
         uses: actions/cache@v4
@@ -157,33 +519,209 @@ jobs:
           path: .fastembed_cache
           key: fastembed-allminilml6v2-v2
 
-      - name: Run tests
-        run: cargo test --all-features
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
-      - name: Harness eval fixture suite
-        run: cargo test --lib harness_eval --all-features
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-${{ runner.os }}
 
-  build-check:
-    name: Build check (release)
+      # Required on Linux, not skippable: AIDAEMON_REQUIRE_BWRAP=1 turns the
+      # bubblewrap tests' "bwrap unavailable" skip into a failure.
+      - name: Test
+        env:
+          AIDAEMON_REQUIRE_BWRAP: ${{ runner.os == 'Linux' && '1' || '' }}
+        run: cargo nextest run --archive-file tests-${{ runner.os }}.tar.zst --workspace-remap . --profile ci --partition hash:${{ matrix.partition }}/${{ matrix.of }}
+
+  # What a nextest archive leaves out: doctests, the SDK examples and the
+  # parity agent, all scripted and platform-neutral, so Linux only.
+  # Alongside the test build, not after it.
+  test-extras:
+    name: Doctests and examples
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v3-test-extras
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Doctests
+        run: >-
+          cargo test --doc --all-features
+          -p aidaemon
+          -p aidaemon-core -p aidaemon-providers -p aidaemon-tools -p aidaemon-tool-browser
+          -p aidaemon-store-sqlite -p aidaemon-mcp -p aidaemon-agents
+          -p aidaemon-policies -p aidaemon-eval -p aidaemon-sdk -p aidaemon-macros -p aidaemon-memory
+          -p aidaemon-events -p aidaemon-work -p aidaemon-decisions -p aidaemon-runtime -p aidaemon-skills -p aidaemon-secrets -p aidaemon-nodes -p aidaemon-terminal-bridge -p aidaemon-client-protocol -p aidaemon-client-gateway
+          -p aidaemon-channels -p aidaemon-channel-telegram -p aidaemon-channel-slack
+          -p aidaemon-channel-discord -p aidaemon-client-core -p aidaemon-surfaces
+
+      # Each example runs against the scripted provider when no API key is
+      # set (CI sets none), and against a live model when one is.
+      - name: SDK examples (scripted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANTHROPIC_API_KEY OPENAI_API_KEY
+          for example in quickstart custom_tool approvals resume_after_crash sub_agent \
+              memory_swap channel_bot sse_server otel_traces support_triage; do
+            echo "::group::$example"
+            cargo run -q -p aidaemon-sdk --all-features --example "$example"
+            echo "::endgroup::"
+          done
+          cargo run -q -p aidaemon-core --features testing --example kernel_tour
+
+      # Definition of done 2: an agent assembled from the SDK crates alone
+      # passes the shared behavior suite with the full memory, ScopedMemory
+      # and a custom memory system (scripted model, in-process channel).
+      - name: Parity example and behavior suite (scripted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANTHROPIC_API_KEY OPENAI_API_KEY
+          cargo run -q -p aidaemon-parity-agent
+          cargo test -q -p aidaemon-parity-agent
+
+  # The app (clients/app, nsh, its own Cargo workspace): check, lint and the
+  # headless tests on the real engine. Linux needs GTK 4.14 for the desktop
+  # backend the binary links.
+  app:
+    name: App (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: clients/app
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # GStreamer (gstreamer, -base, -app, -audio) and Wayland are linked by the app's media backend.
+          sudo apt-get install -y libgtk-4-dev clang pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
+      - name: Check
+        run: cargo check --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Headless tests
+        run: cargo test -q
+
+  # The app's web bundle (wasm), as the release builds it. Pins match
+  # release.yml's env.
+  web-app:
+    name: App (web)
+    runs-on: ubuntu-24.04
+    env:
+      NSH_VERSION: "0.5.1"
+      NSH_LINUX_SHA256: "f34729e613196ca122d956deb543a92f319e053ff17dfc09ba04a6ec2fb79c74"
+      WASM_BINDGEN_CLI_VERSION: "0.2.130"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - name: Install wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18
+          # nsh package also compiles native crates (glib-sys and the rest of
+          # the GTK 4 stack), as the Linux app job does.
+          sudo apt-get install -y libgtk-4-dev clang pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
+      - name: Install nsh CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-linux-x86_64.tar.gz" -o nsh.tar.gz
+          echo "${NSH_LINUX_SHA256}  nsh.tar.gz" | sha256sum -c -
+          # The archive holds one nsh/ folder (bin/nsh, runtime/).
+          tar -xzf nsh.tar.gz -C "$HOME"
+          test -x "$HOME/nsh/bin/nsh"
+          rm nsh.tar.gz
+          echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_CLI_VERSION }}
+      - name: Build web bundle
+        working-directory: clients/app
+        env:
+          CC_wasm32_unknown_unknown: clang-18
+          AR_wasm32_unknown_unknown: llvm-ar-18
+        run: |
+          nsh package --target web
+          test -f .nsh/out/AIdaemon/index.html
+
+      # nsh package builds in its own workspace and ignores the app's [patch]:
+      # check it took nsh from the checkout the app pins (the fork's fixes).
+      - name: Check nsh came from the pinned checkout
+        working-directory: clients/app
+        run: |
+          set -euo pipefail
+          rev="$(grep -m1 -oE '^nsh-core = \{ git = "[^"]+", rev = "[0-9a-f]{7}' Cargo.toml | tail -c 8)"
+          if ! grep -qE "^nsh-core = \{ path = \".*/${rev}/crates/nsh-core\"" .nsh/rust/Cargo.toml; then
+            echo "::error::the web build did not use nsh at ${rev}:"
+            grep -n '^nsh-core' .nsh/rust/Cargo.toml || true
+            exit 1
+          fi
+
+  # x86_64 and ARM64 Linux, the two Linux downloads.
+  build-check:
+    name: Build check (release, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Registry plus compiled release dependencies, saved from master only.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-release-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-v2-
+          prefix-key: v1-release
+          key: ${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build release
         run: cargo build --release --features "browser"
@@ -192,10 +730,15 @@ jobs:
     name: Code coverage
     runs-on: ubuntu-latest
     continue-on-error: true  # Visibility only — doesn't block merges
+    # A second full test run under instrumentation: master only, so a pull
+    # request's runners go to the suite itself.
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
         run: |
@@ -218,6 +761,9 @@ jobs:
           if [ -n "$current_apparmor" ] && [ "$current_apparmor" != "0" ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

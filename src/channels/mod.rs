@@ -1,40 +1,41 @@
-mod approval_render;
-pub(crate) mod attachments;
+#[cfg(test)]
+pub(crate) use aidaemon_channels::approval_render;
+#[cfg(test)]
+pub(crate) use aidaemon_channels::attachments;
 pub(crate) mod commands;
 pub(crate) mod connect;
 #[cfg(feature = "discord")]
-mod discord;
-mod formatting;
-mod hub;
-pub(crate) mod live_status;
-mod presentation;
-mod rate_limit;
+pub(crate) mod discord;
+#[cfg(test)]
+pub(crate) use aidaemon_channels::live_status;
+#[cfg(test)]
+pub(crate) mod mock_api;
+pub(crate) mod set_key;
 #[cfg(feature = "slack")]
-mod slack;
+pub(crate) mod slack;
 pub(crate) mod telegram;
-mod telegram_bootstrap_signing;
+pub(crate) use aidaemon_channel_telegram::bot_api as telegram_api;
+#[cfg(test)]
+pub(crate) use aidaemon_channels::turns;
+#[cfg(test)]
+mod turns_tests;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use aidaemon_channels::hub::{ChannelHub, SessionMap};
 #[cfg(feature = "discord")]
-pub use discord::{spawn_discord_channel, DiscordChannel};
-pub use hub::{ChannelHub, SessionMap};
-pub(crate) use presentation::{
-    prepare_chat_message, present_notification, present_scheduled_run_notification,
-};
+pub use discord::{DiscordChannel, spawn_discord_channel};
 #[cfg(feature = "slack")]
-pub use slack::{spawn_slack_channel, SlackChannel};
-pub use telegram::TelegramChannel;
+pub use slack::{SlackChannel, spawn_slack_channel};
+pub(crate) use telegram::{TelegramBot, new_telegram_bot};
 
 /// Shared application services/configuration consumed by every chat transport.
 /// Transport constructors take this named bundle plus protocol-specific values,
 /// so adding an application dependency does not change every constructor.
 #[derive(Clone)]
 pub(crate) struct ChannelRuntimeDeps {
-    pub agent: Arc<dyn crate::runtime_ports::ChannelAgentRuntime>,
+    pub agent: Arc<dyn crate::runtime_ports::DaemonAgentRuntime>,
     pub config_path: PathBuf,
     pub session_map: SessionMap,
     pub task_registry: Arc<crate::tasks::TaskRegistry>,
@@ -43,53 +44,46 @@ pub(crate) struct ChannelRuntimeDeps {
     pub max_file_size_mb: u64,
     pub state: Arc<dyn crate::traits::StateStore>,
     pub watchdog_stale_threshold_secs: u64,
+    /// Who sees every turn: the Client Gateway, when it runs.
+    pub watch: aidaemon_channels::turns::TurnWatch,
 }
 
-/// Wait until the heartbeat becomes stale and return stale minutes.
-///
-/// `stale_threshold_secs` must be > 0.
-pub(crate) async fn wait_for_stale_heartbeat(
-    heartbeat: Arc<AtomicU64>,
-    stale_threshold_secs: u64,
-    check_interval_secs: u64,
-) -> u64 {
-    debug_assert!(stale_threshold_secs > 0);
-
-    loop {
-        tokio::time::sleep(Duration::from_secs(check_interval_secs.max(1))).await;
-        let last_hb = heartbeat.load(Ordering::Relaxed);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now.saturating_sub(last_hb) > stale_threshold_secs {
-            return now.saturating_sub(last_hb) / 60;
+impl ChannelRuntimeDeps {
+    /// What a bot in an adapter crate runs on.
+    pub(crate) fn bot_deps(&self) -> aidaemon_channels::bot::BotDeps {
+        aidaemon_channels::bot::BotDeps {
+            agent: self.agent.clone(),
+            session_map: self.session_map.clone(),
+            sessions: self.state.clone(),
+            task_registry: self.task_registry.clone(),
+            files_enabled: self.files_enabled,
+            inbox_dir: self.inbox_dir.clone(),
+            max_file_size_mb: self.max_file_size_mb,
+            watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+            watch: self.watch.clone(),
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::wait_for_stale_heartbeat;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    /// The shared slash commands on the daemon's stores.
+    pub(crate) fn command_context(&self) -> commands::CommandContext {
+        commands::CommandContext {
+            agent: self.agent.clone(),
+            state: self.state.clone(),
+            task_registry: self.task_registry.clone(),
+            config_path: self.config_path.clone(),
+        }
+    }
 
-    #[tokio::test]
-    async fn stale_heartbeat_returns_minutes() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let heartbeat = Arc::new(AtomicU64::new(now.saturating_sub(125)));
-
-        let mins = tokio::time::timeout(
-            Duration::from_secs(3),
-            wait_for_stale_heartbeat(heartbeat, 60, 1),
-        )
-        .await
-        .expect("stale heartbeat should resolve quickly");
-
-        assert!(mins >= 2);
+    /// What the shared turn runner needs from these.
+    #[cfg(test)]
+    pub(crate) fn turn_deps(&self) -> turns::TurnDeps {
+        turns::TurnDeps {
+            agent: self.agent.clone(),
+            session_map: self.session_map.clone(),
+            sessions: self.state.clone(),
+            task_registry: self.task_registry.clone(),
+            watchdog_stale_threshold_secs: self.watchdog_stale_threshold_secs,
+            watch: self.watch.clone(),
+        }
     }
 }

@@ -16,7 +16,7 @@
 //! M. Context window (additional edge cases)
 
 use crate::memory::embeddings::EmbeddingService;
-use crate::state::sqlite::SqliteStateStore;
+use crate::state::SqliteStateStore;
 use crate::traits::store_prelude::*;
 use crate::traits::{BehaviorPattern, Episode, ErrorSolution, Person, Procedure};
 use crate::types::FactPrivacy;
@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 async fn setup_test_store() -> (SqliteStateStore, tempfile::NamedTempFile) {
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let embedding_service = Arc::new(EmbeddingService::new().unwrap());
-    let store = SqliteStateStore::new(
+    let embedding_service = Arc::new(EmbeddingService::deterministic());
+    let store = SqliteStateStore::for_tests(
         db_file.path().to_str().unwrap(),
         100,
         None,
@@ -521,6 +521,70 @@ async fn test_global_fact_accessible_everywhere() {
     );
 }
 
+/// The prompt's facts follow the one visibility rule a memory search uses:
+/// a public channel gets only its own channel's facts, never global ones,
+/// and a channel fact with no channel is shown nowhere.
+#[tokio::test]
+async fn a_public_channel_gets_only_its_own_facts() {
+    let (store, _db) = setup_test_store().await;
+    store
+        .upsert_fact(
+            "user",
+            "city",
+            "Springfield",
+            "test",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "project",
+            "launch",
+            "Launch is Friday",
+            "test",
+            Some("slack:synthetic-channel-1"),
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "project",
+            "orphan",
+            "No channel",
+            "test",
+            None,
+            FactPrivacy::Channel,
+        )
+        .await
+        .unwrap();
+    let public = store
+        .get_relevant_facts_for_channel(
+            "",
+            10,
+            Some("slack:synthetic-channel-1"),
+            crate::types::ChannelVisibility::Public,
+            true,
+        )
+        .await
+        .unwrap();
+    let keys: Vec<&str> = public.iter().map(|fact| fact.key.as_str()).collect();
+    assert_eq!(keys, vec!["launch"]);
+    let group = store
+        .get_relevant_facts_for_channel(
+            "",
+            10,
+            None,
+            crate::types::ChannelVisibility::PrivateGroup,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(group.iter().all(|fact| fact.key != "orphan"));
+}
+
 /// Verify Private facts are only accessible in OwnerDm context.
 #[tokio::test]
 async fn test_private_fact_dm_only() {
@@ -656,7 +720,7 @@ async fn test_null_channel_legacy_facts() {
 /// Regression: explicit semantic search must surface a near-synonym match that
 /// falls just under the passive-injection threshold. "spouse" embeds at ~0.28
 /// against a stored `partner_name` fact — below the 0.30 passive cutoff but above
-/// the 0.22 explicit-search cutoff — so `search_facts_semantic` (the user-initiated
+/// the 0.22 explicit-search cutoff — so `search_facts` (the user-initiated
 /// tool path) must return it, even though passive injection might not.
 #[tokio::test]
 async fn test_explicit_search_catches_near_threshold_synonym() {
@@ -673,11 +737,22 @@ async fn test_explicit_search_catches_near_threshold_synonym() {
         .await
         .unwrap();
 
-    let hits = store.search_facts_semantic("spouse", 10).await.unwrap();
+    let report = store
+        .search_facts(
+            "spouse",
+            10,
+            &aidaemon_memory::search::FactSearchConfig::default(),
+        )
+        .await
+        .unwrap();
     assert!(
-        hits.iter().any(|(f, _)| f.key == "partner_name"),
-        "explicit semantic search should surface the partner fact for the synonym 'spouse'; got {:?}",
-        hits.iter().map(|(f, _)| f.key.as_str()).collect::<Vec<_>>()
+        report.hits.iter().any(|h| h.fact.key == "partner_name"),
+        "explicit search should surface the partner fact for the synonym 'spouse'; got {:?}",
+        report
+            .hits
+            .iter()
+            .map(|h| h.fact.key.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1539,7 +1614,7 @@ async fn test_retention_superseded_facts_cleanup() {
         .unwrap();
 
     // Run cleanup with 90-day threshold
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let stats = retention.run_all().await.unwrap();
 
@@ -1582,7 +1657,7 @@ async fn test_retention_preserves_active_facts() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let _stats = retention.run_all().await.unwrap();
 
@@ -1629,7 +1704,7 @@ async fn test_retention_unreferenced_episodes_cleanup() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let stats = retention.run_all().await.unwrap();
 
@@ -1671,7 +1746,7 @@ async fn test_retention_preserves_recalled_episodes() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let _stats = retention.run_all().await.unwrap();
 
@@ -1713,7 +1788,7 @@ async fn test_retention_zero_success_procedures_cleanup() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     let stats = retention.run_all().await.unwrap();
 
@@ -1753,7 +1828,7 @@ async fn test_retention_preserves_successful_procedures() {
         .await
         .unwrap();
 
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool.clone(), config);
     retention.run_all().await.unwrap();
 
@@ -1879,10 +1954,9 @@ async fn test_fresh_db_migration() {
 
 // ==================== M. Context Window & Scoring ====================
 
-/// Verify the scoring module gives higher scores to messages with keywords.
+/// Verify message importance does not depend on matching keywords.
 #[tokio::test]
 async fn test_message_scoring_keywords() {
-    use crate::memory::scoring::score_message;
     use crate::traits::Message;
 
     let mut msg = Message {
@@ -1898,15 +1972,14 @@ async fn test_message_scoring_keywords() {
         ..Message::runtime_defaults()
     };
 
-    let score_high = score_message(&msg);
+    let with_keywords = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
 
-    msg.content = Some("I just walked around the block for some exercise today".into());
-    let score_medium = score_message(&msg);
+    msg.content = Some("I just walked around the block for some exercise".into());
+    let casual = aidaemon_memory::turn_importance(&msg.role, msg.content.as_deref());
 
-    assert!(
-        score_high > score_medium,
-        "Message with 'password' keyword should score higher than casual message"
-    );
+    // Importance reads structure, not wording: two user messages of the
+    // same length class score the same whatever words they use.
+    assert_eq!(with_keywords, casual);
 }
 
 /// Verify user profile defaults and update.
@@ -1914,7 +1987,9 @@ async fn test_message_scoring_keywords() {
 async fn test_user_profile_defaults() {
     let (store, _db) = setup_test_store().await;
 
-    let profile = store.get_user_profile().await.unwrap();
+    let profile = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     assert_eq!(profile.verbosity_preference, "medium");
     assert_eq!(profile.tone_preference, "neutral");
     assert!(profile.prefers_explanations);
@@ -1925,12 +2000,16 @@ async fn test_user_profile_defaults() {
 async fn test_user_profile_update() {
     let (store, _db) = setup_test_store().await;
 
-    let mut profile = store.get_user_profile().await.unwrap();
+    let mut profile = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     profile.verbosity_preference = "brief".to_string();
     profile.emoji_preference = "frequent".to_string();
     store.update_user_profile(&profile).await.unwrap();
 
-    let updated = store.get_user_profile().await.unwrap();
+    let updated = aidaemon_memory::sqlite::SqliteMemory::get_user_profile(&store)
+        .await
+        .unwrap();
     assert_eq!(updated.verbosity_preference, "brief");
     assert_eq!(updated.emoji_preference, "frequent");
 }
@@ -2012,7 +2091,7 @@ async fn test_retention_empty_database() {
     let (store, _db) = setup_test_store().await;
 
     let pool = store.pool();
-    let config = crate::config::RetentionConfig::default();
+    let config = crate::config::RetentionConfig::default().policy();
     let retention = crate::memory::retention::RetentionManager::new(pool, config);
     let stats = retention.run_all().await.unwrap();
 
@@ -2073,17 +2152,17 @@ async fn test_error_solution_multiple_domains() {
 #[tokio::test]
 async fn test_procedure_extraction_helpers() {
     use crate::memory::procedures::{
-        extract_error_pattern, extract_trigger_pattern, generalize_procedure,
-        generate_procedure_name,
+        extract_error_pattern, extract_trigger_pattern, generalize_procedure, procedure_base_name,
     };
 
-    // Test procedure name generation
+    // Procedure names come from the tools used, not the request's wording.
     assert_eq!(
-        generate_procedure_name("Build the Rust project"),
-        "rust-build"
+        procedure_base_name(&[
+            "terminal(cargo build)".to_string(),
+            "write_file(x)".to_string()
+        ]),
+        "terminal-write_file"
     );
-    assert_eq!(generate_procedure_name("Run the test suite"), "run-tests");
-    assert_eq!(generate_procedure_name("Deploy to production"), "deploy");
 
     // Test trigger pattern extraction
     let trigger = extract_trigger_pattern(
@@ -2406,32 +2485,11 @@ async fn test_procedure_promotion_eligibility_criteria() {
 /// Verify context window token estimation.
 #[tokio::test]
 async fn test_context_window_token_estimation() {
-    use crate::memory::context_window::estimate_tokens;
+    use crate::context_budget::estimate_tokens;
 
     assert_eq!(estimate_tokens(""), 0);
     assert_eq!(estimate_tokens("hi"), 1); // ceil(2/4) = 1
     assert_eq!(estimate_tokens("hello world and more"), 5); // 20/4 = 5
     let long = "a".repeat(4000);
     assert_eq!(estimate_tokens(&long), 1000); // 4000/4 = 1000
-}
-
-/// Verify context window should_extract_facts filtering.
-#[tokio::test]
-async fn test_should_extract_facts_filtering() {
-    use crate::memory::context_window::should_extract_facts;
-
-    // Trivial messages should be filtered
-    assert!(!should_extract_facts("ok"));
-    assert!(!should_extract_facts("thanks"));
-    assert!(!should_extract_facts("yes"));
-    assert!(!should_extract_facts("lol"));
-    assert!(!should_extract_facts("short")); // <20 chars
-
-    // Meaningful messages should pass
-    assert!(should_extract_facts(
-        "My dog's name is Mia and she's a golden retriever"
-    ));
-    assert!(should_extract_facts(
-        "I work at Acme Corp in the engineering department"
-    ));
 }

@@ -1,0 +1,24 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "surface": {
+      "controller": {
+        "device": "Synthetic phone",
+        "device_id": "dev-phone-1",
+        "kind": "owner"
+      },
+      "handoff_pending": true,
+      "height": 720,
+      "id": "srf_7d1c",
+      "interactive": true,
+      "kind": "browser_tab",
+      "session_id": "app:6c1f",
+      "site": "login.acme.example",
+      "title": "Sign in - Acme",
+      "width": 1280
+    },
+    "type": "surface_updated"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

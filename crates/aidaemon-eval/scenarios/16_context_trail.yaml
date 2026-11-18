@@ -1,0 +1,32 @@
+name: context_trail
+description: >
+  Ten log files of ~1.8k tokens each, each naming the next; the answer is in
+  the last. Live, the model stands in for one with a 10k-token window
+  (`context_cap`): the whole transcript no longer fits after about six
+  files. Aimed at ContextWindow.
+tags: ["kit:logs", "context_cap:10000"]
+input: >
+  An incident trail starts in logs/trail-1.log, and each file names the next
+  one. Follow it to the end and tell me the final error code.
+limits:
+  max_turns: 20
+script:
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-1.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-2.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-3.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-4.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-5.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-6.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-7.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-8.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-9.log } }]
+  - tool_calls: [{ name: read_log, arguments: { path: logs/trail-10.log } }]
+  - text: The final error code is E-7731.
+expect:
+  status: completed
+  final_text_contains: [E-7731]
+  tool_call_counts: { read_log: 10 }
+  no_failed_receipts: true
+live_expect:
+  status: completed
+  final_text_contains: [E-7731]

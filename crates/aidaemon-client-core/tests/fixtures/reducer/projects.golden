@@ -1,0 +1,94 @@
+{
+  "description": "Projects arrive from list_projects and project_updated; a session's project rides on its summary.",
+  "frames": [
+    {
+      "request_id": "r1",
+      "result": {
+        "projects": [
+          {
+            "id": "project-acme",
+            "name": "Acme site",
+            "path": "/home/synthetic/acme-site"
+          }
+        ],
+        "type": "projects"
+      },
+      "type": "ack"
+    },
+    {
+      "at_ms": 1767225601000,
+      "event": {
+        "project": {
+          "id": "project-notes",
+          "name": "Design notes"
+        },
+        "type": "project_updated"
+      },
+      "seq": 1,
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225602000,
+      "event": {
+        "project": {
+          "id": "project-acme",
+          "name": "Acme Corp site",
+          "path": "/home/synthetic/acme-site"
+        },
+        "type": "project_updated"
+      },
+      "seq": 2,
+      "type": "event"
+    },
+    {
+      "at_ms": 1767225603000,
+      "event": {
+        "session": {
+          "channel": "app",
+          "id": "app:s1",
+          "project_id": "project-acme",
+          "title": "Contact form",
+          "writable": true
+        },
+        "type": "session_created"
+      },
+      "seq": 3,
+      "session_id": "app:s1",
+      "type": "event"
+    }
+  ],
+  "state": {
+    "approvals": {},
+    "last_seq": 3,
+    "notice": null,
+    "order": [
+      "app:s1"
+    ],
+    "projects": {
+      "project-acme": {
+        "id": "project-acme",
+        "name": "Acme Corp site",
+        "path": "/home/synthetic/acme-site"
+      },
+      "project-notes": {
+        "id": "project-notes",
+        "name": "Design notes"
+      }
+    },
+    "sessions": {
+      "app:s1": {
+        "lines": [],
+        "live": null,
+        "summary": {
+          "channel": "app",
+          "id": "app:s1",
+          "project_id": "project-acme",
+          "title": "Contact form",
+          "writable": true
+        }
+      }
+    },
+    "tasks": {},
+    "view_request": null
+  }
+}

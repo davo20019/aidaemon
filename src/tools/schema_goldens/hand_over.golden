@@ -1,0 +1,25 @@
+{
+  "description": "Ask the owner to do a step themselves on a screen you are working on, then wait.",
+  "name": "hand_over",
+  "schema": {
+    "description": "Ask the owner to do something themselves on a browser tab you are working on, such as signing in, entering a verification code or solving a challenge, then wait until they say they are done. Use it whenever a step needs the owner's password, a one-time code or their personal judgement; never ask for a password or a code in chat. The owner does it from the live view in their app or at the computer, and you never see what they type. Returns where the tab is afterwards: check it before going on.",
+    "name": "hand_over",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "surface": {
+          "description": "The browser tab_id to hand over, as the browser tool returned it. Omit for the tab you are on.",
+          "type": "string"
+        },
+        "what": {
+          "description": "The step the owner should do, in a few plain words, e.g. 'Sign in to your Acme account'. Only the step: the card adds the site and the Done button itself.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "what"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,2927 @@
+//! Backend seam for the browser tool.
+//!
+//! `BrowserTool`'s actions are routed through the [`BrowserBackend`] /
+//! [`PageHandle`] traits instead of calling `chromiumoxide` directly. This lets
+//! tests drive the tool against a [`MockBackend`] with no real Chrome
+//! dependency, while production wires up [`ChromiumoxideBackend`], which wraps
+//! the existing `Browser`/`Page` calls with no behavior change.
+//!
+//! Error style mirrors the rest of the module: internal methods return
+//! `Result<_, String>`.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chromiumoxide::browser::{Browser, BrowserConfig as ChromeBrowserConfig};
+use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, PrintToPdfParams};
+use chromiumoxide::cdp::browser_protocol::target::{
+    CloseTargetParams, CreateTargetParams, GetTargetsParams, TargetId,
+};
+use chromiumoxide::page::ScreenshotParams;
+use futures::StreamExt;
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+
+use crate::settings::{BrowserSettings, SessionIsolation};
+use crate::tool::diagnostics::BrowserDiagnosticsStore;
+
+/// Upper bound on how long the graceful Chrome shutdown (`Browser::close()` +
+/// `Browser::wait()`) and per-resource disposal (close-target / dispose-context)
+/// are allowed to take before we give up and fall back to the abrupt teardown.
+/// Keeps a wedged/dying Chrome from hanging the close path (or the daemon's
+/// shutdown) indefinitely.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A handle to a single browser page/tab. Methods mirror the chromiumoxide
+/// `Page` operations the tool's actions need today. Some methods (e.g. the tab
+/// target operations) are declared so later tasks can fill them in; the
+/// chromiumoxide adapter currently provides thin/stub implementations for those.
+#[async_trait]
+pub trait PageHandle: Send + Sync {
+    /// Navigate the page to `url`.
+    async fn goto(&self, url: &str) -> Result<(), String>;
+
+    /// Returns `Ok(())` if an element matching `selector` exists, `Err` otherwise.
+    async fn find_element(&self, selector: &str) -> Result<(), String>;
+
+    /// Wait for the page's navigation lifecycle to settle (the load event /
+    /// committed navigation), bounded by `timeout`.
+    ///
+    /// Used by `action_navigate` after `goto` (replacing the old fixed 2s sleep)
+    /// and by the `action_click` nav-race when a click triggered a navigation.
+    /// On the underlying CDP error this returns `Err`; on the LOCAL timeout
+    /// firing first the caller proceeds best-effort (a page that never fires
+    /// `load` must not hard-fail navigate). Implementations bound the wait
+    /// internally so a wedged page cannot hang the action.
+    async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String>;
+
+    /// Whether the element matching `selector` is currently VISIBLE — present in
+    /// the DOM, laid out (non-zero box / has an `offsetParent`), and not hidden
+    /// via `display:none`/`visibility:hidden`. Returns `Ok(false)` when the
+    /// element is absent or laid out as hidden; `Err` only on a transport-class
+    /// failure.
+    ///
+    /// The selector reaches CDP's DOM query via `find_element` ONLY; the
+    /// visibility predicate runs as a CONSTANT JS function bound to the resolved
+    /// element object — the selector is NEVER interpolated into a JS source
+    /// string (Task 14 rule).
+    async fn is_element_visible(&self, selector: &str) -> Result<bool, String>;
+
+    /// Whether the element matching `selector` is ENABLED (its `disabled`
+    /// property is falsy). Returns `Ok(false)` when the element is absent or
+    /// disabled; `Err` only on a transport-class failure. Selector handling
+    /// matches [`Self::is_element_visible`] — no JS interpolation of the selector.
+    async fn is_element_enabled(&self, selector: &str) -> Result<bool, String>;
+
+    /// Typed DOM facts about the element matching `selector`
+    /// ([`super::policy::ElementFacts`]), read by the constant
+    /// [`super::policy::ELEMENT_FACTS_FN`] bound to the resolved element (the
+    /// selector is never interpolated into JS). `Ok(None)` when no element
+    /// matches; `Err` when the facts could not be read.
+    async fn element_facts(
+        &self,
+        selector: &str,
+    ) -> Result<Option<super::policy::ElementFacts>, String>;
+
+    /// Click the element matching `selector`.
+    async fn click(&self, selector: &str) -> Result<(), String>;
+
+    /// Focus the element matching `selector` and type `value` into it
+    /// (append semantics — kept as a seam primitive for future tasks).
+    #[allow(dead_code)]
+    async fn type_text(&self, selector: &str, value: &str) -> Result<(), String>;
+
+    /// Evaluate a JavaScript `script` and return its result as a JSON value.
+    ///
+    /// Returns `Ok(None)` when the script produced no deserializable value
+    /// (e.g. `undefined`), so callers can reproduce the existing
+    /// "(no return value)" fallback while still distinguishing a genuine JSON
+    /// `null` (`Ok(Some(Value::Null))`).
+    async fn evaluate(&self, script: &str) -> Result<Option<serde_json::Value>, String>;
+
+    /// `innerText` of the element matching `selector`.
+    async fn inner_text(&self, selector: &str) -> Result<String, String>;
+
+    /// `document.body.innerText` of the page.
+    async fn body_text(&self) -> Result<String, String>;
+
+    /// Scroll the page vertically by a bounded pixel delta.
+    async fn scroll_by(&self, delta_y: i64) -> Result<(), String>;
+
+    /// Capture a screenshot. When `selector` is `Some`, screenshots that
+    /// element (and `full_page` is ignored — the element bounds define the
+    /// capture). When `selector` is `None`, captures the VIEWPORT by default
+    /// (`full_page=false`) and only the entire scrollable page when
+    /// `full_page=true`. Defaulting to the viewport keeps captures within
+    /// downstream channel (e.g. Telegram) dimension/byte limits.
+    async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String>;
+
+    /// Print the current page to PDF with the page's CSS paper size and painted
+    /// backgrounds preserved. Keeping this as a CDP primitive avoids routing
+    /// designed HTML through office, PostScript, or Quick Look converters.
+    async fn render_pdf(&self) -> Result<Vec<u8>, String>;
+
+    /// Current page URL, if available.
+    ///
+    /// The action layer (`action_navigate`/`action_new_tab`) calls this AFTER a
+    /// `goto` settles and revalidates the committed URL against the shared
+    /// private-network policy (`policy::validate_network_url`). This catches
+    /// server-side redirects to a blocked host (e.g. a public redirector landing
+    /// on `http://127.0.0.1/...`).
+    ///
+    /// NOTE (deferred): this is NOT per-request subresource interception. Frame,
+    /// script, XHR/fetch, WebSocket, and form-POST requests issued by the page
+    /// are NOT individually validated, because chromiumoxide 0.8 offers no
+    /// per-request continue/abort seam without a fragile browser-global Fetch
+    /// pump (see the `#[ignore]`d `deferred_per_request_subresource_interception_stub`
+    /// test for the full feasibility finding). Enforcement today is: validated
+    /// tool-initiated navigations + final-committed-URL revalidation.
+    async fn url(&self) -> Option<String>;
+
+    /// Replace the entire content of the element matching `selector` with
+    /// `value`, firing native `input` and `change` events.
+    ///
+    /// This replaces whatever is already in the field. The `value` is NEVER
+    /// interpolated into a JavaScript source string — it is delivered as real
+    /// key events via `type_str` after the field is cleared through an
+    /// element-bound JS function.
+    async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String>;
+
+    /// Spawn listeners that record console logs and network load failures into
+    /// `store` for `(session_id, tab_id)`. Default: no-op (mock pages without
+    /// scripted logs).
+    async fn attach_diagnostics(
+        &self,
+        _session_id: &str,
+        _tab_id: &str,
+        _store: BrowserDiagnosticsStore,
+    ) {
+    }
+
+    /// Start a live picture of the page (JPEG frames as the page paints).
+    /// Each frame must be acked with [`PageHandle::ack_screencast`] before the
+    /// next comes. Default: not supported.
+    async fn start_screencast(
+        &self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<ScreencastFrames, String> {
+        Err("this browser cannot stream its page".to_string())
+    }
+
+    /// The page may send its next frame.
+    async fn ack_screencast(&self, _session: i64) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn stop_screencast(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Start a running live picture again (the frames keep coming to the
+    /// stream [`PageHandle::start_screencast`] returned). Default: nothing
+    /// to restart.
+    async fn restart_screencast(
+        &self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// A pointer event at CSS pixel `(x, y)` of the viewport.
+    async fn dispatch_mouse(&self, _event: &MouseInput) -> Result<(), String> {
+        Err("this browser takes no pointer input".to_string())
+    }
+
+    async fn dispatch_key(&self, _event: &KeyInput) -> Result<(), String> {
+        Err("this browser takes no key input".to_string())
+    }
+
+    /// Type committed text where the focus is.
+    async fn insert_text(&self, _text: &str) -> Result<(), String> {
+        Err("this browser takes no text input".to_string())
+    }
+
+    /// The viewport's size in CSS pixels.
+    async fn viewport(&self) -> Result<(f64, f64), String> {
+        Err("viewport unknown".to_string())
+    }
+
+    /// The page's title, best effort.
+    async fn title(&self) -> Option<String> {
+        None
+    }
+
+    /// Behave as the focused window (draw the caret and focus rings) even
+    /// in the background, while the owner drives the page.
+    async fn emulate_focus(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Lay the page out as a phone of `room` CSS pixels would (its mobile
+    /// layout), or back at the window's own size (`None`). Default: the
+    /// page keeps its size.
+    async fn fit(&self, _room: Option<(u32, u32)>) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// One live frame of a page.
+pub struct ScreencastFrame {
+    pub data: Vec<u8>,
+    /// The viewport in CSS pixels when it was painted.
+    pub css_w: f64,
+    pub css_h: f64,
+    /// Ack it with this.
+    pub session: i64,
+    /// The first frame of a new document in the tab.
+    pub new_page: bool,
+}
+
+/// A page's live frames, until the page goes away or the cast stops.
+pub type ScreencastFrames = std::pin::Pin<Box<dyn futures::Stream<Item = ScreencastFrame> + Send>>;
+
+/// What a pointer event does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    Pressed,
+    Released,
+    Moved,
+    Wheel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButtonKind {
+    None,
+    Left,
+    Middle,
+    Right,
+}
+
+/// A pointer event in the page's CSS pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MouseInput {
+    pub kind: MouseKind,
+    pub x: f64,
+    pub y: f64,
+    pub button: MouseButtonKind,
+    pub click_count: i64,
+    pub delta_x: f64,
+    pub delta_y: f64,
+    /// CDP modifier bits: Alt 1, Ctrl 2, Meta 4, Shift 8.
+    pub modifiers: i64,
+}
+
+/// A key event. `text` is what a key-down types (a printable key).
+#[derive(Clone, PartialEq)]
+pub struct KeyInput {
+    pub down: bool,
+    pub code: String,
+    pub key: String,
+    pub text: Option<String>,
+    pub modifiers: i64,
+    pub windows_virtual_key_code: Option<i64>,
+    /// Editing commands the key runs (`selectAll`, `copy`, `paste`...):
+    /// Chrome takes a shortcut sent as a key event only with these.
+    pub commands: Vec<String>,
+}
+
+impl std::fmt::Debug for KeyInput {
+    // What was typed is never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyInput")
+            .field("down", &self.down)
+            .field("code", &self.code)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Lightweight description of a live browser target/tab, returned by
+/// [`BrowserBackend::list_targets`]. The `target_id` is the chromiumoxide target
+/// id string (used as the opaque, stable tab id surfaced to the LLM); `title`
+/// and `url` are best-effort and may be `None`/empty if the page is still
+/// loading or unreachable.
+///
+/// `opener_id` is the target id of the page that SPAWNED this target (the CDP
+/// `openerId`), or `None` for targets opened independently (a user-typed tab,
+/// the initial blank tab, etc.). Popup attribution uses it to bind a net-new
+/// target to the SPECIFIC session whose page opened it, instead of attributing
+/// any net-new global target to whoever clicked — which under concurrent timing
+/// would let one session capture another session's freshly-opened tab.
+#[derive(Debug, Clone)]
+pub struct TargetInfo {
+    pub target_id: String,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub opener_id: Option<String>,
+}
+
+/// A browser backend: owns the connection lifecycle and hands out page handles.
+#[async_trait]
+pub trait BrowserBackend: Send + Sync {
+    /// Ensure a browser is launched or connected and ready for use.
+    async fn ensure_ready(&self) -> Result<(), String>;
+
+    /// Transport failures seen so far ([`ConnectionFaults`]). An action
+    /// failed because the connection died when this count moved while it
+    /// ran.
+    fn connection_faults(&self) -> u64;
+
+    /// Create a NEW page/tab and return its `(target_id, context_id, handle)`.
+    ///
+    /// Unlike the old `current_page()` (which grabbed the first existing tab and
+    /// thus shared one page across all sessions), this always creates a distinct
+    /// page so the session registry can give each session (the call's
+    /// `ToolCallContext::session_id`) its own tab.
+    ///
+    /// `context_id` is `Some(id)` in `browser_context` isolation mode — the CDP
+    /// browser-context id the page was created in, so the session can dispose it
+    /// on eviction/close. It is `None` in `page` isolation mode (the page lives in
+    /// the default shared context, which is never disposed).
+    async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String>;
+
+    /// Gracefully shut the browser session down. Returns a user-facing status
+    /// message describing what happened (disconnected vs. closed vs. no-op).
+    ///
+    /// For a LAUNCHED browser this performs a graceful Chrome shutdown
+    /// (`Browser::close()` + `Browser::wait()`, bounded by a timeout) before
+    /// falling back to aborting the handler task; for an ATTACHED browser
+    /// (`remote_debugging_port`) it detaches WITHOUT sending a browser-close
+    /// command, so the user's own Chrome keeps running. Idempotent: safe to call
+    /// repeatedly (a second call on an already-closed backend is a no-op).
+    ///
+    /// This is the single graceful-teardown path; `close`, `set_headless_mode`'s
+    /// restart, idle eviction, and daemon shutdown all route through it.
+    async fn shutdown(&self) -> Result<String, String>;
+
+    /// Dispose the per-session resources surfaced by idle eviction (or session
+    /// close): close each tab target, then dispose any per-session CDP browser
+    /// context. Best-effort and bounded — a failure on one resource is logged and
+    /// does not block the others or wedge the caller. Does NOT close the browser
+    /// itself (that is [`BrowserBackend::shutdown`]'s job).
+    async fn dispose_session(&self, tab_target_ids: &[String], context_ids: &[String]);
+
+    /// Apply a headless/visible mode switch, restarting the browser on the next
+    /// action if the mode actually changed. Returns a user-facing status
+    /// message. `headless` is the requested target mode; `mode` is the original
+    /// user-supplied label (e.g. "visible"/"headless") used verbatim in messages.
+    ///
+    /// The backend owns the headless state and the no-display fallback policy,
+    /// so this encapsulates the full set_mode behavior.
+    async fn set_headless_mode(&self, headless: bool, mode: &str) -> Result<String, String>;
+
+    // --- Tab/target management ---
+
+    /// List every live target/tab the browser currently holds, with best-effort
+    /// title and URL. Used to diff for popup detection and to render `list_tabs`.
+    async fn list_targets(&self) -> Result<Vec<TargetInfo>, String>;
+
+    /// Resolve an existing target by id into a page handle, so a session can bind
+    /// it as its active tab (the chromiumoxide-level "switch"). Returns `Err` if
+    /// the target is unknown to the browser.
+    async fn page_for_target(&self, target_id: &str) -> Result<Arc<dyn PageHandle>, String>;
+
+    /// Close the target/tab identified by `target_id` at the browser level.
+    async fn close_target(&self, target_id: &str) -> Result<(), String>;
+
+    // --- Connection health + recovery ---
+
+    /// Whether the backend currently holds a live connection.
+    ///
+    /// This reflects REAL handler health: it is `true` only when a browser is
+    /// held AND its CDP event handler task is still running. A browser whose
+    /// handler has exited (the connection died) reports `false`, even though the
+    /// `Option<Browser>` is still `Some`.
+    ///
+    /// Exposed for health introspection; `ensure_ready` consults the same
+    /// underlying handler-alive signal directly.
+    #[allow(dead_code)]
+    async fn is_connected(&self) -> bool;
+
+    /// Forcibly drop the current browser + handler and re-run the launch/connect
+    /// path, spawning a fresh supervised handler. Respects `connected_to_existing`
+    /// (reconnects to the same remote-debugging port for attached Chrome;
+    /// relaunches for an owned instance).
+    ///
+    /// Returns `Ok(())` on a successful reconnect. After a successful reconnect
+    /// all previously-minted page handles are stale and MUST be re-created
+    /// (the tool layer invalidates the session registry's cached pages).
+    async fn reconnect(&self) -> Result<(), String>;
+
+    /// Where sign-ins made in this browser go. Default: nowhere lasting.
+    async fn sign_in_store(&self) -> SignInStore {
+        SignInStore::NotKept
+    }
+
+    /// Move onto a profile that keeps sign-ins, when this browser can
+    /// (`sign_in_store` is `CanKeep`). `Ok(true)`: the browser restarted on
+    /// it and every open tab is gone.
+    async fn keep_sign_ins_now(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Delete the agent's own kept sign-ins. Refused for a profile or a
+    /// Chrome that is the owner's own.
+    async fn forget_sign_ins(&self) -> Result<String, String> {
+        Err("This browser keeps no sign-ins of its own.".to_string())
+    }
+}
+
+/// Where sign-ins made in the agent's browser go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInStore {
+    /// A lasting profile: a sign-in is there for later tasks.
+    Kept,
+    /// Ephemeral now, and allowed to move to the agent's own profile.
+    CanKeep,
+    /// Ephemeral, and kept nowhere.
+    NotKept,
+}
+
+/// Whether a chromiumoxide error means the connection to Chrome itself is
+/// gone, judged from its typed variant: the websocket failed (`Ws`, `Io`),
+/// the handler's command channel is closed (`ChannelSendError`), or the
+/// handler dropped the request unanswered (`NoResponse`). A page error
+/// (`JavascriptException`, `NotFound`, a `Chrome` protocol error, a request
+/// `Timeout`) is not, whatever its text says, so nothing a page throws can
+/// trigger a reconnect.
+pub fn is_transport_error(error: &chromiumoxide::error::CdpError) -> bool {
+    use chromiumoxide::error::CdpError;
+    matches!(
+        error,
+        CdpError::Ws(_) | CdpError::Io(_) | CdpError::ChannelSendError(_) | CdpError::NoResponse
+    )
+}
+
+/// How many transport failures the backend and its pages have seen: typed
+/// state, recorded where a typed chromiumoxide error is still in hand
+/// ([`is_transport_error`]) or when the CDP handler task ends. The tool's
+/// recovery compares the count before and after an action instead of reading
+/// error text ([`BrowserBackend::connection_faults`]).
+#[derive(Clone, Default)]
+pub struct ConnectionFaults(Arc<std::sync::atomic::AtomicU64>);
+
+impl ConnectionFaults {
+    /// Failures seen so far.
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Record a transport failure.
+    pub fn record(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record `error` if it is a transport failure; return `message`.
+    fn noted(&self, error: &chromiumoxide::error::CdpError, message: String) -> String {
+        if is_transport_error(error) {
+            self.record();
+        }
+        message
+    }
+}
+
+// =============================================================================
+// Chromiumoxide adapter
+// =============================================================================
+
+/// Production backend: wraps the existing `chromiumoxide` `Browser`/`Page`
+/// logic verbatim. Behavior is identical to the pre-refactor `BrowserTool`.
+pub struct ChromiumoxideBackend {
+    browser: Arc<Mutex<Option<Browser>>>,
+    browser_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Liveness flag for the CDP event-handler task. Set `true` at spawn and set
+    /// `false` by the supervised drain loop when it exits (the connection died or
+    /// the browser closed). `ensure_ready`/`is_connected` consult this so a dead
+    /// handler is treated as a dead connection instead of "healthy because
+    /// `browser.is_some()`".
+    handler_alive: Arc<AtomicBool>,
+    /// Transport failures seen by this backend and its pages.
+    faults: ConnectionFaults,
+    /// True when connected to an existing Chrome (don't close it on "close").
+    connected_to_existing: Arc<Mutex<bool>>,
+    /// Runtime-mutable headless mode (togglable via the tool's set_mode action).
+    headless: AtomicBool,
+    /// Resolved session-isolation mode (computed once at construction). Controls
+    /// whether each session's page is created in the default shared context
+    /// (`Page` — shared cookies) or its own incognito browser context
+    /// (`BrowserContext` — isolated cookies). Changes when the browser moves
+    /// onto the agent's own profile to keep sign-ins.
+    session_isolation: std::sync::Mutex<SessionIsolation>,
+    /// The agent's own profile, once in use (an ephemeral browser that moved
+    /// onto it to keep sign-ins, or found it from an earlier move).
+    active_profile: std::sync::Mutex<Option<String>>,
+    config: BrowserSettings,
+}
+
+impl ChromiumoxideBackend {
+    /// Construct a backend, resolving the session-isolation mode from config.
+    ///
+    /// Returns an `Err` if the configuration is incompatible (e.g. requesting
+    /// per-session `browser_context` isolation while attached to a shared
+    /// persistent profile or remote-debugging Chrome). Callers must surface this
+    /// error at startup rather than silently downgrading — honesty over a
+    /// false claim of cookie isolation.
+    pub fn new(config: BrowserSettings) -> Result<Self, String> {
+        let mut session_isolation = config.resolve_session_isolation()?;
+        // An ephemeral browser that moved onto the agent's own profile before
+        // starts on it again.
+        let active_profile = config
+            .agent_profile_dir
+            .clone()
+            .filter(|_| Self::may_keep_sign_ins(&config))
+            .filter(|dir| std::path::Path::new(&*shellexpand::tilde(dir)).is_dir());
+        if active_profile.is_some() {
+            session_isolation = SessionIsolation::Page;
+        }
+        let headless = AtomicBool::new(config.headless);
+        Ok(Self {
+            browser: Arc::new(Mutex::new(None)),
+            browser_handle: Arc::new(Mutex::new(None)),
+            handler_alive: Arc::new(AtomicBool::new(false)),
+            faults: ConnectionFaults::default(),
+            connected_to_existing: Arc::new(Mutex::new(false)),
+            headless,
+            session_isolation: std::sync::Mutex::new(session_isolation),
+            active_profile: std::sync::Mutex::new(active_profile),
+            config,
+        })
+    }
+
+    /// An ephemeral browser that the owner allowed to keep sign-ins, with no
+    /// isolation it would break.
+    fn may_keep_sign_ins(config: &BrowserSettings) -> bool {
+        config.keep_sign_ins
+            && config.user_data_dir.is_none()
+            && config.remote_debugging_port.is_none()
+            && config.session_isolation != Some(SessionIsolation::BrowserContext)
+            && config.agent_profile_dir.is_some()
+    }
+
+    /// The resolved session-isolation mode this backend will use.
+    pub fn session_isolation(&self) -> SessionIsolation {
+        *self
+            .session_isolation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn profile_in_use(&self) -> Option<String> {
+        self.config.user_data_dir.clone().or_else(|| {
+            self.active_profile
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+    }
+
+    /// Check if a display is available for non-headless Chrome.
+    fn has_display() -> bool {
+        if cfg!(target_os = "macos") {
+            // macOS always has display capability (Quartz)
+            true
+        } else if cfg!(target_os = "windows") {
+            true
+        } else {
+            // Linux: check for X11 or Wayland display
+            std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
+        }
+    }
+
+    /// Create a fresh `about:blank` page and return its target id + handle.
+    ///
+    /// The global browser mutex is held only long enough to issue `new_page`;
+    /// the returned handle owns its own `Arc<Page>`, so the action that follows
+    /// runs without holding this mutex.
+    ///
+    /// In `Page` isolation mode the page is created in the default (shared)
+    /// browser context — sessions share cookies, and the returned context id is
+    /// `None`. In `BrowserContext` mode a new incognito browser context is
+    /// created per session, giving real per-session cookie/cache isolation, and
+    /// its id is returned so the session can dispose it on eviction/close
+    /// (`dispose_session`), closing the context leak that earlier tasks deferred.
+    async fn new_blank_page(
+        &self,
+    ) -> Result<(String, Option<String>, Arc<chromiumoxide::Page>), String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+
+        let (page, context_id) = match self.session_isolation() {
+            SessionIsolation::Page => (
+                browser.new_page("about:blank").await.map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to create new page: {}", e))
+                })?,
+                None,
+            ),
+            SessionIsolation::BrowserContext => {
+                // Create a fresh incognito browser context so this session's
+                // cookies/cache are isolated from every other session. The id is
+                // returned to the caller and stored in the session/tab state so
+                // it can be disposed when the session is evicted or closed.
+                let context_id = browser
+                    .create_browser_context(Default::default())
+                    .await
+                    .map_err(|e| {
+                        self.faults.noted(
+                            &e,
+                            format!("Failed to create isolated browser context: {}", e),
+                        )
+                    })?;
+                debug!("Created isolated browser context for session");
+                let context_id_str = context_id.as_ref().to_string();
+                let params = CreateTargetParams::builder()
+                    .url("about:blank")
+                    .browser_context_id(context_id)
+                    .build()
+                    .map_err(|e| format!("Failed to build isolated page parameters: {}", e))?;
+                let page = browser.new_page(params).await.map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to create new isolated page: {}", e))
+                })?;
+                (page, Some(context_id_str))
+            }
+        };
+        let target_id = page.target_id().as_ref().to_string();
+        Ok((target_id, context_id, Arc::new(page)))
+    }
+
+    /// Abruptly tear the browser down: drop the `Browser`, mark the handler dead,
+    /// abort the handler task, and clear `connected_to_existing`. This is the
+    /// fallback when a graceful close/wait errors or times out, and the only
+    /// teardown an ATTACHED browser ever needs (we must NOT send a browser-close
+    /// command to the user's own Chrome). The caller holds the `browser` guard.
+    async fn abort_teardown(&self, guard: &mut Option<Browser>) {
+        *guard = None;
+        self.handler_alive.store(false, Ordering::SeqCst);
+        let mut handle_guard = self.browser_handle.lock().await;
+        if let Some(handle) = handle_guard.take() {
+            handle.abort();
+        }
+        *self.connected_to_existing.lock().await = false;
+    }
+
+    /// The shared graceful-teardown core. Returns a user-facing status message.
+    ///
+    /// - LAUNCHED browser: take the `Browser` out and call `close().await` then
+    ///   `wait().await`, bounded by [`SHUTDOWN_TIMEOUT`]. On error/timeout, fall
+    ///   back to [`Self::abort_teardown`]. Either way the handler is aborted and
+    ///   state cleared.
+    /// - ATTACHED browser (`connected_to_existing`): NEVER send a browser-close
+    ///   command (that would kill the user's Chrome) — just detach + abort.
+    /// - No browser held: no-op (idempotent).
+    async fn graceful_teardown(&self) -> String {
+        let mut guard = self.browser.lock().await;
+        if guard.is_none() {
+            return "No browser session was active.".to_string();
+        }
+
+        let was_connected = *self.connected_to_existing.lock().await;
+        if was_connected {
+            // Attached: detach only. Do NOT close the user's Chrome.
+            self.abort_teardown(&mut guard).await;
+            info!("Disconnected from existing Chrome (browser still running)");
+            return "Disconnected from Chrome (your browser is still running).".to_string();
+        }
+
+        // Launched: take ownership so we can call the &mut close()/wait().
+        let mut browser = guard.take().expect("guard is Some (checked above)");
+        let graceful = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            browser.close().await.map_err(|e| e.to_string())?;
+            // wait() collects the child process so it doesn't become a zombie.
+            browser.wait().await.map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await;
+
+        // The Browser is dropped here regardless (the `take()`d value goes out of
+        // scope), so even a timed-out close still releases the connection.
+        match graceful {
+            Ok(Ok(())) => info!("Browser closed gracefully"),
+            Ok(Err(e)) => warn!(error = %e, "graceful browser close failed; forcing teardown"),
+            Err(_) => warn!("graceful browser close timed out; forcing teardown"),
+        }
+        // Clear remaining state (handler/handle/flag). `guard` is already None.
+        self.abort_teardown(&mut guard).await;
+        info!("Browser session closed");
+        "Browser session closed.".to_string()
+    }
+
+    /// Spawn the SUPERVISED CDP event-handler drain task.
+    ///
+    /// Unlike the old fire-and-forget `tokio::spawn(async move { while
+    /// handler.next().await.is_some() {} })`, this records the handler's exit:
+    /// `handler_alive` is set `true` here and flipped to `false` the moment the
+    /// drain loop ends (which happens when `handler.next()` yields `None` — i.e.
+    /// the websocket/connection to Chrome died or the browser was closed). That
+    /// turns "connection died" into an observable signal instead of a silent
+    /// state where `browser` stays `Some` forever.
+    fn spawn_supervised_handler<H>(&self, mut handler: H) -> tokio::task::JoinHandle<()>
+    where
+        H: futures::Stream + Send + Unpin + 'static,
+    {
+        let alive = Arc::clone(&self.handler_alive);
+        let faults = self.faults.clone();
+        alive.store(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            while handler.next().await.is_some() {}
+            // The handler stream ended: the CDP connection is gone. Record it so
+            // ensure_ready/is_connected stop treating this browser as healthy,
+            // and so an action failing now is recovered as a dead connection.
+            alive.store(false, Ordering::SeqCst);
+            faults.record();
+            warn!("browser CDP handler exited — connection is no longer healthy");
+        })
+    }
+
+    /// Launch a new Chrome or connect to an existing one (per config), store the
+    /// browser + a freshly-spawned supervised handler, and update
+    /// `connected_to_existing`. The caller holds the `browser` mutex guard.
+    ///
+    /// This is the single launch/connect path shared by the first `ensure_ready`
+    /// and by `reconnect` — so reconnect re-uses the exact same logic (including
+    /// remote-port reconnect vs. relaunch) rather than duplicating it.
+    async fn launch_or_connect(&self, guard: &mut Option<Browser>) -> Result<(), String> {
+        // Connect to existing Chrome if a remote debugging port is configured.
+        if let Some(port) = self.config.remote_debugging_port {
+            let url = format!("http://127.0.0.1:{}", port);
+            info!(port, "Connecting to existing Chrome instance");
+
+            let (browser, handler) = Browser::connect(&url).await.map_err(|e| {
+                format!(
+                    "Failed to connect to Chrome on port {}. \
+                         Make sure Chrome is running with: --remote-debugging-port={}\n\
+                         Error: {}",
+                    port, port, e
+                )
+            })?;
+
+            let handle = self.spawn_supervised_handler(handler);
+
+            info!(
+                port,
+                "Connected to existing Chrome — sharing login sessions"
+            );
+            *guard = Some(browser);
+            *self.connected_to_existing.lock().await = true;
+
+            let mut handle_guard = self.browser_handle.lock().await;
+            *handle_guard = Some(handle);
+            return Ok(());
+        }
+
+        // Otherwise, launch a new Chrome instance.
+        // Chrome's warning that a password was found in a breach is a
+        // window of the browser's own, never in a page's picture: while it
+        // is up, the live view's taps reach nothing and the owner cannot
+        // see why. The browser the daemon launches never shows it.
+        {
+            let dir = self.profile_in_use().map_or_else(
+                || std::env::temp_dir().join("chromiumoxide-runner"),
+                |dir| std::path::PathBuf::from(shellexpand::tilde(&dir).into_owned()),
+            );
+            let profile = if self.profile_in_use().is_some() {
+                self.config.profile.as_deref().unwrap_or("Default")
+            } else {
+                "Default"
+            };
+            if let Err(e) = quiet_breach_warning(&dir.join(profile)) {
+                warn!(error = %e, "Could not turn off Chrome's breached-password warning");
+            }
+        }
+        let mut builder = ChromeBrowserConfig::builder();
+        let want_headless = self.headless.load(Ordering::Relaxed);
+        let use_headless = if !want_headless && !Self::has_display() {
+            warn!("No display available — falling back to headless mode");
+            true
+        } else {
+            want_headless
+        };
+        // chromiumoxide 0.9 writes each flag as `--key[=value]` itself: a
+        // flag passed with its own dashes reaches Chrome as `----key` and is
+        // ignored (the profile then fell back to a temporary one, so nothing
+        // the owner signed in to was kept).
+        builder = if use_headless {
+            builder.new_headless_mode()
+        } else {
+            builder.with_head()
+        };
+        // Use existing Chrome profile if configured (inherits cookies/sessions)
+        if let Some(ref user_data_dir) = self.profile_in_use() {
+            let expanded = shellexpand::tilde(user_data_dir).into_owned();
+            builder = builder.user_data_dir(&expanded);
+            let profile = self.config.profile.as_deref().unwrap_or("Default");
+            builder = builder.arg(("profile-directory", profile));
+            info!(
+                user_data_dir = %expanded,
+                profile,
+                "Using existing Chrome profile"
+            );
+        }
+
+        builder = builder
+            .window_size(self.config.screenshot_width, self.config.screenshot_height)
+            // The page fills the window. chromiumoxide otherwise emulates an
+            // 800x600 page inside it, and the live view (which shows the whole
+            // window) draws an empty strip beside the page.
+            .viewport(None)
+            .arg("no-first-run")
+            .arg("no-default-browser-check")
+            .arg("disable-gpu")
+            .arg("disable-dev-shm-usage")
+            // Anti-detection: prevent sites from identifying headless Chrome
+            .arg(("disable-blink-features", "AutomationControlled"))
+            .arg(("disable-features", "AutomationControlled"));
+
+        let browser_config = builder.build().map_err(|e| {
+            format!(
+                "Failed to build browser config: {}. Is Chrome/Chromium installed?",
+                e
+            )
+        })?;
+
+        let (browser, handler) = Browser::launch(browser_config).await.map_err(|e| {
+            format!(
+                "Failed to launch browser: {}. Make sure Chrome or Chromium is installed.",
+                e
+            )
+        })?;
+
+        let handle = self.spawn_supervised_handler(handler);
+
+        info!("Browser launched successfully");
+        *guard = Some(browser);
+        *self.connected_to_existing.lock().await = false;
+
+        let mut handle_guard = self.browser_handle.lock().await;
+        *handle_guard = Some(handle);
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BrowserBackend for ChromiumoxideBackend {
+    fn connection_faults(&self) -> u64 {
+        self.faults.count()
+    }
+
+    async fn ensure_ready(&self) -> Result<(), String> {
+        let mut guard = self.browser.lock().await;
+
+        // Healthy ONLY if we hold a browser AND its handler task is still alive.
+        // The pre-fix check (`guard.is_some()`) treated a dead connection as
+        // healthy forever: when Chrome's websocket dies, the handler drain loop
+        // ends but `browser` stays `Some`. Now we verify the handler is alive.
+        if guard.is_some() && self.handler_alive.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Either we have no browser yet, OR the handler has died (dead
+        // connection). In the dead-handler case, drop the stale browser/handle
+        // first so launch_or_connect starts clean, then (re)launch/connect.
+        if guard.is_some() {
+            warn!("browser handler is dead — dropping stale connection and reconnecting");
+            *guard = None;
+            let mut handle_guard = self.browser_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+
+        self.launch_or_connect(&mut guard).await
+    }
+
+    async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String> {
+        let (target_id, context_id, page) = self.new_blank_page().await?;
+        Ok((
+            target_id,
+            context_id,
+            Arc::new(ChromiumoxidePage {
+                page,
+                faults: self.faults.clone(),
+            }),
+        ))
+    }
+
+    async fn shutdown(&self) -> Result<String, String> {
+        Ok(self.graceful_teardown().await)
+    }
+
+    async fn dispose_session(&self, tab_target_ids: &[String], context_ids: &[String]) {
+        // Best-effort: with no live browser there is nothing to dispose.
+        if self.browser.lock().await.is_none() {
+            return;
+        }
+        // Close each tab target first, then dispose the browser context(s).
+        for target_id in tab_target_ids {
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.close_target(target_id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(target_id, error = %e, "dispose_session: close_target failed"),
+                Err(_) => warn!(target_id, "dispose_session: close_target timed out"),
+            }
+        }
+        for context_id in context_ids {
+            let guard = self.browser.lock().await;
+            let Some(browser) = guard.as_ref() else {
+                return;
+            };
+            match tokio::time::timeout(
+                SHUTDOWN_TIMEOUT,
+                browser.dispose_browser_context(context_id.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => debug!(context_id, "disposed isolated browser context"),
+                Ok(Err(e)) => {
+                    warn!(context_id, error = %e, "dispose_session: dispose_browser_context failed")
+                }
+                Err(_) => warn!(
+                    context_id,
+                    "dispose_session: dispose_browser_context timed out"
+                ),
+            }
+        }
+    }
+
+    async fn set_headless_mode(&self, headless: bool, mode: &str) -> Result<String, String> {
+        let new_headless = headless;
+        let old_headless = self.headless.load(Ordering::Relaxed);
+        if old_headless == new_headless {
+            return Ok(format!("Browser is already in {} mode.", mode));
+        }
+
+        // Warn if requesting visible mode on a headless server
+        if !new_headless && !Self::has_display() {
+            return Ok(
+                "No display available on this system. Visible mode requires a monitor, \
+                 VNC, or X forwarding (ssh -X). Staying in headless mode."
+                    .to_string(),
+            );
+        }
+
+        self.headless.store(new_headless, Ordering::Relaxed);
+
+        // Gracefully close the existing browser so the next call launches with
+        // the new mode. Reuses the shared graceful-teardown path (launched →
+        // close()+wait()+timeout+fallback; attached → detach only).
+        let had_browser = self.browser.lock().await.is_some();
+        if had_browser {
+            self.graceful_teardown().await;
+            info!(mode, "Browser mode changed, restarting on next use");
+            Ok(format!(
+                "Switched to {} mode. Browser will restart on next action.",
+                mode
+            ))
+        } else {
+            info!(mode, "Browser mode changed");
+            Ok(format!("Switched to {} mode.", mode))
+        }
+    }
+
+    async fn list_targets(&self) -> Result<Vec<TargetInfo>, String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+        // Use CDP `Target.getTargets` rather than `pages()` because the raw
+        // `TargetInfo` carries `openerId` — the id of the target that spawned
+        // this one. Popup detection needs the opener to attribute a net-new tab
+        // to the SPECIFIC session whose page opened it (cross-session safety),
+        // which `pages()`/`Page` does not surface.
+        let returns = browser
+            .execute(GetTargetsParams::builder().build())
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to list browser tabs: {}", e))
+            })?;
+        let infos = returns
+            .result
+            .target_infos
+            .into_iter()
+            // Only real page tabs — drop browser/background/service-worker etc.
+            .filter(|t| t.r#type == "page")
+            .map(|t| {
+                let title = (!t.title.is_empty()).then(|| t.title.clone());
+                let url = (!t.url.is_empty()).then(|| t.url.clone());
+                TargetInfo {
+                    target_id: String::from(t.target_id),
+                    title,
+                    url,
+                    opener_id: t.opener_id.map(String::from),
+                }
+            })
+            .collect();
+        Ok(infos)
+    }
+
+    async fn page_for_target(&self, target_id: &str) -> Result<Arc<dyn PageHandle>, String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+        let page = browser
+            .get_page(TargetId::new(target_id.to_string()))
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Tab '{}' not found: {}", target_id, e))
+            })?;
+        Ok(Arc::new(ChromiumoxidePage {
+            page: Arc::new(page),
+            faults: self.faults.clone(),
+        }))
+    }
+
+    async fn close_target(&self, target_id: &str) -> Result<(), String> {
+        let guard = self.browser.lock().await;
+        let browser = guard
+            .as_ref()
+            .ok_or_else(|| "Browser not initialized".to_string())?;
+        browser
+            .execute(CloseTargetParams::new(TargetId::new(target_id.to_string())))
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to close tab '{}': {}", target_id, e))
+            })?;
+        Ok(())
+    }
+
+    async fn is_connected(&self) -> bool {
+        // Real health: a browser is held AND its handler task is still running.
+        self.browser.lock().await.is_some() && self.handler_alive.load(Ordering::SeqCst)
+    }
+
+    async fn reconnect(&self) -> Result<(), String> {
+        let mut guard = self.browser.lock().await;
+        // Forcibly drop the current browser + handler regardless of state.
+        *guard = None;
+        self.handler_alive.store(false, Ordering::SeqCst);
+        {
+            let mut handle_guard = self.browser_handle.lock().await;
+            if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+        info!("reconnecting browser after a connection-class failure");
+        self.launch_or_connect(&mut guard).await
+    }
+
+    async fn sign_in_store(&self) -> SignInStore {
+        if self.config.remote_debugging_port.is_some() || self.profile_in_use().is_some() {
+            SignInStore::Kept
+        } else if Self::may_keep_sign_ins(&self.config) {
+            SignInStore::CanKeep
+        } else {
+            SignInStore::NotKept
+        }
+    }
+
+    async fn keep_sign_ins_now(&self) -> Result<bool, String> {
+        if self.sign_in_store().await != SignInStore::CanKeep {
+            return Ok(false);
+        }
+        let Some(dir) = self.config.agent_profile_dir.clone() else {
+            return Ok(false);
+        };
+        let expanded = shellexpand::tilde(&dir).into_owned();
+        std::fs::create_dir_all(&expanded)
+            .map_err(|e| format!("Could not make the agent's browser profile: {e}"))?;
+        *self
+            .active_profile
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        *self
+            .session_isolation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = SessionIsolation::Page;
+        let closed = self.graceful_teardown().await;
+        info!(%closed, "browser moved onto the agent's own profile to keep sign-ins");
+        Ok(true)
+    }
+
+    async fn forget_sign_ins(&self) -> Result<String, String> {
+        if self.config.remote_debugging_port.is_some() {
+            return Err("The agent uses your own Chrome; sign out there.".to_string());
+        }
+        let Some(agent_dir) = self.config.agent_profile_dir.clone() else {
+            return Err("This browser keeps no sign-ins of its own.".to_string());
+        };
+        if self
+            .config
+            .user_data_dir
+            .as_ref()
+            .is_some_and(|dir| *dir != agent_dir)
+        {
+            return Err("The agent uses a Chrome profile you chose; sign out there.".to_string());
+        }
+        let closed = self.graceful_teardown().await;
+        let expanded = shellexpand::tilde(&agent_dir).into_owned();
+        if std::path::Path::new(&expanded).exists() {
+            std::fs::remove_dir_all(&expanded)
+                .map_err(|e| format!("Could not delete the agent's sign-ins: {e}"))?;
+        }
+        if self.config.user_data_dir.is_none() {
+            *self
+                .active_profile
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self
+                .session_isolation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = self
+                .config
+                .resolve_session_isolation()
+                .unwrap_or(SessionIsolation::Page);
+        }
+        info!(%closed, "forgot the agent's browser sign-ins");
+        Ok("Forgot every sign-in the agent's browser kept.".to_string())
+    }
+}
+
+/// Turn off the breached-password warning in a Chrome profile's
+/// `Preferences` (kept otherwise as it is), before Chrome starts on it.
+fn quiet_breach_warning(profile_dir: &std::path::Path) -> Result<(), String> {
+    let path = profile_dir.join("Preferences");
+    let mut prefs = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| format!("unreadable Preferences: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.to_string()),
+    };
+    let Some(root) = prefs.as_object_mut() else {
+        return Err("Preferences is not an object".to_string());
+    };
+    let profile = root
+        .entry("profile")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(profile) = profile.as_object_mut() else {
+        return Err("Preferences' profile is not an object".to_string());
+    };
+    if profile.get("password_manager_leak_detection") == Some(&serde_json::Value::Bool(false)) {
+        return Ok(());
+    }
+    profile.insert(
+        "password_manager_leak_detection".to_string(),
+        serde_json::Value::Bool(false),
+    );
+    std::fs::create_dir_all(profile_dir).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&prefs).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
+/// The room each tab is laid out for (`fit`), by target id. Chrome keeps a
+/// device-metrics override across a new document but paints the new one
+/// into a window-sized picture (the page in a corner of it), so the live
+/// view lays the page out again on each navigation; a page handle is made
+/// per lookup, so the room is kept here rather than on one.
+static FITTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u32, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn fitted_room(target: &str) -> Option<(u32, u32)> {
+    FITTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(target)
+        .copied()
+}
+
+/// Page handle wrapping a concrete `chromiumoxide::Page`.
+struct ChromiumoxidePage {
+    page: Arc<chromiumoxide::Page>,
+    faults: ConnectionFaults,
+}
+
+#[async_trait]
+impl PageHandle for ChromiumoxidePage {
+    async fn goto(&self, url: &str) -> Result<(), String> {
+        self.page.goto(url).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to navigate to {}: {}", url, e))
+        })?;
+        Ok(())
+    }
+
+    async fn find_element(&self, selector: &str) -> Result<(), String> {
+        self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+        Ok(())
+    }
+
+    async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String> {
+        // Bound chromiumoxide's `wait_for_navigation` (which resolves on the
+        // load/navigation lifecycle) with our own timer. On the LOCAL timeout we
+        // return Ok(()) best-effort: a page that never fires `load` (long-poll,
+        // streaming, SPA that never settles) must not hard-fail the action — the
+        // caller will still revalidate the committed URL. A genuine CDP error is
+        // surfaced so the recovery layer can classify it.
+        match tokio::time::timeout(timeout, self.page.wait_for_navigation()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("Navigation wait failed: {}", e)),
+            Err(_) => {
+                // LOCAL-TIMEOUT connection-reset criterion: our `tokio::time::
+                // timeout` cancelled the in-flight `wait_for_navigation` CDP
+                // future, which MAY leave the CDP command channel mid-request.
+                // We do NOT reconnect here unconditionally — the common case is a
+                // benign slow/never-`load` page where the connection is perfectly
+                // healthy, and reconnecting would needlessly drop every session's
+                // pages. Instead we rely on the Task 10 mechanism: the action's
+                // NEXT backend call (the final-committed-URL `page.url()`
+                // revalidation, or the following action's `ensure_ready` health
+                // gate) surfaces a connection-class error if the CDP channel was
+                // actually left dead, and `dispatch_with_recovery` then performs
+                // the single reconnect. A cancelled-but-healthy connection
+                // continues to work with no reset. This is the lightest correct
+                // behavior: reset only when a later call proves CDP is dead.
+                debug!(
+                    "wait_for_navigation local-timeout; proceeding best-effort (next call's health gate catches a dead CDP)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn is_element_visible(&self, selector: &str) -> Result<bool, String> {
+        // Resolve the element via the CDP DOM query (selector never enters a JS
+        // source string), then evaluate a CONSTANT predicate bound to the element
+        // object: laid-out (has an offsetParent OR a non-empty client rect) and
+        // not display:none/visibility:hidden. `position:fixed` elements have a
+        // null offsetParent yet are visible, so the rect check covers them.
+        let element = match self.page.find_element(selector).await {
+            Ok(el) => el,
+            // A missing element is "not visible", not a transport error.
+            Err(_) => return Ok(false),
+        };
+        let ret = element
+            .call_js_fn(
+                "function() { \
+                    const s = window.getComputedStyle(this); \
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false; \
+                    const r = this.getClientRects().length > 0; \
+                    return (this.offsetParent !== null || r); \
+                }",
+                false,
+            )
+            .await
+            .map_err(|e| self.faults.noted(&e, format!("Failed to check visibility of '{}': {}", selector, e)))?;
+        Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    async fn is_element_enabled(&self, selector: &str) -> Result<bool, String> {
+        let element = match self.page.find_element(selector).await {
+            Ok(el) => el,
+            Err(_) => return Ok(false),
+        };
+        // Constant predicate bound to the element: enabled == !disabled. The
+        // `disabled` IDL property is `false` for elements that don't support it,
+        // so non-form elements read as enabled.
+        let ret = element
+            .call_js_fn("function() { return !this.disabled; }", false)
+            .await
+            .map_err(|e| {
+                self.faults.noted(
+                    &e,
+                    format!("Failed to check enabled state of '{}': {}", selector, e),
+                )
+            })?;
+        Ok(ret.result.value.and_then(|v| v.as_bool()).unwrap_or(false))
+    }
+
+    async fn element_facts(
+        &self,
+        selector: &str,
+    ) -> Result<Option<super::policy::ElementFacts>, String> {
+        let Ok(element) = self.page.find_element(selector).await else {
+            return Ok(None);
+        };
+        let ret = element
+            .call_js_fn(super::policy::ELEMENT_FACTS_FN, false)
+            .await
+            .map_err(|e| {
+                self.faults.noted(
+                    &e,
+                    format!("Failed to read element facts of '{}': {}", selector, e),
+                )
+            })?;
+        let value = ret
+            .result
+            .value
+            .ok_or_else(|| format!("No element facts returned for '{}'", selector))?;
+        serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| format!("Unreadable element facts for '{}': {}", selector, e))
+    }
+
+    async fn click(&self, selector: &str) -> Result<(), String> {
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+        element.click().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to click '{}': {}", selector, e))
+        })?;
+        Ok(())
+    }
+
+    async fn type_text(&self, selector: &str, value: &str) -> Result<(), String> {
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+        element.click().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to focus '{}': {}", selector, e))
+        })?;
+        element.type_str(value).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to type into '{}': {}", selector, e))
+        })?;
+        Ok(())
+    }
+
+    async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String> {
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+
+        // Focus the element.
+        element.focus().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to focus '{}': {}", selector, e))
+        })?;
+
+        // Clear the field via a bound JS function — the empty-string literal `''`
+        // is a compile-time constant, NOT user data; no interpolation occurs.
+        element
+            .call_js_fn(
+                "function() { \
+                    this.value = ''; \
+                    this.dispatchEvent(new Event('input', {bubbles: true})); \
+                }",
+                false,
+            )
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to clear '{}': {}", selector, e))
+            })?;
+
+        // Type the new value with real key events (never enters a JS string).
+        element.type_str(value).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to type into '{}': {}", selector, e))
+        })?;
+
+        // Fire a final `change` event (some frameworks rely on it to commit).
+        element
+            .call_js_fn(
+                "function() { \
+                    this.dispatchEvent(new Event('change', {bubbles: true})); \
+                }",
+                false,
+            )
+            .await
+            .map_err(|e| {
+                self.faults.noted(
+                    &e,
+                    format!("Failed to dispatch change on '{}': {}", selector, e),
+                )
+            })?;
+
+        Ok(())
+    }
+
+    async fn evaluate(&self, script: &str) -> Result<Option<serde_json::Value>, String> {
+        let result = self.page.evaluate(script).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("JavaScript execution failed: {}", e))
+        })?;
+        Ok(result.into_value::<serde_json::Value>().ok())
+    }
+
+    async fn inner_text(&self, selector: &str) -> Result<String, String> {
+        // Use the element handle's own `inner_text()` method instead of building
+        // a JS string from the selector.  The old approach interpolated `selector`
+        // into `document.querySelector('<selector>').innerText`, which broke on
+        // backslashes, newlines, and un-escapable CSS escapes, and could inject
+        // arbitrary JS via a crafted selector.
+        //
+        // `Page::find_element` passes the selector to the CDP DOM query (not to
+        // any JS source string), and `Element::inner_text()` evaluates the
+        // constant function `function() { return this.innerText; }` bound to the
+        // element object — NO selector interpolation occurs anywhere.
+        //
+        // Real-Chrome adversarial-selector coverage is deferred to the Task 18
+        // smoke suite; the mock-level dispatch contract (selector passed through
+        // unchanged, no Evaluate call recorded) is locked down in Task 14 tests.
+        let element = self.page.find_element(selector).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Element not found '{}': {}", selector, e))
+        })?;
+
+        Ok(element
+            .inner_text()
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to get text from '{}': {}", selector, e))
+            })?
+            .unwrap_or_else(|| "(could not extract text)".to_string()))
+    }
+
+    async fn body_text(&self) -> Result<String, String> {
+        let result = self
+            .page
+            .evaluate("document.body.innerText")
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to get page text: {}", e))
+            })?;
+
+        Ok(result
+            .into_value::<String>()
+            .unwrap_or_else(|_| "(could not extract text)".to_string()))
+    }
+
+    async fn scroll_by(&self, delta_y: i64) -> Result<(), String> {
+        self.page
+            .evaluate(format!("window.scrollBy(0, {delta_y})"))
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to scroll page: {}", e))
+            })?;
+        Ok(())
+    }
+
+    async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String> {
+        if let Some(selector) = selector {
+            // Element capture: the element's bounds define the image; full_page
+            // does not apply.
+            let element = self.page.find_element(selector).await.map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Element not found '{}': {}", selector, e))
+            })?;
+            element
+                .screenshot(CaptureScreenshotFormat::Png)
+                .await
+                .map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to screenshot element: {}", e))
+                })
+        } else {
+            // full_page=false (default) captures only the current viewport, which
+            // is inherently bounded by the configured window size; full_page=true
+            // captures the entire scrollable page (may be very tall).
+            self.page
+                .screenshot(ScreenshotParams::builder().full_page(full_page).build())
+                .await
+                .map_err(|e| {
+                    self.faults
+                        .noted(&e, format!("Failed to take screenshot: {}", e))
+                })
+        }
+    }
+
+    async fn render_pdf(&self) -> Result<Vec<u8>, String> {
+        let params = PrintToPdfParams::builder()
+            .display_header_footer(false)
+            .print_background(true)
+            .prefer_css_page_size(true)
+            .build();
+        self.page.pdf(params).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to render PDF with Chromium: {}", e))
+        })
+    }
+
+    async fn url(&self) -> Option<String> {
+        self.page.url().await.ok().flatten()
+    }
+
+    async fn start_screencast(
+        &self,
+        max_w: u32,
+        max_h: u32,
+        quality: u8,
+    ) -> Result<ScreencastFrames, String> {
+        use base64::Engine as _;
+        use chromiumoxide::cdp::browser_protocol::page::{
+            EventScreencastFrame, StartScreencastFormat, StartScreencastParams,
+        };
+        let events = self
+            .page
+            .event_listener::<EventScreencastFrame>()
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to listen for frames: {e}"))
+            })?;
+        let params = StartScreencastParams::builder()
+            .format(StartScreencastFormat::Jpeg)
+            .quality(i64::from(quality.clamp(10, 100)))
+            .max_width(i64::from(max_w))
+            .max_height(i64::from(max_h))
+            .build();
+        // A view closed a moment ago may still be stopping its own: one
+        // screencast per page, so stop it first.
+        let _ = self
+            .page
+            .execute(chromiumoxide::cdp::browser_protocol::page::StopScreencastParams::default())
+            .await;
+        self.page.execute(params).await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to start the live view: {e}"))
+        })?;
+        // A new document in the tab (a link, a form sent, a redirect)
+        // stalls Chrome's screencast on the old one: start it again, so the
+        // picture follows the page.
+        let navigations = self
+            .page
+            .event_listener::<chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated>()
+            .await
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to follow the page: {e}"))
+            })?;
+        let page = self.page.clone();
+        // The next frame after a restart is the new document's.
+        let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = moved.clone();
+        let quality = i64::from(quality.clamp(10, 100));
+        let (max_w, max_h) = (i64::from(max_w), i64::from(max_h));
+        let restarts = navigations
+            .filter(|event| futures::future::ready(event.frame.parent_id.is_none()))
+            .then(move |_| {
+                let page = page.clone();
+                mark.store(true, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    // The new document is laid out for the phone's room
+                    // again, so its picture is that size too.
+                    if let Some((w, h)) = fitted_room(page.target_id().as_ref()) {
+                        let _ = page
+                            .execute(
+                                chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams::new(
+                                    w, h, 2.0, true,
+                                ),
+                            )
+                            .await;
+                    }
+                    let again = StartScreencastParams::builder()
+                        .format(StartScreencastFormat::Jpeg)
+                        .quality(quality)
+                        .max_width(max_w)
+                        .max_height(max_h)
+                        .build();
+                    // Chrome still waits for an ack of the old page's last
+                    // frame, which it no longer takes: stop, then start.
+                    let _ = page
+                        .execute(
+                            chromiumoxide::cdp::browser_protocol::page::StopScreencastParams::default(),
+                        )
+                        .await;
+                    let _ = page.execute(again).await;
+                    None
+                }
+            });
+        let painter = self.page.clone();
+        let frames = events.filter_map(move |event| {
+            let moved = moved.clone();
+            let page = painter.clone();
+            async move {
+                // A picture at another size than the room the page is laid
+                // out for (a new document painted at the window's size
+                // before it is laid out again, or the old size just after a
+                // turn) is stale: acknowledge it so the next comes, and
+                // never show it.
+                if let Some((w, h)) = fitted_room(page.target_id().as_ref()) {
+                    let (fw, fh) = (event.metadata.device_width, event.metadata.device_height);
+                    if (fw - f64::from(w)).abs() > 1.0 || (fh - f64::from(h)).abs() > 1.0 {
+                        let _ = page
+                            .execute(
+                                chromiumoxide::cdp::browser_protocol::page::ScreencastFrameAckParams::new(
+                                    event.session_id,
+                                ),
+                            )
+                            .await;
+                        return None;
+                    }
+                }
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(AsRef::<str>::as_ref(&event.data))
+                    .ok()?;
+                Some(ScreencastFrame {
+                    data,
+                    css_w: event.metadata.device_width,
+                    css_h: event.metadata.device_height,
+                    session: event.session_id,
+                    new_page: moved.swap(false, std::sync::atomic::Ordering::Relaxed),
+                })
+            }
+        });
+        let frames =
+            futures::stream::select(frames.map(Some), restarts).filter_map(futures::future::ready);
+        Ok(Box::pin(frames))
+    }
+
+    async fn ack_screencast(&self, session: i64) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::page::ScreencastFrameAckParams;
+        self.page
+            .execute(ScreencastFrameAckParams::new(session))
+            .await
+            .map(|_| ())
+            .map_err(|e| self.faults.noted(&e, format!("Failed to ack a frame: {e}")))
+    }
+
+    async fn stop_screencast(&self) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::page::StopScreencastParams;
+        self.page
+            .execute(StopScreencastParams::default())
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                self.faults
+                    .noted(&e, format!("Failed to stop the live view: {e}"))
+            })
+    }
+
+    async fn restart_screencast(&self, max_w: u32, max_h: u32, quality: u8) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::page::{
+            StartScreencastFormat, StartScreencastParams, StopScreencastParams,
+        };
+        // Chrome still waits for an ack of a frame painted at the old size,
+        // which it no longer takes: stop, then start.
+        let _ = self.page.execute(StopScreencastParams::default()).await;
+        let params = StartScreencastParams::builder()
+            .format(StartScreencastFormat::Jpeg)
+            .quality(i64::from(quality.clamp(10, 100)))
+            .max_width(i64::from(max_w))
+            .max_height(i64::from(max_h))
+            .build();
+        self.page.execute(params).await.map(|_| ()).map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to restart the live view: {e}"))
+        })
+    }
+
+    async fn dispatch_mouse(&self, event: &MouseInput) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+        };
+        let kind = match event.kind {
+            MouseKind::Pressed => DispatchMouseEventType::MousePressed,
+            MouseKind::Released => DispatchMouseEventType::MouseReleased,
+            MouseKind::Moved => DispatchMouseEventType::MouseMoved,
+            MouseKind::Wheel => DispatchMouseEventType::MouseWheel,
+        };
+        let button = match event.button {
+            MouseButtonKind::None => MouseButton::None,
+            MouseButtonKind::Left => MouseButton::Left,
+            MouseButtonKind::Middle => MouseButton::Middle,
+            MouseButtonKind::Right => MouseButton::Right,
+        };
+        let mut params = DispatchMouseEventParams::builder()
+            .r#type(kind)
+            .x(event.x)
+            .y(event.y)
+            .modifiers(event.modifiers)
+            .button(button);
+        if matches!(event.kind, MouseKind::Pressed | MouseKind::Released) {
+            params = params.click_count(event.click_count);
+        }
+        if event.kind == MouseKind::Wheel {
+            params = params.delta_x(event.delta_x).delta_y(event.delta_y);
+        }
+        let params = params
+            .build()
+            .map_err(|e| format!("Bad pointer event: {e}"))?;
+        self.page.execute(params).await.map(|_| ()).map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to send a pointer event: {e}"))
+        })
+    }
+
+    async fn dispatch_key(&self, event: &KeyInput) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        let kind = match (event.down, event.text.is_some()) {
+            (true, true) => DispatchKeyEventType::KeyDown,
+            (true, false) => DispatchKeyEventType::RawKeyDown,
+            (false, _) => DispatchKeyEventType::KeyUp,
+        };
+        let mut params = DispatchKeyEventParams::builder()
+            .r#type(kind)
+            .code(event.code.clone())
+            .key(event.key.clone())
+            .modifiers(event.modifiers);
+        if let Some(text) = &event.text {
+            params = params.text(text.clone()).unmodified_text(text.clone());
+        }
+        if let Some(code) = event.windows_virtual_key_code {
+            params = params
+                .windows_virtual_key_code(code)
+                .native_virtual_key_code(code);
+        }
+        if !event.commands.is_empty() {
+            params = params.commands(event.commands.clone());
+        }
+        let params = params.build().map_err(|e| format!("Bad key event: {e}"))?;
+        self.page
+            .execute(params)
+            .await
+            .map(|_| ())
+            .map_err(|e| self.faults.noted(&e, format!("Failed to send a key: {e}")))
+    }
+
+    async fn insert_text(&self, text: &str) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+        self.page
+            .execute(InsertTextParams::new(text))
+            .await
+            .map(|_| ())
+            .map_err(|e| self.faults.noted(&e, format!("Failed to type: {e}")))
+    }
+
+    async fn viewport(&self) -> Result<(f64, f64), String> {
+        let metrics = self.page.layout_metrics().await.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to read the viewport: {e}"))
+        })?;
+        let viewport = metrics.css_visual_viewport;
+        Ok((viewport.client_width, viewport.client_height))
+    }
+
+    async fn title(&self) -> Option<String> {
+        self.page.get_title().await.ok().flatten()
+    }
+
+    async fn emulate_focus(&self, on: bool) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetFocusEmulationEnabledParams;
+        self.page
+            .execute(SetFocusEmulationEnabledParams::new(on))
+            .await
+            .map(|_| ())
+            .map_err(|e| self.faults.noted(&e, format!("Failed to show focus: {e}")))
+    }
+
+    async fn fit(&self, room: Option<(u32, u32)>) -> Result<(), String> {
+        use chromiumoxide::cdp::browser_protocol::emulation::{
+            ClearDeviceMetricsOverrideParams, SetDeviceMetricsOverrideParams,
+        };
+        {
+            let target = self.page.target_id().as_ref().to_owned();
+            let mut fitted = FITTED.lock().unwrap_or_else(|e| e.into_inner());
+            match room {
+                Some(room) => fitted.insert(target, room),
+                None => fitted.remove(&target),
+            };
+        }
+        let done = match room {
+            // Twice the pixels, so a phone's picture stays sharp.
+            Some((w, h)) => self
+                .page
+                .execute(SetDeviceMetricsOverrideParams::new(w, h, 2.0, true))
+                .await
+                .map(|_| ()),
+            None => self
+                .page
+                .execute(ClearDeviceMetricsOverrideParams::default())
+                .await
+                .map(|_| ()),
+        };
+        done.map_err(|e| {
+            self.faults
+                .noted(&e, format!("Failed to size the page: {e}"))
+        })
+    }
+
+    async fn attach_diagnostics(
+        &self,
+        session_id: &str,
+        tab_id: &str,
+        store: BrowserDiagnosticsStore,
+    ) {
+        use chromiumoxide::cdp::browser_protocol::network::EventLoadingFailed;
+        use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+
+        let session_id = session_id.to_string();
+        let tab_id = tab_id.to_string();
+        let page = Arc::clone(&self.page);
+
+        if let Ok(mut stream) = page.event_listener::<EventConsoleApiCalled>().await {
+            let store = store.clone();
+            let session_id = session_id.clone();
+            let tab_id = tab_id.clone();
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    let level = format!("{:?}", event.r#type);
+                    let message = format_console_api_args(&event.args);
+                    store
+                        .record_console(&session_id, &tab_id, &level, &message)
+                        .await;
+                }
+            });
+        }
+
+        if let Ok(mut stream) = page.event_listener::<EventLoadingFailed>().await {
+            let page_for_url = Arc::clone(&page);
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    let url = page_for_url.url().await.ok().flatten().unwrap_or_default();
+                    let detail = format!("{:?}: {}", event.r#type, event.error_text);
+                    store
+                        .record_network_error(&session_id, &tab_id, &url, &detail)
+                        .await;
+                }
+            });
+        }
+    }
+}
+
+fn format_console_api_args(
+    args: &[chromiumoxide::cdp::js_protocol::runtime::RemoteObject],
+) -> String {
+    args.iter()
+        .map(|arg| {
+            if let Some(v) = &arg.value {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string())
+            } else if let Some(desc) = &arg.description {
+                desc.clone()
+            } else {
+                "(object)".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// =============================================================================
+// Mock backend (test-only)
+// =============================================================================
+
+/// A recorded call against the mock backend, for assertions in tests.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MockCall {
+    EnsureReady,
+    /// Recorded each time the backend creates a new per-session page. Carries the
+    /// synthetic target id handed back, so tests can assert two sessions caused
+    /// two distinct pages.
+    CreatePage(String),
+    /// Recorded by `shutdown`. `graceful` is `true` when the mock performed a
+    /// graceful close (launched browser), `false` when it merely detached an
+    /// attached browser WITHOUT issuing a browser-close command.
+    Shutdown {
+        graceful: bool,
+    },
+    SetHeadlessMode(bool),
+    /// Recorded by `dispose_session` per tab target id it closed.
+    CloseTarget(String),
+    /// Recorded by `dispose_session` per browser context id it disposed.
+    DisposeContext(String),
+    Goto(String),
+    FindElement(String),
+    Click(String),
+    TypeText(String, String),
+    /// Recorded by `MockPage::replace_text`. Fields: (selector, value).
+    ReplaceText(String, String),
+    Evaluate(String),
+    InnerText(String),
+    BodyText,
+    Scroll(i64),
+    /// Recorded by `screenshot`. Fields: (selector, full_page) — lets tests
+    /// assert the viewport default (`full_page=false`) vs. explicit full-page.
+    Screenshot(Option<String>, bool),
+    /// Recorded by the deterministic Chromium PDF primitive.
+    RenderPdf,
+    Url,
+    /// Recorded by `MockBackend::reconnect`. Asserting on its count proves the
+    /// tool layer reconnected exactly once on a connection-class error.
+    Reconnect,
+    /// Recorded each time `wait_for_navigation` is invoked.
+    WaitForNavigation,
+    /// Recorded by `is_element_visible(selector)`.
+    IsVisible(String),
+    /// Recorded by `is_element_enabled(selector)`.
+    IsEnabled(String),
+    /// Recorded by `start_screencast`.
+    StartScreencast,
+    StopScreencast,
+    /// Recorded by `dispatch_mouse`: kind and CSS position (rounded).
+    Mouse(String, i64, i64),
+    /// Recorded by `dispatch_key`: down, code, and whether it typed text.
+    Key(bool, String, bool),
+    /// Recorded by `insert_text`: the number of characters only.
+    InsertText(usize),
+    /// Recorded by `fit`: the room the page was laid out for (`None`: back
+    /// at its own size).
+    Fit(Option<(u32, u32)>),
+    /// Recorded when the browser moves onto a profile that keeps sign-ins.
+    KeepSignIns,
+}
+
+/// Which page operation a scripted connection-class error should fire on, used
+/// by `MockBackend::fail_once_with_connection_error_on`. Distinct ops let a test
+/// target the body_text/inner_text read for the observation-retry case or the
+/// click/replace_text op for the mutation non-replay case.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailOp {
+    BodyText,
+    InnerText,
+    Click,
+    ReplaceText,
+}
+
+/// In-memory mock backend that records calls and returns scripted results. It
+/// has no real Chrome dependency.
+#[cfg(test)]
+pub struct MockBackend {
+    calls: Arc<Mutex<Vec<MockCall>>>,
+    /// Value returned by `evaluate`. `None` mimics a void/`undefined` result.
+    eval_result: Option<serde_json::Value>,
+    /// Text returned by `inner_text` and `body_text`.
+    text_result: String,
+    /// Bytes returned by `screenshot`.
+    screenshot_bytes: Vec<u8>,
+    /// URL returned by `url`.
+    url: Option<String>,
+    connected: AtomicBool,
+    /// Monotonic counter behind a Mutex, used to mint a fresh synthetic page id
+    /// for each `create_page` call (so distinct sessions get distinct ids).
+    next_page_id: Mutex<u64>,
+    /// Live targets the mock browser "holds". `create_page`/`page_for_target`
+    /// append/track here; `list_targets` returns these. Each entry is a
+    /// `TargetInfo`. Shared with `MockPage` so a click can reveal a popup.
+    targets: Arc<Mutex<Vec<TargetInfo>>>,
+    /// A scripted popup revealed (appended to `targets`) the next time a page
+    /// CLICK happens, modeling a `target=_blank`/`window.open` spawn. Shared with
+    /// `MockPage` so the reveal is tied to the click, not to `list_targets`.
+    pending_popup: Arc<Mutex<Option<TargetInfo>>>,
+    /// Handler liveness, mirroring `ChromiumoxideBackend::handler_alive`. Tests
+    /// flip this to model a dead CDP handler; `ensure_ready` consults it and, on
+    /// a dead handler, relaunches (recorded as a fresh `EnsureReady`/`Reconnect`).
+    handler_alive: Arc<AtomicBool>,
+    /// A scripted one-shot connection-class error: the FIRST time the named op
+    /// runs, it returns the connection error and clears the slot, so the retry
+    /// (against a fresh page after reconnect) succeeds. Shared with `MockPage`.
+    pending_fail: Arc<Mutex<Option<FailOp>>>,
+    /// Transport failures the mock reported (each scripted connection error
+    /// records one, as the real adapter does from a typed `CdpError`).
+    faults: ConnectionFaults,
+    /// A scripted one-shot page error: `(op, text)`.
+    pending_page_error: Arc<Mutex<Option<(FailOp, String)>>>,
+    /// When `true`, `create_page` hands back a synthetic browser-context id (one
+    /// per page), modeling `browser_context` isolation. When `false`, context
+    /// ids are `None` (the `page`-isolation default).
+    isolate_contexts: bool,
+    /// When `true`, the mock models an ATTACHED browser (`connected_to_existing`):
+    /// `shutdown` detaches WITHOUT a graceful close (records `graceful: false`).
+    attached: bool,
+    /// When `true`, the mock models a graceful close that ERRORS/TIMES OUT —
+    /// `shutdown` still tears down and records `graceful: false`, exercising the
+    /// forced-cleanup fallback path.
+    graceful_fails: bool,
+    /// Current headless mode, mirroring `ChromiumoxideBackend::headless`. Lets
+    /// `set_headless_mode` detect a REAL mode change (vs. a no-op same-mode call)
+    /// and model the real backend's teardown-on-change (`backend.rs` graceful
+    /// teardown) by recording a `Shutdown` when a browser is live. Defaults to
+    /// `true` (headless), matching the common config default.
+    headless: AtomicBool,
+    /// When `true`, `wait_for_navigation` resolves immediately (modeling a click
+    /// that triggered a navigation, or a navigate whose load event fires fast).
+    /// When `false` (default), navigation resolves immediately anyway — see
+    /// `nav_never_settles` for the never-resolving case. Shared with pages.
+    click_navigates: Arc<AtomicBool>,
+    /// When `true`, `wait_for_navigation` sleeps the FULL `timeout` before
+    /// returning, modeling a page whose `load` event never fires (e.g. a
+    /// long-poll or streaming page). This is the OPT-IN path for tests that
+    /// specifically exercise the bounded-timeout behavior; it should be paired
+    /// with `#[tokio::test(start_paused = true)]` so the fake clock elapses
+    /// the timeout instantly. The default (`false`) makes `wait_for_navigation`
+    /// return immediately, keeping ordinary navigation tests fast. Shared with pages.
+    nav_never_settles: Arc<AtomicBool>,
+    /// When true, the mock Chromium print call never resolves. Used to prove
+    /// the render action's outer timeout cancels a stalled conversion.
+    pdf_never_finishes: Arc<AtomicBool>,
+    /// Deterministic element-state scripting, shared with every `MockPage`.
+    ///
+    /// Each state predicate (present/visible/enabled) reads a per-condition
+    /// "becomes-true-after-N-polls" countdown: while the counter is > 0 the poll
+    /// records its call, decrements, and reports the NOT-satisfied state; at 0 it
+    /// reports satisfied. A value of `u64::MAX` models a condition that NEVER
+    /// becomes true (the bounded-timeout path). `None` means "always satisfied"
+    /// (the default), so existing find_element-based tests keep their behavior.
+    element_state: Arc<Mutex<MockElementState>>,
+    diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
+    diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
+    /// When set, the URL every page reports from `url()` instead of `url`
+    /// (a page that moved to another site).
+    live_url: Arc<Mutex<Option<String>>>,
+    sign_in_store: Arc<std::sync::Mutex<SignInStore>>,
+}
+
+/// Scripted, poll-counted element state for the `wait`-condition tests. Each
+/// `Option<u64>` is a countdown: `None` = condition already satisfied; `Some(n)`
+/// = becomes satisfied after `n` more polls (`u64::MAX` ≈ never). `text` is what
+/// `inner_text` returns once the present countdown reaches 0 (else empty).
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct MockElementState {
+    pub present_after: Option<u64>,
+    pub visible_after: Option<u64>,
+    pub enabled_after: Option<u64>,
+    pub hidden_after: Option<u64>,
+    pub text: Option<String>,
+    pub text_after: Option<u64>,
+    /// Scripted facts per selector for `element_facts`. A selector not
+    /// listed reads as a neutral target, ordinary for both a click (a web
+    /// link) and a fill (a text field).
+    pub facts: std::collections::HashMap<String, MockFacts>,
+}
+
+/// What `MockPage::element_facts` reports for a scripted selector.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub enum MockFacts {
+    Element(super::policy::ElementFacts),
+    Unreadable,
+}
+
+#[cfg(test)]
+impl MockElementState {
+    /// Decrement a countdown, returning whether the condition is NOW satisfied.
+    /// `None` is already-satisfied; `Some(0)` is satisfied; `Some(n>0)`
+    /// decrements toward satisfaction.
+    fn tick(slot: &mut Option<u64>) -> bool {
+        match slot {
+            None => true,
+            Some(0) => true,
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            eval_result: Some(serde_json::json!("mock-eval")),
+            text_result: "mock text".to_string(),
+            screenshot_bytes: vec![0x89, 0x50, 0x4e, 0x47],
+            url: Some("https://mock.example/".to_string()),
+            connected: AtomicBool::new(false),
+            next_page_id: Mutex::new(0),
+            targets: Arc::new(Mutex::new(Vec::new())),
+            pending_popup: Arc::new(Mutex::new(None)),
+            handler_alive: Arc::new(AtomicBool::new(true)),
+            pending_fail: Arc::new(Mutex::new(None)),
+            faults: ConnectionFaults::default(),
+            pending_page_error: Arc::new(Mutex::new(None)),
+            isolate_contexts: false,
+            attached: false,
+            graceful_fails: false,
+            headless: AtomicBool::new(true),
+            click_navigates: Arc::new(AtomicBool::new(false)),
+            nav_never_settles: Arc::new(AtomicBool::new(false)),
+            pdf_never_finishes: Arc::new(AtomicBool::new(false)),
+            element_state: Arc::new(Mutex::new(MockElementState::default())),
+            diagnostic_console: Arc::new(Mutex::new(Vec::new())),
+            diagnostic_network: Arc::new(Mutex::new(Vec::new())),
+            live_url: Arc::new(Mutex::new(None)),
+            sign_in_store: Arc::new(std::sync::Mutex::new(SignInStore::NotKept)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl MockBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Where sign-ins go; `CanKeep` moves to `Kept` on `keep_sign_ins_now`.
+    pub fn with_sign_in_store(self, store: SignInStore) -> Self {
+        *self.sign_in_store.lock().unwrap() = store;
+        self
+    }
+
+    /// Override the value returned by `evaluate`. `Some(Value::Null)` mimics a
+    /// JS expression that returns `null`; `None` mimics `undefined`/void.
+    pub fn with_eval_result(mut self, eval_result: Option<serde_json::Value>) -> Self {
+        self.eval_result = eval_result;
+        self
+    }
+
+    /// Override the text returned by `inner_text` and `body_text`.
+    pub fn with_text_result(mut self, text: impl Into<String>) -> Self {
+        self.text_result = text.into();
+        self
+    }
+
+    /// Override the raw bytes returned by `screenshot`. Lets a test feed a PNG
+    /// header that encodes oversized dimensions so the tool's pre-enqueue bounds
+    /// check rejects it.
+    pub fn with_screenshot_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.screenshot_bytes = bytes;
+        self
+    }
+
+    /// Override the URL the mock's pages report from `url()` (and that `new_tab`
+    /// snapshots into the session). Lets tests feed a path/query-bearing URL to
+    /// assert origin redaction in `list_tabs`.
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    /// Script console logs recorded when diagnostics listeners attach to a page.
+    pub fn with_console_logs(mut self, logs: Vec<(impl Into<String>, impl Into<String>)>) -> Self {
+        self.diagnostic_console = Arc::new(Mutex::new(
+            logs.into_iter()
+                .map(|(level, msg)| (level.into(), msg.into()))
+                .collect(),
+        ));
+        self
+    }
+
+    /// Script network errors recorded when diagnostics listeners attach to a page.
+    pub fn with_network_errors(
+        mut self,
+        errors: Vec<(impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.diagnostic_network = Arc::new(Mutex::new(
+            errors
+                .into_iter()
+                .map(|(url, err)| (url.into(), err.into()))
+                .collect(),
+        ));
+        self
+    }
+
+    /// Model `browser_context` isolation: `create_page` returns a synthetic
+    /// context id per page (so eviction has something to dispose).
+    pub fn with_isolated_contexts(mut self) -> Self {
+        self.isolate_contexts = true;
+        self
+    }
+
+    /// Model an ATTACHED browser (`connected_to_existing`): `shutdown` must
+    /// detach WITHOUT a graceful browser-close command.
+    pub fn attached(mut self) -> Self {
+        self.attached = true;
+        self
+    }
+
+    /// Script deterministic, poll-counted element state for the `wait`-condition
+    /// tests (present/visible/enabled/hidden/text_contains). See
+    /// [`MockElementState`].
+    pub fn with_element_state(mut self, state: MockElementState) -> Self {
+        self.element_state = Arc::new(Mutex::new(state));
+        self
+    }
+
+    /// Make every page report `url` from `url()` from now on (the page moved
+    /// to another site).
+    pub async fn set_page_url(&self, url: &str) {
+        *self.live_url.lock().await = Some(url.to_string());
+    }
+
+    /// Script the facts `element_facts` reports for `selector` from now on.
+    pub async fn set_element_facts(&self, selector: &str, facts: MockFacts) {
+        self.element_state
+            .lock()
+            .await
+            .facts
+            .insert(selector.to_string(), facts);
+    }
+
+    /// Model a click that triggers a navigation: `wait_for_navigation` resolves
+    /// immediately so the click nav-race's nav branch wins. The default also
+    /// resolves immediately, so this flag's primary effect is semantic clarity in
+    /// tests that distinguish "navigating" from "non-navigating" clicks.
+    pub fn with_click_navigates(self) -> Self {
+        self.click_navigates.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Model a page whose `load` event NEVER fires: `wait_for_navigation` sleeps
+    /// the full `timeout` duration before returning. Use this OPT-IN flag in tests
+    /// that specifically exercise the bounded-timeout path, paired with
+    /// `#[tokio::test(start_paused = true)]` so the fake clock elapses instantly.
+    pub fn with_nav_never_settles(self) -> Self {
+        self.nav_never_settles.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Model a Chromium print command that never returns. The caller's action
+    /// timeout—not the mock—must end the operation.
+    pub fn with_pdf_never_finishes(self) -> Self {
+        self.pdf_never_finishes.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Model a graceful close that errors/times out: `shutdown` still tears down
+    /// (forced-cleanup fallback) and records `graceful: false`.
+    pub fn with_failing_graceful_close(mut self) -> Self {
+        self.graceful_fails = true;
+        self
+    }
+
+    /// Shared handle to the recorded call log, for assertions.
+    pub fn calls(&self) -> Arc<Mutex<Vec<MockCall>>> {
+        Arc::clone(&self.calls)
+    }
+
+    /// Script a popup target revealed by the next `MockPage::click` (appended to
+    /// the live target set on click), simulating a click that opened a new tab
+    /// (`target=_blank` / `window.open`). The popup's `opener_id` is left `None`,
+    /// so callers that need it attributed to a clicking session should use
+    /// [`MockBackend::script_popup_with_opener`] with that session's active
+    /// target id. The given `url` is used verbatim so tests can assert origin
+    /// redaction (e.g. include a path + query string).
+    #[allow(dead_code)]
+    pub async fn script_popup(&self, target_id: &str, title: &str, url: &str) {
+        self.script_popup_with_opener(target_id, title, url, None)
+            .await;
+    }
+
+    /// Like [`MockBackend::script_popup`], but sets the popup's `opener_id`.
+    ///
+    /// Pass `Some(active_target_id)` of the clicking session to model a popup
+    /// the session legitimately spawned (it should be attributed to that
+    /// session). Pass a DIFFERENT target id to model a tab opened by another
+    /// session / independently (it must NOT be attributed to the clicker).
+    pub async fn script_popup_with_opener(
+        &self,
+        target_id: &str,
+        title: &str,
+        url: &str,
+        opener_id: Option<&str>,
+    ) {
+        *self.pending_popup.lock().await = Some(TargetInfo {
+            target_id: target_id.to_string(),
+            title: Some(title.to_string()),
+            url: Some(url.to_string()),
+            opener_id: opener_id.map(|s| s.to_string()),
+        });
+    }
+
+    /// Mark the mock's CDP handler as dead, modeling a browser whose connection
+    /// died. `ensure_ready` sees `is_some && !handler_alive` and relaunches.
+    pub fn mark_handler_dead(&self) {
+        self.handler_alive.store(false, Ordering::SeqCst);
+    }
+
+    /// Script a one-shot connection-class error on the next invocation of `op`.
+    /// The op records its `MockCall` (so we can assert it ran), then returns a
+    /// transport-class error string and clears the slot — so a retry succeeds.
+    pub async fn fail_once_with_connection_error_on(&self, op: FailOp) {
+        *self.pending_fail.lock().await = Some(op);
+    }
+
+    /// Script a one-shot PAGE error on the next invocation of `op`: it fails
+    /// with `text` (whatever it says) and records no transport failure, as a
+    /// script exception or a missing element does.
+    pub async fn fail_once_with_page_error_on(&self, op: FailOp, text: &str) {
+        *self.pending_page_error.lock().await = Some((op, text.to_string()));
+    }
+
+    /// Count of `Reconnect` calls recorded so far.
+    pub async fn reconnect_count(&self) -> usize {
+        self.calls
+            .lock()
+            .await
+            .iter()
+            .filter(|c| matches!(c, MockCall::Reconnect))
+            .count()
+    }
+
+    async fn record(&self, call: MockCall) {
+        self.calls.lock().await.push(call);
+    }
+}
+
+/// The error text a scripted mock connection failure returns. The tool
+/// recovers because the failure is recorded in `faults`, not because of
+/// this text.
+#[cfg(test)]
+const MOCK_CONNECTION_ERROR: &str = "WebSocket connection closed: Sender was dropped";
+
+#[cfg(test)]
+struct MockPage {
+    /// Synthetic page/target id this handle was created with. Lets tests tie a
+    /// recorded action back to the specific per-session page it ran on.
+    #[allow(dead_code)]
+    page_id: String,
+    calls: Arc<Mutex<Vec<MockCall>>>,
+    eval_result: Option<serde_json::Value>,
+    text_result: String,
+    screenshot_bytes: Vec<u8>,
+    url: Option<String>,
+    /// Shared live-target list + scripted popup, so a click on this page can
+    /// reveal a popup target (modeling target=_blank/window.open).
+    targets: Arc<Mutex<Vec<TargetInfo>>>,
+    pending_popup: Arc<Mutex<Option<TargetInfo>>>,
+    /// Shared one-shot connection-error script (see `MockBackend::pending_fail`).
+    pending_fail: Arc<Mutex<Option<FailOp>>>,
+    /// Shared with the backend (`MockBackend::faults`).
+    faults: ConnectionFaults,
+    /// Shared with the backend (`MockBackend::pending_page_error`).
+    pending_page_error: Arc<Mutex<Option<(FailOp, String)>>>,
+    /// Shared scripted element state for the `wait`-condition tests.
+    element_state: Arc<Mutex<MockElementState>>,
+    /// Shared click-navigation flag for the click nav-race tests.
+    #[allow(dead_code)]
+    click_navigates: Arc<AtomicBool>,
+    /// Shared never-settles flag: when `true`, `wait_for_navigation` sleeps the
+    /// full timeout (opt-in for bounded-timeout tests under paused clock).
+    nav_never_settles: Arc<AtomicBool>,
+    /// Shared print-stall flag used by the render timeout regression.
+    pdf_never_finishes: Arc<AtomicBool>,
+    /// Scripted console logs flushed into the diagnostics store on attach.
+    diagnostic_console: Arc<Mutex<Vec<(String, String)>>>,
+    /// Scripted network errors flushed into the diagnostics store on attach.
+    diagnostic_network: Arc<Mutex<Vec<(String, String)>>>,
+    /// When set, the URL every page reports from `url()` instead of `url`
+    /// (a page that moved to another site).
+    live_url: Arc<Mutex<Option<String>>>,
+}
+
+#[cfg(test)]
+impl MockPage {
+    async fn record(&self, call: MockCall) {
+        self.calls.lock().await.push(call);
+    }
+
+    /// If a one-shot connection error is scripted for `op`, consume it and return
+    /// the transport-class error string; otherwise `None` (op proceeds normally).
+    async fn take_scripted_failure(&self, op: FailOp) -> Option<String> {
+        let mut slot = self.pending_fail.lock().await;
+        if *slot == Some(op) {
+            *slot = None;
+            self.faults.record();
+            return Some(MOCK_CONNECTION_ERROR.to_string());
+        }
+        let mut page_error = self.pending_page_error.lock().await;
+        if page_error
+            .as_ref()
+            .is_some_and(|(failing, _)| *failing == op)
+        {
+            return page_error.take().map(|(_, text)| text);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl PageHandle for MockPage {
+    async fn goto(&self, url: &str) -> Result<(), String> {
+        self.record(MockCall::Goto(url.to_string())).await;
+        Ok(())
+    }
+
+    async fn find_element(&self, selector: &str) -> Result<(), String> {
+        self.record(MockCall::FindElement(selector.to_string()))
+            .await;
+        // Respect a scripted `present_after` countdown so the `wait` action's
+        // `present` (and `hidden`) conditions can become true after N polls.
+        let satisfied = {
+            let mut st = self.element_state.lock().await;
+            MockElementState::tick(&mut st.present_after)
+        };
+        if satisfied {
+            Ok(())
+        } else {
+            Err(format!("Element not found '{}': not present yet", selector))
+        }
+    }
+
+    async fn wait_for_navigation(&self, timeout: Duration) -> Result<(), String> {
+        self.record(MockCall::WaitForNavigation).await;
+        if self.nav_never_settles.load(Ordering::SeqCst) {
+            // Opt-in never-settling mode: model a page whose `load` event never
+            // fires (long-poll, streaming). Sleep the full bound so bounded-timeout
+            // tests can verify the caller is not stuck. Pair with
+            // `#[tokio::test(start_paused = true)]` so the fake clock elapses
+            // this instantly with no real wall-clock cost.
+            tokio::time::sleep(timeout).await;
+            Ok(())
+        } else {
+            // Default (fast) path: return immediately. Most tests just need
+            // `navigate`/`click` to dispatch; they don't care about the actual
+            // navigation-readiness wait. This avoids any real sleep, keeping the
+            // ordinary test suite instant even without a paused clock.
+            Ok(())
+        }
+    }
+
+    async fn is_element_visible(&self, selector: &str) -> Result<bool, String> {
+        self.record(MockCall::IsVisible(selector.to_string())).await;
+        let mut st = self.element_state.lock().await;
+        // `hidden_after` models an element that starts VISIBLE and becomes hidden
+        // after N polls — the inverse countdown, used by the `hidden` condition.
+        if st.hidden_after.is_some() {
+            // Returns `false` (hidden) once the countdown reaches 0, `true`
+            // (still visible) before then.
+            return Ok(!MockElementState::tick(&mut st.hidden_after));
+        }
+        Ok(MockElementState::tick(&mut st.visible_after))
+    }
+
+    async fn is_element_enabled(&self, selector: &str) -> Result<bool, String> {
+        self.record(MockCall::IsEnabled(selector.to_string())).await;
+        let mut st = self.element_state.lock().await;
+        Ok(MockElementState::tick(&mut st.enabled_after))
+    }
+
+    async fn element_facts(
+        &self,
+        selector: &str,
+    ) -> Result<Option<super::policy::ElementFacts>, String> {
+        let scripted = self.element_state.lock().await.facts.get(selector).cloned();
+        match scripted {
+            Some(MockFacts::Element(facts)) => Ok(Some(facts)),
+            Some(MockFacts::Unreadable) => Err("facts unavailable".to_string()),
+            None => Ok(Some(super::policy::ElementFacts {
+                tag: "input".to_string(),
+                input_type: Some("text".to_string()),
+                link_scheme: Some("https".to_string()),
+                editable: true,
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn click(&self, selector: &str) -> Result<(), String> {
+        self.record(MockCall::Click(selector.to_string())).await;
+        if let Some(err) = self.take_scripted_failure(FailOp::Click).await {
+            return Err(err);
+        }
+        // A click reveals any scripted popup: it appears as a new live target,
+        // exactly as a real target=_blank/window.open would after the click.
+        if let Some(popup) = self.pending_popup.lock().await.take() {
+            self.targets.lock().await.push(popup);
+        }
+        Ok(())
+    }
+
+    async fn type_text(&self, selector: &str, value: &str) -> Result<(), String> {
+        self.record(MockCall::TypeText(selector.to_string(), value.to_string()))
+            .await;
+        Ok(())
+    }
+
+    async fn replace_text(&self, selector: &str, value: &str) -> Result<(), String> {
+        self.record(MockCall::ReplaceText(
+            selector.to_string(),
+            value.to_string(),
+        ))
+        .await;
+        if let Some(err) = self.take_scripted_failure(FailOp::ReplaceText).await {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn evaluate(&self, script: &str) -> Result<Option<serde_json::Value>, String> {
+        self.record(MockCall::Evaluate(script.to_string())).await;
+        Ok(self.eval_result.clone())
+    }
+
+    async fn inner_text(&self, selector: &str) -> Result<String, String> {
+        self.record(MockCall::InnerText(selector.to_string())).await;
+        if let Some(err) = self.take_scripted_failure(FailOp::InnerText).await {
+            return Err(err);
+        }
+        // If text is scripted with a poll countdown (text_contains condition),
+        // return empty until the countdown reaches 0, then the scripted text.
+        let mut st = self.element_state.lock().await;
+        if st.text.is_some() {
+            let ready = MockElementState::tick(&mut st.text_after);
+            return Ok(if ready {
+                st.text.clone().unwrap_or_default()
+            } else {
+                String::new()
+            });
+        }
+        Ok(self.text_result.clone())
+    }
+
+    async fn body_text(&self) -> Result<String, String> {
+        self.record(MockCall::BodyText).await;
+        if let Some(err) = self.take_scripted_failure(FailOp::BodyText).await {
+            return Err(err);
+        }
+        Ok(self.text_result.clone())
+    }
+
+    async fn scroll_by(&self, delta_y: i64) -> Result<(), String> {
+        self.record(MockCall::Scroll(delta_y)).await;
+        Ok(())
+    }
+
+    async fn screenshot(&self, selector: Option<&str>, full_page: bool) -> Result<Vec<u8>, String> {
+        self.record(MockCall::Screenshot(
+            selector.map(|s| s.to_string()),
+            full_page,
+        ))
+        .await;
+        Ok(self.screenshot_bytes.clone())
+    }
+
+    async fn render_pdf(&self) -> Result<Vec<u8>, String> {
+        self.record(MockCall::RenderPdf).await;
+        if self.pdf_never_finishes.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        Ok(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n".to_vec())
+    }
+
+    async fn url(&self) -> Option<String> {
+        self.record(MockCall::Url).await;
+        if let Some(url) = self.live_url.lock().await.clone() {
+            return Some(url);
+        }
+        self.url.clone()
+    }
+
+    async fn start_screencast(
+        &self,
+        _max_w: u32,
+        _max_h: u32,
+        _quality: u8,
+    ) -> Result<ScreencastFrames, String> {
+        self.record(MockCall::StartScreencast).await;
+        let frame = ScreencastFrame {
+            data: b"\xff\xd8mock-frame".to_vec(),
+            css_w: 1280.0,
+            css_h: 720.0,
+            session: 1,
+            new_page: false,
+        };
+        Ok(Box::pin(
+            futures::stream::iter(vec![frame]).chain(futures::stream::pending()),
+        ))
+    }
+
+    async fn stop_screencast(&self) -> Result<(), String> {
+        self.record(MockCall::StopScreencast).await;
+        Ok(())
+    }
+
+    async fn dispatch_mouse(&self, event: &MouseInput) -> Result<(), String> {
+        self.record(MockCall::Mouse(
+            format!("{:?}", event.kind),
+            event.x.round() as i64,
+            event.y.round() as i64,
+        ))
+        .await;
+        Ok(())
+    }
+
+    async fn dispatch_key(&self, event: &KeyInput) -> Result<(), String> {
+        self.record(MockCall::Key(
+            event.down,
+            event.code.clone(),
+            event.text.is_some(),
+        ))
+        .await;
+        Ok(())
+    }
+
+    async fn insert_text(&self, text: &str) -> Result<(), String> {
+        self.record(MockCall::InsertText(text.chars().count()))
+            .await;
+        Ok(())
+    }
+
+    async fn viewport(&self) -> Result<(f64, f64), String> {
+        Ok((1280.0, 720.0))
+    }
+
+    async fn fit(&self, room: Option<(u32, u32)>) -> Result<(), String> {
+        self.record(MockCall::Fit(room)).await;
+        Ok(())
+    }
+
+    async fn title(&self) -> Option<String> {
+        Some("Mock page".into())
+    }
+
+    async fn attach_diagnostics(
+        &self,
+        session_id: &str,
+        tab_id: &str,
+        store: BrowserDiagnosticsStore,
+    ) {
+        for (level, message) in self.diagnostic_console.lock().await.iter() {
+            store
+                .record_console(session_id, tab_id, level, message)
+                .await;
+        }
+        for (url, error) in self.diagnostic_network.lock().await.iter() {
+            store
+                .record_network_error(session_id, tab_id, url, error)
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl BrowserBackend for MockBackend {
+    fn connection_faults(&self) -> u64 {
+        self.faults.count()
+    }
+
+    async fn ensure_ready(&self) -> Result<(), String> {
+        self.record(MockCall::EnsureReady).await;
+        // Model the production health check: a (re)launch revives the handler and
+        // marks the connection live. A test that flipped `mark_handler_dead`
+        // before this call sees the EnsureReady record + a revived handler,
+        // proving a dead handler is no longer treated as healthy.
+        self.connected.store(true, Ordering::Relaxed);
+        self.handler_alive.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn create_page(&self) -> Result<(String, Option<String>, Arc<dyn PageHandle>), String> {
+        let page_id = {
+            let mut counter = self.next_page_id.lock().await;
+            *counter += 1;
+            format!("mock-page-{}", *counter)
+        };
+        self.record(MockCall::CreatePage(page_id.clone())).await;
+        // In browser_context isolation mode, hand back a synthetic context id
+        // (one per page) so eviction/close has something to dispose.
+        let context_id = self
+            .isolate_contexts
+            .then(|| format!("mock-ctx-{}", page_id));
+        // Register the new target so list_targets/popup-diff can see it.
+        self.targets.lock().await.push(TargetInfo {
+            target_id: page_id.clone(),
+            title: Some("mock tab".to_string()),
+            url: self.url.clone(),
+            // A directly-created page has no opener (independent tab).
+            opener_id: None,
+        });
+        Ok((
+            page_id.clone(),
+            context_id,
+            Arc::new(MockPage {
+                page_id,
+                calls: Arc::clone(&self.calls),
+                eval_result: self.eval_result.clone(),
+                text_result: self.text_result.clone(),
+                screenshot_bytes: self.screenshot_bytes.clone(),
+                url: self.url.clone(),
+                targets: Arc::clone(&self.targets),
+                pending_popup: Arc::clone(&self.pending_popup),
+                pending_fail: Arc::clone(&self.pending_fail),
+                faults: self.faults.clone(),
+                pending_page_error: Arc::clone(&self.pending_page_error),
+                element_state: Arc::clone(&self.element_state),
+                click_navigates: Arc::clone(&self.click_navigates),
+                nav_never_settles: Arc::clone(&self.nav_never_settles),
+                pdf_never_finishes: Arc::clone(&self.pdf_never_finishes),
+                diagnostic_console: Arc::clone(&self.diagnostic_console),
+                diagnostic_network: Arc::clone(&self.diagnostic_network),
+                live_url: Arc::clone(&self.live_url),
+            }),
+        ))
+    }
+
+    async fn shutdown(&self) -> Result<String, String> {
+        // Attached or failing-graceful both end in a forced/detach teardown that
+        // records `graceful: false`; a healthy launched browser records
+        // `graceful: true`. Either way the connection ends up torn down.
+        let graceful = !self.attached && !self.graceful_fails;
+        self.record(MockCall::Shutdown { graceful }).await;
+        self.connected.store(false, Ordering::Relaxed);
+        self.handler_alive.store(false, Ordering::SeqCst);
+        if self.attached {
+            Ok("Disconnected from Chrome (your browser is still running).".to_string())
+        } else {
+            Ok("Browser session closed.".to_string())
+        }
+    }
+
+    async fn dispose_session(&self, tab_target_ids: &[String], context_ids: &[String]) {
+        for target_id in tab_target_ids {
+            self.record(MockCall::CloseTarget(target_id.clone())).await;
+            self.targets
+                .lock()
+                .await
+                .retain(|t| &t.target_id != target_id);
+        }
+        for context_id in context_ids {
+            self.record(MockCall::DisposeContext(context_id.clone()))
+                .await;
+        }
+    }
+
+    async fn set_headless_mode(&self, headless: bool, mode: &str) -> Result<String, String> {
+        self.record(MockCall::SetHeadlessMode(headless)).await;
+        // Mirror the real backend (`ChromiumoxideBackend::set_headless_mode` →
+        // `graceful_teardown`): a REAL mode change while a browser is live tears
+        // the old browser down through the shared graceful-shutdown path so the
+        // next action relaunches in the new mode; a no-op same-mode call does
+        // NOT. Recording `Shutdown` here lets tests verify that reuse instead of
+        // only asserting the mode switch was routed to the backend.
+        let old = self.headless.swap(headless, Ordering::Relaxed);
+        let changed = old != headless;
+        if changed && self.connected.load(Ordering::Relaxed) {
+            let graceful = !self.attached && !self.graceful_fails;
+            self.record(MockCall::Shutdown { graceful }).await;
+            self.connected.store(false, Ordering::Relaxed);
+            self.handler_alive.store(false, Ordering::SeqCst);
+        }
+        Ok(format!("Switched to {} mode.", mode))
+    }
+
+    async fn list_targets(&self) -> Result<Vec<TargetInfo>, String> {
+        Ok(self.targets.lock().await.clone())
+    }
+
+    async fn page_for_target(&self, target_id: &str) -> Result<Arc<dyn PageHandle>, String> {
+        let known = self
+            .targets
+            .lock()
+            .await
+            .iter()
+            .any(|t| t.target_id == target_id);
+        if !known {
+            return Err(format!("Tab '{}' not found", target_id));
+        }
+        Ok(Arc::new(MockPage {
+            page_id: target_id.to_string(),
+            calls: Arc::clone(&self.calls),
+            eval_result: self.eval_result.clone(),
+            text_result: self.text_result.clone(),
+            screenshot_bytes: self.screenshot_bytes.clone(),
+            url: self.url.clone(),
+            targets: Arc::clone(&self.targets),
+            pending_popup: Arc::clone(&self.pending_popup),
+            pending_fail: Arc::clone(&self.pending_fail),
+            faults: self.faults.clone(),
+            pending_page_error: Arc::clone(&self.pending_page_error),
+            element_state: Arc::clone(&self.element_state),
+            click_navigates: Arc::clone(&self.click_navigates),
+            nav_never_settles: Arc::clone(&self.nav_never_settles),
+            pdf_never_finishes: Arc::clone(&self.pdf_never_finishes),
+            diagnostic_console: Arc::clone(&self.diagnostic_console),
+            diagnostic_network: Arc::clone(&self.diagnostic_network),
+            live_url: Arc::clone(&self.live_url),
+        }))
+    }
+
+    async fn close_target(&self, target_id: &str) -> Result<(), String> {
+        self.targets
+            .lock()
+            .await
+            .retain(|t| t.target_id != target_id);
+        Ok(())
+    }
+
+    async fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed) && self.handler_alive.load(Ordering::SeqCst)
+    }
+
+    async fn reconnect(&self) -> Result<(), String> {
+        self.record(MockCall::Reconnect).await;
+        // A successful reconnect revives the connection + handler.
+        self.connected.store(true, Ordering::Relaxed);
+        self.handler_alive.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn sign_in_store(&self) -> SignInStore {
+        *self.sign_in_store.lock().unwrap()
+    }
+
+    async fn keep_sign_ins_now(&self) -> Result<bool, String> {
+        let moved = {
+            let mut store = self.sign_in_store.lock().unwrap();
+            let can = *store == SignInStore::CanKeep;
+            if can {
+                *store = SignInStore::Kept;
+            }
+            can
+        };
+        if moved {
+            self.record(MockCall::KeepSignIns).await;
+        }
+        Ok(moved)
+    }
+}
+
+// =============================================================================
+// Backend construction / isolation-resolution tests (no real Chrome needed)
+// =============================================================================
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use crate::settings::SessionIsolation;
+
+    fn ephemeral_config() -> BrowserSettings {
+        BrowserSettings {
+            headless: true,
+            screenshot_width: 1280,
+            screenshot_height: 720,
+            remote_debugging_port: None,
+            user_data_dir: None,
+            profile: None,
+            session_isolation: None,
+            ..BrowserSettings::default()
+        }
+    }
+
+    #[test]
+    fn ephemeral_auto_resolves_to_browser_context() {
+        match ChromiumoxideBackend::new(ephemeral_config()) {
+            Ok(backend) => assert_eq!(
+                backend.session_isolation(),
+                SessionIsolation::BrowserContext
+            ),
+            Err(e) => panic!("ephemeral config must construct: {e}"),
+        }
+    }
+
+    #[test]
+    fn profile_auto_resolves_to_page() {
+        let mut config = ephemeral_config();
+        config.user_data_dir = Some("/tmp/profile".to_string());
+        match ChromiumoxideBackend::new(config) {
+            Ok(backend) => assert_eq!(backend.session_isolation(), SessionIsolation::Page),
+            Err(e) => panic!("profile config must construct: {e}"),
+        }
+    }
+
+    #[test]
+    fn incompatible_browser_context_with_profile_is_rejected_at_construction() {
+        let mut config = ephemeral_config();
+        config.session_isolation = Some(SessionIsolation::BrowserContext);
+        config.user_data_dir = Some("/tmp/profile".to_string());
+        match ChromiumoxideBackend::new(config) {
+            Ok(_) => {
+                panic!("browser_context + persistent profile must fail fast at construction")
+            }
+            Err(err) => assert!(
+                err.contains("browser_context"),
+                "construction error should explain the incompatibility: {err}"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod breach_warning_tests {
+    use super::quiet_breach_warning;
+
+    #[test]
+    fn the_breach_warning_is_turned_off_and_the_rest_kept() {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let profile = dir.path().join("Default");
+        quiet_breach_warning(&profile).expect("fresh profile");
+        let prefs: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(profile.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(prefs["profile"]["password_manager_leak_detection"], false);
+
+        std::fs::write(
+            profile.join("Preferences"),
+            r#"{"profile":{"name":"Agent","password_manager_leak_detection":true},"homepage":"about:blank"}"#,
+        )
+        .unwrap();
+        quiet_breach_warning(&profile).expect("existing profile");
+        let prefs: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(profile.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(prefs["profile"]["password_manager_leak_detection"], false);
+        assert_eq!(prefs["profile"]["name"], "Agent");
+        assert_eq!(prefs["homepage"], "about:blank");
+    }
+}

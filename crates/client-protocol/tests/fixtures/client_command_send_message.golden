@@ -1,0 +1,24 @@
+{
+  "command": {
+    "attachments": [
+      {
+        "id": "up-1",
+        "mime": "application/pdf",
+        "name": "report.pdf",
+        "size_bytes": 2048
+      }
+    ],
+    "effort": "high",
+    "mid_run": "queue",
+    "model": {
+      "mode": "pinned",
+      "model": "synthetic-model-large",
+      "provider": "main"
+    },
+    "project_id": "project-acme",
+    "text": "Post the synthetic report for Alice Rivera",
+    "type": "send_message"
+  },
+  "request_id": "5d0c2b1e-0001",
+  "type": "command"
+}

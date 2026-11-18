@@ -1,0 +1,9 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "new_session": true,
+    "session_id": "app:6c1f",
+    "type": "message_accepted"
+  },
+  "type": "ack"
+}

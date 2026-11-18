@@ -1,0 +1,25 @@
+{
+  "description": "Ask the agent coordinating this request to decide something you should not decide alone: work another sub-agent may already be doing, or a conflict with its changes. Use it sparingly; the answer is one of proceed, stop or instead (do what the note says), with a note.",
+  "name": "escalate_to_parent",
+  "schema": {
+    "description": "Ask the agent coordinating this request to decide something you should not decide alone: work another sub-agent may already be doing, or a conflict with its changes. Use it sparingly; the answer is one of proceed, stop or instead (do what the note says), with a note.",
+    "name": "escalate_to_parent",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "description": "What you have found that the coordinator needs to decide.",
+          "type": "string"
+        },
+        "question": {
+          "description": "What you need decided.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    }
+  }
+}

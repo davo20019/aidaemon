@@ -51,10 +51,75 @@ pub(crate) fn load_agent_persona(
     Ok(Some(persona.to_string()))
 }
 
+/// What the base prompt says about memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemoryPrompt {
+    /// The daemon's own memory and its tools.
+    DaemonsOwn,
+    /// Another memory system, with its own guidance if it has any.
+    Replaced(Option<String>),
+}
+
+const DAEMON_MEMORY_SECTION: &str = "## Memory
+You have persistent memory across sessions. Your memory is accessed on demand via tools — \
+it is NOT pre-loaded into this prompt. When the user asks about their preferences, goals, \
+contacts, or past interactions, use the appropriate tool to look it up.
+
+**Storing facts:** Use `remember_fact` ONLY for stable, long-term knowledge about the user — \
+preferences, personal info, environment details, communication patterns. \
+Do NOT save task-scoped research or content being built for a specific project. \
+When the user says \"learn this\", \"remember this\", or \"save these\" about themselves, use `remember_fact`. \
+When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
+
+**Recalling facts:** Use `manage_memories(action='search', query='...')` to look up stored facts. \
+Use `manage_memories(action='search_episodes', query='...')` for coarse semantic conversation recall, \
+then `search_history(action='search', query='...')` for exact retained user/assistant messages, anchored \
+context, task bookends, and signed forward/backward paging. \
+Only state what your tools return. NEVER infer, guess, or fabricate personal data. \
+\"I don't have that stored\" is always a valid answer.
+
+";
+
+const DAEMON_MEMORY_TABLE_ROWS: &str = "| Store user info | remember_fact | — |
+| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories |
+";
+
+const DAEMON_CORRECTION_RULE: &str =
+    "- **Learn from corrections.** When the user corrects you, store it with `remember_fact` \
+(category \"preference\") so you remember next time.
+";
+
+const DAEMON_PEOPLE_TABLE_ROW: &str = "\n| Remember other people, family, relationships | manage_people (remember) | — |\n| Track contacts, birthdays | manage_people | — |";
+
+/// The memory parts of the base prompt: section, tool-table rows, correction
+/// rule, people row.
+fn memory_prompt_parts(
+    memory: &MemoryPrompt,
+) -> (String, &'static str, &'static str, &'static str) {
+    match memory {
+        MemoryPrompt::DaemonsOwn => (
+            DAEMON_MEMORY_SECTION.to_string(),
+            DAEMON_MEMORY_TABLE_ROWS,
+            DAEMON_CORRECTION_RULE,
+            DAEMON_PEOPLE_TABLE_ROW,
+        ),
+        MemoryPrompt::Replaced(guidance) => (
+            guidance
+                .as_deref()
+                .map(|guidance| format!("## Memory\n{}\n\n", guidance.trim()))
+                .unwrap_or_default(),
+            "",
+            "",
+            "",
+        ),
+    }
+}
+
 pub(crate) fn build_base_system_prompt(
     config: &AppConfig,
     skill_names: &[String],
     custom_persona: Option<&str>,
+    memory: &MemoryPrompt,
 ) -> anyhow::Result<String> {
     let agent_name = config.agent.validated_name()?;
     let custom_persona_section = custom_persona
@@ -76,13 +141,21 @@ pub(crate) fn build_base_system_prompt(
     };
 
     let cli_agent_table_row = if config.cli_agents.enabled {
-        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal/run_command for simple or fallback work |"
+        "\n| Complex multi-step tasks (research, coding, analysis, admin) | cli_agent (REQUIRED when available at runtime) | terminal for simple or fallback work |"
     } else {
         ""
     };
 
     let manage_cli_agents_table_row = if config.cli_agents.enabled {
         "\n| List installed CLI AI agents, or add/enable/disable them (Claude Code, Gemini, etc.) | manage_cli_agents | — |"
+    } else {
+        ""
+    };
+
+    // goal_trace and self_diagnose register only with diagnostics on.
+    let diagnostics_table_rows = if config.diagnostics.enabled {
+        "| Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |\n\
+         | Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |\n"
     } else {
         ""
     };
@@ -117,20 +190,17 @@ pub(crate) fn build_base_system_prompt(
         ""
     };
 
-    let manage_people_table_row =
-        "\n| Track contacts, relationships, birthdays | manage_people | — |";
+    let (memory_section, memory_table_rows, correction_rule, manage_people_table_row) =
+        memory_prompt_parts(memory);
+    // Live 2026-11-12: a run reported "can't connect to Docker" with
+    // OrbStack stopped instead of starting it.
+    let obstacle_guidance = aidaemon_policies::OBSTACLE_GUIDANCE;
 
-    let http_request_table_row =
-        "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
+    let http_request_table_row = "\n| Make authenticated API requests (Twitter, Stripe, etc.) | http_request | terminal (curl) |";
 
-    let manage_api_table_row =
-        "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
+    let manage_api_table_row = "\n| Deterministically connect, learn, and verify an API end-to-end | manage_api | manual multi-tool orchestration |";
 
-    let manage_http_auth_table_row =
-        "\n| Create and verify generic API auth profiles | manage_http_auth | manual config edits + keychain commands |";
-
-    let manage_oauth_table_row =
-        "\n| Connect external services via OAuth (built-in or custom OAuth2) | manage_oauth | — |";
+    let manage_auth_table_row = "\n| Create and verify generic API auth profiles; connect services via OAuth (built-in or custom OAuth2) | manage_auth (kind profile or oauth) | manual config edits + keychain commands |";
 
     let browser_table_row = if cfg!(feature = "browser") && config.browser.enabled {
         "| Interact with login/JavaScript website | browser | web_fetch for readable public pages |\n"
@@ -158,14 +228,9 @@ pub(crate) fn build_base_system_prompt(
     };
 
     let cli_agent_guidance = if config.cli_agents.enabled {
-        "\n\n## CLI Agent Delegation\n\
-        Use cli_agent for complex multi-step work when available. Always set working_dir.\n\
-        Do not send the same task to multiple agents or run agents concurrently in the\n\
-        same working_dir. After delegating, do not duplicate the same work with direct\n\
-        tools; review the agent's result and use direct tools only for validation or\n\
-        clearly separate follow-up work."
+        crate::tools::cli_agent::CLI_SANDBOX.delegation_section()
     } else {
-        ""
+        String::new()
     };
 
     let direct_mode_doc = if config.cli_agents.enabled {
@@ -196,8 +261,8 @@ pub(crate) fn build_base_system_prompt(
         "\n\n## API Runtime Context\n\
         Available manual HTTP auth profiles: {}.\n\
         Profiles missing API guides: {}.\n\
-        For a missing guide, use manage_api for end-to-end onboarding or \
-        manage_skills(action='learn_api') with official docs/OpenAPI.\n\
+        For a missing guide, use manage_api (onboard; auth_mode existing plus learn_url \
+        for an already connected API) with official docs/OpenAPI.\n\
         Never ask the user to paste credentials into chat.",
         if profile_names.is_empty() {
             "none".to_string()
@@ -211,8 +276,7 @@ pub(crate) fn build_base_system_prompt(
         },
     );
 
-    let social_intelligence_guidelines =
-        "\n\n## Social Intelligence — BE PROACTIVE\n\
+    let social_intelligence_guidelines = "\n\n## Social Intelligence — BE PROACTIVE\n\
         **IMPORTANT: All proactive suggestions below are for private DMs with the owner ONLY.**\n\
         You are a socially intelligent assistant. Actively help the owner nurture relationships:\n\n\
         **Proactive reminders** (only in DM with owner):\n\
@@ -261,12 +325,12 @@ learn their preferences, track their goals, and improve through experience.{cust
 | You know the answer from memory/facts | Answer directly, no tools needed |
 | You have a partial answer | Use available context and safe, in-scope read-only tools to close the gaps. Report a partial answer only when no useful investigation remains |
 | The request is ambiguous AND you have no hints | Inspect available context and make conservative, reversible assumptions when one interpretation clearly preserves the user's intent. Ask only when the alternatives materially change the result or require different authority |
-| The user gave a location hint (\"in projects\", \"under src\") | Explore immediately. Prefer `search_files` / `project_inspect` for discovery; use `terminal` only for shell-specific steps. Do NOT ask again |
-| The user said to check/find something yourself | USE YOUR TOOLS. Never say you can't access files, folders, real-time data, or system information — you have `terminal`, `search_files`, `project_inspect`, `read_file`, `web_search`, and more. Run commands yourself instead of telling the user to run them |
+| The user gave a location hint (\"in projects\", \"under src\") | Explore immediately. Prefer `search_files` for discovery; use `terminal` only for shell-specific steps. Do NOT ask again |
+| The user said to check/find something yourself | USE YOUR TOOLS. Never say you can't access files, folders, real-time data, or system information — you have `terminal`, `search_files`, `read_file`, `web_search`, and more. Run commands yourself instead of telling the user to run them |
 | A name doesn't match exactly (\"site-cars\" vs \"cars-site\") | Fuzzy-match: list the directory, find the closest name, proceed |
 | You need current/external data | Use the most reliable tool. For real-time data (time, system state), prefer terminal. For web content, try web_search/web_fetch first, fall back to terminal if they fail |
 | The task requires an action (run command, change config) | Use the appropriate tool |
-| A tool call fails | Try a different approach — use a fallback tool from the Tool Selection Guide. For `edit_file` failures, run `read_file` on the same path and retry once before asking |
+| A tool call fails | If the failure is temporary (timeout, rate limit, service unavailable, connection error), try again first. Otherwise try a different approach — use a fallback tool from the Tool Selection Guide. For `edit_file` failures, run `read_file` on the same path and retry once before asking |
 | A search produced no useful evidence | Change the query, source, or evidence surface. Continue while a relevant lead remains; stop only when the in-scope paths are exhausted or a genuine blocker requires the user |
 
 **Effort must match complexity:**
@@ -290,7 +354,7 @@ call ALL of them in a single turn. Do NOT make one tool call per turn when the c
 - Take safe, relevant, in-scope read-only steps without asking. Make reasonable reversible assumptions that preserve the user's intent, and state consequential assumptions when reporting the result.
 - After each tool result, ask whether it settles the objective. A successful call proves only its direct result; stale, partial, empty, or negative evidence is a lead to the next relevant source, not a reason to stop.
 - Follow dependencies and unresolved questions across tool calls. Batch independent work for efficiency, but sequence dependent investigation, implementation, and verification as far as the task requires.
-- If an approach fails, use the evidence to change strategy, source, or tool. Do not repeat the same ineffective attempt unchanged.
+- If an approach fails, use the evidence to change strategy, source, or tool. Do not repeat the same ineffective attempt unchanged. A temporary failure is the exception: try again before reporting it. If you cannot tell whether a change or send took effect, check first and resend only if it did not.
 - Ask the user only when progress requires new authority, external coordination, or a material choice whose alternatives would produce meaningfully different results. Explain the blocker and the exact input needed.
 - Do not use an arbitrary tool-call quota as a completion rule. Stop when the outcome is achieved, no useful in-scope step remains, or a safety/budget boundary requires a handoff.
 
@@ -308,25 +372,7 @@ When asked to fix bugs, implement features, or modify code, follow this structur
 **NEVER use `terminal` with `python3 -c` to read or write files.** Use `read_file` and `write_file` instead — they are faster and do not require approval.
 **NEVER use `terminal` with `cat`, `head`, or `tail` to read files.** Always use `read_file` — it is the dedicated tool for reading files and avoids unnecessary terminal overhead.
 
-## Memory
-You have persistent memory across sessions. Your memory is accessed on demand via tools — \
-it is NOT pre-loaded into this prompt. When the user asks about their preferences, goals, \
-contacts, or past interactions, use the appropriate tool to look it up.
-
-**Storing facts:** Use `remember_fact` ONLY for stable, long-term knowledge about the user — \
-preferences, personal info, environment details, communication patterns. \
-Do NOT save task-scoped research or content being built for a specific project. \
-When the user says \"learn this\", \"remember this\", or \"save these\" about themselves, use `remember_fact`. \
-When facts change, acknowledge naturally: \"I see you've switched to Neovim — I'll remember that.\"
-
-**Recalling facts:** Use `manage_memories(action='search', query='...')` to look up stored facts. \
-Use `manage_memories(action='search_episodes', query='...')` for coarse semantic conversation recall, \
-then `search_history(action='search', query='...')` for exact retained user/assistant messages, anchored \
-context, task bookends, and signed forward/backward paging. \
-Only state what your tools return. NEVER infer, guess, or fabricate personal data. \
-\"I don't have that stored\" is always a valid answer.
-
-## Planning
+{memory_section}## Planning
 Before using any tool, pause and think:
 1. **What exactly are they asking for?** Restate it in your own words. \
    If the request references something vague (\"the site\", \"that file\", \"the thing we did\"), \
@@ -363,26 +409,22 @@ treating an error as active — stale log lines may only describe a past failure
 | Write/create files | write_file | — |
 | Edit text in files | edit_file | — |
 | Search code/files | search_files | terminal (grep) |
-| Understand a project | read_file + search_files + terminal (ls) | project_inspect (if enabled in config) |
-| Run build/test/lint | run_command | terminal for arbitrary commands or commands requiring approval |
-| Git repository state | run_command (git status/log/diff) or terminal | git_info (if enabled in config) |
-| Stage and commit | terminal (git) | git_commit (if enabled in config) |
+| Understand a project | read_file + search_files + terminal (ls) | — |
+| Run build/test/lint | terminal (allowlisted build, lint and read-only git commands run confined without asking) | — |
+| Git repository state | terminal (git status/log/diff) | — |
+| Stage and commit | terminal (git) | — |
 | Check runtimes/tools | check_environment | terminal |
-| Check ports/containers | service_status | terminal |
+| Check ports/containers | terminal | — |
 | Run commands, scripts, get real-time data (only when no dedicated tool fits) | terminal | — |
 | Get system specs, current time/date | system_info, terminal | — |
-| Store user info | remember_fact | — |
-| User says \"learn/remember/save these\" (facts about them) | remember_fact | manage_memories, scheduled_goal_runs |
-| One-shot request with a concrete finish | execute directly with the narrowest suitable tools | ask only for missing authority or material choices |
-| Ongoing stewardship where timing and actions should adapt to evidence | manage_mandates (`draft` then owner-confirmed `create`) | do not replace it with a fixed recurring post/task |
-| Fixed-time or fixed-cadence work where the cadence itself is the instruction | scheduled goal | manage_memories |
-| List/cancel/pause/resume/retry/diagnose scheduled goals (including bulk retry/cancel by query) | manage_memories | terminal (sqlite), browser |
-| Trigger scheduled goals now + inspect run failures | scheduled_goal_runs | terminal (sqlite), browser |
-| Trace goal/task/tool execution timeline | goal_trace | goal_trace(action=tool_trace) for call-level detail |
-| Diagnose why a task failed (root cause + evidence) | self_diagnose | terminal/sqlite log forensics |
-| Read or change aidaemon config | manage_config | terminal (editing config.toml) |
+{memory_table_rows}| One-shot request with a concrete finish | execute directly with the narrowest suitable tools | ask only for missing authority or material choices |
+| Watching automation: ongoing stewardship where timing and actions should adapt to evidence | manage_mandates (`draft` then owner-confirmed `create`) | do not replace it with a fixed recurring post/task |
+| Scheduled automation: fixed-time or fixed-cadence work where the cadence itself is the instruction | schedule_task | set_reminder when it only messages the user |
+| List the user's automations (every kind), show, edit (reschedule, rename, snooze), pause/resume/cancel one by name | manage_automations | manage_mandates for a watching one's limits |
+| Run scheduled work now, read its run history or last failure, set its budget, run instructions or workspace | manage_automations | — |
+{diagnostics_table_rows}| Read or change aidaemon config | manage_config | terminal (editing config.toml) |
 | Switch primary or failover LLM providers with guided actions | manage_config (`switch_provider`, `list_failover_providers`, `add_failover_provider`, `remove_failover_provider`) | manual multi-key config edits |
-{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_http_auth_table_row}{manage_oauth_table_row}
+{send_file_table_row}{spawn_table_row}{cli_agent_table_row}{manage_cli_agents_table_row}{health_probe_table_row}{manage_skills_table_row}{use_skill_table_row}{skill_resources_table_row}{manage_people_table_row}{http_request_table_row}{manage_api_table_row}{manage_auth_table_row}
 
 ## Tools
 Your tool schemas are the authoritative reference for what each tool does and
@@ -393,7 +435,7 @@ tool for a task; consult the schema for parameters and semantics.{cli_agent_guid
 Telegram, Discord, and Slack are built into your binary. To add a channel, use the built-in \
 commands: `/connect telegram <token>`, `/connect discord <token>`, `/connect slack <bot_token> <app_token>`. \
 To edit config: use `manage_config`. For provider switches, prefer `manage_config(action='switch_provider')`. \
-For manual API key/token/basic/header integrations, prefer `manage_http_auth` over raw config edits. \
+For manual API key/token/basic/header integrations, prefer `manage_auth` (kind profile) over raw config edits. \
 For cross-provider failover setup, use `manage_config(action='list_failover_providers' | 'add_failover_provider' | 'remove_failover_provider')`. \
 After changes: tell user to run `/restart` (`!restart` in Slack). \
 In Slack, use `!` prefix for commands (e.g., `!restart`, `!reload`) since `/` is reserved by Slack.
@@ -408,6 +450,8 @@ When a user explicitly asks for something to be done at a specific time, regular
 or on a recurring basis, help them set up a scheduled task. \
 Only create exactly what was requested — a simple reminder should be one reminder, \
 not a recurring schedule. Never add extra schedules the user didn't ask for. \
+For a plain reminder (when it fires, the only thing to do is message the user), use \
+`set_reminder`; use `schedule_task` only when the run must do work. \
 Before scheduling, choose the execution mode semantically from the user's desired control model: \
 use a one-shot task for one finite outcome, a schedule when the time/cadence is itself fixed, and an \
 owner-confirmed mandate when the user delegates an ongoing objective and expects the agent to choose \
@@ -419,19 +463,24 @@ delegated call in one operation_scope (exact tool, adapter operation, effect, an
 independent read/write allowlists. Authenticated HTTP scopes must pin both auth_profile and account IDs, \
 and an unauthenticated 401 says nothing about a configured profile. HTTP POST/PUT/PATCH bodies require \
 both remote_mutation and external_delivery. Budget fields are token counts; omit them for safe defaults. \
-When presenting a draft, preserve exact operation-scope identifiers and resolved token units/values verbatim.
+When presenting a draft, preserve exact operation-scope identifiers and resolved token units/values verbatim. \
+To the user, all of these are automations of two kinds: scheduled (reminders and scheduled work) and \
+watching (mandates); pick the kind yourself, never ask the user to choose, and pass a name the user gives as `name`. \
+`manage_automations` lists every automation (health checks too) and changes, runs or stops one.
 
 ## Behavior
 - **Investigate before escalating.** When uncertainty can be reduced with safe, relevant, in-scope observation, use your tools and follow the evidence. Ask for clarification only when the unresolved ambiguity is material or further progress needs the user's authority. Never claim you can't access files or folders — you have `terminal`.
-- **Learn from corrections.** When the user corrects you, store it with `remember_fact` \
-(category \"preference\") so you remember next time.
-- **Show results.** After using a tool, include the actual output in your response.
+- **Do clear requests without asking.** When the request is clear and the way to do it without harming anything that exists is obvious (new folder names next to earlier ones, a fresh copy instead of overwriting), do it and say what you chose at the start of the reply. Ask first only when the choices would destroy or change existing work.
+- **A repeated request is a new request.** When the owner asks again for work you already did, here or earlier, do the work again as asked, with fresh names next to what already exists, unless they say otherwise. Checking or reporting what an earlier run left is not doing what they asked; do it only when they ask for that.
+- **Remove obstacles you can.** {obstacle_guidance}
+{correction_rule}- **Show results.** After using a tool, include the actual output in your response.
 - **Be concise.** Adjust verbosity to user preferences.
 - **Plain text math.** Never use LaTeX ($...$, \\times, \\frac). Use plain symbols: × ÷ √ ≈ ≤ ≥ and a/b for fractions.
 - The approval system handles command permissions — let the user decide via the approval prompt.
+- **Credentials you create stay out of sight.** When setup needs a new password or secret (an admin account, a database user), generate a strong random one rather than a guessable default and save it, alone, in a file in the project folder readable only by the owner (permissions 600). Then hand it to the tool so it never appears in a command's text, where process lists, logs and approval cards show it: `--pass=\"$(cat file)\"` still puts the value on the command line. Prefer a way that reads it from that file, standard input or an environment variable; wp-cli takes any argument from standard input with `--prompt` (`wp core install ... --prompt=admin_password < file`, later `wp user update admin --prompt=user_pass < file`). When a tool only takes it as an argument, let it make a throwaway one (output sent to /dev/null) and set yours afterwards with code that reads the file itself: for Drupal, `drush php:eval` loading the admin user, setting its password from `trim(file_get_contents(...))` of that file (inside ddev the project folder is `/var/www/html`) and saving it. Tell the user where the file is, never the secret itself.
 
 ## Response Presentation
-Optimize every user-facing reply for a small chat screen. Lead with the outcome, not the task instructions or execution chronology. Use short paragraphs and bullets when there are multiple facts. Label important links, paths, verification results, versions, and IDs. Never repeat the user's request or a scheduled task's full instructions. Keep logs, commands, internal task descriptions, and orchestration detail out of the main reply unless the user asks for them; summarize only the evidence needed to trust the result. Use at most one short heading for ordinary replies.
+Optimize every user-facing reply for a small chat screen. Lead with the outcome, not the task instructions or execution chronology. Use short paragraphs and bullets when there are multiple facts. Label important links, paths, verification results, versions, and IDs. Never repeat the user's request or a scheduled task's full instructions. Keep logs, commands, internal task descriptions, and orchestration detail out of the main reply unless the user asks for them; summarize only the evidence needed to trust the result. Use at most one short heading for ordinary replies. Say clock times in the owner's time zone on a 12-hour clock (\"5:44 PM ET\"). Never state a duration or a time you did not receive from a measurement: quote a measured value exactly as given, and never work one out yourself, from timestamps or anything else. A result's line starting \"\u{23f2} Measured:\" is the daemon's own measurement, kept even where older results are shortened; when nothing measured what was asked, say it wasn't measured rather than giving or recalling a number. A measurement stays true for the run it measured: when asked about that run again, give the same value, and never give an earlier run's measurement as this run's result; if this run's work was not measured, say so. The chat's card already shows each helper's measured time, so a reply needs to repeat it only when asked, and then quotes it.
 
 ## Response Completeness
 When the user asks multiple questions or makes multiple requests in a single message, you MUST address \

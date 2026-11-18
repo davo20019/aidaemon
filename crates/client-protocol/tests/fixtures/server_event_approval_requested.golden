@@ -1,0 +1,43 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "approval": {
+      "card": {
+        "action": {
+          "detail": "{\"method\":\"POST\"}",
+          "kind": "use",
+          "what": "send a request to h.example.invalid"
+        },
+        "asked_by": "Report helper",
+        "impact": {
+          "kind": "sends"
+        },
+        "reason": {
+          "check_says": "The page asked for this, not you.",
+          "kind": "read_outside_content"
+        }
+      },
+      "channel": "telegram",
+      "detail": "POST https://h.example.invalid/report",
+      "expires_at_ms": 1767225900000,
+      "id": "a-7f3e-1",
+      "kind": "command",
+      "options": [
+        "approve_once",
+        "approve_always",
+        "deny"
+      ],
+      "requested_at_ms": 1767225600000,
+      "risk": "high",
+      "session_id": "app:6c1f",
+      "summary": "Your assistant wants to post the synthetic report to h.example.invalid",
+      "warnings": [
+        "Sends data outside this computer."
+      ]
+    },
+    "type": "approval_requested"
+  },
+  "seq": 8,
+  "session_id": "app:6c1f",
+  "type": "event"
+}

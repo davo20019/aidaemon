@@ -1,13 +1,10 @@
-//! Harness effectiveness evaluation: offline fixtures and online reporting helpers.
+//! Harness effectiveness evaluation: offline scenarios on `aidaemon-eval` and
+//! online reporting helpers.
 
-pub mod fixture;
+pub mod recorder;
 pub mod report;
 
 #[cfg(test)]
-pub mod runner;
+pub mod subject;
 
-pub use fixture::{ExpectBlock, HarnessEvalFixture, MockResponseSpec};
-pub use report::{format_eval_summary_row, format_eval_task_report, EvalSummaryStats, EvalTaskRow};
-
-#[cfg(test)]
-mod permission_tests;
+pub use report::{EvalSummaryStats, EvalTaskRow, format_eval_summary_row, format_eval_task_report};

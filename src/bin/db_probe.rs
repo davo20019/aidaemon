@@ -643,8 +643,8 @@ mod tests {
 }
 
 async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::report::{format_eval_task_report, EvalTaskRow};
     use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{EvalTaskRow, format_eval_task_report};
 
     let row = sqlx::query(
         r#"
@@ -681,8 +681,8 @@ async fn print_eval_task(pool: &SqlitePool, task_id: &str) -> anyhow::Result<()>
 }
 
 async fn print_eval_summary(pool: &SqlitePool, hours: i64, root_only: bool) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::report::{aggregate_summary, format_eval_summary_row, EvalTaskRow};
     use aidaemon::TaskEndData;
+    use aidaemon::harness_eval::report::{EvalTaskRow, aggregate_summary, format_eval_summary_row};
 
     let rows = sqlx::query(
         r#"
@@ -1018,6 +1018,201 @@ fn refusal_gate_label(tool: &str, message: &str) -> String {
     format!("{tool}: {label}")
 }
 
+/// Prompt-cache reuse of agent-turn model calls (no `call_purpose`), by
+/// model, split into a run's first call and its later ones. Later calls
+/// resend an append-only transcript, so their reuse should approach the
+/// share of input that the previous call already sent.
+async fn print_decisions(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Decision Layer (Last {} Hours) ==\n", hours);
+    let rows = sqlx::query(
+        "SELECT task_id, json_extract(data, '$.metadata') AS metadata
+         FROM events
+         WHERE event_type = 'decision_point' AND created_at >= ?
+           AND json_extract(data, '$.metadata.condition') = 'decision_layer'
+         ORDER BY id",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    // decision/backend -> (outcomes, latencies, per question (asked, trusted, acted))
+    type Questions = std::collections::BTreeMap<String, (u64, u64, u64)>;
+    type Group = (std::collections::BTreeMap<String, u64>, Vec<u64>, Questions);
+    let mut groups: std::collections::BTreeMap<(String, String), Group> = Default::default();
+    let mut digest_relationship: std::collections::HashMap<String, (String, f64)> =
+        Default::default();
+    for row in &rows {
+        let raw: String = row.try_get("metadata").unwrap_or_default();
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let text = |key: &str| {
+            meta.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        let entry = groups
+            .entry((
+                format!("{} ({})", text("decision"), text("mode")),
+                text("backend"),
+            ))
+            .or_default();
+        *entry.0.entry(text("outcome")).or_default() += 1;
+        if let Some(ms) = meta.get("latency_ms").and_then(|v| v.as_u64()) {
+            entry.1.push(ms);
+        }
+        if let Some(answers) = meta.get("answers").and_then(|v| v.as_object()) {
+            for (key, answer) in answers {
+                // Per-fact keys (f0, f1, ...) are one question kind.
+                let name = if text("decision") == "recall_filter" {
+                    "fact".to_string()
+                } else {
+                    key.clone()
+                };
+                let counts = entry.2.entry(name).or_default();
+                counts.0 += 1;
+                counts.1 += answer
+                    .get("trusted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as u64;
+                counts.2 += answer
+                    .get("acted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false) as u64;
+                if text("decision") == "turn_digest" && key == "relationship" {
+                    let task: String = row.try_get("task_id").unwrap_or_default();
+                    let value = answer.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    let class = if value.starts_with("continuation") {
+                        "continuation"
+                    } else {
+                        value
+                    };
+                    let confidence = answer
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    digest_relationship.insert(task, (class.to_string(), confidence));
+                }
+            }
+        }
+    }
+    if groups.is_empty() {
+        println!("No decision-layer calls recorded.");
+        return Ok(());
+    }
+    for ((decision, backend), (outcomes, mut latencies, questions)) in groups {
+        latencies.sort_unstable();
+        let pct = |q: f64| {
+            latencies
+                .get(((latencies.len() as f64 - 1.0) * q).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        let total: u64 = outcomes.values().sum();
+        println!(
+            "{decision} on {backend}: {total} calls, p50 {} ms, p95 {} ms",
+            pct(0.5),
+            pct(0.95)
+        );
+        println!(
+            "  outcomes: {}",
+            outcomes
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (question, (asked, trusted, acted)) in questions {
+            println!(
+                "  {question:<22} asked {asked:>5}  over threshold {trusted:>5}  acted {acted:>5}"
+            );
+        }
+    }
+    // Shadow comparison: the digest's relationship class against the
+    // relationship the turn actually committed.
+    if !digest_relationship.is_empty() {
+        let finalized = sqlx::query(
+            "SELECT task_id, json_extract(data, '$.metadata.relationship') AS relationship
+             FROM events
+             WHERE event_type = 'decision_point' AND created_at >= ?
+               AND json_extract(data, '$.metadata.condition') = 'task_relationship_finalized'",
+        )
+        .bind(&cutoff)
+        .fetch_all(pool)
+        .await?;
+        let mut bands: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+        for row in finalized {
+            let task: String = row.try_get("task_id").unwrap_or_default();
+            let committed: String = row.try_get("relationship").unwrap_or_default();
+            if let Some((class, confidence)) = digest_relationship.get(&task) {
+                let band = if *confidence >= 0.9 {
+                    ">=0.9"
+                } else if *confidence >= 0.6 {
+                    "0.6-0.9"
+                } else {
+                    "<0.6"
+                };
+                let entry = bands.entry(band).or_default();
+                entry.0 += 1;
+                entry.1 += (class == &committed) as u64;
+            }
+        }
+        println!("\nturn_digest relationship vs committed relationship, by confidence:");
+        for (band, (n, agree)) in bands {
+            println!("  {band:<8} {agree}/{n} agree");
+        }
+    }
+    Ok(())
+}
+
+async fn print_cache_reuse(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
+    let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
+    println!("== Prompt-Cache Reuse (Last {} Hours) ==", hours);
+    println!("(successful agent-turn calls; reuse = cached input / input)\n");
+    let rows = sqlx::query(
+        "SELECT COALESCE(json_extract(data, '$.final_model'), json_extract(data, '$.model')) AS model,
+                CASE WHEN json_extract(data, '$.iteration') = 1 THEN 'first' ELSE 'later' END AS position,
+                COUNT(*) AS calls,
+                SUM(COALESCE(json_extract(data, '$.cached_input_tokens'), 0) = 0) AS cold,
+                SUM(json_extract(data, '$.input_tokens')) AS input,
+                SUM(COALESCE(json_extract(data, '$.cached_input_tokens'), 0)) AS cached
+         FROM events
+         WHERE event_type = 'llm_call' AND created_at >= ?
+           AND json_extract(data, '$.call_purpose') IS NULL
+           AND json_extract(data, '$.failed') = 0
+         GROUP BY model, position
+         ORDER BY calls DESC",
+    )
+    .bind(&cutoff)
+    .fetch_all(pool)
+    .await?;
+    println!(
+        "{:<24} {:<6} {:>6} {:>6} {:>12} {:>12} {:>6}",
+        "model", "call", "calls", "cold", "input", "cached", "reuse"
+    );
+    for row in rows {
+        let input: i64 = row.try_get("input").unwrap_or(0);
+        let cached: i64 = row.try_get("cached").unwrap_or(0);
+        let reuse = if input > 0 {
+            format!("{:.0}%", cached as f64 * 100.0 / input as f64)
+        } else {
+            "-".to_string()
+        };
+        println!(
+            "{:<24} {:<6} {:>6} {:>6} {:>12} {:>12} {:>6}",
+            row.try_get::<String, _>("model").unwrap_or_default(),
+            row.try_get::<String, _>("position").unwrap_or_default(),
+            row.try_get::<i64, _>("calls").unwrap_or(0),
+            row.try_get::<i64, _>("cold").unwrap_or(0),
+            input,
+            cached,
+            reuse
+        );
+    }
+    Ok(())
+}
+
 async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()> {
     let cutoff = events_cutoff_rfc3339(chrono::Utc::now(), hours);
     println!("== Gate Outcomes (Last {} Hours) ==", hours);
@@ -1033,7 +1228,7 @@ async fn print_gate_outcomes(pool: &SqlitePool, hours: i64) -> anyhow::Result<()
          WHERE event_type = 'decision_point' AND created_at >= ? AND task_id IS NOT NULL
            AND json_extract(data, '$.code') IN ({placeholders})"
     );
-    let mut query = sqlx::query(&decision_sql).bind(&cutoff);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(&*decision_sql)).bind(&cutoff);
     for code in GATE_INTERVENTION_CODES {
         query = query.bind(*code);
     }
@@ -1214,10 +1409,10 @@ async fn print_fabrication_audit(pool: &SqlitePool, hours: i64) -> anyhow::Resul
         if material {
             material_tasks.insert(task_id.clone());
         }
-        if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")? {
-            if let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw) {
-                proofs.insert(task_id, proof);
-            }
+        if let Some(raw) = row.try_get::<Option<String>, _>("completion_proof")?
+            && let Ok(proof) = serde_json::from_str::<aidaemon::TaskCompletionProofData>(&raw)
+        {
+            proofs.insert(task_id, proof);
         }
     }
 
@@ -1296,8 +1491,8 @@ async fn record_fixture_from_session(
     output: Option<&str>,
     include_text: bool,
 ) -> anyhow::Result<()> {
-    use aidaemon::harness_eval::fixture::{
-        record_fixture_from_events, recorded_fixtures_dir, RECORDED_FIXTURE_HEADER,
+    use aidaemon::harness_eval::recorder::{
+        RECORDED_SCENARIO_HEADER, record_scenario_from_events, recorded_scenarios_dir,
     };
 
     // Plain SELECT (no EventStore::new, which would run migrations against a
@@ -1336,25 +1531,28 @@ async fn record_fixture_from_session(
         });
     }
 
-    let mut fixture = record_fixture_from_events(session_id, &events, task_id)?;
+    let mut scenario = record_scenario_from_events(session_id, &events, task_id)?;
     if include_text {
-        if let Some(aidaemon::harness_eval::MockResponseSpec::Text { text }) =
-            fixture.mock_responses.last()
-        {
-            fixture.expect.response_contains = vec![text.chars().take(40).collect()];
+        let last_text = scenario.script.last().and_then(|reply| reply.text.clone());
+        if let Some(text) = last_text {
+            scenario.expect.final_text_contains_exact = vec![text.chars().take(40).collect()];
         }
     }
 
     let output_path = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| recorded_fixtures_dir().join(format!("{}.yaml", fixture.name)));
+        .unwrap_or_else(|| recorded_scenarios_dir().join(format!("{}.yaml", scenario.name)));
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let yaml = serde_yaml::to_string(&fixture)?;
-    std::fs::write(&output_path, format!("{RECORDED_FIXTURE_HEADER}{yaml}"))?;
-    println!("Recorded draft fixture -> {}", output_path.display());
-    println!("Script its task_assessments before moving it into the suite.");
+    // One-line strings stay on one line, as serde_yaml wrote them.
+    let yaml = serde_saphyr::to_string_with_options(
+        &scenario,
+        serde_saphyr::ser_options! { folded_wrap_chars: usize::MAX },
+    )?;
+    std::fs::write(&output_path, format!("{RECORDED_SCENARIO_HEADER}{yaml}"))?;
+    println!("Recorded draft scenario -> {}", output_path.display());
+    println!("Check it against the trace before moving it into the suite.");
     Ok(())
 }
 
@@ -1416,6 +1614,8 @@ async fn main() -> anyhow::Result<()> {
     let handholding_summary = args.iter().any(|arg| arg == "--handholding-summary");
     let fabrication_audit = args.iter().any(|arg| arg == "--fabrication-audit");
     let gate_outcomes = args.iter().any(|arg| arg == "--gate-outcomes");
+    let cache_reuse = args.iter().any(|arg| arg == "--cache-reuse");
+    let decisions = args.iter().any(|arg| arg == "--decisions");
     let eval_hours = args
         .windows(2)
         .find(|w| w[0] == "--eval-hours")
@@ -1604,6 +1804,26 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if args.iter().any(|a| a == "--fact-dup-audit") {
+        fact_dup_audit(&pool).await?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--fact-conflict-audit") {
+        fact_conflict_audit(&pool, args.iter().any(|a| a == "--apply")).await?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--retire-inferred-behavior") {
+        retire_inferred_behavior(&pool, args.iter().any(|a| a == "--apply")).await?;
+        return Ok(());
+    }
+    if let Some(days) = args
+        .windows(2)
+        .find(|w| w[0] == "--fact-quality")
+        .and_then(|w| w[1].parse::<i64>().ok())
+    {
+        fact_quality(&pool, days).await?;
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--goals") {
         print_scheduled_goal_state(&pool).await?;
         return Ok(());
@@ -1695,6 +1915,14 @@ async fn main() -> anyhow::Result<()> {
     }
     if fabrication_audit {
         print_fabrication_audit(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if cache_reuse {
+        print_cache_reuse(&pool, eval_hours).await?;
+        return Ok(());
+    }
+    if decisions {
+        print_decisions(&pool, eval_hours).await?;
         return Ok(());
     }
     if gate_outcomes {
@@ -1941,8 +2169,10 @@ async fn main() -> anyhow::Result<()> {
             row.try_get::<Option<i64>, _>("success").unwrap_or(None),
             row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
             row.get::<String, _>("started_at"),
-            row.try_get::<Option<String>, _>("completed_at").unwrap_or(None),
-            row.try_get::<Option<f64>, _>("duration_secs").unwrap_or(None),
+            row.try_get::<Option<String>, _>("completed_at")
+                .unwrap_or(None),
+            row.try_get::<Option<f64>, _>("duration_secs")
+                .unwrap_or(None),
             row.get::<String, _>("prompt_summary")
         );
     }
@@ -2328,8 +2558,10 @@ async fn main() -> anyhow::Result<()> {
                 row.try_get::<Option<i64>, _>("success").unwrap_or(None),
                 row.try_get::<Option<i64>, _>("exit_code").unwrap_or(None),
                 row.get::<String, _>("started_at"),
-                row.try_get::<Option<String>, _>("completed_at").unwrap_or(None),
-                row.try_get::<Option<f64>, _>("duration_secs").unwrap_or(None),
+                row.try_get::<Option<String>, _>("completed_at")
+                    .unwrap_or(None),
+                row.try_get::<Option<f64>, _>("duration_secs")
+                    .unwrap_or(None),
                 row.get::<String, _>("prompt_summary"),
                 row.try_get::<Option<String>, _>("output_summary")
                     .unwrap_or(None)
@@ -2413,24 +2645,38 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "- task_id={:?} iter={} model={} fell_back={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={:?} usage_evidence={:?} failed={} failure_kind={:?} provider_status={:?} at={}",
                 row.try_get::<Option<String>, _>("task_id").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<String>, _>("model").unwrap_or(None).unwrap_or_default(),
+                row.try_get::<Option<i64>, _>("iteration")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<String>, _>("model")
+                    .unwrap_or(None)
+                    .unwrap_or_default(),
                 row.try_get::<Option<i64>, _>("fell_back").unwrap_or(None) == Some(1),
                 latency_ms,
                 prefill_ms.map(|v| v.round() as i64),
                 decode_ms.map(|v| v.round() as i64),
                 overhead_ms,
-                row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("input_tokens")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("cached_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("fresh_input_tokens")
+                    .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                     .unwrap_or(None),
-                row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
-                row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None),
-                row.try_get::<Option<String>, _>("token_usage_evidence").unwrap_or(None),
+                row.try_get::<Option<i64>, _>("output_tokens")
+                    .unwrap_or(None)
+                    .unwrap_or(0),
+                row.try_get::<Option<i64>, _>("est_input_tokens")
+                    .unwrap_or(None),
+                row.try_get::<Option<String>, _>("token_usage_evidence")
+                    .unwrap_or(None),
                 row.try_get::<Option<i64>, _>("failed").unwrap_or(None) == Some(1),
-                row.try_get::<Option<String>, _>("provider_error_kind").unwrap_or(None),
-                row.try_get::<Option<i64>, _>("provider_status").unwrap_or(None),
+                row.try_get::<Option<String>, _>("provider_error_kind")
+                    .unwrap_or(None),
+                row.try_get::<Option<i64>, _>("provider_status")
+                    .unwrap_or(None),
                 row.get::<String, _>("created_at"),
             );
         }
@@ -2512,21 +2758,44 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_default();
                     println!(
                         "  contract: task_kind={} requires_observation={} evidence={} invocations={} allowed_tools={}",
-                        contract.get("task_kind").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                        contract.get("requires_observation").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        contract
+                            .get("task_kind")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        contract
+                            .get("requires_observation")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
                         evidence.len(),
                         invocations.len(),
-                        contract.get("allowed_tool_names").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        contract
+                            .get("allowed_tool_names")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                     for (index, requirement) in evidence.iter().enumerate() {
                         println!(
                             "  evidence[{index}]: purpose={} authority={} temporal={} scopes={} target={} receipt={}",
-                            requirement.get("purpose").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("minimum_authority").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("temporal_scope").and_then(serde_json::Value::as_str).unwrap_or("unknown"),
-                            requirement.get("acceptable_scopes").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                            requirement.get("target").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                            requirement.get("receipt").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("purpose")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("minimum_authority")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("temporal_scope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown"),
+                            requirement
+                                .get("acceptable_scopes")
+                                .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("target")
+                                .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                            requirement
+                                .get("receipt")
+                                .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
                         );
                     }
                     for (index, predicate) in invocations.iter().enumerate() {
@@ -2536,28 +2805,63 @@ async fn main() -> anyhow::Result<()> {
                 if row.get::<String, _>("event_type") == "tool_call" {
                     println!(
                         "  claim: call_id={} stable_key={} obligations={} max_attempts={} max_invocations={} lineage={}",
-                        data.get("tool_call_id").and_then(serde_json::Value::as_str).unwrap_or("none"),
-                        data.get("stable_operation_key").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                        data.get("max_operation_attempts").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("max_operation_invocations").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        data.get("operation_lineage").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("none"),
+                        data.get("stable_operation_key")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_attempts")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("max_operation_invocations")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        data.get("operation_lineage")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
                     );
                 }
                 if let Some(receipt) = data.get("receipt") {
                     println!(
                         "  receipt: call_id={} outcome={} evidence={} exit_code={} http_status={} result_id={} completeness={}/{} preflight={} closes={} continues={}",
-                        data.get("tool_call_id").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.get("outcome_status").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.get("outcome_evidence").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.get("exit_code").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        receipt.get("http_status").map_or_else(|| "none".to_string(), serde_json::Value::to_string),
-                        receipt.pointer("/result_provenance/result_id").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.pointer("/result_provenance/model_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.pointer("/result_provenance/durable_view_completeness").and_then(|value| value.as_str()).unwrap_or("unknown"),
-                        receipt.pointer("/authorization_preflight/status").and_then(|value| value.as_str()).unwrap_or("none"),
-                        receipt.get("completion_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
-                        receipt.get("continuation_obligation_ids").map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        data.get("tool_call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .get("outcome_status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .get("outcome_evidence")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .get("exit_code")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .get("http_status")
+                            .map_or_else(|| "none".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .pointer("/result_provenance/result_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .pointer("/result_provenance/model_view_completeness")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .pointer("/result_provenance/durable_view_completeness")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown"),
+                        receipt
+                            .pointer("/authorization_preflight/status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("none"),
+                        receipt
+                            .get("completion_obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
+                        receipt
+                            .get("continuation_obligation_ids")
+                            .map_or_else(|| "[]".to_string(), serde_json::Value::to_string),
                     );
                 }
                 let metadata = data.get("metadata");
@@ -2631,22 +2935,36 @@ async fn main() -> anyhow::Result<()> {
                 };
                 println!(
                     "- iter={} model={} fell_back={} attempts={} latency_ms={} prefill_ms={:?} decode_ms={:?} overhead_ms={:?} build_ms={} in_tok={} cached_in_tok={:?} fresh_in_tok={:?} cache_create_tok={:?} out_tok={} est_in_tok={}",
-                    row.try_get::<Option<i64>, _>("iteration").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("iteration")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                     model_label,
                     fell_back,
-                    row.try_get::<Option<i64>, _>("attempts").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("attempts")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                     latency_ms,
                     prefill_ms.map(|v| v.round() as i64),
                     decode_ms.map(|v| v.round() as i64),
                     overhead_ms,
-                    row.try_get::<Option<i64>, _>("build_ms").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("input_tokens").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("cached_input_tokens").unwrap_or(None),
-                    row.try_get::<Option<i64>, _>("fresh_input_tokens").unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("build_ms")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("input_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("cached_input_tokens")
+                        .unwrap_or(None),
+                    row.try_get::<Option<i64>, _>("fresh_input_tokens")
+                        .unwrap_or(None),
                     row.try_get::<Option<i64>, _>("cache_creation_input_tokens")
                         .unwrap_or(None),
-                    row.try_get::<Option<i64>, _>("output_tokens").unwrap_or(None).unwrap_or(0),
-                    row.try_get::<Option<i64>, _>("est_input_tokens").unwrap_or(None).unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("output_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
+                    row.try_get::<Option<i64>, _>("est_input_tokens")
+                        .unwrap_or(None)
+                        .unwrap_or(0),
                 );
             }
         }
@@ -2836,7 +3154,9 @@ async fn main() -> anyhow::Result<()> {
                 r.get::<i64, _>("is_paused"),
                 r.get::<i64, _>("is_one_shot"),
                 r.get::<String, _>("next_run_at"),
-                r.try_get::<Option<String>, _>("last_run_at").unwrap_or(None).unwrap_or_else(|| "never".to_string()),
+                r.try_get::<Option<String>, _>("last_run_at")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "never".to_string()),
                 r.get::<String, _>("desc"),
             );
         }
@@ -2862,10 +3182,18 @@ async fn main() -> anyhow::Result<()> {
                 &r.get::<String, _>("goal_id")[..8],
                 r.get::<String, _>("status"),
                 r.get::<i64, _>("retry_count"),
-                r.try_get::<Option<String>, _>("agent_id").unwrap_or(None).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("agent_id")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "none".to_string()),
                 &r.get::<String, _>("created_at")[..19],
-                r.try_get::<Option<String>, _>("started_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
-                r.try_get::<Option<String>, _>("completed_at").unwrap_or(None).map(|s| s[..19].to_string()).unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("started_at")
+                    .unwrap_or(None)
+                    .map(|s| s[..19].to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                r.try_get::<Option<String>, _>("completed_at")
+                    .unwrap_or(None)
+                    .map(|s| s[..19].to_string())
+                    .unwrap_or_else(|| "none".to_string()),
                 r.get::<String, _>("desc"),
             );
         }
@@ -2879,7 +3207,9 @@ async fn main() -> anyhow::Result<()> {
 /// values are rendered as text without interpretation.
 async fn print_query_rows(pool: &SqlitePool, title: &str, sql: &str) -> anyhow::Result<()> {
     use sqlx::{Column, Row, TypeInfo, ValueRef};
-    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_all(pool)
+        .await?;
     println!("== {title} ({}) ==", rows.len());
     for row in rows {
         let mut parts = Vec::new();
@@ -2971,5 +3301,348 @@ async fn print_scheduled_goal_state(pool: &SqlitePool) -> anyhow::Result<()> {
           ORDER BY created_at DESC LIMIT 20",
     )
     .await?;
+    Ok(())
+}
+
+/// Active facts with a vector, as the fold planner reads them.
+async fn fact_fold_candidates(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<aidaemon_memory::sqlite::FoldCandidate>> {
+    let rows = sqlx::query(
+        "SELECT id, category, key, value, source, COALESCE(recall_count, 0) AS recall_count,
+                COALESCE(privacy, 'global') AS privacy, channel_id, embedding
+         FROM facts WHERE superseded_at IS NULL AND embedding IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let blob: Vec<u8> = row.get("embedding");
+            let vector = aidaemon_memory::decode_embedding(&blob)?;
+            let category: String = row.get("category");
+            let source: String = row.get("source");
+            Some(aidaemon_memory::sqlite::FoldCandidate {
+                id: row.get("id"),
+                pinned: aidaemon_memory::full::recall::IDENTITY_CATEGORIES
+                    .contains(&category.trim().to_ascii_lowercase().as_str()),
+                category,
+                key: row.get("key"),
+                value: row.get("value"),
+                source_rank: aidaemon_memory::sqlite::fact_source_rank(&source),
+                recall_count: row.get("recall_count"),
+                privacy: row.get("privacy"),
+                channel_id: row.get("channel_id"),
+                vector,
+            })
+        })
+        .collect())
+}
+
+/// Dry run of the maintenance fold pass: every fact it would retire, the
+/// fact that would keep its knowledge, and which rule matched. Writes
+/// nothing; the daemon's maintenance pass applies the same plan.
+async fn fact_dup_audit(pool: &SqlitePool) -> anyhow::Result<()> {
+    use aidaemon_memory::sqlite::{FoldRule, plan_folds};
+    let mut candidates = fact_fold_candidates(pool).await?;
+    let by_id: std::collections::HashMap<i64, (String, String, String)> = candidates
+        .iter()
+        .map(|c| (c.id, (c.category.clone(), c.key.clone(), c.value.clone())))
+        .collect();
+    let mut folds = plan_folds(&mut candidates);
+    folds.sort_by(|a, b| a.similarity.total_cmp(&b.similarity));
+    let mut rules = std::collections::BTreeMap::<&str, usize>::new();
+    let mut cross_category = 0usize;
+    println!("== fact dup audit: {} active facts ==", by_id.len());
+    for fold in &folds {
+        let (fc, fk, fv) = &by_id[&fold.folded];
+        let (kc, kk, _) = &by_id[&fold.kept];
+        let rule = match fold.rule {
+            FoldRule::Restatement => "restatement",
+            FoldRule::OneValue => "one-value",
+        };
+        *rules.entry(rule).or_default() += 1;
+        cross_category += usize::from(!fc.eq_ignore_ascii_case(kc));
+        println!(
+            "- {:.3} {rule:<11} {fc}/{fk} -> {kc}/{kk} = {}",
+            fold.similarity,
+            fv.chars().take(60).collect::<String>()
+        );
+    }
+    println!(
+        "== {} folds ({} across categories): {:?} ==",
+        folds.len(),
+        cross_category,
+        rules
+    );
+    Ok(())
+}
+
+/// Active fact pairs that may be one attribute with two values: whole-fact
+/// similarity of at least 0.90, one scope, and values whose numbers differ.
+/// Each gets a default: the owner-stated row wins, else, when the keys name
+/// the same attribute, the one first seen later; keys that may name two
+/// attributes (`version` / `previous_version`) are listed for review and kept.
+/// `behavior` rows are left to `--retire-inferred-behavior`. `--apply`
+/// retires every default loser as `replaced`, pointing at the winner;
+/// restart the daemon afterwards so recall's projections catch up.
+async fn fact_conflict_audit(pool: &SqlitePool, apply: bool) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, category, key, value, source, COALESCE(first_seen_at, created_at) AS seen,
+                COALESCE(recall_count, 0) AS recall_count, COALESCE(privacy, 'global') AS privacy,
+                channel_id, source_excerpt, embedding
+         FROM facts WHERE superseded_at IS NULL AND embedding IS NOT NULL
+           AND LOWER(TRIM(category)) <> 'behavior'
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    struct Row {
+        id: i64,
+        category: String,
+        key: String,
+        value: String,
+        source: String,
+        seen: String,
+        recall: i64,
+        scope: (String, Option<String>),
+        excerpt: Option<String>,
+        numbers: std::collections::BTreeSet<String>,
+        vector: Vec<f32>,
+    }
+    let rows: Vec<Row> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let value: String = row.get("value");
+            let numbers = value
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
+                .map(str::to_lowercase)
+                .collect();
+            Some(Row {
+                id: row.get("id"),
+                category: row.get("category"),
+                key: row.get("key"),
+                value,
+                source: row.get("source"),
+                seen: row.get("seen"),
+                recall: row.get("recall_count"),
+                scope: (row.get("privacy"), row.get("channel_id")),
+                excerpt: row.get("source_excerpt"),
+                numbers,
+                vector: aidaemon_memory::decode_embedding(&row.get::<Vec<u8>, _>("embedding"))?,
+            })
+        })
+        .collect();
+    let owner = |r: &Row| aidaemon_memory::sqlite::is_owner_authored_fact_source(&r.source);
+    let mut losers: Vec<(i64, i64)> = Vec::new();
+    let mut pairs = 0usize;
+    println!("== fact conflict audit ==");
+    for (i, a) in rows.iter().enumerate() {
+        for b in &rows[i + 1..] {
+            if a.numbers == b.numbers || a.scope != b.scope {
+                continue;
+            }
+            let same_attribute = aidaemon_memory::sqlite::keys_name_same_attribute(&a.key, &b.key);
+            let similarity = aidaemon_memory::cosine(&a.vector, &b.vector);
+            if similarity < 0.90 {
+                continue;
+            }
+            pairs += 1;
+            let winner = match (owner(a), owner(b)) {
+                (true, false) => Some(a),
+                (false, true) => Some(b),
+                (true, true) => None,
+                (false, false) if same_attribute => Some(if a.seen >= b.seen { a } else { b }),
+                (false, false) => None,
+            };
+            let verdict = match winner {
+                Some(w) => {
+                    let loser = if w.id == a.id { b } else { a };
+                    losers.push((loser.id, w.id));
+                    format!("keep #{}, retire #{}", w.id, loser.id)
+                }
+                None if owner(a) && owner(b) => "both owner-stated: review by hand".to_string(),
+                None => "keys may name two attributes: kept, review by hand".to_string(),
+            };
+            println!("- {similarity:.3} {verdict}");
+            for r in [a, b] {
+                println!(
+                    "    #{} {}/{} = {} [{} seen {} recalled {}] {}",
+                    r.id,
+                    r.category,
+                    r.key,
+                    r.value.chars().take(70).collect::<String>(),
+                    r.source,
+                    r.seen.chars().take(10).collect::<String>(),
+                    r.recall,
+                    r.excerpt
+                        .as_deref()
+                        .map(|e| format!("\"{}\"", e.chars().take(60).collect::<String>()))
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
+    // One retirement per row, even when it lost to several.
+    losers.sort();
+    losers.dedup_by_key(|(loser, _)| *loser);
+    println!("== {pairs} pairs, {} rows to retire ==", losers.len());
+    if !apply {
+        println!("Dry run. Add --apply to retire them.");
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for (loser, winner) in &losers {
+        sqlx::query(
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'replaced', folded_into = ?
+             WHERE id = ? AND superseded_at IS NULL",
+        )
+        .bind(&now)
+        .bind(winner)
+        .bind(loser)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    println!(
+        "Retired {} rows. Restart the daemon so recall's projections catch up.",
+        losers.len()
+    );
+    Ok(())
+}
+
+/// Retire every `behavior` fact a background extractor wrote. Extractors
+/// read one session or one task, so they cannot observe a habit; owner-stated
+/// behavior rows stay. Retired, not deleted: the rows stay recoverable
+/// until retention removes old superseded rows, and `--apply` first writes
+/// them to a JSON backup.
+async fn retire_inferred_behavior(pool: &SqlitePool, apply: bool) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, key, value, source, COALESCE(recall_count, 0) AS recall_count
+         FROM facts
+         WHERE superseded_at IS NULL AND LOWER(TRIM(category)) = 'behavior'
+         ORDER BY recall_count DESC, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            !aidaemon_memory::sqlite::is_owner_authored_fact_source(&row.get::<String, _>("source"))
+        })
+        .collect();
+    println!("== {} inferred behavior facts ==", rows.len());
+    for row in rows.iter().take(20) {
+        println!(
+            "- #{} recalled {} {} = {}",
+            row.get::<i64, _>("id"),
+            row.get::<i64, _>("recall_count"),
+            row.get::<String, _>("key"),
+            row.get::<String, _>("value")
+                .chars()
+                .take(90)
+                .collect::<String>()
+        );
+    }
+    if !apply {
+        println!("Dry run (top 20 by recall shown). Add --apply to retire them.");
+        return Ok(());
+    }
+    let backup: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<i64, _>("id"),
+                "key": row.get::<String, _>("key"),
+                "value": row.get::<String, _>("value"),
+                "source": row.get::<String, _>("source"),
+                "recall_count": row.get::<i64, _>("recall_count"),
+            })
+        })
+        .collect();
+    let path = format!(
+        "retired-behavior-facts-{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    std::fs::write(&path, serde_json::to_string_pretty(&backup)?)
+        .with_context(|| format!("writing backup {path}"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    for row in &rows {
+        sqlx::query(
+            "UPDATE facts SET superseded_at = ?, superseded_reason = 'retired'
+             WHERE id = ? AND superseded_at IS NULL",
+        )
+        .bind(&now)
+        .bind(row.get::<i64, _>("id"))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    println!(
+        "Retired {} rows; backup in {path}. Restart the daemon so recall's projections catch up.",
+        rows.len()
+    );
+    Ok(())
+}
+
+/// Memory write quality over the last `days`: new facts by source and
+/// category, how many landed beside an identical value already stored, and
+/// how many retired rows were brought back.
+async fn fact_quality(pool: &SqlitePool, days: i64) -> anyhow::Result<()> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let by_source = sqlx::query(
+        "SELECT source, category, COUNT(*) AS n FROM facts
+         WHERE created_at >= ? GROUP BY source, category ORDER BY n DESC",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await?;
+    println!("== new facts in the last {days} days, by source/category ==");
+    for row in &by_source {
+        println!(
+            "- {}/{}: {}",
+            row.get::<String, _>("source"),
+            row.get::<String, _>("category"),
+            row.get::<i64, _>("n")
+        );
+    }
+    let same_value: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM facts n WHERE n.created_at >= ? AND n.superseded_at IS NULL
+           AND EXISTS (SELECT 1 FROM facts o WHERE o.id <> n.id AND o.superseded_at IS NULL
+                        AND LOWER(TRIM(o.value)) = LOWER(TRIM(n.value)) AND o.created_at < n.created_at)",
+    )
+    .bind(&since)
+    .fetch_one(pool)
+    .await?;
+    let resurrected: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM facts n WHERE n.created_at >= ? AND n.superseded_at IS NULL
+           AND n.source IN ('consolidation', 'progressive', 'owner_quoted', 'task_learning')
+           AND EXISTS (SELECT 1 FROM facts d WHERE d.superseded_reason = 'deleted'
+                        AND LOWER(TRIM(d.value)) = LOWER(TRIM(n.value))
+                        AND d.superseded_at < n.created_at)",
+    )
+    .bind(&since)
+    .fetch_one(pool)
+    .await?;
+    let retired = sqlx::query(
+        "SELECT COALESCE(superseded_reason, 'unrecorded') AS reason, COUNT(*) AS n FROM facts
+         WHERE superseded_at >= ? GROUP BY reason ORDER BY n DESC",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await?;
+    println!("== active new facts beside an older identical value: {same_value} ==");
+    println!("== automated facts matching a value the owner deleted: {resurrected} ==");
+    println!("== rows retired, by reason ==");
+    for row in &retired {
+        println!(
+            "- {}: {}",
+            row.get::<String, _>("reason"),
+            row.get::<i64, _>("n")
+        );
+    }
     Ok(())
 }

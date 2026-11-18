@@ -1,0 +1,13 @@
+{
+  "command": {
+    "device_id": "dev-phone-1",
+    "scopes": [
+      "observe",
+      "chat",
+      "approve"
+    ],
+    "type": "set_device_scopes"
+  },
+  "request_id": "5d0c2b1e-002c",
+  "type": "command"
+}

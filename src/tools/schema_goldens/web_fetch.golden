@@ -1,0 +1,29 @@
+{
+  "description": "Fetch a readable web page and extract its content; not for REST/JSON API endpoints",
+  "name": "web_fetch",
+  "schema": {
+    "description": "Fetch a readable web page and extract its content. Strips ads/navigation. Do NOT use for REST/JSON API endpoints or machine-readable responses; use http_request for APIs. For login-required sites, use browser instead.",
+    "name": "web_fetch",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "max_chars": {
+          "description": "Maximum characters to return (default 20000, max 50000)",
+          "type": "integer"
+        },
+        "offset": {
+          "description": "Characters of page text to skip, to read past a truncated reply",
+          "type": "integer"
+        },
+        "url": {
+          "description": "The URL to fetch",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    }
+  }
+}

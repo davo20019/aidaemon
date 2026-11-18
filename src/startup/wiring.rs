@@ -30,10 +30,9 @@ use crate::runtime_ports::{ChildAgentRuntime, ConversationRuntime, OutboundRoute
 
 /// Phase 1: wiring that only needs the constructed [`Agent`] (no hub yet).
 ///
-/// Must be called immediately after the agent is constructed, in the same
-/// order as the original inline calls:
-/// 1. give the spawn tool a weak child-runtime reference,
-/// 2. give the agent a weak self-reference for background task spawning.
+/// Must be called immediately after the agent is constructed: it gives the
+/// spawn tool a weak child-runtime reference, and checks the agent holds
+/// its weak self-reference (the runtime preset's `build` sets it).
 pub async fn wire_agent_cycles(
     agent: &Arc<Agent>,
     spawn_tool: Option<&Arc<crate::tools::SpawnAgentTool>>,
@@ -43,9 +42,6 @@ pub async fn wire_agent_cycles(
         let runtime: Arc<dyn ChildAgentRuntime> = agent.clone();
         st.set_agent(Arc::downgrade(&runtime));
     }
-
-    // Give the agent a weak self-reference for background task spawning.
-    agent.set_self_ref(Arc::downgrade(agent)).await;
 
     validate_components(&[
         ("agent.self_ref", agent.self_reference_ready().await),
@@ -81,20 +77,28 @@ pub async fn wire_hub_cycles(
     // Give the spawn tool a reference to the hub for background mode notifications.
     if let Some(st) = spawn_tool {
         st.set_hub(Arc::downgrade(&outbound));
+        st.set_plan_store(plan_store.clone());
     }
 
     // Give terminal a reference to the hub so background command progress/completion
     // can be delivered immediately (not only via heartbeat queue polling).
     // Also give it a weak agent reference so background completions can re-engage
     // the agent loop to process the output and continue the original task.
+    // A command or agent left running in the background is a run in the
+    // same records as a background helper, on its turn's card.
+    let runs = crate::runtime_ports::ChildAgentRuntime::helper_runs(agent.as_ref());
     if let Some(tt) = terminal_tool {
+        tt.set_runs(runs.clone());
         tt.set_hub(Arc::downgrade(&outbound));
-        tt.set_agent(Arc::downgrade(agent));
+        let runtime: Arc<dyn ConversationRuntime> = agent.clone();
+        tt.set_agent(Arc::downgrade(&runtime));
         // Durable plan store for completion-time deliverable attribution and the
         // conservative delivery-step write-back.
-        tt.set_plan_store(plan_store);
+        tt.set_plan_store(plan_store.clone());
     }
     if let Some(cat) = cli_agent_tool {
+        cat.set_runs(runs);
+        cat.set_plan_store(plan_store);
         cat.set_hub(Arc::downgrade(&outbound));
         let runtime: Arc<dyn ConversationRuntime> = agent.clone();
         cat.set_agent(Arc::downgrade(&runtime));

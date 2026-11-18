@@ -4,9 +4,17 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::config::AppConfig;
-use crate::tools::ApprovalBroker;
 use crate::tools::{ManageSkillsTool, SkillResourcesTool, UseSkillTool};
 use crate::traits::{SkillsStore, Tool};
+
+/// Register a skills tool, declared in the tool manifest.
+fn push_global(tools: &mut Vec<Arc<dyn Tool>>, tool: Arc<dyn Tool>) {
+    aidaemon_runtime::tool_manifest::push(
+        tools,
+        aidaemon_runtime::tool_manifest::ToolContext::Global,
+        tool,
+    );
+}
 
 pub async fn register_skills_tools(
     config: &AppConfig,
@@ -14,7 +22,6 @@ pub async fn register_skills_tools(
     http_profiles: crate::oauth::SharedHttpProfiles,
     state: Arc<dyn SkillsStore>,
     tools: &mut Vec<Arc<dyn Tool>>,
-    approval_tx: ApprovalBroker,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !config.skills.enabled {
         info!("Skills system disabled");
@@ -94,23 +101,26 @@ pub async fn register_skills_tools(
     }
 
     if config.tools.is_enabled("use_skill") {
-        tools.push(Arc::new(UseSkillTool::new(dir.clone())));
+        push_global(tools, Arc::new(UseSkillTool::new(dir.clone())));
         info!("use_skill tool enabled");
     }
 
     if config.tools.is_enabled("skill_resources") {
-        tools.push(Arc::new(SkillResourcesTool::new(
-            dir.clone(),
-            fs_resolver as Arc<dyn crate::skills::ResourceResolver>,
-        )));
+        push_global(
+            tools,
+            Arc::new(SkillResourcesTool::new(
+                dir.clone(),
+                fs_resolver as Arc<dyn crate::skills::ResourceResolver>,
+            )),
+        );
         info!("skill_resources tool enabled");
     }
 
     if config.tools.is_enabled("manage_skills") {
-        let manage_skills = ManageSkillsTool::new(dir.clone(), state, approval_tx)
+        let manage_skills = ManageSkillsTool::new(dir.clone(), state)
             .with_http_profiles(http_profiles)
             .with_registries(config.skills.registries.clone());
-        tools.push(Arc::new(manage_skills));
+        push_global(tools, Arc::new(manage_skills));
         info!("manage_skills tool enabled");
     }
 

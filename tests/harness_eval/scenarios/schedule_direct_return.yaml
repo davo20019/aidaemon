@@ -1,0 +1,14 @@
+name: schedule_model_directed
+description: Schedule language reaches the model instead of a deterministic direct-return router
+input: Check deployment tomorrow at 9am
+setup:
+  session_id: eval_schedule_01
+  orchestrator: true
+script:
+  - text: I will assess the requested future check and use the available goal tools if scheduling is appropriate.
+expect:
+  ext:
+    llm_calls_min: 1
+    tool_calls_max: 0
+    direct_return: false
+    orchestration_route: default_continue

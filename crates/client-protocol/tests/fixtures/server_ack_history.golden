@@ -1,0 +1,41 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "messages": [
+      {
+        "at_ms": 1767225600000,
+        "id": "m-119",
+        "role": "user",
+        "text": "Post the synthetic report for Alice Rivera"
+      },
+      {
+        "at_ms": 1767225660000,
+        "calls": [
+          {
+            "input": "{\"method\":\"POST\",\"url\":\"https://reports.example.invalid/weekly\"}",
+            "kind": "web",
+            "name": "http_request",
+            "output": "201 Created"
+          }
+        ],
+        "id": "m-120",
+        "role": "assistant",
+        "text": "Posted it.",
+        "tools": [
+          "http_request"
+        ]
+      },
+      {
+        "at_ms": 1767225720000,
+        "handed_off": true,
+        "id": "m-121",
+        "role": "assistant",
+        "text": "Started in the background: synthetic test run."
+      }
+    ],
+    "more": true,
+    "session_id": "app:6c1f",
+    "type": "history"
+  },
+  "type": "ack"
+}

@@ -1,0 +1,8 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "text": "Nothing is running in this chat right now.",
+    "type": "reply"
+  },
+  "type": "ack"
+}

@@ -1,0 +1,16 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "hits": [
+      {
+        "at_ms": 1767225600000,
+        "message_id": "m-119",
+        "role": "user",
+        "session_id": "app:6c1f",
+        "snippet": "Post the synthetic report for Alice Rivera"
+      }
+    ],
+    "type": "search_results"
+  },
+  "type": "ack"
+}
