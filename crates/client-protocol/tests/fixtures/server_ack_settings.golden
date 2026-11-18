@@ -21,6 +21,26 @@
         "preset": "openai",
         "suggested": "gpt-x"
       },
+      "coding_agents": [
+        {
+          "mode": "checked",
+          "modes": [
+            "checked",
+            "every_command",
+            "full_access"
+          ],
+          "name": "codex",
+          "program": "Codex"
+        },
+        {
+          "modes": [
+            "full_access"
+          ],
+          "name": "aider",
+          "note": "AIDaemon cannot check this agent's actions.",
+          "program": "Aider"
+        }
+      ],
       "config_path": "/home/synthetic/.aidaemon/config.toml",
       "connected": [
         {

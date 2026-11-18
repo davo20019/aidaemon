@@ -77,7 +77,30 @@ it another way.";
 /// unchanged (`-c` profile entries, the sandbox mode, the model); the
 /// approval policy becomes `on-request`, answered by this host. `Err` names
 /// an argument with no app-server equivalent, and the run stays on `exec`.
-pub fn app_server_args(args: &[String], start: usize) -> Result<Vec<String>, String> {
+/// When a hosted Codex asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asks {
+    /// Before it leaves its sandbox (the project folder): checked mode.
+    /// Its network goes through Codex's own proxy, which lets no host
+    /// through unasked, so a blocked host is a plain refusal it can ask
+    /// past rather than a lookup that just fails.
+    BeyondSandbox,
+    /// Before every command and file change but its short list of
+    /// read-only commands: every-command mode.
+    EveryCommand,
+}
+
+impl Asks {
+    /// Codex's name for the policy (a machine format of its protocol).
+    fn policy(self) -> &'static str {
+        match self {
+            Self::BeyondSandbox => "on-request",
+            Self::EveryCommand => "untrusted",
+        }
+    }
+}
+
+pub fn app_server_args(args: &[String], start: usize, asks: Asks) -> Result<Vec<String>, String> {
     let toml = |value: &str| serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
     let mut out: Vec<String> = args[..start.min(args.len())].to_vec();
     let mut saw_exec = false;
@@ -93,7 +116,13 @@ pub fn app_server_args(args: &[String], start: usize) -> Result<Vec<String>, Str
             }
             "-c" | "--config" => {
                 let value = value.ok_or("`-c` has no value")?;
-                if !value.trim_start().starts_with("approval_policy") {
+                // Its own entries, by their config keys (machine format).
+                let key = value.split('=').next().unwrap_or_default().trim();
+                if key == "approval_policy" {
+                } else if asks == Asks::BeyondSandbox && key.ends_with(".network.enabled") {
+                    // Through the proxy below, which allows no host.
+                    out.extend(["-c".to_string(), format!("{key}=true")]);
+                } else {
                     out.extend(["-c".to_string(), value.to_string()]);
                 }
                 index += 1;
@@ -131,9 +160,15 @@ pub fn app_server_args(args: &[String], start: usize) -> Result<Vec<String>, Str
     if !saw_exec {
         return Err("the launch does not run `codex exec`".to_string());
     }
+    if asks == Asks::BeyondSandbox {
+        out.extend([
+            "-c".to_string(),
+            "features.network_proxy.enabled=true".to_string(),
+        ]);
+    }
     out.extend([
         "-c".to_string(),
-        "approval_policy=\"on-request\"".to_string(),
+        format!("approval_policy=\"{}\"", asks.policy()),
         "-c".to_string(),
         "approvals_reviewer=\"user\"".to_string(),
     ]);
@@ -309,6 +344,7 @@ pub struct CodexHost {
     nested: NestedCalls,
     working_dir: Option<String>,
     prompt: Arc<str>,
+    asks: Asks,
     state: Arc<Mutex<HostState>>,
 }
 
@@ -318,12 +354,14 @@ impl CodexHost {
         nested: NestedCalls,
         working_dir: Option<String>,
         prompt: &str,
+        asks: Asks,
     ) -> Self {
         Self {
             stdin: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
             nested,
             working_dir,
             prompt: Arc::from(prompt),
+            asks,
             state: Arc::default(),
         }
     }
@@ -388,7 +426,7 @@ impl CodexHost {
                 let mut lines = json!({"jsonrpc": "2.0", "method": "initialized"}).to_string();
                 lines.push('\n');
                 let mut params = json!({
-                    "approvalPolicy": "on-request",
+                    "approvalPolicy": self.asks.policy(),
                     "approvalsReviewer": "user",
                     "ephemeral": true,
                     "developerInstructions": HOST_INSTRUCTIONS,
@@ -744,11 +782,13 @@ mod tests {
             "-c",
             "approval_policy=\"never\"",
         ]);
-        let out = app_server_args(&args, 0).unwrap();
+        let out = app_server_args(&args, 0, Asks::BeyondSandbox).unwrap();
         assert_eq!(out[0], "app-server");
         let config = config_values(&out);
         assert!(config.contains(&"default_permissions=\"aidaemon-task\""));
-        assert!(config.contains(&"permissions.aidaemon-task.network.enabled=false"));
+        // Its network goes through Codex's proxy, which allows no host.
+        assert!(config.contains(&"permissions.aidaemon-task.network.enabled=true"));
+        assert!(config.contains(&"features.network_proxy.enabled=true"));
         assert!(config.contains(&"model=\"gpt-test\""));
         // It asks now, and never by the owner's own policy.
         assert!(config.contains(&"approval_policy=\"on-request\""));
@@ -760,13 +800,16 @@ mod tests {
     #[test]
     fn an_env_launcher_is_kept_and_an_unknown_argument_keeps_the_run_on_exec() {
         let args = strings(&["FOO=1", "codex", "exec", "--sandbox", "read-only"]);
-        let out = app_server_args(&args, 2).unwrap();
+        let out = app_server_args(&args, 2, Asks::EveryCommand).unwrap();
         assert_eq!(&out[..3], &strings(&["FOO=1", "codex", "app-server"])[..]);
         assert!(config_values(&out).contains(&"sandbox_mode=\"read-only\""));
+        // Every command is asked; no proxy (its sandbox is read-only).
+        assert!(config_values(&out).contains(&"approval_policy=\"untrusted\""));
+        assert!(!config_values(&out).contains(&"features.network_proxy.enabled=true"));
 
         let args = strings(&["exec", "--output-schema", "s.json"]);
-        assert!(app_server_args(&args, 0).is_err());
-        assert!(app_server_args(&strings(&["--json"]), 0).is_err());
+        assert!(app_server_args(&args, 0, Asks::BeyondSandbox).is_err());
+        assert!(app_server_args(&strings(&["--json"]), 0, Asks::BeyondSandbox).is_err());
     }
 
     #[test]
@@ -849,7 +892,13 @@ mod tests {
                 NestedVerdict::Allow
             }
         });
-        let host = CodexHost::new(stdin, nested, Some("/w".to_string()), "fix it");
+        let host = CodexHost::new(
+            stdin,
+            nested,
+            Some("/w".to_string()),
+            "fix it",
+            Asks::BeyondSandbox,
+        );
 
         // What the host writes to the agent comes back on `cat`'s stdout.
         let mut sent = BufReader::new(echoed).lines();
@@ -921,7 +970,13 @@ mod tests {
         let (nested, asked) = aidaemon_core::testing::nested_calls(|_| NestedVerdict::Deny {
             reason: "outside the task".to_string(),
         });
-        let host = CodexHost::new(child.stdin.take().unwrap(), nested, None, "p");
+        let host = CodexHost::new(
+            child.stdin.take().unwrap(),
+            nested,
+            None,
+            "p",
+            Asks::BeyondSandbox,
+        );
         host.on_line(r#"{"method":"item/started","params":{"item":{"type":"fileChange","id":"f1","status":"inProgress","changes":[{"path":"/etc/hosts","kind":{"type":"update"},"diff":"+x"}]}}}"#).await;
         host.answer(
             "item/fileChange/requestApproval",

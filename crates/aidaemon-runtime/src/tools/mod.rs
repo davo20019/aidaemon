@@ -1,6 +1,7 @@
 //! Tools that join several domains (memory with scheduled work, the
 //! automation surfaces), so they live where those crates meet.
 
+pub mod agent_mode;
 pub mod cli_agent;
 mod cli_agent_left_running;
 pub mod cli_host;

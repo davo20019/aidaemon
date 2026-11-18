@@ -1139,6 +1139,26 @@ fn server_samples() -> Vec<ServerFrame> {
                     models: vec!["gpt-x".into(), "gpt-y".into()],
                     suggested: Some("gpt-x".into()),
                 }),
+                coding_agents: vec![
+                    CodingAgent {
+                        name: "codex".into(),
+                        program: "Codex".into(),
+                        mode: Some(AgentMode::Checked),
+                        modes: vec![
+                            AgentMode::Checked,
+                            AgentMode::EveryCommand,
+                            AgentMode::FullAccess,
+                        ],
+                        note: String::new(),
+                    },
+                    CodingAgent {
+                        name: "aider".into(),
+                        program: "Aider".into(),
+                        mode: None,
+                        modes: vec![AgentMode::FullAccess],
+                        note: "AIDaemon cannot check this agent's actions.".into(),
+                    },
+                ],
             },
         }),
         ack(CommandResult::SettingsChanged {

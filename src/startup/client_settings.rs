@@ -516,6 +516,7 @@ impl SettingsHost {
             )
             .display()
             .to_string(),
+            coding_agents: coding_agents(&*self.state).await,
             database_encrypted: cfg!(feature = "encryption")
                 && std::env::var("AIDAEMON_ALLOW_PLAINTEXT_DB").is_err(),
         })
@@ -692,6 +693,22 @@ impl SettingsHost {
                 DatabaseAction::Cancel => SettingsGate::Free,
                 DatabaseAction::Unknown => return Err("Unknown database action".to_string()),
             },
+            SettingsChange::SetAgentMode { agent, mode } => {
+                let kind = aidaemon_runtime::tools::agent_mode::kind_of(agent)
+                    .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+                match agent_mode(*mode)? {
+                    // Nothing it does is checked from then on.
+                    aidaemon_runtime::tools::agent_mode::AgentMode::FullAccess => ask(
+                        format!(
+                            "Give {} full access: it runs on this machine with nothing asked, \
+                             and your rules don't see what it does.",
+                            kind.program(agent)
+                        ),
+                        false,
+                    ),
+                    _ => SettingsGate::Free,
+                }
+            }
             SettingsChange::ForgetSignIns => ask(
                 "Forget every sign-in the agent's browser kept. Its open tabs close, and you \
                  sign in again next time."
@@ -1104,6 +1121,16 @@ impl SettingsHost {
                     applies: Some(Applies::Restart),
                 })
             }
+            SettingsChange::SetAgentMode { agent, mode } => {
+                use aidaemon_runtime::tools::agent_mode;
+                let kind = agent_mode::kind_of(&agent)
+                    .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+                agent_mode::set_mode(&*self.state, &agent, kind, agent_mode(mode)?).await?;
+                Ok(SettingsDone {
+                    message: format!("{} now runs as you chose.", kind.program(&agent)),
+                    applies: Some(Applies::Now),
+                })
+            }
             SettingsChange::ForgetSignIns => {
                 let message = crate::startup::surfaces::forget_sign_ins().await?;
                 Ok(SettingsDone {
@@ -1158,6 +1185,47 @@ impl EarlierSecret {
 /// The group a setting is shown in: its config table.
 fn group_of(key: &str) -> String {
     key.split(['.', '[']).next().unwrap_or_default().to_string()
+}
+
+/// The protocol's mode as the runtime's; `Err` for one this daemon does
+/// not know.
+fn agent_mode(
+    mode: aidaemon_client_protocol::AgentMode,
+) -> Result<aidaemon_runtime::tools::agent_mode::AgentMode, String> {
+    use aidaemon_client_protocol::AgentMode as Wire;
+    use aidaemon_runtime::tools::agent_mode::AgentMode;
+    match mode {
+        Wire::Checked => Ok(AgentMode::Checked),
+        Wire::EveryCommand => Ok(AgentMode::EveryCommand),
+        Wire::FullAccess => Ok(AgentMode::FullAccess),
+        _ => Err("This mode is not known to this daemon".to_string()),
+    }
+}
+
+/// The coding agents the daemon can delegate to, each with its mode.
+async fn coding_agents(
+    store: &(impl aidaemon_tools::services::SettingsStore + ?Sized),
+) -> Vec<aidaemon_client_protocol::CodingAgent> {
+    use aidaemon_client_protocol::AgentMode as Wire;
+    use aidaemon_runtime::tools::agent_mode::{self, AgentMode};
+    let wire = |mode: AgentMode| match mode {
+        AgentMode::Checked => Wire::Checked,
+        AgentMode::EveryCommand => Wire::EveryCommand,
+        AgentMode::FullAccess => Wire::FullAccess,
+    };
+    let mut out = Vec::new();
+    for info in agent_mode::agents() {
+        out.push(aidaemon_client_protocol::CodingAgent {
+            program: info.kind.program(&info.name),
+            mode: agent_mode::mode_of(store, &info.name, info.kind)
+                .await
+                .map(wire),
+            modes: info.kind.offered().iter().copied().map(wire).collect(),
+            note: info.kind.note().to_string(),
+            name: info.name,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1263,6 +1331,61 @@ allowed_user_ids = [1]
         );
         let host = SettingsHost::new(path, state, None, None);
         (dir, host)
+    }
+
+    /// Each coding agent is listed with its mode; checked is the default
+    /// for one the daemon can host, full access asks first, and the choice
+    /// is kept per agent.
+    #[tokio::test]
+    async fn a_coding_agents_mode_is_listed_set_and_full_access_asks() {
+        use aidaemon_client_protocol::{AgentMode, CodingAgent};
+        use aidaemon_runtime::tools::agent_mode::{self, AgentInfo, AgentKind};
+        agent_mode::publish(Arc::new(|| {
+            vec![
+                AgentInfo {
+                    name: "synthetic-codex".into(),
+                    kind: AgentKind::Codex,
+                },
+                AgentInfo {
+                    name: "synthetic-coder".into(),
+                    kind: AgentKind::Other,
+                },
+            ]
+        }));
+        let (_dir, host) = host(CONFIG).await;
+        let agents = coding_agents(&*host.state).await;
+        let codex: &CodingAgent = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
+        assert_eq!(codex.program, "Codex");
+        assert_eq!(codex.mode, Some(AgentMode::Checked));
+        assert_eq!(codex.modes.len(), 3);
+        let other = agents.iter().find(|a| a.name == "synthetic-coder").unwrap();
+        assert_eq!(other.mode, None);
+        assert_eq!(other.modes, vec![AgentMode::FullAccess]);
+        assert!(!other.note.is_empty());
+
+        let full = SettingsChange::SetAgentMode {
+            agent: "synthetic-codex".into(),
+            mode: AgentMode::FullAccess,
+        };
+        assert!(matches!(
+            host.gate(&full).await.unwrap(),
+            SettingsGate::Ask { .. }
+        ));
+        let every = SettingsChange::SetAgentMode {
+            agent: "synthetic-codex".into(),
+            mode: AgentMode::EveryCommand,
+        };
+        assert_eq!(host.gate(&every).await.unwrap(), SettingsGate::Free);
+        host.change(every, false).await.unwrap();
+        let agents = coding_agents(&*host.state).await;
+        let codex = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
+        assert_eq!(codex.mode, Some(AgentMode::EveryCommand));
+        // A mode its kind does not offer is refused.
+        let refused = SettingsChange::SetAgentMode {
+            agent: "synthetic-coder".into(),
+            mode: AgentMode::Checked,
+        };
+        assert!(host.change(refused, false).await.is_err());
     }
 
     const CONFIG: &str = r#"

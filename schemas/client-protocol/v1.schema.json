@@ -40,6 +40,26 @@
       ],
       "type": "object"
     },
+    "AgentMode": {
+      "description": "How much a coding agent may do on its own (protocol 1.36).",
+      "oneOf": [
+        {
+          "const": "checked",
+          "description": "Free inside the project folder (its sandbox); anything beyond it\nis asked first and checked by the daemon's rules, and the owner is\nasked only what those do not cover.",
+          "type": "string"
+        },
+        {
+          "const": "every_command",
+          "description": "On the machine itself, with every command and file change (but a\nfew read-only commands) asked first and checked the same way.",
+          "type": "string"
+        },
+        {
+          "const": "full_access",
+          "description": "On the machine itself, nothing asked: the daemon's rules do not\nsee what it does.",
+          "type": "string"
+        }
+      ]
+    },
     "Applies": {
       "description": "When a saved change takes effect.",
       "oneOf": [
@@ -1077,6 +1097,47 @@
           "type": "string"
         }
       ]
+    },
+    "CodingAgent": {
+      "description": "A coding agent the daemon can hand work to (Claude Code, Codex, ...)\nand its permission mode (protocol 1.36).",
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its mode; `None`: it may not run delegated work until the owner\npicks one of `modes`."
+        },
+        "modes": {
+          "description": "The modes it can run in, safest first: checking needs an agent\nwhose approval requests the daemon can answer.",
+          "items": {
+            "$ref": "#/$defs/AgentMode"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Its name in the daemon (`claude`, `codex`, or one the owner added).",
+          "type": "string"
+        },
+        "note": {
+          "description": "Why some modes are not offered, in plain words; empty when all are.",
+          "type": "string"
+        },
+        "program": {
+          "description": "The program it launches, in plain words (\"Claude Code\", \"Codex\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "program",
+        "modes"
+      ],
+      "type": "object"
     },
     "Command": {
       "description": "What a client asks the daemon to do.",
@@ -5785,6 +5846,13 @@
           ],
           "description": "The last key checked from Settings, with its account's models."
         },
+        "coding_agents": {
+          "description": "The coding agents the daemon can hand work to, each with how much\nit may do on its own (protocol 1.36).",
+          "items": {
+            "$ref": "#/$defs/CodingAgent"
+          },
+          "type": "array"
+        },
         "config_path": {
           "description": "The config file the settings live in.",
           "type": "string"
@@ -6176,6 +6244,27 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Set coding agent `agent`'s permission mode (protocol 1.36). Full\naccess asks first.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_agent_mode",
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/AgentMode"
+            }
+          },
+          "required": [
+            "kind",
+            "agent",
+            "mode"
           ],
           "type": "object"
         }

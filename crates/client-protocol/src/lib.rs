@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 35;
+pub const PROTOCOL_MINOR: u16 = 36;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1325,6 +1325,49 @@ pub struct Settings {
     /// The last key checked from Settings, with its account's models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked: Option<CheckedKey>,
+    /// The coding agents the daemon can hand work to, each with how much
+    /// it may do on its own (protocol 1.36).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coding_agents: Vec<CodingAgent>,
+}
+
+/// A coding agent the daemon can hand work to (Claude Code, Codex, ...)
+/// and its permission mode (protocol 1.36).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct CodingAgent {
+    /// Its name in the daemon (`claude`, `codex`, or one the owner added).
+    pub name: String,
+    /// The program it launches, in plain words ("Claude Code", "Codex").
+    pub program: String,
+    /// Its mode; `None`: it may not run delegated work until the owner
+    /// picks one of `modes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AgentMode>,
+    /// The modes it can run in, safest first: checking needs an agent
+    /// whose approval requests the daemon can answer.
+    pub modes: Vec<AgentMode>,
+    /// Why some modes are not offered, in plain words; empty when all are.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// How much a coding agent may do on its own (protocol 1.36).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    /// Free inside the project folder (its sandbox); anything beyond it
+    /// is asked first and checked by the daemon's rules, and the owner is
+    /// asked only what those do not cover.
+    Checked,
+    /// On the machine itself, with every command and file change (but a
+    /// few read-only commands) asked first and checked the same way.
+    EveryCommand,
+    /// On the machine itself, nothing asked: the daemon's rules do not
+    /// see what it does.
+    FullAccess,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// A provider the daemon uses: the main one or a failover.
@@ -1564,6 +1607,12 @@ pub enum SettingsChange {
     /// Delete every sign-in the agent's own browser profile kept (protocol
     /// 1.30). Asks first; open tabs close.
     ForgetSignIns,
+    /// Set coding agent `agent`'s permission mode (protocol 1.36). Full
+    /// access asks first.
+    SetAgentMode {
+        agent: String,
+        mode: AgentMode,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

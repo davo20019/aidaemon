@@ -158,6 +158,23 @@ pub fn daemon_call(
             })
         }
         "WebFetch" => json!({"url": text("url").ok_or_else(|| missing("URL"))?}),
+        // A read outside its folder (every-command mode asks for those).
+        "Read" => json!({"path": text("file_path").ok_or_else(|| missing("file"))?}),
+        "Grep" => {
+            let mut arguments =
+                json!({"pattern": text("pattern").ok_or_else(|| missing("pattern"))?});
+            if let Some(path) = text("path") {
+                arguments["path"] = json!(path);
+            }
+            arguments
+        }
+        "Glob" => {
+            let mut arguments = json!({"glob": text("pattern").ok_or_else(|| missing("pattern"))?});
+            if let Some(path) = text("path") {
+                arguments["path"] = json!(path);
+            }
+            arguments
+        }
         // Its sandbox asks before a command reaches a network host: judged
         // as a fetch from that host (an egress to it).
         "SandboxNetworkAccess" => {
@@ -173,6 +190,8 @@ pub fn daemon_call(
     let tool = match prompt.tool_name.as_str() {
         "Write" => "write_file",
         "Edit" | "MultiEdit" => "edit_file",
+        "Read" => "read_file",
+        "Grep" | "Glob" => "search_files",
         _ => "web_fetch",
     };
     Ok(ToolCall::new(id, tool, arguments))
@@ -356,6 +375,25 @@ mod tests {
             tool_name: tool.into(),
             input,
         };
+        let read = daemon_call(
+            &prompt("Read", json!({"file_path": "/etc/synthetic.conf"})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read.name, "read_file");
+        assert_eq!(read.arguments, json!({"path": "/etc/synthetic.conf"}));
+        let grep = daemon_call(
+            &prompt("Grep", json!({"pattern": "TODO", "path": "/w/other"})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(grep.name, "search_files");
+        assert_eq!(
+            grep.arguments,
+            json!({"pattern": "TODO", "path": "/w/other"})
+        );
+        let glob = daemon_call(&prompt("Glob", json!({"pattern": "*.rs"})), None).unwrap();
+        assert_eq!(glob.arguments, json!({"glob": "*.rs"}));
         let write = daemon_call(
             &prompt(
                 "Write",

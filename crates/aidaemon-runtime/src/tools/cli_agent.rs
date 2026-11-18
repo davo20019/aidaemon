@@ -43,6 +43,7 @@ use aidaemon_tools::{BackendFileType, BackendPath, ExecutionRequest, ProcessHand
 /// and task a delegated run reports to, and notices for a chat no one reads.
 pub trait CliAgentStore:
     aidaemon_tools::services::DynamicCliAgentStore
+    + aidaemon_tools::services::SettingsStore
     + aidaemon_events::stores::MessageStore
     + aidaemon_work::stores::GoalStore
     + aidaemon_work::stores::TaskStore
@@ -52,6 +53,7 @@ pub trait CliAgentStore:
 
 impl<T> CliAgentStore for T where
     T: aidaemon_tools::services::DynamicCliAgentStore
+        + aidaemon_tools::services::SettingsStore
         + aidaemon_events::stores::MessageStore
         + aidaemon_work::stores::GoalStore
         + aidaemon_work::stores::TaskStore
@@ -478,6 +480,70 @@ fn apply_scoped_cli_adapter(
     Ok(())
 }
 
+/// Remove every flag of a Claude Code launch that sets what it may do
+/// (exact command-line flags: a machine format), so an adapter's own are
+/// the only ones.
+fn drop_claude_permission_flags(args: &mut Vec<String>) {
+    const DROPS_VALUE: [&str; 8] = [
+        "--permission-mode",
+        "--tools",
+        "--allowedTools",
+        "--allowed-tools",
+        "--settings",
+        "--setting-sources",
+        "--add-dir",
+        "--mcp-config",
+    ];
+    let mut kept = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        let name = argument.split('=').next().unwrap_or(argument);
+        if DROPS_VALUE.contains(&name) {
+            index += if argument.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if matches!(name, "--restricted" | "--strict-mcp-config") {
+            index += 1;
+            continue;
+        }
+        kept.push(argument.clone());
+        index += 1;
+    }
+    *args = kept;
+}
+
+/// Claude Code on the machine itself with every action asked
+/// (every-command mode): none of the owner's or the project's settings are
+/// loaded (so no allow rule of theirs answers for the run), no MCP servers,
+/// no sandbox, and `manual` permissions, so each command (but its own few
+/// read-only ones), edit and read outside its folder is a prompt the run
+/// judges (`cli_host`). Verified live against 2.1.327, 2026-11-18.
+fn apply_claude_every_command_adapter(
+    args: &mut Vec<String>,
+    read_only: bool,
+) -> Result<(), String> {
+    drop_claude_permission_flags(args);
+    let tools = if read_only {
+        "Read,Glob,Grep"
+    } else {
+        "Bash,Read,Edit,Write,Glob,Grep"
+    };
+    args.extend(
+        [
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--permission-mode",
+            "manual",
+            "--tools",
+            tools,
+        ]
+        .iter()
+        .map(|arg| arg.to_string()),
+    );
+    Ok(())
+}
+
 /// Confine one Claude Code run the way the access contract asks, in
 /// Claude Code's own terms (verified live against 2.1.327, 2026-11-18):
 /// `--restricted` loads no user, project or local settings (so no allow
@@ -508,31 +574,8 @@ fn apply_claude_confined_adapter(
             "a confined Claude Code run reaches only its working directory {working_dir}, and {outside} is outside it"
         ));
     }
-    const DROPS_VALUE: [&str; 8] = [
-        "--permission-mode",
-        "--tools",
-        "--allowedTools",
-        "--allowed-tools",
-        "--settings",
-        "--setting-sources",
-        "--add-dir",
-        "--mcp-config",
-    ];
-    let mut confined = Vec::with_capacity(args.len().saturating_add(10));
-    let mut index = 0;
-    while let Some(argument) = args.get(index) {
-        let name = argument.split('=').next().unwrap_or(argument);
-        if DROPS_VALUE.contains(&name) {
-            index += if argument.contains('=') { 1 } else { 2 };
-            continue;
-        }
-        if matches!(name, "--restricted" | "--strict-mcp-config") {
-            index += 1;
-            continue;
-        }
-        confined.push(argument.clone());
-        index += 1;
-    }
+    drop_claude_permission_flags(args);
+    let mut confined = std::mem::take(args);
     let tools = if read_only {
         "Read,Glob,Grep"
     } else {
@@ -1589,6 +1632,15 @@ impl CliAgentTool {
         confinable
     }
 
+    /// What kind of agent `name` launches (`Other` when there is none).
+    fn agent_kind(&self, name: &str) -> crate::tools::agent_mode::AgentKind {
+        self.tools
+            .read()
+            .ok()
+            .and_then(|tools| tools.get(name).map(entry_kind))
+            .unwrap_or(crate::tools::agent_mode::AgentKind::Other)
+    }
+
     fn configured_tool(&self, name: &str) -> Option<String> {
         self.tools
             .read()
@@ -1787,6 +1839,24 @@ impl CliAgentTool {
 
         // Load dynamic agents from DB
         tool.load_dynamic_agents().await;
+        // The Settings page lists these agents with their modes.
+        let listed = Arc::downgrade(&tool.tools);
+        crate::tools::agent_mode::publish(Arc::new(move || {
+            listed
+                .upgrade()
+                .and_then(|tools| {
+                    tools.read().ok().map(|tools| {
+                        tools
+                            .iter()
+                            .map(|(name, entry)| crate::tools::agent_mode::AgentInfo {
+                                name: name.clone(),
+                                kind: entry_kind(entry),
+                            })
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        }));
 
         tool
     }
@@ -2567,7 +2637,7 @@ impl CliAgentTool {
         claude_confinable: bool,
     ) -> anyhow::Result<String> {
         // Get entry from the tools map (clone what we need, release lock)
-        let (mut command, mut args, timeout, max_output, is_dynamic) = {
+        let (mut command, mut args, timeout, max_output, is_dynamic, kind) = {
             let tools = self.tools.read().unwrap();
             let entry = tools
                 .get(tool_name)
@@ -2578,8 +2648,27 @@ impl CliAgentTool {
                 entry.timeout,
                 entry.max_output_chars,
                 entry.is_dynamic,
+                entry_kind(entry),
             )
         };
+        // The owner's mode for this agent decides how it runs
+        // (`agent_mode`). Only the dispatcher's path enforces it.
+        use crate::tools::agent_mode::{AgentKind, AgentMode};
+        let mode = crate::tools::agent_mode::mode_of(&*self.state, tool_name, kind).await;
+        let Some(mode) = mode.or((!enforce_native_access).then_some(AgentMode::Checked)) else {
+            return Ok(format!(
+                "Blocked: {program} (`{tool_name}`) may not run delegated work: AIDaemon can't \
+                 check its actions, and the owner has not given it full access (Settings, \
+                 Coding agent permissions).",
+                program = kind.program(tool_name)
+            ));
+        };
+        info!(agent = %tool_name, mode = mode.as_str(), "A coding agent runs in its mode");
+        // Full access: nothing is confined or asked; the owner chose it.
+        let full_access = mode == AgentMode::FullAccess;
+        let every_command = mode == AgentMode::EveryCommand;
+        let enforce_native_access = enforce_native_access && !full_access;
+        let nested = nested.filter(|_| !full_access);
 
         // Claude Code can refuse to start when it detects it's running inside a
         // parent Claude session. Also, aidaemon has no TTY for interactive mode.
@@ -2672,6 +2761,20 @@ impl CliAgentTool {
                 ));
             }
         }
+        // Full access, in each agent's own terms (added after the bypass
+        // flags a launch carried were removed: this is the owner's choice).
+        if full_access {
+            match kind {
+                AgentKind::ClaudeCode => args.extend([
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ]),
+                AgentKind::Codex => {
+                    args.push("--dangerously-bypass-approvals-and-sandbox".to_string())
+                }
+                AgentKind::Other => {}
+            }
+        }
         // Claude Code built in and run inside a kernel turn asks its host
         // for permission instead of denying on its own: each prompt is
         // judged by this run (`cli_host`).
@@ -2712,7 +2815,21 @@ impl CliAgentTool {
             }
         }
         if enforce_native_access {
-            let adapter_result = if tool_name.eq_ignore_ascii_case("claude")
+            let adapter_result = if every_command
+                && kind == AgentKind::ClaudeCode
+                && claude_confinable
+                && host_nested.is_some()
+            {
+                apply_claude_every_command_adapter(
+                    &mut args,
+                    workspace_mode == CliWorkspaceMode::ReadOnly,
+                )
+            } else if every_command && kind == AgentKind::Codex {
+                // Its sandbox stays read-only; every command and change is
+                // asked of the run (`codex_host`), and once allowed runs on
+                // the machine itself.
+                apply_read_only_cli_adapter(&command, &mut args)
+            } else if tool_name.eq_ignore_ascii_case("claude")
                 && claude_confinable
                 && host_nested.is_some()
             {
@@ -2747,9 +2864,15 @@ impl CliAgentTool {
         let mut codex_hosting: Option<(
             aidaemon_core::NestedCalls,
             crate::tools::codex_host::CodexHome,
+            crate::tools::codex_host::Asks,
         )> = None;
+        let asks = if every_command {
+            crate::tools::codex_host::Asks::EveryCommand
+        } else {
+            crate::tools::codex_host::Asks::BeyondSandbox
+        };
         if enforce_native_access
-            && workspace_mode == CliWorkspaceMode::ReadWrite
+            && (workspace_mode == CliWorkspaceMode::ReadWrite || every_command)
             && agent_kind.eq_ignore_ascii_case("codex")
             && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local
             && let Some(nested) = nested
@@ -2760,14 +2883,14 @@ impl CliAgentTool {
                 0
             };
             let hosted =
-                crate::tools::codex_host::app_server_args(&args, start).and_then(|hosted| {
+                crate::tools::codex_host::app_server_args(&args, start, asks).and_then(|hosted| {
                     crate::tools::codex_host::CodexHome::prepare().map(|home| (hosted, home))
                 });
             match hosted {
                 Ok((hosted, home)) => {
                     info!("A Codex run is hosted through its app-server");
                     args = hosted;
-                    codex_hosting = Some((nested, home));
+                    codex_hosting = Some((nested, home, asks));
                 }
                 Err(reason) => info!(%reason, "A Codex run stays on exec"),
             }
@@ -2967,7 +3090,7 @@ impl CliAgentTool {
                 Some(crate::tools::cli_host::claude_prompt_line(&final_prompt).into_bytes());
             request.keep_stdin = true;
         }
-        if let Some((_, home)) = codex_hosting.as_ref() {
+        if let Some((_, home, _)) = codex_hosting.as_ref() {
             // The handshake goes in first; the task follows once its thread
             // is started, and stdin stays open for the host's answers.
             request.stdin = Some(crate::tools::codex_host::initialize_line().into_bytes());
@@ -3045,13 +3168,14 @@ impl CliAgentTool {
         });
         let claude_host_for_task = claude_host.clone();
         let (codex_host, codex_home) = match codex_hosting {
-            Some((nested, home)) => (
+            Some((nested, home, asks)) => (
                 spawned.take_stdin().map(|stdin| {
                     crate::tools::codex_host::CodexHost::new(
                         stdin,
                         nested,
                         canonical_working_dir.clone(),
                         &final_prompt,
+                        asks,
                     )
                 }),
                 Some(home),
@@ -4587,6 +4711,22 @@ fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Op
 
 /// Whether an entry launches Claude Code: its program (or the program an
 /// `env` launcher wraps) is the `claude` executable.
+/// What kind of agent an entry launches, by the program it runs.
+fn entry_kind(entry: &CliToolEntry) -> crate::tools::agent_mode::AgentKind {
+    let program_index = is_env_launcher(&entry.command)
+        .then(|| env_wrapped_program_index(&entry.args))
+        .flatten();
+    let program = program_index
+        .and_then(|index| entry.args.get(index).map(String::as_str))
+        .unwrap_or(&entry.command);
+    crate::tools::agent_mode::AgentKind::of_program(
+        std::path::Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program),
+    )
+}
+
 fn launches_claude_code(entry: &CliToolEntry) -> bool {
     let program_index = is_env_launcher(&entry.command)
         .then(|| env_wrapped_program_index(&entry.args))
@@ -5615,7 +5755,42 @@ impl CliAgentTool {
                     .as_deref()
                     .filter(|name| name.eq_ignore_ascii_case("claude") && claude_confinable)
                     .and_then(|name| self.configured_tool(name));
-                let mut tool = if !enforce_native_access {
+                // An agent asked for by name runs as its owner-set mode
+                // allows (`agent_mode`): full access always, every command
+                // when it can be hosted here; checked by the rules below.
+                let by_mode = match args
+                    .tool
+                    .as_deref()
+                    .and_then(|name| self.configured_tool(name))
+                {
+                    Some(name) if enforce_native_access => {
+                        let kind = self.agent_kind(&name);
+                        let mode =
+                            crate::tools::agent_mode::mode_of(&*self.state, &name, kind).await;
+                        let hostable = match kind {
+                            crate::tools::agent_mode::AgentKind::ClaudeCode => claude_confinable,
+                            crate::tools::agent_mode::AgentKind::Codex => {
+                                self.backend.kind() == aidaemon_tools::backend::BackendKind::Local
+                                    && facts
+                                        .extensions
+                                        .get::<aidaemon_core::NestedCalls>()
+                                        .is_some()
+                            }
+                            crate::tools::agent_mode::AgentKind::Other => false,
+                        };
+                        match mode {
+                            Some(crate::tools::agent_mode::AgentMode::FullAccess) => Some(name),
+                            Some(crate::tools::agent_mode::AgentMode::EveryCommand) if hostable => {
+                                Some(name)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let mut tool = if by_mode.is_some() {
+                    by_mode
+                } else if !enforce_native_access {
                     args.tool
                         .as_deref()
                         .and_then(|name| self.configured_tool(name))
@@ -5879,6 +6054,10 @@ mod tests {
             }
         }
     }
+
+    /// No mode stored: each agent runs in its kind's default.
+    #[async_trait::async_trait]
+    impl aidaemon_tools::services::SettingsStore for TestStore {}
 
     impl aidaemon_work::sqlite::WorkDatabase for TestStore {
         fn work_pool(&self) -> &sqlx::SqlitePool {
@@ -8665,6 +8844,30 @@ mod tests {
         ) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn every_command_claude_loads_no_settings_and_asks_for_each_action() {
+        let mut args = strings(&[
+            "-p",
+            "--permission-mode",
+            "acceptEdits",
+            "--settings",
+            "{}",
+            "--restricted",
+        ]);
+        apply_claude_every_command_adapter(&mut args, false).unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("--permission-mode manual"), "{joined}");
+        assert!(joined.contains("--strict-mcp-config"));
+        assert!(!joined.contains("acceptEdits"));
+        assert!(!joined.contains("--restricted"));
+        assert!(!joined.contains("--settings {}"));
+        let sources = args
+            .iter()
+            .position(|arg| arg == "--setting-sources")
+            .unwrap();
+        assert_eq!(args[sources + 1], "");
     }
 
     /// Live 2026-11-13: two codex runs, one refused `ddev` by its sandbox,
