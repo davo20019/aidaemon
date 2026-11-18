@@ -6,7 +6,7 @@
 //! `SettingsChange::SetAgentMode` on that same path.
 
 use aidaemon_client_protocol::{
-    AgentMode, CodingAgent, SecretText, Setting, Settings, SettingsChange,
+    AgentMode, AgentReadiness, CodingAgent, SecretText, Setting, Settings, SettingsChange,
 };
 use nsh_core::prelude::*;
 
@@ -269,11 +269,22 @@ fn coding_agents(store: Store, agents: &[CodingAgent]) -> View {
         }
         list = list.child(coding_agent(store, agent));
     }
-    view()
+    let head = view()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
         .gap_2()
         .child(section_label("Coding agent permissions"))
-        .child(key)
-        .child(list)
+        .child(ui::btn(
+            "Check again",
+            Variant::Ghost,
+            Size::Sm,
+            move || {
+                store.check_agents();
+            },
+        ));
+    view().gap_2().child(head).child(key).child(list)
 }
 
 fn coding_agent(store: Store, agent: &CodingAgent) -> View {
@@ -285,6 +296,7 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
     if agent.name != agent.program {
         title = title.child(faint(agent.name.clone()));
     }
+    let title = view().gap_1().child(title).child(readiness(agent));
     let items: Vec<(String, String)> = agent
         .modes
         .iter()
@@ -328,6 +340,29 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
         row = row.child(faint(agent.note.clone()).number_of_lines(3));
     }
     row
+}
+
+/// Whether an agent can do work now, as it last answered; one that cannot
+/// says why and how to fix it.
+fn readiness(agent: &CodingAgent) -> View {
+    match agent.readiness {
+        AgentReadiness::Ready => ui::status("Ready", Tone::Success),
+        AgentReadiness::NotUsable => {
+            let why = if agent.readiness_reason.is_empty() {
+                "Not usable".to_owned()
+            } else {
+                format!("Not usable: {}", agent.readiness_reason)
+            };
+            let mut lines = view().gap_1().child(ui::status(why, Tone::Danger));
+            if !agent.readiness_fix.is_empty() {
+                lines = lines.child(muted(agent.readiness_fix.clone()).number_of_lines(3));
+            }
+            lines
+        }
+        AgentReadiness::Unchecked | AgentReadiness::Unknown => {
+            ui::status("Not checked yet", Tone::Neutral)
+        }
+    }
 }
 
 /// How this device's composer behaves: kept on the device, not the daemon.

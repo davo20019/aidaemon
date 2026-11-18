@@ -1275,6 +1275,13 @@ impl Client {
         });
     }
 
+    /// Ask every coding agent again whether it can do work now. The
+    /// daemon answers like any settings change, and the settings it
+    /// announces carry each agent's new readiness.
+    pub fn check_agents(&mut self) {
+        self.change_settings(SettingsChange::CheckAgents);
+    }
+
     /// A settings change was sent and has no answer yet.
     pub fn settings_busy(&self) -> bool {
         !self.settings_changes.is_empty()
@@ -3274,6 +3281,31 @@ mod tests {
         client.setup_step_later(SetupAction::SkipChannel);
         let effects = client.update(created("app:synthetic-9"), &cx(None));
         assert!(!effects.iter().any(|e| matches!(e, Effect::OpenGreeting(_))));
+    }
+
+    #[test]
+    fn checking_agents_again_is_one_settings_change() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.check_agents();
+        let mut sent = client.take_outgoing();
+        assert_eq!(sent.len(), 1);
+        let (id, command) = sent.pop().unwrap();
+        assert_eq!(
+            command,
+            Command::ChangeSettings {
+                change: SettingsChange::CheckAgents
+            }
+        );
+        assert!(client.settings_busy());
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings_changed","outcome":{{"kind":"done","message":"Checked the coding agents"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(!client.settings_busy());
     }
 
     #[test]

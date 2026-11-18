@@ -483,6 +483,47 @@ fn a_coding_agent_s_mode_is_picked_and_full_access_waits_for_approval() -> Resul
     Ok(())
 }
 
+#[test]
+fn each_coding_agent_says_whether_it_is_ready_and_check_again_asks() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let before = sent("get_settings");
+    feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    let result = SETTINGS.replace(
+        r#""restart_pending": false}"#,
+        r#""restart_pending": false, "coding_agents": [{"name": "claude", "program": "Claude Code", "mode": "checked", "modes": ["checked", "every_command", "full_access"], "readiness": "ready"}, {"name": "synthetic-agent", "program": "Acme Coder", "mode": "full_access", "modes": ["full_access"], "readiness": "not_usable", "readiness_reason": "Acme Coder is not signed in.", "readiness_fix": "Run acme-coder login, then check again."}, {"name": "other-agent", "program": "Other Coder", "modes": ["full_access"]}]}"#,
+    );
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
+    ))]);
+    app.wait_for("Ready")?;
+    app.wait_for("Not usable: Acme Coder is not signed in.")?;
+    app.wait_for("Run acme-coder login, then check again.")?;
+    app.wait_for("Not checked yet")?;
+    let before = nsh_app_aidaemon::settings_sent_ids().len();
+    app.press("Check again")?;
+    let mut change = None;
+    for _ in 0..100 {
+        change = nsh_app_aidaemon::settings_sent_ids()
+            .into_iter()
+            .skip(before)
+            .find(|(_, c)| c.contains("check_agents"));
+        if change.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (_, json) = change.ok_or("no check_agents was sent")?;
+    let sent: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if sent["change"] != serde_json::json!({"kind": "check_agents"}) {
+        return Err(format!("the change sent: {}", sent["change"]));
+    }
+    Ok(())
+}
+
 /// Wait for a setup step naming `what`, sent after the first `before`;
 /// its request id.
 fn wait_setup_sent(before: usize, what: &str) -> Result<String, String> {
