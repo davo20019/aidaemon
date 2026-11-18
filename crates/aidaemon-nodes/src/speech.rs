@@ -90,7 +90,7 @@ impl NodeSpeechSynthesizer for MacOsSaySpeech {
                 .status(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("speech synthesis timed out"))??;
+        .map_err(|_| timed_out("speech synthesis"))??;
         anyhow::ensure!(say_status.success(), "speech synthesis command failed");
         let ffmpeg_status = tokio::time::timeout(
             std::time::Duration::from_secs(self.config.timeout_seconds),
@@ -118,7 +118,7 @@ impl NodeSpeechSynthesizer for MacOsSaySpeech {
                 .status(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("speech conversion timed out"))??;
+        .map_err(|_| timed_out("speech conversion"))??;
         let _ = tokio::fs::remove_file(&aiff).await;
         anyhow::ensure!(ffmpeg_status.success(), "speech conversion failed");
         let size_bytes = tokio::fs::metadata(&wav).await?.len();
@@ -155,5 +155,20 @@ mod tests {
         assert_eq!(&bytes[8..12], b"WAVE");
         assert_eq!(&bytes[36..40], b"data");
         assert!(bytes.len() < 512 * 1024);
+    }
+}
+/// A speech step that ran out of time, raised as a typed
+/// [`aidaemon_tools::ToolTimedOut`] so it is retryable, not a failure.
+fn timed_out(step: &str) -> anyhow::Error {
+    aidaemon_tools::ToolTimedOut(format!("{step} timed out")).into()
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    #[test]
+    fn a_speech_timeout_is_typed() {
+        assert!(aidaemon_tools::timed_out(&super::timed_out(
+            "speech synthesis"
+        )));
     }
 }

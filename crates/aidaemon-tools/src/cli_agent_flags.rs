@@ -308,12 +308,10 @@ pub async fn discover_agent_flags(agent: &str) -> anyhow::Result<Vec<AgentFlagDo
                 Ok(Err(second_err)) => {
                     anyhow::bail!("Failed to run `{}` help: {}", agent, second_err)
                 }
-                Err(_) => {
-                    anyhow::bail!("`{} -h` timed out while fetching help output.", agent)
-                }
+                Err(_) => return Err(help_timed_out(agent, "-h")),
             }
         }
-        Err(_) => anyhow::bail!("`{} --help` timed out while fetching help output.", agent),
+        Err(_) => return Err(help_timed_out(agent, "--help")),
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -460,9 +458,25 @@ pub async fn save_terminal_agent_defaults(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A help fetch that ran out of time, raised as a typed
+/// [`crate::ToolTimedOut`] so it is retryable, not a failure.
+fn help_timed_out(agent: &str, flag: &str) -> anyhow::Error {
+    crate::ToolTimedOut(format!(
+        "`{agent} {flag}` timed out while fetching help output."
+    ))
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_help_fetch_timeout_is_typed() {
+        let error = help_timed_out("synthetic-agent", "--help");
+        assert!(crate::timed_out(&error));
+        assert!(error.to_string().contains("synthetic-agent --help"));
+    }
 
     #[test]
     fn format_agent_flag_docs_paginates_and_keeps_footer_actions() {
