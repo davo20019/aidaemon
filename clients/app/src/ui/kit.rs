@@ -44,6 +44,8 @@ pub fn switch_only(
     change: impl Fn(bool) + 'static,
 ) -> nsh_base::SwitchElement {
     let label = label.into();
+    // The colour and thumb are bound to `on`, so the switch follows its
+    // value on its own: style closures run once, bound values rerun.
     switch()
         .checked(on)
         .accessibility_label(label.clone())
@@ -56,7 +58,7 @@ pub fn switch_only(
                 .h(px(18.0))
                 .rounded_full()
                 .p(px(2.0))
-                .bg(if on() { colors::ACCENT } else { colors::BORDER })
+                .bg(move || if on() { colors::ACCENT } else { colors::BORDER })
                 .transition_colors()
                 .duration(motion::FAST)
         })
@@ -66,7 +68,7 @@ pub fn switch_only(
                 .rounded_full()
                 .bg(colors::SURFACE)
                 .shadow_sm()
-                .translate_x(px(if on() { 12.0 } else { 0.0 }))
+                .translate_x(move || px(if on() { 12.0 } else { 0.0 }))
                 .transition_transform()
                 .duration(motion::BASE)
         })
