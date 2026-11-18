@@ -238,6 +238,7 @@ pub fn aidaemon_core::testing::StreamingProvider<P>::unavailable_until(&self, &s
 pub const aidaemon_core::testing::SCRIPTED_MODEL: &str
 pub const aidaemon_core::testing::SCRIPTED_USAGE: aidaemon_core::Usage
 pub fn aidaemon_core::testing::call(&str, &str, serde_json::value::Value) -> aidaemon_core::ToolCall
+pub fn aidaemon_core::testing::nested_calls(impl core::ops::function::Fn(&aidaemon_core::ToolCall) -> aidaemon_core::NestedVerdict + core::marker::Send + 'static) -> (aidaemon_core::NestedCalls, alloc::sync::Arc<std::sync::poison::mutex::Mutex<alloc::vec::Vec<aidaemon_core::ToolCall>>>)
 pub fn aidaemon_core::testing::spec(&str, &str, &[&str]) -> aidaemon_core::ToolSpec
 pub fn aidaemon_core::testing::text(impl core::convert::Into<alloc::string::String>) -> aidaemon_core::ModelResponse
 pub fn aidaemon_core::testing::tool_calls(impl core::iter::traits::collect::IntoIterator<Item = aidaemon_core::ToolCall>) -> aidaemon_core::ModelResponse
