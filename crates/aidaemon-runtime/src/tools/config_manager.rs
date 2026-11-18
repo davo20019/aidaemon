@@ -1499,6 +1499,145 @@ impl ConfigManagerTool {
         Ok(response.join("\n"))
     }
 
+    /// Whether provider `table` is the one `selection` names: the same kind
+    /// at the same address.
+    fn same_provider(table: &toml::Table, selection: &ResolvedProviderSelection) -> bool {
+        let field = |key: &str| {
+            table
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches('/')
+                .to_string()
+        };
+        if field("kind") != selection.preset.kind {
+            return false;
+        }
+        match field("base_url") {
+            // A native kind's address is its own; an OpenAI-compatible one
+            // with none is no particular service.
+            url if url.is_empty() => selection.preset.kind != "openai_compatible",
+            url => url == selection.base_url.trim().trim_end_matches('/'),
+        }
+    }
+
+    /// Before `selection` replaces the main provider, put the main provider
+    /// in the failover list: in the place of a failover that is the same
+    /// provider as `selection` (the two swap), else first. Its API key goes
+    /// with it, read from [`PROVIDER_OUTGOING_API_KEY`] (where the app puts
+    /// it before a new key takes the main slot), else from the main slot
+    /// when the new provider stores no key there. Nothing moves when the
+    /// main provider is the one selected (only its models change), or there
+    /// is none. Returns where it went with its label, and the secret-store
+    /// names left unused.
+    ///
+    /// [`PROVIDER_OUTGOING_API_KEY`]: aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY
+    #[allow(clippy::type_complexity)]
+    fn demote_main_provider(
+        &self,
+        provider_table: &mut toml::Table,
+        selection: &ResolvedProviderSelection,
+        notes: &mut Vec<String>,
+    ) -> anyhow::Result<(Option<(usize, String)>, Vec<String>)> {
+        use aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY;
+        let main: toml::Table = provider_table
+            .iter()
+            .filter(|(key, _)| key.as_str() != "fallbacks" && key.as_str() != "failover")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let has_kind = main
+            .get("kind")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|kind| !kind.trim().is_empty());
+        if !has_kind || Self::same_provider(&main, selection) {
+            return Ok((None, Vec::new()));
+        }
+        let existing: Vec<toml::Table> = match Self::get_failover_array(provider_table)? {
+            Some(entries) => entries
+                .iter()
+                .map(|value| {
+                    value
+                        .as_table()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("fallback provider entry is not a table"))
+                })
+                .collect::<anyhow::Result<_>>()?,
+            None => Vec::new(),
+        };
+        let count = existing.len();
+        // Its secrets wait in the slot just past the list, then move with
+        // the others to where it lands.
+        let parked = Self::fallback_key_prefix(count);
+        let mut cleanup = Vec::new();
+        let mut demoted = main.clone();
+        let keyed = demoted.get("api_key").and_then(toml::Value::as_str) == Some("keychain");
+        let source = if self.secrets.contains(PROVIDER_OUTGOING_API_KEY) {
+            Some(PROVIDER_OUTGOING_API_KEY)
+        } else if !selection.api_key_stored && self.secrets.contains("api_key") {
+            Some("api_key")
+        } else {
+            None
+        };
+        match (keyed, source) {
+            (true, Some(source)) => self.migrate_secret_string(
+                &mut demoted,
+                "api_key",
+                source,
+                &Self::keychain_field_name(Some(&parked), "api_key"),
+                &mut cleanup,
+                notes,
+            )?,
+            (true, None) => notes.push(
+                "The provider it replaced has no API key to keep: add its key again in \
+                 Settings."
+                    .to_string(),
+            ),
+            (false, _) => {}
+        }
+        if !selection.gateway_token_stored {
+            self.migrate_secret_string(
+                &mut demoted,
+                "gateway_token",
+                "gateway_token",
+                &Self::keychain_field_name(Some(&parked), "gateway_token"),
+                &mut cleanup,
+                notes,
+            )?;
+        }
+        self.migrate_secret_headers(&mut demoted, "provider", &parked, &mut cleanup, notes)?;
+        // Its headers are its own: the new main provider does not inherit them.
+        provider_table.remove("extra_headers");
+
+        let promoted = existing
+            .iter()
+            .position(|table| Self::same_provider(table, selection));
+        let order: Vec<usize> = match promoted {
+            Some(at) => (0..count)
+                .map(|i| if i == at { count } else { i })
+                .collect(),
+            None => std::iter::once(count).chain(0..count).collect(),
+        };
+        let landed = promoted.unwrap_or(0);
+        let mut tables = existing;
+        tables.push(demoted);
+        let (entries, mut stale, mut moved_notes) = self.reindex_failovers(tables, &order)?;
+        notes.append(&mut moved_notes);
+        let label = Self::failover_label(&entries, landed);
+        *Self::normalize_failover_array_mut(provider_table)? = entries;
+        cleanup.append(&mut stale);
+        // A slot a failover holds now, or the main slot the new provider
+        // reads, keeps its secrets.
+        let held: Vec<String> = (0..order.len())
+            .map(|index| format!("{}_", Self::fallback_key_prefix(index)))
+            .collect();
+        cleanup.retain(|key| {
+            !held.iter().any(|slot| key.starts_with(slot.as_str()))
+                && !(key == "api_key" && selection.api_key_stored)
+        });
+        Ok((Some((landed, label)), cleanup))
+    }
+
     async fn switch_provider(&self, args: &ConfigArgs) -> anyhow::Result<String> {
         let selection = match self.resolve_provider_selection(args, "switch_provider", None) {
             Ok(selection) => selection,
@@ -1516,6 +1655,10 @@ impl ConfigManagerTool {
             .or_insert_with(|| toml::Value::Table(toml::Table::new()))
             .as_table_mut()
             .ok_or_else(|| anyhow::anyhow!("`provider` is not a table"))?;
+        // The main provider replaced is kept: it becomes a failover (in the
+        // place of the failover promoted, else first), never dropped.
+        let (demoted_to, cleanup_keys) =
+            self.demote_main_provider(provider_table, &selection, &mut notes)?;
         self.apply_provider_selection(provider_table, &selection, None, &mut notes, "");
 
         let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
@@ -1532,6 +1675,7 @@ impl ConfigManagerTool {
         }
 
         self.config.write_checked(&new_content).await?;
+        self.delete_stale_keys(cleanup_keys);
 
         let mut response = vec![
             format!("Switched provider to {}.", selection.preset.display_name),
@@ -1549,6 +1693,12 @@ impl ConfigManagerTool {
                 selection.primary_model, selection.fast_model, selection.smart_model
             ),
         ];
+        if let Some((index, label)) = demoted_to {
+            response.push(format!(
+                "- the provider it replaced, {label}, is now failover {}",
+                index + 1
+            ));
+        }
         if !notes.is_empty() {
             response.push(String::new());
             response.push("Notes:".to_string());
@@ -2886,6 +3036,113 @@ default = "synthetic-c"
             ])
         );
         assert!(store.get("provider_fallback_moving_0_api_key").is_err());
+    }
+
+    const SUBSCRIPTION_MAIN: &str = r#"
+[provider]
+kind = "openai_chatgpt"
+api_key = ""
+
+[provider.models]
+default = "synthetic-main"
+
+[[provider.fallbacks]]
+kind = "anthropic"
+api_key = "keychain"
+
+[provider.fallbacks.models]
+default = "synthetic-a"
+
+[[provider.fallbacks]]
+kind = "google_genai"
+api_key = "keychain"
+
+[provider.fallbacks.models]
+default = "synthetic-c"
+"#;
+
+    fn switch_args(provider: &str) -> ConfigArgs {
+        let mut args = test_args();
+        args.action = "switch_provider".to_string();
+        args.provider = provider.to_string();
+        args.primary_model = "synthetic-new".to_string();
+        args
+    }
+
+    #[tokio::test]
+    async fn making_a_failover_main_swaps_it_with_the_main_provider() {
+        let (_dir, path) = write_temp_config(SUBSCRIPTION_MAIN);
+        // The app put the failover's key in the main slot before the switch.
+        let (tool, store) = tool_with_secrets(
+            path.clone(),
+            &[
+                ("api_key", "key-a"),
+                ("provider_fallback_0_api_key", "key-a"),
+                ("provider_fallback_1_api_key", "key-c"),
+            ],
+        );
+        let reply = tool
+            .switch_provider(&switch_args("anthropic"))
+            .await
+            .unwrap();
+        assert!(reply.contains("is now failover 1"), "{reply}");
+        let saved = fs::read_to_string(&path).unwrap();
+        let doc: toml::Table = saved.parse().unwrap();
+        assert_eq!(doc["provider"]["kind"].as_str(), Some("anthropic"));
+        let kinds: Vec<String> = fallbacks(&saved)
+            .iter()
+            .map(|f| f["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["openai_chatgpt", "google_genai"]);
+        assert_eq!(failover_keys(&path, &store)[1].1, "key-c");
+        assert_eq!(store.get("api_key").unwrap().expose(), "key-a");
+    }
+
+    #[tokio::test]
+    async fn a_new_main_provider_puts_the_old_one_first_with_its_key() {
+        let (_dir, path) = write_temp_config(
+            THREE_KEYCHAIN_FAILOVERS
+                .replace("api_key = \"primary-key\"", "api_key = \"keychain\"")
+                .as_str(),
+        );
+        let mut secrets = THREE_KEYS.to_vec();
+        secrets.push(("api_key", "new-key"));
+        secrets.push((
+            aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY,
+            "old-main-key",
+        ));
+        let (tool, store) = tool_with_secrets(path.clone(), &secrets);
+        tool.switch_provider(&switch_args("moonshot"))
+            .await
+            .unwrap();
+        assert_eq!(
+            failover_keys(&path, &store),
+            [
+                ("primary-model", "old-main-key"),
+                ("synthetic-a", "key-a"),
+                ("synthetic-b", "key-b"),
+                ("synthetic-c", "key-c"),
+            ]
+            .map(|(m, k)| (m.to_string(), k.to_string()))
+        );
+        assert_eq!(store.get("api_key").unwrap().expose(), "new-key");
+        assert!(!store.contains(aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY));
+    }
+
+    #[tokio::test]
+    async fn changing_only_the_main_providers_models_moves_nothing() {
+        let (_dir, path) = write_temp_config(SUBSCRIPTION_MAIN);
+        let (tool, _store) = tool_with_secrets(
+            path.clone(),
+            &[
+                ("provider_fallback_0_api_key", "key-a"),
+                ("provider_fallback_1_api_key", "key-c"),
+            ],
+        );
+        tool.switch_provider(&switch_args("openai_chatgpt"))
+            .await
+            .unwrap();
+        assert_eq!(fallbacks(&fs::read_to_string(&path).unwrap()).len(), 2);
     }
 
     #[tokio::test]

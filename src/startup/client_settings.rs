@@ -736,8 +736,22 @@ impl SettingsHost {
         if let Some(call) = self.config_call(&change)? {
             // Its key goes into the slot the provider reads first; the
             // earlier one comes back if the change does not go through.
-            let stored_key = match self.key_change(&change)? {
-                Some(key) => Some(self.store_provider_key(key).await?),
+            let key = self.key_change(&change)?;
+            // A switch that stores a new main key keeps the one it replaces
+            // where `manage_config` finds it: the old main provider becomes
+            // a failover with its key.
+            let outgoing = matches!(change, SettingsChange::SwitchProvider { .. }) && key.is_some();
+            if outgoing {
+                stash_outgoing_main_key();
+            }
+            let stored_key = match key {
+                Some(key) => match self.store_provider_key(key).await {
+                    Ok(earlier) => Some(earlier),
+                    Err(reason) => {
+                        drop_outgoing_main_key();
+                        return Err(reason);
+                    }
+                },
                 None => None,
             };
             let before = std::fs::read_to_string(&self.config_path).ok();
@@ -759,6 +773,9 @@ impl SettingsHost {
                 (Err(_), Some(earlier)) => earlier.put_back(),
                 (Ok(_), Some(_)) => self.flow.clear_checked().await,
                 _ => {}
+            }
+            if outgoing {
+                drop_outgoing_main_key();
             }
             return done;
         }
@@ -1170,6 +1187,29 @@ struct ProviderKey {
     value: String,
     entry: &'static aidaemon_providers::catalog::CatalogEntry,
     base_url: String,
+}
+
+/// Copy the main provider's stored API key to where a switch reads the
+/// key of the provider it demotes to a failover.
+fn stash_outgoing_main_key() {
+    use aidaemon_secrets::SecretStore as _;
+    use aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY;
+    let store = crate::config::secret_store();
+    if let Ok(key) = store.get("api_key")
+        && let Err(error) = store.set(PROVIDER_OUTGOING_API_KEY, key.expose())
+    {
+        tracing::warn!(%error, "Could not keep the outgoing main provider's key");
+    }
+}
+
+/// Forget the copy [`stash_outgoing_main_key`] made (the switch moved it,
+/// or did not go through).
+fn drop_outgoing_main_key() {
+    use aidaemon_secrets::SecretStore as _;
+    let store = crate::config::secret_store();
+    if store.contains(aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY) {
+        let _ = store.delete(aidaemon_secrets::names::PROVIDER_OUTGOING_API_KEY);
+    }
 }
 
 /// What a keychain slot held before a provider key replaced it.

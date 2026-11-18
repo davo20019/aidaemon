@@ -6,6 +6,10 @@
 //!
 //! [`SecretStore`]: crate::SecretStore
 
+/// Where the primary provider's API key waits while a switch replaces it:
+/// the switch moves it to the failover the old main provider becomes.
+pub const PROVIDER_OUTGOING_API_KEY: &str = "provider_outgoing_api_key";
+
 /// A provider field: `api_key` for the primary provider, `{prefix}_api_key`
 /// for a fallback (see [`provider_fallback_prefix`]).
 pub fn provider_field(prefix: Option<&str>, field: &str) -> String {
