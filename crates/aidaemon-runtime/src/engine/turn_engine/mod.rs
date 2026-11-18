@@ -1335,6 +1335,7 @@ impl TurnEngine<'_> {
             not_attempted: std::sync::Mutex::new(Vec::new()),
             answered_past_quota: std::sync::Mutex::new(None),
             answered_by: std::sync::Mutex::new(None),
+            took_over: std::sync::Mutex::new(None),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
             checklist_declared: AtomicBool::new(false),

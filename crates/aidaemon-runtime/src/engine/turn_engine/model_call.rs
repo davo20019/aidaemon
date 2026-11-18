@@ -103,6 +103,17 @@ pub fn interleave_directives<T: Clone>(run: Vec<T>, directives: &[(usize, T)]) -
 #[derive(Debug)]
 pub struct ModelCallTimedOut(Duration);
 
+/// What the model that took over a turn is told: who it took over from,
+/// and that the earlier model's reasoning did not reach it while its text
+/// and tool calls did.
+pub(crate) fn takeover_note(from: &str, to: &str) -> String {
+    format!(
+        "[SYSTEM] Model handoff: {from} could not answer, so {to} answered the last call and \
+         answers the rest of this turn. The messages and tool calls above stand as they were \
+         written; {from}'s own reasoning was not carried over."
+    )
+}
+
 impl std::fmt::Display for ModelCallTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "model call timed out after {}s", self.0.as_secs())
@@ -180,6 +191,42 @@ impl TurnEngine<'_> {
         retry
     }
 
+    /// Record that `answered_by` took over a call meant for `asked`, so the
+    /// turn's later calls for the turn's model (`turn_model`) start there,
+    /// and tell the model that took over, once per takeover: it is
+    /// answering in another model's conversation, whose replayed reasoning
+    /// it did not receive.
+    fn note_takeover(
+        &self,
+        scope: &TurnScope<'_>,
+        turn_model: &str,
+        asked: &str,
+        answered_by: &str,
+    ) {
+        if answered_by == asked {
+            return;
+        }
+        let Ok(mut slot) = scope.took_over.lock() else {
+            return;
+        };
+        let changed = slot.as_ref().is_none_or(|(_, to)| to != answered_by);
+        *slot = Some((turn_model.to_string(), answered_by.to_string()));
+        drop(slot);
+        if !changed {
+            return;
+        }
+        info!(
+            session_id = scope.session_id,
+            task_id = scope.task_id,
+            from = asked,
+            to = answered_by,
+            "Fallback model took over for the rest of the turn"
+        );
+        if let Ok(mut extra) = scope.extra_system.lock() {
+            extra.push(takeover_note(asked, answered_by));
+        }
+    }
+
     /// The per-call ceiling: a hung provider must not hold the turn.
     pub fn sdk_model_call_timeout(&self) -> Duration {
         let ceiling = if self.mandate_execution().is_some() {
@@ -200,9 +247,20 @@ impl TurnEngine<'_> {
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime().snapshot();
+        // A model that already failed over in this turn is not asked first
+        // again: the call starts at the model that took over, and the usual
+        // fallback chain stands behind it.
+        let took_over = scope
+            .took_over
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .filter(|(from, _)| *from == request.model)
+            .map(|(_, to)| to);
+        let call_model = took_over.unwrap_or_else(|| request.model.clone());
         let tools = to_daemon_tools(&request.tools);
         let window = crate::context_budget::request_window(
-            &request.model,
+            &call_model,
             &self.turn_runtime().context_window_config,
         );
         // Hook notes (recalled memory) ride in the wire prefix; the rest of
@@ -269,7 +327,7 @@ impl TurnEngine<'_> {
         // already chose one for this call.
         if options.reasoning_effort_override.is_none() {
             options.reasoning_effort_override =
-                crate::llm::turn_calls::session_effort(self.host, scope.session_id, &request.model)
+                crate::llm::turn_calls::session_effort(self.host, scope.session_id, &call_model)
                     .await;
         }
         // llama.cpp slot pinning (opt-in): the root interactive agent carries
@@ -287,7 +345,7 @@ impl TurnEngine<'_> {
         // calibrated one is what the call is expected to cost.
         let raw_input_tokens = fitted.estimated_tokens;
         let est_input_tokens =
-            crate::context_budget::calibrated_tokens(&request.model, raw_input_tokens);
+            crate::context_budget::calibrated_tokens(&call_model, raw_input_tokens);
         let mut telemetry = crate::llm::turn_calls::LlmCallTelemetry::default();
         // Mandate runs share one durable token balance across the task lead
         // and its executors: reserve before the call, settle after it.
@@ -326,7 +384,7 @@ impl TurnEngine<'_> {
                 self.host,
                 snapshot.provider(),
                 snapshot.router(),
-                &request.model,
+                &call_model,
                 &messages,
                 &tools,
                 &options,
@@ -413,10 +471,13 @@ impl TurnEngine<'_> {
             && let Ok(mut slot) = scope.answered_by.lock()
         {
             *slot = Some(if telemetry.final_model.is_empty() {
-                request.model.clone()
+                call_model.clone()
             } else {
                 telemetry.final_model.clone()
             });
+        }
+        if result.is_ok() && telemetry.fell_back && !telemetry.final_model.is_empty() {
+            self.note_takeover(scope, &request.model, &call_model, &telemetry.final_model);
         }
         if let Some(limit) = telemetry.answered_past_quota.clone()
             && let Ok(mut slot) = scope.answered_past_quota.lock()
@@ -436,9 +497,9 @@ impl TurnEngine<'_> {
                     call_purpose: None,
                     task_id: scope.task_id.to_string(),
                     iteration: Some(iteration as u32),
-                    model: request.model.clone(),
+                    model: call_model.clone(),
                     final_model: Some(if telemetry.final_model.is_empty() {
-                        request.model.clone()
+                        call_model.clone()
                     } else {
                         telemetry.final_model.clone()
                     }),
@@ -502,7 +563,7 @@ impl TurnEngine<'_> {
             // Calibrates the chars/4 estimate the request budget and the
             // summarization threshold use.
             crate::context_budget::record_token_estimate_calibration(
-                &request.model,
+                &call_model,
                 raw_input_tokens,
                 input_tokens as usize,
             );
@@ -513,7 +574,7 @@ impl TurnEngine<'_> {
                 warn!(
                     session_id = scope.session_id,
                     task_id = scope.task_id,
-                    model = %request.model,
+                    model = %call_model,
                     %error,
                     "SDK engine: model call failed after recovery"
                 );
@@ -526,13 +587,13 @@ impl TurnEngine<'_> {
                     .map(|limit| limit.map(|l| l as usize))
                 {
                     let budget = crate::settings::record_context_overflow(
-                        &request.model,
+                        &call_model,
                         stated,
                         est_input_tokens,
                     );
                     warn!(
                         task_id = scope.task_id,
-                        model = %request.model,
+                        model = %call_model,
                         est_input_tokens,
                         ?stated,
                         budget,

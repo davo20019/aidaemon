@@ -1745,3 +1745,54 @@ async fn test_role_tool_access_tiers() {
         );
     }
 }
+
+/// A turn whose model failed over stays on the model that took over: before,
+/// every later call in the turn asked the failed model first again (A, B,
+/// A, B…), and the model that took over was never told it had.
+#[tokio::test]
+async fn a_turn_that_failed_over_stays_on_the_model_that_took_over() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response("The system is fine."),
+    ])
+    .with_leading_provider_errors(vec![crate::providers::ProviderError::from_status(
+        404,
+        "synthetic model not found",
+    )]);
+    let harness = setup_test_agent_with_models(provider, "gpt-6-synthetic", "synthetic-fallback")
+        .await
+        .unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "takeover_session",
+            "Check the system.",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "The system is fine.");
+    let calls = harness.provider.call_log.lock().await.clone();
+    let main: Vec<_> = calls.iter().filter(|call| !call.tools.is_empty()).collect();
+    let models: Vec<&str> = main.iter().map(|call| call.model.as_str()).collect();
+    assert_eq!(
+        models,
+        vec!["gpt-6-synthetic", "synthetic-fallback", "synthetic-fallback"],
+        "the failed model is asked once"
+    );
+    let told = |call: &crate::testing::MockChatCall| {
+        call.messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(|content| content.as_str())
+                .is_some_and(|text| {
+                    text.contains("Model handoff: gpt-6-synthetic could not answer")
+                })
+        })
+    };
+    assert!(!told(main[1]), "the call it took over carries no note");
+    assert!(told(main[2]), "the next call tells it");
+}

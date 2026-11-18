@@ -70,6 +70,11 @@ pub struct TurnScope<'a> {
     /// when one answered): the reply is recorded under it, so a client can
     /// show which model wrote it.
     pub answered_by: std::sync::Mutex<Option<String>>,
+    /// A call that fell back from the model it asked for: (that model, the
+    /// one that answered). The turn's later calls for the same model start
+    /// at the one that answered, instead of asking the failed one again
+    /// first and bouncing between them.
+    pub took_over: std::sync::Mutex<Option<(String, String)>>,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger
