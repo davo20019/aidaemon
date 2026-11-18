@@ -422,6 +422,59 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     Ok(())
 }
 
+#[test]
+fn a_coding_agent_s_mode_is_picked_and_full_access_waits_for_approval() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let before = sent("get_settings");
+    feed([Update::Connected]);
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    let result = SETTINGS.replace(
+        r#""restart_pending": false}"#,
+        r#""restart_pending": false, "coding_agents": [{"name": "claude", "program": "Claude Code", "mode": "checked", "modes": ["checked", "every_command", "full_access"]}, {"name": "synthetic-agent", "program": "Acme Coder", "modes": ["full_access"], "note": "Acme Coder's requests cannot be checked."}]}"#,
+    );
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
+    ))]);
+    app.wait_for("Full access: Runs on this machine with nothing checked. Fastest; your rules don't see what it does.")?;
+    app.wait_for("Claude Code")?;
+    app.wait_for("synthetic-agent")?;
+    // An agent with no mode yet says it may not run, and why it offers
+    // fewer modes.
+    app.wait_for("Not allowed to run delegated work yet.")?;
+    app.wait_for("Acme Coder's requests cannot be checked.")?;
+    app.wait_for("Checked by AIDaemon >> nth=0")?;
+    // Full access goes to the daemon, which asks first.
+    let before = nsh_app_aidaemon::settings_sent_ids().len();
+    app.press("label:Claude Code permission mode")?;
+    app.press("Full access")?;
+    let mut change = None;
+    for _ in 0..100 {
+        change = nsh_app_aidaemon::settings_sent_ids()
+            .into_iter()
+            .skip(before)
+            .find(|(_, c)| c.contains("set_agent_mode"));
+        if change.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (id, json) = change.ok_or("no set_agent_mode was sent")?;
+    let sent: serde_json::Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if sent["change"]
+        != serde_json::json!({"kind": "set_agent_mode", "agent": "claude", "mode": "full_access"})
+    {
+        return Err(format!("the change sent: {}", sent["change"]));
+    }
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings_changed","outcome":{{"kind":"awaiting_approval","approval_id":"ap-synthetic-1"}}}}}}"#
+    ))]);
+    app.wait_for("Waiting for your approval")?;
+    Ok(())
+}
+
 /// Wait for a setup step naming `what`, sent after the first `before`;
 /// its request id.
 fn wait_setup_sent(before: usize, what: &str) -> Result<String, String> {
@@ -451,6 +504,10 @@ fn settings_opens_the_phone_step_and_not_now_leaves_it() -> Result<(), String> {
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
     ))]);
     app.wait_for("On this device")?;
+    // A daemon with no coding agents shows no modes to pick for them.
+    if app.shows("Full access: Runs on this machine with nothing checked. Fastest; your rules don't see what it does.") {
+        return Err("coding agent modes show with no agent to pick for".into());
+    }
     app.press("Connections")?;
     let before = nsh_app_aidaemon::setup_sent().len();
     app.press("Reach it from your phone")?;

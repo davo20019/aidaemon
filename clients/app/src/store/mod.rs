@@ -12,7 +12,7 @@ use aidaemon_client_core::client::{Client, Context, Effect};
 use aidaemon_client_core::machine::Update;
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, ViewRequest};
 use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, AttachmentRef, Command, Feature, MemoryItem, MidRun,
+    AgentMode, Approval, ApprovalDecision, AttachmentRef, Command, Feature, MemoryItem, MidRun,
     ProjectSummary, SessionChanges, Settings, SettingsChange, SetupAction, SetupState,
     SlashCommand, TaskSummary,
 };
@@ -1240,6 +1240,11 @@ impl Store {
 
     pub fn change_settings(&self, change: SettingsChange) {
         self.act(|c| c.change_settings(change));
+    }
+
+    /// Set a coding agent's permission mode; full access asks first.
+    pub fn set_agent_mode(&self, agent: String, mode: AgentMode) {
+        self.act(|c| c.set_agent_mode(&agent, mode));
     }
 
     pub fn settings_busy(&self) -> bool {

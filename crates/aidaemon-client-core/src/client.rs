@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aidaemon_client_protocol::{
-    Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
+    AgentMode, Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
     AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
     MidRun, ModelChoice, ModelOptions, ProjectDir, ProjectFile, ProjectSummary, QueuedMessage,
     SearchHit, ServerFrame, SessionChanges, SessionModel, Settings, SettingsChange,
@@ -1257,6 +1257,22 @@ impl Client {
         self.settings_error = None;
         let id = self.send(Command::ChangeSettings { change });
         self.settings_changes.insert(id);
+    }
+
+    /// Set coding agent `agent`'s permission mode. Picking the mode it
+    /// already has, or one it does not offer, sends nothing; full access
+    /// is asked first by the daemon (`SettingsOutcome::AwaitingApproval`).
+    pub fn set_agent_mode(&mut self, agent: &str, mode: AgentMode) {
+        if let Read::Ready(settings) = &self.settings
+            && let Some(known) = settings.coding_agents.iter().find(|a| a.name == agent)
+            && (known.mode == Some(mode) || !known.modes.contains(&mode))
+        {
+            return;
+        }
+        self.change_settings(SettingsChange::SetAgentMode {
+            agent: agent.to_owned(),
+            mode,
+        });
     }
 
     /// A settings change was sent and has no answer yet.
@@ -3258,6 +3274,58 @@ mod tests {
         client.setup_step_later(SetupAction::SkipChannel);
         let effects = client.update(created("app:synthetic-9"), &cx(None));
         assert!(!effects.iter().any(|e| matches!(e, Effect::OpenGreeting(_))));
+    }
+
+    #[test]
+    fn an_agent_mode_change_is_sent_once_and_full_access_waits_for_approval() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.refresh_settings();
+        let read = settings_reads(&mut client);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{}","result":{{"type":"settings","settings":{{"config_path":"/home/synthetic/config.toml","database_path":"","groups":[],"coding_agents":[{{"name":"claude","program":"Claude Code","mode":"checked","modes":["checked","every_command","full_access"]}},{{"name":"synthetic-agent","program":"Acme Coder","modes":["full_access"],"note":"Acme Coder cannot be checked."}}]}}}}}}"#,
+                read[0]
+            )),
+            &cx(None),
+        );
+        let Read::Ready(settings) = &client.settings else {
+            panic!("settings not ready");
+        };
+        assert_eq!(settings.coding_agents.len(), 2);
+        assert_eq!(settings.coding_agents[1].mode, None);
+        // The mode it has, or one it does not offer: nothing sent.
+        client.set_agent_mode("claude", AgentMode::Checked);
+        client.set_agent_mode("synthetic-agent", AgentMode::Checked);
+        assert!(client.take_outgoing().is_empty());
+        // Full access: sent, and the daemon asks for approval first.
+        client.set_agent_mode("claude", AgentMode::FullAccess);
+        let mut sent = client.take_outgoing();
+        assert_eq!(sent.len(), 1);
+        let (id, command) = sent.pop().unwrap();
+        assert_eq!(
+            command,
+            Command::ChangeSettings {
+                change: SettingsChange::SetAgentMode {
+                    agent: "claude".into(),
+                    mode: AgentMode::FullAccess
+                }
+            }
+        );
+        assert!(client.settings_busy());
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"settings_changed","outcome":{{"kind":"awaiting_approval","approval_id":"ap-1"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(!client.settings_busy());
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Say(s) if s == "Waiting for your approval"))
+        );
     }
 
     #[test]

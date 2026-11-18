@@ -2,9 +2,12 @@
 //! settings most owners change, each with a real control) and the decision
 //! model on the Models tab. Every change is a `SettingsChange::Set` of the
 //! config key, so it takes the same path, approvals and refusals as the
-//! full list on the Advanced tab.
+//! full list on the Advanced tab; a coding agent's permission mode is a
+//! `SettingsChange::SetAgentMode` on that same path.
 
-use aidaemon_client_protocol::{SecretText, Setting, Settings, SettingsChange};
+use aidaemon_client_protocol::{
+    AgentMode, CodingAgent, SecretText, Setting, Settings, SettingsChange,
+};
 use nsh_core::prelude::*;
 
 use crate::store::Store;
@@ -216,7 +219,115 @@ pub fn general(store: Store, settings: &Settings) -> View {
         }
         page = page.child(view().gap_2().child(section_label(*title)).child(list));
     }
+    if !settings.coding_agents.is_empty() {
+        page = page.child(coding_agents(store, &settings.coding_agents));
+    }
     page.child(this_device(store))
+}
+
+/// Each mode a coding agent can run in: its id on the wire, its title and
+/// what it means, safest first.
+const AGENT_MODES: &[(AgentMode, &str, &str, &str)] = &[
+    (
+        AgentMode::Checked,
+        "checked",
+        "Checked by AIDaemon",
+        "Works freely in the project folder. Anything beyond it is checked by your rules first.",
+    ),
+    (
+        AgentMode::EveryCommand,
+        "every_command",
+        "Every command checked",
+        "Runs on this machine. Every command and file change is checked by your rules first.",
+    ),
+    (
+        AgentMode::FullAccess,
+        "full_access",
+        "Full access",
+        "Runs on this machine with nothing checked. Fastest; your rules don't see what it does.",
+    ),
+];
+
+fn agent_mode_id(mode: AgentMode) -> Option<&'static str> {
+    AGENT_MODES
+        .iter()
+        .find(|(m, ..)| *m == mode)
+        .map(|(_, id, ..)| *id)
+}
+
+/// The coding agents the daemon hands work to, each with a pick of the
+/// modes it supports. Full access asks first, like any guarded change.
+fn coding_agents(store: Store, agents: &[CodingAgent]) -> View {
+    let mut key = view().gap_1();
+    for (_, _, title, words) in AGENT_MODES {
+        key = key.child(faint(format!("{title}: {words}")));
+    }
+    let mut list = ui::surface().gap_0();
+    for (at, agent) in agents.iter().enumerate() {
+        if at > 0 {
+            list = list.child(ui::separator());
+        }
+        list = list.child(coding_agent(store, agent));
+    }
+    view()
+        .gap_2()
+        .child(section_label("Coding agent permissions"))
+        .child(key)
+        .child(list)
+}
+
+fn coding_agent(store: Store, agent: &CodingAgent) -> View {
+    let mut title = view().flex_row().flex_wrap().items_center().gap_2().child(
+        text(agent.program.clone())
+            .text_size(px(ui::fit::body()))
+            .font_weight(FontWeight::MEDIUM),
+    );
+    if agent.name != agent.program {
+        title = title.child(faint(agent.name.clone()));
+    }
+    let items: Vec<(String, String)> = agent
+        .modes
+        .iter()
+        .filter_map(|mode| {
+            AGENT_MODES
+                .iter()
+                .find(|(m, ..)| m == mode)
+                .map(|(_, id, title, _)| (id.to_string(), title.to_string()))
+        })
+        .collect();
+    let current = agent.mode.and_then(agent_mode_id);
+    let name = agent.name.clone();
+    let label = format!("{} permission mode", agent.program);
+    let mut row = view().p_3().gap_2().child(title).child(
+        view().flex_row().child(
+            ui::choice(
+                label,
+                "Choose a mode",
+                items,
+                move || current.map(str::to_owned),
+                move |next: Option<String>| {
+                    let mode = next.as_deref().and_then(|id| {
+                        AGENT_MODES
+                            .iter()
+                            .find(|(_, m, ..)| *m == id)
+                            .map(|(mode, ..)| *mode)
+                    });
+                    if let Some(mode) = mode {
+                        store.set_agent_mode(name.clone(), mode);
+                    }
+                },
+            )
+            .flex_1()
+            .max_w(px(if ui::touch() { f32::MAX } else { 360.0 })),
+        ),
+    );
+    if agent.mode.is_none() {
+        row = row.child(muted("Not allowed to run delegated work yet."));
+    }
+    if !agent.note.is_empty() {
+        row = row.child(faint(agent.note.clone()).number_of_lines(3));
+    }
+    row
 }
 
 /// How this device's composer behaves: kept on the device, not the daemon.
