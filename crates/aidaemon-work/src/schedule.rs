@@ -106,9 +106,9 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
         return Ok(one_shot_cron_from_local(target));
     }
 
-    // "today at 11:09pm" / "tonight at 23:10" / "tomorrow at 9am -05:00":
-    // the owner's zone unless a numeric offset, UTC or the owner's own IANA
-    // zone name follows.
+    // "today at 11:09pm" / "tonight at 23:10" / "tomorrow at 9am -05:00" /
+    // "tomorrow at 9am Europe/Madrid": the owner's zone unless a numeric
+    // offset, UTC or an IANA zone name follows.
     if let Some(target) = parse_day_time_with_optional_timezone(input, now_local)? {
         if target <= now_local {
             anyhow::bail!(
@@ -120,9 +120,9 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
         return Ok(one_shot_cron_from_local(target));
     }
 
-    // Dynamic absolute datetime parser:
-    // RFC3339, ISO-like forms, and common date/time formats interpreted in system timezone.
-    if let Some(target) = parse_absolute_datetime_local(input) {
+    // Dynamic absolute datetime parser: RFC3339, ISO-like forms, and common
+    // date/time formats, in the owner's zone or a trailing zone token's.
+    if let Some(target) = parse_absolute_datetime(input, now_local)? {
         if target <= now_local {
             anyhow::bail!(
                 "Schedule time '{}' is in the past for system timezone {}.",
@@ -144,7 +144,7 @@ pub fn parse_schedule(input: &str) -> anyhow::Result<String> {
     }
 
     anyhow::bail!(
-        "Unrecognized schedule format '{}'. Use 'daily at 9am', 'every 5m', 'in 2 hours', 'tomorrow at 9am', an exact time like 2026-03-14T09:30:00-04:00 or '2026-03-14 09:30', or a 5-field cron expression. Interpreted in the owner's timezone {}.",
+        "Unrecognized schedule format '{}'. Use 'daily at 9am', 'every 5m', 'in 2 hours', 'tomorrow at 9am', an exact time like 2026-03-14T09:30:00-04:00 or '2026-03-14 09:30', or a 5-field cron expression. Interpreted in the owner's timezone {} unless a time names its zone (an IANA name like Europe/Madrid, a numeric offset or UTC).",
         input,
         system_timezone_display()
     )
@@ -209,6 +209,70 @@ fn parse_relative_duration(input: &str) -> anyhow::Result<Option<chrono::Duratio
     Ok(Some(total))
 }
 
+/// The zone a schedule's wall-clock time is read in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ScheduleZone {
+    /// The owner's own clock (the system zone), with its daylight-saving rules.
+    Owner,
+    /// A numeric offset or UTC: no daylight saving.
+    Fixed(FixedOffset),
+    /// A named IANA zone such as `Europe/Madrid`, with its daylight-saving rules.
+    Named(chrono_tz::Tz),
+}
+
+impl ScheduleZone {
+    /// The calendar date `now` falls on in this zone.
+    fn date_at(&self, now: DateTime<Local>) -> NaiveDate {
+        match self {
+            Self::Owner => now.date_naive(),
+            Self::Fixed(offset) => now.with_timezone(offset).date_naive(),
+            Self::Named(tz) => now.with_timezone(tz).date_naive(),
+        }
+    }
+
+    /// The instant a wall-clock time in this zone names. A time the clocks
+    /// skip (the spring-forward gap) is an error naming it; a time they pass
+    /// twice (the fall-back hour) is the earlier of the two.
+    fn resolve(&self, naive: NaiveDateTime) -> anyhow::Result<DateTime<Local>> {
+        let resolved = match self {
+            // The owner's zone by its IANA rules when it has a name: the
+            // system clock's own lookup does not always report a fall-back
+            // time as ambiguous.
+            Self::Owner => {
+                match owner_zone_name().and_then(|name| name.parse::<chrono_tz::Tz>().ok()) {
+                    Some(tz) => tz
+                        .from_local_datetime(&naive)
+                        .map(|dt| dt.with_timezone(&Local)),
+                    None => Local.from_local_datetime(&naive),
+                }
+            }
+            Self::Fixed(offset) => offset
+                .from_local_datetime(&naive)
+                .map(|dt| dt.with_timezone(&Local)),
+            Self::Named(tz) => tz
+                .from_local_datetime(&naive)
+                .map(|dt| dt.with_timezone(&Local)),
+        };
+        match resolved {
+            LocalResult::Single(dt) => Ok(dt),
+            LocalResult::Ambiguous(earlier, _) => Ok(earlier),
+            LocalResult::None => anyhow::bail!(
+                "{} does not exist in {}: the clocks skip it for daylight saving. Pick a time outside the skipped hour.",
+                naive.format("%Y-%m-%d %H:%M"),
+                self.name()
+            ),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Owner => owner_zone_name().unwrap_or_else(system_timezone_display),
+            Self::Fixed(offset) => offset.to_string(),
+            Self::Named(tz) => tz.name().to_string(),
+        }
+    }
+}
+
 fn parse_day_time_with_optional_timezone(
     input: &str,
     now_local: DateTime<Local>,
@@ -228,75 +292,136 @@ fn parse_day_time_with_optional_timezone(
     let Some((hour, minute)) = parse_time_with_offset_captures(&caps, 2, 3, 4) else {
         return Ok(None);
     };
-    let offset = match caps.get(5).map(|m| m.as_str().trim()) {
-        Some(token) => parse_timezone_offset(token)?,
-        None => None,
+    let zone = match caps.get(5).map(|m| m.as_str().trim()) {
+        Some(token) => parse_schedule_zone(token)?,
+        None => ScheduleZone::Owner,
     };
-
-    if let Some(offset) = offset {
-        let now_in_tz = now_local.with_timezone(&offset);
-        let base_date = match day_kw.as_str() {
-            "tomorrow" => (now_in_tz + chrono::Duration::days(1)).date_naive(),
-            _ => now_in_tz.date_naive(),
-        };
-        let Some(naive) = base_date.and_hms_opt(hour, minute, 0) else {
-            return Ok(None);
-        };
-        let target_in_tz = match offset.from_local_datetime(&naive) {
-            LocalResult::Single(dt) => dt,
-            LocalResult::Ambiguous(early, _) => early,
-            LocalResult::None => return Ok(None),
-        };
-        return Ok(Some(target_in_tz.with_timezone(&Local)));
-    }
-
+    let today = zone.date_at(now_local);
     let base_date = match day_kw.as_str() {
-        "tomorrow" => (now_local + chrono::Duration::days(1)).date_naive(),
-        _ => now_local.date_naive(),
+        "tomorrow" => today.succ_opt().unwrap_or(today),
+        _ => today,
     };
-    Ok(base_date
-        .and_hms_opt(hour, minute, 0)
-        .and_then(resolve_local_naive))
+    let Some(naive) = base_date.and_hms_opt(hour, minute, 0) else {
+        return Ok(None);
+    };
+    zone.resolve(naive).map(Some)
 }
 
 /// The zone a time names after it: a numeric offset (`-05:00`, `+0530`),
-/// `UTC`/`GMT`/`Z`, or the owner's own IANA zone name (`Ok(None)`: the
-/// owner's zone, with its daylight-saving rules). An abbreviation such as
-/// EST or PST is refused, not mapped to a fixed offset: "EST" in July is
-/// read as EDT by people and would fire an hour off.
-fn parse_timezone_offset(token: &str) -> anyhow::Result<Option<FixedOffset>> {
+/// `UTC`/`GMT`/`Z`, or any IANA zone name (`Europe/Madrid`,
+/// `America/Guayaquil`; exact, or the same name in another letter case),
+/// read with that zone's daylight-saving rules. An abbreviation such as EST
+/// or PST is refused, not mapped to a fixed offset: "EST" in July is read as
+/// EDT by people and would fire an hour off. So are the IANA database's
+/// legacy names without a region (`EST`, `CET`, `Japan`): a real zone name
+/// has a `/`.
+fn parse_schedule_zone(token: &str) -> anyhow::Result<ScheduleZone> {
     static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^(?:UTC|GMT)?([+-])(\d{2})(?::?(\d{2}))?$").expect("numeric offset regex")
     });
     let token = token.trim();
     let upper = token.to_ascii_uppercase();
     if matches!(upper.as_str(), "UTC" | "GMT" | "Z") {
-        return Ok(FixedOffset::east_opt(0));
+        return Ok(ScheduleZone::Fixed(
+            FixedOffset::east_opt(0).expect("zero offset"),
+        ));
     }
     if owner_zone_name().is_some_and(|zone| zone.eq_ignore_ascii_case(token)) {
-        return Ok(None);
+        return Ok(ScheduleZone::Owner);
     }
     if let Some(caps) = NUMERIC.captures(&upper) {
         let hours: i32 = caps[2].parse()?;
         let minutes: i32 = caps.get(3).map_or(Ok(0), |m| m.as_str().parse())?;
         if hours <= 23 && minutes <= 59 {
             let seconds = hours * 3600 + minutes * 60;
-            return Ok(if &caps[1] == "+" {
+            let offset = if &caps[1] == "+" {
                 FixedOffset::east_opt(seconds)
             } else {
                 FixedOffset::west_opt(seconds)
-            });
+            };
+            if let Some(offset) = offset {
+                return Ok(ScheduleZone::Fixed(offset));
+            }
         }
     }
+    if token.contains('/') {
+        if let Ok(tz) = token.parse::<chrono_tz::Tz>() {
+            return Ok(ScheduleZone::Named(tz));
+        }
+        if let Some(tz) = chrono_tz::TZ_VARIANTS
+            .iter()
+            .find(|tz| tz.name().eq_ignore_ascii_case(token))
+        {
+            return Ok(ScheduleZone::Named(*tz));
+        }
+        anyhow::bail!(
+            "'{token}' is not an IANA time zone name. Use a name like Europe/Madrid or America/New_York, a numeric offset like -05:00, or UTC."
+        );
+    }
+    let example = zone_abbreviation_example(&upper).unwrap_or("America/New_York or Europe/Madrid");
     anyhow::bail!(
-        "Time zone '{token}' is not one this can resolve exactly. Leave it out to use the owner's timezone ({}), or give a numeric offset like -05:00 or UTC.",
+        "Time zone '{token}' is not one this can resolve exactly: an abbreviation hides daylight saving. Name the IANA zone instead (e.g. {example}), give a numeric offset like -05:00 or UTC, or leave it out to use the owner's timezone ({}).",
         owner_zone_name().unwrap_or_else(system_timezone_display)
     )
 }
 
-fn parse_absolute_datetime_local(input: &str) -> Option<DateTime<Local>> {
+/// An IANA zone a common abbreviation usually means, for the refusal's hint
+/// only: an abbreviation is ambiguous (IST, CST), so it is never resolved.
+fn zone_abbreviation_example(upper: &str) -> Option<&'static str> {
+    Some(match upper {
+        "ET" | "EST" | "EDT" => "America/New_York",
+        "CT" | "CST" | "CDT" => "America/Chicago",
+        "MT" | "MST" | "MDT" => "America/Denver",
+        "PT" | "PST" | "PDT" => "America/Los_Angeles",
+        "AKST" | "AKDT" => "America/Anchorage",
+        "HST" => "Pacific/Honolulu",
+        "BST" | "WET" | "WEST" => "Europe/London",
+        "CET" | "CEST" | "MET" | "MEST" => "Europe/Madrid",
+        "EET" | "EEST" => "Europe/Athens",
+        "MSK" => "Europe/Moscow",
+        "IST" => "Asia/Kolkata",
+        "JST" => "Asia/Tokyo",
+        "KST" => "Asia/Seoul",
+        "AEST" | "AEDT" => "Australia/Sydney",
+        "NZST" | "NZDT" => "Pacific/Auckland",
+        "ECT" => "America/Guayaquil",
+        _ => return None,
+    })
+}
+
+/// An exact date or date-time, read in the owner's zone, or in the zone a
+/// trailing token names (`2026-03-14 09:30 Europe/Madrid`). RFC 3339 carries
+/// its own offset.
+fn parse_absolute_datetime(
+    input: &str,
+    now_local: DateTime<Local>,
+) -> anyhow::Result<Option<DateTime<Local>>> {
+    if let Some(dt) = parse_absolute_datetime_in(input, ScheduleZone::Owner, now_local)? {
+        return Ok(Some(dt));
+    }
+    if let Some((rest, token)) = input.rsplit_once(char::is_whitespace) {
+        let rest = rest.trim_end();
+        // Only a trailing token after a date the parser reads is a zone; the
+        // token is then held to `parse_schedule_zone`, so "... EST" is refused.
+        // The shape is checked in UTC, which skips no time.
+        let probe = ScheduleZone::Fixed(FixedOffset::east_opt(0).expect("zero offset"));
+        if !rest.is_empty()
+            && parse_absolute_datetime_in(rest, probe, now_local).is_ok_and(|dt| dt.is_some())
+        {
+            let zone = parse_schedule_zone(token)?;
+            return parse_absolute_datetime_in(rest, zone, now_local);
+        }
+    }
+    Ok(None)
+}
+
+fn parse_absolute_datetime_in(
+    input: &str,
+    zone: ScheduleZone,
+    now_local: DateTime<Local>,
+) -> anyhow::Result<Option<DateTime<Local>>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
-        return Some(dt.with_timezone(&Local));
+        return Ok(Some(dt.with_timezone(&Local)));
     }
 
     let dt_formats = [
@@ -314,39 +439,54 @@ fn parse_absolute_datetime_local(input: &str) -> Option<DateTime<Local>> {
         "%B %d %Y %I:%M %p",
     ];
     for fmt in dt_formats {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(input, fmt)
-            && let Some(dt) = resolve_local_naive(naive)
-        {
-            return Some(dt);
+        if let Ok(naive) = NaiveDateTime::parse_from_str(input, fmt) {
+            return zone.resolve(naive).map(Some);
         }
     }
 
-    if let Some(dt) = parse_named_month_datetime_local(input) {
-        return Some(dt);
+    if let Some(dt) = parse_named_month_datetime(input, zone, now_local)? {
+        return Ok(Some(dt));
     }
 
     let date_formats = ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"];
     for fmt in date_formats {
         if let Ok(date) = NaiveDate::parse_from_str(input, fmt)
             && let Some(naive) = date.and_hms_opt(0, 0, 0)
-            && let Some(dt) = resolve_local_naive(naive)
         {
-            return Some(dt);
+            return zone.resolve(naive).map(Some);
         }
     }
 
-    None
+    Ok(None)
 }
 
-fn parse_named_month_datetime_local(input: &str) -> Option<DateTime<Local>> {
-    let re = Regex::new(
-        r"(?i)^(?:on\s+)?(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,\s*(?P<year>\d{4}))?(?:\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?)?$",
-    )
-    .ok()?;
-    let caps = re.captures(input.trim())?;
+fn parse_named_month_datetime(
+    input: &str,
+    zone: ScheduleZone,
+    now_local: DateTime<Local>,
+) -> anyhow::Result<Option<DateTime<Local>>> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)^(?:on\s+)?(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,\s*(?P<year>\d{4}))?(?:\s+at\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?)?$",
+        )
+        .expect("named-month regex")
+    });
+    let Some(caps) = RE.captures(input.trim()) else {
+        return Ok(None);
+    };
 
-    let month = parse_month_name(caps.name("month")?.as_str())?;
-    let day: u32 = caps.name("day")?.as_str().parse().ok()?;
+    let Some(month) = caps
+        .name("month")
+        .and_then(|m| parse_month_name(m.as_str()))
+    else {
+        return Ok(None);
+    };
+    let Some(day) = caps
+        .name("day")
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+    else {
+        return Ok(None);
+    };
     let explicit_year = caps
         .name("year")
         .and_then(|m| m.as_str().parse::<i32>().ok());
@@ -368,30 +508,23 @@ fn parse_named_month_datetime_local(input: &str) -> Option<DateTime<Local>> {
         }
     }
     if hour > 23 || minute > 59 {
-        return None;
+        return Ok(None);
     }
 
-    let now_local = Local::now();
-    let mut year = explicit_year.unwrap_or(now_local.year());
-    let mut candidate = build_named_month_datetime_local(year, month, day, hour, minute)?;
-    if explicit_year.is_none() && candidate <= now_local {
-        year += 1;
-        candidate = build_named_month_datetime_local(year, month, day, hour, minute)?;
+    let build = |year: i32| -> anyhow::Result<Option<DateTime<Local>>> {
+        let Some(naive) =
+            NaiveDate::from_ymd_opt(year, month, day).and_then(|d| d.and_hms_opt(hour, minute, 0))
+        else {
+            return Ok(None);
+        };
+        zone.resolve(naive).map(Some)
+    };
+    let year = explicit_year.unwrap_or_else(|| zone.date_at(now_local).year());
+    let candidate = build(year)?;
+    if explicit_year.is_none() && candidate.is_some_and(|dt| dt <= now_local) {
+        return build(year + 1);
     }
-
-    Some(candidate)
-}
-
-fn build_named_month_datetime_local(
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-) -> Option<DateTime<Local>> {
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let naive = date.and_hms_opt(hour, minute, 0)?;
-    resolve_local_naive(naive)
+    Ok(candidate)
 }
 
 fn parse_month_name(month: &str) -> Option<u32> {
@@ -409,14 +542,6 @@ fn parse_month_name(month: &str) -> Option<u32> {
         "nov" | "november" => Some(11),
         "dec" | "december" => Some(12),
         _ => None,
-    }
-}
-
-fn resolve_local_naive(naive: NaiveDateTime) -> Option<DateTime<Local>> {
-    match Local.from_local_datetime(&naive) {
-        LocalResult::Single(dt) => Some(dt),
-        LocalResult::Ambiguous(early, _) => Some(early),
-        LocalResult::None => None,
     }
 }
 
@@ -1213,12 +1338,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_timezone_offset_numeric_utc_and_owner_zone() {
-        let seconds = |token: &str| {
-            parse_timezone_offset(token)
-                .unwrap()
-                .unwrap()
-                .local_minus_utc()
+    fn test_parse_schedule_zone_numeric_utc_owner_and_iana() {
+        let seconds = |token: &str| match parse_schedule_zone(token).unwrap() {
+            ScheduleZone::Fixed(offset) => offset.local_minus_utc(),
+            other => panic!("{token}: {other:?}"),
         };
         assert_eq!(seconds("+05:30"), 5 * 3600 + 30 * 60);
         assert_eq!(seconds("-0400"), -4 * 3600);
@@ -1229,9 +1352,151 @@ mod tests {
         if let Some(zone) = owner_zone_name()
             .filter(|zone| !matches!(zone.to_ascii_uppercase().as_str(), "UTC" | "GMT" | "Z"))
         {
-            assert_eq!(parse_timezone_offset(&zone).unwrap(), None);
+            assert_eq!(parse_schedule_zone(&zone).unwrap(), ScheduleZone::Owner);
         }
-        assert!(parse_timezone_offset("EDT").is_err());
+        // Any other IANA zone, exact or in another letter case.
+        for (token, name) in [
+            ("Asia/Tokyo", "Asia/Tokyo"),
+            ("america/guayaquil", "America/Guayaquil"),
+            ("EUROPE/MADRID", "Europe/Madrid"),
+        ] {
+            if owner_zone_name().is_some_and(|zone| zone.eq_ignore_ascii_case(token)) {
+                continue;
+            }
+            match parse_schedule_zone(token).unwrap() {
+                ScheduleZone::Named(tz) => assert_eq!(tz.name(), name),
+                other => panic!("{token}: {other:?}"),
+            }
+        }
+        assert!(parse_schedule_zone("EDT").is_err());
+    }
+
+    /// Noon UTC on a fixed day, as the owner's clock: a fixed "now" so the
+    /// zone tests do not depend on the date they run.
+    fn fixed_now(y: i32, mo: u32, d: u32) -> DateTime<Local> {
+        Utc.with_ymd_and_hms(y, mo, d, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&Local)
+    }
+
+    fn utc(input: &str, now: DateTime<Local>) -> String {
+        parse_absolute_datetime(input, now)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{input}: not read"))
+            .with_timezone(&Utc)
+            .to_rfc3339()
+    }
+
+    #[test]
+    fn a_named_zone_follows_its_daylight_saving_rules() {
+        let now = fixed_now(2030, 1, 1);
+        // Madrid is UTC+1 in winter and UTC+2 in summer.
+        assert_eq!(
+            utc("2030-01-15 09:00 Europe/Madrid", now),
+            "2030-01-15T08:00:00+00:00"
+        );
+        assert_eq!(
+            utc("2030-07-15 09:00 Europe/Madrid", now),
+            "2030-07-15T07:00:00+00:00"
+        );
+        assert_eq!(
+            utc("July 15, 2030 at 9am Europe/Madrid", now),
+            "2030-07-15T07:00:00+00:00"
+        );
+        // Guayaquil keeps UTC-5 all year.
+        assert_eq!(
+            utc("2030-01-15 09:00 America/Guayaquil", now),
+            "2030-01-15T14:00:00+00:00"
+        );
+        assert_eq!(
+            utc("2030-07-15 09:00 America/Guayaquil", now),
+            "2030-07-15T14:00:00+00:00"
+        );
+        assert_eq!(
+            utc("2030-07-15 09:00 Asia/Tokyo", now),
+            "2030-07-15T00:00:00+00:00"
+        );
+        // A fall-back time the clocks pass twice is the earlier one (CEST).
+        assert_eq!(
+            utc("2030-10-27 02:30 Europe/Madrid", now),
+            "2030-10-27T00:30:00+00:00"
+        );
+        // The owner's zone and numeric offsets still read as before.
+        assert_eq!(
+            utc("2030-07-15 09:00 -05:00", now),
+            "2030-07-15T14:00:00+00:00"
+        );
+        assert_eq!(
+            utc("2030-07-15 09:00 UTC", now),
+            "2030-07-15T09:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn tomorrow_at_a_time_in_a_named_zone_uses_that_zones_calendar_and_offset() {
+        let resolve = |input: &str, now: DateTime<Local>| {
+            parse_day_time_with_optional_timezone(input, now)
+                .unwrap()
+                .unwrap()
+                .with_timezone(&Utc)
+                .to_rfc3339()
+        };
+        assert_eq!(
+            resolve("tomorrow at 9am Europe/Madrid", fixed_now(2030, 1, 14)),
+            "2030-01-15T08:00:00+00:00"
+        );
+        assert_eq!(
+            resolve("tomorrow at 9am Europe/Madrid", fixed_now(2030, 7, 14)),
+            "2030-07-15T07:00:00+00:00"
+        );
+        assert_eq!(
+            resolve("tomorrow at 9am America/Guayaquil", fixed_now(2030, 7, 14)),
+            "2030-07-15T14:00:00+00:00"
+        );
+        // 12:00 UTC on the 14th is already the 14th at 21:00 in Tokyo.
+        assert_eq!(
+            resolve("tomorrow at 9:30am Asia/Tokyo", fixed_now(2030, 7, 14)),
+            "2030-07-15T00:30:00+00:00"
+        );
+    }
+
+    #[test]
+    fn a_time_the_clocks_skip_in_a_named_zone_is_an_error_naming_it() {
+        let now = fixed_now(2030, 1, 1);
+        let error = parse_absolute_datetime("2030-03-31 02:30 Europe/Madrid", now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2030-03-31 02:30"), "{error}");
+        assert!(error.contains("Europe/Madrid"), "{error}");
+        assert!(error.contains("daylight saving"), "{error}");
+        let error = parse_day_time_with_optional_timezone(
+            "tomorrow at 2:30am Europe/Madrid",
+            fixed_now(2030, 3, 30),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn an_abbreviation_or_unknown_zone_after_a_time_is_refused_with_a_hint() {
+        let now = fixed_now(2030, 1, 1);
+        let error = parse_absolute_datetime("2030-07-15 09:00 EST", now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("America/New_York"), "{error}");
+        let error = parse_schedule("tomorrow at 9am CET")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Europe/Madrid"), "{error}");
+        // IANA's legacy region-less names are abbreviations too.
+        assert!(parse_schedule_zone("EST").is_err());
+        assert!(parse_schedule_zone("Japan").is_err());
+        let error = parse_absolute_datetime("2030-07-15 09:00 Europe/Atlantis", now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not an IANA time zone"), "{error}");
+        assert!(parse_schedule("tomorrow at 9am Mars/Olympus").is_err());
     }
 
     #[test]
