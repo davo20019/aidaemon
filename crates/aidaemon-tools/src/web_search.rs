@@ -261,11 +261,10 @@ impl SearchBackend for DuckDuckGoBackend {
 
 /// Detect DuckDuckGo's anti-bot challenge page, which returns HTTP 200 with
 /// no results. Without this check a block is indistinguishable from a query
-/// that genuinely has no matches.
+/// that genuinely has no matches. Only the page's DOM class/id markers are
+/// read (structure), never its sentences, which change with locale.
 fn is_ddg_challenge(html: &str) -> bool {
-    html.contains("anomaly-modal")
-        || html.contains("challenge-form")
-        || html.contains("Unfortunately, bots use DuckDuckGo too")
+    html.contains("anomaly-modal") || html.contains("challenge-form")
 }
 
 /// Parse the DuckDuckGo lite HTML page into results.
@@ -983,8 +982,10 @@ mod tests {
         assert!(is_ddg_challenge(
             "<html><div class=\"anomaly-modal\">...</div></html>"
         ));
-        assert!(is_ddg_challenge(
-            "<p>Unfortunately, bots use DuckDuckGo too.</p>"
+        assert!(is_ddg_challenge("<form id=\"challenge-form\"></form>"));
+        // A result snippet quoting the challenge sentence is not a challenge.
+        assert!(!is_ddg_challenge(
+            "<td class=\"result-snippet\">Unfortunately, bots use DuckDuckGo too.</td>"
         ));
         assert!(!is_ddg_challenge("<td class=\"result-snippet\">ok</td>"));
     }
