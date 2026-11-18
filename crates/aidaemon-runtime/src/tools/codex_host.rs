@@ -60,6 +60,17 @@ const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
 
+/// What the agent is told about its approvals. Codex's own model decides
+/// when to ask to leave its sandbox, and without this it reads a sandbox
+/// refusal as final (live 2026-11-18: a blocked `touch` outside the folder
+/// and a blocked `curl` were reported as failures, never asked).
+pub const HOST_INSTRUCTIONS: &str = "Your approval requests are answered by the \
+owner's assistant that delegated this task, under the owner's own rules. When \
+the sandbox blocks a command, file change or network access that the task \
+needs, request escalated permissions for it (with a one-line justification) \
+instead of reporting the failure. A declined request is final: do not retry \
+it another way.";
+
 /// The arguments that launch `codex app-server` for a run the adapters
 /// already confined as `codex exec` (`args[start..]` are Codex's own; what
 /// precedes them is an `env` launcher's). The confinement carries over
@@ -380,6 +391,7 @@ impl CodexHost {
                     "approvalPolicy": "on-request",
                     "approvalsReviewer": "user",
                     "ephemeral": true,
+                    "developerInstructions": HOST_INSTRUCTIONS,
                 });
                 if let Some(dir) = self.working_dir.as_deref() {
                     params["cwd"] = json!(dir);
@@ -849,6 +861,10 @@ mod tests {
         assert_eq!(thread_start["method"], "thread/start");
         assert_eq!(thread_start["params"]["approvalPolicy"], "on-request");
         assert_eq!(thread_start["params"]["cwd"], "/w");
+        assert_eq!(
+            thread_start["params"]["developerInstructions"],
+            HOST_INSTRUCTIONS
+        );
 
         host.on_line(r#"{"id":2,"result":{"thread":{"id":"t1"}}}"#)
             .await;
