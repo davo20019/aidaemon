@@ -221,6 +221,11 @@ pub enum RunFailure {
     Cancelled { by: CancelledBy },
     /// It made no progress for its limit and was stopped.
     NoProgress,
+    /// A delegated coding agent's own permission check refused these
+    /// actions (typed by the agent: Claude Code's `permission_denials`),
+    /// and it changed nothing. Each is the tool and what it targeted, e.g.
+    /// "Bash: touch notes.txt".
+    AgentRefused { actions: Vec<String> },
     /// Its end record says it failed and records nothing more: said as
     /// that, so the owner is never left with a bare "failed".
     NoCause,
@@ -345,6 +350,15 @@ impl RunFailure {
             Self::NoProgress => {
                 "It made no progress for its time limit, so it was stopped.".to_string()
             }
+            Self::AgentRefused { actions } => format!(
+                "Its coding agent's own permission check refused {}, so nothing was changed: {}.",
+                if actions.len() == 1 {
+                    "an action it needed"
+                } else {
+                    "actions it needed"
+                },
+                actions.join("; ")
+            ),
             Self::NoCause => {
                 "It ended without a successful outcome, and its records give no cause.".to_string()
             }
@@ -1288,6 +1302,9 @@ mod tests {
                 by: CancelledBy::Owner,
             },
             RunFailure::NoProgress,
+            RunFailure::AgentRefused {
+                actions: vec!["Bash: touch notes.txt".into()],
+            },
             RunFailure::NoCause,
         ];
         let runs = RunStates::default();

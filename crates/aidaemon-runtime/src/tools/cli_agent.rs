@@ -1197,6 +1197,53 @@ fn cli_auth_failed(stdout: &str, display: &str, exit_code: Option<i32>) -> bool 
         })
 }
 
+/// The actions a CLI agent's own permission check refused, from the typed
+/// record it gives at the end of its run: Claude Code's `result` event
+/// lists each under `permission_denials` (`tool_name`, `tool_input`). Each
+/// reads "<tool>: <target>", the target being the call's command or path
+/// when it names one (JSON fields, never prose).
+fn agent_refused_actions(stdout: &str) -> Vec<String> {
+    let Some(result) = stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("result"))
+    else {
+        return Vec::new();
+    };
+    let mut actions = Vec::new();
+    for denial in result
+        .get("permission_denials")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(tool) = denial.get("tool_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let input = denial.get("tool_input");
+        let target = ["command", "file_path", "path", "url", "pattern"]
+            .iter()
+            .find_map(|key| {
+                input
+                    .and_then(|input| input.get(*key))
+                    .and_then(Value::as_str)
+            })
+            .map(|target| target.split_whitespace().collect::<Vec<_>>().join(" "));
+        let action = match target {
+            Some(target) if !target.is_empty() => format!(
+                "{tool}: {}",
+                aidaemon_events::text::truncate_str(&target, 160)
+            ),
+            _ => tool.to_string(),
+        };
+        if !actions.contains(&action) {
+            actions.push(action);
+        }
+    }
+    actions
+}
+
 fn first_cli_failure_detail(output: &str) -> String {
     output
         .lines()
@@ -3119,6 +3166,7 @@ impl CliAgentTool {
                     expects_change,
                     changed_something,
                     step: task_context.clone(),
+                    refused: agent_refused_actions(&stdout_buf_writer.lock().await),
                 });
             let _ = end_record_for_task.set(CliRunEnd {
                 end: run_phase.clone(),
@@ -7156,6 +7204,29 @@ mod tests {
     // -----------------------------------------------------------------------
     // Auth error detection tests
     // -----------------------------------------------------------------------
+
+    /// The shape Claude Code 2.1.327 printed in a live probe (2026-11-17):
+    /// a Bash call denied by its own permission check, listed in the final
+    /// `result` event.
+    #[test]
+    fn refused_actions_are_read_from_the_agents_typed_denials() {
+        let stdout = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"touch notes.txt"}}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"I couldn't run it.","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_1","tool_input":{"command":"touch   notes.txt","description":"Create notes"}},{"tool_name":"Write","tool_use_id":"toolu_2","tool_input":{"file_path":"/w/synthetic/notes.txt","content":"x"}},{"tool_name":"Bash","tool_use_id":"toolu_3","tool_input":{"command":"touch notes.txt"}},{"tool_name":"WebSearch","tool_use_id":"toolu_4","tool_input":{}}]}"#;
+        assert_eq!(
+            agent_refused_actions(stdout),
+            vec![
+                "Bash: touch notes.txt".to_string(),
+                "Write: /w/synthetic/notes.txt".to_string(),
+                "WebSearch".to_string(),
+            ]
+        );
+        // No result event, or one without denials: nothing refused.
+        assert!(agent_refused_actions(r#"{"type":"assistant"}"#).is_empty());
+        assert!(agent_refused_actions(r#"{"type":"result","permission_denials":[]}"#).is_empty());
+        // Prose that talks about permissions is never read.
+        assert!(agent_refused_actions("permission denied: touch notes.txt").is_empty());
+    }
 
     #[test]
     fn auth_failure_is_read_from_what_the_cli_reported_about_itself() {

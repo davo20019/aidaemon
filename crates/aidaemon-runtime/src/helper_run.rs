@@ -176,6 +176,9 @@ pub struct ProgramEnd {
     pub changed_something: bool,
     /// What it was sent to do, as the owner reads it.
     pub step: String,
+    /// Actions the agent's own permission check refused, as the agent
+    /// typed them (tool and target).
+    pub refused: Vec<String>,
 }
 
 /// How a CLI agent's run ended: an error exit failed, a stop by the runtime
@@ -194,6 +197,16 @@ pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
         return (
             RunEnd::Failed(RunFailure::Exited {
                 code: end.exit_code,
+            }),
+            RunEvidence::default(),
+        );
+    }
+    // Its own permission check refused what it needed and nothing changed:
+    // that, not "nothing was done", is why it ended short.
+    if !end.refused.is_empty() && !end.changed_something {
+        return (
+            RunEnd::Failed(RunFailure::AgentRefused {
+                actions: end.refused.clone(),
             }),
             RunEvidence::default(),
         );
@@ -365,6 +378,7 @@ mod tests {
             expects_change: true,
             changed_something: false,
             step: "Install WordPress in claude-wordpress-7".to_string(),
+            refused: Vec::new(),
         };
         let (end, _) = program_phase(&refused);
         assert!(matches!(
@@ -398,6 +412,44 @@ mod tests {
         };
         let (end, _) = program_phase(&stopped);
         assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: None }));
+    }
+
+    /// Live probe 2026-11-17: Claude Code run with `-p` denied `touch` on
+    /// its own (no host answers its prompts) and exited 0; its result
+    /// listed the call under `permission_denials`. The run ends naming
+    /// what was refused, not as "nothing was done".
+    #[test]
+    fn a_cli_run_its_agent_refused_names_the_refused_actions() {
+        let refused = ProgramEnd {
+            exit_code: Some(0),
+            expects_change: true,
+            step: "Create notes.txt".to_string(),
+            refused: vec!["Bash: touch notes.txt".to_string()],
+            ..ProgramEnd::default()
+        };
+        let (end, _) = program_phase(&refused);
+        assert_eq!(
+            end,
+            RunEnd::Failed(RunFailure::AgentRefused {
+                actions: vec!["Bash: touch notes.txt".to_string()]
+            })
+        );
+        // It found another way and changed what it was sent to change:
+        // the receipt decides.
+        let changed = ProgramEnd {
+            changed_something: true,
+            ..refused.clone()
+        };
+        assert_eq!(program_phase(&changed).0, RunEnd::Succeeded);
+        // An error exit is still that.
+        let errored = ProgramEnd {
+            exit_code: Some(1),
+            ..refused
+        };
+        assert_eq!(
+            program_phase(&errored).0,
+            RunEnd::Failed(RunFailure::Exited { code: Some(1) })
+        );
     }
 
     #[test]
