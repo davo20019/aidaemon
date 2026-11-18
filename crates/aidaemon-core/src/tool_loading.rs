@@ -101,7 +101,7 @@ impl LoadToolsTool {
     fn description(&self) -> String {
         let mut text = String::from(
             "Load more tools. These tools exist but their parameters are not shown yet; \
-             load the ones a step needs by name (or find them with a query), then call \
+             load the ones a step needs by name (or by part of a name), then call \
              them. Loaded tools stay available.",
         );
         for entry in &self.entries {
@@ -110,32 +110,22 @@ impl LoadToolsTool {
         text
     }
 
-    /// Entries a free-text query matches: every word of the query appears
-    /// in the tool's name or line (case-insensitive).
+    /// Entries whose name contains a fragment of `query`. Names are
+    /// machine identifiers from the index the model reads, so a fragment
+    /// ("config", "browser") is matched against them only; descriptions are
+    /// prose and never decide what loads.
     fn matching(&self, query: &str) -> Vec<&DeferredEntry> {
-        let words: Vec<String> = query
-            .split(|c: char| !c.is_alphanumeric())
+        let fragments: Vec<String> = query
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
             .filter(|w| w.len() > 1)
             .map(str::to_lowercase)
             .collect();
-        if words.is_empty() {
-            return Vec::new();
-        }
-        let scored = |entry: &DeferredEntry| {
-            let haystack =
-                format!("{} {}", entry.name.replace('_', " "), entry.summary).to_lowercase();
-            words
-                .iter()
-                .filter(|w| haystack.contains(w.as_str()))
-                .count()
-        };
-        let best = self.entries.iter().map(scored).max().unwrap_or(0);
-        if best == 0 {
-            return Vec::new();
-        }
         self.entries
             .iter()
-            .filter(|entry| scored(entry) == best)
+            .filter(|entry| {
+                let name = entry.name.to_lowercase();
+                fragments.iter().any(|f| name.contains(f.as_str()))
+            })
             .take(5)
             .collect()
     }
@@ -157,7 +147,7 @@ impl Tool for LoadToolsTool {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Words describing the capability, when the name is unknown"
+                        "description": "Part of a tool name from the list (e.g. \"config\"), when the exact name is unsure"
                     }
                 },
                 "additionalProperties": false
@@ -286,10 +276,7 @@ mod tests {
             .unwrap();
         assert!(!out.is_error && out.content.contains("Loaded: browser"));
         assert!(loaded.contains("browser"));
-        let out = tool
-            .call(json!({"query": "change config"}), &ctx)
-            .await
-            .unwrap();
+        let out = tool.call(json!({"query": "config"}), &ctx).await.unwrap();
         assert!(
             out.content.contains("Loaded: manage_config"),
             "{}",
@@ -302,6 +289,18 @@ mod tests {
         assert!(out.content.contains("Already loaded: browser"));
         let out = tool.call(json!({"names": ["nope"]}), &ctx).await.unwrap();
         assert!(out.is_error && out.content.contains("Not a deferred tool: nope"));
+    }
+
+    #[tokio::test]
+    async fn a_query_matches_tool_names_never_descriptions() {
+        let (tool, loaded) = tool();
+        let ctx = ToolContext::new("test:synthetic-session", "call-1");
+        // "web" appears only in browser's description: nothing loads.
+        let out = tool.call(json!({"query": "web"}), &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(!loaded.contains("browser"));
+        let out = tool.call(json!({"query": "brows"}), &ctx).await.unwrap();
+        assert!(out.content.contains("Loaded: browser"), "{}", out.content);
     }
 
     #[test]
