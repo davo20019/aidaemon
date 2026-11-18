@@ -61,15 +61,13 @@ impl AcpAgent {
         }
     }
 
-    /// Gemini CLI (`gemini --acp`).
+    /// Gemini CLI (`gemini --acp`). Not looked for on its own: since
+    /// 2026-06-18 Google serves it only to enterprise licences and paid API
+    /// keys, not to personal Google sign-ins (which it refuses a session).
+    /// An owner with such an account adds a `gemini` agent, and it is
+    /// recognized and hosted as this.
     pub fn gemini() -> Self {
         Self {
-            discovery: Some(Discovery {
-                name: "gemini",
-                command: "gemini",
-                args: &["--acp"],
-                description: "Gemini CLI — Google's AI coding agent",
-            }),
             arguments: Some(LaunchArguments {
                 flags: &["--acp", "--experimental-acp", "--debug", "-d"],
                 valued: &["--model", "-m"],

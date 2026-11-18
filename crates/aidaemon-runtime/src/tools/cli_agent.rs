@@ -672,7 +672,7 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
 ///
 /// Rationale: keep common coding agents at the front so orchestrator calls can
 /// simply provide a prompt and still use a strong default.
-const DEFAULT_TOOL_PRIORITY: &[&str] = &["claude", "gemini", "codex", "copilot", "aider"];
+const DEFAULT_TOOL_PRIORITY: &[&str] = &["claude", "codex", "agy", "copilot", "aider"];
 
 fn env_wrapped_program_index(args: &[String]) -> Option<usize> {
     let mut index = 0;

@@ -19,13 +19,14 @@ impl CodingAgents {
 
     /// The agents this crate ships: Claude Code and Codex (hosted by their
     /// own protocols), Antigravity CLI and Gemini CLI (hosted over the Agent
-    /// Client Protocol), GitHub Copilot CLI and Aider (full access only).
+    /// Client Protocol; Gemini CLI only when the owner adds it), GitHub
+    /// Copilot CLI and Aider (full access only).
     pub fn builtin() -> Self {
         Self::empty()
             .with(ClaudeCode)
-            .with(AcpAgent::gemini())
             .with(Codex)
             .with(AcpAgent::antigravity())
+            .with(AcpAgent::gemini())
             .with(PlainAgent::copilot())
             .with(PlainAgent::aider())
     }
@@ -74,8 +75,10 @@ mod tests {
         let agents = CodingAgents::builtin();
         assert_eq!(agents.for_program("claude").name(), "Claude Code");
         assert_eq!(agents.for_program("codex.exe").name(), "Codex");
-        assert_eq!(agents.for_program("gemini").name(), "Gemini CLI");
         assert_eq!(agents.for_program("agy").name(), "Antigravity CLI");
+        // Recognized when added, though never looked for on its own.
+        assert_eq!(agents.for_program("gemini").name(), "Gemini CLI");
+        assert!(agents.for_program("gemini").discovery().is_none());
         let unknown = agents.for_program("synthetic-coder");
         assert_eq!(unknown.name(), "synthetic-coder");
         assert_eq!(unknown.modes(), &[PermissionMode::FullAccess]);
@@ -92,7 +95,9 @@ mod tests {
     #[test]
     fn every_default_launch_is_on_its_list() {
         for agent in CodingAgents::builtin().all() {
-            let found = agent.discovery().unwrap();
+            let Some(found) = agent.discovery() else {
+                continue;
+            };
             assert_eq!(unlisted(found.command, found.args), None, "{}", found.name);
         }
     }
@@ -109,7 +114,6 @@ mod tests {
             ("claude", &["-p", "--permission-mode", "acceptEdits"]),
             ("claude", &["--add-dir", "/synthetic/elsewhere"]),
             ("claude", &["--verbose=true"]),
-            ("gemini", &["--approval-mode", "auto_edit"]),
             ("agy", &["acp", "--dangerously-skip-permissions"]),
             ("aider", &["--auto-commits"]),
             ("codex", &["sandbox"]),
@@ -148,9 +152,6 @@ mod tests {
             .iter()
             .filter_map(|agent| agent.discovery().map(|found| found.name))
             .collect();
-        assert_eq!(
-            names,
-            ["claude", "gemini", "codex", "agy", "copilot", "aider"]
-        );
+        assert_eq!(names, ["claude", "codex", "agy", "copilot", "aider"]);
     }
 }
