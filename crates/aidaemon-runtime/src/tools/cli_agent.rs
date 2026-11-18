@@ -773,9 +773,27 @@ struct TreeReceipt {
     newest: Option<std::time::SystemTime>,
 }
 
+/// What the run's write roots hold: every file and folder under each root
+/// that is a folder, and each root that is a file itself (live 2026-11-18:
+/// a run given the exact file `notes.txt` to write created it, and its
+/// receipt read only folders, so the run read as "did not do its work").
+/// A root that does not exist yet counts nothing, so creating it is a
+/// change.
 async fn tree_receipt(backend: &SharedExecutionBackend, roots: &[String]) -> TreeReceipt {
     let mut receipt = TreeReceipt::default();
-    let mut queue: VecDeque<BackendPath> = roots.iter().map(BackendPath::new).collect();
+    let mut queue: VecDeque<BackendPath> = VecDeque::new();
+    for root in roots {
+        let path = BackendPath::new(root);
+        match backend.metadata(&path).await {
+            Ok(meta) if meta.file_type == BackendFileType::Directory => queue.push_back(path),
+            Ok(meta) => {
+                receipt.entries += 1;
+                receipt.bytes = receipt.bytes.saturating_add(meta.len);
+                receipt.newest = receipt.newest.max(meta.modified);
+            }
+            Err(_) => {}
+        }
+    }
     while let Some(directory) = queue.pop_front() {
         let Ok(entries) = backend.read_dir(&directory).await else {
             continue;
@@ -7250,6 +7268,24 @@ mod tests {
     // -----------------------------------------------------------------------
     // Auth error detection tests
     // -----------------------------------------------------------------------
+
+    /// A write root that is a single file is measured itself: creating it,
+    /// or rewriting it, is a change.
+    #[tokio::test]
+    async fn a_file_write_root_is_measured_by_the_change_receipt() {
+        let backend = aidaemon_tools::testing::active_execution_backend();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        let roots = vec![file.to_string_lossy().to_string()];
+        let missing = tree_receipt(&backend, &roots).await;
+        std::fs::write(&file, "nightjar").unwrap();
+        let created = tree_receipt(&backend, &roots).await;
+        assert_ne!(missing, created, "creating the file is a change");
+        std::fs::write(&file, "nightjar and more").unwrap();
+        let rewritten = tree_receipt(&backend, &roots).await;
+        assert_ne!(created, rewritten, "rewriting it is a change");
+        assert_eq!(rewritten, tree_receipt(&backend, &roots).await);
+    }
 
     /// The shape Claude Code 2.1.327 printed in a live probe (2026-11-17):
     /// a Bash call denied by its own permission check, listed in the final
