@@ -2239,11 +2239,13 @@ fn dictation(store: Store, terminal: bool) -> View {
         listening.set(true);
         owner.run(|| {
             spawn(async move {
+                let mut dictated = Dictated::new(lead);
                 loop {
                     let event = std::future::poll_fn(|cx| running.borrow_mut().poll_next(cx)).await;
                     match event {
                         Some(SpeechEvent::Result { text, .. }) => {
-                            store.set_draft(format!("{lead}{text}"))
+                            let draft = dictated.write(&store.draft(), &text);
+                            store.set_draft(draft)
                         }
                         Some(SpeechEvent::End { error }) => {
                             if let Some(note) = error.and_then(speech_note) {
@@ -2278,6 +2280,67 @@ fn dictation(store: Store, terminal: bool) -> View {
     ))
 }
 
+/// What dictation writes into the composer: the text that was there, then
+/// what has been heard. The recognizer always reports the whole transcript
+/// of the session, so when the draft is no longer what dictation last wrote
+/// (the message was sent, or the owner typed) the draft as it is becomes the
+/// new start and only words heard after that are added: a sent message never
+/// comes back, and edits are kept.
+struct Dictated {
+    /// The draft before the words dictation adds.
+    lead: String,
+    /// How much of the transcript is already in `lead` (or was sent).
+    heard: String,
+    /// The draft dictation last wrote, and the transcript it wrote it from.
+    written: Option<String>,
+    written_transcript: String,
+}
+
+impl Dictated {
+    fn new(lead: String) -> Self {
+        Self {
+            lead,
+            heard: String::new(),
+            written: None,
+            written_transcript: String::new(),
+        }
+    }
+
+    /// The draft once `transcript` (the whole session's, so far) is heard,
+    /// given the draft as it is now.
+    fn write(&mut self, draft: &str, transcript: &str) -> String {
+        if self.written.as_deref().is_some_and(|w| w != draft) {
+            // Changed outside dictation: keep it, and start after it.
+            self.lead = if draft.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{} ", draft.trim_end())
+            };
+            self.heard = self.written_transcript.clone();
+        }
+        let new = after_heard(transcript, &self.heard);
+        let text = format!("{}{}", self.lead, new.trim_start());
+        self.written_transcript = transcript.to_string();
+        self.written = Some(text.clone());
+        text
+    }
+}
+
+/// The words of `transcript` after `heard`, an earlier transcript of the
+/// same session: as many words are skipped as `heard` had (the recognizer
+/// may still revise words it had not settled, so their text can differ).
+fn after_heard(transcript: &str, heard: &str) -> String {
+    let skip = heard.split_whitespace().count();
+    if skip == 0 {
+        return transcript.to_string();
+    }
+    transcript
+        .split_whitespace()
+        .skip(skip)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// What to tell the owner when listening failed; nothing when it only
 /// heard nothing.
 fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
@@ -2293,6 +2356,52 @@ fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
             Some("Listening stopped: speech recognition could not reach its service")
         }
         _ => Some("Listening stopped: speech recognition failed"),
+    }
+}
+
+#[cfg(test)]
+mod dictation_tests {
+    use super::Dictated;
+
+    #[test]
+    fn words_follow_what_was_typed() {
+        let mut d = Dictated::new("Note: ".into());
+        assert_eq!(d.write("Note:", "buy"), "Note: buy");
+        assert_eq!(d.write("Note: buy", "buy milk"), "Note: buy milk");
+    }
+
+    #[test]
+    fn a_sent_message_does_not_come_back() {
+        let mut d = Dictated::new(String::new());
+        assert_eq!(d.write("", "commit the change"), "commit the change");
+        // Sent: the composer is empty, the recognizer still has it all.
+        assert_eq!(d.write("", "commit the change continue"), "continue");
+        assert_eq!(
+            d.write("continue", "commit the change continue please"),
+            "continue please"
+        );
+    }
+
+    #[test]
+    fn the_last_result_after_sending_leaves_the_composer_empty() {
+        let mut d = Dictated::new(String::new());
+        d.write("", "hello there");
+        // Stop after sending: the recognizer reports what it heard once more.
+        assert_eq!(d.write("", "hello there"), "");
+    }
+
+    #[test]
+    fn typing_while_listening_is_kept() {
+        let mut d = Dictated::new(String::new());
+        d.write("", "fix the");
+        assert_eq!(d.write("fix the bug", "fix the mic"), "fix the bug mic");
+    }
+
+    #[test]
+    fn a_revised_word_skips_by_words() {
+        let mut d = Dictated::new(String::new());
+        d.write("", "hello word");
+        assert_eq!(d.write("", "hello world again"), "again");
     }
 }
 
