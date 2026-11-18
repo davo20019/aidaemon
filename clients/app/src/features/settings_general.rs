@@ -320,7 +320,7 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
     let current = agent.mode.and_then(agent_mode_id);
     let name = agent.name.clone();
     let label = format!("{} permission mode", agent.program);
-    let mut row = view().p_3().gap_2().child(title).child(
+    let mut row = view().p_3().gap_2().child(title).child(shown(
         view().flex_row().child(
             ui::choice(
                 label,
@@ -343,7 +343,7 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
             .flex_1()
             .max_w(px(if ui::touch() { f32::MAX } else { 360.0 })),
         ),
-    );
+    ));
     if agent.mode.is_none() {
         row = row.child(muted("Not allowed to run delegated work yet."));
     }
