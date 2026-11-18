@@ -489,7 +489,7 @@ impl Tool for ScheduleTaskTool {
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "The instruction each run carries out." },
-                    "when": { "type": "string", "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am', or an exact time like 2026-03-14T09:30:00-04:00 for anything further out" },
+                    "when": { "type": "string", "description": "e.g. 'in 2 hours', 'tomorrow at 9am', 'every weekday at 8am', or an exact time like 2026-03-14T09:30:00-04:00 for anything further out. Times are in the owner's zone; for another zone add its IANA name, e.g. 'every weekday at 8am Europe/Madrid'" },
                     "name": { "type": "string", "description": "The short name the user gave it, exactly as given; omit when none." }
                 },
                 "required": ["task", "when"],
