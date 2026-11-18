@@ -147,6 +147,28 @@ fn a_streamed_reply_an_approval_and_the_turn_s_activity() -> Result<(), String> 
 }
 
 #[test]
+fn a_site_scoped_click_card_names_the_site_and_the_button() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-2","channel":"app","title":"Order the synthetic parts","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("Order the synthetic parts")?;
+    app.press("Order the synthetic parts >> nth=0")?;
+    feed([frame(
+        r#"{"type":"event","seq":1,"at_ms":5,"session_id":"app:synthetic-2","event":{"type":"approval_requested","approval":{"id":"ap-click","session_id":"app:synthetic-2","kind":"command","risk":"medium","summary":"Your assistant wants to click a button on https://shop.acme.example in the browser.","detail":"button#checkout","options":["approve_once","approve_session","deny"],"requested_at_ms":5,"card":{"action":{"kind":"click_on_site","site":"https://shop.acme.example","target":"button#checkout"}}}}}"#,
+    )]);
+    app.wait_for("text:Click buttons on https://shop.acme.example")?;
+    app.wait_for("button#checkout")?;
+    app.wait_for("Allow this session")?;
+    Ok(())
+}
+
+#[test]
 fn offline_says_why() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();

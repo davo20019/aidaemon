@@ -728,6 +728,30 @@
           "type": "object"
         },
         {
+          "description": "Click a button on a web site in the browser (protocol 1.34): one\nwhose effect the page's script decides. Allow once covers this\nclick; allowing it for the session covers buttons on `site` (an\norigin) until the browser session ends. Forms, passwords and\npayment fields still ask. Older clients read it as `Unknown` and\nshow the approval's `summary` and `detail`.",
+          "properties": {
+            "kind": {
+              "const": "click_on_site",
+              "type": "string"
+            },
+            "site": {
+              "type": "string"
+            },
+            "target": {
+              "description": "The selector the click targets.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "site"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Do something on a surface yourself (protocol 1.30): sign in, enter\na code. `what` is the agent's few words; `site` the host only.",
           "properties": {
             "keeps_sign_in": {

@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 33;
+pub const PROTOCOL_MINOR: u16 = 34;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2322,6 +2322,18 @@ pub enum CardAction {
         what: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+    /// Click a button on a web site in the browser (protocol 1.34): one
+    /// whose effect the page's script decides. Allow once covers this
+    /// click; allowing it for the session covers buttons on `site` (an
+    /// origin) until the browser session ends. Forms, passwords and
+    /// payment fields still ask. Older clients read it as `Unknown` and
+    /// show the approval's `summary` and `detail`.
+    ClickOnSite {
+        site: String,
+        /// The selector the click targets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
     /// Do something on a surface yourself (protocol 1.30): sign in, enter
     /// a code. `what` is the agent's few words; `site` the host only.

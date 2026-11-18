@@ -328,6 +328,10 @@ fn card_of(card: &aidaemon_core::ApprovalCard) -> wire::ApprovalCard {
                 site: site.clone(),
                 keeps_sign_in: *keeps_sign_in,
             },
+            CardAction::ClickOnSite { site, target } => wire::CardAction::ClickOnSite {
+                site: site.clone(),
+                target: target.clone(),
+            },
             _ => wire::CardAction::Unknown,
         },
         reason: card.reason.as_ref().map(|reason| match reason {
@@ -355,8 +359,9 @@ fn detail_of(card: &aidaemon_core::ApprovalCard) -> Option<String> {
         aidaemon_core::CardAction::Command { line, .. } => Some(line.clone()),
         aidaemon_core::CardAction::OpenLocalSite { site, .. } => Some(site.clone()),
         aidaemon_core::CardAction::Use { detail, .. } => detail.clone(),
-        // The app has no card for this action yet: the scope goes in the
-        // detail under the headline.
+        // Clients older than protocol 1.34 read the card's action as
+        // unknown and show this detail under the headline: the target and
+        // what the longer answer covers.
         aidaemon_core::CardAction::ClickOnSite { site, target } => {
             let scope = aidaemon_channels::approval_render::click_on_site_scope(site);
             Some(match target {
@@ -510,6 +515,24 @@ mod tests {
         ));
         book.settle(&id, Some((ApprovalResponse::AllowOnce, "app".into())));
         assert!(book.pending().is_empty());
+    }
+
+    #[test]
+    fn a_click_on_site_card_goes_out_typed_with_a_detail_for_older_clients() {
+        let card = aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction::ClickOnSite {
+            site: "https://shop.acme.example".into(),
+            target: Some("button#checkout".into()),
+        });
+        assert_eq!(
+            card_of(&card).action,
+            wire::CardAction::ClickOnSite {
+                site: "https://shop.acme.example".into(),
+                target: Some("button#checkout".into()),
+            }
+        );
+        let detail = detail_of(&card).unwrap();
+        assert!(detail.starts_with("button#checkout\n"), "{detail}");
+        assert!(detail.contains("https://shop.acme.example"), "{detail}");
     }
 
     #[test]

@@ -108,6 +108,37 @@ fn handoff() -> Approval {
     }
 }
 
+fn click_on_site() -> Approval {
+    Approval {
+        id: "a-7f3e-3".into(),
+        session_id: "app:6c1f".into(),
+        kind: ApprovalKind::Command,
+        risk: Risk::Medium,
+        summary:
+            "Your assistant wants to click a button on https://shop.acme.example in the browser."
+                .into(),
+        detail: Some("button#checkout".into()),
+        card: Some(ApprovalCard {
+            asked_by: None,
+            action: CardAction::ClickOnSite {
+                site: "https://shop.acme.example".into(),
+                target: Some("button#checkout".into()),
+            },
+            reason: None,
+            impact: None,
+        }),
+        warnings: vec![],
+        options: vec![
+            ApprovalDecision::ApproveOnce,
+            ApprovalDecision::ApproveSession,
+            ApprovalDecision::Deny,
+        ],
+        requested_at_ms: 1_767_225_600_000,
+        expires_at_ms: None,
+        channel: None,
+    }
+}
+
 fn surface() -> SurfaceInfo {
     SurfaceInfo {
         id: "srf_7d1c".into(),
@@ -131,7 +162,7 @@ fn snapshot() -> Snapshot {
     Snapshot {
         sessions: vec![session()],
         running_tasks: vec![task()],
-        pending_approvals: vec![approval(), handoff()],
+        pending_approvals: vec![approval(), handoff(), click_on_site()],
         live_turns: vec![LiveTurnState {
             session_id: "app:synthetic-1".into(),
             turn_id: "turn-7".into(),
@@ -1622,4 +1653,15 @@ fn every_view_action_round_trips_and_carries_no_decision() {
         }
         assert_eq!(serde_json::from_value::<ViewAction>(value).unwrap(), action);
     }
+}
+
+/// A card action this build does not know (an older client meeting a newer
+/// daemon's `click_on_site`, say) reads as `Unknown`, so the client falls
+/// back to the approval's summary and detail.
+#[test]
+fn an_unknown_card_action_reads_as_unknown() {
+    let action: CardAction =
+        serde_json::from_str(r#"{"kind":"some_later_action","site":"https://acme.example"}"#)
+            .unwrap();
+    assert_eq!(action, CardAction::Unknown);
 }

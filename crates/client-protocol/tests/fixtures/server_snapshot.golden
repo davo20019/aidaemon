@@ -73,6 +73,27 @@
         "risk": "low",
         "session_id": "app:6c1f",
         "summary": "Sign in to login.acme.example, then press Done."
+      },
+      {
+        "card": {
+          "action": {
+            "kind": "click_on_site",
+            "site": "https://shop.acme.example",
+            "target": "button#checkout"
+          }
+        },
+        "detail": "button#checkout",
+        "id": "a-7f3e-3",
+        "kind": "command",
+        "options": [
+          "approve_once",
+          "approve_session",
+          "deny"
+        ],
+        "requested_at_ms": 1767225600000,
+        "risk": "medium",
+        "session_id": "app:6c1f",
+        "summary": "Your assistant wants to click a button on https://shop.acme.example in the browser."
       }
     ],
     "running_tasks": [

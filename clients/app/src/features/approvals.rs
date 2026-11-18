@@ -109,6 +109,12 @@ pub fn card(store: Store, approval: Approval) -> View {
         Some(CardAction::Use { what, detail }) => {
             (sentence_case(what), detail.clone().map(detail_text))
         }
+        // A click whose effect the page decides: the longer answer covers
+        // every button on that site for this browser session.
+        Some(CardAction::ClickOnSite { site, target }) => (
+            format!("Click buttons on {site}"),
+            Some(click_on_site_body(site, target.as_deref())),
+        ),
         Some(CardAction::TakeOver {
             surface_id,
             what,
@@ -312,6 +318,18 @@ fn command_block(line: &str, looks_inside: &[String]) -> View {
             let inside = looks_inside.join(", ");
             move || detail_text(format!("Looks inside: {inside}"))
         }))
+}
+
+/// What a site-scoped click covers, then the button it targets.
+fn click_on_site_body(site: &str, target: Option<&str>) -> View {
+    view()
+        .gap_1()
+        .child(detail_text(format!(
+            "Allow once covers only this click. Allowing it for this session covers buttons on \
+             {site} until this browser session ends; forms, passwords, payment fields and other \
+             sites still ask."
+        )))
+        .child(target.map(|target| command_block(target, &[])))
 }
 
 /// `text` with its first letter capitalised.
