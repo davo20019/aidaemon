@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Pre-push gate: the CI checks that fail most often after a push, run here
+# first and only for what the push changes. Install once per clone:
+#
+#   ln -sf ../../scripts/git-hooks/pre-push "$(git rev-parse --git-common-dir)/hooks/pre-push"
+#
+# It checks the working tree, which in a shared checkout can hold another
+# session's uncommitted edits: a failure in a file you did not touch is
+# theirs (`git status`). Skip it for one push with AIDAEMON_SKIP_PREPUSH=1.
+set -uo pipefail
+
+if [[ -n "${AIDAEMON_SKIP_PREPUSH:-}" ]]; then
+    echo "pre-push: skipped (AIDAEMON_SKIP_PREPUSH)"
+    exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root" || exit 1
+zero=0000000000000000000000000000000000000000
+
+# Files the pushed commits change against what the remote already has.
+changed="$(
+    while read -r _lref lsha _rref rsha; do
+        [[ "$lsha" == "$zero" ]] && continue
+        base="$rsha"
+        if [[ "$base" == "$zero" ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git merge-base "$lsha" origin/master 2>/dev/null || true)"
+        fi
+        if [[ -n "$base" ]]; then
+            git diff --name-only "$base" "$lsha"
+        else
+            git show --name-only --format= "$lsha"
+        fi
+    done | sort -u
+)"
+[[ -z "$changed" ]] && exit 0
+
+touches() { grep -qE "$1" <<<"$changed"; }
+
+# Files with uncommitted edits (this session's or another's). They are not
+# being pushed, so a failure that sits only in them does not block.
+dirty="$(git status --porcelain --untracked-files=no | cut -c4- | sed 's/.* -> //' | sort -u)"
+dirty_code="$(grep -E '^(src|crates)/.*\.rs$|schema_goldens|public-api\.txt' <<<"$dirty" || true)"
+
+failed=()
+warned=()
+show() { grep -E "^(error|warning)|-->|Diff in|panicked|FAILED|changed" "$log" | head -30; }
+
+# A check whose errors name files (fmt, clippy, rustdoc): blocks unless every
+# file it names has uncommitted edits.
+run() {
+    local name="$1"
+    shift
+    echo "pre-push: $name"
+    "$@" >"$log" 2>&1 && return
+    show
+    local paths
+    paths="$(grep -oE '(--> |Diff in )[^ :]+' "$log" | sed -E 's/^(--> |Diff in )//; s#^'"$root"'/##' | sort -u)"
+    if [[ -n "$paths" ]] && ! grep -qvxF -f <(printf '%s\n' "$dirty") <<<"$paths"; then
+        warned+=("$name")
+    else
+        failed+=("$name")
+    fi
+}
+
+# A check whose failures cannot be traced to a file (goldens, API snapshot):
+# blocks unless source files have uncommitted edits that may explain it.
+run_whole() {
+    local name="$1"
+    shift
+    echo "pre-push: $name"
+    "$@" >"$log" 2>&1 && return
+    show
+    if [[ -n "$dirty_code" ]]; then warned+=("$name"); else failed+=("$name"); fi
+}
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
+sdk_crates=(aidaemon-core aidaemon-providers aidaemon-tools aidaemon-tool-browser
+    aidaemon-store-sqlite aidaemon-mcp aidaemon-agents aidaemon-policies aidaemon-eval
+    aidaemon-sdk aidaemon-macros aidaemon-memory aidaemon-events aidaemon-work
+    aidaemon-decisions aidaemon-runtime aidaemon-skills aidaemon-secrets aidaemon-nodes
+    aidaemon-terminal-bridge aidaemon-client-protocol aidaemon-client-gateway
+    aidaemon-channels aidaemon-channel-telegram aidaemon-channel-slack
+    aidaemon-channel-discord aidaemon-parity-agent aidaemon-client-core aidaemon-surfaces)
+
+if touches '^(src|crates|tests|scripts/check-app-boundary)'; then
+    run "app boundary" python3 scripts/check-app-boundary.py
+fi
+
+if touches '\.rs$|Cargo\.(toml|lock)$'; then
+    run "fmt" cargo fmt --check
+    run "clippy (daemon)" cargo clippy --all-features -- -D warnings
+    sdk_args=()
+    for c in "${sdk_crates[@]}"; do sdk_args+=(-p "$c"); done
+    run "clippy (SDK crates, all targets)" \
+        cargo clippy "${sdk_args[@]}" --all-targets --all-features -- -D warnings
+fi
+
+# Rustdoc -D warnings for each changed SDK crate (private intra-doc links).
+doc_args=()
+for c in "${sdk_crates[@]}"; do
+    [[ "$c" == aidaemon-parity-agent || "$c" == aidaemon-client-core ]] && continue
+    dir="crates/$c"
+    [[ -d "$dir" ]] || dir="crates/${c#aidaemon-}"
+    if touches "^$dir/"; then doc_args+=(-p "$c"); fi
+done
+if ((${#doc_args[@]})); then
+    run "rustdoc -D warnings" env RUSTDOCFLAGS="-D warnings" \
+        cargo doc --no-deps --all-features "${doc_args[@]}"
+fi
+
+if touches '^crates/aidaemon-core/'; then
+    run_whole "core public API" scripts/check-core-api.sh
+fi
+
+# Tool schemas: per-tool goldens and the catalog budget.
+if touches '^(src|crates)/.*\.rs$|schema_goldens'; then
+    run_whole "tool schema goldens" env RUST_MIN_STACK=8388608 \
+        cargo test -q --all-features --lib catalog_
+fi
+
+if touches '^clients/app/'; then
+    run "app clippy" bash -c 'cd clients/app && cargo clippy --all-targets -- -D warnings'
+fi
+
+if ((${#warned[@]})); then
+    echo
+    echo "pre-push: WARNING: ${warned[*]} failed, but only where files have"
+    echo "  uncommitted edits (git status). Not blocking: if the failure is from"
+    echo "  your pushed change, fix it now; CI runs the same check."
+fi
+if ((${#failed[@]})); then
+    echo
+    echo "pre-push: FAILED: ${failed[*]}"
+    echo "  Goldens: UPDATE_TOOL_GOLDENS=1 cargo test --all-features --lib catalog_"
+    echo "  Core API: scripts/check-core-api.sh --bless"
+    echo "  A failure in a file with someone else's uncommitted edits is theirs;"
+    echo "  then push with AIDAEMON_SKIP_PREPUSH=1."
+    exit 1
+fi
+echo "pre-push: ok"

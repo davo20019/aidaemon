@@ -29,6 +29,19 @@ The first embedding-backed run downloads the fastembed model into
 2. `cargo clippy --all-features -- -D warnings`
 3. `cargo test`
 
+A pre-push hook (`scripts/git-hooks/pre-push`) runs the checks CI most often
+fails on, scoped to what the push changes: app boundary, fmt, clippy (daemon
+and SDK crates, all targets), rustdoc `-D warnings` per changed SDK crate, the
+`aidaemon-core` public API snapshot, the tool schema goldens and the app's
+clippy. Install it once per clone with
+`ln -sf ../../scripts/git-hooks/pre-push "$(git rev-parse --git-common-dir)/hooks/pre-push"`.
+A failure only in files with uncommitted edits (another session's) warns
+instead of blocking. When a tool schema or the core API changes on purpose,
+update its snapshot in the same commit:
+`UPDATE_TOOL_GOLDENS=1 cargo test --all-features --lib catalog_` and
+`scripts/check-core-api.sh --bless`. Tests must not assume the host's time
+zone (CI runs on UTC), a fast shell (Windows) or a Unix-only command.
+
 For CI parity on broad changes also run `cargo test --all-features`,
 `cargo test --lib harness_eval --all-features` and
 `cargo build --release --features "browser"`. CI lives in
