@@ -922,7 +922,13 @@ impl Channel for SlackChannel {
             json!({ "channel": target.0, "timestamp": target.1, "name": Self::TYPING_REACTION });
         match self.post_bot("reactions.add", &body).await {
             Ok(_) => Ok(()),
-            Err(ChannelError::Other(reason)) if reason.contains("already_reacted") => Ok(()),
+            // `already_reacted` is Slack's machine error code, which `call`
+            // reports as "<method>: <code>": compared whole, never searched.
+            Err(ChannelError::Other(reason))
+                if is_slack_error(&reason, "reactions.add", "already_reacted") =>
+            {
+                Ok(())
+            }
             Err(e) => {
                 if let Ok(mut reacting) = self.reacting.lock() {
                     reacting.remove(&conversation.id);
@@ -1130,4 +1136,37 @@ pub async fn validate_tokens(
         json["user"].as_str().unwrap_or("unknown").to_string(),
         json["team"].as_str().unwrap_or("unknown").to_string(),
     ))
+}
+
+/// Whether `reason`, as `SlackChannel::call` words a refused call
+/// ("<method>: <code>"), is Slack's error `code` for `method`.
+fn is_slack_error(reason: &str, method: &str, code: &str) -> bool {
+    reason
+        .strip_prefix(method)
+        .and_then(|rest| rest.strip_prefix(": "))
+        == Some(code)
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::is_slack_error;
+
+    #[test]
+    fn a_slack_error_code_is_compared_whole() {
+        assert!(is_slack_error(
+            "reactions.add: already_reacted",
+            "reactions.add",
+            "already_reacted"
+        ));
+        assert!(!is_slack_error(
+            "reactions.add: not_already_reacted_synthetic",
+            "reactions.add",
+            "already_reacted"
+        ));
+        assert!(!is_slack_error(
+            "chat.postMessage: already_reacted",
+            "reactions.add",
+            "already_reacted"
+        ));
+    }
 }

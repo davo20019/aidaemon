@@ -1797,7 +1797,7 @@ impl HubChannel for TelegramBot {
             Ok(_) => Ok(true),
             // Telegram rejects an edit whose text is identical to the current
             // message — that's benign (nothing to change), so treat it as success.
-            Err(e) if e.to_string().contains("message is not modified") => Ok(true),
+            Err(e) if e.is_not_modified() => Ok(true),
             Err(_) => match self
                 .bot
                 .edit_message_text(ChatId(chat_id), MessageId(mid), text)
@@ -1805,7 +1805,7 @@ impl HubChannel for TelegramBot {
                 .await
             {
                 Ok(_) => Ok(true),
-                Err(e) if e.to_string().contains("message is not modified") => Ok(true),
+                Err(e) if e.is_not_modified() => Ok(true),
                 Err(e) => Err(e.into()),
             },
         }

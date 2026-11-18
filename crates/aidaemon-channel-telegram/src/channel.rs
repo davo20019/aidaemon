@@ -123,6 +123,16 @@ impl TelegramChannel {
     /// host features the channel contract does not cover (reply keyboards,
     /// callback answers, web-app buttons). One short rate limit is waited
     /// out.
+    /// [`Self::call_bot_api`] with Telegram's `error_code` and description
+    /// kept, for callers that act on a specific refusal.
+    pub(crate) async fn call_bot_api_typed(
+        &self,
+        method: &str,
+        body: &Value,
+    ) -> Result<Value, crate::api::ApiError> {
+        self.call_with_retry::<Value>(method, body).await
+    }
+
     pub async fn call_bot_api(&self, method: &str, body: &Value) -> Result<Value, ChannelError> {
         self.call_with_retry::<Value>(method, body)
             .await

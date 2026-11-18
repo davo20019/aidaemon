@@ -38,6 +38,12 @@ impl ApiError {
         }
     }
 
+    // Telegram's Bot API answers a refusal with only `error_code` and a
+    // human `description`; it has no machine reason field. The two checks
+    // below are gated on 400 (Bad Request) and match Telegram's own
+    // fixed descriptions, the only signal there is: a parse error resends
+    // the text as plain text, "not modified" means an edit had nothing to
+    // change.
     pub(crate) fn is_parse_error(&self) -> bool {
         self.code() == Some(400)
             && (self.description_contains("can't parse entities")

@@ -18,11 +18,39 @@ use serde_json::{Value, json};
 
 /// A failed Bot API call.
 #[derive(Debug)]
-pub struct RequestError(pub ChannelError);
+pub struct RequestError {
+    pub error: ChannelError,
+    /// Telegram refused an edit whose text and markup are already the
+    /// message's (see [`crate::api::ApiError::is_not_modified`]).
+    not_modified: bool,
+}
+
+impl RequestError {
+    fn other(error: ChannelError) -> Self {
+        Self {
+            error,
+            not_modified: false,
+        }
+    }
+
+    /// The edit changed nothing because the message already reads so.
+    pub fn is_not_modified(&self) -> bool {
+        self.not_modified
+    }
+}
+
+impl From<crate::api::ApiError> for RequestError {
+    fn from(error: crate::api::ApiError) -> Self {
+        Self {
+            not_modified: error.is_not_modified(),
+            error: error.into(),
+        }
+    }
+}
 
 impl std::fmt::Display for RequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.error.fmt(f)
     }
 }
 
@@ -470,11 +498,11 @@ impl<T: DeserializeOwned + Send + 'static> IntoFuture for Request<T> {
         Box::pin(async move {
             let result = self
                 .api
-                .call_bot_api(self.method, &self.body)
+                .call_bot_api_typed(self.method, &self.body)
                 .await
-                .map_err(RequestError)?;
+                .map_err(RequestError::from)?;
             serde_json::from_value(result).map_err(|e| {
-                RequestError(ChannelError::Other(format!(
+                RequestError::other(ChannelError::Other(format!(
                     "{}: unexpected result: {e}",
                     self.method
                 )))
@@ -499,6 +527,29 @@ pub async fn validate_token(token: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_modified_is_telegrams_400_refusal_only() {
+        let api = |code: u16, description: &str| crate::api::ApiError::Api {
+            code,
+            description: description.into(),
+            retry_after: None,
+        };
+        let refusal = RequestError::from(api(
+            400,
+            "Bad Request: message is not modified: specified new message content and reply markup are exactly the same",
+        ));
+        assert!(refusal.is_not_modified());
+        // The same words under another code, or a transport failure, are not it.
+        assert!(!RequestError::from(api(500, "message is not modified")).is_not_modified());
+        assert!(
+            !RequestError::from(crate::api::ApiError::Transport(
+                "message is not modified".into()
+            ))
+            .is_not_modified()
+        );
+        assert!(!RequestError::from(api(400, "Bad Request: chat not found")).is_not_modified());
+    }
 
     #[test]
     fn updates_parse_whatever_the_key_order() {
