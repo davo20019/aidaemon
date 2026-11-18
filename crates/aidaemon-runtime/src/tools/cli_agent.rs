@@ -2765,6 +2765,7 @@ impl CliAgentTool {
                 });
             match hosted {
                 Ok((hosted, home)) => {
+                    info!("A Codex run is hosted through its app-server");
                     args = hosted;
                     codex_hosting = Some((nested, home));
                 }
