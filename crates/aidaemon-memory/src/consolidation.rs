@@ -10,7 +10,9 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::history::{ConsolidationCursors, ConversationSource, TurnRole};
-use crate::progressive::{identity_fact_lacks_user_evidence, worth_extracting};
+use crate::progressive::{
+    FactSubject, identity_fact_lacks_quoted_self_statement, worth_extracting,
+};
 use crate::records::{
     ExtractedMemoryGraph, Fact, FactPrivacy, PersonalMemoryWrite, automated_fact_category_allowed,
 };
@@ -24,7 +26,10 @@ const CANDIDATES_PER_SESSION: usize = 30;
 
 const CONSOLIDATION_PROMPT: &str = "You are a memory consolidation system. Given a conversation excerpt, \
             extract durable facts worth remembering long-term. Output ONLY a JSON array. Each item has \
-            category, key, value, privacy, optional restates or updates (see ALREADY STORED, when given), and an optional graph or personal_memory object. Graph entities have local_id, \
+            category, key, value, privacy, subject, evidence, optional restates or updates (see ALREADY STORED, when given), and an optional graph or personal_memory object. \
+            subject is \"owner\" when the fact is about the owner themself and \"other\" when it is about anyone or anything else; \
+            a name the owner mentions, addresses or asks about is \"other\". evidence is an exact, verbatim quote copied from the owner's message that states the fact; \
+            never quote the assistant, never paraphrase. The owner's own name is stored only with subject \"owner\" and such a quote. Graph entities have local_id, \
             name, entity_type, aliases, confidence. Relationships have source_id, target_id, relation, \
             confidence. Use owner for the user. Include graph data only when directly supported by the \
             owner's words; never infer entity types from category or key names. For names, aliases, handles, dates of birth, residence, accounts, or family relationships, emit personal_memory with entities, aliases, facts, relationships, direct_user_statement, and correction instead of dynamic person-name keys. Use owner as the owner's local_id, stable entity references, ISO dates, and typed relationships PARENT_OF, CHILD_OF, LIVES_WITH, LIVES_IN, USES_HANDLE, HAS_ACCOUNT. \
@@ -487,11 +492,20 @@ async fn store_consolidated<S>(
             );
             continue;
         }
-        // Identity facts must appear in the owner's own messages.
-        if identity_fact_lacks_user_evidence(category, key, &fact.value, user_text) {
+        // The owner's own name needs the extractor's typed subject and a
+        // quote of the owner's own words.
+        if identity_fact_lacks_quoted_self_statement(
+            category,
+            key,
+            &fact.value,
+            fact.subject,
+            &fact.evidence,
+            user_text,
+        ) {
             warn!(
-                "Skipping consolidated user identity fact [{}={}] — no evidence in user messages",
-                fact.key, fact.value
+                key = fact.key,
+                subject = ?fact.subject,
+                "Skipping consolidated user identity fact the owner did not state about themselves"
             );
             continue;
         }
@@ -581,6 +595,14 @@ pub struct ExtractedFact {
     /// For a session that works in a project: `project` or `personal`.
     #[serde(default, deserialize_with = "deserialize_optional_key")]
     pub scope: Option<String>,
+    /// Whom the fact is about. Missing, null or unknown values read as
+    /// [`FactSubject::Unstated`].
+    #[serde(default, deserialize_with = "crate::progressive::lenient_subject")]
+    pub subject: FactSubject,
+    /// A verbatim quote of the owner's message that states the fact; empty
+    /// when missing.
+    #[serde(default, deserialize_with = "crate::progressive::lenient_string")]
+    pub evidence: String,
 }
 
 fn deserialize_optional_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -869,7 +891,7 @@ mod tests {
     }
 
     const REPLY: &str = r#"[{"category":"user","key":"city","value":"Lisbon","privacy":"global"},
-        {"category":"user","key":"name","value":"Jordan Lee"}]"#;
+        {"category":"user","key":"name","value":"Jordan Lee","subject":"owner","evidence":"My name is Jordan Lee"}]"#;
 
     #[tokio::test]
     async fn owner_facts_are_stored_and_the_cursor_advances() {
@@ -881,7 +903,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.consolidated_sessions, ["telegram:synthetic-chat"]);
-        // The name is not in the owner's words: refused.
+        // The name's quote is not in the owner's words: refused.
         let stored = facts.0.lock().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].0, "city");
@@ -890,6 +912,35 @@ mod tests {
         // The assistant's words and the too-short message never reach the model.
         let sent = &provider.requests()[0].messages[1].content;
         assert!(sent.contains("Lisbon") && !sent.contains("Pixel") && !sent.contains("user: ok"));
+    }
+
+    #[tokio::test]
+    async fn the_owners_name_is_admitted_from_its_typed_subject_and_quote() {
+        let reply = r#"[{"category":"user","key":"name","value":"Alice Rivera","subject":"owner","evidence":"I'm Alice Rivera"},
+            {"category":"user","key":"nickname","value":"Jordan","subject":"other","evidence":"say hi to Jordan"}]"#;
+        let history = History {
+            turns: vec![turn(
+                1,
+                TurnRole::User,
+                "I'm Alice Rivera, by the way; say hi to Jordan for me",
+            )],
+            ..owner_history()
+        };
+        let provider = Arc::new(ScriptedProvider::new([text(reply)]));
+        let (cursors, facts) = (Cursors::default(), Facts::default());
+        FactConsolidator::new(provider, "mock")
+            .consolidate(&history, &cursors, &facts, Utc::now())
+            .await
+            .unwrap();
+        let stored: Vec<(String, String)> = facts
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| (f.0.clone(), f.1.clone()))
+            .collect();
+        // Jordan appears in the owner's words but is typed as someone else.
+        assert_eq!(stored, [("name".to_string(), "Alice Rivera".to_string())]);
     }
 
     #[tokio::test]

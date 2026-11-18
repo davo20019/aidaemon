@@ -120,14 +120,18 @@ fn lenient_stance<'de, D: Deserializer<'de>>(deserializer: D) -> Result<FactStan
         .unwrap_or_default())
 }
 
-fn lenient_subject<'de, D: Deserializer<'de>>(deserializer: D) -> Result<FactSubject, D::Error> {
+pub(crate) fn lenient_subject<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<FactSubject, D::Error> {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default())
 }
 
-fn lenient_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+pub(crate) fn lenient_string<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value
         .as_ref()
@@ -709,24 +713,23 @@ pub fn identity_fact_lacks_self_statement(fact: &InlineFact) -> bool {
         && (fact.subject != FactSubject::Owner || fact.value.trim().chars().count() <= 1)
 }
 
-/// Consolidation's identity guard: its extractor returns no evidence span or
-/// subject, so an owner identity value must at least appear in the owner's
-/// own messages. Progressive extraction uses
-/// [`identity_fact_lacks_self_statement`] instead.
-pub fn identity_fact_lacks_user_evidence(
+/// Consolidation's identity guard: an owner identity fact (e.g. `user.name`)
+/// is admitted only when its extractor typed it as the owner's own
+/// ([`FactSubject::Owner`]) and its `evidence` quotes the owner's own
+/// messages (`user_text`). The quote check validates a citation against its
+/// source; it does not interpret what the words mean.
+pub fn identity_fact_lacks_quoted_self_statement(
     category: &str,
     key: &str,
     value: &str,
+    subject: FactSubject,
+    evidence: &str,
     user_text: &str,
 ) -> bool {
-    if !is_owner_identity_key(category, key) {
-        return false;
-    }
-    let value_norm = value.trim().to_lowercase();
-    if value_norm.len() <= 1 {
-        return true;
-    }
-    !user_text.to_lowercase().contains(&value_norm)
+    is_owner_identity_key(category, key)
+        && (subject != FactSubject::Owner
+            || value.trim().chars().count() <= 1
+            || !quote_occurs_in(evidence, user_text))
 }
 
 /// Normalize a fact key for cross-category comparison: lowercase, every run of
@@ -857,13 +860,49 @@ mod tests {
     }
 
     #[test]
-    fn consolidation_identity_guard_blocks_unevidenced_user_name() {
-        // Third-party or hallucinated name not present in the user's words.
-        assert!(identity_fact_lacks_user_evidence(
-            "user",
+    fn consolidation_identity_guard_needs_an_owner_subject_and_an_owner_quote() {
+        let owner_text = "Hi, I'm Alice Rivera. Tell Jordan Lee hi from me.";
+        let lacks = |key: &str, value: &str, subject: FactSubject, evidence: &str| {
+            identity_fact_lacks_quoted_self_statement(
+                "user", key, value, subject, evidence, owner_text,
+            )
+        };
+        assert!(!lacks(
+            "name",
+            "Alice Rivera",
+            FactSubject::Owner,
+            "I'm Alice Rivera"
+        ));
+        // A name the owner only mentions, typed so: refused.
+        assert!(lacks(
             "name",
             "Jordan Lee",
-            "Tell me about the grant applicant and their nationality"
+            FactSubject::Other,
+            "Tell Jordan Lee hi"
+        ));
+        // No subject, or a quote that is not the owner's words: refused,
+        // even when the value appears in the owner's text.
+        assert!(lacks(
+            "name",
+            "Jordan Lee",
+            FactSubject::Unstated,
+            "Tell Jordan Lee hi"
+        ));
+        assert!(lacks(
+            "name",
+            "Alice Rivera",
+            FactSubject::Owner,
+            "My name is Alice Rivera"
+        ));
+        assert!(lacks("name", "Alice Rivera", FactSubject::Owner, ""));
+        // Not an identity key: not this guard's to judge.
+        assert!(!identity_fact_lacks_quoted_self_statement(
+            "user",
+            "city",
+            "Lisbon",
+            FactSubject::Unstated,
+            "",
+            owner_text
         ));
     }
 
