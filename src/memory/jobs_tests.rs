@@ -867,3 +867,62 @@ async fn internal_continuations_are_left_out_of_episode_turns() {
         .collect();
     assert_eq!(texts, ["Find the synthetic product specifications."]);
 }
+
+/// A goal mentioned again after a similar one was completed is a new goal;
+/// the completed one is never resurrected and an open identical one gets
+/// the reference.
+#[tokio::test]
+async fn a_new_goal_is_not_hidden_by_a_completed_similar_one() {
+    let (store, _provider, _jobs, _db) = setup_memory_manager_with_responses(Vec::new()).await;
+    let pool = store.pool();
+    let embedder = EmbeddingService::deterministic();
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO episodes (id, session_id, summary, start_time, end_time, created_at)
+         VALUES (1, 's', 'synthetic episode', ?, ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO goals (id, description, domain, goal_type, status, priority, session_id, created_at, updated_at)
+         VALUES ('goal-2026', 'Run a marathon in 2026', 'personal', 'finite', 'completed', 'medium', 's', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let file = |goal: &'static str| {
+        let pool = pool.clone();
+        let embedder = &embedder;
+        async move {
+            aidaemon_runtime::memory::jobs::file_goal_observation(&pool, embedder, goal, 1, "s")
+                .await
+                .unwrap();
+        }
+    };
+    file("Run a marathon in 2027").await;
+    file("Run a marathon in 2026").await;
+    file("run a  marathon in 2027").await;
+    let goals: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT description, status, progress_notes FROM goals WHERE domain = 'personal' ORDER BY description",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(goals.len(), 2, "{goals:?}");
+    assert_eq!(goals[0].0, "Run a marathon in 2026");
+    assert_eq!(goals[0].1, "completed");
+    assert_eq!(goals[1].0, "Run a marathon in 2027");
+    assert_eq!(goals[1].1, "observed");
+    assert!(
+        goals[1]
+            .2
+            .as_deref()
+            .is_some_and(|notes| notes.contains("episode 1"))
+    );
+}
