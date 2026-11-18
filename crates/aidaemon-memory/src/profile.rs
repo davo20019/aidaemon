@@ -50,6 +50,50 @@ const CORE_PROFILE_MAX_ENTITIES: usize = 20;
 const CORE_PROFILE_MAX_CHARS: usize = 2400;
 const CORE_PROFILE_MAX_LINE_CHARS: usize = 240;
 
+/// A family relation a flat fact key names by its first token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyRole {
+    Partner,
+    Child,
+    Parent,
+}
+
+impl FamilyRole {
+    /// The relation a whole key token names, if any.
+    fn of_token(token: &str) -> Option<Self> {
+        match token {
+            "wife" | "husband" | "spouse" | "partner" => Some(Self::Partner),
+            "daughter" | "son" | "child" | "kid" => Some(Self::Child),
+            "mother" | "father" | "mom" | "dad" => Some(Self::Parent),
+            _ => None,
+        }
+    }
+}
+
+/// The profile group of a flat fact key, and the family relation it names.
+/// The relation comes from the key's first `_`-separated token as a whole
+/// token ("son_name" is a child; "song_title" is nothing), and a numbered
+/// key ("son_2_school") keeps its number so siblings stay apart.
+fn family_group(key: &str) -> (String, Option<FamilyRole>) {
+    let mut tokens = key.split('_');
+    let first = tokens.next().unwrap_or_default();
+    let Some(role) = FamilyRole::of_token(first) else {
+        return (key.to_string(), None);
+    };
+    // A bare relation key that is a parent stays its own group, as before.
+    if key == first && role == FamilyRole::Parent {
+        return (key.to_string(), Some(role));
+    }
+    let numbered = tokens.next().filter(|second| {
+        !second.is_empty() && second.chars().all(|c| c.is_ascii_digit()) && tokens.next().is_some()
+    });
+    let group = match numbered {
+        Some(number) => format!("{first}_{number}"),
+        None => first.to_string(),
+    };
+    (group, Some(role))
+}
+
 fn canonical_profile_key(key: &str) -> String {
     match key.trim().to_ascii_lowercase().as_str() {
         "birthday" | "date_of_birth" | "dob" => "birth_date".to_string(),
@@ -143,59 +187,19 @@ where
     );
     // BTreeMap (not HashMap) so group iteration order is deterministic — combined
     // with `order_entities` before render, the same data yields byte-identical output.
-    let mut flat_groups: BTreeMap<String, Vec<Fact>> = BTreeMap::new();
+    let mut flat_groups: BTreeMap<String, (Option<FamilyRole>, Vec<Fact>)> = BTreeMap::new();
 
     for fact in flat_facts {
         let key = fact.key.trim().to_ascii_lowercase();
-        let base_id = if key == "wife"
-            || key == "husband"
-            || key == "spouse"
-            || key == "partner"
-            || key == "daughter"
-            || key == "son"
-            || key == "child"
-            || key == "kid"
-        {
-            key.clone()
-        } else if let Some(idx) = key.find('_') {
-            let prefix = &key[..idx];
-            if matches!(
-                prefix,
-                "wife"
-                    | "husband"
-                    | "spouse"
-                    | "partner"
-                    | "daughter"
-                    | "son"
-                    | "child"
-                    | "kid"
-                    | "mother"
-                    | "father"
-                    | "mom"
-                    | "dad"
-            ) {
-                if let Some(idx2) = key[idx + 1..].find('_') {
-                    if key[idx + 1..idx + 1 + idx2]
-                        .chars()
-                        .all(|c| c.is_ascii_digit())
-                    {
-                        key[..idx + 1 + idx2].to_string()
-                    } else {
-                        prefix.to_string()
-                    }
-                } else {
-                    prefix.to_string()
-                }
-            } else {
-                key.clone()
-            }
-        } else {
-            key.clone()
-        };
-        flat_groups.entry(base_id).or_default().push(fact);
+        let (group_id, role) = family_group(&key);
+        flat_groups
+            .entry(group_id)
+            .or_insert_with(|| (role, Vec::new()))
+            .1
+            .push(fact);
     }
 
-    for (group_id, facts) in flat_groups {
+    for (group_id, (role, facts)) in flat_groups {
         let mut max_recall = 0;
         let mut newest_update = chrono::DateTime::<Utc>::MIN_UTC;
         let class = facts
@@ -208,14 +212,7 @@ where
         let mut details = Vec::new();
         let mut generic_lines = Vec::new();
 
-        let is_rel = group_id == "wife"
-            || group_id == "husband"
-            || group_id == "spouse"
-            || group_id == "partner"
-            || group_id.starts_with("daughter")
-            || group_id.starts_with("son")
-            || group_id.starts_with("child")
-            || group_id.starts_with("kid");
+        let is_rel = matches!(role, Some(FamilyRole::Partner | FamilyRole::Child));
 
         for fact in facts {
             max_recall = max_recall.max(fact.recall_count);
@@ -246,20 +243,10 @@ where
             if !details.is_empty() {
                 parts.push(format!("({})", details.join(", ")));
             }
-            let label = if group_id == "wife"
-                || group_id == "husband"
-                || group_id == "spouse"
-                || group_id == "partner"
-            {
-                "partner"
-            } else if group_id.starts_with("daughter")
-                || group_id.starts_with("son")
-                || group_id.starts_with("child")
-                || group_id.starts_with("kid")
-            {
-                "child"
-            } else {
-                group_id.as_str()
+            let label = match role {
+                Some(FamilyRole::Partner) => "partner",
+                Some(FamilyRole::Child) => "child",
+                _ => group_id.as_str(),
             };
             lines.push(format!("Your {}: {}", label, parts.join(" ")));
         } else {
@@ -521,5 +508,28 @@ mod tests {
         assert_eq!(a, a2, "identical content must hash identically");
         assert_ne!(a, b, "changed content must change the hash");
         assert_eq!(a.len(), 8, "short 8-hex digest");
+    }
+
+    #[test]
+    fn a_relation_is_a_whole_key_token() {
+        assert_eq!(family_group("song_title"), ("song_title".into(), None));
+        assert_eq!(family_group("sonar_config"), ("sonar_config".into(), None));
+        assert_eq!(family_group("kidney_donor"), ("kidney_donor".into(), None));
+        assert_eq!(
+            family_group("son_name"),
+            ("son".into(), Some(FamilyRole::Child))
+        );
+        assert_eq!(
+            family_group("son_2_school"),
+            ("son_2".into(), Some(FamilyRole::Child))
+        );
+        assert_eq!(
+            family_group("wife"),
+            ("wife".into(), Some(FamilyRole::Partner))
+        );
+        assert_eq!(
+            family_group("mother"),
+            ("mother".into(), Some(FamilyRole::Parent))
+        );
     }
 }

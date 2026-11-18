@@ -309,26 +309,10 @@ fn normalize_name_candidate(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn extract_name_from_phrase(value: &str) -> Option<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-
-    for prefix in ["my name is ", "i am ", "i'm ", "call me "] {
-        if lower.starts_with(prefix) {
-            let name = value.trim()[prefix.len()..].trim();
-            return normalize_name_candidate(name);
-        }
-    }
-
-    if let Some(idx) = lower.find(" is myself") {
-        return normalize_name_candidate(value[..idx].trim());
-    }
-
-    None
-}
-
+/// The pinned identities, from typed facts only: the owner's name is the
+/// value of a canonical name key (`user.name`, `owner_name`, ...), the
+/// assistant's that of an assistant name key. A value is never parsed for a
+/// name: "I am the CTO" stored under any key names no one.
 pub fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
     let mut summary = CriticalFactSummary::default();
 
@@ -352,10 +336,6 @@ pub fn extract_critical_fact_summary(facts: &[Fact]) -> CriticalFactSummary {
             );
             if (owner_name_key && owner_name_category) || lower_key == "owner_name" {
                 summary.owner_name = normalize_name_candidate(value);
-            } else if let Some(name) = extract_name_from_phrase(value)
-                && (lower_key.contains("name") || lower_key.contains("owner"))
-            {
-                summary.owner_name = Some(name);
             }
         }
 
@@ -427,6 +407,25 @@ mod tests {
             first_seen_at: None,
             source_excerpt: None,
         }
+    }
+
+    #[test]
+    fn a_self_description_never_becomes_the_owners_name() {
+        let fact = |category: &str, key: &str, value: &str| Fact {
+            category: category.to_string(),
+            key: key.to_string(),
+            ..test_fact(1, value)
+        };
+        let summary = extract_critical_fact_summary(&[
+            fact("user", "name_note", "I am the CTO"),
+            fact("user", "owner_intro", "Call me when the build is green"),
+        ]);
+        assert_eq!(summary.owner_name, None);
+        let summary = extract_critical_fact_summary(&[
+            fact("user", "role", "I am the CTO"),
+            fact("user", "name", "Alice Rivera"),
+        ]);
+        assert_eq!(summary.owner_name.as_deref(), Some("Alice Rivera"));
     }
 
     #[test]
