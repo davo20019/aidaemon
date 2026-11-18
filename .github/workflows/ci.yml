@@ -660,8 +660,9 @@ jobs:
           set -euo pipefail
           curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-linux-x86_64.tar.gz" -o nsh.tar.gz
           echo "${NSH_LINUX_SHA256}  nsh.tar.gz" | sha256sum -c -
-          mkdir -p "$HOME/nsh"
-          tar -xzf nsh.tar.gz -C "$HOME/nsh"
+          # The archive holds one nsh/ folder (bin/nsh, runtime/).
+          tar -xzf nsh.tar.gz -C "$HOME"
+          test -x "$HOME/nsh/bin/nsh"
           rm nsh.tar.gz
           echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
       - name: Install wasm-bindgen CLI
