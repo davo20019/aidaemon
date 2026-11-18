@@ -48,6 +48,55 @@ pub fn days_until_anniversary(value: &str, today: NaiveDate) -> Option<i64> {
     Some(if diff < 0 { diff + 365 } else { diff })
 }
 
+/// A value stored before dates were ISO only, rewritten as ISO the way
+/// the old reader understood it: `YYYY-M-D`, numeric month first (`3/15`,
+/// `03-15`: March 15, as the old code read them), or an English month name
+/// and a day (`March 15`, `march 15,`). `None` when `value` is already ISO
+/// or the old reader could not read it either; those stay as written.
+pub fn legacy_date_to_iso(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || parse_month_day(value).is_some() {
+        return None;
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Some(date.format("%Y-%m-%d").to_string());
+    }
+    // Month-day forms, month first as the old reader meant them, checked
+    // against the leap year 2000 so 02-29 stays a real date. (The old
+    // reader's own format left out the year and so never matched; its
+    // intent, month first, is the reading kept here.)
+    for format in ["%Y-%m-%d", "%Y-%m/%d"] {
+        if let Ok(date) = NaiveDate::parse_from_str(&format!("2000-{value}"), format) {
+            return Some(format!("--{:02}-{:02}", date.month(), date.day()));
+        }
+    }
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let lower = value.to_lowercase();
+    for (index, name) in MONTHS.iter().enumerate() {
+        if let Some(rest) = lower.strip_prefix(name) {
+            let rest = rest.trim().trim_start_matches([',', ' ']);
+            let month = index as u32 + 1;
+            let day = rest.parse::<u32>().ok()?;
+            NaiveDate::from_ymd_opt(2000, month, day)?;
+            return Some(format!("--{month:02}-{day:02}"));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +117,36 @@ mod tests {
             assert!(date_argument_error(ambiguous).is_some(), "{ambiguous}");
         }
         assert!(date_argument_error("--05-03").is_none());
+    }
+
+    #[test]
+    fn legacy_dates_convert_as_the_old_reader_read_them() {
+        for (legacy, iso) in [
+            ("March 15", "--03-15"),
+            ("march 5", "--03-05"),
+            ("December, 1", "--12-01"),
+            ("03-15", "--03-15"),
+            ("3/15", "--03-15"),
+            // Month first, as the old reader read it: May 3, not March 5.
+            ("05/03", "--05-03"),
+            ("02-29", "--02-29"),
+            ("2019-4-2", "2019-04-02"),
+        ] {
+            assert_eq!(legacy_date_to_iso(legacy).as_deref(), Some(iso), "{legacy}");
+            assert!(parse_month_day(iso).is_some(), "{iso}");
+        }
+        for untouched in [
+            "--03-15",
+            "2019-04-02",
+            "15 March",
+            "March 15th",
+            "13/01",
+            "February 30",
+            "next spring",
+            "",
+        ] {
+            assert_eq!(legacy_date_to_iso(untouched), None, "{untouched}");
+        }
     }
 
     #[test]

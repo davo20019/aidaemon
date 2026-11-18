@@ -638,6 +638,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     }
 
     repair_blank_validity_bounds(pool).await?;
+    convert_legacy_person_dates(pool).await?;
 
     // FTS5 is present in standard SQLite and bundled SQLCipher builds. Keep the
     // daemon usable on custom SQLite builds without it; semantic and lexical
@@ -702,6 +703,41 @@ async fn repair_blank_validity_bounds(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
         }
+    }
+    Ok(())
+}
+
+/// Birthdays and important dates stored before dates were ISO only
+/// ("March 15", "03-15", "3/15") are read by nothing now: rewrites each one
+/// the old reader understood as ISO, read the way it read them
+/// ([`crate::dates::legacy_date_to_iso`]). A value it could not read stays
+/// as written. Idempotent: an ISO value is never touched, so a second run
+/// changes nothing.
+async fn convert_legacy_person_dates(pool: &SqlitePool) -> anyhow::Result<()> {
+    let placeholders = vec!["?"; crate::dates::DATE_FACT_CATEGORIES.len()].join(", ");
+    let select = format!(
+        "SELECT id, value FROM person_facts WHERE LOWER(TRIM(category)) IN ({placeholders})"
+    );
+    let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(select));
+    for category in crate::dates::DATE_FACT_CATEGORIES {
+        query = query.bind(*category);
+    }
+    let rows = query.fetch_all(pool).await?;
+    let mut converted = 0usize;
+    for (id, value) in rows {
+        let Some(iso) = crate::dates::legacy_date_to_iso(&value) else {
+            continue;
+        };
+        sqlx::query("UPDATE person_facts SET value = ? WHERE id = ? AND value = ?")
+            .bind(&iso)
+            .bind(id)
+            .bind(&value)
+            .execute(pool)
+            .await?;
+        converted += 1;
+    }
+    if converted > 0 {
+        tracing::info!(converted, "Rewrote legacy person dates as ISO dates");
     }
     Ok(())
 }
@@ -901,6 +937,64 @@ pub async fn rebuild_memory_fts_projections(pool: &SqlitePool) -> anyhow::Result
 mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn legacy_person_dates_become_iso_once_and_unreadable_ones_stay() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE person_facts (
+                id INTEGER PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, category, value) in [
+            (1, "birthday", "March 15"),
+            (2, "important_date", "3/15"),
+            (3, "birthday", "--07-04"),
+            (4, "birthday", "15 March"),
+            (5, "preference", "03-15"),
+            (6, "Birthday", "2019-4-2"),
+        ] {
+            sqlx::query(
+                "INSERT INTO person_facts (id, person_id, category, key, value) VALUES (?, 1, ?, 'synthetic', ?)",
+            )
+            .bind(id)
+            .bind(category)
+            .bind(value)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        convert_legacy_person_dates(&pool).await.unwrap();
+        convert_legacy_person_dates(&pool).await.unwrap();
+        let values: Vec<String> = sqlx::query_scalar("SELECT value FROM person_facts ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            values,
+            [
+                "--03-15",
+                "--03-15",
+                "--07-04",
+                // The old reader could not read it: left as written.
+                "15 March",
+                // Not a date category.
+                "03-15",
+                "2019-04-02",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn no_op_content_updates_do_not_churn_or_corrupt_secure_delete_indexes() {
