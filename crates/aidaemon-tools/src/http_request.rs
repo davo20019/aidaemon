@@ -2106,7 +2106,8 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
             truncated,
         );
 
-        // Sanitize response content (strip prompt injection)
+        // Marker hygiene only (spoofed daemon tags, hidden carriers); the body
+        // is untrusted by provenance and wrapped at the result boundary.
         let sanitized_body = sanitize_external_content(&body_str);
 
         // Build result with response details
@@ -2135,7 +2136,9 @@ aidaemon did not attempt an OAuth refresh because this profile is not bearer-tok
 
         // For error responses (4xx/5xx), add structured diagnostic section
         if status_code >= 400 {
-            result.push_str("\n--- API ERROR ---\n");
+            result.push('\n');
+            result.push_str(crate::sanitize::API_ERROR_HEADING);
+            result.push('\n');
             result.push_str(&format!("Status: {}\n", status_code));
             if let Some(diagnostic_line) = Self::oauth_diagnostic_line(
                 status_code,
