@@ -2998,7 +2998,15 @@ pub fn spawn_background_task_lead(
                 let task_lead_error = result.as_ref().err().map(|e| e.to_string());
                 match status {
                     "completed" => {
-                        if !aidaemon_work::goals::tasks_satisfy_goal_completion(&completed_tasks) {
+                        // The same rule the dispatch trigger was settled by: a
+                        // run whose task lead answered without delegating any
+                        // work task is complete when the lead succeeded (live
+                        // 2026-11-18: a scheduled "check the date and reply"
+                        // answered in one call, was reported as an inconsistent
+                        // goal state, and its reply never reached the chat).
+                        if dispatch_trigger_disposition(task_lead_error.is_none(), &completed_tasks)
+                            != DispatchTriggerDisposition::Completed
+                        {
                             (
                                 "failed",
                                 format!(
