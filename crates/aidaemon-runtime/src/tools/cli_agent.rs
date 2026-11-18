@@ -1566,11 +1566,15 @@ impl CliAgentTool {
         let local = self.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
         let authority = crate::authority::parent_authority(facts);
         let clean = authority.is_some_and(|authority| !authority.untrusted_context);
+        // The program it launches is Claude Code, whether the entry is
+        // built in or one the owner stored (live 2026-11-18: a stored
+        // `claude` entry replaced the built-in one): the adapter replaces
+        // every permission flag either way.
         let built_in = self
             .tools
             .read()
             .ok()
-            .and_then(|tools| tools.get("claude").map(|entry| !entry.is_dynamic))
+            .and_then(|tools| tools.get("claude").map(launches_claude_code))
             .unwrap_or(false);
         let confinable = host && local && built_in;
         info!(
@@ -2671,8 +2675,7 @@ impl CliAgentTool {
         // Claude Code built in and run inside a kernel turn asks its host
         // for permission instead of denying on its own: each prompt is
         // judged by this run (`cli_host`).
-        let host_nested =
-            nested.filter(|_| tool_name.eq_ignore_ascii_case("claude") && !is_dynamic);
+        let host_nested = nested.filter(|_| agent_kind.eq_ignore_ascii_case("claude"));
         if host_nested.is_some() {
             for pair in crate::tools::cli_host::CLAUDE_HOST_FLAGS.chunks(2) {
                 if !args.iter().any(|arg| arg == pair[0]) {
@@ -4493,6 +4496,21 @@ fn compose_delegated_prompt(mission: Option<String>, task: Option<String>) -> Op
         parts.push(format!("Task: {}", task));
     }
     Some(parts.join("\n"))
+}
+
+/// Whether an entry launches Claude Code: its program (or the program an
+/// `env` launcher wraps) is the `claude` executable.
+fn launches_claude_code(entry: &CliToolEntry) -> bool {
+    let program_index = is_env_launcher(&entry.command)
+        .then(|| env_wrapped_program_index(&entry.args))
+        .flatten();
+    let program = program_index
+        .and_then(|index| entry.args.get(index).map(String::as_str))
+        .unwrap_or(&entry.command);
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("claude"))
 }
 
 /// The line a run's result starts with when another agent than the one
