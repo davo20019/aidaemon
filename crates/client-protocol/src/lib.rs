@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 34;
+pub const PROTOCOL_MINOR: u16 = 35;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1933,6 +1933,10 @@ pub enum Event {
         state: TurnState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The provider and model that wrote the reply (protocol 1.35);
+        /// `None` when there was none or it is not known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_by: Option<ServedBy>,
     },
     ApprovalRequested {
         approval: Approval,
@@ -2467,6 +2471,21 @@ pub struct HistoryMessage {
     /// as its own reply.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub handed_off: bool,
+    /// For a reply: the provider and model that wrote it (protocol 1.35).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<ServedBy>,
+}
+
+/// The provider and model that wrote a reply (protocol 1.35).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ServedBy {
+    /// The provider's catalog preset (`openai_chatgpt`, `anthropic`...),
+    /// for its mark; empty for one not from the catalog.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preset: String,
+    /// The provider in plain words, as Settings names it ("ChatGPT").
+    pub provider: String,
+    pub model: String,
 }
 
 /// What kind of work a tool call was, as the daemon's cards show it

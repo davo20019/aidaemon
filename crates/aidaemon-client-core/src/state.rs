@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use aidaemon_client_protocol::{
     Approval, AttachmentRef, CommandResult, ErrorCode, Event, Feature, HistoryMessage,
-    ProjectSummary, ServerFrame, SessionSummary, SetupState, Snapshot, SurfaceInfo, TaskState,
-    TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
+    ProjectSummary, ServedBy, ServerFrame, SessionSummary, SetupState, Snapshot, SurfaceInfo,
+    TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -36,6 +36,9 @@ pub enum Line {
         /// report comes later as its own reply.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         handed_off: bool,
+        /// The provider and model that wrote it, when the daemon said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_by: Option<ServedBy>,
     },
     /// A note from the client itself (a stopped turn, an error).
     Note {
@@ -344,6 +347,7 @@ impl State {
                         at_ms: m.at_ms,
                         attachments: m.attachments,
                         handed_off: m.handed_off,
+                        served_by: m.served_by,
                     });
                 }
             }
@@ -394,6 +398,7 @@ impl State {
                     at_ms,
                     attachments,
                     handed_off: false,
+                    served_by: None,
                 });
                 view.suggestions = suggestions;
                 // A message after a hand-off is its report.
@@ -483,6 +488,7 @@ impl State {
                 state,
                 error,
                 attachments,
+                served_by,
             } => {
                 let Some(view) = self.sessions.values_mut().find(|view| {
                     view.live
@@ -498,6 +504,7 @@ impl State {
                             at_ms,
                             attachments,
                             handed_off: state == TurnState::HandedOff,
+                            served_by,
                         });
                     }
                     return;
@@ -522,6 +529,7 @@ impl State {
                         at_ms,
                         attachments,
                         handed_off: state == TurnState::HandedOff,
+                        served_by,
                     });
                 }
                 view.background = state == TurnState::HandedOff;
@@ -653,6 +661,7 @@ mod tests {
                     attachments: Vec::new(),
                     state,
                     error: None,
+                    served_by: None,
                 },
             )
         };
@@ -701,6 +710,7 @@ mod tests {
                     attachments: Vec::new(),
                     state: end,
                     error: None,
+                    served_by: None,
                 },
             ));
         }
@@ -765,6 +775,7 @@ mod tests {
                 attachments: Vec::new(),
                 state: TurnState::Completed,
                 error: None,
+                served_by: None,
             },
         );
         state.apply(done.clone());
@@ -777,6 +788,40 @@ mod tests {
         assert_eq!(view.lines.len(), 2, "{:?}", view.lines);
         assert!(view.live.is_none());
         assert_eq!(state.last_seq, Some(3));
+    }
+
+    /// A reply keeps the provider and model the daemon says wrote it.
+    #[test]
+    fn a_reply_keeps_who_wrote_it() {
+        let mut state = State::default();
+        let served = ServedBy {
+            preset: "anthropic".into(),
+            provider: "Anthropic".into(),
+            model: "synthetic-model-1".into(),
+        };
+        state.apply(event(
+            Some(1),
+            Event::TurnStarted {
+                turn_id: "t1".into(),
+                session_id: "app:s1".into(),
+                origin: "app".into(),
+            },
+        ));
+        state.apply(event(
+            Some(2),
+            Event::TurnCompleted {
+                turn_id: "t1".into(),
+                text: "Done.".into(),
+                attachments: Vec::new(),
+                state: TurnState::Completed,
+                error: None,
+                served_by: Some(served.clone()),
+            },
+        ));
+        let Some(Line::Assistant { served_by, .. }) = state.sessions["app:s1"].lines.last() else {
+            panic!("{:?}", state.sessions["app:s1"].lines);
+        };
+        assert_eq!(served_by.as_ref(), Some(&served));
     }
 
     /// A turn seen running keeps what each tool was doing and how it ended,
@@ -823,6 +868,7 @@ mod tests {
                 attachments: Vec::new(),
                 state: TurnState::Completed,
                 error: None,
+                served_by: None,
             },
         ));
         let Line::Activity { tools, calls, .. } = &state.sessions["app:s1"].lines[0] else {
@@ -856,6 +902,7 @@ mod tests {
                 }],
                 attachments: Vec::new(),
                 handed_off: false,
+                served_by: None,
             }],
         );
         let Line::Activity { calls, .. } = &state.sessions["app:s1"].lines[0] else {

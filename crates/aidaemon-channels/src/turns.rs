@@ -321,6 +321,8 @@ pub struct TurnFinish<'a> {
     pub handed_off: bool,
     /// Why it failed or was cancelled.
     pub error: Option<&'a str>,
+    /// The model that wrote the reply, when the runtime recorded one.
+    pub model: Option<&'a str>,
 }
 
 /// Sees every turn a runner runs, whatever its platform, so one place can
@@ -989,6 +991,7 @@ impl TurnRunner {
                             handed_off: envelope.disposition
                                 == aidaemon_events::AssistantResponseDisposition::BackgroundHandoff,
                             error: None,
+                            model: envelope.model.as_deref(),
                         });
                     }
                     if let Some(card) = &card {
@@ -1034,6 +1037,7 @@ impl TurnRunner {
                             reply: "",
                             handed_off: false,
                             error: Some(&message),
+                            model: None,
                         });
                     }
                     Some((message, cancelled))
@@ -1485,6 +1489,7 @@ mod tests {
                 text: "Done.".into(),
                 referenced_receipts: Vec::new(),
                 disposition: Default::default(),
+                model: None,
             })
         }
     }
@@ -1811,6 +1816,7 @@ mod tests {
                 text: self.reply.into(),
                 referenced_receipts: Vec::new(),
                 disposition: self.disposition,
+                model: None,
             })
         }
     }

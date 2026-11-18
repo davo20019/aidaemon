@@ -66,6 +66,10 @@ pub struct TurnScope<'a> {
     /// The plan's usage limit stopped the chosen model and another answered:
     /// the reply says so, once per limit in a conversation.
     pub answered_past_quota: std::sync::Mutex<Option<crate::llm::turn_calls::QuotaFallback>>,
+    /// The model that wrote the latest successful answer (a failover's
+    /// when one answered): the reply is recorded under it, so a client can
+    /// show which model wrote it.
+    pub answered_by: std::sync::Mutex<Option<String>>,
     /// Extra passes the ledger demanded so far.
     pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger

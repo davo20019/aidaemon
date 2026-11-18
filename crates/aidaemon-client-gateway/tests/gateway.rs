@@ -95,6 +95,7 @@ impl AgentIngress for ScriptedAgent {
             text,
             referenced_receipts: Vec::new(),
             disposition: Default::default(),
+            model: None,
         })
     }
 }
@@ -165,6 +166,7 @@ impl ClientHost for Host {
                 tools: Vec::new(),
                 calls: Vec::new(),
                 handed_off: false,
+                served_by: None,
             })
             .collect())
     }
@@ -477,6 +479,7 @@ async fn a_restart_ends_the_turns_the_previous_process_left_running() {
                     attachments: Vec::new(),
                     state: TurnState::Completed,
                     error: None,
+                    served_by: None,
                 },
             ),
             ("app:synthetic-1", started("t-cut")),

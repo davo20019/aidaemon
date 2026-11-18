@@ -71,6 +71,8 @@ pub struct AgentResponseEnvelope {
     pub text: String,
     pub referenced_receipts: Vec<aidaemon_events::CompletionProofReference>,
     pub disposition: aidaemon_events::AssistantResponseDisposition,
+    /// The model that wrote the reply, as the runtime recorded it.
+    pub model: Option<String>,
 }
 
 impl AgentResponseEnvelope {

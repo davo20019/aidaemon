@@ -409,6 +409,15 @@ impl TurnEngine<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        if result.is_ok()
+            && let Ok(mut slot) = scope.answered_by.lock()
+        {
+            *slot = Some(if telemetry.final_model.is_empty() {
+                request.model.clone()
+            } else {
+                telemetry.final_model.clone()
+            });
+        }
         if let Some(limit) = telemetry.answered_past_quota.clone()
             && let Ok(mut slot) = scope.answered_past_quota.lock()
         {

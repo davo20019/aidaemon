@@ -112,6 +112,12 @@ pub trait ClientHost: Send + Sync {
     fn owner(&self) -> OwnerInfo {
         OwnerInfo::default()
     }
+    /// The connected provider that offers `model`, with it, for a reply
+    /// written by it (protocol 1.35); `None` when no provider lists it.
+    /// Called inline as a turn ends: answer from memory and config only.
+    fn served_by(&self, _model: &str) -> Option<aidaemon_client_protocol::ServedBy> {
+        None
+    }
     /// How the daemon itself is doing; `None` when this host does not say.
     async fn system(&self) -> Option<aidaemon_client_protocol::SystemStatus> {
         None
@@ -521,6 +527,7 @@ impl ClientGateway {
                             attachments: Vec::new(),
                             state: TurnState::Cancelled,
                             error: Some("The daemon restarted before this turn finished.".into()),
+                            served_by: None,
                         },
                     )
                     .await;
@@ -562,6 +569,7 @@ impl ClientGateway {
             live: live.clone(),
             contexts: contexts.clone(),
             files: deps.files.clone(),
+            host: deps.host.clone(),
         }));
         deps.hub.set_approval_tap(approvals.clone());
         let kept = observer::Kept::default();

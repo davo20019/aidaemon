@@ -66,6 +66,8 @@ pub struct GatewayObserver {
     pub(crate) contexts: Contexts,
     /// Where a message's files are shown from; `None`: not shown.
     pub(crate) files: Option<Arc<crate::files::FileStore>>,
+    /// Names the provider of the model that wrote a reply.
+    pub(crate) host: Arc<dyn crate::ClientHost>,
 }
 
 /// Files as clients reach them.
@@ -422,6 +424,10 @@ impl TurnObserver for GatewayObserver {
                 attachments: Vec::new(),
                 state,
                 error: turn.error.map(str::to_string),
+                served_by: turn
+                    .model
+                    .filter(|_| !turn.reply.is_empty())
+                    .and_then(|model| self.host.served_by(model)),
             },
         );
         self.publisher.publish(

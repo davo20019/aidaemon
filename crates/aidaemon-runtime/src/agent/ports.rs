@@ -243,6 +243,7 @@ impl ConversationRuntime for Agent {
             text,
             referenced_receipts: generated.referenced_receipts,
             disposition: generated.disposition,
+            model: generated.model,
         })
     }
 
@@ -294,6 +295,7 @@ impl AgentIngress for Agent {
             text,
             referenced_receipts: generated.referenced_receipts,
             disposition: generated.disposition,
+            model: generated.model,
         })
     }
 
@@ -454,6 +456,7 @@ mod tests {
                 turn_id: Some("turn-synthetic".to_string()),
                 referenced_receipts: Vec::new(),
                 disposition: aidaemon_events::AssistantResponseDisposition::Terminal,
+                model: None,
             },
         };
 

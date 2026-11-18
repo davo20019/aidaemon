@@ -1334,6 +1334,7 @@ impl TurnEngine<'_> {
             partial_demanded: AtomicBool::new(false),
             not_attempted: std::sync::Mutex::new(Vec::new()),
             answered_past_quota: std::sync::Mutex::new(None),
+            answered_by: std::sync::Mutex::new(None),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
             checklist_declared: AtomicBool::new(false),
@@ -1634,6 +1635,13 @@ impl TurnEngine<'_> {
                 }
                 let input_tokens = Some(usage.input_tokens.min(u32::MAX as u64) as u32);
                 let output_tokens = Some(usage.output_tokens.min(u32::MAX as u64) as u32);
+                // Recorded under the model that wrote it, a failover's too.
+                let model = scope
+                    .answered_by
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .unwrap_or_else(|| model.clone());
                 if scope.background_handoff.load(Ordering::Relaxed) {
                     self.append_background_handoff_message_with_event(
                         &emitter,

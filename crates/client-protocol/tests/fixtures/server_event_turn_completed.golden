@@ -1,6 +1,11 @@
 {
   "at_ms": 1767225600000,
   "event": {
+    "served_by": {
+      "model": "synthetic-model-1",
+      "preset": "anthropic",
+      "provider": "Anthropic"
+    },
     "state": "completed",
     "text": "Posted the report.",
     "turn_id": "b9e1-4",

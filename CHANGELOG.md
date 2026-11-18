@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **See which model wrote a reply.** Under a reply in the app, after its time and Copy, the provider's mark and name and the model that wrote it ("ChatGPT · gpt-6.2-sol"). It is the model that actually answered: when a failover answered for the chosen model, the reply names the failover, and the reply is recorded under that model. Older replies show it too when their model is one a connected provider still lists. Client protocol 1.35: `served_by` (`preset`, `provider`, `model`) on `turn_completed` and history messages; `ClientHost::served_by`.
+
 ## [0.20.0] - 2026-11-17
 
 ### Added

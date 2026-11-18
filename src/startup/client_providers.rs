@@ -191,6 +191,13 @@ pub(crate) fn connected(config: &toml::Table) -> Vec<ConnectedProvider> {
     connected_with(config, &stored, chatgpt_signed_in())
 }
 
+/// The providers `config` uses, as [`connected`] lists them, for their
+/// names and presets only: no credential is looked up, so each reads as
+/// signed out or missing its key.
+pub(crate) fn listed(config: &toml::Table) -> Vec<ConnectedProvider> {
+    connected_with(config, &|_| false, false)
+}
+
 fn connected_with(
     config: &toml::Table,
     stored: &dyn Fn(&str) -> bool,

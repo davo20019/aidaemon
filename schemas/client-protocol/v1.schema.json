@@ -3303,6 +3303,17 @@
                 "null"
               ]
             },
+            "served_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ServedBy"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The provider and model that wrote the reply (protocol 1.35);\n`None` when there was none or it is not known."
+            },
             "state": {
               "$ref": "#/$defs/TurnState"
             },
@@ -3899,6 +3910,17 @@
         "role": {
           "description": "`user` or `assistant`.",
           "type": "string"
+        },
+        "served_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServedBy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a reply: the provider and model that wrote it (protocol 1.35)."
         },
         "text": {
           "type": "string"
@@ -5348,6 +5370,27 @@
     "SecretText": {
       "description": "A secret's text: sent once, to be stored, and never shown or logged.",
       "type": "string"
+    },
+    "ServedBy": {
+      "description": "The provider and model that wrote a reply (protocol 1.35).",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "preset": {
+          "description": "The provider's catalog preset (`openai_chatgpt`, `anthropic`...),\nfor its mark; empty for one not from the catalog.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "The provider in plain words, as Settings names it (\"ChatGPT\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ],
+      "type": "object"
     },
     "ServerFrame": {
       "description": "A frame from the daemon to a client.",

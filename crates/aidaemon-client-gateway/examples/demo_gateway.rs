@@ -119,6 +119,7 @@ impl AgentIngress for Agent {
             text: reply,
             referenced_receipts: Vec::new(),
             disposition: Default::default(),
+            model: None,
         })
     }
 }
@@ -534,6 +535,7 @@ impl ClientHost for Host {
                     .collect(),
                 calls: demo_tools(session_id, role, text),
                 handed_off: text.starts_with("Started in the background"),
+                served_by: None,
             })
             .collect())
     }

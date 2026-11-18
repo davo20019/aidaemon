@@ -3451,6 +3451,7 @@ impl Drop for FollowupEnd {
                     reply: "",
                     handed_off: ended.handed_off,
                     error: ended.error.as_deref(),
+                    model: None,
                 });
         }
     }
@@ -11750,6 +11751,7 @@ mod tests {
                 text: "Drupal is installed.".to_string(),
                 referenced_receipts: Vec::new(),
                 disposition: Default::default(),
+                model: None,
             })
         }
 

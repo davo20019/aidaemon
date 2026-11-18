@@ -27,6 +27,8 @@ pub struct GeneratedResponseRef {
     pub turn_id: Option<String>,
     pub referenced_receipts: Vec<super::CompletionProofReference>,
     pub disposition: super::AssistantResponseDisposition,
+    /// The model that wrote it, as recorded; `None` when not recorded.
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +111,11 @@ fn generated_response_from_event(event: &Event) -> Option<CapturedGeneratedRespo
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
+    let model = event
+        .data
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     Some(CapturedGeneratedResponse {
         content,
         response: GeneratedResponseRef {
@@ -117,6 +124,7 @@ fn generated_response_from_event(event: &Event) -> Option<CapturedGeneratedRespo
             turn_id,
             referenced_receipts,
             disposition,
+            model,
         },
     })
 }
@@ -822,12 +830,17 @@ impl EventStore {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
+        let model = data
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         Ok(Some(GeneratedResponseRef {
             response_id,
             task_id,
             turn_id: row.try_get("turn_id")?,
             referenced_receipts,
             disposition,
+            model,
         }))
     }
 

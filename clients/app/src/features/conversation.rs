@@ -3,7 +3,7 @@
 //! conversation is the same page with no session yet.
 
 use aidaemon_client_core::state::Line;
-use aidaemon_client_protocol::{AttachmentRef, MidRun, ToolCallInfo};
+use aidaemon_client_protocol::{AttachmentRef, MidRun, ServedBy, ToolCallInfo};
 use nsh_base::{
     MarkdownOptions, TextViewLinks, TextViewPart, TextViewParts, button, input, text_view,
 };
@@ -21,9 +21,17 @@ enum Row {
     Day(String),
     User(String, u64, Vec<AttachmentRef>),
     /// A reply: its text, time and files, whether it only says the work
-    /// went on in the background, and whether its time and Copy show
-    /// (the last reply before the owner speaks again).
-    Assistant(String, u64, Vec<AttachmentRef>, bool, bool),
+    /// went on in the background, whether its time and Copy show (the
+    /// last reply before the owner speaks again), and the provider and
+    /// model that wrote it.
+    Assistant(
+        String,
+        u64,
+        Vec<AttachmentRef>,
+        bool,
+        bool,
+        Option<ServedBy>,
+    ),
     Note(String),
     /// The reply being written and what the agent is doing.
     Live,
@@ -79,7 +87,8 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
                 at_ms,
                 attachments,
                 handed_off,
-            } => Row::Assistant(text, at_ms, attachments, handed_off, false),
+                served_by,
+            } => Row::Assistant(text, at_ms, attachments, handed_off, false, served_by),
             Line::Note { text, .. } => Row::Note(text),
             Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
             Line::Activity { tools, secs, calls } => Row::Activity(tools, secs, calls),
@@ -91,7 +100,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     for row in rows.iter_mut().rev() {
         match row {
             Row::User(..) => last_of_run = true,
-            Row::Assistant(_, _, _, handed_off, footer) if !*handed_off => {
+            Row::Assistant(_, _, _, handed_off, footer, _) if !*handed_off => {
                 *footer = last_of_run;
                 last_of_run = false;
             }
@@ -101,7 +110,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     if store.live(session).is_some() {
         rows.push(Row::Live);
     } else if store.in_background(session)
-        && !matches!(rows.last(), Some(Row::Assistant(_, _, _, true, _)))
+        && !matches!(rows.last(), Some(Row::Assistant(_, _, _, true, ..)))
     {
         // A launch line already says it; the work's own strip over the
         // composer shows it running, with Cancel.
@@ -905,7 +914,7 @@ fn transcript_list(
                 row.with(|r| {
                     r.as_ref().map(|r| match r {
                         Row::User(..) => 0,
-                        Row::Assistant(_, _, _, true, _) => 9,
+                        Row::Assistant(_, _, _, true, ..) => 9,
                         Row::Assistant(..) => 1,
                         Row::Note(_) => 2,
                         Row::Live => 3,
@@ -966,8 +975,20 @@ fn transcript_list(
                             ))
                             .child(files(store, attached, false))
                             .child(when(
-                                move || row.with(|r| matches!(r, Some(Row::Assistant(.., true)))),
-                                move || reply_footer(store, content, at),
+                                move || {
+                                    row.with(|r| {
+                                        matches!(r, Some(Row::Assistant(_, _, _, _, true, _)))
+                                    })
+                                },
+                                move || {
+                                    let served = move || {
+                                        row.with(|r| match r {
+                                            Some(Row::Assistant(.., served)) => served.clone(),
+                                            _ => None,
+                                        })
+                                    };
+                                    reply_footer(store, content, at, served)
+                                },
                             )),
                         9 => column.child(handed_off(content)),
                         2 => column.child(note(content)),
@@ -1141,22 +1162,52 @@ fn stamp(at: impl Fn() -> u64 + 'static) -> Text {
     .text_color(colors::FAINT)
 }
 
-/// Under a reply: its time and Copy.
+/// Under a reply: its time, Copy, and the provider and model that wrote
+/// it when the daemon said.
 fn reply_footer(
     store: Store,
     content: impl Fn() -> String + Clone + 'static,
     at: impl Fn() -> u64 + 'static,
+    served: impl Fn() -> Option<ServedBy> + Clone + 'static,
 ) -> View {
     view()
         .flex_row()
         .items_center()
         .gap_2()
+        .min_w(px(0.0))
         .child(stamp(at))
         // An icon, as chat apps keep it: the reply is what is read.
         .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
             set_clipboard(content());
             store.say("Copied the reply");
         }))
+        .child(dynamic(move || {
+            let served = served()?;
+            Some(untracked(move || served_by(served)))
+        }))
+}
+
+/// Which provider and model wrote a reply: the provider's mark when it has
+/// one, then "Provider · model", cut short on a narrow screen.
+fn served_by(served: ServedBy) -> View {
+    let label = format!("{} · {}", served.provider, served.model);
+    let mut row = view()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_1()
+        .min_w(px(0.0));
+    if let Some(glyph) = ui::provider_glyph(&served.preset) {
+        row = row.child(ui::icon_inline(glyph).accessibility_elements_hidden(true));
+    }
+    row.child(
+        text(label)
+            .truncate()
+            .flex_1()
+            .min_w(px(0.0))
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+    )
 }
 
 /// Under a message of the owner's: its time, then Copy, Edit (back into

@@ -2,7 +2,7 @@
 //! what the runtime can pin, and the per-session setting the turn reads.
 
 use aidaemon_client_protocol::{
-    Billing, Effort, ModelChoice, ModelOption, ModelOptions, ModelProvider, SessionModel,
+    Billing, Effort, ModelChoice, ModelOption, ModelOptions, ModelProvider, ServedBy, SessionModel,
 };
 use aidaemon_providers::routing::ProviderKind;
 use aidaemon_runtime::llm::SharedLlmRuntime;
@@ -56,6 +56,41 @@ pub(crate) fn options(llm: &SharedLlmRuntime) -> ModelOptions {
             .map(option_of)
             .collect(),
     }
+}
+
+/// The connected provider that offers `model`, named as Settings names it
+/// (from `config`, else by its kind), for a reply written by it. `None`
+/// when no provider lists the model.
+pub(crate) fn served_by(
+    llm: &SharedLlmRuntime,
+    config: Option<&toml::Table>,
+    model: &str,
+) -> Option<ServedBy> {
+    let provider = pickable(&llm.snapshot())
+        .into_iter()
+        .find(|provider| provider.models.iter().any(|listed| listed == model))?;
+    let listed = config
+        .map(super::client_providers::listed)
+        .unwrap_or_default();
+    let named = listed.into_iter().find(|connected| {
+        let id = match connected.failover {
+            None => session_model::MAIN_PROVIDER.to_string(),
+            Some(index) => format!("failover-{index}"),
+        };
+        id == provider.id
+    });
+    let (preset, name) = match named {
+        Some(connected) => (connected.preset, connected.name),
+        None => (
+            String::new(),
+            session_model::provider_name(provider.kind).to_string(),
+        ),
+    };
+    Some(ServedBy {
+        preset,
+        provider: name,
+        model: model.to_string(),
+    })
 }
 
 /// `options` with each provider named as Settings names it ("OpenRouter",
@@ -398,6 +433,33 @@ mod tests {
         assert_eq!(choices.providers[0].name, "Anthropic");
         assert_eq!(choices.providers[1].name, "OpenRouter");
         assert_eq!(named(options(&runtime()), None), options(&runtime()));
+    }
+
+    #[test]
+    fn a_reply_names_the_provider_that_offers_its_model() {
+        let config: toml::Table = r#"
+            [provider]
+            kind = "anthropic"
+            [[provider.fallbacks]]
+            kind = "openai_compatible"
+            base_url = "https://openrouter.ai/api/v1"
+        "#
+        .parse()
+        .unwrap();
+        let llm = runtime();
+        let main = served_by(&llm, Some(&config), "synthetic-shared").unwrap();
+        assert_eq!(main.provider, "Anthropic");
+        assert_eq!(main.model, "synthetic-shared");
+        assert!(!main.preset.is_empty());
+        let failover = served_by(&llm, Some(&config), "synthetic-gemini-catalog").unwrap();
+        assert_eq!(failover.provider, "OpenRouter");
+        assert_eq!(failover.preset, "openrouter");
+        // Without a config, the provider's kind names it and no mark is known.
+        let bare = served_by(&llm, None, "synthetic-gemini").unwrap();
+        assert_eq!(bare.preset, "");
+        assert!(!bare.provider.is_empty());
+        // A model no provider lists (a daemon-written reply) names none.
+        assert_eq!(served_by(&llm, Some(&config), "system"), None);
     }
 
     #[test]

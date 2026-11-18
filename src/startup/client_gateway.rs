@@ -523,6 +523,39 @@ struct SessionEnds {
     latest: std::collections::HashMap<String, String>,
 }
 
+/// The model each of `ids` (a session's replies) was recorded under, from
+/// its `assistant_response` event; a reply with none is left out.
+async fn reply_models(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    ids: &[&str],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for chunk in ids.chunks(200) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        // Only fixed text and `?` placeholders are joined; every id is bound.
+        let sql = format!(
+            "SELECT json_extract(data, '$.message_id'), json_extract(data, '$.model') \
+             FROM events WHERE session_id = ? AND event_type = 'assistant_response' \
+             AND json_extract(data, '$.message_id') IN ({marks})"
+        );
+        let mut query =
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(sqlx::AssertSqlSafe(sql))
+                .bind(session_id);
+        for id in chunk {
+            query = query.bind(*id);
+        }
+        match query.fetch_all(pool).await {
+            Ok(rows) => out.extend(
+                rows.into_iter()
+                    .filter_map(|(id, model)| Some((id?, model?))),
+            ),
+            Err(error) => tracing::warn!(%error, "Could not read the models of replies"),
+        }
+    }
+    out
+}
+
 async fn session_ends(pool: &sqlx::SqlitePool) -> SessionEnds {
     // Each reads one row per session: the per-session ends come from
     // `idx_events_type_session`, then only those rows are opened.
@@ -872,8 +905,19 @@ impl ClientHost for DaemonClientHost {
         self.setup.step(action, &channels).await
     }
 
+    fn served_by(&self, model: &str) -> Option<aidaemon_client_protocol::ServedBy> {
+        super::client_models::served_by(&self.llm, self.config_table().as_ref(), model)
+    }
+
     async fn history(&self, session_id: &str, limit: usize) -> anyhow::Result<Vec<HistoryMessage>> {
         let messages = self.state.get_history(session_id, limit).await?;
+        let reply_ids: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.id.as_str())
+            .collect();
+        let models = reply_models(&self.system.pool, session_id, &reply_ids).await;
+        let config = self.config_table();
         // Runtime continuations and system notices ride as user-role turns
         // for the model; they are not what the owner said. A reply carries
         // the tools its turn used before it.
@@ -960,7 +1004,14 @@ impl ClientHost for DaemonClientHost {
             let handed_off = m.role == "assistant"
                 && delivered.is_none()
                 && aidaemon_runtime::background_run::is_launch_line(&text);
+            let served_by = (m.role == "assistant")
+                .then(|| models.get(&m.id))
+                .flatten()
+                .and_then(|model| {
+                    super::client_models::served_by(&self.llm, config.as_ref(), model)
+                });
             out.push(HistoryMessage {
+                served_by,
                 handed_off,
                 attachments,
                 id: m.id,

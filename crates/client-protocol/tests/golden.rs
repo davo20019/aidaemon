@@ -763,6 +763,11 @@ fn server_samples() -> Vec<ServerFrame> {
                 attachments: Vec::new(),
                 state: TurnState::Completed,
                 error: None,
+                served_by: Some(aidaemon_client_protocol::ServedBy {
+                    preset: "anthropic".into(),
+                    provider: "Anthropic".into(),
+                    model: "synthetic-model-1".into(),
+                }),
             },
         ),
         event(
@@ -880,6 +885,7 @@ fn server_samples() -> Vec<ServerFrame> {
                     tools: Vec::new(),
                     calls: Vec::new(),
                     handed_off: false,
+                    served_by: None,
                 },
                 HistoryMessage {
                     attachments: Vec::new(),
@@ -896,6 +902,7 @@ fn server_samples() -> Vec<ServerFrame> {
                         kind: Some(ToolKind::Web),
                     }],
                     handed_off: false,
+                    served_by: None,
                 },
                 HistoryMessage {
                     attachments: Vec::new(),
@@ -906,6 +913,7 @@ fn server_samples() -> Vec<ServerFrame> {
                     tools: Vec::new(),
                     calls: Vec::new(),
                     handed_off: true,
+                    served_by: None,
                 },
             ],
             more: true,
