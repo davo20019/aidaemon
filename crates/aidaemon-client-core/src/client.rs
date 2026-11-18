@@ -366,8 +366,12 @@ pub struct Client {
     /// file open in it. Only the latest read of each is kept.
     pub files_dir: Read<ProjectDir>,
     files_dir_request: Option<String>,
+    /// What the unanswered folder read asked: the same read again is not
+    /// sent (a view drawn again while offline asked once per draw).
+    files_dir_asked: Option<Command>,
     pub files_file: Read<ProjectFile>,
     files_file_request: Option<String>,
+    files_file_asked: Option<Command>,
     /// The daemon's slash commands.
     pub commands: Vec<SlashCommand>,
     project_request: Option<String>,
@@ -1278,6 +1282,14 @@ impl Client {
     /// `project_id`. What was shown stays until the answer, unless it was
     /// another project's.
     pub fn list_project_files(&mut self, project_id: &str, path: &str, ignored: bool) {
+        let command = Command::ListProjectFiles {
+            project_id: project_id.to_owned(),
+            path: (!path.is_empty()).then(|| path.to_owned()),
+            ignored,
+        };
+        if self.files_dir_request.is_some() && self.files_dir_asked.as_ref() == Some(&command) {
+            return;
+        }
         if self
             .files_dir
             .ready()
@@ -1285,20 +1297,22 @@ impl Client {
         {
             self.files_dir = Read::Loading;
         }
-        self.files_dir_request = Some(self.send(Command::ListProjectFiles {
-            project_id: project_id.to_owned(),
-            path: (!path.is_empty()).then(|| path.to_owned()),
-            ignored,
-        }));
+        self.files_dir_asked = Some(command.clone());
+        self.files_dir_request = Some(self.send(command));
     }
 
     /// Read file `path` of project `project_id`.
     pub fn read_project_file(&mut self, project_id: &str, path: &str) {
-        self.files_file = Read::Loading;
-        self.files_file_request = Some(self.send(Command::ReadProjectFile {
+        let command = Command::ReadProjectFile {
             project_id: project_id.to_owned(),
             path: path.to_owned(),
-        }));
+        };
+        if self.files_file_request.is_some() && self.files_file_asked.as_ref() == Some(&command) {
+            return;
+        }
+        self.files_file = Read::Loading;
+        self.files_file_asked = Some(command.clone());
+        self.files_file_request = Some(self.send(command));
     }
 
     /// Close the open file; an answer still on its way is dropped.
@@ -2943,6 +2957,30 @@ mod tests {
             &cx(None),
         );
         assert!(!client.can_retry("app:s1"));
+    }
+
+    #[test]
+    fn the_same_files_read_unanswered_is_not_sent_again() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        // A view drawn again and again while offline asks each time.
+        for _ in 0..8 {
+            client.list_project_files("p-acme", "", false);
+            client.read_project_file("p-acme", "README.md");
+        }
+        assert_eq!(client.take_outgoing().len(), 2);
+        // Another read is sent, and once answered the same one may be again.
+        client.list_project_files("p-acme", "", true);
+        let (id, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"project_dir","dir":{{"project_id":"p-acme"}}}}}}"#,
+            )),
+            &cx(None),
+        );
+        client.list_project_files("p-acme", "", true);
+        assert_eq!(client.take_outgoing().len(), 1);
     }
 
     #[test]
