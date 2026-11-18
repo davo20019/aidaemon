@@ -107,6 +107,22 @@ impl SurfaceNotifier {
     pub fn detached() -> Self {
         Self(Weak::new())
     }
+
+    /// Whether the owner is on a surface of this kind: a handoff waits
+    /// there, the owner controls it, or a live view shows it. A backend
+    /// must not tear such a surface down.
+    pub fn owner_engaged(&self, kind: crate::SurfaceKind) -> bool {
+        let Some(shared) = self.0.upgrade() else {
+            return false;
+        };
+        let state = lock(&shared.state);
+        state.surfaces.iter().any(|(id, entry)| {
+            entry.descriptor.kind == kind
+                && (entry.handoff
+                    || entry.controller.owner_device().is_some()
+                    || state.lives.values().any(|live| &live.surface == id))
+        })
+    }
 }
 
 /// Every surface, its lease, its live sessions and its handoff.

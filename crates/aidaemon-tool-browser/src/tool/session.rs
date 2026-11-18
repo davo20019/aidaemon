@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
 use super::backend::{BrowserBackend, PageHandle};
@@ -262,6 +262,24 @@ impl BrowserSessionRegistry {
         sessions
             .get(session_id)
             .map(|state| state.action_lock.clone())
+    }
+
+    /// Every session's action lock, taken only when no action runs and none
+    /// was used since `idle_since`: the browser may then close without
+    /// pulling a page out from under an action. Actions that start while the
+    /// guards are held wait for them. `None` when the browser is in use.
+    pub async fn quiet_since(&self, idle_since: Instant) -> Option<Vec<OwnedMutexGuard<()>>> {
+        let sessions = self.sessions.lock().await;
+        if sessions
+            .values()
+            .any(|state| state.last_used_at > idle_since)
+        {
+            return None;
+        }
+        sessions
+            .values()
+            .map(|state| state.action_lock.clone().try_lock_owned().ok())
+            .collect()
     }
 
     /// Count the owner's use of a session as activity, so idle eviction does

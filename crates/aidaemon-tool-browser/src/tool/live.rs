@@ -106,6 +106,14 @@ impl LiveState {
         lock(&self.owner_typed).contains(target_id)
     }
 
+    /// The owner is on one of the browser's tabs: a handoff waits there, they
+    /// control it, or a live view shows it.
+    pub fn owner_engaged(&self) -> bool {
+        lock(&self.notifier)
+            .as_ref()
+            .is_some_and(|notifier| notifier.owner_engaged(SurfaceKind::BrowserTab))
+    }
+
     /// Tell the registry the tabs may have changed.
     pub fn notify(&self) {
         if let Some(notifier) = lock(&self.notifier).as_ref() {
@@ -874,6 +882,74 @@ mod tests {
             .expect("the agent goes on after release")
             .unwrap();
         registry.close_live(&live.live_id);
+    }
+
+    const IDLE: Duration = Duration::from_secs(300);
+
+    async fn closed(backend: &MockBackend) -> bool {
+        calls(backend)
+            .await
+            .iter()
+            .any(|call| matches!(call, MockCall::Shutdown { .. }))
+    }
+
+    /// The browser as launched: connected, with the tab `setup` opened.
+    async fn launched() -> (BrowserTool, Arc<MockBackend>, SurfaceRegistry, SurfaceId) {
+        let (tool, backend, registry, id) = setup(MockBackend::new()).await;
+        backend.ensure_ready().await.unwrap();
+        (tool, backend, registry, id)
+    }
+
+    #[tokio::test]
+    async fn a_browser_nobody_used_for_a_while_closes_and_a_used_one_stays() {
+        let (tool, backend, _registry, _id) = launched().await;
+        let now = tokio::time::Instant::now();
+        assert!(!tool.close_if_idle(now, IDLE).await, "used just now");
+        assert!(!closed(&backend).await);
+
+        let later = now + IDLE + Duration::from_secs(1);
+        assert!(tool.close_if_idle(later, IDLE).await);
+        assert!(closed(&backend).await);
+        // Closed: the tabs are gone, and there is nothing left to close.
+        assert!(tool.sessions.active_target_id("app:s1").await.is_none());
+        assert!(!tool.close_if_idle(later + IDLE, IDLE).await);
+    }
+
+    #[tokio::test]
+    async fn the_browser_stays_while_a_handoff_waits_or_the_owner_watches() {
+        let later = tokio::time::Instant::now() + IDLE + Duration::from_secs(1);
+
+        let (tool, backend, registry, id) = launched().await;
+        registry.begin_handoff(&id).unwrap();
+        assert!(!tool.close_if_idle(later, IDLE).await, "a handoff waits");
+        registry.end_handoff(&id);
+        assert!(
+            tool.close_if_idle(later, IDLE).await,
+            "handed back and idle"
+        );
+        assert!(closed(&backend).await);
+
+        let (tool, backend, registry, id) = launched().await;
+        let live = registry
+            .open_live(&id, "phone", LiveMode::View, StreamParams::default())
+            .await
+            .unwrap();
+        assert!(!tool.close_if_idle(later, IDLE).await, "the owner watches");
+        registry.close_live(&live.live_id);
+        assert!(tool.close_if_idle(later, IDLE).await);
+        assert!(closed(&backend).await);
+    }
+
+    #[tokio::test]
+    async fn the_browser_stays_while_an_action_runs() {
+        let (tool, backend, _registry, _id) = launched().await;
+        let lock = tool.sessions.action_lock("app:s1").await.unwrap();
+        let running = lock.lock().await;
+        let later = tokio::time::Instant::now() + IDLE + Duration::from_secs(1);
+        assert!(!tool.close_if_idle(later, IDLE).await);
+        drop(running);
+        assert!(tool.close_if_idle(later, IDLE).await);
+        assert!(closed(&backend).await);
     }
 
     #[tokio::test]

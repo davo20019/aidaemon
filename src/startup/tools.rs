@@ -812,6 +812,7 @@ pub async fn register_optional_tools(
                     )
                     .map_err(|e| anyhow::anyhow!("Invalid browser configuration: {e}"))?,
                 );
+                browser_tool.start_idle_close();
                 if config.surfaces.enabled {
                     crate::startup::surfaces::add_browser(config, browser_tool.clone());
                 }

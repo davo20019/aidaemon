@@ -600,6 +600,11 @@ pub struct BrowserTool {
 /// Upper bound on the element-poll timeout, mirroring `BrowserSettings`'s
 /// `element_timeout` clamp, applied to a per-call `timeout_secs` override.
 const MAX_ELEMENT_TIMEOUT_SECS: u64 = 120;
+/// A launched browser nobody used for this long is closed (the window goes
+/// away; the profile and its sign-ins stay).
+const IDLE_CLOSE_AFTER: Duration = Duration::from_secs(5 * 60);
+/// How often the idle browser is looked for.
+const IDLE_CHECK_EVERY: Duration = Duration::from_secs(30);
 
 /// Interval between element-state polls in the `wait` action. With a paused
 /// clock, tests advance by this step to drive the loop deterministically.
@@ -2146,18 +2151,59 @@ impl BrowserTool {
         // browser-close command). All cached session pages are now stale handles
         // into a torn-down connection, so drop them too.
         //
-        // NOTE (deferred follow-up): DAEMON-EXIT graceful close is NOT wired.
-        // Only `close`, `set_mode` (mode change), and idle eviction reuse the
-        // backend's graceful-teardown path; nothing calls it on process exit.
-        // Wiring a daemon-shutdown hook would require threading a concrete
-        // `Arc<BrowserTool>` into `core.rs`'s shutdown handler — out of scope and
-        // low value here: on process exit a LAUNCHED Chrome is reclaimed by OS
-        // teardown of its temp profile, and an ATTACHED Chrome is unaffected
-        // (we never send it a close command). Left as a documented follow-up.
+        // Nothing closes the browser on process exit: under launchd/systemd the
+        // service's processes go with it, but a launched Chrome outlives a
+        // process killed any other way. An ATTACHED Chrome is never closed.
+        self.close_browser().await
+    }
+
+    async fn close_browser(&self) -> Result<String, String> {
         let result = self.backend.shutdown().await;
         self.sessions.invalidate_all_pages().await;
         self.diagnostics.reset_attached().await;
+        self.live.notify();
         result
+    }
+
+    /// Close the browser when nothing used it for `after`: no agent action
+    /// ran or started, and the owner is not on one of its tabs (a handoff
+    /// waiting, control, or a live view). Sign-ins stay in the profile; the
+    /// next action launches the browser again. Returns whether it closed.
+    async fn close_if_idle(&self, now: tokio::time::Instant, after: Duration) -> bool {
+        if !self.backend.is_connected().await || self.live.owner_engaged() {
+            return false;
+        }
+        let Some(idle_since) = now.checked_sub(after) else {
+            return false;
+        };
+        // Held across the close: an action that starts now waits, then runs
+        // on a fresh browser.
+        let Some(_quiet) = self.sessions.quiet_since(idle_since).await else {
+            return false;
+        };
+        let closed = self.close_browser().await;
+        info!(
+            ?closed,
+            idle_secs = after.as_secs(),
+            "closed the idle browser"
+        );
+        true
+    }
+
+    /// Close the browser once it sits idle (see [`Self::close_if_idle`]), for
+    /// as long as the tool lives. Needs a tokio runtime.
+    pub fn start_idle_close(self: &Arc<Self>) {
+        let tool = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(IDLE_CHECK_EVERY);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(tool) = tool.upgrade() else { return };
+                tool.close_if_idle(tokio::time::Instant::now(), IDLE_CLOSE_AFTER)
+                    .await;
+            }
+        });
     }
 
     /// Dispatch a single action to its handler (no recovery). Pulled out of
