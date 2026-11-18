@@ -402,7 +402,10 @@ async fn render_pdf_times_out_a_stalled_chromium_print_without_output() {
             aidaemon_tools::testing::call_facts("sess-pdf-timeout"),
         )
         .await
-        .unwrap();
+        .expect_err("a stalled render is raised as a typed timeout");
+    // Known by its type, so the dispatcher records a retryable timeout.
+    assert!(aidaemon_tools::timed_out(&result), "{result}");
+    let result = result.to_string();
     assert!(result.contains("timed out after 2 seconds"), "{result}");
     assert!(result.contains("no PDF was produced"), "{result}");
     assert!(!temp.path().join("inbox/browser-render").exists());

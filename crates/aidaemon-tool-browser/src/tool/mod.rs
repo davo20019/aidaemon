@@ -543,6 +543,20 @@ struct CallFiles<'a> {
     produced: Option<&'a aidaemon_tools::semantics::ProducedFiles>,
 }
 
+/// Why a browser action did not complete: words the model reads as the
+/// tool's answer, or a typed timeout raised as [`aidaemon_tools::ToolTimedOut`].
+#[derive(Debug)]
+enum ActionError {
+    Failed(String),
+    TimedOut(String),
+}
+
+impl From<String> for ActionError {
+    fn from(text: String) -> Self {
+        ActionError::Failed(text)
+    }
+}
+
 /// Result of a browser action dispatch — text for the LLM plus optional vision attachments.
 struct DispatchResult {
     text: String,
@@ -1574,9 +1588,11 @@ impl BrowserTool {
     /// shells out to optional Ghostscript, and Quick Look can wait forever. CDP
     /// gives us one deterministic renderer, a hard timeout, print backgrounds,
     /// and CSS `@page` sizing in a single operation.
-    async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, String> {
+    async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, ActionError> {
         if self.execution_backend.kind() != aidaemon_tools::backend::BackendKind::Local {
-            return Err("render_pdf is only available with local execution".to_string());
+            return Err(ActionError::Failed(
+                "render_pdf is only available with local execution".to_string(),
+            ));
         }
 
         let raw_source = args
@@ -1588,14 +1604,18 @@ impl BrowserTool {
         let source = dunce::canonicalize(&source)
             .map_err(|e| format!("Could not resolve HTML source: {e}"))?;
         if !source.is_file() {
-            return Err("source_path must identify a regular HTML file".to_string());
+            return Err(ActionError::Failed(
+                "source_path must identify a regular HTML file".to_string(),
+            ));
         }
         let is_html = source
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"));
         if !is_html {
-            return Err("render_pdf accepts only .html or .htm source files".to_string());
+            return Err(ActionError::Failed(
+                "render_pdf accepts only .html or .htm source files".to_string(),
+            ));
         }
 
         let default_filename = source
@@ -1634,16 +1654,16 @@ impl BrowserTool {
                 self.backend
                     .dispose_session(std::slice::from_ref(&target_id), &context_ids)
                     .await;
-                return Err(error);
+                return Err(ActionError::Failed(error));
             }
             Err(_) => {
                 self.backend
                     .dispose_session(std::slice::from_ref(&target_id), &context_ids)
                     .await;
-                return Err(format!(
+                return Err(ActionError::TimedOut(format!(
                     "Chromium PDF rendering timed out after {} seconds; no PDF was produced",
                     self.action_timeout.as_secs()
-                ));
+                )));
             }
         };
 
@@ -1669,7 +1689,9 @@ impl BrowserTool {
             .await;
 
         if pdf_bytes.len() < 32 || !pdf_bytes.starts_with(b"%PDF-") {
-            return Err("Chromium returned invalid PDF data; no output file was saved".to_string());
+            return Err(ActionError::Failed(
+                "Chromium returned invalid PDF data; no output file was saved".to_string(),
+            ));
         }
 
         // A per-render directory prevents accidental overwrites while preserving
@@ -2215,14 +2237,14 @@ impl BrowserTool {
         session_id: &str,
         files: CallFiles<'_>,
         clearance: &Clearance,
-    ) -> Result<DispatchResult, String> {
-        match action {
+    ) -> Result<DispatchResult, ActionError> {
+        let text_result: Result<DispatchResult, String> = match action {
             "navigate" => self
                 .action_navigate(args, session_id)
                 .await
                 .map(DispatchResult::text_only),
             "screenshot" => self.action_screenshot(args, session_id, files).await,
-            "render_pdf" => self.action_render_pdf(args).await,
+            "render_pdf" => return self.action_render_pdf(args).await,
             "click" => self.action_click(args, session_id, clearance).await,
             "fill" => self
                 .action_fill(args, session_id, clearance)
@@ -2281,7 +2303,8 @@ impl BrowserTool {
                 "Unknown browser action: '{}'. Valid actions: navigate, screenshot, render_pdf, click, fill, get_text, inspect_page, scroll, execute_js, wait, list_tabs, get_console_logs, get_network_errors, new_tab, switch_tab, close_tab, set_mode, close",
                 action
             )),
-        }
+        };
+        text_result.map_err(ActionError::Failed)
     }
 
     /// Whether an action is safe to AUTOMATICALLY replay after a connection-class
@@ -2335,7 +2358,7 @@ impl BrowserTool {
         session_id: &str,
         files: CallFiles<'_>,
         clearance: &Clearance,
-    ) -> Result<DispatchResult, String> {
+    ) -> Result<DispatchResult, ActionError> {
         let faults = self.backend.connection_faults();
         let first = self
             .dispatch_action(action, args, session_id, files, clearance)
@@ -2364,11 +2387,11 @@ impl BrowserTool {
         self.sessions.invalidate_all_pages().await;
         self.diagnostics.reset_attached().await;
         if let Err(reconnect_err) = self.backend.reconnect().await {
-            return Err(format!(
+            return Err(ActionError::Failed(format!(
                 "Browser connection lost and reconnect failed: {}. \
                  The action did not complete; please retry.",
                 reconnect_err
-            ));
+            )));
         }
 
         if Self::action_is_safe_to_replay(action) {
@@ -2385,13 +2408,13 @@ impl BrowserTool {
             action,
             "mutation hit a disconnect; NOT replaying (uncertain state)"
         );
-        Err(format!(
+        Err(ActionError::Failed(format!(
             "Browser connection was lost while performing '{}'. The action could NOT be \
              confirmed and may have partially completed — it was NOT retried automatically to \
              avoid duplicating it. The connection has been restored; re-issue the action \
              manually if needed after checking the page state.",
             action
-        ))
+        )))
     }
 
     /// Resolve the tab id for diagnostics actions: explicit `tab_id` arg or the
@@ -2689,7 +2712,13 @@ impl BrowserTool {
             .await
         {
             Ok(result) => Ok(result),
-            Err(err_text) => {
+            // A timeout is raised typed, so the dispatcher records a
+            // retryable timed-out outcome rather than a failure.
+            Err(ActionError::TimedOut(text)) => {
+                warn!(action, error = %text, "Browser action timed out");
+                Err(aidaemon_tools::ToolTimedOut(text).into())
+            }
+            Err(ActionError::Failed(err_text)) => {
                 warn!(action, error = %err_text, "Browser action failed");
                 Ok(DispatchResult::text_only(format!("Error: {}", err_text)))
             }
