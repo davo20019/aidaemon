@@ -1332,6 +1332,16 @@ impl Store {
         self.reads.settings_waiting.get()
     }
 
+    /// The waiting settings approvals this device may answer itself (the
+    /// daemon asks no other device for them): Settings asks them in place.
+    pub fn settings_asking_here(&self) -> Vec<Approval> {
+        let ids = self.reads.settings_asking_here.get();
+        self.approvals()
+            .into_iter()
+            .filter(|a| ids.contains(&a.id))
+            .collect()
+    }
+
     // ----- Projects ----------------------------------------------------------
 
     pub fn projects(&self) -> Vec<ProjectSummary> {
@@ -1379,16 +1389,6 @@ impl Store {
         }
         let (mut pinned, rest): (Vec<_>, Vec<_>) =
             ids.into_iter().partition(|id| self.is_project_pinned(id));
-    /// The waiting settings approvals this device may answer itself (the
-    /// daemon asks no other device for them): Settings asks them in place.
-    pub fn settings_asking_here(&self) -> Vec<Approval> {
-        let ids = self.reads.settings_asking_here.get();
-        self.approvals()
-            .into_iter()
-            .filter(|a| ids.contains(&a.id))
-            .collect()
-    }
-
         pinned.extend(rest);
         pinned
     }
