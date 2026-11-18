@@ -99,6 +99,7 @@ impl ExposureAdapter for CommandAdapter {
             assume_up_after: None,
             pidfile: Some(super::pidfile(&self.state_dir, "command", service)),
             cleanup: None,
+            probe: None,
         };
         let watcher = FirstLine {
             stability: self.stability(),

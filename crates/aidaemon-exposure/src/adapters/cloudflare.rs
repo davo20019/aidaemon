@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::config::CloudflareMode;
-use crate::process::{self, ProcessOptions, ProcessSpec, Stream, Watcher};
+use crate::process::{self, Probe, ProcessOptions, ProcessSpec, Stream, Watcher};
 use crate::{
     ExposedService, Exposure, ExposureAdapter, ExposureError, ExposureHealth, OriginStability,
     PublicEndpoint,
@@ -21,8 +21,6 @@ const INSTALL_HINT: &str = "install cloudflared \
 const LOGIN_HINT: &str = "cloudflared has no credentials for this tunnel: run \
      `cloudflared tunnel login`, then `cloudflared tunnel create <name>` and \
      `cloudflared tunnel route dns <name> <hostname>`";
-/// What cloudflared logs once the edge accepted a connection.
-const REGISTERED: &str = "Registered tunnel connection";
 
 pub struct CloudflareAdapter {
     pub mode: CloudflareMode,
@@ -82,32 +80,59 @@ pub(crate) fn quick_origin(line: &str) -> Option<String> {
         .then(|| format!("https://{host}"))
 }
 
-fn credentials_problem(line: &str) -> bool {
-    let line = line.to_ascii_lowercase();
-    line.contains("cannot determine default origin certificate")
-        || line.contains("tunnel credentials file")
-        || line.contains("origin cert")
-            && (line.contains("not found") || line.contains("no such file"))
+/// Whether cloudflared's `/ready` answer says the edge holds a
+/// connection: HTTP 200 and `readyConnections` above zero.
+pub(crate) fn ready_answer(status: u16, body: &str) -> bool {
+    status == 200
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v["readyConnections"].as_u64())
+            .is_some_and(|n| n > 0)
 }
 
+/// Asks cloudflared's metrics server (`--metrics`) whether it is ready.
+struct ReadyProbe {
+    url: String,
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl Probe for ReadyProbe {
+    async fn ready(&mut self) -> bool {
+        let Ok(answer) = self.http.get(&self.url).send().await else {
+            return false;
+        };
+        let status = answer.status().as_u16();
+        let body = answer.text().await.unwrap_or_default();
+        ready_answer(status, &body)
+    }
+}
+
+/// A loopback port free now, for cloudflared's metrics server.
+fn free_loopback_port() -> Result<u16, ExposureError> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .map_err(|error| ExposureError::Failed(format!("no port for tunnel metrics: {error}")))
+}
+
+/// Up once `/ready` says so.
 struct NamedWatcher {
     endpoint: PublicEndpoint,
 }
 
 impl Watcher for NamedWatcher {
-    fn on_line(&mut self, stream: Stream, line: &str) -> Option<ExposureHealth> {
-        if stream != Stream::Stderr {
-            return None;
-        }
-        if line.contains(REGISTERED) {
-            return Some(ExposureHealth::Up(self.endpoint.clone()));
-        }
-        credentials_problem(line).then(|| ExposureHealth::Down {
-            reason: LOGIN_HINT.to_string(),
-        })
+    fn on_line(&mut self, _stream: Stream, _line: &str) -> Option<ExposureHealth> {
+        None
+    }
+
+    fn on_ready(&mut self) -> Option<ExposureHealth> {
+        Some(ExposureHealth::Up(self.endpoint.clone()))
     }
 }
 
+/// A quick tunnel's origin appears only in its log (a URL, read as one);
+/// it is up once `/ready` says so and the origin is known.
 #[derive(Default)]
 struct QuickWatcher {
     origin: Option<String>,
@@ -118,15 +143,16 @@ impl Watcher for QuickWatcher {
         if self.origin.is_none() {
             self.origin = quick_origin(line);
         }
-        if line.contains(REGISTERED) {
-            return self.origin.clone().map(|origin| {
-                ExposureHealth::Up(PublicEndpoint {
-                    origin,
-                    stability: OriginStability::Ephemeral,
-                })
-            });
-        }
         None
+    }
+
+    fn on_ready(&mut self) -> Option<ExposureHealth> {
+        self.origin.clone().map(|origin| {
+            ExposureHealth::Up(PublicEndpoint {
+                origin,
+                stability: OriginStability::Ephemeral,
+            })
+        })
     }
 }
 
@@ -161,6 +187,17 @@ impl ExposureAdapter for CloudflareAdapter {
         let config_path = self
             .state_dir
             .join(format!("cloudflare-{}.yml", service.key()));
+        if self.mode == CloudflareMode::Named
+            && let Some(file) = self
+                .credentials_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+            && !std::path::Path::new(&expand_home(file)).is_file()
+        {
+            return Err(ExposureError::Failed(LOGIN_HINT.to_string()));
+        }
+        let metrics = format!("127.0.0.1:{}", free_loopback_port()?);
         let (config, args) = match self.mode {
             CloudflareMode::Named => (
                 named_config(
@@ -175,6 +212,8 @@ impl ExposureAdapter for CloudflareAdapter {
                     "tunnel".to_string(),
                     "--config".to_string(),
                     config_path.display().to_string(),
+                    "--metrics".to_string(),
+                    metrics.clone(),
                     "run".to_string(),
                     self.tunnel.clone(),
                 ],
@@ -188,6 +227,8 @@ impl ExposureAdapter for CloudflareAdapter {
                     "tunnel".to_string(),
                     "--config".to_string(),
                     config_path.display().to_string(),
+                    "--metrics".to_string(),
+                    metrics.clone(),
                     "--url".to_string(),
                     format!("http://{local}"),
                 ],
@@ -202,6 +243,17 @@ impl ExposureAdapter for CloudflareAdapter {
             assume_up_after: None,
             pidfile: Some(super::pidfile(&self.state_dir, "cloudflare", service)),
             cleanup: None,
+            probe: Some((
+                Duration::from_secs(1),
+                Box::new(ReadyProbe {
+                    url: format!("http://{metrics}/ready"),
+                    http: reqwest::Client::builder()
+                        .no_proxy()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .map_err(|error| ExposureError::Failed(format!("http client: {error}")))?,
+                }),
+            )),
         };
         let exposure = match self.mode {
             CloudflareMode::Named => {
@@ -244,13 +296,17 @@ mod tests {
     }
 
     #[test]
-    fn quick_watcher_reads_the_origin_then_waits_for_registration() {
+    fn quick_watcher_reads_the_origin_then_waits_for_ready() {
         let mut watcher = QuickWatcher::default();
-        let mut states = QUICK_LOG
-            .lines()
-            .filter_map(|line| watcher.on_line(Stream::Stderr, line));
+        assert_eq!(watcher.on_ready(), None, "no origin yet");
+        assert!(
+            QUICK_LOG
+                .lines()
+                .all(|line| watcher.on_line(Stream::Stderr, line).is_none()),
+            "log lines never decide health"
+        );
         assert_eq!(
-            states.next(),
+            watcher.on_ready(),
             Some(ExposureHealth::Up(PublicEndpoint {
                 origin: "https://synthetic-words-here.trycloudflare.com".into(),
                 stability: OriginStability::Ephemeral,
@@ -259,23 +315,33 @@ mod tests {
     }
 
     #[test]
-    fn named_watcher_is_up_on_registration() {
+    fn named_watcher_is_up_only_when_ready() {
         let mut watcher = NamedWatcher {
             endpoint: PublicEndpoint {
                 origin: "https://nodes.example.com".into(),
                 stability: OriginStability::Stable,
             },
         };
-        let states: Vec<_> = NAMED_LOG
-            .lines()
-            .filter_map(|line| watcher.on_line(Stream::Stderr, line))
-            .collect();
-        assert!(matches!(states.first(), Some(ExposureHealth::Up(_))));
-        let down = watcher.on_line(
-            Stream::Stderr,
-            "ERR Cannot determine default origin certificate path. No file cert.pem",
+        assert!(
+            NAMED_LOG
+                .lines()
+                .all(|line| watcher.on_line(Stream::Stderr, line).is_none())
         );
-        assert!(matches!(down, Some(ExposureHealth::Down { .. })));
+        assert!(matches!(watcher.on_ready(), Some(ExposureHealth::Up(_))));
+    }
+
+    #[test]
+    fn ready_means_a_200_with_a_ready_connection() {
+        assert!(ready_answer(
+            200,
+            r#"{"status":200,"readyConnections":4,"connectorId":"00000000-0000-0000-0000-000000000000"}"#
+        ));
+        assert!(!ready_answer(
+            503,
+            r#"{"status":503,"readyConnections":0,"connectorId":"00000000-0000-0000-0000-000000000000"}"#
+        ));
+        assert!(!ready_answer(200, r#"{"readyConnections":0}"#));
+        assert!(!ready_answer(200, "Registered tunnel connection"));
     }
 
     #[test]

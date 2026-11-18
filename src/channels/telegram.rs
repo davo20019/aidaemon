@@ -1555,12 +1555,23 @@ impl Cx<'_> {
     async fn run_setup_commands(
         specs: &[crate::wizard::SetupCommandSpec],
         timeout_secs: u64,
-        treat_existing_resource_as_success: bool,
+        skip_existing_tunnel: bool,
     ) -> (Vec<String>, bool) {
         let mut lines = Vec::with_capacity(specs.len());
         let mut had_failures = false;
         for spec in specs {
             let display = crate::wizard::format_setup_command(spec);
+            // A tunnel that already exists is read from cloudflared's JSON
+            // list, not from the words of a failed create. `route dns`
+            // exits 0 when the hostname already routes to this tunnel, so
+            // its exit status alone decides.
+            if skip_existing_tunnel
+                && let Some(name) = crate::wizard::cloudflared_tunnel_created_by(spec)
+                && crate::wizard::cloudflared_tunnel_exists(name, timeout_secs).await
+            {
+                lines.push(format!("OK   {} - tunnel {} already exists", display, name));
+                continue;
+            }
             let run_result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
                 Command::new(&spec.program)
@@ -1576,15 +1587,7 @@ impl Cx<'_> {
                         &output.stdout,
                         &output.stderr,
                     );
-                    let combined = format!(
-                        "{}\n{}",
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    let treated_as_success = output.status.success()
-                        || (treat_existing_resource_as_success
-                            && crate::wizard::cloudflared_reports_existing_resource(&combined));
-                    if treated_as_success {
+                    if output.status.success() {
                         if summary.is_empty() {
                             lines.push(format!("OK   {}", display));
                         } else {

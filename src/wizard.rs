@@ -1161,12 +1161,51 @@ pub(crate) fn cloudflared_origin_cert_path() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".cloudflared").join("cert.pem"))
 }
 
-pub(crate) fn cloudflared_reports_existing_resource(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("already exists")
-        || lower.contains("already routed")
-        || lower.contains("already points to")
-        || lower.contains("record already exists")
+/// The tunnel name when `spec` is `cloudflared tunnel create <name>`.
+pub(crate) fn cloudflared_tunnel_created_by(spec: &SetupCommandSpec) -> Option<&str> {
+    match spec.args.as_slice() {
+        [tunnel, create, name]
+            if spec.program == "cloudflared" && tunnel == "tunnel" && create == "create" =>
+        {
+            Some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `cloudflared tunnel list --output json` lists a live (not
+/// deleted) tunnel called `name`.
+pub(crate) fn cloudflared_tunnel_listed(list_json: &str, name: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(list_json)
+        .ok()
+        .and_then(|list| list.as_array().cloned())
+        .is_some_and(|tunnels| {
+            tunnels.iter().any(|tunnel| {
+                tunnel["name"].as_str() == Some(name)
+                    && tunnel["deleted_at"]
+                        .as_str()
+                        .is_none_or(|at| at.is_empty() || at.starts_with("0001-01-01"))
+            })
+        })
+}
+
+/// Whether the owner's Cloudflare account already has the tunnel `name`,
+/// read from `cloudflared tunnel list --output json`.
+pub(crate) async fn cloudflared_tunnel_exists(name: &str, timeout_secs: u64) -> bool {
+    let run = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        tokio::process::Command::new("cloudflared")
+            .args(["tunnel", "list", "--output", "json", "--name", name])
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await;
+    match run {
+        Ok(Ok(output)) if output.status.success() => {
+            cloudflared_tunnel_listed(&String::from_utf8_lossy(&output.stdout), name)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn format_setup_command(spec: &SetupCommandSpec) -> String {
@@ -1707,6 +1746,39 @@ mod tests {
         low_latency_cloudflared_ingress_routes_for_plans, normalize_domain_input,
         normalize_hostname_input, render_cloudflared_ingress_config, setup_route_dns_hosts,
     };
+
+    #[test]
+    fn an_existing_tunnel_is_read_from_cloudflareds_json_list() {
+        use super::{cloudflared_tunnel_created_by, cloudflared_tunnel_listed};
+        let create = SetupCommandSpec {
+            program: "cloudflared".to_string(),
+            args: vec!["tunnel".into(), "create".into(), "aidaemon-telegram".into()],
+        };
+        assert_eq!(
+            cloudflared_tunnel_created_by(&create),
+            Some("aidaemon-telegram")
+        );
+        let route = SetupCommandSpec {
+            program: "cloudflared".to_string(),
+            args: vec![
+                "tunnel".into(),
+                "route".into(),
+                "dns".into(),
+                "aidaemon-telegram".into(),
+                "bot.example.com".into(),
+            ],
+        };
+        assert_eq!(cloudflared_tunnel_created_by(&route), None);
+        let listed = r#"[{"id":"00000000-0000-0000-0000-000000000000","name":"aidaemon-telegram","created_at":"2026-11-01T00:00:00Z","deleted_at":"0001-01-01T00:00:00Z","connections":[]}]"#;
+        assert!(cloudflared_tunnel_listed(listed, "aidaemon-telegram"));
+        assert!(!cloudflared_tunnel_listed(listed, "another-tunnel"));
+        assert!(!cloudflared_tunnel_listed("[]", "aidaemon-telegram"));
+        // Prose saying it exists is not the list.
+        assert!(!cloudflared_tunnel_listed(
+            "tunnel with name already exists",
+            "aidaemon-telegram"
+        ));
+    }
 
     #[test]
     fn normalize_domain_input_rejects_url_scheme() {

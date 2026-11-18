@@ -148,6 +148,19 @@ pub(crate) enum Stream {
 /// Reads the child's output and says when its state changes.
 pub(crate) trait Watcher: Send + 'static {
     fn on_line(&mut self, stream: Stream, line: &str) -> Option<ExposureHealth>;
+
+    /// The state once the options' [`Probe`] says the exposure serves.
+    fn on_ready(&mut self) -> Option<ExposureHealth> {
+        None
+    }
+}
+
+/// Asks the program's own structured state (a status command's JSON, a
+/// readiness endpoint) whether the exposure serves, instead of reading
+/// its log prose.
+#[async_trait]
+pub(crate) trait Probe: Send + 'static {
+    async fn ready(&mut self) -> bool;
 }
 
 pub(crate) struct ProcessOptions {
@@ -160,6 +173,9 @@ pub(crate) struct ProcessOptions {
     pub pidfile: Option<PathBuf>,
     /// Run after the child stopped (best effort).
     pub cleanup: Option<ProcessSpec>,
+    /// Asked this often until it says ready; then the watcher's
+    /// `on_ready` state is reported.
+    pub probe: Option<(Duration, Box<dyn Probe>)>,
 }
 
 /// A running child as an [`Exposure`].
@@ -264,6 +280,7 @@ enum Event {
     Exited(String),
     Timeout,
     AssumeUp,
+    Probe,
 }
 
 /// Start `spec` and watch it until it exits or is stopped.
@@ -309,6 +326,12 @@ pub(crate) async fn spawn(
         };
         let assume = tokio::time::sleep(assume_after);
         tokio::pin!(assume);
+        let (probe_every, mut probe) = match options.probe {
+            Some((every, probe)) => (every, Some(probe)),
+            None => (Duration::from_secs(u64::MAX / 4), None),
+        };
+        let mut probe_tick = tokio::time::interval(probe_every);
+        probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let final_health = loop {
             let event = tokio::select! {
                 _ = &mut stop_rx => Event::Stop,
@@ -320,6 +343,7 @@ pub(crate) async fn spawn(
                 }),
                 _ = &mut timeout, if !up => Event::Timeout,
                 _ = &mut assume, if !up && assumed.is_some() => Event::AssumeUp,
+                _ = probe_tick.tick(), if !up && probe.is_some() => Event::Probe,
             };
             match event {
                 Event::Stop => {
@@ -333,8 +357,10 @@ pub(crate) async fn spawn(
                     Stream::Stderr => stderr_open = false,
                 },
                 Event::Line(stream, Some(line)) => {
-                    if stream == Stream::Stderr {
-                        debug!(program = %label, line = %line.chars().take(200).collect::<String>(), "tunnel stderr");
+                    // Both streams feed the failure reason: some programs
+                    // say why they wait or refuse on stdout.
+                    debug!(program = %label, ?stream, line = %line.chars().take(200).collect::<String>(), "tunnel output");
+                    if !line.trim().is_empty() {
                         if ring.len() == RING {
                             ring.pop_front();
                         }
@@ -371,6 +397,16 @@ pub(crate) async fn spawn(
                             &ring,
                         ),
                     };
+                }
+                Event::Probe => {
+                    let ready = match probe.as_mut() {
+                        Some(probe) => probe.ready().await,
+                        None => false,
+                    };
+                    if ready && let Some(health) = watcher.on_ready() {
+                        up = true;
+                        tx.send_replace(health);
+                    }
                 }
                 Event::AssumeUp => {
                     if let Some(health) = assumed.clone() {
@@ -449,7 +485,68 @@ mod tests {
             assume_up_after: None,
             pidfile,
             cleanup: None,
+            probe: None,
         }
+    }
+
+    struct ReadyAfter(u32);
+    #[async_trait]
+    impl Probe for ReadyAfter {
+        async fn ready(&mut self) -> bool {
+            self.0 = self.0.saturating_sub(1);
+            self.0 == 0
+        }
+    }
+
+    struct SilentUntilReady;
+    impl Watcher for SilentUntilReady {
+        fn on_line(&mut self, _: Stream, _: &str) -> Option<ExposureHealth> {
+            None
+        }
+        fn on_ready(&mut self) -> Option<ExposureHealth> {
+            Some(ExposureHealth::Up(PublicEndpoint {
+                origin: "https://probe.example.com".into(),
+                stability: OriginStability::Stable,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn up_when_the_probe_says_ready_whatever_the_output_says() {
+        let mut opts = options(None);
+        opts.probe = Some((Duration::from_millis(20), Box::new(ReadyAfter(3))));
+        let exposure = spawn(
+            sh("echo 'Available on the internet' ; sleep 30"),
+            SilentUntilReady,
+            opts,
+        )
+        .await
+        .unwrap();
+        let mut rx = exposure.watch();
+        let up = wait_for(&mut rx, |h| !matches!(h, ExposureHealth::Starting)).await;
+        assert!(matches!(up, ExposureHealth::Up(_)), "{up:?}");
+        Box::new(exposure).stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_says_ready_times_out_with_the_programs_words() {
+        let mut opts = options(None);
+        opts.startup_timeout = Duration::from_millis(300);
+        opts.probe = Some((Duration::from_millis(20), Box::new(ReadyAfter(u32::MAX))));
+        let exposure = spawn(
+            sh("echo 'Funnel is not enabled on your tailnet'; sleep 30"),
+            SilentUntilReady,
+            opts,
+        )
+        .await
+        .unwrap();
+        let mut rx = exposure.watch();
+        let down = wait_for(&mut rx, |h| matches!(h, ExposureHealth::Down { .. })).await;
+        let text = format!("{down:?}");
+        assert!(
+            text.contains("did not come up") && text.contains("Funnel is not enabled"),
+            "{text}"
+        );
     }
 
     async fn wait_for(
