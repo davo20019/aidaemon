@@ -756,12 +756,33 @@ pub(crate) fn spawn_dashboard_or_health_server(
     }
 }
 
-pub(crate) fn collect_notify_session_ids(config: &AppConfig) -> Vec<String> {
+/// The owner chats that get daemon-wide notices (updates, model upgrades,
+/// trigger events), as the session ids the hub routes: a Telegram chat's
+/// session carries its bot's namespace (`<bot>:<chat id>`), so a bare user
+/// id is never routed.
+pub(crate) async fn collect_notify_session_ids(
+    config: &AppConfig,
+    first_telegram_bot: Option<&crate::channels::TelegramBot>,
+) -> Vec<String> {
     let mut session_ids = Vec::new();
 
     if let Some(first_telegram) = config.all_telegram_bots().first() {
         for uid in &first_telegram.allowed_user_ids {
-            session_ids.push(uid.to_string());
+            let bare = uid.to_string();
+            // The namespace may need one getMe call; never hold startup on it.
+            let session_id = match (first_telegram_bot, i64::try_from(*uid)) {
+                (Some(bot), Ok(chat_id)) => tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    bot.session_id(chat_id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    warn!("Timed out resolving the Telegram session namespace for owner notices");
+                    bare
+                }),
+                _ => bare,
+            };
+            session_ids.push(session_id);
         }
     }
 
@@ -779,6 +800,7 @@ pub(crate) fn collect_notify_session_ids(config: &AppConfig) -> Vec<String> {
         }
     }
 
+    info!(sessions = ?session_ids, "Owner notices go to these sessions");
     session_ids
 }
 

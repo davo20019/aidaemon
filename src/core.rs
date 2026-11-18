@@ -527,7 +527,11 @@ pub async fn run(
     );
 
     // 14. Event listener: route trigger events to agent -> broadcast via hub
-    let notify_session_ids = startup_runtime::collect_notify_session_ids(&config);
+    let notify_session_ids = startup_runtime::collect_notify_session_ids(
+        &config,
+        channel_bundle.telegram_bots.first().map(|bot| bot.as_ref()),
+    )
+    .await;
     startup_runtime::spawn_trigger_event_listener(startup_runtime::TriggerListenerDependencies {
         event_rx,
         hub: hub.clone(),
