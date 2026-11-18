@@ -708,8 +708,9 @@ impl SqliteMemory {
         .fetch_all(&self.pool)
         .await
         {
+            // `migrate` always creates memory_claims_fts, so a failure here
+            // is a real error for the caller, never a missing table.
             Ok(rows) => rows,
-            Err(error) if error.to_string().contains("no such table") => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
 
@@ -981,13 +982,33 @@ fn normalize_graph_name(value: &str) -> String {
         .join(" ")
 }
 
+/// Whether an extracted entity is named in its evidence: its name or an
+/// alias (two characters or more) occurs there as whole words, in order
+/// ("Al" is grounded by "Al said", never by "also"). The graph extractor
+/// gives no span offsets, so this checks the citation on word boundaries.
 fn entity_is_grounded(name: &str, aliases: &[String], evidence: &str) -> bool {
+    let evidence = word_tokens(evidence);
+    let named = |text: &str| {
+        let words = word_tokens(text);
+        !words.is_empty()
+            && evidence
+                .windows(words.len())
+                .any(|window| window == words.as_slice())
+    };
     name.eq_ignore_ascii_case("owner")
-        || evidence.contains(&name.to_lowercase())
+        || named(name)
         || aliases
             .iter()
-            .filter(|alias| alias.trim().len() >= 2)
-            .any(|alias| evidence.contains(&alias.trim().to_lowercase()))
+            .filter(|alias| alias.trim().chars().count() >= 2)
+            .any(|alias| named(alias))
+}
+
+/// Lowercase alphanumeric words of `text`, in order.
+fn word_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 async fn resolve_entity_identity(
@@ -1287,5 +1308,23 @@ mod tests {
             ChannelVisibility::PublicExternal,
             true
         ));
+    }
+
+    #[test]
+    fn an_entity_is_grounded_only_by_whole_words() {
+        let aliases = vec!["Al".to_string()];
+        assert!(!entity_is_grounded(
+            "Alice Rivera",
+            &aliases,
+            "I also moved to Lisbon"
+        ));
+        assert!(entity_is_grounded("Alice Rivera", &aliases, "Al said hi"));
+        assert!(entity_is_grounded(
+            "Alice Rivera",
+            &[],
+            "my sister alice rivera, again"
+        ));
+        assert!(!entity_is_grounded("Alice Rivera", &[], "Alice moved"));
+        assert!(!entity_is_grounded("Jordan", &[], "Jordanna called"));
     }
 }
