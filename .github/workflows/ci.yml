@@ -636,6 +636,47 @@ jobs:
       - name: Headless tests
         run: cargo test -q
 
+  # The app's web bundle (wasm), as the release builds it. Pins match
+  # release.yml's env.
+  web-app:
+    name: App (web)
+    runs-on: ubuntu-24.04
+    env:
+      NSH_VERSION: "0.5.1"
+      NSH_LINUX_SHA256: "a422bbe5dc2a7ae3ff308ee56e05d73d5becc81f57adf11447fc570dcee65e0f"
+      WASM_BINDGEN_CLI_VERSION: "0.2.130"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - name: Install wasm C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18
+      - name: Install nsh CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-linux-x86_64.tar.gz" -o nsh.tar.gz
+          echo "${NSH_LINUX_SHA256}  nsh.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/nsh"
+          tar -xzf nsh.tar.gz -C "$HOME/nsh"
+          rm nsh.tar.gz
+          echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_CLI_VERSION }}
+      - name: Build web bundle
+        working-directory: clients/app
+        env:
+          CC_wasm32_unknown_unknown: clang-18
+          AR_wasm32_unknown_unknown: llvm-ar-18
+        run: |
+          nsh package --target web
+          test -f .nsh/out/AIdaemon/index.html
+
   build-check:
     name: Build check (release)
     runs-on: ubuntu-latest

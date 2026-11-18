@@ -983,7 +983,7 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
     let provider = MockProvider::with_responses(vec![
         step("1"),
         step("1"),
-        step("2.5"),
+        step("4"),
         MockProvider::text_response("synthetic install finished"),
     ]);
     let harness = setup_full_stack_test_agent_with_extra_tools(provider, Vec::new())
@@ -1007,8 +1007,11 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
                 None,
                 Some("telegram:synthetic-chat"),
                 None,
+                // Above the idle gap between steps on a loaded runner (a
+                // Windows CI run measured more than 1.5 s); the last step
+                // still runs past it.
                 Some(crate::runtime_ports::ChildTimeLimit {
-                    limit: std::time::Duration::from_millis(1_500),
+                    limit: std::time::Duration::from_secs(3),
                 }),
                 None,
             )
@@ -1037,7 +1040,7 @@ async fn test_a_slow_but_progressing_child_is_never_stopped() {
         .unwrap()
         .expect("a progressing child runs to its end");
     assert!(
-        begun.elapsed() > std::time::Duration::from_secs(4),
+        begun.elapsed() > std::time::Duration::from_secs(6),
         "the child worked well past its idle limit: {:?}",
         begun.elapsed()
     );

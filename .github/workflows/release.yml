@@ -1,5 +1,8 @@
 name: Release
 
+# A tag with a suffix (v0.20.0-rc.1) is a rehearsal: every build runs, the
+# release is a draft prerelease, and nothing is published to crates.io or
+# Homebrew. Delete the draft and the tag afterwards.
 on:
   push:
     tags:
@@ -84,8 +87,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 24.04 for GTK 4.14, which the app's desktop backend needs.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             name: linux-x86_64
             cross: false
             app: true
@@ -126,7 +130,7 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        if: runner.os == 'Linux' && !matrix.cross
         run: |
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
@@ -143,12 +147,9 @@ jobs:
 
       # The app (`aidaemon app` / `aidaemon tui` launch it from beside the
       # daemon). Its own Cargo workspace, so its target dir is clients/app/target.
-      # A failure here must not block the daemon release: the archive then
-      # ships without aidaemon-app and install.sh skips it.
+      # The apps are the release: a failed build fails it.
       - name: Build app
-        id: build_app
         if: matrix.app
-        continue-on-error: true
         run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path clients/app/Cargo.toml
 
       - name: Package (Unix)
@@ -157,10 +158,8 @@ jobs:
           stage="$(mktemp -d)"
           cp target/${{ matrix.target }}/release/aidaemon "$stage/"
           app_bin="clients/app/target/${{ matrix.target }}/release/aidaemon-app"
-          if [ "${{ steps.build_app.outcome }}" = "success" ] && [ -f "$app_bin" ]; then
+          if [ "${{ matrix.app }}" = "true" ]; then
             cp "$app_bin" "$stage/"
-          elif [ "${{ matrix.app }}" = "true" ]; then
-            echo "::warning::aidaemon-app did not build for ${{ matrix.name }}; the archive ships without it."
           fi
           tar -czvf aidaemon-${{ matrix.name }}.tar.gz -C "$stage" .
           shasum -a 256 aidaemon-${{ matrix.name }}.tar.gz > aidaemon-${{ matrix.name }}.tar.gz.sha256
@@ -168,7 +167,7 @@ jobs:
       # The download for people who do not use a terminal: AIdaemon.app with
       # the daemon inside, in a disk image, signed and notarized.
       - name: Signing (macOS)
-        if: runner.os == 'macOS' && steps.build_app.outcome == 'success'
+        if: runner.os == 'macOS' && matrix.app
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -178,13 +177,15 @@ jobs:
         run: scripts/ci-macos-signing.sh >> "$GITHUB_ENV"
 
       - name: Package disk image (macOS)
-        if: runner.os == 'macOS' && steps.build_app.outcome == 'success'
+        if: runner.os == 'macOS' && matrix.app
         run: |
           set -euo pipefail
+          # Bundle versions are numeric: an rc tag's suffix is dropped.
+          version="${GITHUB_REF_NAME#v}"
           scripts/package-macos-dmg.sh \
             target/${{ matrix.target }}/release/aidaemon \
             clients/app/target/${{ matrix.target }}/release/aidaemon-app \
-            "${GITHUB_REF_NAME#v}" "AIdaemon-${{ matrix.name }}.dmg"
+            "${version%%-*}" "AIdaemon-${{ matrix.name }}.dmg"
           shasum -a 256 "AIdaemon-${{ matrix.name }}.dmg" > "AIdaemon-${{ matrix.name }}.dmg.sha256"
 
       - name: Upload artifact
@@ -261,10 +262,6 @@ jobs:
     name: Build web app
     needs: [quality-gate]
     runs-on: ubuntu-24.04
-    # Like the desktop app, the web bundle must not block the daemon release:
-    # without it the release has no aidaemon-app-web asset and install.sh
-    # skips it.
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -291,7 +288,9 @@ jobs:
           echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
 
       - name: Install wasm-bindgen CLI
-        run: cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_CLI_VERSION}" --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_CLI_VERSION }}
 
       - name: Build web bundle
         working-directory: clients/app
@@ -338,7 +337,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: false
+          draft: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
@@ -349,6 +349,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -547,6 +548,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew Tap
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Get release info
