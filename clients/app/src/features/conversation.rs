@@ -80,7 +80,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
                 attachments,
                 handed_off,
             } => Row::Assistant(text, at_ms, attachments, handed_off, false),
-            Line::Note { text } => Row::Note(text),
+            Line::Note { text, .. } => Row::Note(text),
             Line::Activity { .. } if mode == ActivityMode::Hidden => continue,
             Line::Activity { tools, secs, calls } => Row::Activity(tools, secs, calls),
         });

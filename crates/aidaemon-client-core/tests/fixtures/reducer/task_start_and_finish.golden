@@ -143,10 +143,12 @@
       "app:s1": {
         "lines": [
           {
+            "ended": "cancelled",
             "kind": "note",
             "text": "Stopped."
           },
           {
+            "ended": "failed",
             "kind": "note",
             "text": "Failed: the model timed out"
           },

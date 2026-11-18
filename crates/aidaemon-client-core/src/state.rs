@@ -38,7 +38,13 @@ pub enum Line {
         handed_off: bool,
     },
     /// A note from the client itself (a stopped turn, an error).
-    Note { text: String },
+    Note {
+        text: String,
+        /// The turn end this note reports (`cancelled`, `failed`); none
+        /// for any other note. Retry reads this, never the text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended: Option<TurnState>,
+    },
     /// What the turn behind the next reply did: the tools it used, in
     /// order, and how long it took when known.
     Activity {
@@ -458,9 +464,10 @@ impl State {
             }
             Event::UserActionRequired { message, .. } => {
                 if let Some(session_id) = session_id {
-                    self.session(&session_id)
-                        .lines
-                        .push(Line::Note { text: message });
+                    self.session(&session_id).lines.push(Line::Note {
+                        text: message,
+                        ended: None,
+                    });
                 }
             }
             Event::TurnCompleted {
@@ -514,9 +521,11 @@ impl State {
                 match state {
                     TurnState::Cancelled => view.lines.push(Line::Note {
                         text: "Stopped.".into(),
+                        ended: Some(TurnState::Cancelled),
                     }),
                     TurnState::Failed => view.lines.push(Line::Note {
                         text: format!("Failed: {}", error.unwrap_or_default()),
+                        ended: Some(TurnState::Failed),
                     }),
                     _ => {}
                 }

@@ -20,7 +20,7 @@ use aidaemon_client_protocol::{
     MidRun, ModelChoice, ModelOptions, ProjectDir, ProjectFile, ProjectSummary, QueuedMessage,
     SearchHit, ServerFrame, SessionChanges, SessionModel, Settings, SettingsChange,
     SettingsOutcome, SetupAction, SetupStep, SlashCommand, StreamAccept, SurfaceController,
-    SurfaceInfo, SurfaceMode, SurfaceTransport, SystemStatus, TaskSummary, TurnStatus,
+    SurfaceInfo, SurfaceMode, SurfaceTransport, SystemStatus, TaskSummary, TurnState, TurnStatus,
 };
 
 use crate::surfaces::LiveView;
@@ -104,6 +104,9 @@ impl Connection {
         matches!(self, Connection::Offline { .. })
     }
 }
+
+/// The protocol minor that added `get_settings`.
+const GET_SETTINGS_MINOR: u16 = 4;
 
 /// Something read from the daemon, as last asked.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -324,6 +327,9 @@ pub struct Client {
     /// Why the last settings change was refused, until dismissed or the
     /// next change.
     pub settings_error: Option<String>,
+    /// The protocol version the daemon said it speaks when this socket
+    /// opened.
+    pub daemon_version: Option<aidaemon_client_protocol::ProtocolVersion>,
     /// The providers and models a conversation can answer with.
     pub models: Read<ModelOptions>,
     models_request: Option<String>,
@@ -530,6 +536,9 @@ impl Client {
 
     fn frame(&mut self, frame: ServerFrame, cx: &Context) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if let ServerFrame::Welcome { version, .. } = &frame {
+            self.daemon_version = Some(*version);
+        }
         if self.live_answer(&frame, &mut effects) {
             return effects;
         }
@@ -1949,12 +1958,25 @@ impl Client {
         self.stopping.contains(id) && self.is_running(id)
     }
 
+    /// Whether the settings read failed because the daemon predates
+    /// `get_settings` (protocol 1.4): read from the version it speaks,
+    /// never from the error's words.
+    pub fn settings_unsupported(&self) -> bool {
+        matches!(self.settings, Read::Failed(_))
+            && self
+                .daemon_version
+                .is_some_and(|v| v.major == 1 && v.minor < GET_SETTINGS_MINOR)
+    }
+
     /// Whether the last turn of `session` failed or was stopped.
     pub fn can_retry(&self, session: &str) -> bool {
         !self.is_running(session)
             && matches!(
                 self.lines(session).last(),
-                Some(Line::Note { text }) if text == "Stopped." || text.starts_with("Failed:")
+                Some(Line::Note {
+                    ended: Some(TurnState::Cancelled | TurnState::Failed),
+                    ..
+                })
             )
     }
 
@@ -2836,6 +2858,75 @@ mod tests {
                 )
             })
             .expect("a surface command")
+    }
+
+    #[test]
+    fn a_settings_read_is_unsupported_only_on_a_daemon_older_than_1_4() {
+        for (minor, unsupported) in [(3, true), (34, false)] {
+            let mut client = Client::new();
+            client.update(Update::Connected, &cx(None));
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"welcome","version":{{"major":1,"minor":{minor}}},"owner":{{"name":"Alice Rivera"}},"latest_seq":0}}"#
+                )),
+                &cx(None),
+            );
+            client.refresh_settings();
+            let (id, _) = client
+                .take_outgoing()
+                .into_iter()
+                .rfind(|(_, c)| matches!(c, Command::GetSettings))
+                .expect("a settings read");
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"error","request_id":"{id}","error":{{"code":"invalid","message":"Unknown command for this gateway version","retryable":false}}}}"#
+                )),
+                &cx(None),
+            );
+            assert_eq!(client.settings_unsupported(), unsupported, "1.{minor}");
+        }
+    }
+
+    #[test]
+    fn retry_follows_the_turn_end_not_the_note_text() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        // A daemon note that happens to read like a stop is not a stop.
+        client.update(
+            frame(
+                r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:s1","event":{"type":"user_action_required","turn_id":"t0","message":"Stopped."}}"#,
+            ),
+            &cx(None),
+        );
+        assert!(!client.can_retry("app:s1"));
+        for (seq, state) in [(2, "failed"), (3, "cancelled")] {
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"event","at_ms":2,"session_id":"app:s1","event":{{"type":"turn_started","turn_id":"t{seq}","session_id":"app:s1","origin":"app"}}}}"#
+                )),
+                &cx(None),
+            );
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"event","seq":{seq},"at_ms":2,"session_id":"app:s1","event":{{"type":"turn_completed","turn_id":"t{seq}","text":"","state":"{state}","error":"synthetic outage"}}}}"#
+                )),
+                &cx(None),
+            );
+            assert!(client.can_retry("app:s1"), "{state}");
+        }
+        client.update(
+            frame(
+                r#"{"type":"event","at_ms":3,"session_id":"app:s1","event":{"type":"turn_started","turn_id":"t4","session_id":"app:s1","origin":"app"}}"#,
+            ),
+            &cx(None),
+        );
+        client.update(
+            frame(
+                r#"{"type":"event","seq":4,"at_ms":3,"session_id":"app:s1","event":{"type":"turn_completed","turn_id":"t4","text":"Done with the synthetic notes.","state":"completed"}}"#,
+            ),
+            &cx(None),
+        );
+        assert!(!client.can_retry("app:s1"));
     }
 
     #[test]

@@ -172,6 +172,7 @@ struct Reads {
     settings: Memo<SettingsRead>,
     settings_busy: Memo<bool>,
     settings_error: Memo<Option<String>>,
+    settings_unsupported: Memo<bool>,
     settings_waiting: Memo<usize>,
     search: Memo<SearchRead>,
     changes: Memo<ChangesRead>,
@@ -211,6 +212,7 @@ impl Reads {
             settings: computed(move || client.with(|c| c.settings.clone())),
             settings_busy: computed(move || client.with(Client::settings_busy)),
             settings_error: computed(move || client.with(|c| c.settings_error.clone())),
+            settings_unsupported: computed(move || client.with(|c| c.settings_unsupported())),
             settings_waiting: computed(move || client.with(|c| c.settings_waiting.len())),
             search: computed(move || client.with(|c| c.search.clone())),
             changes: computed(move || client.with(|c| c.changes.clone())),
@@ -990,7 +992,7 @@ impl Store {
             let (who, text, at) = match line {
                 Line::User { text, at_ms, .. } => ("You", text, at_ms),
                 Line::Assistant { text, at_ms, .. } => ("AIdaemon", text, at_ms),
-                Line::Note { text } => ("Note", text, 0),
+                Line::Note { text, .. } => ("Note", text, 0),
                 Line::Activity { tools, .. } => {
                     out.push_str(&format!("\n_Used: {}_\n", tools.join(", ")));
                     continue;
@@ -1234,6 +1236,11 @@ impl Store {
 
     pub fn settings_busy(&self) -> bool {
         self.reads.settings_busy.get()
+    }
+
+    /// The daemon is too old to answer a settings read.
+    pub fn settings_unsupported(&self) -> bool {
+        self.reads.settings_unsupported.get()
     }
 
     pub fn settings_error(&self) -> Option<String> {

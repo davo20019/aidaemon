@@ -131,7 +131,7 @@ fn body(
         }
         SettingsRead::Failed(reason) => view().child(
             ui::banner(
-                if reason.contains("Unknown command") {
+                if store.settings_unsupported() {
                     "This daemon is too old to show its settings here. Update aidaemon, then \
                      try again."
                         .to_string()
