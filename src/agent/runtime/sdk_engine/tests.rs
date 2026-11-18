@@ -1548,7 +1548,13 @@ fn reply_checks_reject_empty_marker_only_and_pasted_replies() {
 
 #[test]
 fn final_replies_are_sanitized_and_never_a_bare_done() {
-    let clean = finalize_reply("All set.\n[SYSTEM] internal note", &[], None);
+    // A reply mostly of its own words keeps them once a marker line goes; one
+    // the sanitizer gutted is judged by how much it removed.
+    let clean = finalize_reply(
+        "All set. The report is saved in notes.txt and the summary is above.\n[SYSTEM] note",
+        &[],
+        None,
+    );
     assert!(
         clean.contains("All set.") && !clean.contains("[SYSTEM]"),
         "{clean}"

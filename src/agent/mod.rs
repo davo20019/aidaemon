@@ -326,13 +326,11 @@ mod final_reply_marker_tests {
     }
 
     #[test]
-    fn strips_model_identity_leaks_from_final_reply() {
+    fn identity_lines_stay_as_written_in_a_final_reply() {
+        // Replies are cleaned of the daemon's own markers only, never
+        // rewritten by their wording (976886d4).
         let reply = "I am a large language model, trained by Google. How can I help?";
-        let sanitized = Agent::sanitize_final_reply_markers(reply);
-        assert!(!sanitized.contains("trained by Google"));
-        assert!(sanitized.contains("your personal AI assistant"));
-        assert!(!sanitized.contains("ChatGPT"));
-        assert!(!sanitized.contains("Gemini"));
+        assert_eq!(Agent::sanitize_final_reply_markers(reply), reply);
     }
 
     #[test]
