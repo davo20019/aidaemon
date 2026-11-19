@@ -174,6 +174,12 @@ fn snapshot() -> Snapshot {
                 activity: Some(ToolKind::Run),
             }),
             tools: vec!["terminal".into()],
+            calls: vec![ToolCallInfo {
+                name: "terminal".into(),
+                input: "cargo test -q".into(),
+                output: String::new(),
+                kind: Some(ToolKind::Run),
+            }],
         }],
         surfaces: vec![surface()],
     }

@@ -233,13 +233,26 @@ impl State {
         // What running turns have got to: the working line comes back after
         // a reload or a dropped connection, and later status events find
         // their turn.
-        for turn in state.live_turns {
+        for mut turn in state.live_turns {
+            // The app pairs a tool with its call by position: an older
+            // daemon sends no calls, and the steps after the snapshot must
+            // still land at their own index.
+            if turn.calls.len() != turn.tools.len() {
+                turn.calls = turn
+                    .tools
+                    .iter()
+                    .map(|name| ToolCallInfo {
+                        name: name.clone(),
+                        ..ToolCallInfo::default()
+                    })
+                    .collect();
+            }
             self.session(&turn.session_id).live = Some(LiveTurn {
                 turn_id: turn.turn_id,
                 streamed: turn.streamed,
                 status: turn.status.as_ref().map(status_text),
                 tools: turn.tools,
-                calls: Vec::new(),
+                calls: turn.calls,
                 started_ms: turn.started_at_ms,
             });
         }
@@ -1015,6 +1028,8 @@ mod tests {
                     streamed: "Half a reply".into(),
                     status: Some(TurnStatus::Thinking),
                     tools: vec!["terminal".into()],
+                    // An older daemon's snapshot: names only.
+                    calls: Vec::new(),
                 }],
                 ..Snapshot::default()
             },
@@ -1033,7 +1048,7 @@ mod tests {
                 turn_id: "t1".into(),
                 status: TurnStatus::ToolStarted {
                     name: "read_file".into(),
-                    summary: String::new(),
+                    summary: "notes.md".into(),
                     activity: None,
                 },
             },
@@ -1043,6 +1058,41 @@ mod tests {
             .clone()
             .expect("live");
         assert_eq!(live.tools.len(), 2);
+        // The new step's call sits at its own index, after the snapshot's.
+        assert_eq!(live.calls.len(), 2);
+        assert_eq!(live.calls[1].name, "read_file");
+        assert_eq!(live.calls[1].input, "notes.md");
+    }
+
+    /// A client that joins mid-turn shows each step as one that watched it.
+    #[test]
+    fn a_snapshot_brings_back_what_each_step_worked_on() {
+        let mut state = State::default();
+        state.apply(ServerFrame::Snapshot {
+            seq: 4,
+            state: Snapshot {
+                live_turns: vec![aidaemon_client_protocol::LiveTurnState {
+                    session_id: "app:synthetic-1".into(),
+                    turn_id: "t1".into(),
+                    started_at_ms: 10,
+                    tools: vec!["reading a file".into()],
+                    calls: vec![ToolCallInfo {
+                        name: "reading a file".into(),
+                        input: "src/synthetic.rs".into(),
+                        output: "120 lines".into(),
+                        kind: None,
+                    }],
+                    ..Default::default()
+                }],
+                ..Snapshot::default()
+            },
+        });
+        let live = state.sessions["app:synthetic-1"]
+            .live
+            .clone()
+            .expect("live");
+        assert_eq!(live.calls[0].input, "src/synthetic.rs");
+        assert_eq!(live.calls[0].output, "120 lines");
     }
 
     #[test]

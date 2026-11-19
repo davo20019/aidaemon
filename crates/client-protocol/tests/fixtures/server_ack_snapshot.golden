@@ -5,6 +5,13 @@
     "state": {
       "live_turns": [
         {
+          "calls": [
+            {
+              "input": "cargo test -q",
+              "kind": "run",
+              "name": "terminal"
+            }
+          ],
           "session_id": "app:synthetic-1",
           "started_at_ms": 1700000000000,
           "status": {

@@ -4172,6 +4172,13 @@
     "LiveTurnState": {
       "description": "A running turn as far as it has got: the text streamed so far, what it\nis doing now and the tools it started, in order.",
       "properties": {
+        "calls": {
+          "description": "What each of those tools was given and, once done, gave back, in\nthe same order (protocol 1.39), so a client that joins mid-turn shows\nthem as one that watched it. Empty from an older daemon.",
+          "items": {
+            "$ref": "#/$defs/ToolCallInfo"
+          },
+          "type": "array"
+        },
         "session_id": {
           "type": "string"
         },

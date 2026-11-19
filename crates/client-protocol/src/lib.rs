@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 38;
+pub const PROTOCOL_MINOR: u16 = 39;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2732,6 +2732,11 @@ pub struct LiveTurnState {
     pub status: Option<TurnStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// What each of those tools was given and, once done, gave back, in
+    /// the same order (protocol 1.39), so a client that joins mid-turn shows
+    /// them as one that watched it. Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<ToolCallInfo>,
 }
 
 /// How the daemon itself is doing, for the app's System area.

@@ -12,7 +12,7 @@ use aidaemon_channels::turns::{
     Delivered, TurnEnd, TurnFinish, TurnObserver, TurnStart, TurnSurface,
 };
 use aidaemon_client_protocol::{
-    Event, LiveTurnState, StepState, TaskState, TaskSummary, TurnState, TurnStatus,
+    Event, LiveTurnState, StepState, TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus,
 };
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::ApprovalResponse;
@@ -388,8 +388,33 @@ impl TurnObserver for GatewayObserver {
             if let Ok(mut live) = self.live.lock()
                 && let Some(state) = live.get_mut(&turn)
             {
-                if let TurnStatus::ToolStarted { name, .. } = &status {
-                    state.tools.push(name.clone());
+                match &status {
+                    TurnStatus::ToolStarted {
+                        name,
+                        summary,
+                        activity,
+                    } => {
+                        state.tools.push(name.clone());
+                        state.calls.push(ToolCallInfo {
+                            name: name.clone(),
+                            input: summary.clone(),
+                            output: String::new(),
+                            kind: *activity,
+                        });
+                    }
+                    // The latest call of that name still running, as the
+                    // client marks it.
+                    TurnStatus::ToolCompleted { name, summary } => {
+                        if let Some(call) = state
+                            .calls
+                            .iter_mut()
+                            .rev()
+                            .find(|c| &c.name == name && c.output.is_empty())
+                        {
+                            call.output = summary.clone();
+                        }
+                    }
+                    _ => {}
                 }
                 state.status = Some(status.clone());
             }
