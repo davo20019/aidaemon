@@ -602,13 +602,18 @@ impl ToolMutationEffects {
         let generic_required = required.intersects(Self::UNSPECIFIED);
         let generic_satisfied = !generic_required || !self.is_empty();
         let specific_required = Self(required.0 & !Self::UNSPECIFIED.0);
-        // A precisely typed local write (source file, derived output) is a
-        // workspace write: the broader requirement is satisfied by the more
-        // specific receipt, never the reverse.
+        // A precisely typed source write is also a workspace and a derived
+        // write. Workspace and derived writes satisfy each other: the plan's
+        // label is a hint, and the model cannot tell which one a tool
+        // records (live 2026-11-18: a generated image, recorded as a
+        // workspace write, never closed an item planned as a derived write,
+        // and the closeout held a delivered reply for five model calls).
+        // A source edit is still proven only by a source write.
         let widened = if self.intersects(Self::LOCAL_SOURCE_WRITE)
             || self.intersects(Self::LOCAL_DERIVED_WRITE)
+            || self.intersects(Self::LOCAL_WORKSPACE_WRITE)
         {
-            Self(self.0 | Self::LOCAL_WORKSPACE_WRITE.0)
+            Self(self.0 | Self::LOCAL_WORKSPACE_WRITE.0 | Self::LOCAL_DERIVED_WRITE.0)
         } else {
             self
         };
@@ -3524,4 +3529,22 @@ mod file_trust_tests {
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+#[cfg(test)]
+mod local_write_satisfaction_tests {
+    use super::ToolMutationEffects as E;
+
+    /// Workspace and derived writes close each other's plans; a source edit
+    /// is proven only by a source write.
+    #[test]
+    fn local_write_labels_satisfy_each_other_except_source() {
+        assert!(E::LOCAL_WORKSPACE_WRITE.satisfies(E::LOCAL_DERIVED_WRITE));
+        assert!(E::LOCAL_DERIVED_WRITE.satisfies(E::LOCAL_WORKSPACE_WRITE));
+        assert!(E::LOCAL_SOURCE_WRITE.satisfies(E::LOCAL_DERIVED_WRITE));
+        assert!(E::LOCAL_SOURCE_WRITE.satisfies(E::LOCAL_WORKSPACE_WRITE));
+        assert!(!E::LOCAL_WORKSPACE_WRITE.satisfies(E::LOCAL_SOURCE_WRITE));
+        assert!(!E::LOCAL_DERIVED_WRITE.satisfies(E::LOCAL_SOURCE_WRITE));
+        assert!(!E::LOCAL_WORKSPACE_WRITE.satisfies(E::EXTERNAL_DELIVERY));
+    }
 }
