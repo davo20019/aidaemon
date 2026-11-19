@@ -109,7 +109,7 @@ jobs:
             app: true
 
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             name: macos-aarch64
             cross: false
             app: true
