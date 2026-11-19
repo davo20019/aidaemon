@@ -828,6 +828,12 @@ impl TurnEngine<'_> {
             }
             UnattemptedWorkVerdict::StopUnmet => {
                 scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
+                // The demand's pass changed nothing: the reply it wrote
+                // answers the internal check, and the answer the demand
+                // interrupted is the one the owner should get.
+                if !aggregate.operations.values().any(|op| op.mutating) {
+                    scope.verdict.restore_interrupted_answer();
+                }
                 return sdk::StopDecision::AcceptUnmet {
                     unmet: record_not_attempted(scope, &aggregate),
                 };

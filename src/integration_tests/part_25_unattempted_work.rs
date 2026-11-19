@@ -568,6 +568,31 @@ async fn a_promise_after_reads_on_a_change_request_goes_back_once() {
     assert!(held_for_unattempted_work(&harness, session).await);
 }
 
+/// Live 2026-11-18: a story request was typed as a change, the run wrote the
+/// whole story, the demand sent it back, and its reply to the demand ("That's
+/// the story") replaced the story. A demand pass that changed nothing ships
+/// the answer it interrupted, not its reply to the internal check.
+#[tokio::test]
+async fn a_demand_pass_that_changes_nothing_keeps_the_interrupted_answer() {
+    let session = "owner-units-interrupted-answer";
+    let story = "Once upon a time, Mia's turtle ate a whole pizza. The end.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(story),
+        MockProvider::text_response("That's the story. Want another one?"),
+        MockProvider::text_response("UNREACHED"),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[(
+        "Make a story about a turtle",
+        true,
+    )])]);
+    let harness = unattempted_work_harness(provider).await;
+    let reply = ask_owner_turn(&harness, session, "Make a story about a turtle.").await;
+
+    assert!(held_for_unattempted_work(&harness, session).await);
+    assert!(reply.starts_with(story), "{reply}");
+    assert!(!reply.contains("That's the story"), "{reply}");
+}
+
 // ==================== The request is the owner's words ====================
 //
 // Live 2026-11-13, after `/clear`: "Have two parallel agents. One installing
