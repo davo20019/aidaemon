@@ -71,7 +71,7 @@ pub struct RequestOptions {
 /// sends them, so loading one never changes the request's tool block (and
 /// with it the whole cached prefix). Providers without that ignore it:
 /// [`ModelRequest::tools`] already holds every tool the model may call.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolSurfacing {
     /// Every deferred tool not loaded when the run segment started,
     /// name-sorted: declared hidden on every call of the segment.
@@ -82,7 +82,7 @@ pub struct ToolSurfacing {
 
 /// Deferred tools a run loaded, surfaced after the result of the call
 /// that answers `after_tool_call` (the batch whose call loaded them).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolLoad {
     pub after_tool_call: String,
     pub names: Vec<String>,

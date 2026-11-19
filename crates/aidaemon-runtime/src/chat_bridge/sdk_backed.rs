@@ -177,7 +177,10 @@ pub fn to_sdk_request(
             fallback_when_unspent: options.fallback_when_unspent,
             cache_key: options.cache_key.clone(),
         },
-        tool_surfacing: None,
+        tool_surfacing: options
+            .tool_surfacing
+            .as_ref()
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
     }
 }
 
@@ -400,6 +403,10 @@ pub fn to_chat_options(request: &sdk::ModelRequest) -> ChatOptions {
         single_attempt_fail_closed: request.options.single_attempt,
         fallback_when_unspent: request.options.fallback_when_unspent,
         cache_key: request.options.cache_key.clone(),
+        tool_surfacing: request
+            .tool_surfacing
+            .as_ref()
+            .and_then(|surfacing| serde_json::to_value(surfacing).ok()),
         ..Default::default()
     }
 }
@@ -679,6 +686,31 @@ pub fn to_daemon_error(error: sdk::ProviderError) -> ProviderError {
 mod tests {
     use super::*;
     use crate::chat_bridge::ProviderRecoveryRoute as Route;
+
+    /// The run's deferred tools survive the trip through the daemon's
+    /// provider stack, so a provider can keep its tool block fixed.
+    #[test]
+    fn tool_surfacing_survives_the_daemon_options() {
+        let surfacing = sdk::ToolSurfacing {
+            deferred: vec![sdk::ToolSpec {
+                name: "generate_image".into(),
+                description: "Draw".into(),
+                parameters: json!({"type": "object"}),
+            }],
+            loads: vec![sdk::ToolLoad {
+                after_tool_call: "c1".into(),
+                names: vec!["generate_image".into()],
+            }],
+        };
+        let request = sdk::ModelRequest {
+            model: "claude-opus-5-5".into(),
+            tool_surfacing: Some(surfacing.clone()),
+            ..Default::default()
+        };
+        let options = to_chat_options(&request);
+        let back = to_sdk_request("claude-opus-5-5", &[], &[], &options);
+        assert_eq!(back.tool_surfacing, Some(surfacing));
+    }
 
     #[test]
     fn requests_carry_options_tools_images_audio_and_signatures() {

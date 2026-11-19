@@ -124,6 +124,10 @@ pub struct ChatOptions {
     /// The conversation this call belongs to, for providers that route
     /// prompt-cache lookups by key.
     pub cache_key: Option<String>,
+    /// The run's deferred tools and where each was loaded: an
+    /// `aidaemon_core::ToolSurfacing` as JSON, carried through so a provider
+    /// that keeps one tool block can surface loads without changing it.
+    pub tool_surfacing: Option<serde_json::Value>,
 }
 
 /// Token usage statistics from an LLM API response.
