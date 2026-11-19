@@ -350,6 +350,8 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     let mut app = start();
     app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
+    // Earlier tests' requests stay in the sent list: wait for this one's.
+    let before = sent("get_settings");
     app.press("Settings: change how the daemon runs")?;
     app.wait_for("Reading settings…")?;
     feed([frame(
@@ -358,7 +360,7 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
     app.wait_for("Updated memory.retention_days = 30")?;
     // The settings arrive: a value edits as TOML in a code editor, and
     // another key is typed with the known keys suggested.
-    let id = wait_sent("get_settings")?;
+    let id = wait_sent_new("get_settings", before)?;
     let result = SETTINGS;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
@@ -546,8 +548,10 @@ fn settings_opens_the_phone_step_and_not_now_leaves_it() -> Result<(), String> {
     let mut app = start();
     app.wait_for("What can I help you with?")?;
     feed([Update::Connected]);
+    // Earlier tests' requests stay in the sent list: wait for this one's.
+    let before = sent("get_settings");
     app.press("Settings: change how the daemon runs")?;
-    let id = wait_sent("get_settings")?;
+    let id = wait_sent_new("get_settings", before)?;
     let result = SETTINGS;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{result}}}"#
