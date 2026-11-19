@@ -12,6 +12,10 @@
 #   APPSTORE_API_ISSUER_ID
 set -euo pipefail
 
+# Only the variable lines may reach stdout ($GITHUB_ENV): `security` prints
+# progress ("1 identity imported.") that GitHub rejects as an env line.
+exec 3>&1 1>&2
+
 if [ -z "${MACOS_CERTIFICATE_P12_BASE64:-}" ]; then
   echo "No signing certificate in this run: the package will be ad hoc signed." >&2
   exit 0
@@ -38,11 +42,11 @@ if [ -z "$identity" ]; then
   echo "The certificate holds no Developer ID Application identity." >&2
   exit 1
 fi
-echo "SIGN_IDENTITY=$identity"
+echo "SIGN_IDENTITY=$identity" >&3
 
 if [ -n "${APPSTORE_API_KEY_P8_BASE64:-}" ]; then
   echo "$APPSTORE_API_KEY_P8_BASE64" | base64 --decode >"$work/notary.p8"
-  echo "NOTARY_KEY_PATH=$work/notary.p8"
-  echo "NOTARY_KEY_ID=$APPSTORE_API_KEY_ID"
-  echo "NOTARY_ISSUER=$APPSTORE_API_ISSUER_ID"
+  echo "NOTARY_KEY_PATH=$work/notary.p8" >&3
+  echo "NOTARY_KEY_ID=$APPSTORE_API_KEY_ID" >&3
+  echo "NOTARY_ISSUER=$APPSTORE_API_ISSUER_ID" >&3
 fi
