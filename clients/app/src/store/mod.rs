@@ -2509,6 +2509,11 @@ impl Store {
         });
     }
 
+    /// When this device last sent a message (ms; 0 before any), tracked.
+    pub fn last_sent(&self) -> u64 {
+        self.sent_at.get()
+    }
+
     /// Send the draft of the selected conversation (or start one).
     pub fn submit(&self) {
         self.submit_placed(None);

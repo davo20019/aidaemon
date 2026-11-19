@@ -2206,7 +2206,10 @@ fn file_path(uri: &str) -> String {
 /// stops listening (the last words are kept). Shown only where speech can
 /// be recognized: the platform's recognizer, or the browser's.
 fn dictation(store: Store, terminal: bool) -> View {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use crate::link::Listening;
     use nsh_core::speech::{SpeechEvent, SpeechRequest};
@@ -2217,6 +2220,30 @@ fn dictation(store: Store, terminal: bool) -> View {
     }
     let listening = signal(false);
     let session: Stored<Option<Rc<RefCell<Listening>>>> = stored(None);
+    // Set when a send takes the draft: the session ends, and what the
+    // recognizer still reports is dropped, so it never refills the cleared
+    // composer.
+    let sent: Stored<Option<Rc<Cell<bool>>>> = stored(None);
+    let seen_send = Cell::new(untracked(|| store.last_sent()));
+    effect(move || {
+        let at = store.last_sent();
+        if at == seen_send.replace(at) {
+            return;
+        }
+        untracked(|| {
+            sent.with(|s| {
+                if let Some(s) = s {
+                    s.set(true)
+                }
+            });
+            session.with(|s| {
+                if let Some(s) = s {
+                    s.borrow().stop()
+                }
+            });
+            listening.set(false);
+        });
+    });
     // The session outlives the button pressed to start it (the button
     // becomes Stop): it runs under the composer.
     let owner = Owner::current();
@@ -2237,7 +2264,9 @@ fn dictation(store: Store, terminal: bool) -> View {
             format!("{} ", before.trim_end())
         };
         let running = Rc::new(RefCell::new(Listening::start(SpeechRequest::default())));
+        let dropped = Rc::new(Cell::new(false));
         session.replace(Some(running.clone()));
+        sent.replace(Some(dropped.clone()));
         listening.set(true);
         owner.run(|| {
             spawn(async move {
@@ -2245,6 +2274,7 @@ fn dictation(store: Store, terminal: bool) -> View {
                 loop {
                     let event = std::future::poll_fn(|cx| running.borrow_mut().poll_next(cx)).await;
                     match event {
+                        Some(SpeechEvent::Result { .. }) if dropped.get() => {}
                         Some(SpeechEvent::Result { text, .. }) => {
                             let draft = dictated.write(&store.draft(), &text);
                             store.set_draft(draft)
@@ -2259,8 +2289,12 @@ fn dictation(store: Store, terminal: bool) -> View {
                         Some(_) => {}
                     }
                 }
-                session.replace(None);
-                listening.set(false);
+                // A newer session may have started after a send ended this one.
+                if session.with(|s| s.as_ref().is_some_and(|s| Rc::ptr_eq(s, &running))) {
+                    session.replace(None);
+                    sent.replace(None);
+                    listening.set(false);
+                }
             })
         });
     };
