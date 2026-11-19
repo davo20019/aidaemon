@@ -327,7 +327,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows
-          cache-on-failure: true
+          # Saved from master only: a pull request's ~0.8 GB copy evicted
+          # master's caches from the 10 GB budget.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # SQLCipher links OpenSSL. vcpkg's build of it is kept between runs.
       - uses: actions/cache@v4
@@ -385,7 +387,9 @@ jobs:
         with:
           key: windows-app
           workspaces: clients/app
-          cache-on-failure: true
+          # Saved from master only: a pull request's ~0.8 GB copy evicted
+          # master's caches from the 10 GB budget.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build the app
         run: cargo build --locked --manifest-path clients/app/Cargo.toml
@@ -667,6 +671,14 @@ jobs:
         with:
           # GStreamer (gstreamer, -base, -app, -audio) and Wayland are linked by the app's media backend.
           packages: libgtk-4-dev clang pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
+      # The app is its own workspace; its GTK/nsh dependencies were rebuilt
+      # from scratch on every run.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-app
+          workspaces: clients/app
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
         run: cargo check --all-targets
       - name: Clippy
@@ -725,6 +737,12 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@${{ env.WASM_BINDGEN_CLI_VERSION }}
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-web-app
+          workspaces: clients/app
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Build web bundle
         working-directory: clients/app
         env:
@@ -761,6 +779,14 @@ jobs:
           prefix-key: v1-release
           key: ${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # ONNX Runtime's prebuilt library, shared with release.yml's builds.
+      - name: Cache ONNX Runtime download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ort.pyke.io
+          key: ort-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ort-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build release
         run: cargo build --release --features "browser"
