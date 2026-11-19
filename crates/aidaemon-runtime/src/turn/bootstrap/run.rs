@@ -569,11 +569,6 @@ async fn annotate_identity(
     }
 }
 
-/// How long bootstrap waits for the turn digest before starting the
-/// relationship router beside it: about the digest's p90 (0.8 s on
-/// 2026-11-14, against a 1.5 s deadline and a router p50 of 2 s).
-const ROUTER_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_millis(800);
-
 /// When the digest gave no answer, how long after the planner starts the
 /// request compiler may still finish (its p50 was 1.8 s on 2026-11-14).
 const COMPILER_WAIT_WITHOUT_DIGEST: std::time::Duration = std::time::Duration::from_secs(3);
@@ -1164,24 +1159,22 @@ pub async fn run_bootstrap(
                 );
                 let mut decide = std::pin::pin!(decide);
                 let mut router = std::pin::pin!(router);
-                // A digest slower than it almost always is (its p90) is
-                // likely to time out, and the router it stands in for takes
-                // seconds: from then the router runs beside it, so a timeout
-                // costs the turn the hedge delay instead of the whole
-                // deadline. A digest that still decides drops the router.
+                // The router runs beside the digest from the start: when
+                // the digest is unsure of the relationship (or fails), the
+                // router's seconds have already run instead of starting
+                // then (live 2026-11-18: a 0.2 s digest below threshold, then
+                // a 2.4 s router after it). A digest that decides drops it.
                 let mut routed = None;
-                let outcome = match tokio::time::timeout(ROUTER_HEDGE_AFTER, &mut decide).await {
-                    Ok(outcome) => outcome,
-                    Err(_) if relationship_needed => {
-                        tokio::select! {
-                            outcome = &mut decide => outcome,
-                            shaped = &mut router => {
-                                routed = Some(shaped);
-                                decide.await
-                            }
+                let outcome = if relationship_needed {
+                    tokio::select! {
+                        outcome = &mut decide => outcome,
+                        shaped = &mut router => {
+                            routed = Some(shaped);
+                            decide.await
                         }
                     }
-                    Err(_) => decide.await,
+                } else {
+                    decide.await
                 };
                 let decided =
                     crate::turn::task_planning::digest_relationship(&outcome, &digest.antecedents);

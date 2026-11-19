@@ -293,6 +293,28 @@ fn takes_structured_output(model: &str) -> bool {
 /// A JSON schema in the subset structured outputs accept: every object
 /// closed (`additionalProperties: false`), numeric, string and array-size
 /// constraints dropped (the caller still validates what it reads).
+/// Whether `schema` has an object that lists no properties and does not
+/// forbid extra ones. Structured outputs close every object, so such an
+/// object could only be `{}`: the schema is then left to the prompt.
+fn has_open_object(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            let is_object = map.get("type").is_some_and(|kind| {
+                kind == "object"
+                    || kind
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|k| k == "object"))
+            });
+            let open = is_object
+                && !map.contains_key("properties")
+                && map.get("additionalProperties") != Some(&Value::Bool(false));
+            open || map.values().any(has_open_object)
+        }
+        Value::Array(items) => items.iter().any(has_open_object),
+        _ => false,
+    }
+}
+
 fn output_schema(schema: &Value) -> Value {
     match schema {
         Value::Object(map) => {
@@ -494,6 +516,7 @@ fn build_body(
     }
     if let ResponseFormat::JsonSchema { schema, .. } = &request.options.response_format
         && takes_structured_output(&request.model)
+        && !has_open_object(schema)
     {
         if !body["output_config"].is_object() {
             body["output_config"] = json!({});
@@ -1175,5 +1198,38 @@ mod tool_surfacing_tests {
                 ("generate_image".to_string(), false),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod open_object_tests {
+    use super::{build_body, has_open_object};
+    use aidaemon_core::{Message, ModelRequest, ResponseFormat};
+    use serde_json::json;
+
+    /// An object schema listing no fields could only be answered `{}` once
+    /// closed, so it is not sent as structured output.
+    #[test]
+    fn an_open_object_schema_is_left_to_the_prompt() {
+        let open = json!({"type": "object", "additionalProperties": true});
+        assert!(has_open_object(&open));
+        assert!(has_open_object(
+            &json!({"type": "object", "properties": {"rest": {"type": "object"}}})
+        ));
+        assert!(!has_open_object(
+            &json!({"type": "object", "properties": {"n": {"type": "integer"}}})
+        ));
+        let mut request = ModelRequest {
+            model: "claude-haiku-5-5".into(),
+            messages: vec![Message::user("classify")],
+            ..Default::default()
+        };
+        request.options.response_format = ResponseFormat::JsonSchema {
+            name: "edge".into(),
+            schema: open,
+            strict: false,
+        };
+        let body = build_body(&request, 1024, false, None);
+        assert!(body["output_config"]["format"].is_null(), "{body}");
     }
 }
