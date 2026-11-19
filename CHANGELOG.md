@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-18
+
+### Added
+
+- **Read aloud.** Under a reply, beside Copy, Read aloud speaks it with the system's own voice: the browser's speech in the web app, `say` on macOS, Windows' built-in voices, and `spd-say` or `espeak-ng` on Linux (no button when a Linux desktop has neither). Code blocks are said as "(code)" and links as their text.
+- **Replies stream into the app.** The web and desktop apps show a reply as the model writes it instead of when the turn ends.
+- **Steps survive a reconnect.** A client that reconnects during a turn sees what each step was given and gave back, not just its label. Client protocol 1.39.
+
+### Changed
+
+- **Claude keeps its prompt cache.** Deferred tools are declared up front, so loading one no longer rewrites Anthropic's prompt cache: after `load_tools`, calls read about 30k tokens from the cache instead of writing them again. The fixed prefix (tools, system prompt) is cached for an hour, so a reply after a pause or a new conversation within the hour reads it too; the conversation tail keeps the five-minute cache.
+- **Faster turn setup.** The relationship router runs beside the turn digest instead of after it (setup about 2.7 s to 1.8 s on Claude).
+- The app uses nsh 0.6.0 from crates.io instead of a fork; 0.6.0 includes every fix the fork carried.
+
+### Fixed
+
+- **Claude through the catalog's Anthropic URL.** A base URL ending in `/v1` (the catalog's form) posted to `/v1/v1/messages` and got a 404 on every call.
+- **Gemini tool calls.** Tool results go back as user-role parts, because current Gemini models refuse the `function` role. Before, a turn with a tool call fell back again and again (an image tool ran ten times or more) and never replied.
+- **Turn planning on Claude.** The relationship router and the request compiler asked for an open object schema, which Claude could only answer with `{}`, so both answers were dropped.
+- **A delivered image ends the turn.** A generated image now satisfies a planned file write, so closeout no longer held a delivered reply for five more model calls and recorded the run as partial.
+- **No needless closing call.** `track_requirements` marks items its tool calls already proved, so the model no longer spends a call ticking them off.
+- **Stories and other replies that are the result.** A request to write something in the conversation (a story) is no longer sent back for unmade changes, and a closeout pass that changes nothing keeps the answer it interrupted. A held stop tells the model its reply was not delivered.
+- **Dictation stops at Send.** Sending a message ends dictation, so speech no longer keeps writing into the composer.
+
 ## [0.20.0] - 2026-11-18
 
 ### Added

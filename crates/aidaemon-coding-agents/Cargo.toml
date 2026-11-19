@@ -16,7 +16,7 @@ exclude = ["tests/", "benches/"]
 publish = false
 
 [dependencies]
-aidaemon-core = { version = "0.20.0", path = "../aidaemon-core" }
+aidaemon-core = { version = "0.21.0", path = "../aidaemon-core" }
 async-trait = "0.1"
 dirs = "7"
 serde_json = "1"

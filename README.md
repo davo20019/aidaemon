@@ -398,7 +398,7 @@ For external APIs, the built-in auth flow is:
 
 ## Build your own agent (SDK)
 
-The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every SDK crate shares one version (0.20.0); the public-contract crates are semver-checked in CI.
+The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every SDK crate shares one version (0.21.0); the public-contract crates are semver-checked in CI.
 
 The SDK is not on crates.io yet, so depend on the repository:
 

@@ -12,6 +12,12 @@ stability promise.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-18
+
+### Added
+- `aidaemon-core`: `ModelRequest::tool_surfacing` (`ToolSurfacing`): the run's deferred tools and where each was loaded, so a provider can declare them up front and keep its prompt cache. A breaking change for code that builds `ModelRequest` without `..Default::default()`.
+- `aidaemon-events`: `ChatOptions::tool_surfacing` carries it through the daemon's model calls.
+
 ### Changed
 - `aidaemon-sdk`: `provider_from_env` takes the first catalog provider whose key is set (still `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY` with `OPENAI_BASE_URL`, then `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `XAI_API_KEY`, ...), so a key other than the first two no longer fails with `NoProvider`.
 - `aidaemon-providers`: `tokio` is a plain dependency (it was only with `chatgpt-login`).
