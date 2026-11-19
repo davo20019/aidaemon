@@ -1144,7 +1144,7 @@ primary = "gpt-4o"
         // A helper reports no time at all: its run's time is the daemon's
         // measurement, added under its report.
         assert!(
-            include_str!("../specialists/_executor_base.md")
+            include_str!("../crates/aidaemon-runtime/specialists/_executor_base.md")
                 .contains(aidaemon_runtime::specialists::compose::OWN_DURATION_RULE)
         );
     }

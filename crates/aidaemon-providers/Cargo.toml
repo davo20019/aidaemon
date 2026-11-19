@@ -15,7 +15,6 @@ categories = ["api-bindings", "asynchronous"]
 # Integration tests need dev-dependencies that are not published with the crate;
 # planning notes and the API snapshot stay in the repository.
 exclude = ["tests/", "benches/"]
-publish = false
 
 [features]
 # The ChatGPT subscription login (`chatgpt_login`): PKCE sign-in, the loopback

@@ -13,7 +13,6 @@ readme = "README.md"
 keywords = ["agent", "llm", "tools", "macro", "proc-macro"]
 categories = ["development-tools::procedural-macro-helpers"]
 exclude = ["tests/"]
-publish = false
 
 [lib]
 proc-macro = true

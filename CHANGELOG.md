@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The SDK on crates.io.** The 30 `aidaemon-*` SDK crates are published to crates.io for the first time, at 0.21.0, and the daemon (`cargo install aidaemon`) builds from them.
 - **Read aloud.** Under a reply, beside Copy, Read aloud speaks it with the system's own voice: the browser's speech in the web app, `say` on macOS, Windows' built-in voices, and `spd-say` or `espeak-ng` on Linux (no button when a Linux desktop has neither). Code blocks are said as "(code)" and links as their text.
 - **Replies stream into the app.** The web and desktop apps show a reply as the model writes it instead of when the turn ends.
 - **Steps survive a reconnect.** A client that reconnects during a turn sees what each step was given and gave back, not just its label. Client protocol 1.39.
@@ -29,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A delivered image ends the turn.** A generated image now satisfies a planned file write, so closeout no longer held a delivered reply for five more model calls and recorded the run as partial.
 - **No needless closing call.** `track_requirements` marks items its tool calls already proved, so the model no longer spends a call ticking them off.
 - **Stories and other replies that are the result.** A request to write something in the conversation (a story) is no longer sent back for unmade changes, and a closeout pass that changes nothing keeps the answer it interrupted. A held stop tells the model its reply was not delivered.
+- **Dictation in the Mac app.** The downloaded app explains its microphone and speech recognition use and its signature allows audio input, so dictation is offered there; before, the packaged app could not dictate.
 - **Dictation stops at Send.** Sending a message ends dictation, so speech no longer keeps writing into the composer.
 
 ## [0.20.0] - 2026-11-18

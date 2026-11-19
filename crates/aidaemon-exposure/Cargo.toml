@@ -12,7 +12,6 @@ documentation = "https://docs.rs/aidaemon-exposure"
 readme = "README.md"
 keywords = ["agent", "tunnel", "gateway", "tailscale", "cloudflare"]
 categories = ["network-programming", "asynchronous"]
-publish = false
 
 [features]
 # Exposes `aidaemon_exposure::testing::FakeAdapter`.

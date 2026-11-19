@@ -15,7 +15,6 @@ categories = ["network-programming", "asynchronous"]
 # Integration tests need dev-dependencies that are not published with the crate;
 # planning notes and the API snapshot stay in the repository.
 exclude = ["tests/", "benches/"]
-publish = false
 
 [dependencies]
 aidaemon-channels = { version = "0.21.0", path = "../aidaemon-channels" }

@@ -15,7 +15,6 @@ categories = ["network-programming", "encoding"]
 # Integration tests (golden fixtures, the schema staleness check) read files
 # outside the crate; they stay in the repository.
 exclude = ["tests/", "benches/"]
-publish = false
 
 [[bin]]
 name = "export-client-schema"

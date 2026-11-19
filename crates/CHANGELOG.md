@@ -12,7 +12,7 @@ stability promise.
 
 ## [Unreleased]
 
-## [0.21.0] - 2026-11-18
+## [0.21.0] - 2026-11-18: first release on crates.io
 
 ### Added
 - `aidaemon-core`: `ModelRequest::tool_surfacing` (`ToolSurfacing`): the run's deferred tools and where each was loaded, so a provider can declare them up front and keep its prompt cache. A breaking change for code that builds `ModelRequest` without `..Default::default()`.
@@ -93,7 +93,7 @@ stability promise.
 - Phase 9.3: `aidaemon-work::scheduler`, the goal cycle (due mandate reviews, scheduled goals and reminders, stuck and orphaned tasks, escalated recoveries, goal notifications) as `GoalCycle` and `GoalCycleService`, over `SchedulerStore`. The host gives its agent runtime (`TaskLeadHost`), channels (`NoticeDelivery`) and presentation (`WorkPresenter`). `goals::{tasks_satisfy_goal_completion, goal_completion_summary_indicates_not_finished, is_terminal_task_status}`; `goal_tokens::SCHEDULED_AUTONOMOUS_*`.
 - Phase 9.3: `aidaemon-work::triggers` holds the trigger event bus (`event_bus`, `EventSender`, `EventReceiver`), `TriggerSettings` and, behind the new `email-trigger` feature, the IMAP `TriggerManager`.
 
-## [0.20.0]: first release (not yet published)
+## [0.20.0]: tagged with the daemon, not published to crates.io
 
 ### aidaemon-core (public contract)
 - Hook-driven agent loop: `Agent` builder, streaming `Provider` with `Retry`, `Tool` with annotations, access manifests and timeout hints, five hook points.

@@ -14,7 +14,6 @@ keywords = ["agent", "gateway", "websocket", "llm"]
 categories = ["network-programming", "asynchronous"]
 # Integration tests need dev-dependencies that are not published with the crate.
 exclude = ["tests/", "benches/"]
-publish = false
 
 [dependencies]
 dunce = "1.0"

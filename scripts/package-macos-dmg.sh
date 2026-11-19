@@ -62,6 +62,8 @@ cat >"$app/Contents/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key><string>${version}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>AIdaemon listens to the microphone while you dictate a message.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>AIdaemon turns what you dictate into the text of your message.</string>
 </dict>
 </plist>
 EOF
@@ -95,7 +97,10 @@ sign() {
   fi
 }
 sign --identifier ai.aidaemon "$helper"
-sign --identifier ai.aidaemon.app "$app"
+# The app dictates (microphone and speech recognition): its Info.plist
+# explains both, and the hardened runtime allows audio input only with this
+# entitlement.
+sign --identifier ai.aidaemon.app --entitlements "$here/scripts/macos/AIdaemon.entitlements" "$app"
 codesign --verify --deep --strict "$app"
 
 # The disk image: the app and a link to Applications to drag it onto. The

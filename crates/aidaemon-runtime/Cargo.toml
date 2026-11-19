@@ -15,7 +15,6 @@ categories = ["asynchronous"]
 # Integration tests need dev-dependencies that are not published with the crate;
 # planning notes and the API snapshot stay in the repository.
 exclude = ["tests/", "benches/"]
-publish = false
 
 [features]
 # Test-only helpers that dependents' test builds need, as `cfg(test)` cannot

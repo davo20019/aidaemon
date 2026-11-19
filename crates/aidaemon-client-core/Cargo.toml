@@ -12,7 +12,6 @@ readme = "README.md"
 keywords = ["agent", "client", "websocket"]
 categories = ["network-programming"]
 exclude = ["tests/"]
-publish = false
 
 [dependencies]
 aidaemon-client-protocol = { version = "0.21.0", path = "../client-protocol" }

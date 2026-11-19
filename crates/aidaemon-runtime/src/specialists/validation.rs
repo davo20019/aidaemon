@@ -96,7 +96,7 @@ mod tests {
             }
         }
         let mut checked = 0;
-        for entry in std::fs::read_dir(root.join("specialists"))
+        for entry in std::fs::read_dir(root.join("crates/aidaemon-runtime/specialists"))
             .unwrap()
             .flatten()
         {

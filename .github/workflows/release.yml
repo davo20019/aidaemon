@@ -361,7 +361,9 @@ jobs:
     needs: release
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # crates.io lets an account publish a few new crates at once, then one
+    # every ten minutes: a release that adds many crates takes hours.
+    timeout-minutes: 350
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -459,10 +461,21 @@ jobs:
             local log_file
             log_file="$(mktemp)"
 
-            set +e
-            cargo publish -p "$package" --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$log_file"
-            local status=${PIPESTATUS[0]}
-            set -e
+            local status
+            for try in $(seq 1 40); do
+              set +e
+              cargo publish -p "$package" --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$log_file"
+              status=${PIPESTATUS[0]}
+              set -e
+              # crates.io's limit on new crates: cargo reports only the HTTP
+              # status in its error text (a machine format), so wait and retry.
+              if [ "$status" -ne 0 ] && grep -qE '\b429\b|Too Many Requests' "$log_file"; then
+                echo "crates.io rate limit on ${package} (try ${try}); waiting 10 minutes."
+                sleep 600
+                continue
+              fi
+              break
+            done
 
             if [ "$status" -ne 0 ] && ! grep -Eqi 'already (uploaded|exists|been uploaded)|crate version .* is already uploaded' "$log_file"; then
               echo "::error::cargo publish failed for ${package} ${expected_version}."
@@ -517,32 +530,36 @@ jobs:
           # over their non-dev dependencies, and add the crate to the
           # sdk-docs and msrv lists in ci.yml.
           SDK_CRATES=(
-            aidaemon-macros
-            aidaemon-client-protocol
-            aidaemon-secrets
             aidaemon-core
             aidaemon-agents
-            aidaemon-channels
-            aidaemon-decisions
-            aidaemon-eval
-            aidaemon-mcp
             aidaemon-policies
-            aidaemon-providers
-            aidaemon-store-sqlite
+            aidaemon-secrets
             aidaemon-tools
+            aidaemon-events
+            aidaemon-channels
             aidaemon-channel-discord
             aidaemon-channel-slack
             aidaemon-channel-telegram
-            aidaemon-events
+            aidaemon-client-protocol
+            aidaemon-client-core
+            aidaemon-store-sqlite
+            aidaemon-surfaces
             aidaemon-client-gateway
-            aidaemon-tool-browser
+            aidaemon-decisions
+            aidaemon-exposure
+            aidaemon-mcp
             aidaemon-memory
-            aidaemon-skills
-            aidaemon-terminal-bridge
             aidaemon-work
             aidaemon-nodes
+            aidaemon-providers
+            aidaemon-coding-agents
+            aidaemon-skills
             aidaemon-runtime
+            aidaemon-eval
+            aidaemon-macros
             aidaemon-sdk
+            aidaemon-terminal-bridge
+            aidaemon-tool-browser
           )
           WORKSPACE_VERSION="${{ steps.sdk_gate.outputs.version }}"
           for crate in "${SDK_CRATES[@]}"; do
