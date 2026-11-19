@@ -2519,6 +2519,25 @@ async fn deferred_tools_are_sent_once_loaded() {
         "{index}"
     );
     assert_eq!(names(1), vec!["load_tools", "echo"]);
+    // For providers that keep one tool block: every deferred tool on each
+    // call, and the load placed after the call that made it.
+    let surfacing = |index: usize| provider.requests()[index].tool_surfacing.clone().unwrap();
+    let deferred: Vec<String> = surfacing(0)
+        .deferred
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(deferred, vec!["count", "echo"]);
+    assert_eq!(surfacing(1).deferred, surfacing(0).deferred);
+    assert!(surfacing(0).loads.is_empty());
+    assert_eq!(
+        surfacing(1).loads,
+        vec![aidaemon_core::ToolLoad {
+            after_tool_call: "c1".into(),
+            names: vec!["echo".into()],
+        }]
+    );
+    assert_eq!(surfacing(2).loads, surfacing(1).loads);
     assert!(
         tool_messages(&out.state)
             .iter()
@@ -2547,4 +2566,9 @@ async fn deferred_tools_are_sent_once_loaded() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(second, vec!["load_tools", "count", "echo"]);
+    // `echo` was loaded before this run: an ordinary tool, not deferred.
+    let surfacing = provider.requests()[1].tool_surfacing.clone().unwrap();
+    let deferred: Vec<String> = surfacing.deferred.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(deferred, vec!["count"]);
+    assert_eq!(surfacing.loads[0].names, vec!["count"]);
 }

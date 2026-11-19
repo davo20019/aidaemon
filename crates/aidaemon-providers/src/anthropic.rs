@@ -199,11 +199,23 @@ impl Provider for Anthropic {
         &'a self,
         request: &'a ModelRequest,
     ) -> BoxStream<'a, Result<StreamEvent, ProviderError>> {
+        let mut headers = self.headers.clone();
+        if surfaces_tools(request) {
+            let beta = match headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+                Some(existing) if !existing.is_empty() => {
+                    format!("{existing},{INLINE_TOOLS_BETA}")
+                }
+                _ => INLINE_TOOLS_BETA.to_string(),
+            };
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&beta) {
+                headers.insert("anthropic-beta", value);
+            }
+        }
         let http = self
             .client
             .post(&self.endpoint)
             .timeout(self.timeout)
-            .headers(self.headers.clone())
+            .headers(headers)
             .header("accept", "text/event-stream")
             .json(&self.request_body(request));
         drive(http, MessagesDecoder::default())
@@ -225,6 +237,37 @@ fn input_schema(parameters: &Value) -> Value {
             .or_insert_with(|| Value::String("object".to_string()));
     }
     schema
+}
+
+/// The beta that keeps `tools` fixed while tools are added mid-conversation.
+const INLINE_TOOLS_BETA: &str = "inline-tools-2026-09-15";
+
+/// Whether `model` takes `tool_addition` blocks and `defer_loading` tools
+/// (the inline-tools beta): the Claude 5 family except Sonnet 5, and Opus
+/// 4.8. Model ids are a machine format; matched by family prefix.
+fn takes_tool_additions(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    [
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-opus-4-8",
+    ]
+    .iter()
+    .any(|family| model.starts_with(family))
+}
+
+/// Whether this request declares its deferred tools hidden and surfaces
+/// loaded ones in the transcript, so the tool block (the front of the
+/// cached prefix) never changes when a tool is loaded.
+fn surfaces_tools(request: &ModelRequest) -> bool {
+    request
+        .tool_surfacing
+        .as_ref()
+        .is_some_and(|s| !s.deferred.is_empty())
+        && takes_tool_additions(&request.model)
 }
 
 /// Whether `model` constrains its reply to a JSON schema
@@ -394,6 +437,45 @@ fn build_body(
     if caching && let Some(last) = messages.last_mut() {
         tail_breakpoint(last);
     }
+    // Loaded deferred tools are surfaced where they were loaded; one whose
+    // anchor is gone (the transcript was edited) is sent as an ordinary tool.
+    let surfacing = request
+        .tool_surfacing
+        .as_ref()
+        .filter(|_| surfaces_tools(request));
+    let mut unanchored: Vec<&str> = Vec::new();
+    if let Some(surfacing) = surfacing {
+        for load in &surfacing.loads {
+            let at = messages.iter().position(|m| {
+                m["role"] == "user"
+                    && m["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            is_tool_result(b) && b["tool_use_id"] == load.after_tool_call.as_str()
+                        })
+                    })
+            });
+            let names = load
+                .names
+                .iter()
+                .filter(|name| surfacing.deferred.iter().any(|d| &d.name == *name));
+            match at {
+                Some(at) => {
+                    let blocks: Vec<Value> = names
+                        .map(|name| {
+                            json!({
+                                "type": "tool_addition",
+                                "tool": {"type": "tool_reference", "name": name},
+                            })
+                        })
+                        .collect();
+                    if !blocks.is_empty() {
+                        messages.insert(at + 1, json!({"role": "system", "content": blocks}));
+                    }
+                }
+                None => unanchored.extend(names.map(String::as_str)),
+            }
+        }
+    }
     let mut body = json!({
         "model": request.model,
         "max_tokens": max_tokens,
@@ -422,19 +504,44 @@ fn build_body(
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
-    if !request.tools.is_empty() {
-        let mut tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|spec| {
-                json!({
-                    "name": spec.name,
-                    "description": spec.description,
-                    "input_schema": input_schema(&spec.parameters),
-                })
-            })
-            .collect();
-        if caching && let Some(last) = tools.last_mut() {
+    let wire_tool = |spec: &aidaemon_core::ToolSpec| {
+        json!({
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": input_schema(&spec.parameters),
+        })
+    };
+    let mut tools: Vec<Value> = match surfacing {
+        // The ordinary tools, then every deferred tool hidden: the same
+        // block on every call, whatever the run loads.
+        Some(surfacing) => {
+            let deferred = |name: &str| surfacing.deferred.iter().any(|d| d.name == name);
+            let mut tools: Vec<Value> = request
+                .tools
+                .iter()
+                .filter(|spec| !deferred(&spec.name))
+                .map(wire_tool)
+                .collect();
+            tools.extend(surfacing.deferred.iter().map(|spec| {
+                let mut tool = wire_tool(spec);
+                if !unanchored.contains(&spec.name.as_str()) {
+                    tool["defer_loading"] = json!(true);
+                }
+                tool
+            }));
+            tools
+        }
+        None => request.tools.iter().map(wire_tool).collect(),
+    };
+    if !tools.is_empty() {
+        // A deferred tool is not rendered into the prompt: the breakpoint
+        // goes on the last tool that is.
+        if caching
+            && let Some(last) = tools
+                .iter_mut()
+                .rev()
+                .find(|tool| tool.get("defer_loading").is_none())
+        {
             last["cache_control"] = ephemeral();
         }
         body["tools"] = Value::Array(tools);
@@ -940,5 +1047,133 @@ mod endpoint_tests {
                 "{base}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_surfacing_tests {
+    use super::build_body;
+    use aidaemon_core::{Message, ModelRequest, ToolCall, ToolLoad, ToolSpec, ToolSurfacing};
+    use serde_json::{Value, json};
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("{name} tool"),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    /// A run that loaded `generate_image` after call `c1`.
+    fn request(model: &str, loads: Vec<ToolLoad>) -> ModelRequest {
+        let loaded = !loads.is_empty();
+        let mut tools = vec![spec("read_file"), spec("load_tools")];
+        if loaded {
+            tools.push(spec("generate_image"));
+        }
+        ModelRequest {
+            model: model.into(),
+            messages: vec![
+                Message::system("You are a synthetic test agent."),
+                Message::user("draw a cat"),
+                Message::assistant(
+                    "",
+                    vec![ToolCall::new(
+                        "c1",
+                        "load_tools",
+                        json!({"names": ["generate_image"]}),
+                    )],
+                ),
+                Message::tool_result("c1", "loaded"),
+            ],
+            tools,
+            tool_surfacing: Some(ToolSurfacing {
+                deferred: vec![spec("browser"), spec("generate_image")],
+                loads,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn tool_names(body: &Value) -> Vec<(String, bool)> {
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap().to_string(),
+                    t.get("defer_loading").is_some(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_tool_block_is_the_same_before_and_after_a_load() {
+        let before = build_body(&request("claude-opus-5-5", vec![]), 1024, true, None);
+        let load = ToolLoad {
+            after_tool_call: "c1".into(),
+            names: vec!["generate_image".into()],
+        };
+        let after = build_body(&request("claude-opus-5-5", vec![load]), 1024, true, None);
+        assert_eq!(before["tools"], after["tools"]);
+        assert_eq!(
+            tool_names(&after),
+            [
+                ("read_file".to_string(), false),
+                ("load_tools".to_string(), false),
+                ("browser".to_string(), true),
+                ("generate_image".to_string(), true),
+            ]
+        );
+        // The breakpoint is on the last rendered tool, not a hidden one.
+        assert!(after["tools"][1].get("cache_control").is_some());
+        let messages = after["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "system");
+        assert_eq!(
+            last["content"],
+            json!([{"type": "tool_addition",
+                    "tool": {"type": "tool_reference", "name": "generate_image"}}])
+        );
+        assert_eq!(
+            messages[messages.len() - 2]["content"][0]["type"],
+            "tool_result"
+        );
+    }
+
+    #[test]
+    fn a_load_whose_anchor_is_gone_is_an_ordinary_tool() {
+        let load = ToolLoad {
+            after_tool_call: "edited-away".into(),
+            names: vec!["generate_image".into()],
+        };
+        let body = build_body(&request("claude-opus-5-5", vec![load]), 1024, false, None);
+        assert!(tool_names(&body).contains(&("generate_image".to_string(), false)));
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["role"] != "system")
+        );
+    }
+
+    #[test]
+    fn a_model_without_the_beta_gets_only_the_loaded_tools() {
+        let load = ToolLoad {
+            after_tool_call: "c1".into(),
+            names: vec!["generate_image".into()],
+        };
+        let body = build_body(&request("claude-sonnet-5", vec![load]), 1024, false, None);
+        assert_eq!(
+            tool_names(&body),
+            [
+                ("read_file".to_string(), false),
+                ("load_tools".to_string(), false),
+                ("generate_image".to_string(), false),
+            ]
+        );
     }
 }

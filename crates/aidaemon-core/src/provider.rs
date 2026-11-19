@@ -67,6 +67,27 @@ pub struct RequestOptions {
     pub cache_key: Option<String>,
 }
 
+/// Deferred tools as a provider that can surface tools mid-conversation
+/// sends them, so loading one never changes the request's tool block (and
+/// with it the whole cached prefix). Providers without that ignore it:
+/// [`ModelRequest::tools`] already holds every tool the model may call.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ToolSurfacing {
+    /// Every deferred tool not loaded when the run segment started,
+    /// name-sorted: declared hidden on every call of the segment.
+    pub deferred: Vec<ToolSpec>,
+    /// Those loaded since, in load order.
+    pub loads: Vec<ToolLoad>,
+}
+
+/// Deferred tools a run loaded, surfaced after the result of the call
+/// that answers `after_tool_call` (the batch whose call loaded them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolLoad {
+    pub after_tool_call: String,
+    pub names: Vec<String>,
+}
+
 /// One provider call. Hooks may edit it in [`crate::Hook::before_model`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelRequest {
@@ -77,6 +98,10 @@ pub struct ModelRequest {
     pub tool_choice: ToolChoice,
     pub max_output_tokens: Option<u32>,
     pub options: RequestOptions,
+    /// The run's deferred tools, for providers that keep a fixed tool block
+    /// and surface loaded tools in the transcript; `None` for a run with no
+    /// deferred tools.
+    pub tool_surfacing: Option<ToolSurfacing>,
 }
 
 /// Token accounting for one call or a whole run.

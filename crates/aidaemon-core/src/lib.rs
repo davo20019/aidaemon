@@ -79,7 +79,7 @@ pub use outcome::{CallResult, FinishOutcome, RunOutcome, RunStatus};
 pub use project::ProjectRef;
 pub use provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, RequestOptions, ResponseFormat, Retry,
-    StreamEvent, ToolChoice, ToolSpec, Usage, collect_stream,
+    StreamEvent, ToolChoice, ToolLoad, ToolSpec, ToolSurfacing, Usage, collect_stream,
 };
 pub use quota::{Cooldown, QuotaGuard};
 pub use receipt::{InvocationStage, Receipt, ReceiptStatus};

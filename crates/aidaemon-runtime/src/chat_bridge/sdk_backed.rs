@@ -177,6 +177,7 @@ pub fn to_sdk_request(
             fallback_when_unspent: options.fallback_when_unspent,
             cache_key: options.cache_key.clone(),
         },
+        tool_surfacing: None,
     }
 }
 

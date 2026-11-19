@@ -66,6 +66,7 @@ impl ProviderDecider {
                 reasoning_effort: Some("low".into()),
                 ..Default::default()
             },
+            tool_surfacing: None,
         }
     }
 }

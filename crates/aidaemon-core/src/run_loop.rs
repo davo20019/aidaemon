@@ -57,6 +57,12 @@ pub(crate) struct Driver<'a> {
     /// tool waits; `None` when the run has no resolver (the call then goes
     /// unanswered).
     resolver: Option<&'a dyn crate::agent::InterruptResolver>,
+    /// Deferred tools loaded when this segment started: sent as ordinary
+    /// tools. Set at the segment's first request.
+    loaded_at_start: Option<std::collections::BTreeSet<String>>,
+    /// Deferred tools loaded during this segment, each placed after the
+    /// tool result the request ended with when it was first seen.
+    tool_loads: Vec<crate::provider::ToolLoad>,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -155,6 +161,8 @@ impl<'a> Driver<'a> {
             own_declines,
             report_run_end: true,
             resolver: None,
+            loaded_at_start: None,
+            tool_loads: Vec::new(),
         }
     }
 
@@ -303,6 +311,7 @@ impl<'a> Driver<'a> {
             let turn = self.state.turn;
             self.emit(Event::TurnStarted { turn }).await?;
             self.apply_transcript_edits().await?;
+            self.note_tool_loads();
             let mut request = self.build_request();
             {
                 let ctx = self.ctx();
@@ -1744,6 +1753,50 @@ impl<'a> Driver<'a> {
             .is_some_and(|f| f.done.iter().any(|id| id == call_id))
     }
 
+    /// Record deferred tools loaded since the last request, anchored to the
+    /// tool result the transcript now ends with (the batch that loaded
+    /// them). Without such a result they join the ordinary tools.
+    fn note_tool_loads(&mut self) {
+        if self.agent.deferred.is_empty() {
+            return;
+        }
+        let loaded: std::collections::BTreeSet<String> = self
+            .agent
+            .loaded
+            .names()
+            .into_iter()
+            .filter(|name| self.agent.deferred.contains(name))
+            .collect();
+        let Some(at_start) = &mut self.loaded_at_start else {
+            self.loaded_at_start = Some(loaded);
+            return;
+        };
+        let new: Vec<String> = loaded
+            .iter()
+            .filter(|name| {
+                !at_start.contains(*name)
+                    && !self.tool_loads.iter().any(|load| load.names.contains(name))
+            })
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        match self
+            .state
+            .messages
+            .last()
+            .filter(|m| m.role == crate::Role::Tool)
+            .and_then(|m| m.tool_call_id.clone())
+        {
+            Some(after_tool_call) => self.tool_loads.push(crate::provider::ToolLoad {
+                after_tool_call,
+                names: new,
+            }),
+            None => at_start.extend(new),
+        }
+    }
+
     fn build_request(&self) -> ModelRequest {
         let mut messages = Vec::with_capacity(self.state.messages.len() + 1);
         if !self.agent.instructions.is_empty() {
@@ -1765,6 +1818,21 @@ impl<'a> Driver<'a> {
                 .collect(),
             tool_choice: ToolChoice::Auto,
             max_output_tokens: self.agent.max_output_tokens,
+            tool_surfacing: self.loaded_at_start.as_ref().map(|at_start| {
+                crate::provider::ToolSurfacing {
+                    deferred: self
+                        .agent
+                        .specs
+                        .iter()
+                        .filter(|spec| {
+                            self.agent.deferred.contains(&spec.name)
+                                && !at_start.contains(&spec.name)
+                        })
+                        .cloned()
+                        .collect(),
+                    loads: self.tool_loads.clone(),
+                }
+            }),
             ..Default::default()
         }
     }
