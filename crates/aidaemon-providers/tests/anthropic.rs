@@ -110,14 +110,19 @@ async fn request_body_shape_and_cache_markers() {
         body["system"],
         json!([
             {"type": "text", "text": "Stable instructions."},
-            {"type": "text", "text": "More stable context.", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "More stable context.", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
         ])
     );
     let tools = body["tools"].as_array().unwrap();
     assert_eq!(tools[0]["name"], "read");
     assert_eq!(tools[0]["input_schema"], tool("read").parameters);
     assert!(tools[0].get("cache_control").is_none());
-    assert_eq!(tools[1]["cache_control"], json!({"type": "ephemeral"}));
+    // The fixed prefix (system, tools) is kept an hour; the conversation
+    // tail keeps the five-minute default.
+    assert_eq!(
+        tools[1]["cache_control"],
+        json!({"type": "ephemeral", "ttl": "1h"})
+    );
     assert_eq!(body["tool_choice"], json!({"type": "any"}));
 
     let messages = body["messages"].as_array().unwrap();
