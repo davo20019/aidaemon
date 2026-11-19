@@ -300,7 +300,9 @@ impl Tool for TrackRequirementsTool {
          for reads/verifications. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
-         Mark items 'completed' as you finish them, 'skipped' if one turned out to have nothing \
+         An item with mutation_effects, targets or requires_observation is marked done by the \
+         result of the tool call that does it: do not call this again just to tick it. Mark \
+         'completed' only an item with none of those, 'skipped' if one turned out to have nothing \
          to do (you looked and nothing matched, there was nothing to cancel), 'failed' if you \
          tried one and it did not work, or 'deferred' if you will not do one: the run may then \
          end, but a failed, deferred or removed item is reported as not done, never as done. \
@@ -312,9 +314,11 @@ impl Tool for TrackRequirementsTool {
          job's end marks it done or failed. \
          If the user adds, changes or cancels work while you are working, pass the revised list \
          before continuing. \
-         Before your final answer, pass the list once more with outcome: done, partial, or blocked; \
-         the request is reported that way, and only receipts can confirm done. When it stopped \
-         because this machine ran out of disk, Docker disk or memory, add short_of. \
+         When your tool calls did every item, just give your final answer: the receipts report \
+         it done, and a closing call adds nothing. When some of it was not done, pass the list \
+         once more before your final answer with outcome partial or blocked; the request is \
+         reported that way. When it stopped because this machine ran out of disk, Docker disk or \
+         memory, add short_of. \
          Use needs_owner only when the work cannot start without the owner's choice (for \
          example, earlier results exist and redoing the work would replace or duplicate them): \
          your final answer is then that one question. Earlier results are never by themselves \
@@ -434,7 +438,7 @@ impl Tool for TrackRequirementsTool {
                     },
                     "outcome": {
                         "type": "string",
-                        "description": "Your verdict on the whole request, set on your last call before the final answer. needs_owner: the work waits on the owner's choice, and your final answer is that question. nothing_new: a scheduled run found nothing changed since its previous run, so there is nothing new to tell the owner.",
+                        "description": "Your verdict on the whole request, on your last call before the final answer. Needed only when it is not fully done (partial, blocked, needs_owner) or for nothing_new; work your tool calls finished needs no closing call. needs_owner: the work waits on the owner's choice, and your final answer is that question. nothing_new: a scheduled run found nothing changed since its previous run, so there is nothing new to tell the owner.",
                         "enum": aidaemon_events::ExecutorClaimedOutcome::PROTOCOL_NAMES
                     },
                     "short_of": {
