@@ -1,0 +1,56 @@
+name: apt install
+description: >-
+  Install Ubuntu packages with a cache of the downloaded .debs, short network
+  timeouts and bounded retries, so a slow or failing Ubuntu mirror costs a
+  minute or two instead of a hung job.
+
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Key the package cache
+      id: key
+      shell: bash
+      run: |
+        set -euo pipefail
+        list="$(printf '%s\n' ${{ inputs.packages }} | sort -u | tr '\n' ' ')"
+        echo "hash=$(printf '%s' "$list" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        echo "release=$(. /etc/os-release && echo "$VERSION_ID")" >> "$GITHUB_OUTPUT"
+
+    - name: Restore downloaded packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.apt-archives
+        key: apt-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.release }}-${{ steps.key.outputs.hash }}
+
+    - name: Install packages
+      shell: bash
+      run: |
+        set -uo pipefail
+        archives="$HOME/.apt-archives"
+        mkdir -p "$archives/partial"
+        # Retries and timeouts for every apt download; the archive cache lives
+        # where the runner user can save it (apt downloads as root here).
+        sudo tee /etc/apt/apt.conf.d/80-ci >/dev/null <<EOF
+        Acquire::Retries "5";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        APT::Sandbox::User "root";
+        Dir::Cache::Archives "$archives";
+        EOF
+        for attempt in 1 2 3; do
+          if timeout 600 sudo apt-get update -q \
+            && timeout 600 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q ${{ inputs.packages }}; then
+            sudo chown -R "$(id -u):$(id -g)" "$archives"
+            rm -rf "$archives/partial" "$archives/lock"
+            exit 0
+          fi
+          echo "::warning::apt attempt ${attempt} failed (Ubuntu mirror trouble?); retrying in 30s."
+          sleep 30
+        done
+        echo "::error::apt could not install: ${{ inputs.packages }}"
+        exit 1

@@ -7,6 +7,9 @@ on:
   push:
     tags:
       - 'v*'
+  # tag-release.yml starts it on the tag it creates (its token's tag push
+  # starts no workflow); run it on a tag ref.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,25 +28,59 @@ jobs:
   quality-gate:
     name: Quality gate
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v5
 
+      # CI already ran every test on this exact commit (the pull request or
+      # the master push): reuse its result instead of spending most of an
+      # hour repeating it. A commit no CI run passed gets the full suite here.
+      - name: Find a passing CI run for this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=20" \
+              -q '[.workflow_runs[] | {status, conclusion}]')"
+            if echo "$runs" | jq -e 'any(.conclusion == "success")' >/dev/null; then
+              echo "CI passed on ${GITHUB_SHA}; skipping the test rerun."
+              echo "green=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # A run still going on this commit (master pushed with the tag):
+            # wait for it rather than repeating it.
+            if ! echo "$runs" | jq -e 'any(.status != "completed")' >/dev/null; then
+              break
+            fi
+            sleep 60
+          done
+          echo "::notice::No passing CI run on ${GITHUB_SHA}; running the test suite here."
+          echo "green=false" >> "$GITHUB_OUTPUT"
+
       # The toolchain (and clippy/rustfmt) comes from rust-toolchain.toml.
       - name: Install Rust
+        if: steps.ci.outputs.green != 'true'
         run: rustup toolchain install && rustc --version
 
       - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+        if: steps.ci.outputs.green != 'true'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libdbus-1-dev pkg-config libssl-dev
 
       - name: Install Codex sandbox adapter
+        if: steps.ci.outputs.green != 'true'
         run: |
           npm install --global "@openai/codex@${CODEX_CLI_VERSION}"
           codex --version
 
       - name: Configure Linux sandbox namespaces
+        if: steps.ci.outputs.green != 'true'
         run: |
           set -euo pipefail
           current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
@@ -56,12 +93,14 @@ jobs:
           fi
 
       - name: Free disk space
+        if: steps.ci.outputs.green != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h
 
       - name: Cache cargo registry
+        if: steps.ci.outputs.green != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -71,12 +110,14 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-release-gate-v2-
 
       - name: Cache fastembed model
+        if: steps.ci.outputs.green != 'true'
         uses: actions/cache@v4
         with:
           path: .fastembed_cache
           key: fastembed-allminilml6v2-v2
 
       - name: Run tests
+        if: steps.ci.outputs.green != 'true'
         run: cargo test --all-features
 
   build:
@@ -119,6 +160,20 @@ jobs:
         uses: actions/checkout@v5
 
       # The toolchain comes from rust-toolchain.toml.
+      # ONNX Runtime's prebuilt library (ort-sys, through fastembed), fetched
+      # from pyke's CDN by every build; a truncated download failed the
+      # v0.21.0 Linux build.
+      - name: Cache ONNX Runtime download
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/ort.pyke.io
+          # Same key as ci.yml's build check, so a release restores the copy
+          # master saved (a tag's own caches are not shared).
+          key: ort-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ort-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Rust
         run: |
           rustup toolchain install
@@ -131,11 +186,10 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux' && !matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+        uses: ./.github/actions/apt-install
+        with:
           # The app's desktop backend links GTK 4 (see the `app` job in ci.yml).
-          sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev clang
+          packages: libdbus-1-dev pkg-config libssl-dev libgtk-4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev clang
 
       # Intel Macs: ONNX Runtime from a pinned static library (see the script).
       - name: ONNX Runtime (Intel Mac)
@@ -278,13 +332,11 @@ jobs:
           rustc --version
 
       - name: Install wasm C toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-18 llvm-18
+        uses: ./.github/actions/apt-install
+        with:
           # nsh package also compiles native crates (glib-sys and the rest of
           # the GTK 4 stack), as the Linux app job does.
-          sudo apt-get install -y libgtk-4-dev clang pkg-config \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
+          packages: clang-18 llvm-18 libgtk-4-dev clang pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
 
       - name: Install nsh CLI
         run: |
@@ -398,40 +450,28 @@ jobs:
             exit 1
           fi
 
-      - name: Check the SDK crates are ready to publish
-        id: sdk_gate
+      # The daemon must pin exactly the SDK version being published.
+      - name: Check the daemon's SDK pin
         run: |
           set -euo pipefail
-
-          # Publishing is permanent and owner-approved: the SDK crates carry
-          # `publish = false` until the owner removes it. While any does, this
-          # workflow skips the SDK crates and the daemon (cargo would refuse
-          # them anyway) and still ships binaries and Homebrew.
-          ready=true
-          if grep -lE '^publish = false' crates/aidaemon-*/Cargo.toml | grep -q .; then
-            ready=false
-          fi
-
           version="$(sed -nE '/^\[workspace\.package\]/,/^\[/ s/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
           test -n "$version"
-
-          if [ "$ready" = "true" ]; then
-            # The daemon must pin exactly the version being published.
-            if ! grep -qE "^aidaemon-core = \{ version = \"=${version}\"" Cargo.toml; then
-              echo "::error::The daemon's aidaemon-core pin does not match workspace version ${version}."
-              exit 1
-            fi
+          if ! grep -qE "^aidaemon-core = \{ version = \"=${version}\"" Cargo.toml; then
+            echo "::error::The daemon's aidaemon-core pin does not match workspace version ${version}."
+            exit 1
           fi
 
-          echo "ready=$ready" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Linux dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libdbus-1-dev pkg-config libssl-dev
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
-
-      - name: Publish workspace crates in dependency order
+      # Every publishable crate in dependency order (scripts/publish-order.py
+      # reads it from cargo metadata, so a new crate needs no list here).
+      # `--no-verify`: CI's "Package crates" job already built every crate
+      # from its packaged sources on this commit; rebuilding 30+ crates one
+      # by one here took most of the publish time.
+      - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -442,78 +482,8 @@ jobs:
             exit 1
           fi
 
-          manifest_version() {
-            awk '
-              /^\[package\]$/ { in_package=1; next }
-              /^\[/ && in_package { exit }
-              in_package && /^version = / {
-                gsub(/^version = "/, "", $0)
-                gsub(/"$/, "", $0)
-                print
-                exit
-              }
-            ' "$1"
-          }
-
-          publish_package() {
-            local package="$1"
-            local expected_version="$2"
-            local log_file
-            log_file="$(mktemp)"
-
-            local status
-            for try in $(seq 1 40); do
-              set +e
-              cargo publish -p "$package" --token "$CARGO_REGISTRY_TOKEN" 2>&1 | tee "$log_file"
-              status=${PIPESTATUS[0]}
-              set -e
-              # crates.io's limit on new crates: cargo reports only the HTTP
-              # status in its error text (a machine format), so wait and retry.
-              if [ "$status" -ne 0 ] && grep -qE '\b429\b|Too Many Requests' "$log_file"; then
-                echo "crates.io rate limit on ${package} (try ${try}); waiting 10 minutes."
-                sleep 600
-                continue
-              fi
-              break
-            done
-
-            if [ "$status" -ne 0 ] && ! grep -Eqi 'already (uploaded|exists|been uploaded)|crate version .* is already uploaded' "$log_file"; then
-              echo "::error::cargo publish failed for ${package} ${expected_version}."
-              exit "$status"
-            fi
-
-            for attempt in $(seq 1 30); do
-              local reported_version
-              reported_version="$(
-                CRATE_NAME="$package" python3 -c 'import json, os, urllib.request; url = "https://crates.io/api/v1/crates/" + os.environ["CRATE_NAME"]; payload = json.load(urllib.request.urlopen(url, timeout=20)); print(payload["crate"]["max_version"])' 2>/dev/null || true
-              )"
-
-              if [ "$reported_version" = "$expected_version" ]; then
-                echo "crates.io reports ${package} ${reported_version}."
-                return 0
-              fi
-
-              echo "Attempt ${attempt}/30: crates.io reports ${package} ${reported_version:-unavailable}; waiting for ${expected_version}."
-              sleep 10
-            done
-
-            echo "::error::crates.io did not report ${package} ${expected_version} within 5 minutes."
-            exit 1
-          }
-
-          PROTOCOL_VERSION="$(manifest_version crates/node-protocol/Cargo.toml)"
-          SDK_VERSION="$(manifest_version crates/node-sdk/Cargo.toml)"
-
-          publish_package "aidaemon-node-protocol" "$PROTOCOL_VERSION"
-          publish_package "aidaemon-node-sdk" "$SDK_VERSION"
-
-          if [ "${{ steps.sdk_gate.outputs.ready }}" != "true" ]; then
-            echo "::notice::SDK crates still have publish = false; not publishing them or the daemon to crates.io. GitHub binaries and Homebrew are unaffected."
-            exit 0
-          fi
-
-          # Skip a version that is already on crates.io (a daemon release that
-          # does not change the SDK re-uses the published crates).
+          # Already on crates.io (an earlier, interrupted run, or a crate whose
+          # own version did not change): skip it.
           already_published() {
             local code
             code="$(curl -s -o /dev/null -w '%{http_code}' \
@@ -522,55 +492,43 @@ jobs:
             [ "$code" = "200" ]
           }
 
-          # SDK crates in dependency order (each after everything it depends on;
-          # dev-dependencies do not count). The shared version is
-          # [workspace.package] version. To regenerate after adding a crate or
-          # a dependency edge: topologically sort the `aidaemon-*` packages of
-          #   cargo metadata --format-version 1 --no-deps
-          # over their non-dev dependencies, and add the crate to the
-          # sdk-docs and msrv lists in ci.yml.
-          SDK_CRATES=(
-            aidaemon-core
-            aidaemon-agents
-            aidaemon-policies
-            aidaemon-secrets
-            aidaemon-tools
-            aidaemon-events
-            aidaemon-channels
-            aidaemon-channel-discord
-            aidaemon-channel-slack
-            aidaemon-channel-telegram
-            aidaemon-client-protocol
-            aidaemon-client-core
-            aidaemon-store-sqlite
-            aidaemon-surfaces
-            aidaemon-client-gateway
-            aidaemon-decisions
-            aidaemon-exposure
-            aidaemon-mcp
-            aidaemon-memory
-            aidaemon-work
-            aidaemon-nodes
-            aidaemon-providers
-            aidaemon-coding-agents
-            aidaemon-skills
-            aidaemon-runtime
-            aidaemon-eval
-            aidaemon-macros
-            aidaemon-sdk
-            aidaemon-terminal-bridge
-            aidaemon-tool-browser
-          )
-          WORKSPACE_VERSION="${{ steps.sdk_gate.outputs.version }}"
-          for crate in "${SDK_CRATES[@]}"; do
-            if already_published "$crate" "$WORKSPACE_VERSION"; then
-              echo "$crate $WORKSPACE_VERSION is already on crates.io; skipping."
+          publish_package() {
+            local package="$1" log_file status
+            log_file="$(mktemp)"
+            for try in $(seq 1 40); do
+              set +e
+              cargo publish --locked --no-verify -p "$package" 2>&1 | tee "$log_file"
+              status=${PIPESTATUS[0]}
+              set -e
+              # crates.io's rate limit (new crates: one every ten minutes;
+              # new versions: a burst, then one a minute). cargo reports only
+              # the HTTP status in its error text (a machine format), so wait
+              # for the time crates.io names, or a minute, and retry.
+              if [ "$status" -ne 0 ] && grep -qE '\b429\b|Too Many Requests' "$log_file"; then
+                wait_s=60
+                if grep -qE 'new crates' "$log_file"; then wait_s=600; fi
+                echo "crates.io rate limit on ${package} (try ${try}); waiting ${wait_s}s."
+                sleep "$wait_s"
+                continue
+              fi
+              break
+            done
+            if [ "$status" -ne 0 ] && ! grep -Eqi 'already (uploaded|exists|been uploaded)' "$log_file"; then
+              echo "::error::cargo publish failed for ${package}."
+              exit "$status"
+            fi
+          }
+
+          versions="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | "\(.name) \(.version)"')"
+          for package in $(scripts/publish-order.py --check); do
+            version="$(awk -v n="$package" '$1 == n { print $2 }' <<<"$versions")"
+            if already_published "$package" "$version"; then
+              echo "${package} ${version} is already on crates.io; skipping."
               continue
             fi
-            publish_package "$crate" "$WORKSPACE_VERSION"
+            publish_package "$package"
           done
-
-          publish_package "aidaemon" "${{ steps.release_meta.outputs.crate_version }}"
 
   update-homebrew:
     name: Update Homebrew Tap

@@ -1,0 +1,74 @@
+name: Tag release
+
+# A push to master whose Cargo.toml version has no tag yet is a release: once
+# CI has passed on that commit (its pull request run or the master run), tag
+# it vX.Y.Z and start release.yml. Nobody has to wait for CI and push the tag
+# by hand. A tag pushed by hand still starts release.yml as before.
+on:
+  push:
+    branches: [master]
+    paths: [Cargo.toml]
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag the new version
+    runs-on: ubuntu-latest
+    # CI takes about an hour; allow for a slow run or a rerun.
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -nE '/^\[package\]/,/^\[/ s/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+          test -n "$version"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CI on this commit, then tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} already exists; nothing to release."
+            exit 0
+          fi
+
+          # A failed CI job can be rerun; this keeps waiting while any run on
+          # the commit is still going, and stops once all have finished
+          # without a pass.
+          for i in $(seq 1 220); do
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&per_page=20" \
+              -q '[.workflow_runs[] | {status, conclusion}]')"
+            if echo "$runs" | jq -e 'any(.conclusion == "success")' >/dev/null; then
+              break
+            fi
+            if [ "$i" -gt 5 ] && ! echo "$runs" | jq -e 'any(.status != "completed")' >/dev/null; then
+              echo "::error::CI did not pass on ${GITHUB_SHA}; not tagging ${TAG}. Rerun CI's failed jobs, then rerun this workflow."
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "$runs" | jq -e 'any(.conclusion == "success")' >/dev/null \
+            || { echo "::error::Timed out waiting for CI on ${GITHUB_SHA}."; exit 1; }
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} was pushed by hand meanwhile; its push started the release."
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f ref="refs/tags/${TAG}" -f sha="${GITHUB_SHA}" >/dev/null
+          echo "Tagged ${TAG} at ${GITHUB_SHA}."
+          # A tag created with this workflow's token starts no workflow on its
+          # own, so start the release on the tag explicitly.
+          gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"
+          echo "Started release.yml on ${TAG}."
