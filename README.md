@@ -63,7 +63,7 @@ Telegram owners can also run `/terminal [agent] [working_dir]` to launch the hos
 ### Tools & Agents
 40+ built-in tools including terminal execution, file operations, git, web browser (headless Chrome), web search, HTTP requests with auth profiles, and MCP server integration. Tools declare their risk level — read-only operations run freely, side effects require approval.
 
-Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude, Gemini, Codex, Aider — auto-discovered).
+Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude, Gemini, Codex, Aider, Antigravity — auto-discovered). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first, so every one can be judged.
 
 `manage_api` onboards an API from its OpenAPI spec or GraphQL schema and derives a safe verification probe from it (GraphQL reuses introspection when no `verify_url` is given). Credentials stay in the OS keychain by default, or in the configured `.env` file when `AIDAEMON_NO_KEYCHAIN=1`.
 
