@@ -434,9 +434,11 @@ pub struct RequestCompletionContract {
 pub struct RequestWorkUnit {
     /// The result, briefly, as the owner put it.
     pub what: String,
-    /// It asks for new work or a change (something made, installed, changed
-    /// or removed), not only for a look at what is there. A look covers
-    /// such a unit only as context: it is done by the change itself.
+    /// Its result lives outside the conversation once done (something
+    /// installed, changed or removed, a file or record written, something
+    /// scheduled or sent elsewhere), so only a change does it: a look
+    /// covers it only as context. False when the reply itself is the result
+    /// (an answer, a report, or any text written for the owner there).
     pub asks_change: bool,
 }
 

@@ -91,7 +91,45 @@ const UNREPORTED_JOB_POLL: std::time::Duration = std::time::Duration::from_milli
 const UNREPORTED_JOB_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 impl TurnEngine<'_> {
+    /// Judge a stop. A stop sent back for more work holds the reply the
+    /// model was about to give: the kernel ships only the run's last reply,
+    /// so the held one never reaches the user. Every `Continue` says so,
+    /// whichever check sent it, so the model's next reply stands on its own
+    /// (live 2026-11-18: a story was held for a check, and the next reply
+    /// said "the full story is in my message just above").
     pub async fn serve_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
+        let (inner, verdict) = tokio::sync::oneshot::channel();
+        let StopCheck {
+            completed_results,
+            failed_without_success,
+            final_text,
+            reply,
+        } = check;
+        self.judge_sdk_stop(
+            scope,
+            StopCheck {
+                completed_results,
+                failed_without_success,
+                final_text,
+                reply: inner,
+            },
+        )
+        .await;
+        let Ok(decision) = verdict.await else {
+            return;
+        };
+        let _ = reply.send(match decision {
+            sdk::StopDecision::Continue { message } => sdk::StopDecision::Continue {
+                message: format!(
+                    "{message}\n\n{}",
+                    crate::turn::system_directives::HELD_REPLY_NOT_DELIVERED
+                ),
+            },
+            other => other,
+        });
+    }
+
+    async fn judge_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
         if let Some(ended) = self.sdk_wait_for_unreported_jobs(scope).await {
             let _ = check.reply.send(sdk::StopDecision::Continue {
                 message: crate::turn::system_directives::SystemDirective::BackgroundJobHeld {
@@ -828,12 +866,6 @@ impl TurnEngine<'_> {
             }
             UnattemptedWorkVerdict::StopUnmet => {
                 scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
-                // The demand's pass changed nothing: the reply it wrote
-                // answers the internal check, and the answer the demand
-                // interrupted is the one the owner should get.
-                if !aggregate.operations.values().any(|op| op.mutating) {
-                    scope.verdict.restore_interrupted_answer();
-                }
                 return sdk::StopDecision::AcceptUnmet {
                     unmet: record_not_attempted(scope, &aggregate),
                 };

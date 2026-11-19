@@ -569,16 +569,17 @@ async fn a_promise_after_reads_on_a_change_request_goes_back_once() {
 }
 
 /// Live 2026-11-18: a story request was typed as a change, the run wrote the
-/// whole story, the demand sent it back, and its reply to the demand ("That's
-/// the story") replaced the story. A demand pass that changed nothing ships
-/// the answer it interrupted, not its reply to the internal check.
+/// whole story, the demand sent it back, and the next reply said "the full
+/// story is in my message just above": the story was never delivered. A
+/// held stop tells the model its reply was not delivered, so the reply that
+/// ships stands on its own.
 #[tokio::test]
-async fn a_demand_pass_that_changes_nothing_keeps_the_interrupted_answer() {
-    let session = "owner-units-interrupted-answer";
+async fn a_held_stop_tells_the_model_its_reply_was_not_delivered() {
+    let session = "owner-units-held-reply";
     let story = "Once upon a time, Mia's turtle ate a whole pizza. The end.";
     let provider = MockProvider::with_responses(vec![
         MockProvider::text_response(story),
-        MockProvider::text_response("That's the story. Want another one?"),
+        MockProvider::text_response(story),
         MockProvider::text_response("UNREACHED"),
     ])
     .with_owner_units(vec![MockProvider::owner_units(&[(
@@ -590,7 +591,12 @@ async fn a_demand_pass_that_changes_nothing_keeps_the_interrupted_answer() {
 
     assert!(held_for_unattempted_work(&harness, session).await);
     assert!(reply.starts_with(story), "{reply}");
-    assert!(!reply.contains("That's the story"), "{reply}");
+    let calls = harness.provider.call_log.lock().await;
+    let demand = serde_json::to_string(&calls[1].messages).unwrap();
+    assert!(
+        demand.contains("the user has not received it"),
+        "{demand}"
+    );
 }
 
 // ==================== The request is the owner's words ====================

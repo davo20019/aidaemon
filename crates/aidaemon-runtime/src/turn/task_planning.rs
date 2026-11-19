@@ -361,10 +361,9 @@ pub async fn compile_owner_units(
          A rule for how the work is done (follow the project's guide, use this branch, don't push, keep the tests passing) is not a unit: \
          it qualifies the units it applies to. Checking or committing the work is a unit only when the owner asks for that result itself. \
          A check the owner wants passing (tests, typecheck, lint) is never asks_change: it is a look at the work, and a passing run of it is its result. \
-         asks_change is true when the owner wants the world to be different afterwards: something made, installed, set up, changed or removed, \
-         a result that does not exist until the work is done. It is false when the owner wants only to know or see something: to look, check, find, measure, report or be shown. \
-         Text the owner wants said or written in this conversation (a message for someone here, a mention or ping of someone here, a reply, a draft, a translation, a story, poem, joke, essay, summary or plan made up for the owner to read) is never asks_change: the reply is its result. \
-         Sending it to another chat, person or place is asks_change. \
+         asks_change is true when the result the owner wants lives outside this conversation once the work is done: \
+         something installed, set up, changed or removed, a file or record written, something scheduled, or anything sent or published to another chat, person or place. \
+         It is false when the reply itself is the result: anything the owner wants to know, see, check or be shown, and anything they want written for them here, whatever kind of text it is. \
          Judge what the owner wants done, not what may already exist: asking for something to be made is new work even if something like it exists, \
          and only the owner can say that what exists will do. \
          If the message answers an earlier question, the units are the earlier request as this answer settles it. \
@@ -595,9 +594,9 @@ pub fn turn_digest_request(
     request.insert(
         digest_keys::ASKS_CHANGE,
         Question::yes_no_described(
-            "Does the current user message ask for anything to be made, changed, installed, set up, removed, sent, published or scheduled? A reply that approves, answers or settles an earlier request asks for what that request asked.",
-            "Yes: carrying it out changes something or sends something, in any language.",
-            "No: it only asks to look at, find, check, count, explain or report something, or asks for nothing (thanks, a greeting, a remark).",
+            "Does carrying out the current user message leave a result outside this conversation: something installed, set up, changed or removed, a file or record written, something scheduled, or something sent or published elsewhere? A reply that approves, answers or settles an earlier request asks for what that request asked.",
+            "Yes: carrying it out changes or sends something outside this conversation, in any language.",
+            "No: the reply itself is the result (an answer, a check, a report, or any text written for the user here), or it asks for nothing (thanks, a greeting, a remark).",
         ),
     );
     TurnDigestRequest {

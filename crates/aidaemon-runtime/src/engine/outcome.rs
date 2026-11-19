@@ -157,12 +157,6 @@ pub struct TurnVerdict {
     /// more work. If the model then replies with nothing, this ships instead
     /// of a generic activity summary.
     pub interrupted_answer: std::sync::Mutex<Option<String>>,
-    /// Set when a closeout demand's pass ended with the demanded work still
-    /// unattempted and nothing changed in the run: the reply written after
-    /// the demand answers an internal check the owner never saw, so the
-    /// interrupted answer ships instead (live 2026-11-18: a requested story
-    /// was replaced by "That's the story" after a demand pass).
-    pub restore_interrupted_answer: std::sync::atomic::AtomicBool,
     /// The handoff reply for a run that stopped while a job it launched was
     /// still running: that job's notifier delivers the result, so the run
     /// tells the user the work continues instead of shipping the model's own
@@ -189,11 +183,6 @@ impl TurnVerdict {
         if let Ok(mut interrupted) = self.interrupted_answer.lock() {
             *interrupted = Some(answer);
         }
-    }
-
-    pub fn restore_interrupted_answer(&self) {
-        self.restore_interrupted_answer
-            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The reply the user gets, with its status and outcome: [`Self::resolve`],
@@ -236,11 +225,8 @@ impl TurnVerdict {
                 .lock()
                 .ok()
                 .and_then(|answer| answer.clone());
-            let restore = self
-                .restore_interrupted_answer
-                .load(std::sync::atomic::Ordering::Relaxed);
             let reply = match interrupted {
-                Some(answer) if restore || reply.trim().is_empty() => answer,
+                Some(answer) if reply.trim().is_empty() => answer,
                 _ => reply,
             };
             finalize_reply(&reply, tool_calls, note.as_deref())

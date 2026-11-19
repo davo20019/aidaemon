@@ -1,3 +1,8 @@
+/// Appended to every directive that sends a stop back for more work: the
+/// reply the model was about to give is held, never delivered, and the run's
+/// next reply replaces it.
+pub const HELD_REPLY_NOT_DELIVERED: &str = "[SYSTEM] Your previous reply was held for this check and the user has not received it. Your next reply without tool calls replaces it, so make that reply complete on its own: include in full anything from the held reply the user still needs, and do not refer to it as already sent.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SystemDirective {
     /// The current owner turn is structurally bound to an unresolved mandate
