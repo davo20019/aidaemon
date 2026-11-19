@@ -179,9 +179,10 @@ async fn anthropic_agent_tool_round_trip() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
     let body = &requests[1].body;
+    // The fixed prefix is kept an hour (the conversation tail, five minutes).
     assert_eq!(
         body["system"][0]["cache_control"],
-        json!({"type": "ephemeral"})
+        json!({"type": "ephemeral", "ttl": "1h"})
     );
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 3);
