@@ -3,7 +3,7 @@ use crate::llm::side_calls::SideCall;
 use aidaemon_core as sdk;
 use aidaemon_events::text::truncate_str;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::warn;
 
 /// The memory policy event's reason for a turn the user opted out of
@@ -161,15 +161,56 @@ pub fn memory_policy_compiled_data(
 /// daemon's semantic producers should not depend on prompt spelling.  A
 /// permissive named schema requests the same object protocol while leaving
 /// the domain parser as the authoritative validator for optional fields.
-fn typed_object_response_format(name: &str) -> sdk::ResponseFormat {
+/// The reply's JSON schema, with every field the parser reads. Providers
+/// that enforce a schema close every object, so an open one would let them
+/// answer only `{}` (live 2026-11-18: on Claude every relationship and
+/// request-units reply came back empty and was dropped).
+fn typed_object_response_format(name: &str, schema: Value) -> sdk::ResponseFormat {
     sdk::ResponseFormat::JsonSchema {
         name: name.to_string(),
-        schema: json!({
-            "type": "object",
-            "additionalProperties": true
-        }),
-        strict: false,
+        schema,
+        strict: true,
     }
+}
+
+fn task_relationship_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "integer"},
+            "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+            "request_relationship": {
+                "type": "string",
+                "enum": ["new_request", "continuation", "clarification_answer", "courtesy"]
+            },
+            "antecedent_user_message_id": {"type": ["string", "null"]}
+        },
+        "required": ["schema_version", "confidence", "request_relationship", "antecedent_user_message_id"],
+        "additionalProperties": false
+    })
+}
+
+fn request_units_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "integer"},
+            "units": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "what": {"type": "string"},
+                        "asks_change": {"type": "boolean"}
+                    },
+                    "required": ["what", "asks_change"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["schema_version", "units"],
+        "additionalProperties": false
+    })
 }
 
 /// Resolve only the typed dialogue edge. This deliberately cannot produce
@@ -206,7 +247,10 @@ pub async fn generate_task_relationship(
         messages: vec![sdk::Message::system(system), sdk::Message::user(prompt)],
         max_output_tokens: Some(1024),
         options: sdk::RequestOptions {
-            response_format: typed_object_response_format("task_relationship"),
+            response_format: typed_object_response_format(
+                "task_relationship",
+                task_relationship_schema(),
+            ),
             reasoning_effort: Some("low".to_string()),
             // Failover across the chain's models stays on: a used-up
             // primary quota must not cost the turn its relationship edge.
@@ -335,7 +379,7 @@ pub async fn compile_owner_units(
         ],
         max_output_tokens: Some(1024),
         options: sdk::RequestOptions {
-            response_format: typed_object_response_format("request_units"),
+            response_format: typed_object_response_format("request_units", request_units_schema()),
             reasoning_effort: Some("low".to_string()),
             single_attempt: false,
             fallback_when_unspent: false,
