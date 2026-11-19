@@ -1643,7 +1643,7 @@ fn search_hits(store: Store) -> View {
                     let who = if hit.role == "user" {
                         "You"
                     } else {
-                        "AIdaemon"
+                        "AIDaemon"
                     };
                     let title = store.title(&hit.session_id);
                     let title = if store.is_archived(&hit.session_id) {

@@ -520,7 +520,7 @@ async fn natural_language_stewardship_drafts_then_creates_a_mandate_not_a_schedu
 async fn cadence_inside_draft_only_mandate_request_is_model_directed_not_scheduled() {
     let draft_args = json!({
         "action": "draft",
-        "objective": "Assess current public AIdaemon work and draft at most one grounded X post",
+        "objective": "Assess current public AIDaemon work and draft at most one grounded X post",
         "operation_scopes": [{
             "tool": "http_request",
             "operation": "POST",

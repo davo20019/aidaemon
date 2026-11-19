@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The name is AIDaemon.** The app, messages, help text, README and crate descriptions say AIDaemon. Commands, crate names and the domain stay lowercase `aidaemon`; release file names (`AIdaemon-macos-*.dmg`, `AIdaemon.app`) and the Windows scheduled task keep their current names so downloads and existing installs keep working.
+- **`--help` and the installer point to the current commands.** `aidaemon --help` lists `setup`, `service install` and `service uninstall`, and marks `install-service` as the legacy system-wide service. `install.sh` suggests `aidaemon-app`, `aidaemon setup` and `aidaemon service install` instead of the old setup wizard and `install-service` (#21).
+- **README:** the SDK installs from crates.io (`aidaemon-sdk = "0.21"`) and the daemon with `cargo install --locked aidaemon`.
+
+### Fixed
+
+- **`aidaemon app` and `aidaemon tui` work on a fresh install.** With no config yet they open `aidaemon-app`, whose first run sets AIDaemon up, instead of failing with "The Client Gateway is off". `app`, `tui`, `pair`, `web` and `client-token` also find `~/.aidaemon/config.toml` when run from another folder (#20).
+- **Settings nothing reads now say so.** `[provider] streaming` and `[people] auto_extract`, `auto_extract_categories` and `restricted_categories` log a warning at startup; `restricted_categories` never kept any category out of memory (#22).
+- **An API key sent over plain HTTP is flagged.** An OpenAI-compatible provider whose `base_url` is plain `http://` to another machine logs a warning at startup, since the key crosses the network unencrypted. Local servers (`localhost`, `127.0.0.1`, `::1`) and keyless servers are unaffected (#23).
+
 ## [0.21.0] - 2026-11-18
 
 ### Added

@@ -119,12 +119,12 @@ pub fn where_page(store: Store) -> View {
         view()
             .gap_4()
             .child(heading(if auto {
-                "Welcome to AIdaemon"
+                "Welcome to AIDaemon"
             } else {
                 "Where should your agent run?"
             }))
             .child(lead(
-                "AIdaemon is an agent that works for you around the clock. It runs on a computer \
+                "AIDaemon is an agent that works for you around the clock. It runs on a computer \
                  you choose; this app is how you talk to it.",
             ))
             .child(when(link::RUNS_DAEMON, move || run_here(store, auto)))
@@ -305,7 +305,7 @@ fn starting(store: Store) -> View {
             .child(heading("Connected"))
             .child(lead(move || {
                 format!(
-                    "{} answered its test. AIdaemon is starting with it…",
+                    "{} answered its test. AIDaemon is starting with it…",
                     store
                         .setup()
                         .and_then(|s| s.model)
@@ -406,7 +406,7 @@ fn model_step(store: Store) -> View {
                 move || choices(store, chosen, key, model, base_url, connect),
             ))
             .child(lead(
-                "Your conversations and memory stay on the machine AIdaemon runs on. There is no \
+                "Your conversations and memory stay on the machine AIDaemon runs on. There is no \
                  account and no usage data is sent; it talks to the model you pick and the sites \
                  you ask about.",
             ))

@@ -7826,5 +7826,5 @@
       "$ref": "#/$defs/ServerFrame"
     }
   ],
-  "title": "AIdaemon Client Protocol v1"
+  "title": "AIDaemon Client Protocol v1"
 }

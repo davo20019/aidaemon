@@ -3,7 +3,7 @@ name = "aidaemon-node-sdk"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Rust client SDK for AIdaemon Nodes"
+description = "Rust client SDK for AIDaemon Nodes"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
 

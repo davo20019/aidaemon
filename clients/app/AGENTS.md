@@ -1,6 +1,6 @@
 # clients/app: agent guide
 
-The AIdaemon app: one Rust crate on Native Shell (nsh 0.6.0 from
+The AIDaemon app: one Rust crate on Native Shell (nsh 0.6.0 from
 crates.io; CI and releases pin the same nsh CLI version) for desktop, web
 and terminal. `CLAUDE.md` is a symlink to this file.
 It is its own Cargo workspace; the root workspace excludes it, so the

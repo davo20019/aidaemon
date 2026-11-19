@@ -1063,7 +1063,7 @@ impl Store {
         for line in self.lines(&id) {
             let (who, text, at) = match line {
                 Line::User { text, at_ms, .. } => ("You", text, at_ms),
-                Line::Assistant { text, at_ms, .. } => ("AIdaemon", text, at_ms),
+                Line::Assistant { text, at_ms, .. } => ("AIDaemon", text, at_ms),
                 Line::Note { text, .. } => ("Note", text, 0),
                 Line::Activity { tools, .. } => {
                     out.push_str(&format!("\n_Used: {}_\n", tools.join(", ")));

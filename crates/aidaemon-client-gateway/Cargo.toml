@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon-client-gateway"
-description = "The Client Gateway: serves the AIdaemon Client Protocol (/client/v1) over WebSocket and HTTP so the owner's own apps drive the same turn runner, approvals and running-work list as the chat bots; internal to aidaemon, no stability promise"
+description = "The Client Gateway: serves the AIDaemon Client Protocol (/client/v1) over WebSocket and HTTP so the owner's own apps drive the same turn runner, approvals and running-work list as the chat bots; internal to aidaemon, no stability promise"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

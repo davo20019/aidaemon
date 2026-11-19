@@ -53,11 +53,11 @@ pub fn start(store: Store) {
 /// Run the daemon on this computer: install it to start at login (no
 /// administrator rights), wait for its token, then connect.
 pub fn install_here(store: Store) {
-    store.set_starting_daemon(Some(("Starting AIdaemon on this computer…".into(), false)));
+    store.set_starting_daemon(Some(("Starting AIDaemon on this computer…".into(), false)));
     spawn(async move {
         let result = background(local::install_daemon())
             .await
-            .unwrap_or_else(|_| Err("Could not start AIdaemon".to_string()));
+            .unwrap_or_else(|_| Err("Could not start AIDaemon".to_string()));
         match result {
             Ok(()) => {
                 store.set_starting_daemon(None);

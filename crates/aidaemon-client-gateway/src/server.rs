@@ -456,7 +456,7 @@ pub(crate) const NOT_INSTALLED_PAGE: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AIdaemon</title>
+<title>AIDaemon</title>
 <style>
 body { font: 16px/1.5 system-ui, sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; color: #1f2328; background: #fff; }
 code { font-family: ui-monospace, monospace; font-size: 0.9em; background: #f0f1f3; padding: 0.1em 0.3em; border-radius: 4px; }
@@ -464,7 +464,7 @@ code { font-family: ui-monospace, monospace; font-size: 0.9em; background: #f0f1
 </style>
 </head>
 <body>
-<h1>The AIdaemon web app is not installed</h1>
+<h1>The AIDaemon web app is not installed</h1>
 <p>This daemon serves the web app from <code>~/.aidaemon/app-web</code>, and nothing is there yet.</p>
 <p>To get it, re-run the install script, which installs the web app with each release:</p>
 <p><code>curl -sSfL https://get.aidaemon.ai | bash</code></p>

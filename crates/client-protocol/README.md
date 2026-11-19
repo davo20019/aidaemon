@@ -2,7 +2,7 @@
 
 **Tier: internal.** No stability promise yet; the protocol itself is versioned (`ProtocolVersion`, v1).
 
-The wire types of the AIdaemon Client Protocol v1: the JSON frames a terminal UI, web page, desktop or phone app, or watch exchanges with the daemon's Client Gateway at `/client/v1` (WebSocket at `/client/v1/ws`, or plain HTTP: `POST /client/v1/commands` and the long-poll `GET /client/v1/events?since=<seq>&wait=<s>`). Depends only on serde and schemars, so any Rust client can use it directly.
+The wire types of the AIDaemon Client Protocol v1: the JSON frames a terminal UI, web page, desktop or phone app, or watch exchanges with the daemon's Client Gateway at `/client/v1` (WebSocket at `/client/v1/ws`, or plain HTTP: `POST /client/v1/commands` and the long-poll `GET /client/v1/events?since=<seq>&wait=<s>`). Depends only on serde and schemars, so any Rust client can use it directly.
 
 The Rust types are the source of truth. The JSON Schema non-Rust clients generate from is checked in at `schemas/client-protocol/v1.schema.json`; regenerate it with
 

@@ -92,8 +92,8 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
 
     let listener = aidaemon_client_gateway::setup::bind(&gateway).await?;
     eprintln!();
-    eprintln!("  AIdaemon is not set up yet.");
-    eprintln!("  On this computer: open the AIdaemon app.");
+    eprintln!("  AIDaemon is not set up yet.");
+    eprintln!("  On this computer: open the AIDaemon app.");
     eprintln!(
         "  From another device: reach this machine's port {} (an SSH tunnel or your",
         gateway_config.port
@@ -128,6 +128,6 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
     if !config_path.exists() {
         anyhow::bail!("setup stopped before a model was connected");
     }
-    eprintln!("  Set up. Starting AIdaemon…");
+    eprintln!("  Set up. Starting AIDaemon…");
     Ok(())
 }

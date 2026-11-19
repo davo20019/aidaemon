@@ -141,17 +141,17 @@ pub async fn install_daemon() -> Result<(), String> {
             .ok()
             .is_some_and(|exe| exe.starts_with("/Volumes"))
     {
-        return Err("Drag AIdaemon to Applications first, then open it from there.".to_string());
+        return Err("Drag AIDaemon to Applications first, then open it from there.".to_string());
     }
     let binary = daemon_binary().ok_or_else(|| {
-        "The aidaemon program is not beside this app. Reinstall the app, or install AIdaemon \
+        "The aidaemon program is not beside this app. Reinstall the app, or install AIDaemon \
          with the install script."
             .to_string()
     })?;
     let output = std::process::Command::new(binary)
         .args(["service", "install"])
         .output()
-        .map_err(|e| format!("Could not start AIdaemon: {e}"))?;
+        .map_err(|e| format!("Could not start AIDaemon: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -169,5 +169,5 @@ pub async fn install_daemon() -> Result<(), String> {
     } else {
         "See why with `journalctl --user -u aidaemon`."
     };
-    Err(format!("AIdaemon did not start within a minute. {why}"))
+    Err(format!("AIDaemon did not start within a minute. {why}"))
 }

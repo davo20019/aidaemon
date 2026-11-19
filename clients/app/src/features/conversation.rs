@@ -2418,7 +2418,7 @@ fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
     match error {
         SpeechError::NoSpeech => None,
         SpeechError::NotAllowed => Some(
-            "The microphone or speech recognition is not allowed for AIdaemon in the system's settings",
+            "The microphone or speech recognition is not allowed for AIDaemon in the system's settings",
         ),
         SpeechError::AudioCapture => Some("No microphone could be used"),
         SpeechError::LanguageNotSupported => Some("Speech in this language is not recognized here"),

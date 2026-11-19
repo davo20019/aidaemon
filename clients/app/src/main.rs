@@ -27,7 +27,7 @@ fn main() -> impl std::process::Termination {
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<nsh_app_aidaemon::App>()),
         platform::AppOptions {
-            title: "AIdaemon".to_owned(),
+            title: "AIDaemon".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             app_id: "ai.aidaemon.app".to_owned(),
             size: (1180, 780),

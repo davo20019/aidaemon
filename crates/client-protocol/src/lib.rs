@@ -1,6 +1,6 @@
 //! # aidaemon-client-protocol
 //!
-//! The wire types of the AIdaemon Client Protocol v1, spoken between the
+//! The wire types of the AIDaemon Client Protocol v1, spoken between the
 //! daemon's Client Gateway (`/client/v1`) and the owner's own clients: a
 //! terminal UI, a web page, a desktop or phone app, a watch.
 //!
@@ -3147,7 +3147,7 @@ pub fn schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://aidaemon.ai/schemas/client-protocol/v1.schema.json",
-        "title": "AIdaemon Client Protocol v1",
+        "title": "AIDaemon Client Protocol v1",
         "oneOf": [client, server],
         "$defs": defs,
     })

@@ -1,6 +1,6 @@
 # aidaemon-client-core
 
-The shared core of AIdaemon's own clients, with no rendering:
+The shared core of AIDaemon's own clients, with no rendering:
 
 - `link`: the connection to the Client Gateway. Signs in, says `hello` with the last `seq` applied, pings, reconnects with backoff and resumes; commands not yet answered are resent under their own `request_id`. It reports its state (`Connecting`, `Connected`, `Disconnected` with a `DropKind`: daemon not running, unauthorized, version unsupported, dropped) so a client can always say where it stands.
 - `state`: the event reducer. The client's view (sessions, transcripts, live turns, approvals, running work, the last `seq`) built only from server frames. Its JSON form is what the shared reducer fixtures in `tests/fixtures/reducer/` compare.

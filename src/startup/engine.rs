@@ -22,6 +22,20 @@ pub(crate) fn settings_from_config(
              use per-goal daily budgets, subagents.task_token_budget or a provider spend limit"
         );
     }
+    if config.provider.streaming {
+        warn!("[provider] streaming is ignored: no code reads it; remove it from config.toml");
+    }
+    let people = &config.people;
+    if people.auto_extract.is_some()
+        || people.auto_extract_categories.is_some()
+        || people.restricted_categories.is_some()
+    {
+        warn!(
+            "[people] auto_extract, auto_extract_categories and restricted_categories are \
+             ignored: no code reads them, and restricted_categories does not keep any category \
+             out of memory; remove them from config.toml"
+        );
+    }
     if config.subagents.task_timeout_secs.is_some() {
         warn!(
             "[subagents] task_timeout_secs is ignored: runs are bounded by progress and cost \

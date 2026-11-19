@@ -100,7 +100,7 @@ impl Updater {
     fn perform_update() -> anyhow::Result<String> {
         if crate::daemon::in_signed_app() {
             anyhow::bail!(
-                "This AIdaemon came with the app download: get the new version of the app \
+                "This AIDaemon came with the app download: get the new version of the app \
                  (its .dmg) to update both."
             );
         }

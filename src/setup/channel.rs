@@ -21,7 +21,7 @@ const GREETING_TITLE: &str = "Welcome";
 pub(crate) fn greeting(agent_name: &str, on_server: bool) -> (String, Vec<String>) {
     // The default name reads as the product's.
     let name = match agent_name.trim() {
-        "" | "aidaemon" => "AIdaemon",
+        "" | "aidaemon" => "AIDaemon",
         name => name,
     };
     let place = if on_server {
@@ -282,7 +282,7 @@ mod tests {
         assert!(suggestions[0].contains("Downloads"));
         let (server, on_server) = greeting("", true);
         assert!(!on_server[0].contains("Downloads"));
-        assert!(server.starts_with("Hi, I'm AIdaemon."));
+        assert!(server.starts_with("Hi, I'm AIDaemon."));
         assert!(!server.contains("sleeps"));
     }
 

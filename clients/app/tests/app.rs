@@ -629,7 +629,7 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
         r#"{"type":"event","at_ms":1,"event":{"type":"setup_updated","setup":{"step":"starting","model":"OpenRouter · synthetic/model-1"}}}"#,
     )]);
     app.wait_for(
-        "OpenRouter · synthetic/model-1 answered its test. AIdaemon is starting with it…",
+        "OpenRouter · synthetic/model-1 answered its test. AIDaemon is starting with it…",
     )?;
     feed([frame(
         r#"{"type":"event","at_ms":2,"event":{"type":"setup_updated","setup":{"step":"channel","model":"OpenRouter · synthetic/model-1","channels":[{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}]}}}"#,
@@ -648,10 +648,10 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
             r#"{"type":"event","seq":1,"at_ms":5,"session_id":"app:welcome","event":{"type":"session_created","session":{"id":"app:welcome","channel":"app","title":"Welcome","writable":true}}}"#,
         ),
         frame(
-            r#"{"type":"event","seq":2,"at_ms":6,"session_id":"app:welcome","event":{"type":"assistant_message","session_id":"app:welcome","text":"Hi, I'm AIdaemon.","suggestions":["What can you do on this computer?"]}}"#,
+            r#"{"type":"event","seq":2,"at_ms":6,"session_id":"app:welcome","event":{"type":"assistant_message","session_id":"app:welcome","text":"Hi, I'm AIDaemon.","suggestions":["What can you do on this computer?"]}}"#,
         ),
     ]);
-    app.wait_for("Hi, I'm AIdaemon.")?;
+    app.wait_for("Hi, I'm AIDaemon.")?;
     app.wait_for("What can you do on this computer?")?;
     Ok(())
 }

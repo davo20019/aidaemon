@@ -1973,7 +1973,7 @@ fn devices(store: Store) -> View {
                     let mut list = view().gap_2();
                     if !can_change {
                         list = list.child(muted(
-                            "Change what a device may do in the app on the computer AIdaemon \
+                            "Change what a device may do in the app on the computer AIDaemon \
                              runs on.",
                         ));
                     }

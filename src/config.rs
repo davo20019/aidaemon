@@ -547,12 +547,9 @@ pub struct ProviderConfig {
     /// same request shape used before this option was introduced.
     #[serde(default)]
     pub llama_cpp_thinking: bool,
-    /// Opt-in SSE streaming transport (OpenAI-compatible providers).
-    /// Responses are accumulated to the same shape as buffered calls; a
-    /// stream that dies after partial text is recovered via the
-    /// truncation-recovery path instead of failing the whole call.
+    /// Legacy key no code reads (replies stream through the Client Gateway):
+    /// kept so old configs still load, and warned about at startup.
     #[serde(default)]
-    #[allow(dead_code)] // read by serde only: no daemon code reads it
     pub streaming: bool,
     /// Models whose final (no-tool-call) answers are re-issued through a
     /// tool-less, schema-constrained `{reasoning, response}` second pass
@@ -1410,7 +1407,7 @@ pub struct DaemonConfig {
     pub health_bind: String,
     /// Serve the OAuth callback and the mandate wake webhook (`/api/mandates/signals`,
     /// token-authenticated) beside `/health` on the health server port (default: true).
-    /// The status page that used to live here is in the AIdaemon app.
+    /// The status page that used to live here is in the AIDaemon app.
     #[serde(default = "default_dashboard_enabled")]
     pub dashboard_enabled: bool,
     /// Watchdog configuration for detecting stuck agent tasks.
@@ -2005,15 +2002,15 @@ pub use aidaemon_tools::services::oauth::OAuthProviderConfig;
 pub struct PeopleConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_people_auto_extract")]
-    #[allow(dead_code)] // read by serde only: no daemon code reads it
-    pub auto_extract: bool,
-    #[serde(default = "default_people_auto_extract_categories")]
-    #[allow(dead_code)] // read by serde only: no daemon code reads it
-    pub auto_extract_categories: Vec<String>,
-    #[serde(default = "default_people_restricted_categories")]
-    #[allow(dead_code)] // read by serde only: no daemon code reads it
-    pub restricted_categories: Vec<String>,
+    /// Legacy keys no code reads: kept so old configs still load, and
+    /// warned about at startup (`startup::engine`). People facts are only
+    /// stored through `manage_people` and memory's own extraction.
+    #[serde(default)]
+    pub auto_extract: Option<bool>,
+    #[serde(default)]
+    pub auto_extract_categories: Option<Vec<String>>,
+    #[serde(default)]
+    pub restricted_categories: Option<Vec<String>>,
     #[serde(default = "default_people_fact_retention_days")]
     pub fact_retention_days: u32,
     #[serde(default = "default_people_reconnect_reminder_days")]
@@ -2034,36 +2031,15 @@ impl Default for PeopleConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            auto_extract: default_people_auto_extract(),
-            auto_extract_categories: default_people_auto_extract_categories(),
-            restricted_categories: default_people_restricted_categories(),
+            auto_extract: None,
+            auto_extract_categories: None,
+            restricted_categories: None,
             fact_retention_days: default_people_fact_retention_days(),
             reconnect_reminder_days: default_people_reconnect_reminder_days(),
         }
     }
 }
 
-fn default_people_auto_extract() -> bool {
-    true
-}
-fn default_people_auto_extract_categories() -> Vec<String> {
-    vec![
-        "birthday".into(),
-        "preference".into(),
-        "interest".into(),
-        "work".into(),
-        "family".into(),
-        "important_date".into(),
-    ]
-}
-fn default_people_restricted_categories() -> Vec<String> {
-    vec![
-        "health".into(),
-        "finance".into(),
-        "political".into(),
-        "religious".into(),
-    ]
-}
 fn default_people_fact_retention_days() -> u32 {
     180
 }

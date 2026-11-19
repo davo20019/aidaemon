@@ -2,7 +2,7 @@
 //!
 //! **Tier: internal.** Internal to aidaemon, no stability promise.
 //!
-//! The Client Gateway serves the AIdaemon Client Protocol v1
+//! The Client Gateway serves the AIDaemon Client Protocol v1
 //! ([`aidaemon_client_protocol`]) so the owner's own apps (a terminal UI, a
 //! web page, a phone, a watch) drive and watch the daemon:
 //!
@@ -1429,7 +1429,7 @@ impl ClientGateway {
                 if caller.principal.device_id.is_some() {
                     return Err(ProtocolError::new(
                         ErrorCode::Forbidden,
-                        "Change what devices may do on the computer AIdaemon runs on",
+                        "Change what devices may do on the computer AIDaemon runs on",
                     ));
                 }
                 if !self.pairing.set_scopes(&device_id, &scopes).await? {
@@ -1841,7 +1841,7 @@ impl ClientGateway {
             }
         };
         self.hub
-            .send_text(&session_id, &format!("↪ From the AIdaemon app: {text}"))
+            .send_text(&session_id, &format!("↪ From the AIDaemon app: {text}"))
             .await
             .map_err(|error| {
                 ProtocolError::new(

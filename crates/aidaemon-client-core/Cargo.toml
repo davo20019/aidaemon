@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon-client-core"
-description = "The shared core of AIdaemon's own clients: the Client Gateway link (reconnect, resume, resend), the event reducer, and sign-in with the local token or a paired device key"
+description = "The shared core of AIDaemon's own clients: the Client Gateway link (reconnect, resume, resend), the event reducer, and sign-in with the local token or a paired device key"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

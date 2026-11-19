@@ -1,6 +1,6 @@
 //! # aidaemon-client-core
 //!
-//! What every AIdaemon client shares, with no rendering: the connection to
+//! What every AIDaemon client shares, with no rendering: the connection to
 //! the Client Gateway ([`link`]: hello, resume from the last `seq`, pings,
 //! reconnect with backoff, unanswered commands resent under their own
 //! `request_id`), the event reducer ([`state`]: the client's view built only

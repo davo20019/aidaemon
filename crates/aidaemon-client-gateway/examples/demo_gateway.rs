@@ -304,7 +304,7 @@ impl ClientHost for Host {
                         .post_greeting(
                             &aidaemon_client_gateway::new_app_session_id(),
                             "Welcome",
-                            "Hi, I'm AIdaemon. I research, write, organize files, run commands \
+                            "Hi, I'm AIDaemon. I research, write, organize files, run commands \
                              and keep an eye on things for you on a schedule. I run on this \
                              computer. While it sleeps, I'm offline.\n\nI read and look things \
                              up on my own. Before anything that sends, posts, deletes or spends, \

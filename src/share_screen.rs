@@ -37,7 +37,7 @@ mod mac {
 fn usage() {
     println!("Usage: aidaemon share-screen [--pair <link>] [--name <name>]");
     println!();
-    println!("Share this computer's main display with your AIdaemon, so you can watch and");
+    println!("Share this computer's main display with your AIDaemon, so you can watch and");
     println!("control it from the app. Pair once with the link `aidaemon pair` prints on the");
     println!("daemon's computer. It shares only while this runs; press Ctrl-C to stop.");
 }

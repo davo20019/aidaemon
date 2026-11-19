@@ -57,7 +57,7 @@ impl SendNodeAudioTool {
             .context("send_node_audio arguments must be valid JSON")?;
         anyhow::ensure!(
             facts.user_role == Some(UserRole::Owner),
-            "Only the AIdaemon owner may send Node audio"
+            "Only the AIDaemon owner may send Node audio"
         );
         let delivery = self
             .announcements
@@ -232,13 +232,13 @@ impl Tool for ReadNodeSensorsTool {
     }
 
     fn description(&self) -> &str {
-        "Read the latest authenticated environmental sensor readings reported by an enrolled AIdaemon Node. Use when the owner asks for the K10 temperature or humidity."
+        "Read the latest authenticated environmental sensor readings reported by an enrolled AIDaemon Node. Use when the owner asks for the K10 temperature or humidity."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "read_node_sensors",
-            "description": "Read the latest server-received temperature and humidity values from an enrolled AIdaemon Node, including reading age. This reads stored sensor state; it does not activate a microphone, camera, or actuator.",
+            "description": "Read the latest server-received temperature and humidity values from an enrolled AIDaemon Node, including reading age. This reads stored sensor state; it does not activate a microphone, camera, or actuator.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -282,7 +282,7 @@ impl ReadNodeSensorsTool {
         .context("read_node_sensors arguments must be valid JSON")?;
         anyhow::ensure!(
             facts.user_role == Some(UserRole::Owner),
-            "Only the AIdaemon owner may read Node sensor values"
+            "Only the AIDaemon owner may read Node sensor values"
         );
         let readings =
             super::store::latest_sensor_readings(&self.pool, args.node.as_deref()).await?;
@@ -362,7 +362,7 @@ impl Tool for ReadNodeHealthTool {
     }
 
     fn description(&self) -> &str {
-        "Read an enrolled AIdaemon Node's latest authenticated heartbeat, reported capabilities, current gateway authorizations, and bounded Runtime recovery evidence."
+        "Read an enrolled AIDaemon Node's latest authenticated heartbeat, reported capabilities, current gateway authorizations, and bounded Runtime recovery evidence."
     }
 
     fn schema(&self) -> Value {
@@ -412,7 +412,7 @@ impl ReadNodeHealthTool {
         .context("read_node_health arguments must be valid JSON")?;
         anyhow::ensure!(
             facts.user_role == Some(UserRole::Owner),
-            "Only the AIdaemon owner may read Node health"
+            "Only the AIDaemon owner may read Node health"
         );
         let health = super::store::node_health_snapshot(&self.pool, args.node.as_deref()).await?;
         let now = Utc::now();
@@ -439,7 +439,7 @@ impl ReadNodeHealthTool {
             "recovery": health.recovery,
             "reported_capabilities": health.capabilities,
             "current_authorizations": health.authorizations,
-            "interpretation": "This is the latest authenticated Runtime report stored by AIdaemon. Capability absence means the Node did not report that protocol control; it does not prove the physical hardware lacks it. Authorization absence means the gateway has not granted that action. A stale report does not prove the Device is currently reachable, and a recovery report does not prove physical hardware health."
+            "interpretation": "This is the latest authenticated Runtime report stored by AIDaemon. Capability absence means the Node did not report that protocol control; it does not prove the physical hardware lacks it. Authorization absence means the gateway has not granted that action. A stale report does not prove the Device is currently reachable, and a recovery report does not prove physical hardware health."
         }))?)
     }
 }
@@ -480,7 +480,7 @@ impl Tool for SendNodeAudioTool {
     }
 
     fn description(&self) -> &str {
-        "Deliver a short owner-requested spoken announcement to an enrolled, explicitly authorized audio-capable Node. Use when the owner asks AIdaemon to tell or announce something on a Companion."
+        "Deliver a short owner-requested spoken announcement to an enrolled, explicitly authorized audio-capable Node. Use when the owner asks AIDaemon to tell or announce something on a Companion."
     }
 
     fn schema(&self) -> Value {
@@ -617,7 +617,7 @@ impl ManageNodeMonitorsTool {
             .context("manage_node_monitors arguments must be valid JSON")?;
         anyhow::ensure!(
             facts.user_role == Some(UserRole::Owner),
-            "Only the AIdaemon owner may manage Node monitors"
+            "Only the AIDaemon owner may manage Node monitors"
         );
         anyhow::ensure!(
             facts.channel_visibility == Some(ChannelVisibility::Private),
@@ -774,7 +774,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Only the AIdaemon owner"));
+        assert!(error.to_string().contains("Only the AIDaemon owner"));
         let health_tool = ReadNodeHealthTool::new(pool);
         let error = health_tool
             .call_with(
@@ -786,7 +786,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Only the AIdaemon owner"));
+        assert!(error.to_string().contains("Only the AIDaemon owner"));
     }
 
     #[tokio::test]
@@ -810,7 +810,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(non_owner.to_string().contains("Only the AIdaemon owner"));
+        assert!(non_owner.to_string().contains("Only the AIDaemon owner"));
 
         let disabled = tool
             .call_with(
@@ -850,7 +850,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(non_owner.to_string().contains("Only the AIdaemon owner"));
+        assert!(non_owner.to_string().contains("Only the AIDaemon owner"));
 
         let public_channel = tool
             .call_with(

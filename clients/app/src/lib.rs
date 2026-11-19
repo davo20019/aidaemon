@@ -1,4 +1,4 @@
-//! AIdaemon's app: chat, approvals and the agent's running work, on the
+//! AIDaemon's app: chat, approvals and the agent's running work, on the
 //! desktops, the web and a terminal, from one Rust crate.
 
 use nsh_core::prelude::*;
