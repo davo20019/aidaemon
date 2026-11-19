@@ -118,11 +118,32 @@ if [ "$identity" != "-" ]; then
 fi
 
 if [ -n "${NOTARY_KEY_PATH:-}" ] && [ "$identity" != "-" ]; then
-  xcrun notarytool submit "$out_dmg" \
-    --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
-    --wait
-  xcrun stapler staple "$out_dmg"
-  spctl --assess --type open --context context:primary-signature --verbose "$out_dmg"
+  auth=(--key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER")
+  submission="$(xcrun notarytool submit "$out_dmg" "${auth[@]}" --output-format plist \
+    | plutil -extract id raw -)"
+  echo "Notarization submission ${submission}"
+  # Apple usually answers in minutes, but a team's first submissions get an
+  # in-depth check that can take a day: wait a bounded time. A disk image
+  # still in review ships signed; Gatekeeper asks Apple online and opens it
+  # once accepted (`stapler staple` it later to work offline too).
+  xcrun notarytool wait "$submission" "${auth[@]}" \
+    --timeout "${NOTARY_WAIT:-45m}" >/dev/null 2>&1 || true
+  status="$(xcrun notarytool info "$submission" "${auth[@]}" --output-format plist \
+    | plutil -extract status raw -)"
+  case "$status" in
+    Accepted)
+      xcrun stapler staple "$out_dmg"
+      spctl --assess --type open --context context:primary-signature --verbose "$out_dmg"
+      ;;
+    "In Progress")
+      echo "::warning::Notarization ${submission} is still in review; shipping the signed disk image unstapled."
+      ;;
+    *)
+      echo "::error::Notarization ${submission}: ${status}"
+      xcrun notarytool log "$submission" "${auth[@]}" || true
+      exit 1
+      ;;
+  esac
 fi
 
 echo "Packaged $out_dmg (signed with ${identity})"
