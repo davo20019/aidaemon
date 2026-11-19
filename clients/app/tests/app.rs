@@ -935,10 +935,9 @@ fn projects_group_their_conversations_and_start_new_ones_in_their_folder() -> Re
     // takes it out of one.
     app.press_key("escape")?;
     app.press("Back to all conversations >> nth=0")?;
-    app.long_press("Grocery list >> nth=0")?;
     // The sheet says which conversation it is about: another may be the
     // one marked as open.
-    app.wait_for("Move to project…")?;
+    open_menu(&mut app, "Grocery list >> nth=0", "Move to project…")?;
     assert!(
         app.screen()
             .layout_nodes()
