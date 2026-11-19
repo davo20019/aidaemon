@@ -70,8 +70,11 @@ and targeted patches. When unrelated files are modified, leave them alone.
 ## Releases
 
 Bump `Cargo.toml`, add a Keep a Changelog entry to `CHANGELOG.md`, run the
-pre-commit checklist, commit everything including `Cargo.lock`, push to
-`master`, then tag `vX.Y.Z`, push the tag and create the GitHub release.
+pre-commit checklist, commit everything including `Cargo.lock` and push to
+`master`. `tag-release.yml` tags `vX.Y.Z` once CI passes on that commit and
+starts `release.yml`, which reuses CI's result, builds, creates the GitHub
+release and publishes the crates in `scripts/publish-order.py` order (CI's
+"Package crates" job keeps every crate publishable on each pull request).
 `cargo publish` packages only git-tracked files: never use `--allow-dirty`;
 inspect size problems with `cargo package --list`.
 
