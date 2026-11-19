@@ -127,7 +127,12 @@ impl TurnEngine<'_> {
     /// stack: billing-aware retries, the fallback cascade and failover
     /// providers all apply.
     pub async fn serve_sdk_model_call(&self, scope: &TurnScope<'_>, call: ModelCall) {
-        let reply = self.sdk_model_call(scope, &call.request).await;
+        let ModelCall {
+            request,
+            reply: answer,
+            text,
+        } = call;
+        let reply = self.sdk_model_call(scope, &request, text).await;
         if reply.is_ok() {
             // Every message taken so far rode in this call (placed messages
             // stay pinned in each later call): the model has answered it with
@@ -138,7 +143,7 @@ impl TurnEngine<'_> {
                 }
             }
         }
-        let _ = call.reply.send(reply);
+        let _ = answer.send(reply);
     }
 
     /// Whether to try a failed model call again. The kernel runs the retry
@@ -244,6 +249,7 @@ impl TurnEngine<'_> {
         &self,
         scope: &TurnScope<'_>,
         request: &sdk::ModelRequest,
+        text: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot = self.llm_runtime().snapshot();
@@ -377,21 +383,30 @@ impl TurnEngine<'_> {
         };
         let started = Instant::now();
         let idle_timeout = self.sdk_model_call_timeout();
+        let call = crate::llm::turn_calls::call_llm_with_recovery(
+            self.host,
+            snapshot.provider(),
+            snapshot.router(),
+            &call_model,
+            &messages,
+            &tools,
+            &options,
+            &mut telemetry,
+            None,
+            first_attempt_deadline(idle_timeout),
+        );
+        // Only the reply's own call streams text to the run: no other model
+        // call on this task is in scope.
+        let call = async move {
+            match text {
+                Some(text) => crate::chat_bridge::streaming::with_stream_text(text, call).await,
+                None => call.await,
+            }
+        };
         let result = match with_idle_timeout(
             idle_timeout,
             idle_timeout.max(STREAMING_MAX_MODEL_CALL),
-            crate::llm::turn_calls::call_llm_with_recovery(
-                self.host,
-                snapshot.provider(),
-                snapshot.router(),
-                &call_model,
-                &messages,
-                &tools,
-                &options,
-                &mut telemetry,
-                None,
-                first_attempt_deadline(idle_timeout),
-            ),
+            call,
         )
         .await
         {

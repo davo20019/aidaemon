@@ -102,4 +102,7 @@ pub struct GateRequest {
 pub struct ModelCall {
     pub request: sdk::ModelRequest,
     pub reply: oneshot::Sender<Result<sdk::ModelResponse, sdk::ProviderError>>,
+    /// Where the reply's text goes piece by piece while the call streams,
+    /// all of it before `reply` is answered. `None`: only the final reply.
+    pub text: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }

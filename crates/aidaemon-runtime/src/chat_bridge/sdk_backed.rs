@@ -132,6 +132,7 @@ pub async fn send<P: sdk::Provider + ?Sized>(
         super::streaming::note_stream_progress();
         match event {
             Ok(sdk::StreamEvent::Done(response)) => return Ok(response),
+            Ok(sdk::StreamEvent::TextDelta(text)) => super::streaming::note_stream_text(text),
             Ok(_) => {}
             Err(error) => return Err(to_daemon_error(error).into()),
         }

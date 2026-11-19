@@ -56,6 +56,25 @@ pub fn note_stream_progress() {
     let _ = STREAM_PROGRESS.try_with(StreamProgress::note);
 }
 
+tokio::task_local! {
+    static STREAM_TEXT: tokio::sync::mpsc::UnboundedSender<String>;
+}
+
+/// Run `call` with `text` receiving the reply text the model streams on
+/// this task, piece by piece as it arrives. Only the step a failover chain
+/// committed to streams text, so a piece is never taken back by a switch.
+pub async fn with_stream_text<F: Future>(
+    text: tokio::sync::mpsc::UnboundedSender<String>,
+    call: F,
+) -> F::Output {
+    STREAM_TEXT.scope(text, call).await
+}
+
+/// The model streamed a piece of its reply. No-op outside a text scope.
+pub fn note_stream_text(piece: String) {
+    let _ = STREAM_TEXT.try_with(|text| text.send(piece));
+}
+
 #[cfg(test)]
 mod progress_tests {
     use super::*;
@@ -69,5 +88,19 @@ mod progress_tests {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         with_stream_progress(progress.clone(), async { note_stream_progress() }).await;
         assert!(progress.last_activity() > before);
+    }
+
+    #[tokio::test]
+    async fn text_pieces_reach_the_scoped_sink_only() {
+        note_stream_text("outside".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        with_stream_text(tx, async {
+            note_stream_text("Hel".into());
+            note_stream_text("lo".into());
+        })
+        .await;
+        assert_eq!(rx.recv().await.as_deref(), Some("Hel"));
+        assert_eq!(rx.recv().await.as_deref(), Some("lo"));
+        assert_eq!(rx.recv().await, None);
     }
 }

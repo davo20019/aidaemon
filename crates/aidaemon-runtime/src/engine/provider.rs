@@ -8,6 +8,8 @@
 
 use aidaemon_core as sdk;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
+use futures::stream::{self, BoxStream};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,12 +39,111 @@ impl sdk::Provider for HostProvider {
             .send(HostCall::Model(ModelCall {
                 request: request.clone(),
                 reply,
+                text: None,
             }))
             .await
             .map_err(|_| sdk::ProviderError::Other("model dispatcher stopped".into()))?;
         answer
             .await
             .map_err(|_| sdk::ProviderError::Other("model dispatcher dropped the call".into()))?
+    }
+
+    /// The call as the dispatcher makes it, with the reply's text forwarded
+    /// as it streams in, so the run's `TextDelta` events (and the clients
+    /// showing them) see the reply while it is written.
+    fn stream<'a>(
+        &'a self,
+        request: &'a sdk::ModelRequest,
+    ) -> BoxStream<'a, Result<sdk::StreamEvent, sdk::ProviderError>> {
+        let (text_tx, text_rx) = mpsc::unbounded_channel::<String>();
+        let calls = self.calls.clone();
+        let request = request.clone();
+        let answer: BoxFuture<'static, Answer> = Box::pin(async move {
+            let (reply, answer) = oneshot::channel();
+            calls
+                .send(HostCall::Model(ModelCall {
+                    request,
+                    reply,
+                    text: Some(text_tx),
+                }))
+                .await
+                .map_err(|_| sdk::ProviderError::Other("model dispatcher stopped".into()))?;
+            answer.await.map_err(|_| {
+                sdk::ProviderError::Other("model dispatcher dropped the call".into())
+            })?
+        });
+        Box::pin(stream::unfold(
+            Streamed {
+                answer: Some(answer),
+                landed: None,
+                text_rx,
+                open: true,
+                buffered: String::new(),
+                last_sent: None,
+            },
+            Streamed::next,
+        ))
+    }
+}
+
+/// How often streamed text reaches the run. Pieces arriving closer together
+/// are joined: each `TextDelta` is a journaled event, and a reader sees no
+/// difference below this.
+const TEXT_BATCH: std::time::Duration = std::time::Duration::from_millis(80);
+
+type Answer = Result<sdk::ModelResponse, sdk::ProviderError>;
+
+/// [`HostProvider::stream`]'s state: the dispatcher's answer, and the text
+/// it streamed that the run has not seen yet.
+struct Streamed {
+    answer: Option<BoxFuture<'static, Answer>>,
+    /// The answer, held back while text sent before it is still buffered.
+    landed: Option<Answer>,
+    text_rx: mpsc::UnboundedReceiver<String>,
+    open: bool,
+    buffered: String,
+    last_sent: Option<tokio::time::Instant>,
+}
+
+impl Streamed {
+    fn send_text(mut self) -> Option<(Result<sdk::StreamEvent, sdk::ProviderError>, Self)> {
+        self.last_sent = Some(tokio::time::Instant::now());
+        let text = std::mem::take(&mut self.buffered);
+        Some((Ok(sdk::StreamEvent::TextDelta(text)), self))
+    }
+
+    async fn next(mut self) -> Option<(Result<sdk::StreamEvent, sdk::ProviderError>, Self)> {
+        loop {
+            if let Some(answer) = self.landed.take() {
+                // Every piece was sent before the answer: they go first.
+                if !self.buffered.is_empty() {
+                    self.landed = Some(answer);
+                    return self.send_text();
+                }
+                return Some((answer.map(sdk::StreamEvent::Done), self));
+            }
+            let due = self
+                .last_sent
+                .map_or_else(tokio::time::Instant::now, |at| at + TEXT_BATCH);
+            let answer = self.answer.as_mut()?;
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(due), if !self.buffered.is_empty() => {
+                    return self.send_text();
+                }
+                piece = self.text_rx.recv(), if self.open => match piece {
+                    Some(piece) => self.buffered.push_str(&piece),
+                    None => self.open = false,
+                },
+                answer = answer => {
+                    while let Ok(piece) = self.text_rx.try_recv() {
+                        self.buffered.push_str(&piece);
+                    }
+                    self.answer = None;
+                    self.landed = Some(answer);
+                }
+            }
+        }
     }
 }
 
@@ -290,6 +391,98 @@ mod tests {
     use super::*;
     use aidaemon_events::traits::{TokenUsage, ToolChoiceMode};
     use serde_json::json;
+
+    /// A stand-in dispatcher: streams `pieces` to the call's text sink, then
+    /// answers with `reply` once `go` fires.
+    fn serve_one(
+        mut calls: mpsc::Receiver<HostCall>,
+        pieces: Vec<&'static str>,
+        reply: &'static str,
+        go: oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let Some(HostCall::Model(call)) = calls.recv().await else {
+                panic!("expected a model call");
+            };
+            let text = call.text.expect("a streamed call carries a text sink");
+            for piece in pieces {
+                text.send(piece.to_string()).unwrap();
+            }
+            let _ = go.await;
+            let _ = call.reply.send(Ok(sdk::testing::text(reply)));
+        })
+    }
+
+    /// The reply's text reaches the run while the call is still open, and
+    /// all of it before the final response.
+    #[tokio::test]
+    async fn stream_forwards_text_before_the_reply_lands() {
+        use futures::StreamExt;
+        let (calls_tx, calls_rx) = mpsc::channel(4);
+        let (go_tx, go_rx) = oneshot::channel();
+        let server = serve_one(calls_rx, vec!["Hel", "lo"], "Hello", go_rx);
+        let provider = HostProvider { calls: calls_tx };
+        let request = sdk::ModelRequest {
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        let mut events = sdk::Provider::stream(&provider, &request);
+        // The dispatcher has not answered yet: the text arrives anyway.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+            .await
+            .expect("text arrives before the reply")
+            .unwrap()
+            .unwrap();
+        let mut streamed = match first {
+            sdk::StreamEvent::TextDelta(text) => text,
+            other => panic!("expected text first, got {other:?}"),
+        };
+        go_tx.send(()).unwrap();
+        let mut done = None;
+        while let Some(event) = events.next().await {
+            match event.unwrap() {
+                sdk::StreamEvent::TextDelta(text) => {
+                    assert!(done.is_none(), "text after the reply");
+                    streamed.push_str(&text);
+                }
+                sdk::StreamEvent::Done(response) => done = Some(response),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(streamed, "Hello");
+        assert_eq!(done.expect("a final reply").text, "Hello");
+        server.await.unwrap();
+    }
+
+    /// Text still buffered when the reply lands comes out ahead of it.
+    #[tokio::test]
+    async fn stream_flushes_buffered_text_before_the_reply() {
+        use futures::StreamExt;
+        let (calls_tx, calls_rx) = mpsc::channel(4);
+        let (go_tx, go_rx) = oneshot::channel();
+        go_tx.send(()).unwrap();
+        let server = serve_one(calls_rx, vec!["a", "b", "c"], "abc", go_rx);
+        let provider = HostProvider { calls: calls_tx };
+        let request = sdk::ModelRequest {
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        let events: Vec<_> = sdk::Provider::stream(&provider, &request)
+            .map(Result::unwrap)
+            .collect()
+            .await;
+        let (last, text) = events.split_last().unwrap();
+        assert!(matches!(last, sdk::StreamEvent::Done(r) if r.text == "abc"));
+        let joined: String = text
+            .iter()
+            .map(|event| match event {
+                sdk::StreamEvent::TextDelta(text) => text.as_str(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(joined, "abc");
+        server.await.unwrap();
+    }
 
     /// Hook notes are found by their origin, wherever they sit; a plain
     /// system message stays in the transcript.
