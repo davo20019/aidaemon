@@ -685,8 +685,8 @@ fn context_menu_of(
         .popup_starting_class("opacity-0 scale-95")
         .popup_ending_class("opacity-0 scale-95");
     if let Some((title, open)) = about {
-        menu = menu.on_open_change(move |event: &nsh_base::MenuEvent| {
-            if let nsh_base::MenuEvent::OpenChange(now_open, _) = event {
+        menu = menu.on_open_change(move |event: &nsh_base::ContextMenuEvents| {
+            if let nsh_base::ContextMenuEvents::OpenChange(now_open, _) = event {
                 open.set(*now_open);
             }
         });

@@ -1,9 +1,8 @@
 # clients/app: agent guide
 
-The AIdaemon app: one Rust crate on Native Shell (nsh 0.5.1 plus span
-padding, longbridge/nsh#2141, and vertical span padding, from a fork
-pinned by `rev`: see the note
-in `Cargo.toml`; back to crates.io once a release carries it) for desktop, web and terminal. `CLAUDE.md` is a symlink to this file.
+The AIdaemon app: one Rust crate on Native Shell (nsh 0.6.0 from
+crates.io; CI and releases pin the same nsh CLI version) for desktop, web
+and terminal. `CLAUDE.md` is a symlink to this file.
 It is its own Cargo workspace; the root workspace excludes it, so the
 root's `cargo test`/clippy never build it. Run its checks here.
 
@@ -34,7 +33,7 @@ its pairing link approves itself (use `/client/v1/next/#offer=…`). With
 ## Invariants
 
 - Read the nsh guides before writing UI (nsh repo `skills/nsh`, tag
-  v0.5.0): components run once, only bindings rerun; never invent an API,
+  v0.6.0): components run once, only bindings rerun; never invent an API,
   look it up in the resolved crate source.
 - Features build only from `src/ui/` (tokens, motion, styled controls). No
   raw colours, radii or font sizes in `src/features/`; a missing look is a

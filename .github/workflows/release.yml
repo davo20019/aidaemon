@@ -13,8 +13,8 @@ env:
   CODEX_CLI_VERSION: "0.151.0"
   # The app (clients/app) toolchain: the web bundle needs the nsh CLI and the
   # wasm-bindgen CLI matching the app's wasm-bindgen crate.
-  NSH_VERSION: "0.5.1"
-  NSH_LINUX_SHA256: "f34729e613196ca122d956deb543a92f319e053ff17dfc09ba04a6ec2fb79c74"
+  NSH_VERSION: "0.6.0"
+  NSH_LINUX_SHA256: "19d360eb8dd1ba8847a3b3ad06082f6f3705eb04ae8178357a8cdad31880f0d9"
   WASM_BINDGEN_CLI_VERSION: "0.2.130"
   # Debug-profile async state machines on the agent loop are deep; libtest's
   # default 2 MiB test-thread stack sits within a few percent of what the
@@ -310,19 +310,6 @@ jobs:
         run: |
           nsh --version
           nsh package --target web
-
-      # nsh package builds in its own workspace and ignores the app's [patch]:
-      # check it took nsh from the checkout the app pins (the fork's fixes).
-      - name: Check nsh came from the pinned checkout
-        working-directory: clients/app
-        run: |
-          set -euo pipefail
-          rev="$(grep -m1 -oE '^nsh-core = \{ git = "[^"]+", rev = "[0-9a-f]{7}' Cargo.toml | tail -c 8)"
-          if ! grep -qE "^nsh-core = \{ path = \".*/${rev}/crates/nsh-core\"" .nsh/rust/Cargo.toml; then
-            echo "::error::the web build did not use nsh at ${rev}:"
-            grep -n '^nsh-core' .nsh/rust/Cargo.toml || true
-            exit 1
-          fi
 
       - name: Package
         run: |
