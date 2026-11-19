@@ -499,9 +499,10 @@ fn build_body(request: &ModelRequest) -> Value {
 ///
 /// - A system message stays in place as a `<system-reminder>` text part,
 ///   joined to the previous user content when there is one.
-/// - Tool results become one `function`-role `functionResponse` content
-///   each, named after the call they answer. Images from a run of tool
-///   results follow the run in one user content, labelled with their call.
+/// - A run of tool results becomes one `user` content of `functionResponse`
+///   parts, each named after the call it answers (current Gemini models
+///   refuse the old `function` role). Images from the run follow it in one
+///   user content, labelled with their call.
 fn wire_contents(messages: &[Message]) -> Vec<Value> {
     let mut contents: Vec<Value> = Vec::new();
     let mut tool_images: Vec<Value> = Vec::new();
@@ -516,7 +517,7 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
                 }
                 let part = json!({"text": in_place_system_text(&message.content)});
                 match contents.last_mut() {
-                    Some(last) if last["role"] == "user" => {
+                    Some(last) if last["role"] == "user" && !is_function_responses(last) => {
                         if let Some(parts) = last["parts"].as_array_mut() {
                             parts.push(part);
                         }
@@ -551,15 +552,20 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
             Role::Tool => {
                 let call_id = message.tool_call_id.as_deref().unwrap_or_default();
                 let name = called_tool_name(&messages[..index], call_id);
-                contents.push(json!({
-                    "role": "function",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": name,
-                            "response": function_response(&message.content, message.is_error),
+                let part = json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": function_response(&message.content, message.is_error),
+                    }
+                });
+                match contents.last_mut() {
+                    Some(last) if is_function_responses(last) => {
+                        if let Some(parts) = last["parts"].as_array_mut() {
+                            parts.push(part);
                         }
-                    }]
-                }));
+                    }
+                    _ => contents.push(json!({"role": "user", "parts": [part]})),
+                }
                 if !message.images.is_empty() {
                     tool_images.push(json!({
                         "text": format!("[Images returned by tool call {call_id}]"),
@@ -573,6 +579,14 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
         contents.push(json!({"role": "user", "parts": tool_images}));
     }
     contents
+}
+
+/// Whether `content` is a user content holding only `functionResponse` parts.
+fn is_function_responses(content: &Value) -> bool {
+    content["role"] == "user"
+        && content["parts"].as_array().is_some_and(|parts| {
+            !parts.is_empty() && parts.iter().all(|p| p.get("functionResponse").is_some())
+        })
 }
 
 /// The name of the call `call_id` in the transcript before a tool result.
@@ -698,9 +712,24 @@ fn strip_unsigned_function_call_history(contents: &[Value]) -> (Vec<Value>, usiz
             }
             continue;
         }
-        if role == "function" && pending_response_drops > 0 {
-            pending_response_drops -= 1;
-            dropped_responses += 1;
+        if pending_response_drops > 0
+            && let Some(parts) = msg.get("parts").and_then(Value::as_array)
+            && parts.iter().any(|p| p.get("functionResponse").is_some())
+        {
+            let mut kept_parts = Vec::with_capacity(parts.len());
+            for part in parts {
+                if pending_response_drops > 0 && part.get("functionResponse").is_some() {
+                    pending_response_drops -= 1;
+                    dropped_responses += 1;
+                } else {
+                    kept_parts.push(part.clone());
+                }
+            }
+            if !kept_parts.is_empty() {
+                let mut kept_msg = msg.clone();
+                kept_msg["parts"] = Value::Array(kept_parts);
+                sanitized.push(kept_msg);
+            }
             continue;
         }
         sanitized.push(msg.clone());
@@ -1295,30 +1324,25 @@ mod tests {
             .iter()
             .map(|c| c["role"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            roles,
-            [
-                "user", "model", "function", "function", "function", "user", "user"
-            ]
-        );
+        assert_eq!(roles, ["user", "model", "user", "user", "user"]);
         assert_eq!(contents[1]["parts"][0]["text"], "Looking.");
         assert_eq!(
             contents[1]["parts"][1]["functionCall"],
             json!({"name": "terminal", "args": {"command": "ls"}})
         );
-        let response = |i: usize| &contents[i]["parts"][0]["functionResponse"];
-        assert_eq!(response(2)["name"], "terminal");
-        assert_eq!(response(2)["response"], json!({"stdout": "README.md"}));
-        assert_eq!(response(3)["name"], "screenshot");
-        assert_eq!(response(3)["response"], json!({"result": [1, 2]}));
-        assert_eq!(response(4)["name"], "unknown_tool");
-        assert_eq!(response(4)["response"], json!({"error": "boom"}));
+        let response = |i: usize| &contents[2]["parts"][i]["functionResponse"];
+        assert_eq!(response(0)["name"], "terminal");
+        assert_eq!(response(0)["response"], json!({"stdout": "README.md"}));
+        assert_eq!(response(1)["name"], "screenshot");
+        assert_eq!(response(1)["response"], json!({"result": [1, 2]}));
+        assert_eq!(response(2)["name"], "unknown_tool");
+        assert_eq!(response(2)["response"], json!({"error": "boom"}));
         assert_eq!(
-            contents[5]["parts"][0]["text"],
+            contents[3]["parts"][0]["text"],
             "[Images returned by tool call c2]"
         );
-        assert_eq!(contents[5]["parts"][1]["inlineData"]["data"], "AQID");
-        assert_eq!(contents[6]["parts"][0]["text"], "thanks");
+        assert_eq!(contents[3]["parts"][1]["inlineData"]["data"], "AQID");
+        assert_eq!(contents[4]["parts"][0]["text"], "thanks");
     }
 
     #[test]
@@ -1500,20 +1524,20 @@ mod tests {
                 {"text": "Writing."},
                 {"functionCall": {"name": "write_file", "args": {"path": "/tmp/out.txt"}}}
             ]}),
-            json!({"role": "function", "parts": [{"functionResponse": {
+            json!({"role": "user", "parts": [{"functionResponse": {
                 "name": "write_file", "response": {"result": "ok"}
             }}]}),
             json!({"role": "model", "parts": [
                 {"functionCall": {"name": "read_file", "args": {}},
                  "thoughtSignature": "sig-synthetic"}
             ]}),
-            json!({"role": "function", "parts": [{"functionResponse": {
+            json!({"role": "user", "parts": [{"functionResponse": {
                 "name": "read_file", "response": {"result": "x"}
             }}]}),
             json!({"role": "model", "parts": [
                 {"functionCall": {"name": "write_file", "args": {}}}
             ]}),
-            json!({"role": "function", "parts": [{"functionResponse": {
+            json!({"role": "user", "parts": [{"functionResponse": {
                 "name": "write_file", "response": {"result": "ok"}
             }}]}),
             json!({"role": "model", "parts": [{"text": "Done"}]}),
@@ -1525,7 +1549,7 @@ mod tests {
             .iter()
             .map(|c| c["role"].as_str().unwrap())
             .collect();
-        assert_eq!(roles, ["user", "model", "model", "function", "model"]);
+        assert_eq!(roles, ["user", "model", "model", "user", "model"]);
         assert_eq!(sanitized[1]["parts"], json!([{"text": "Writing."}]));
         assert_eq!(
             sanitized[2]["parts"][0]["thoughtSignature"],

@@ -105,8 +105,13 @@ impl AnthropicBuilder {
     }
 
     /// API root, without `/v1/messages` (default `https://api.anthropic.com`).
+    /// A root ending in `/v1` (the provider catalog's form, shared with the
+    /// model listing) is accepted: the version segment is dropped here so the
+    /// endpoint is never `/v1/v1/messages`.
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        let url = url.into();
+        let root = url.trim_end_matches('/');
+        self.base_url = root.strip_suffix("/v1").unwrap_or(root).to_string();
         self
     }
 
@@ -910,5 +915,30 @@ mod output_format_tests {
     fn a_model_without_structured_outputs_gets_no_format() {
         let body = build_body(&request("claude-3-5-haiku-latest"), 1024, false, None);
         assert!(body["output_config"].get("format").is_none());
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::Anthropic;
+
+    #[test]
+    fn a_root_with_or_without_v1_posts_to_one_messages_path() {
+        for base in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+        ] {
+            let provider = Anthropic::builder()
+                .api_key("sk-synthetic")
+                .base_url(base)
+                .build()
+                .unwrap();
+            assert_eq!(
+                provider.endpoint, "https://api.anthropic.com/v1/messages",
+                "{base}"
+            );
+        }
     }
 }
