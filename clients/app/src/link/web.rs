@@ -72,6 +72,15 @@ extern "C" {
     #[wasm_bindgen(method, js_name = stop)]
     fn stop_keys(this: &KeyCapture);
 
+    #[wasm_bindgen(js_name = speechAvailable)]
+    fn speech_available_js() -> bool;
+    #[wasm_bindgen(js_name = Speaker)]
+    type SpeakerJs;
+    #[wasm_bindgen(constructor, js_class = "Speaker")]
+    fn new(text: &str, lang: &str, ended: &Closure<dyn FnMut()>) -> SpeakerJs;
+    #[wasm_bindgen(method, js_class = "Speaker", js_name = stop)]
+    fn stop_speaker(this: &SpeakerJs);
+
     #[wasm_bindgen(js_name = dictationAvailable)]
     fn dictation_available_js() -> bool;
     #[wasm_bindgen(js_name = Dictation)]
@@ -131,6 +140,42 @@ pub async fn mark_up(url: &str, strokes: &str, width: f32, color: &str) -> Optio
 pub async fn take_picture(max_dimension: u32) -> Option<Vec<u8>> {
     let taken = JsFuture::from(take_picture_js(max_dimension)).await.ok()?;
     (!taken.is_null() && !taken.is_undefined()).then(|| js_sys::Uint8Array::new(&taken).to_vec())
+}
+
+/// Whether the page can speak text (the Web Speech API's synthesis).
+pub fn speech_available() -> bool {
+    speech_available_js()
+}
+
+/// Text read aloud with the page's voice; `ended` runs once when it is
+/// done or stopped. Dropping it stops it.
+pub struct Speaker {
+    js: SpeakerJs,
+    // Called by the page until the reading ends.
+    _ended: Closure<dyn FnMut()>,
+}
+
+impl Speaker {
+    pub fn start(text: &str, ended: impl FnOnce() + 'static) -> Self {
+        let mut ended = Some(ended);
+        let ended = Closure::<dyn FnMut()>::new(move || {
+            if let Some(ended) = ended.take() {
+                ended();
+            }
+        });
+        let js = SpeakerJs::new(text, "", &ended);
+        Self { js, _ended: ended }
+    }
+
+    pub fn stop(&self) {
+        self.js.stop_speaker();
+    }
+}
+
+impl Drop for Speaker {
+    fn drop(&mut self) {
+        self.js.stop_speaker();
+    }
 }
 
 /// Whether the page can recognize speech (the Web Speech API: Chrome,

@@ -134,5 +134,100 @@ impl Listening {
     }
 }
 
+/// Whether replies can be read aloud here: the page's voice in the
+/// browser, the system's on macOS. Not yet on Windows, Linux or in the
+/// terminal (nsh has no speech output of its own).
+pub fn can_speak() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return web::speech_available();
+    #[cfg(target_os = "macos")]
+    return nsh_core::prelude::idiom() != nsh_core::platform::Idiom::Terminal;
+    #[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
+    false
+}
+
+/// Text being read aloud. `ended` runs once, on the thread that drives the
+/// UI, when the reading is done or stopped. Dropping it stops it.
+pub struct Speaking {
+    #[cfg(target_arch = "wasm32")]
+    _inner: web::Speaker,
+    #[cfg(target_os = "macos")]
+    child: std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>,
+}
+
+impl Speaking {
+    /// Read `text` aloud; `None` where nothing can speak.
+    #[allow(unused_variables)]
+    pub fn start(text: &str, ended: impl FnOnce() + 'static) -> Option<Self> {
+        #[cfg(target_arch = "wasm32")]
+        return Some(Self {
+            _inner: web::Speaker::start(text, ended),
+        });
+        #[cfg(target_os = "macos")]
+        return macos_say(text, ended);
+        #[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
+        None
+    }
+
+    /// Stop reading now.
+    pub fn stop(&self) {
+        #[cfg(target_arch = "wasm32")]
+        self._inner.stop();
+        #[cfg(target_os = "macos")]
+        if let Ok(mut child) = self.child.lock()
+            && let Some(child) = child.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
+}
+
+impl Drop for Speaking {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// macOS's own voice: `say`, reading the text from its input.
+#[cfg(target_os = "macos")]
+fn macos_say(text: &str, ended: impl FnOnce() + 'static) -> Option<Speaking> {
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    let mut child = std::process::Command::new("/usr/bin/say")
+        .arg("-f")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut input) = child.stdin.take() {
+        let _ = input.write_all(text.as_bytes());
+    }
+    let child = Arc::new(Mutex::new(Some(child)));
+    let watched = child.clone();
+    // Waited for off the engine thread; the end is reported back on it, so
+    // `ended` (which touches signals) runs there.
+    nsh_core::prelude::spawn(async move {
+        let _ = nsh_core::prelude::blocking(move || {
+            loop {
+                let running = watched
+                    .lock()
+                    .ok()
+                    .and_then(|mut child| child.as_mut().map(|c| matches!(c.try_wait(), Ok(None))))
+                    .unwrap_or(false);
+                if !running {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        })
+        .await;
+        ended();
+    });
+    Some(Speaking { child })
+}
+
 /// Whether this build can run the daemon on its own computer.
 pub const RUNS_DAEMON: bool = cfg!(not(target_arch = "wasm32"));

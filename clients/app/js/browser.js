@@ -402,3 +402,60 @@ export class Dictation {
     this.r?.abort();
   }
 }
+
+/** Whether the page can speak text (the Web Speech API's synthesis). */
+export function speechAvailable() {
+  return typeof window.speechSynthesis === "object" &&
+    typeof window.SpeechSynthesisUtterance === "function";
+}
+
+/**
+ * Text read aloud with the page's voice. `ended()` is called once, when the
+ * last piece was spoken, it failed, or `stop` cut it short. Long text goes
+ * in pieces of whole sentences: some browsers stop a long utterance
+ * partway (Chrome after about fifteen seconds).
+ */
+export class Speaker {
+  constructor(text, lang, ended) {
+    let done = false;
+    this.finish = () => {
+      if (done) return;
+      done = true;
+      ended();
+    };
+    const synth = window.speechSynthesis;
+    if (!synth || typeof window.SpeechSynthesisUtterance !== "function") {
+      setTimeout(this.finish);
+      return;
+    }
+    // One reading at a time on the page.
+    synth.cancel();
+    const pieces = [];
+    for (const paragraph of text.split(/\n+/)) {
+      let piece = "";
+      for (const sentence of paragraph.match(/[^.!?]+[.!?]*\s*/g) || []) {
+        if (piece && (piece + sentence).length > 200) {
+          pieces.push(piece);
+          piece = "";
+        }
+        piece += sentence;
+      }
+      if (piece.trim()) pieces.push(piece);
+    }
+    if (!pieces.length) {
+      setTimeout(this.finish);
+      return;
+    }
+    pieces.forEach((piece, n) => {
+      const u = new SpeechSynthesisUtterance(piece);
+      if (lang) u.lang = lang;
+      if (n === pieces.length - 1) u.onend = this.finish;
+      u.onerror = this.finish;
+      synth.speak(u);
+    });
+  }
+  stop() {
+    window.speechSynthesis?.cancel();
+    this.finish();
+  }
+}

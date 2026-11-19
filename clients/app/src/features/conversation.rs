@@ -1192,10 +1192,44 @@ fn reply_footer(
         .min_w(px(0.0))
         .child(about)
         // An icon, as chat apps keep it: the reply is what is read.
-        .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
-            set_clipboard(content());
-            store.say("Copied the reply");
+        .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, {
+            let content = content.clone();
+            move || {
+                set_clipboard(content());
+                store.say("Copied the reply");
+            }
         }))
+        .child(read_aloud(store, content))
+}
+
+/// Beside Copy: read the reply aloud, and Stop while it reads. Shown only
+/// where something can speak (the browser's voice, or macOS's).
+fn read_aloud(store: Store, content: impl Fn() -> String + 'static) -> View {
+    if !crate::link::can_speak() {
+        return view();
+    }
+    view().child(dynamic(move || {
+        let text = content();
+        let key = reply_key(&text);
+        let on = store.speaking() == Some(key);
+        Some(untracked(move || {
+            let press = move || store.read_aloud(key, &text);
+            if on {
+                ui::icon_btn(Glyph::Stop, "Stop reading", Size::Sm, press)
+                    .text_color(colors::ACCENT)
+            } else {
+                ui::icon_btn(Glyph::Speaker, "Read aloud", Size::Sm, press)
+            }
+        }))
+    }))
+}
+
+/// A reply is known by its words: the key the store's one reading holds.
+fn reply_key(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Which model wrote a reply: the provider's mark when it has one, then

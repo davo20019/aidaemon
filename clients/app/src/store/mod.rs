@@ -336,6 +336,10 @@ pub struct Store {
     /// after it (a second tap of Send stopped the work it had just joined,
     /// live 2026-11-18).
     sent_at: Signal<u64>,
+    /// The reply being read aloud (its key), and the reading itself: one at
+    /// a time, so starting another stops it.
+    speaking: Signal<Option<u64>>,
+    reading: Stored<Option<crate::link::Speaking>>,
     /// The conversation whose name is being edited in the sidebar.
     renaming: Signal<Option<String>>,
     /// The conversation whose project is being chosen, and whether the
@@ -417,6 +421,8 @@ impl Store {
             show_archived: signal(false),
             archived_open: signal(None),
             sent_at: signal(0),
+            speaking: signal(None),
+            reading: stored(None),
             enter_queues: signal(
                 nsh_core::storage::Storage::get_item(ENTER_QUEUES_KEY).as_deref() == Some("1"),
             ),
@@ -2512,6 +2518,47 @@ impl Store {
     /// When this device last sent a message (ms; 0 before any), tracked.
     pub fn last_sent(&self) -> u64 {
         self.sent_at.get()
+    }
+
+    /// The reply being read aloud, by its key; tracked.
+    pub fn speaking(&self) -> Option<u64> {
+        self.speaking.get()
+    }
+
+    /// Read a reply aloud (its Markdown, as words), stopping any other
+    /// reading; reading the same one again stops it.
+    pub fn read_aloud(&self, key: u64, markdown: &str) {
+        let again = self.speaking.get_untracked() == Some(key);
+        self.stop_reading();
+        if again {
+            return;
+        }
+        let text = aidaemon_client_core::text::spoken_text(markdown);
+        if text.is_empty() {
+            return;
+        }
+        let store = *self;
+        let started = crate::link::Speaking::start(&text, move || {
+            // Only this reading's end clears it, not a later one's.
+            if store.speaking.get_untracked() == Some(key) {
+                store.speaking.set(None);
+                store.reading.replace(None);
+            }
+        });
+        match started {
+            Some(reading) => {
+                self.reading.replace(Some(reading));
+                self.speaking.set(Some(key));
+            }
+            None => self.say("Can't read aloud on this device"),
+        }
+    }
+
+    /// Stop reading aloud.
+    pub fn stop_reading(&self) {
+        self.speaking.set(None);
+        // Dropping the reading stops it.
+        drop(self.reading.replace(None));
     }
 
     /// Send the draft of the selected conversation (or start one).
