@@ -703,6 +703,7 @@ mod tests {
             tool_choice: Default::default(),
             max_output_tokens: None,
             options: Default::default(),
+            tool_surfacing: None,
         };
         assert!(estimate_tokens(&request.messages) < 6_000);
         assert!(ContextWindow::new(6_000).compact_request(&mut request));
