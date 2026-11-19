@@ -360,6 +360,14 @@ fn ephemeral() -> Value {
     json!({"type": "ephemeral"})
 }
 
+/// The breakpoint on the fixed prefix (tools, system prompt): kept an hour,
+/// so a reply after a pause of more than five minutes, or a new
+/// conversation within the hour, still reads it. The conversation tail
+/// stays on the five-minute default; one-hour entries come before it.
+fn ephemeral_hour() -> Value {
+    json!({"type": "ephemeral", "ttl": "1h"})
+}
+
 /// Where tool calls carry the signed thinking blocks of the turn that made
 /// them: they must lead the assistant message when the turn is replayed
 /// with thinking enabled.
@@ -430,7 +438,7 @@ fn build_body(
         .map(|m| json!({"type": "text", "text": m.content}))
         .collect();
     if caching && let Some(last) = system.last_mut() {
-        last["cache_control"] = ephemeral();
+        last["cache_control"] = ephemeral_hour();
     }
 
     // Anthropic rejects thinking with a forced tool choice, and a forced
@@ -565,7 +573,7 @@ fn build_body(
                 .rev()
                 .find(|tool| tool.get("defer_loading").is_none())
         {
-            last["cache_control"] = ephemeral();
+            last["cache_control"] = ephemeral_hour();
         }
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = match &request.tool_choice {
@@ -1150,8 +1158,13 @@ mod tool_surfacing_tests {
                 ("generate_image".to_string(), true),
             ]
         );
-        // The breakpoint is on the last rendered tool, not a hidden one.
-        assert!(after["tools"][1].get("cache_control").is_some());
+        // The breakpoint is on the last rendered tool, not a hidden one, and
+        // the fixed prefix is kept an hour; the conversation tail five minutes.
+        assert_eq!(
+            after["tools"][1]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(after["system"][0]["cache_control"]["ttl"], "1h");
         let messages = after["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "system");
