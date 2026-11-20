@@ -952,6 +952,16 @@ impl Store {
     }
 
     /// Prompts the daemon offered under the last reply of `session`.
+    /// `session` shows nothing yet because its history has not come.
+    pub fn history_pending(&self, session: &str) -> bool {
+        self.read(|c| {
+            c.state
+                .sessions
+                .get(session)
+                .is_none_or(|v| !v.history_read && v.lines.is_empty() && v.live.is_none())
+        })
+    }
+
     pub fn suggestions(&self, session: &str) -> Vec<String> {
         self.read(|c| {
             c.state

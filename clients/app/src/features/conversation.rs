@@ -865,8 +865,21 @@ fn transcript(store: Store, session: String) -> View {
     let last_seen = signal(usize::MAX);
     let list = element_ref();
     let unfolding = ui::Unfolding::provide();
+    let loading_id = session.clone();
     view()
         .flex_1()
+        // Opened before its history came (a phone restoring the last
+        // conversation): say so instead of showing an empty page.
+        .child(when(
+            move || all.with(Vec::is_empty) && store.history_pending(&loading_id),
+            || {
+                view().flex_1().items_center().justify_center().child(
+                    text("Loading…")
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::FAINT),
+                )
+            },
+        ))
         .child(ui::refreshable(
             transcript_list(store, session, all, last_seen, unfolding)
                 .element_ref(&list)

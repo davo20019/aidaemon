@@ -98,6 +98,10 @@ pub struct SessionView {
     /// report has not come yet: the conversation is working, not idle.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
+    /// Its history has been read at least once: before that, an empty
+    /// conversation is one still loading, not one with nothing in it.
+    #[serde(skip)]
+    pub history_read: bool,
 }
 
 /// The client's view. Its JSON form (`serde_json::to_value`) is what the
@@ -337,6 +341,7 @@ impl State {
 
     fn set_history(&mut self, session_id: &str, messages: Vec<HistoryMessage>) {
         let view = self.session(session_id);
+        view.history_read = true;
         let mut lines: Vec<Line> = Vec::with_capacity(messages.len());
         for m in messages {
             match m.role.as_str() {
