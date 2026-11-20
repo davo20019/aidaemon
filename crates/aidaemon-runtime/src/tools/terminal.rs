@@ -8482,7 +8482,12 @@ impl Tool for TerminalTool {
                         outcome.metadata.semantics =
                             outcome.metadata.semantics.with_untyped_change();
                     } else {
-                        outcome.metadata.changes_untyped = changes;
+                        // Credited without a claim only when the change is
+                        // recognized: an unknown command can miss a credit,
+                        // never invent one.
+                        outcome.metadata.changes_untyped = run_text
+                            .as_deref()
+                            .is_some_and(aidaemon_tools::command_effects::recognizably_changes);
                     }
                 }
                 outcome

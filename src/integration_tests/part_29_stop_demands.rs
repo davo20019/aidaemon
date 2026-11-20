@@ -358,10 +358,23 @@ async fn an_unclaimed_wrapped_command_does_not_close_the_item() {
 #[tokio::test]
 #[cfg_attr(windows, ignore = "Unix shell wrapper; the typing is platform-neutral")]
 async fn an_unnamed_change_goes_to_the_item_in_progress() {
+    let dir = tempfile::tempdir().expect("container stand-in");
+    let file = dir.path().join("report.txt").to_string_lossy().to_string();
+    let command = format!("sh -c 'touch {file}'");
     let (response, demands) =
-        wrapped_turn("unnamed_change_in_progress", false, "in_progress", "sh -c 'exit 0'").await;
+        wrapped_turn("unnamed_change_in_progress", false, "in_progress", &command).await;
     assert!(response.contains("phase=DONE"), "{response}");
     assert!(demands.is_empty(), "no extra pass: {demands:?}");
+}
+
+/// A command whose change cannot be recognized is not credited without a
+/// claim: the item stays open rather than being closed by a guess.
+#[tokio::test]
+#[cfg_attr(windows, ignore = "Unix shell wrapper; the typing is platform-neutral")]
+async fn an_unrecognized_command_is_not_credited_to_the_item_in_progress() {
+    let (_, demands) =
+        wrapped_turn("unrecognized_in_progress", false, "in_progress", "sh -c 'exit 0'").await;
+    assert!(!demands.is_empty(), "no credit from an unrecognized command");
 }
 
 /// A look is never the work: a read-only command made while an item is in
