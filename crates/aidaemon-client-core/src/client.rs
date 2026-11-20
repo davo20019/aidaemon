@@ -2164,6 +2164,16 @@ impl Client {
         let Some(since) = self.away_since.take() else {
             return false;
         };
+        // A drop while out of sight (a phone suspends a backgrounded app's
+        // sockets) is not news: it gets the quiet grace from now, while the
+        // link reconnects, instead of reading as a long outage at once.
+        if let Connection::Offline {
+            since_ms: Some(lost),
+            ..
+        } = &mut self.connection
+        {
+            *lost = (*lost).max(cx.now_ms);
+        }
         cx.now_ms.saturating_sub(since) >= AWAY_REFRESH_MS && self.refresh_all(cx)
     }
 
@@ -4233,6 +4243,31 @@ mod tests {
         assert!(client.came_back(&at(10_000 + AWAY_REFRESH_MS)));
         assert!(!reads(&mut client).is_empty());
         assert!(!client.came_back(&at(100_000)), "once per return");
+    }
+
+    /// A connection lost while the app was in the background reads as
+    /// connected for a moment on return, while the link reconnects.
+    #[test]
+    fn a_drop_while_away_is_quiet_on_return() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.went_away(1_000);
+        client.connection = Connection::Offline {
+            kind: DropKind::Dropped,
+            reason: "lost".into(),
+            retry_at_ms: 0,
+            since_ms: Some(2_000),
+        };
+        let back = 2_000 + LONG_DROP_MS * 4;
+        client.came_back(&Context {
+            now_ms: back,
+            ..Context::default()
+        });
+        assert_eq!(client.connection.felt(back + 1_000), Felt::Online);
+        assert!(matches!(
+            client.connection.felt(back + LONG_DROP_MS),
+            Felt::Down { .. }
+        ));
     }
 
     /// A reconnect reads the open conversation again even when it shows

@@ -71,9 +71,31 @@ pub fn spawn(
     config: LinkConfig,
     updates: mpsc::UnboundedSender<Update>,
 ) -> mpsc::UnboundedSender<(String, Command)> {
+    spawn_wakeable(config, updates).0
+}
+
+/// Tells the link the device woke (the app came back to the foreground, the
+/// network returned): a link waiting to try again tries now, and a quiet
+/// open socket is pinged and dropped when it does not answer within
+/// [`crate::machine::WAKE_ANSWER`] ([`LinkMachine::woke`]).
+#[derive(Clone, Default)]
+pub struct Waker(Arc<tokio::sync::Notify>);
+
+impl Waker {
+    pub fn wake(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// [`spawn`], with the [`Waker`] to call when the device wakes.
+pub fn spawn_wakeable(
+    config: LinkConfig,
+    updates: mpsc::UnboundedSender<Update>,
+) -> (mpsc::UnboundedSender<(String, Command)>, Waker) {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run(config, updates, rx));
-    tx
+    let waker = Waker::default();
+    tokio::spawn(run(config, updates, rx, waker.clone()));
+    (tx, waker)
 }
 
 struct Link {
@@ -84,12 +106,14 @@ struct Link {
     http: reqwest::Client,
     grant: GrantCache,
     started: tokio::time::Instant,
+    waker: Waker,
 }
 
 async fn run(
     config: LinkConfig,
     updates: mpsc::UnboundedSender<Update>,
     commands: mpsc::UnboundedReceiver<(String, Command)>,
+    waker: Waker,
 ) {
     let machine = LinkMachine::new(
         config.client.clone(),
@@ -104,6 +128,7 @@ async fn run(
         http: crate::tls::http_client(),
         grant: GrantCache::default(),
         started: tokio::time::Instant::now(),
+        waker,
     };
     loop {
         if link.updates.send(Update::Connecting).is_err() {
@@ -121,7 +146,15 @@ async fn run(
         if link.updates.send(Update::Disconnected(disconnect)).is_err() {
             return;
         }
-        tokio::time::sleep(wait).await;
+        // A wake (the app back in front) cuts the wait short.
+        let woke = link.waker.0.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = woke.notified() => {
+                let now = link.now_ms();
+                link.machine.woke(now);
+            }
+        }
     }
 }
 
@@ -235,8 +268,14 @@ impl Link {
         }
         let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
         ticks.tick().await;
+        let woke = self.waker.0.clone();
         loop {
             tokio::select! {
+                _ = woke.notified() => {
+                    if let Some(ping) = self.machine.woke(self.now_ms()) {
+                        socket.send(send(&ping)?).await.map_err(failed)?;
+                    }
+                }
                 incoming = socket.next() => {
                     let message = match incoming {
                         Some(Ok(message)) => message,
@@ -310,5 +349,41 @@ mod tests {
             panic!("a disconnect");
         };
         assert_eq!(disconnect.kind, DropKind::DaemonNotRunning);
+    }
+
+    #[tokio::test]
+    async fn a_wake_ends_the_wait_before_the_next_try() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_commands, waker) = spawn_wakeable(
+            LinkConfig {
+                url: format!("ws://127.0.0.1:{port}/client/v1/ws"),
+                auth: Auth::LocalToken("acg_synthetic".into()),
+                client: ClientIdentity {
+                    kind: aidaemon_client_protocol::ClientKind::Mobile,
+                    name: "test".into(),
+                    version: None,
+                },
+                device: None,
+                capabilities: Vec::new(),
+            },
+            tx,
+        );
+        // Fail until the backoff is long, as in the background.
+        let wait = loop {
+            if let Some(Update::Disconnected(disconnect)) = rx.recv().await
+                && disconnect.retry_in >= std::time::Duration::from_secs(2)
+            {
+                break disconnect.retry_in;
+            }
+        };
+        let woken = std::time::Instant::now();
+        waker.wake();
+        assert_eq!(rx.recv().await, Some(Update::Connecting));
+        assert!(woken.elapsed() < wait / 2, "tried again at once");
     }
 }

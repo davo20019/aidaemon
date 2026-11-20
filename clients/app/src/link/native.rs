@@ -15,6 +15,16 @@ use crate::store::Store;
 /// task stops at its next update (dropping its receiver ends the link).
 static LINK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The current link's waker ([`woke`]).
+static WAKER: std::sync::Mutex<Option<link::Waker>> = std::sync::Mutex::new(None);
+
+/// Tell the current link the device woke.
+pub fn woke() {
+    if let Some(waker) = WAKER.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        waker.wake();
+    }
+}
+
 /// What kind of client this is, for the daemon's device list and limits.
 fn client_kind() -> ClientKind {
     if super::MOBILE {
@@ -57,10 +67,13 @@ pub fn start(store: Store) {
     let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel::<Update>();
     spawn(async move {
         // The link's tasks run on the runtime behind `background`.
-        let Ok(commands) = background(async move { link::spawn(config, updates_tx) }).await else {
+        let Ok((commands, waker)) =
+            background(async move { link::spawn_wakeable(config, updates_tx) }).await
+        else {
             log::error!("could not start the link");
             return;
         };
+        *WAKER.lock().unwrap_or_else(|p| p.into_inner()) = Some(waker);
         store.attach(Box::new(move |id, command| {
             let _ = commands.send((id, command));
         }));

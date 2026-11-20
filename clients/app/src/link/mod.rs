@@ -25,6 +25,14 @@ pub fn app_version() -> String {
     }
 }
 
+/// The device woke (the app back in front, a computer back from sleep):
+/// the link checks its socket, or tries again now. The browser's link
+/// watches the page itself.
+pub fn woke() {
+    #[cfg(not(target_arch = "wasm32"))]
+    native::woke();
+}
+
 /// Start the link for this platform.
 pub fn start(store: Store) {
     #[cfg(not(target_arch = "wasm32"))]
