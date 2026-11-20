@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aidaemon_core::{
-    Image, Message, ModelRequest, ModelResponse, Provider, ProviderError, ResponseFormat, Role,
-    StreamEvent, ToolCall, ToolChoice, Usage, collect_stream,
+    Image, Message, MessageOrigin, ModelRequest, ModelResponse, Provider, ProviderError,
+    ResponseFormat, Role, StreamEvent, ToolCall, ToolChoice, Usage, collect_stream,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -463,9 +463,20 @@ fn build_body(
         max_tokens = max_tokens.max(thinking_budget(effort) + 4_096);
     }
 
-    let mut messages = wire_messages(&request.messages[leading..]);
-    if caching && let Some(last) = messages.last_mut() {
-        tail_breakpoint(last);
+    let transcript = &request.messages[leading..];
+    let mut messages = wire_messages(transcript);
+    if caching {
+        // Earlier turns are rendered the same from turn to turn, but the
+        // tail breakpoint only ever lands inside the turn running now (after
+        // its per-turn context), so without this the next turn reused only
+        // the system prompt and tools (live 2026-11-20: a 7-turn chat read
+        // 27k of 31-35k on every turn's first call).
+        if let Some(history) = history_breakpoint(transcript, &messages) {
+            tail_breakpoint(&mut messages[history]);
+        }
+        if let Some(last) = messages.last_mut() {
+            tail_breakpoint(last);
+        }
     }
     // Loaded deferred tools are surfaced where they were loaded; one whose
     // anchor is gone (the transcript was edited) is sent as an ordinary tool.
@@ -584,6 +595,24 @@ fn build_body(
         };
     }
     body
+}
+
+/// The wire message that ends the earlier turns: the one just before the
+/// message the user typed last (typed by `origin`, never by text), when it
+/// is a message of its own and not the transcript's last.
+fn history_breakpoint(transcript: &[Message], wire: &[Value]) -> Option<usize> {
+    let start = transcript.iter().rposition(|message| {
+        message.role == Role::User && matches!(message.origin, None | Some(MessageOrigin::User))
+    })?;
+    if start == 0 {
+        return None;
+    }
+    let earlier = wire_messages(&transcript[..start]);
+    let end = earlier.len().checked_sub(1)?;
+    // The earlier turns end on the model's reply, so the wire keeps them a
+    // message of their own; anything else may have merged into the next.
+    let own = earlier[end]["role"] == "assistant" && wire.get(end) == Some(&earlier[end]);
+    (own && end + 1 < wire.len()).then_some(end)
 }
 
 /// Mark the conversation's last block as a cache breakpoint, so the next
@@ -1244,5 +1273,79 @@ mod open_object_tests {
         };
         let body = build_body(&request, 1024, false, None);
         assert!(body["output_config"]["format"].is_null(), "{body}");
+    }
+}
+
+#[cfg(test)]
+mod history_cache_tests {
+    use super::build_body;
+    use aidaemon_core::{Message, MessageOrigin, ModelRequest, ToolCall};
+    use serde_json::{Value, json};
+
+    fn marked(body: &Value) -> Vec<usize> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn breakpoints(body: &Value) -> usize {
+        body.to_string().matches("cache_control").count()
+    }
+
+    fn turn(messages: Vec<Message>) -> Value {
+        let request = ModelRequest {
+            model: "claude-opus-5-5".into(),
+            messages,
+            ..Default::default()
+        };
+        build_body(&request, 1024, true, None)
+    }
+
+    /// Earlier turns end in a breakpoint, so the next turn reuses them; the
+    /// turn running now (its user message, per-turn context, tool rounds)
+    /// keeps the last one. Four breakpoints at most, as Anthropic allows.
+    #[test]
+    fn earlier_turns_end_in_a_breakpoint_of_their_own() {
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "a.txt"}),
+            provider_data: None,
+        };
+        let body = turn(vec![
+            Message::system("You are a synthetic test agent."),
+            Message::user("first question"),
+            Message::assistant("first answer", vec![]),
+            Message::user("second question"),
+            Message::system("[Task Context] synthetic per-turn context"),
+            Message::assistant("", vec![call]),
+            Message::tool_result("c1", "file text"),
+        ]);
+        // wire: 0 user(first), 1 assistant(first answer), 2 user(second +
+        // context), 3 assistant(tool_use), 4 user(tool_result)
+        assert_eq!(marked(&body), vec![1, 4], "{body:#}");
+        assert!(breakpoints(&body) <= 4, "{body:#}");
+    }
+
+    /// A first turn has no earlier turns; a hook's injected user message is
+    /// not where the turn starts.
+    #[test]
+    fn no_history_breakpoint_without_earlier_turns() {
+        let first = turn(vec![
+            Message::system("You are a synthetic test agent."),
+            Message::user("only question"),
+            Message::assistant("thinking aloud", vec![]),
+            Message::from_origin(MessageOrigin::StopHook, "keep going"),
+        ]);
+        assert_eq!(marked(&first), vec![2], "{first:#}");
     }
 }
