@@ -230,9 +230,12 @@ pub fn pair_phone(store: Store) -> View {
                             let link = offer.page_link();
                             move || {
                                 let link = link.clone();
-                                btn("Send to my phone", Variant::Secondary, Size::Sm, move || {
-                                    send_to_phone(link.clone())
-                                })
+                                btn(
+                                    "Send to my phone",
+                                    Variant::Secondary,
+                                    Size::Sm,
+                                    move || send_to_phone(link.clone()),
+                                )
                             }
                         }))
                         .child(btn("Copy link", Variant::Ghost, Size::Sm, {
