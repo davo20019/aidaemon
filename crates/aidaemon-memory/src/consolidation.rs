@@ -43,7 +43,8 @@ const CONSOLIDATION_PROMPT: &str = "You are a memory consolidation system. Given
             ONLY learn from owner-authenticated user messages. NEVER extract or store facts from guest/public speakers, and NEVER treat another person's self-description as owner data. \
             A name mentioned in conversation belongs in \"people\" — it is NEVER the owner's \"name\" unless the owner explicitly states it as their own.\n\n\
             A request the owner makes is not a fact about them: you see one excerpt, so you cannot tell a habit from a one-off. \
-            Record a way of working only when the owner states it as a standing instruction (\"always tell me how long each task took\"), as a preference.\n\
+            Record a way of working only when the owner states it as a standing instruction (\"always tell me how long each task took\"), as a preference. \
+            A rule or constraint the owner limits to this chat, this task or this request (\"for this chat\", \"this time\", \"don't install anything for this one\") is not standing: never record it.\n\
             If the owner later in the excerpt retracts or asks to forget something, do not extract it.\n\n\
             For \"people\", extract:\n\
             - Names and relationships mentioned (e.g., \"my wife Alice\", \"coworker Juan\")\n\
