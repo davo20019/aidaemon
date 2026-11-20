@@ -112,33 +112,29 @@ impl SqliteMemory {
             .take(12)
             .map(str::to_lowercase)
             .collect();
-        let mut ids = HashSet::new();
-        for token in tokens {
-            let pattern = format!("%{token}%");
-            let rows: Vec<i64> = sqlx::query_scalar(
-                "SELECT DISTINCT c.source_fact_id
-                 FROM memory_edges edge
-                 JOIN memory_entities source ON source.id = edge.source_entity_id
-                 JOIN memory_entities target ON target.id = edge.target_entity_id
-                 JOIN memory_claims c ON c.id = edge.source_claim_id
-                 WHERE edge.deleted_at IS NULL AND edge.valid_to IS NULL
-                   AND c.deleted_at IS NULL AND c.valid_to IS NULL
-                   AND c.source_fact_id IS NOT NULL
-                   AND (lower(source.display_name) LIKE ? OR lower(source.canonical_name) LIKE ?
-                        OR lower(target.display_name) LIKE ? OR lower(target.canonical_name) LIKE ?
-                        OR lower(edge.relation) LIKE ?)
-                 LIMIT 500",
-            )
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .fetch_all(&self.pool)
-            .await?;
-            ids.extend(rows);
+        if tokens.is_empty() {
+            return Ok(HashSet::new());
         }
-        Ok(ids)
+        // One read of the active edges and their names, every token matched
+        // here: a LIKE scan of the joined tables per token took a turn's
+        // recall to tens of seconds (live 2026-11-20: twelve 1-2.7 s scans
+        // before the first model call).
+        let rows: Vec<(i64, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT c.source_fact_id,
+                    lower(coalesce(source.display_name, '')), lower(coalesce(source.canonical_name, '')),
+                    lower(coalesce(target.display_name, '')), lower(coalesce(target.canonical_name, '')),
+                    lower(coalesce(edge.relation, ''))
+             FROM memory_edges edge
+             JOIN memory_entities source ON source.id = edge.source_entity_id
+             JOIN memory_entities target ON target.id = edge.target_entity_id
+             JOIN memory_claims c ON c.id = edge.source_claim_id
+             WHERE edge.deleted_at IS NULL AND edge.valid_to IS NULL
+               AND c.deleted_at IS NULL AND c.valid_to IS NULL
+               AND c.source_fact_id IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(graph_matches(&tokens, &rows))
     }
 
     pub async fn search_embedding_owners(
@@ -1326,5 +1322,59 @@ mod tests {
         ));
         assert!(!entity_is_grounded("Alice Rivera", &[], "Alice moved"));
         assert!(!entity_is_grounded("Jordan", &[], "Jordanna called"));
+    }
+}
+
+/// Facts whose edge names a token in an entity's name or the relation, at
+/// most 500 per token (as the per-token query had). `lower()` in SQLite
+/// folds ASCII only, so the tokens are matched as they come.
+fn graph_matches(
+    tokens: &[String],
+    rows: &[(i64, String, String, String, String, String)],
+) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    for token in tokens {
+        let mut per_token = HashSet::new();
+        for (fact, a, b, c, d, relation) in rows {
+            if per_token.len() >= 500 {
+                break;
+            }
+            if [a, b, c, d, relation]
+                .iter()
+                .any(|field| field.contains(token.as_str()))
+            {
+                per_token.insert(*fact);
+            }
+        }
+        ids.extend(per_token);
+    }
+    ids
+}
+
+#[cfg(test)]
+mod graph_match_tests {
+    use super::graph_matches;
+
+    #[test]
+    fn a_token_in_any_name_or_relation_finds_the_fact() {
+        let row = |fact: i64, source: &str, target: &str, relation: &str| {
+            (
+                fact,
+                source.to_string(),
+                source.to_string(),
+                target.to_string(),
+                target.to_string(),
+                relation.to_string(),
+            )
+        };
+        let rows = vec![
+            row(1, "alice rivera", "acme corp", "works_at"),
+            row(2, "mia", "piano", "plays"),
+            row(3, "jordan lee", "acme corp", "manages"),
+        ];
+        let tokens = vec!["acme".to_string(), "plays".to_string()];
+        let found = graph_matches(&tokens, &rows);
+        assert_eq!(found, [1, 2, 3].into_iter().collect());
+        assert!(graph_matches(&["zzz".to_string()], &rows).is_empty());
     }
 }
