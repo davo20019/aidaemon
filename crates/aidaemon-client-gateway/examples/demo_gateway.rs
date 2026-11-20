@@ -47,12 +47,11 @@ impl AgentIngress for Agent {
         let text = request.user_text.to_lowercase();
         if let Some(status) = request.status_tx.as_ref() {
             let _ = status
-                .send(StatusUpdate::ToolStart {
-                    name: "terminal".into(),
-                    summary: "reading the synthetic notes".into(),
-                    kind: aidaemon_core::card::ActivityKind::Read,
-                    input: String::new(),
-                })
+                .send(StatusUpdate::tool_start(
+                    "terminal",
+                    "reading the synthetic notes",
+                    aidaemon_core::card::ActivityKind::Read,
+                ))
                 .await;
             // "slow" keeps it working a while, to watch a working row.
             let pause = if text.contains("slow") { 30_000 } else { 600 };

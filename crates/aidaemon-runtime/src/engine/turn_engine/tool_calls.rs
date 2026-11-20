@@ -509,15 +509,10 @@ impl TurnEngine<'_> {
                 });
             let kind = step_kind(&facts, mutates);
             if let Some(status_tx) = &scope.status_tx {
-                let _ = status_tx.try_send(StatusUpdate::ToolStart {
-                    name,
-                    summary,
-                    kind,
-                    // The same arguments a reloaded conversation shows.
-                    input: aidaemon_tools::shown::call_input(&serde_json::Value::String(
-                        arguments.to_string(),
-                    )),
-                });
+                // The same arguments a reloaded conversation shows.
+                let _ = status_tx.try_send(
+                    StatusUpdate::tool_start(name, summary, kind).showing_arguments(arguments),
+                );
             }
         }
         // Where its declared writes land that does not exist yet: a folder
@@ -1290,11 +1285,7 @@ impl TurnEngine<'_> {
                             }
                         },
                     );
-                    StatusUpdate::ToolComplete {
-                        name,
-                        summary,
-                        output: aidaemon_tools::shown::call_output(&output),
-                    }
+                    StatusUpdate::tool_complete(name, summary).showing_result(&output)
                 })
             };
             if let Some(update) = update {

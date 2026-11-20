@@ -176,12 +176,9 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
             summary,
             kind,
             input,
-        } => TurnStatus::ToolStarted {
-            name: name.clone(),
-            summary: summary.clone(),
-            activity: Some(crate::tool_kind(*kind)),
-            input: input.clone(),
-        },
+            ..
+        } => TurnStatus::tool_started(name.clone(), summary.clone(), Some(crate::tool_kind(*kind)))
+            .with_detail(input.clone()),
         StatusUpdate::ToolProgress { name, chunk } => TurnStatus::ToolProgress {
             name: name.clone(),
             chunk: chunk.clone(),
@@ -190,11 +187,8 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
             name,
             summary,
             output,
-        } => TurnStatus::ToolCompleted {
-            name: name.clone(),
-            summary: summary.clone(),
-            output: output.clone(),
-        },
+            ..
+        } => TurnStatus::tool_completed(name.clone(), summary.clone()).with_detail(output.clone()),
         StatusUpdate::PlanStepStart {
             step_index,
             total_steps,

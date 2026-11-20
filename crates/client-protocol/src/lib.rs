@@ -2240,6 +2240,9 @@ pub enum TurnState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnStatus {
     Thinking,
+    /// Built with [`TurnStatus::tool_started`]: non-exhaustive so a new
+    /// field changes one constructor, not every sender.
+    #[non_exhaustive]
     ToolStarted {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2256,6 +2259,8 @@ pub enum TurnStatus {
         name: String,
         chunk: String,
     },
+    /// Built with [`TurnStatus::tool_completed`].
+    #[non_exhaustive]
     ToolCompleted {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2286,6 +2291,40 @@ pub enum TurnStatus {
 }
 
 impl TurnStatus {
+    /// A call starting; [`Self::with_detail`] adds its shown arguments.
+    pub fn tool_started(
+        name: impl Into<String>,
+        summary: impl Into<String>,
+        activity: Option<ToolKind>,
+    ) -> Self {
+        TurnStatus::ToolStarted {
+            name: name.into(),
+            summary: summary.into(),
+            activity,
+            input: String::new(),
+        }
+    }
+
+    /// A call finished; [`Self::with_detail`] adds its shown result.
+    pub fn tool_completed(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        TurnStatus::ToolCompleted {
+            name: name.into(),
+            summary: summary.into(),
+            output: String::new(),
+        }
+    }
+
+    /// A started call with its shown arguments, or a finished one with its
+    /// shown result. Other statuses are unchanged.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        match &mut self {
+            TurnStatus::ToolStarted { input: shown, .. }
+            | TurnStatus::ToolCompleted { output: shown, .. } => *shown = detail.into(),
+            _ => {}
+        }
+        self
+    }
+
     /// What a tool row shows for this status: a started call's arguments or
     /// a completed call's result, else its summary when the daemon sent
     /// none (an older daemon). `None` for a status that is not a call.

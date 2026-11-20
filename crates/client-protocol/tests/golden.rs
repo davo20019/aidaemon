@@ -168,12 +168,11 @@ fn snapshot() -> Snapshot {
             turn_id: "turn-7".into(),
             started_at_ms: 1_700_000_000_000,
             streamed: "Reading the synthetic notes".into(),
-            status: Some(TurnStatus::ToolStarted {
-                name: "terminal".into(),
-                summary: "cargo test -q".into(),
-                activity: Some(ToolKind::Run),
-                input: String::new(),
-            }),
+            status: Some(TurnStatus::tool_started(
+                "terminal",
+                "cargo test -q",
+                Some(ToolKind::Run),
+            )),
             tools: vec!["terminal".into()],
             calls: vec![ToolCallInfo {
                 name: "terminal".into(),
@@ -748,12 +747,7 @@ fn server_samples() -> Vec<ServerFrame> {
             None,
             Event::TurnStatus {
                 turn_id: "b9e1-4".into(),
-                status: TurnStatus::ToolStarted {
-                    name: "http_request".into(),
-                    summary: "POST h.example.invalid".into(),
-                    activity: None,
-                    input: String::new(),
-                },
+                status: TurnStatus::tool_started("http_request", "POST h.example.invalid", None),
             },
         ),
         event(
@@ -1650,21 +1644,13 @@ fn no_fixture_is_orphaned() {
 fn every_turn_status_round_trips() {
     let statuses = [
         TurnStatus::Thinking,
-        TurnStatus::ToolStarted {
-            name: "terminal".into(),
-            summary: String::new(),
-            activity: Some(ToolKind::Run),
-            input: "{\"command\": \"cargo test -q\"}".into(),
-        },
+        TurnStatus::tool_started("terminal", "", Some(ToolKind::Run))
+            .with_detail("{\"command\": \"cargo test -q\"}"),
         TurnStatus::ToolProgress {
             name: "terminal".into(),
             chunk: "building".into(),
         },
-        TurnStatus::ToolCompleted {
-            name: "terminal".into(),
-            summary: "ok".into(),
-            output: "test result: ok".into(),
-        },
+        TurnStatus::tool_completed("terminal", "ok").with_detail("test result: ok"),
         TurnStatus::PlanStep {
             step: 1,
             total: 3,

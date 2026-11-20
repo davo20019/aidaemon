@@ -7448,6 +7448,7 @@
           "type": "object"
         },
         {
+          "description": "Built with [`TurnStatus::tool_started`]: non-exhaustive so a new\nfield changes one constructor, not every sender.",
           "properties": {
             "activity": {
               "anyOf": [
@@ -7502,6 +7503,7 @@
           "type": "object"
         },
         {
+          "description": "Built with [`TurnStatus::tool_completed`].",
           "properties": {
             "kind": {
               "const": "tool_completed",

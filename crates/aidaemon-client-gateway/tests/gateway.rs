@@ -45,12 +45,11 @@ impl AgentIngress for ScriptedAgent {
         *self.files.lock().unwrap() = request.attachments.clone();
         if let Some(status) = request.status_tx.as_ref() {
             let _ = status
-                .send(StatusUpdate::ToolStart {
-                    name: "terminal".into(),
-                    summary: "building the synthetic report".into(),
-                    kind: aidaemon_core::card::ActivityKind::Run,
-                    input: String::new(),
-                })
+                .send(StatusUpdate::tool_start(
+                    "terminal",
+                    "building the synthetic report",
+                    aidaemon_core::card::ActivityKind::Run,
+                ))
                 .await;
             for chunk in ["Do", "ne."] {
                 let _ = status.send(StatusUpdate::ReplyText(chunk.into())).await;

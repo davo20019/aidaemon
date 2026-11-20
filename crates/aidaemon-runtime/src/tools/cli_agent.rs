@@ -3526,11 +3526,7 @@ impl CliAgentTool {
                             &aidaemon_tools::semantics::ToolDispatchFacts::default(),
                             false,
                         );
-                        let _ = tx.try_send(StatusUpdate::ToolComplete {
-                            name: label,
-                            summary,
-                            output: String::new(),
-                        });
+                        let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                     }
 
                     return Ok(with_left(format!(
@@ -3561,11 +3557,7 @@ impl CliAgentTool {
                             &aidaemon_tools::semantics::ToolDispatchFacts::default(),
                             false,
                         );
-                        let _ = tx.try_send(StatusUpdate::ToolComplete {
-                            name: label,
-                            summary,
-                            output: String::new(),
-                        });
+                        let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                     }
                     Self::quarantine_unavailable_tool(
                         &self.tools,
@@ -3619,11 +3611,7 @@ impl CliAgentTool {
                         &aidaemon_tools::semantics::ToolDispatchFacts::default(),
                         false,
                     );
-                    let _ = tx.try_send(StatusUpdate::ToolComplete {
-                        name: label,
-                        summary,
-                        output: String::new(),
-                    });
+                    let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                 }
 
                 if exit_code != Some(0) {

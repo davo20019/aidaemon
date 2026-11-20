@@ -951,24 +951,24 @@ mod tests {
                 origin: "app".into(),
             },
         ));
-        state.apply(status(TurnStatus::ToolStarted {
-            name: "running a command".into(),
-            summary: "typechecking".into(),
-            activity: Some(aidaemon_client_protocol::ToolKind::Run),
-            input: "{\n  \"command\": \"npm run typecheck\"\n}".into(),
-        }));
-        state.apply(status(TurnStatus::ToolCompleted {
-            name: "running a command".into(),
-            summary: "exit 0".into(),
-            output: "Found 0 errors.".into(),
-        }));
+        state.apply(status(
+            TurnStatus::tool_started(
+                "running a command",
+                "typechecking",
+                Some(aidaemon_client_protocol::ToolKind::Run),
+            )
+            .with_detail("{\n  \"command\": \"npm run typecheck\"\n}"),
+        ));
+        state.apply(status(
+            TurnStatus::tool_completed("running a command", "exit 0")
+                .with_detail("Found 0 errors."),
+        ));
         // An older daemon sends no arguments: the summary stands in.
-        state.apply(status(TurnStatus::ToolStarted {
-            name: "reading a file".into(),
-            summary: "src/synthetic.ts".into(),
-            activity: None,
-            input: String::new(),
-        }));
+        state.apply(status(TurnStatus::tool_started(
+            "reading a file",
+            "src/synthetic.ts",
+            None,
+        )));
         state.apply(event(
             Some(1),
             Event::TurnCompleted {
@@ -1052,12 +1052,7 @@ mod tests {
             None,
             Event::TurnStatus {
                 turn_id: "t1".into(),
-                status: TurnStatus::ToolStarted {
-                    name: "read_file".into(),
-                    summary: "notes.md".into(),
-                    activity: None,
-                    input: String::new(),
-                },
+                status: TurnStatus::tool_started("read_file", "notes.md", None),
             },
         ));
         let live = state.sessions["app:synthetic-1"]

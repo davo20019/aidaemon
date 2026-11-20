@@ -1474,12 +1474,11 @@ mod tests {
         ) -> anyhow::Result<AgentResponseEnvelope> {
             if let Some(status) = request.status_tx.as_ref() {
                 let _ = status
-                    .send(StatusUpdate::ToolStart {
-                        name: "terminal".into(),
-                        summary: "installing the blog".into(),
-                        kind: aidaemon_core::card::ActivityKind::Run,
-                        input: String::new(),
-                    })
+                    .send(StatusUpdate::tool_start(
+                        "terminal",
+                        "installing the blog",
+                        aidaemon_core::card::ActivityKind::Run,
+                    ))
                     .await;
             }
             self.release.notified().await;
@@ -1956,12 +1955,7 @@ mod tests {
         use aidaemon_core::card::{ActivityKind, RunPhase};
         let log = run_card_turn(
             vec![
-                StatusUpdate::ToolStart {
-                    name: "spawn".into(),
-                    summary: String::new(),
-                    kind: ActivityKind::Delegate,
-                    input: String::new(),
-                },
+                StatusUpdate::tool_start("spawn", "", ActivityKind::Delegate),
                 helper("Count lines", RunPhase::Running),
                 helper("Count words", RunPhase::Running),
                 helper("Count lines", RunPhase::Succeeded),
@@ -1986,12 +1980,7 @@ mod tests {
         assert!(!log.contains(&"card deleted".to_string()), "{log:#?}");
 
         let log = run_card_turn(
-            vec![StatusUpdate::ToolStart {
-                name: "read".into(),
-                summary: String::new(),
-                kind: ActivityKind::Read,
-                input: String::new(),
-            }],
+            vec![StatusUpdate::tool_start("read", "", ActivityKind::Read)],
             "It says hello.",
             Default::default(),
         )

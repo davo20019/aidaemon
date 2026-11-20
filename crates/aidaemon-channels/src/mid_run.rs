@@ -265,23 +265,13 @@ mod tests {
         live.record(
             "s",
             7,
-            &StatusUpdate::ToolStart {
-                name: "terminal".into(),
-                summary: "installing the site".into(),
-                kind: ActivityKind::Run,
-                input: String::new(),
-            },
+            &StatusUpdate::tool_start("terminal", "installing the site", ActivityKind::Run),
         );
         // A late update from an earlier turn changes nothing.
         live.record(
             "s",
             6,
-            &StatusUpdate::ToolStart {
-                name: "terminal".into(),
-                summary: "old step".into(),
-                kind: ActivityKind::Web,
-                input: String::new(),
-            },
+            &StatusUpdate::tool_start("terminal", "old step", ActivityKind::Web),
         );
         let records = crate::ports::ChatRuns {
             runs: vec![run(
