@@ -237,7 +237,7 @@ impl MemoryJobs {
     /// Embed one batch of learned records still missing an embedding.
     /// True when there was something to embed. While passes keep finding
     /// nothing, later calls skip the scan (returning false) until the backoff
-    /// is due again; see [`IdleBackoff`].
+    /// is due again (doubling from 5 s up to 5 min while passes stay empty).
     pub async fn embeddings(&self) -> anyhow::Result<bool> {
         if !self.backoff().due(Instant::now()) {
             return Ok(false);
