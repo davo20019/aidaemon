@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::spawn::{ConversationRequest, ConversationRuntime};
 use crate::tools::traits::{
@@ -3334,6 +3334,30 @@ fn format_background_continuation_failure(unchecked: &[String]) -> String {
 static REENGAGE_SERIALIZER: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// A command as INFO and WARN logs show it: its program and a fingerprint,
+/// never the full text. The agent reads the daemon's own log when it
+/// troubleshoots, and a full command line there (`grep trigger_pattern …`)
+/// is later found as if it were what the command searched for. The full
+/// command stays in the tool call's record and at DEBUG ("Approval check").
+struct LoggedCommand<'a>(&'a str);
+
+impl std::fmt::Display for LoggedCommand<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use sha2::{Digest, Sha256};
+        // Machine format: the first whitespace-separated word of a shell
+        // command line is its program.
+        let program = self.0.split_whitespace().next().unwrap_or("");
+        let program = program.rsplit('/').next().unwrap_or(program);
+        let program = truncate_str(program, 40);
+        let digest = Sha256::digest(self.0.as_bytes());
+        write!(f, "{program} [{} chars, ", self.0.chars().count())?;
+        for byte in &digest[..4] {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, "]")
+    }
+}
+
 #[cfg(test)]
 pub async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
     REENGAGE_SERIALIZER.lock().await
@@ -4152,6 +4176,7 @@ impl TerminalTool {
             && !self
                 .capabilities_granted(command, &requested_capabilities)
                 .await;
+        debug!(command = %command, "Approval check");
         let needs_approval = if capability_escalation_pending {
             // Elevated capability is new authority; no command-prefix grant
             // or dispatcher preapproval stands in for the user seeing exactly
@@ -4160,7 +4185,7 @@ impl TerminalTool {
                 "Requests elevated capabilities beyond the task scope: {}",
                 Self::describe_capabilities(&requested_capabilities)
             ));
-            info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
+            info!(command = %LoggedCommand(command), capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
             true
         } else if daemonization {
             false
@@ -4168,15 +4193,15 @@ impl TerminalTool {
             // External triggers always need approval regardless of mode
             approval_warnings
                 .push("Command originated from an untrusted external trigger.".to_string());
-            info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
+            info!(command = %LoggedCommand(command), risk = %approval_risk, "Forcing approval: untrusted source");
             true
         } else if args.detach && !is_allowed {
             // Allowlisted commands (permanent or session approvals) may run
             // detached without asking again; only novel detached commands do.
-            info!(command = %command, "Forcing approval: detach=true and command not pre-approved");
+            info!(command = %LoggedCommand(command), "Forcing approval: detach=true and command not pre-approved");
             true
         } else if trust.trusted_session {
-            info!(command = %command, session = %trust.session_id, "Auto-approved: trusted scheduled task");
+            info!(command = %LoggedCommand(command), session = %trust.session_id, "Auto-approved: trusted scheduled task");
             false
         } else if let Some(reason) = deterministic_approval_floor {
             // Before the explicit allow (owner ruling): an allowlisted or
@@ -4184,10 +4209,10 @@ impl TerminalTool {
             approval_warnings.push(reason);
             true
         } else if is_allowed {
-            info!(command = %command, "Auto-approved: explicit command grant");
+            info!(command = %LoggedCommand(command), "Auto-approved: explicit command grant");
             false
         } else if self.confined_tier(args, command, trust).await.is_some() {
-            info!(command = %command, "Auto-approved: allowlisted command runs confined");
+            info!(command = %LoggedCommand(command), "Auto-approved: allowlisted command runs confined");
             false
         } else if let Some(side_calls) = self.side_calls.get() {
             match assess_command(side_calls, command, &self.backend).await {
@@ -4195,15 +4220,15 @@ impl TerminalTool {
                     approval_risk = semantic.risk_level;
                     approval_warnings = semantic.warnings;
                     if semantic.requires_approval {
-                        info!(command = %command, risk = %approval_risk, "Semantic command assessment requires owner approval");
+                        info!(command = %LoggedCommand(command), risk = %approval_risk, "Semantic command assessment requires owner approval");
                         true
                     } else {
-                        info!(command = %command, risk = %approval_risk, "Auto-approved by semantic command assessment");
+                        info!(command = %LoggedCommand(command), risk = %approval_risk, "Auto-approved by semantic command assessment");
                         false
                     }
                 }
                 Err(error) => {
-                    warn!(command = %command, %error, "Semantic command assessment failed; requesting approval");
+                    warn!(command = %LoggedCommand(command), %error, "Semantic command assessment failed; requesting approval");
                     approval_risk = RiskLevel::Critical;
                     approval_warnings.push(format!(
                         "Semantic safety assessment unavailable; failed closed: {}",
@@ -4944,7 +4969,7 @@ impl TerminalTool {
                 },
             );
             Self::prune_completed_map(&mut completed);
-            info!(pid, command = %proc.command, "Reaped finished background process");
+            info!(pid, command = %LoggedCommand(&proc.command), "Reaped finished background process");
         }
     }
 
@@ -5659,7 +5684,7 @@ impl TerminalTool {
                         terminating_signal = ?terminating_signal,
                         stdout_bytes = stdout.len(),
                         stderr_bytes = stderr.len(),
-                        command = %command.chars().take(200).collect::<String>(),
+                        command = %LoggedCommand(command),
                         "Confined command finished with a non-zero result"
                     );
                 }
@@ -6078,7 +6103,7 @@ impl TerminalTool {
                             if session_for_notify.is_empty() {
                                 warn!(
                                     pid,
-                                    command = %command_for_notify,
+                                    command = %LoggedCommand(&command_for_notify),
                                     "Terminal background notifier skipped enqueue due to empty session id"
                                 );
                                 notify_on_completion.store(false, Ordering::Relaxed);
@@ -6130,7 +6155,7 @@ impl TerminalTool {
                                             warn!(
                                                 pid,
                                                 error = %e,
-                                                command = %command_for_notify,
+                                                command = %LoggedCommand(&command_for_notify),
                                                 "Terminal background notifier lost completion signal"
                                             );
                                             None
@@ -6163,7 +6188,7 @@ impl TerminalTool {
                                 // the run ends on its card, with no message.
                                 warn!(
                                     pid,
-                                    command = %command_for_notify,
+                                    command = %LoggedCommand(&command_for_notify),
                                     "Terminal background notifier suppressed (check/kill already handled notification)"
                                 );
                                 if let Some(run) = run {
@@ -6466,7 +6491,7 @@ impl TerminalTool {
                                         warn!(
                                             pid,
                                             session_id = %session_for_notify,
-                                            command = %command_for_notify,
+                                            command = %LoggedCommand(&command_for_notify),
                                             "Background re-engagement budget exhausted; delivering raw output instead of re-entering agent loop"
                                         );
                                     }
@@ -6494,7 +6519,7 @@ impl TerminalTool {
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
-                                            command = %command_for_notify,
+                                            command = %LoggedCommand(&command_for_notify),
                                             "Re-engaging agent loop to process background command output"
                                         );
                                         let (continued, _followup_end) = run_background_continuation(
@@ -6728,7 +6753,7 @@ impl TerminalTool {
                     } else {
                         warn!(
                             pid,
-                            command = %command,
+                            command = %LoggedCommand(command),
                             "Terminal background notifier not started because process buffers were unavailable"
                         );
                         notify_on_completion.store(false, Ordering::Relaxed);
@@ -6736,7 +6761,7 @@ impl TerminalTool {
                 } else {
                     warn!(
                         pid,
-                        command = %command,
+                        command = %LoggedCommand(command),
                         "Terminal background notifier disabled: neither state queue nor channel hub is configured"
                     );
                     notify_on_completion.store(false, Ordering::Relaxed);
