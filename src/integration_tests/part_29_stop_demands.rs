@@ -262,3 +262,83 @@ async fn a_second_empty_reply_does_not_loop() {
         "one ask, never a loop: {verdicts:?}"
     );
 }
+
+/// One turn that declares a write, makes it through a wrapper the terminal
+/// cannot see into (here `sh -c`, live `docker exec`), and replies; returns
+/// the reply and the ledger's demands.
+async fn opaque_write_turn(session_id: &str, claim: bool) -> (String, Vec<String>) {
+    let checklist = json!({"items": [{
+        "text": "write the synthetic report inside the container",
+        "status": "pending",
+        "mutation_effects": ["local_workspace_write"]
+    }]})
+    .to_string();
+    let mut run = json!({"action": "run", "command": "sh -c 'exit 0'"});
+    if claim {
+        run["checklist_items"] = json!([0]);
+    }
+    let done = "phase=DONE; the report is written in the container.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("track_requirements", &checklist),
+        MockProvider::tool_call_response("terminal", &run.to_string()),
+        MockProvider::text_response(done),
+        MockProvider::text_response(done),
+        MockProvider::text_response(done),
+        MockProvider::text_response(done),
+    ]);
+    let plan_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let plan_store = Arc::new(crate::plans::PlanStore::new(plan_pool).await.unwrap());
+    let track = Arc::new(crate::tools::track_requirements::TrackRequirementsTool::new(
+        plan_store,
+    ));
+    let harness = setup_full_stack_test_agent_with_extra_tools(
+        provider,
+        vec![track as Arc<dyn crate::traits::Tool>],
+    )
+    .await
+    .unwrap();
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            "Write the synthetic report inside the container.",
+            None,
+            UserRole::Owner,
+            owner_channel(),
+            None,
+        )
+        .await
+        .unwrap();
+    let demands = all_conditions(&harness, session_id)
+        .await
+        .into_iter()
+        .filter(|c| {
+            c.starts_with("\"ledger_expectations_required\"")
+                || c.starts_with("\"declared_work_unattempted\"")
+        })
+        .collect();
+    (response, demands)
+}
+
+/// A wrapped command that says it does the declared item is the item's
+/// proof: the ledger does not send the run back to redo finished work.
+#[tokio::test]
+#[cfg_attr(windows, ignore = "Unix shell wrapper; the typing is platform-neutral")]
+async fn a_claimed_change_through_a_wrapper_closes_its_item() {
+    let (response, demands) = opaque_write_turn("opaque_change_claimed", true).await;
+    assert!(response.contains("phase=DONE"), "{response}");
+    assert!(demands.is_empty(), "no extra pass: {demands:?}");
+}
+
+/// Without the claim, nothing ties the wrapped command to the item: the
+/// ledger still asks, as before.
+#[tokio::test]
+#[cfg_attr(windows, ignore = "Unix shell wrapper; the typing is platform-neutral")]
+async fn an_unclaimed_wrapped_command_does_not_close_the_item() {
+    let (_, demands) = opaque_write_turn("opaque_change_unclaimed", false).await;
+    assert!(!demands.is_empty(), "the item stays open without a claim");
+}
