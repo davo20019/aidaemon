@@ -49,7 +49,7 @@ pub fn start(store: Store) {
         client: ClientIdentity {
             kind,
             name: "aidaemon-app".into(),
-            version: Some(env!("CARGO_PKG_VERSION").into()),
+            version: Some(crate::link::app_version()),
         },
         device: None,
         capabilities: vec![Capability::ViewActions, Capability::Surfaces],

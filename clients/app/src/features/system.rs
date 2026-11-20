@@ -361,7 +361,10 @@ fn overview(s: &SystemStatus) -> View {
                 Some((format!("p95 {}", seconds(calls.p95_ms)), Tone::Neutral)),
             ));
     }
-    let mut rows = vec![fact("Version", s.version.clone())];
+    let mut rows = vec![
+        fact("Version", s.version.clone()),
+        fact("This app", crate::link::app_version()),
+    ];
     if let Some(model) = &s.model {
         rows.push(fact("Model", model.clone()));
     }

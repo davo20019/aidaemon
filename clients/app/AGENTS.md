@@ -26,6 +26,10 @@ nsh package --target ios-simulator --run       # needs Xcode
 nsh run --target android                       # or ios: hot reload on a device or simulator
 ```
 
+The app shows its own version on the System page (`link::app_version`, from
+`build.rs`: `AIDAEMON_APP_VERSION`/`AIDAEMON_APP_BUILD` when packaging sets
+them, else `nsh.json`); pass the same values as `--app-version`/`--build`.
+
 A phone never runs the daemon (`link::RUNS_DAEMON` is false, `link::MOBILE`
 true): it pairs from a `/pair_device` link or an opened `aidaemon-pair:`
 link (`nsh.json` `schemes`; the desktop's Settings → Paired devices → Pair a

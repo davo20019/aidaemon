@@ -464,6 +464,8 @@ jobs:
           # run number only grows, as Android's versionCode must.
           version="${GITHUB_REF_NAME#v}"
           version="${version%%-*}"
+          # The app shows the same version it is published as.
+          export AIDAEMON_APP_VERSION="$version" AIDAEMON_APP_BUILD="$GITHUB_RUN_NUMBER"
           args=(--keystore "$RUNNER_TEMP/release.jks" --key-alias "${ANDROID_KEY_ALIAS:-upload}"
                 --app-version "$version" --build "$GITHUB_RUN_NUMBER")
           nsh package --target android "${args[@]}"
@@ -531,6 +533,7 @@ jobs:
           nsh component add ios
           version="${GITHUB_REF_NAME#v}"
           version="${version%%-*}"
+          export AIDAEMON_APP_VERSION="$version" AIDAEMON_APP_BUILD="$GITHUB_RUN_NUMBER"
           nsh package --target ios --sign "$IOS_SIGN_IDENTITY" --profile "$IOS_PROFILE" \
             --app-version "$version" --build "$GITHUB_RUN_NUMBER"
 

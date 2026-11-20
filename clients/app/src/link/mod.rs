@@ -16,6 +16,15 @@ mod voice;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
+/// This app's version as the store and the daemon know it: "1.2.0 (14)".
+pub fn app_version() -> String {
+    let version = env!("AIDAEMON_APP_VERSION");
+    match env!("AIDAEMON_APP_BUILD") {
+        "" => version.to_owned(),
+        build => format!("{version} ({build})"),
+    }
+}
+
 /// Start the link for this platform.
 pub fn start(store: Store) {
     #[cfg(not(target_arch = "wasm32"))]
