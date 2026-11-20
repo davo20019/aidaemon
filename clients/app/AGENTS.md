@@ -11,6 +11,7 @@ root's `cargo test`/clippy never build it. Run its checks here.
 ```sh
 cargo check --all-targets && cargo clippy --all-targets -- -D warnings
 cargo test                 # headless, on the real engine (tests/app.rs)
+cargo test --release --test perf -- --ignored --nocapture   # startup, 500-row sidebar, long conversation, CPU per streamed word
 nsh run                    # desktop window against the local daemon
 nsh test --target tui      # the terminal build
 CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \

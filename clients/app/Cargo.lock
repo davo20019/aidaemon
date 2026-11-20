@@ -3214,6 +3214,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "js-sys",
+ "libc",
  "log",
  "nsh-base",
  "nsh-core",

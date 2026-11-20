@@ -866,6 +866,35 @@ fn transcript(store: Store, session: String) -> View {
     let list = element_ref();
     let unfolding = ui::Unfolding::provide();
     let loading_id = session.clone();
+    // Following the end. Sending a message or a reply starting brings
+    // the end into view, as any chat does; other rows added follow it
+    // while the reader is at the end. The list's own follow lost the end
+    // when a reply started in a long conversation: the composer changing
+    // height moved it to an old reply (live 2026-11-19).
+    let shown_len = std::cell::Cell::new(untracked(|| all.with(Vec::len)));
+    effect(move || {
+        let (len, starts) = all.with(|rows| {
+            let before = shown_len.get().min(rows.len());
+            (
+                rows.len(),
+                rows[before..]
+                    .iter()
+                    .any(|row| matches!(row, Row::User(..) | Row::Live)),
+            )
+        });
+        let before = shown_len.replace(len);
+        if before == 0 {
+            // It opened (or its history came): at its end.
+            last_seen.set(usize::MAX);
+            return;
+        }
+        let seen = untracked(|| last_seen.get());
+        let at_end = seen == usize::MAX || seen + 2 >= before;
+        if len > before && (starts || at_end) {
+            list.scroll_to_end(false);
+            last_seen.set(usize::MAX);
+        }
+    });
     view()
         .flex_1()
         // Opened before its history came (a phone restoring the last

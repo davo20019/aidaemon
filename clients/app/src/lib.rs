@@ -107,6 +107,7 @@ pub fn Offline() -> impl IntoElement {
         }
         for kind in [
             "get_changes",
+            "get_history",
             "get_settings",
             "list_models",
             "set_session_model",

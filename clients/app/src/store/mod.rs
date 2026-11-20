@@ -201,10 +201,46 @@ struct Reads {
     /// Whether a live view is open: the view is built once per opening,
     /// so its zoom and keyboard survive the client's other changes.
     live_open: Memo<bool>,
+    /// What each listed conversation's row shows, computed once per change
+    /// of the client and equal when no row changed: a streamed word re-runs
+    /// this one read, not every row's (500 rows cost 7 ms a word before).
+    rows: Memo<BTreeMap<String, RowFacts>>,
+}
+
+/// A conversation as its row and header show it.
+#[derive(Clone, Debug, PartialEq)]
+struct RowFacts {
+    title: String,
+    place: String,
+    source: Source,
+    group: bool,
+    needs_you: bool,
+    running: bool,
+    background: bool,
+    archived: bool,
+    project: Option<String>,
+    last_activity: Option<u64>,
+}
+
+impl RowFacts {
+    fn of(c: &Client, id: &str) -> Self {
+        Self {
+            title: c.title(id),
+            place: c.place(id),
+            source: c.source(id),
+            group: c.is_group(id),
+            needs_you: c.needs_you(id),
+            running: c.is_running(id),
+            background: c.in_background(id),
+            archived: c.is_archived(id),
+            project: c.session_project(id),
+            last_activity: c.last_activity(id),
+        }
+    }
 }
 
 impl Reads {
-    fn new(client: Signal<Client>) -> Self {
+    fn new(client: Signal<Client>, list_rev: Signal<u64>) -> Self {
         Self {
             connection: computed(move || client.with(|c| c.connection.clone())),
             refreshing: computed(move || client.with(Client::is_refreshing)),
@@ -245,12 +281,27 @@ impl Reads {
             approvals: computed(move || client.with(Client::approvals)),
             running: computed(move || client.with(Client::running)),
             notice: computed(move || client.with(|c| c.state.notice.clone())),
-            session_ids: computed(move || client.with(Client::session_ids)),
+            session_ids: computed(move || {
+                list_rev.get();
+                client.with_untracked(Client::session_ids)
+            }),
             unread: computed(move || client.with(|c| c.unread.clone())),
             finished: computed(move || client.with(|c| c.finished.clone())),
             commands: computed(move || client.with(|c| c.commands.clone())),
             models: computed(move || client.with(|c| c.models.clone())),
             live_open: computed(move || client.with(|c| c.live.is_some())),
+            rows: computed(move || {
+                list_rev.get();
+                client.with_untracked(|c| {
+                    c.session_ids()
+                        .into_iter()
+                        .map(|id| {
+                            let facts = RowFacts::of(c, &id);
+                            (id, facts)
+                        })
+                        .collect()
+                })
+            }),
         }
     }
 }
@@ -258,6 +309,10 @@ impl Reads {
 #[derive(Clone, Copy)]
 pub struct Store {
     client: Signal<Client>,
+    /// Bumped by every change of the client except a streamed word or
+    /// status that changed no conversation's row: what the list reads
+    /// track, so a reply streaming does not re-read every row.
+    list_rev: Signal<u64>,
     reads: Reads,
     outbox: Stored<Option<Outbox>>,
     selected: Signal<Option<String>>,
@@ -383,9 +438,11 @@ pub struct Store {
 impl Store {
     pub fn new() -> Self {
         let client = signal_with(Client::new(), SignalEquals::Never);
+        let list_rev = signal(0u64);
         Self {
             client,
-            reads: Reads::new(client),
+            list_rev,
+            reads: Reads::new(client, list_rev),
             outbox: stored(None),
             selected: signal(None),
             drafts: signal(BTreeMap::new()),
@@ -458,8 +515,29 @@ impl Store {
         self.client.with(f)
     }
 
+    /// `f` of a listed conversation's row facts, through the rows read (so a
+    /// change elsewhere in the client does not re-run the caller); one not
+    /// listed reads the client.
+    fn row<R>(&self, id: &str, f: impl FnOnce(&RowFacts) -> R) -> R {
+        let mut f = Some(f);
+        if let Some(found) = self
+            .reads
+            .rows
+            .with(|rows| rows.get(id).map(|row| (f.take().unwrap())(row)))
+        {
+            return found;
+        }
+        let facts = self.read(|c| RowFacts::of(c, id));
+        (f.take().unwrap())(&facts)
+    }
+
     /// Change the client, then send what it queued once there is a link.
     fn act<R>(&self, f: impl FnOnce(&mut Client) -> R) -> R {
+        self.act_quietly(false, f)
+    }
+
+    /// [`Self::act`]; `quiet`: the caller decides whether the list changed.
+    fn act_quietly<R>(&self, quiet: bool, f: impl FnOnce(&mut Client) -> R) -> R {
         let mut result = None;
         let linked = self.outbox.with(|o| o.is_some());
         let mut outgoing = Vec::new();
@@ -469,6 +547,9 @@ impl Store {
                 outgoing = client.take_outgoing();
             }
         });
+        if !quiet {
+            self.list_rev.update(|r| *r += 1);
+        }
         self.flush(outgoing);
         result.expect("ran")
     }
@@ -550,7 +631,28 @@ impl Store {
 
     pub fn update(&self, update: Update) {
         let cx = self.context();
-        let effects = self.act(|client| client.update(update, &cx));
+        // An ephemeral event about one conversation (a streamed word, what
+        // the turn is doing) changes the list only if that conversation's
+        // row changed.
+        let quiet = match &update {
+            Update::Frame(aidaemon_client_protocol::ServerFrame::Event {
+                seq: None,
+                session_id: Some(id),
+                ..
+            }) => Some(id.clone()),
+            _ => None,
+        };
+        let row =
+            |c: &Client, id: &str| (c.state.order.iter().any(|s| s == id), RowFacts::of(c, id));
+        let before = quiet
+            .as_ref()
+            .map(|id| self.client.with_untracked(|c| row(c, id)));
+        let effects = self.act_quietly(before.is_some(), |client| client.update(update, &cx));
+        if let (Some(id), Some(before)) = (quiet, before)
+            && self.client.with_untracked(|c| row(c, &id)) != before
+        {
+            self.list_rev.update(|r| *r += 1);
+        }
         for effect in effects {
             self.effect(effect);
         }
@@ -1504,7 +1606,7 @@ impl Store {
     }
 
     pub fn session_project(&self, session: &str) -> Option<String> {
-        self.read(|c| c.session_project(session))
+        self.row(session, |r| r.project.clone())
     }
 
     /// The project of what is on screen: the selected conversation's, or
@@ -1938,17 +2040,17 @@ impl Store {
     }
 
     pub fn needs_you(&self, id: &str) -> bool {
-        self.read(|c| c.needs_you(id))
+        self.row(id, |r| r.needs_you)
     }
 
     // ----- Where conversations come from ----------------------------------------
 
     pub fn source(&self, id: &str) -> Source {
-        self.read(|c| c.source(id))
+        self.row(id, |r| r.source)
     }
 
     pub fn is_group(&self, id: &str) -> bool {
-        self.read(|c| c.is_group(id))
+        self.row(id, |r| r.group)
     }
 
     /// Whether the app may send to conversation `id` now: anywhere but a
@@ -1978,9 +2080,9 @@ impl Store {
     /// Where conversation `id` came from, in a word or two for a list:
     /// nothing for the app's own, else "Telegram" or "Telegram group".
     pub fn source_tag(&self, id: &str) -> String {
-        self.read(|c| match c.source(id) {
+        self.row(id, |r| match r.source {
             Source::App | Source::All => String::new(),
-            source if c.is_group(id) => format!("{} group", source.label()),
+            source if r.group => format!("{} group", source.label()),
             source => source.label().to_owned(),
         })
     }
@@ -2035,7 +2137,7 @@ impl Store {
     }
 
     pub fn last_activity(&self, id: &str) -> Option<u64> {
-        self.read(|c| c.last_activity(id))
+        self.row(id, |r| r.last_activity)
     }
 
     /// The selected conversation's last reply (Copy reply).
@@ -2396,11 +2498,11 @@ impl Store {
     }
 
     pub fn title(&self, id: &str) -> String {
-        self.read(|c| c.title(id))
+        self.row(id, |r| r.title.clone())
     }
 
     pub fn place(&self, id: &str) -> String {
-        self.read(|c| c.place(id))
+        self.row(id, |r| r.place.clone())
     }
 
     pub fn channel(&self, id: &str) -> Option<String> {
@@ -2421,7 +2523,7 @@ impl Store {
 
     /// A turn runs, or work it handed to the background does.
     pub fn is_working(&self, id: &str) -> bool {
-        self.read(|c| c.is_running(id) || c.in_background(id))
+        self.row(id, |r| r.running || r.background)
     }
 
     pub fn in_background(&self, id: &str) -> bool {
@@ -2429,7 +2531,7 @@ impl Store {
     }
 
     pub fn is_running(&self, id: &str) -> bool {
-        self.read(|c| c.is_running(id))
+        self.row(id, |r| r.running)
     }
 
     pub fn approvals(&self) -> Vec<Approval> {
@@ -2795,7 +2897,7 @@ impl Store {
     }
 
     pub fn is_archived(&self, id: &str) -> bool {
-        self.read(|c| c.is_archived(id))
+        self.row(id, |r| r.archived)
     }
 
     /// Archive conversation `id` or bring it back; archiving the one on
