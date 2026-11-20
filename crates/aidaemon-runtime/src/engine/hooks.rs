@@ -24,10 +24,25 @@ pub struct LedgerStop {
     pub calls: mpsc::Sender<HostCall>,
 }
 
+/// Room the stop judgment has after the longest job wait: the reply
+/// checks and their side calls.
+const STOP_JUDGE_ROOM: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A stop the host never judged (its turn task ended): the run stops, but
+/// never as a success nobody checked.
+fn unjudged_stop() -> sdk::StopDecision {
+    sdk::StopDecision::AcceptUnmet {
+        unmet: vec!["the completion check could not run".to_string()],
+    }
+}
+
 #[async_trait]
 impl sdk::Hook for LedgerStop {
     fn timeout(&self) -> Option<std::time::Duration> {
-        Some(TOOL_TIMEOUT)
+        // A held stop may wait the whole job window and then still judge
+        // the reply (side calls included): outlast both, so the kernel's
+        // timeout never ends a run the host was about to answer.
+        Some(super::turn_engine::stop::UNREPORTED_JOB_MAX_WAIT + STOP_JUDGE_ROOM)
     }
 
     async fn on_stop(&self, ctx: &sdk::HookContext<'_>, final_text: &str) -> sdk::StopDecision {
@@ -52,9 +67,9 @@ impl sdk::Hook for LedgerStop {
             .await
             .is_err()
         {
-            return sdk::StopDecision::Accept;
+            return unjudged_stop();
         }
-        answer.await.unwrap_or(sdk::StopDecision::Accept)
+        answer.await.unwrap_or_else(|_| unjudged_stop())
     }
 }
 
@@ -443,5 +458,34 @@ pub fn thinking_cutoff_effort(cutoffs: u8) -> Option<String> {
         0 | 1 => None,
         2 => Some("low".to_string()),
         _ => Some("off".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The longest held stop ends before the kernel gives up on the hook:
+    /// a run waiting on its jobs ends held, not with an unanswered check.
+    #[test]
+    fn the_stop_hook_outlasts_the_longest_job_wait() {
+        use sdk::Hook;
+        let (calls, _rx) = mpsc::channel(1);
+        let timeout = LedgerStop { calls }.timeout().expect("a bounded hook");
+        assert!(
+            timeout
+                >= super::super::turn_engine::stop::UNREPORTED_JOB_MAX_WAIT
+                    + std::time::Duration::from_secs(60),
+            "the wait ends first, with room left to judge the reply"
+        );
+    }
+
+    /// A stop nobody judged never counts as a success.
+    #[test]
+    fn an_unjudged_stop_is_unmet() {
+        assert!(matches!(
+            unjudged_stop(),
+            sdk::StopDecision::AcceptUnmet { unmet } if !unmet.is_empty()
+        ));
     }
 }

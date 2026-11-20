@@ -87,8 +87,12 @@ pub fn closeout_visible_tools<'a>(
 
 /// How often a held stop rereads whether the run's jobs have ended.
 const UNREPORTED_JOB_POLL: std::time::Duration = std::time::Duration::from_millis(500);
-/// The longest one held stop waits for the run's jobs.
-const UNREPORTED_JOB_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The longest one held stop waits for the run's jobs. The stop hook's
+/// own timeout ([`super::super::hooks::LedgerStop`]) is this plus room for
+/// the rest of the judgment, so the wait ends first and the run ends held
+/// rather than with an unanswered check.
+pub(crate) const UNREPORTED_JOB_MAX_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 
 impl TurnEngine<'_> {
     /// Judge a stop. A stop sent back for more work holds the reply the
