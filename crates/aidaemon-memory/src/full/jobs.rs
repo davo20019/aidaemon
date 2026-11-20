@@ -7,8 +7,8 @@
 //! learning from a session's work trace, and filing the goals an episode
 //! mentions.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aidaemon_core::{FnService, Provider, Schedule, Service, ServiceError};
 use async_trait::async_trait;
@@ -91,6 +91,56 @@ const LONG_MIN_MESSAGES: usize = 10;
 /// How far back pattern detection looks, and how much it reads.
 const PATTERN_WINDOW: chrono::Duration = chrono::Duration::hours(24);
 const PATTERN_TURNS: usize = 500;
+/// Longest wait between embedding passes that keep finding nothing.
+const EMBEDDINGS_IDLE_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// Spaces out embedding passes that find nothing to embed: each empty pass
+/// doubles the wait before the next, up to [`EMBEDDINGS_IDLE_CAP`]; a pass
+/// that embeds something, or fails, goes back to the schedule's pace.
+/// The pass itself is a scan for rows without an embedding, so running it
+/// every few seconds on a fully embedded store only costs database time.
+#[derive(Debug)]
+struct IdleBackoff {
+    base: Duration,
+    cap: Duration,
+    wait: Duration,
+    next_due: Option<Instant>,
+}
+
+impl IdleBackoff {
+    fn new(base: Duration, cap: Duration) -> Self {
+        Self {
+            base,
+            cap: cap.max(base),
+            wait: Duration::ZERO,
+            next_due: None,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.next_due.is_none_or(|due| now >= due)
+    }
+
+    /// Record a pass at `now` that did (`true`) or did not find work.
+    fn record(&mut self, now: Instant, found_work: bool) {
+        if found_work {
+            self.wait = Duration::ZERO;
+            self.next_due = None;
+        } else {
+            self.wait = if self.wait.is_zero() {
+                self.base
+            } else {
+                (self.wait * 2).min(self.cap)
+            };
+            self.next_due = Some(now + self.wait);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.wait = Duration::ZERO;
+        self.next_due = None;
+    }
+}
 
 /// The full memory system's background jobs over `store`.
 pub struct MemoryJobs {
@@ -101,6 +151,8 @@ pub struct MemoryJobs {
     schedule: JobSchedule,
     /// Project memory, for consolidation of sessions that work in a project.
     project_notes: Option<Arc<crate::project::ProjectNotes>>,
+    /// Spaces out [`Self::embeddings`] passes while they find nothing.
+    embeddings_backoff: Mutex<IdleBackoff>,
 }
 
 impl MemoryJobs {
@@ -117,6 +169,10 @@ impl MemoryJobs {
             embedder,
             schedule: JobSchedule::default(),
             project_notes: None,
+            embeddings_backoff: Mutex::new(IdleBackoff::new(
+                JobSchedule::default().embeddings,
+                EMBEDDINGS_IDLE_CAP,
+            )),
         }
     }
 
@@ -131,6 +187,8 @@ impl MemoryJobs {
 
     pub fn with_schedule(mut self, schedule: JobSchedule) -> Self {
         self.schedule = schedule;
+        self.embeddings_backoff =
+            Mutex::new(IdleBackoff::new(schedule.embeddings, EMBEDDINGS_IDLE_CAP));
         self
     }
 
@@ -177,12 +235,27 @@ impl MemoryJobs {
     }
 
     /// Embed one batch of learned records still missing an embedding.
-    /// True when there was something to embed.
+    /// True when there was something to embed. While passes keep finding
+    /// nothing, later calls skip the scan (returning false) until the backoff
+    /// is due again; see [`IdleBackoff`].
     pub async fn embeddings(&self) -> anyhow::Result<bool> {
-        Ok(
-            crate::backfill_learning_embeddings(self.store.as_ref(), self.embedder.as_ref())
-                .await?,
-        )
+        if !self.backoff().due(Instant::now()) {
+            return Ok(false);
+        }
+        let result =
+            crate::backfill_learning_embeddings(self.store.as_ref(), self.embedder.as_ref()).await;
+        let mut backoff = self.backoff();
+        match &result {
+            Ok(found_work) => backoff.record(Instant::now(), *found_work),
+            Err(_) => backoff.reset(),
+        }
+        Ok(result?)
+    }
+
+    fn backoff(&self) -> std::sync::MutexGuard<'_, IdleBackoff> {
+        self.embeddings_backoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Consolidate durable facts from owner history up to an hour before
@@ -405,4 +478,53 @@ fn transcript_entries(turns: &[LoggedTurn]) -> Vec<TranscriptEntry> {
             tool_name: turn.tool_name.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: Duration = Duration::from_secs(5);
+    const CAP: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn empty_passes_double_the_wait_up_to_the_cap() {
+        let start = Instant::now();
+        let mut backoff = IdleBackoff::new(BASE, CAP);
+        assert!(backoff.due(start));
+
+        let mut now = start;
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            backoff.record(now, false);
+            waits.push(backoff.wait);
+            assert!(!backoff.due(now + backoff.wait - Duration::from_millis(1)));
+            now += backoff.wait;
+            assert!(backoff.due(now));
+        }
+        let secs: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 60, 60]);
+    }
+
+    #[test]
+    fn a_pass_with_work_returns_to_the_schedule_pace() {
+        let now = Instant::now();
+        let mut backoff = IdleBackoff::new(BASE, CAP);
+        for _ in 0..4 {
+            backoff.record(now, false);
+        }
+        backoff.record(now, true);
+        assert!(backoff.due(now));
+        backoff.record(now, false);
+        assert_eq!(backoff.wait, BASE);
+    }
+
+    #[test]
+    fn a_failed_pass_clears_the_backoff() {
+        let now = Instant::now();
+        let mut backoff = IdleBackoff::new(BASE, CAP);
+        backoff.record(now, false);
+        backoff.reset();
+        assert!(backoff.due(now));
+    }
 }
