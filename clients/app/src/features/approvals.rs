@@ -43,6 +43,33 @@ fn scope(d: ApprovalDecision) -> &'static str {
     }
 }
 
+/// How approvals work, naming only the answers this card offers.
+fn teach_text(options: &[ApprovalDecision]) -> String {
+    let reach: Vec<&str> = options
+        .iter()
+        .filter_map(|d| match d {
+            ApprovalDecision::ApproveOnce => Some("once"),
+            ApprovalDecision::ApproveSession => Some("for this conversation"),
+            ApprovalDecision::ApproveAlways => Some("always"),
+            ApprovalDecision::Deny => None,
+        })
+        .collect();
+    let allow = match reach.as_slice() {
+        [] => String::new(),
+        [one] => format!("Allow it {one}. "),
+        [rest @ .., last] => format!("Allow it {}, or {last}. ", rest.join(", ")),
+    };
+    let deny = if options.contains(&ApprovalDecision::Deny) {
+        "Deny stops just this step. "
+    } else {
+        ""
+    };
+    format!(
+        "Your agent asks before anything that sends, posts, deletes or spends. {allow}{deny}What \
+         it may do on its own is under Settings, Checks and limits."
+    )
+}
+
 fn impact(impact: &Impact) -> Option<String> {
     match impact {
         Impact::Deletes { targets } if targets.is_empty() => Some("Deletes files".into()),
@@ -194,13 +221,9 @@ pub fn card(store: Store, approval: Approval) -> View {
         }))
         .child(body)
         // The first card this device shows says how approvals work.
-        .child(when(teach, || {
-            detail_text(
-                "Your agent asks before anything that sends, posts, deletes or spends. Allow \
-                 it once, for this conversation, or always; Deny stops just this step. What it may \
-                 do on its own is under Settings, Checks and limits."
-                    .to_string(),
-            )
+        .child(when(teach, {
+            let lesson = teach_text(&approval.options);
+            move || detail_text(lesson.clone())
         }))
         .children(facts.into_iter().map(|(glyph, text_, tone)| {
             view()
@@ -339,5 +362,27 @@ fn sentence_case(text: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod teach_tests {
+    use super::teach_text;
+    use aidaemon_client_protocol::ApprovalDecision as D;
+
+    /// The lesson names the answers the card shows, never one it does not.
+    #[test]
+    fn the_lesson_names_only_the_offered_answers() {
+        let three = teach_text(&[D::ApproveOnce, D::ApproveAlways, D::Deny]);
+        assert!(
+            three.contains("Allow it once, or always. Deny stops just this step."),
+            "{three}"
+        );
+        assert!(!three.contains("conversation"), "{three}");
+        let all = teach_text(&[D::ApproveOnce, D::ApproveSession, D::ApproveAlways, D::Deny]);
+        assert!(
+            all.contains("Allow it once, for this conversation, or always."),
+            "{all}"
+        );
     }
 }

@@ -6,7 +6,7 @@ use nsh_core::prelude::*;
 
 use crate::link;
 use crate::store::Store;
-use crate::ui::{self, Size, Tone, Variant, btn, colors, field, status, type_scale};
+use crate::ui::{self, Size, Tone, Variant, btn, colors, field, status_message, type_scale};
 
 pub fn pairing(store: Store) -> View {
     let offered = link::offered_pairing();
@@ -69,19 +69,17 @@ pub fn pairing(store: Store) -> View {
             .child(labeled("Code", field("Pairing code", code)))
             .child(labeled("Device name", field("How the daemon will list this device", name)))
             .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        btn("Pair", Variant::Primary, Size::Md, submit)
-                            .disabled(move || busy.get() || code.with(|c| c.trim().is_empty())),
-                    )
-                    .child(dynamic(move || {
-                        let (message, tone) = state.get()?;
-                        Some(untracked(move || status(message, tone).flex_1().min_w(px(0.0))))
-                    })),
-            ),
+                view().flex_row().child(
+                    btn("Pair", Variant::Primary, Size::Md, submit)
+                        .disabled(move || busy.get() || code.with(|c| c.trim().is_empty())),
+                ),
+            )
+            // Its own row, every line of it: a refusal's reason is what
+            // the owner acts on (it was cut to two lines beside the button).
+            .child(dynamic(move || {
+                let (message, tone) = state.get()?;
+                Some(untracked(move || status_message(message, tone)))
+            })),
     )
 }
 
@@ -266,7 +264,7 @@ pub fn pair_phone(store: Store) -> View {
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(status(message, tone))
+                .child(status_message(message, tone))
                 .child(btn("Pair another", Variant::Ghost, Size::Sm, start)),
         }))
     }))
