@@ -61,6 +61,11 @@ impl LinkConfig {
     }
 }
 
+/// The longest signing in (a challenge and a grant) may take.
+const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest opening the socket may take.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Start the link; send commands on the returned sender.
 pub fn spawn(
     config: LinkConfig,
@@ -174,7 +179,16 @@ impl Link {
     }
 
     async fn session(&mut self) -> Result<Ended, Failure> {
-        let token = self.token().await?;
+        // A network that swallows packets would hold the link in
+        // "connecting" for good: give up, say why, and try again.
+        let token = tokio::time::timeout(SIGN_IN_TIMEOUT, self.token())
+            .await
+            .map_err(|_| {
+                (
+                    DropKind::DaemonNotRunning,
+                    "signing in to the daemon timed out".to_string(),
+                )
+            })??;
         let mut request = self
             .config
             .url
@@ -186,13 +200,22 @@ impl Link {
             format!("Bearer {token}").parse().map_err(failed)?,
         );
         let tls = crate::tls::client_config().map_err(failed)?;
-        let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        let (mut socket, _) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(tls)),
+            ),
         )
         .await
+        .map_err(|_| {
+            (
+                DropKind::DaemonNotRunning,
+                "connecting to the daemon timed out".to_string(),
+            )
+        })?
         .map_err(connect_failure)?;
         let send = |frame: &ClientFrame| {
             serde_json::to_string(frame)

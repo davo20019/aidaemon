@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The app runs on iOS and Android.** The phone app pairs with your daemon from a `/pair_device` link (or an opened `aidaemon-pair:` link), keeps its key in the iOS keychain or Android's private app storage, and offers "Pair again" when the daemon refuses its key. CI builds an Android APK and an iOS simulator build on every pull request; releases attach a signed APK and send an iOS build to TestFlight once their signing secrets are set. See "The phone app" in the README.
-- **Pair a phone with a QR code.** The desktop app on the daemon's computer shows Settings → Paired devices → Pair a phone: a QR code of the pairing link that the phone's camera opens in the app, then you approve the phone right there.
-- **Pairing links open the phone app.** `/pair_device` replies with an `https://aidaemon.ai/pair#…` link to tap on the phone, and the QR codes (the desktop app's and `aidaemon pair`'s) carry it too: chat apps and phone cameras open it, and the page opens the AIDaemon app, or its store page when it is missing. The pairing details stay in the link's fragment, which is never sent to aidaemon.ai.
+- **Pair a phone from the desktop app.** Settings → Paired devices → Pair a phone shows a QR code the phone's camera opens, a **Send to my phone** button (the system's share menu: Messages, mail, AirDrop) and **Copy link**; you approve the phone right there. The phone app also picks up a pairing link you copied.
+- **Pairing links open the phone app.** `/pair_device` replies with a link to your own daemon's pairing page (`/client/v1/pair#…` at its public address) to tap on the phone, and the QR codes (the desktop app's and `aidaemon pair`'s) carry it too: chat apps and phone cameras open it, and the page opens the AIDaemon app (or its store page when it is missing) or pairs the browser instead. The pairing details stay in the link's fragment, which the browser never sends to the server.
 
 ### Changed
 
@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README:** the SDK installs from crates.io (`aidaemon-sdk = "0.21"`) and the daemon with `cargo install --locked aidaemon`.
 
 ### Fixed
+
+- **The app no longer hangs on "Connecting…".** Signing in and opening the connection time out (30 s and 20 s) and the app shows why, instead of waiting forever on a network that drops packets; error messages name the underlying cause. The daemon logs each device sign-in, accepted or refused.
 
 - **`aidaemon app` and `aidaemon tui` work on a fresh install.** With no config yet they open `aidaemon-app`, whose first run sets AIDaemon up, instead of failing with "The Client Gateway is off". `app`, `tui`, `pair`, `web` and `client-token` also find `~/.aidaemon/config.toml` when run from another folder (#20).
 - **Settings nothing reads now say so.** `[provider] streaming` and `[people] auto_extract`, `auto_extract_categories` and `restricted_categories` log a warning at startup; `restricted_categories` never kept any category out of memory (#22).

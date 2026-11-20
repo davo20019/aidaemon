@@ -1515,6 +1515,25 @@ async fn the_app_path_explains_a_missing_web_build() {
     assert_eq!(gone.status(), 404);
 }
 
+/// A pairing link opens the gateway's own page, which hands the offer in
+/// its fragment to the phone app or the web app; nothing else serves it.
+#[tokio::test]
+async fn the_pairing_page_is_served_by_the_gateway() {
+    let f = fixture(RiskLevel::Medium).await;
+    let page = f
+        .http()
+        .get(format!("http://{}/client/v1/pair", f.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert_eq!(page.headers()["referrer-policy"], "no-referrer");
+    let text = page.text().await.unwrap();
+    assert!(text.contains("scheme=aidaemon-pair"));
+    assert!(text.contains("'/client/v1/app#offer='"));
+    assert!(!text.contains("__WEB_APP__"));
+}
+
 /// The shared client core pairs a device with its own key, signs in with a
 /// signed challenge and holds a socket on the grant, against this router.
 #[tokio::test]

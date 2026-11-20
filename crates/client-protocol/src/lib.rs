@@ -3009,21 +3009,31 @@ pub struct PairingOffer {
     pub public_url: Option<String>,
 }
 
-/// The page that opens the phone app on a pairing: tapped in a chat or
-/// read from a QR code by a phone's camera (which open `https` links, not
-/// the app's own scheme), it hands the link to the app, or to its store
-/// page when the app is missing.
-pub const PAIRING_PAGE: &str = "https://aidaemon.ai/pair";
+/// The gateway's page that opens the phone app on a pairing: tapped in a
+/// chat or read from a QR code by a phone's camera (which open `https`
+/// links, not the app's own scheme), it hands the offer to the app, or to
+/// its store page when the app is missing, or pairs the browser instead.
+pub const PAIRING_PAGE_PATH: &str = "/client/v1/pair";
 
 impl PairingOffer {
-    /// [`PairingOffer::link`] as a [`PAIRING_PAGE`] link. The offer rides
-    /// in the fragment, which browsers never send to the page's server.
+    /// [`PairingOffer::link`] as a link to [`PAIRING_PAGE_PATH`] on the
+    /// gateway's own address. The offer rides in the fragment, which
+    /// browsers never send to the server. An older daemon that does not
+    /// say its address gets the app link itself.
     pub fn page_link(&self) -> String {
+        let Some(base) = self
+            .public_url
+            .as_deref()
+            .map(|url| url.trim().trim_end_matches('/'))
+            .filter(|url| !url.is_empty())
+        else {
+            return self.link.clone();
+        };
         let query = self
             .link
             .split_once('?')
             .map_or(self.link.as_str(), |(_, query)| query);
-        format!("{PAIRING_PAGE}#{query}")
+        format!("{base}{PAIRING_PAGE_PATH}#{query}")
     }
 }
 
@@ -3206,19 +3216,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_pairing_page_link_carries_the_offer_in_its_fragment() {
-        let offer = PairingOffer {
+    fn a_pairing_page_link_is_on_the_gateway_with_the_offer_in_its_fragment() {
+        let mut offer = PairingOffer {
             offer_id: "of-1".into(),
             code: "K7Q2-9FZD".into(),
             expires_at_ms: 0,
             link: "aidaemon-pair:?gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
             fingerprint: "3b1f".into(),
-            public_url: None,
+            public_url: Some("https://d.example.invalid/".into()),
         };
         assert_eq!(
             offer.page_link(),
-            "https://aidaemon.ai/pair#gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f"
+            "https://d.example.invalid/client/v1/pair#gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f"
         );
+        offer.public_url = None;
+        assert_eq!(offer.page_link(), offer.link);
     }
 
     #[test]

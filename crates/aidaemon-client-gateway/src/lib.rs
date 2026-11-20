@@ -50,6 +50,7 @@ pub mod client_view;
 mod config;
 pub mod files;
 mod observer;
+mod pair_page;
 pub mod pairing;
 pub mod project_files;
 pub mod remote_screens;

@@ -75,6 +75,8 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
             "/client/v1/surfaces/provide/{surface_id}/ws",
             get(crate::surfaces::provider_socket),
         )
+        // aidaemon_client_protocol::PAIRING_PAGE_PATH
+        .route("/client/v1/pair", get(pair_page))
         .route("/client/v1/app", get(web_page))
         .route("/client/v1/app/", get(web_page))
         .route("/client/v1/next", get(app_root))
@@ -385,7 +387,16 @@ async fn challenge(
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    reply(gateway.pairing.challenge(&request.device_id).await)
+    let result = gateway.pairing.challenge(&request.device_id).await;
+    match &result {
+        Ok(_) => tracing::info!(device = %request.device_id, "Device sign-in: challenge sent"),
+        Err(error) => tracing::warn!(
+            device = %request.device_id,
+            reason = %error.message,
+            "Device sign-in: challenge refused"
+        ),
+    }
+    reply(result)
 }
 
 async fn open_session(
@@ -396,12 +407,15 @@ async fn open_session(
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    reply(
-        gateway
-            .pairing
-            .open_session(&request.challenge_id, &request.signature)
-            .await,
-    )
+    let result = gateway
+        .pairing
+        .open_session(&request.challenge_id, &request.signature)
+        .await;
+    match &result {
+        Ok(grant) => tracing::info!(device = %grant.device_id, "Device signed in"),
+        Err(error) => tracing::warn!(reason = %error.message, "Device sign-in refused"),
+    }
+    reply(result)
 }
 
 async fn devices(State(gateway): State<Arc<ClientGateway>>, headers: HeaderMap) -> Response {
@@ -473,6 +487,38 @@ code { font-family: ui-monospace, monospace; font-size: 0.9em; background: #f0f1
 </body>
 </html>
 "#;
+
+/// The page a pairing link opens (`/pair_device`'s, the QR codes'): it
+/// hands the offer in its fragment to the phone app, or pairs this browser
+/// through the web app. Static: the offer never reaches the server.
+async fn pair_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
+    let page = PAIR_PAGE.replace("__WEB_APP__", gateway.web_app_path());
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+                 base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+use crate::pair_page::PAIR_PAGE;
+
+#[cfg(test)]
+#[test]
+fn the_pair_page_route_is_the_protocols() {
+    assert_eq!(
+        aidaemon_client_protocol::PAIRING_PAGE_PATH,
+        "/client/v1/pair"
+    );
+}
 
 async fn web_page(State(gateway): State<Arc<ClientGateway>>) -> Response {
     // With the app's web build served, links to this path (pairing links,

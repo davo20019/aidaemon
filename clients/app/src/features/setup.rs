@@ -223,6 +223,25 @@ fn pair_elsewhere(store: Store) -> View {
             pair();
         }
     });
+    // A pairing link the owner copied (from a message, a mail) fills the
+    // field; they still tap Connect.
+    if link::MOBILE {
+        spawn(async move {
+            if !clipboard_has_string().await {
+                return;
+            }
+            let copied = clipboard_string().await;
+            if aidaemon_client_core::signin::PairingLink::parse(&copied).is_some()
+                && link_text.with_untracked(|l| l.trim().is_empty())
+                && link_text.try_set(copied.trim().to_owned())
+            {
+                let _ = pairing.try_set(Some((
+                    "Found the pairing link you copied. Tap Connect.".into(),
+                    Tone::Accent,
+                )));
+            }
+        });
+    }
     ui::surface()
         .p_4()
         .gap_2()
@@ -236,15 +255,17 @@ fn pair_elsewhere(store: Store) -> View {
             .font_weight(FontWeight::MEDIUM),
         )
         .child(lead(if link::MOBILE {
-            "Send /pair_device to your agent (in the desktop app, Telegram, Slack or Discord). \
-             Paste the link it replies with here, then approve this phone in that chat."
+            "On the computer AIDaemon runs on, open the AIDaemon app, go to Settings → Paired \
+             devices → Pair a phone and scan the code with this phone's camera. Or send \
+             /pair_device to your agent in Telegram, Slack or Discord and tap the link it \
+             replies with. You can also paste the link here."
         } else {
             "A server or another computer that stays on. Start `aidaemon` there; it prints a link \
              and a code. Paste the link here."
         }))
         .child(labeled(
             "Pairing link",
-            field("http://…/client/v1/next/#offer=…", link_text),
+            field("https://…/client/v1/pair#…", link_text),
         ))
         .child(labeled(
             "This device's name",

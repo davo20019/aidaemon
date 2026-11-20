@@ -34,6 +34,10 @@ pub(crate) fn http_client() -> reqwest::Client {
         .and_then(|tls| {
             reqwest::Client::builder()
                 .tls_backend_preconfigured((*tls).clone())
+                // Fail rather than hang on a network that drops packets;
+                // per read, so a long upload still goes through.
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .read_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .ok()
         })

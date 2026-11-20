@@ -213,7 +213,8 @@ pub fn pair_phone(store: Store) -> View {
                 }
                 card.child(hint(
                     "Point your phone's camera at this code and tap the link it \
-                     shows. It opens the AIDaemon app.",
+                     shows. It opens the AIDaemon app. No camera? Send the link to \
+                     your phone in a message or mail and tap it there.",
                 ))
                 .child(hint(format!(
                     "Code {} · valid 10 minutes · daemon {}",
@@ -223,7 +224,17 @@ pub fn pair_phone(store: Store) -> View {
                 .child(
                     view()
                         .flex_row()
+                        .flex_wrap()
                         .gap_2()
+                        .child(when(!in_terminal(), {
+                            let link = offer.page_link();
+                            move || {
+                                let link = link.clone();
+                                btn("Send to my phone", Variant::Secondary, Size::Sm, move || {
+                                    send_to_phone(link.clone())
+                                })
+                            }
+                        }))
                         .child(btn("Copy link", Variant::Ghost, Size::Sm, {
                             let link = offer.page_link();
                             move || set_clipboard(link.clone())
@@ -268,4 +279,22 @@ fn hint(words: impl Into<SharedString>) -> Text {
 /// The fingerprint's first characters, enough to tell daemons apart.
 fn short(fingerprint: &str) -> &str {
     fingerprint.get(..8).unwrap_or(fingerprint)
+}
+
+fn in_terminal() -> bool {
+    idiom() == nsh_core::platform::Idiom::Terminal
+}
+
+/// The system's share sheet with the pairing link, to send it to the
+/// owner's phone (Messages, mail, AirDrop, a chat app).
+fn send_to_phone(link: String) {
+    let request = nsh_core::share::ShareRequest::new()
+        .title("Pair your phone with AIDaemon")
+        .text("Open this on your phone to pair it with AIDaemon:")
+        .url(link);
+    spawn(async move {
+        if let Err(why) = share(request).await {
+            log::warn!("could not share the pairing link: {why:?}");
+        }
+    });
 }
