@@ -466,11 +466,10 @@ fn build_body(
     let transcript = &request.messages[leading..];
     let mut messages = wire_messages(transcript);
     if caching {
-        // Earlier turns are rendered the same from turn to turn, but the
-        // tail breakpoint only ever lands inside the turn running now (after
-        // its per-turn context), so without this the next turn reused only
-        // the system prompt and tools (live 2026-11-20: a 7-turn chat read
-        // 27k of 31-35k on every turn's first call).
+        // The tail breakpoint only ever lands inside the turn running now
+        // (after its per-turn context), so without this the next turn
+        // reused only the system prompt and tools (live 2026-11-20: a
+        // 7-turn chat read 27k of 31-35k on every turn's first call).
         if let Some(history) = history_breakpoint(transcript, &messages) {
             tail_breakpoint(&mut messages[history]);
         }
@@ -597,19 +596,24 @@ fn build_body(
     body
 }
 
-/// The wire message that ends the earlier turns: the one just before the
-/// message the user typed last (typed by `origin`, never by text), when it
-/// is a message of its own and not the transcript's last.
+/// The wire message that ends the turns before the previous one. The
+/// daemon renders the previous turn with its tool evidence and compacts it
+/// once a newer turn follows, so only the turns before it read the same on
+/// the next turn: the breakpoint goes there, just before the previous user
+/// message (typed by `origin`, never by text), when that is a message of
+/// its own.
 fn history_breakpoint(transcript: &[Message], wire: &[Value]) -> Option<usize> {
-    let start = transcript.iter().rposition(|message| {
+    let typed = |message: &Message| {
         message.role == Role::User && matches!(message.origin, None | Some(MessageOrigin::User))
-    })?;
-    if start == 0 {
+    };
+    let current = transcript.iter().rposition(typed)?;
+    let previous = transcript[..current].iter().rposition(typed)?;
+    if previous == 0 {
         return None;
     }
-    let earlier = wire_messages(&transcript[..start]);
+    let earlier = wire_messages(&transcript[..previous]);
     let end = earlier.len().checked_sub(1)?;
-    // The earlier turns end on the model's reply, so the wire keeps them a
+    // Those turns end on the model's reply, so the wire keeps them a
     // message of their own; anything else may have merged into the next.
     let own = earlier[end]["role"] == "assistant" && wire.get(end) == Some(&earlier[end]);
     (own && end + 1 < wire.len()).then_some(end)
@@ -1310,11 +1314,11 @@ mod history_cache_tests {
         build_body(&request, 1024, true, None)
     }
 
-    /// Earlier turns end in a breakpoint, so the next turn reuses them; the
-    /// turn running now (its user message, per-turn context, tool rounds)
-    /// keeps the last one. Four breakpoints at most, as Anthropic allows.
+    /// The turns before the previous one end in a breakpoint (the previous
+    /// turn is compacted once a newer one follows, so it is not reusable);
+    /// the turn running now keeps the last one. Four breakpoints at most.
     #[test]
-    fn earlier_turns_end_in_a_breakpoint_of_their_own() {
+    fn the_turns_before_the_previous_one_end_in_a_breakpoint() {
         let call = ToolCall {
             id: "c1".into(),
             name: "read_file".into(),
@@ -1326,14 +1330,23 @@ mod history_cache_tests {
             Message::user("first question"),
             Message::assistant("first answer", vec![]),
             Message::user("second question"),
+            Message::assistant("second answer", vec![]),
+            Message::user("third question"),
             Message::system("[Task Context] synthetic per-turn context"),
             Message::assistant("", vec![call]),
             Message::tool_result("c1", "file text"),
         ]);
-        // wire: 0 user(first), 1 assistant(first answer), 2 user(second +
-        // context), 3 assistant(tool_use), 4 user(tool_result)
-        assert_eq!(marked(&body), vec![1, 4], "{body:#}");
+        // wire: 0 user, 1 assistant(first answer), 2 user, 3 assistant,
+        // 4 user(third + context), 5 assistant(tool_use), 6 user(result)
+        assert_eq!(marked(&body), vec![1, 6], "{body:#}");
         assert!(breakpoints(&body) <= 4, "{body:#}");
+        // A second turn has only the previous turn before it: no mark.
+        let second = turn(vec![
+            Message::user("first question"),
+            Message::assistant("first answer", vec![]),
+            Message::user("second question"),
+        ]);
+        assert_eq!(marked(&second), vec![2], "{second:#}");
     }
 
     /// A first turn has no earlier turns; a hook's injected user message is
