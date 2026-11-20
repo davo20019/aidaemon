@@ -14,7 +14,22 @@ use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, typ
 use aidaemon_client_core::machine::DropKind;
 
 pub fn sidebar(store: Store) -> View {
-    let ids = computed(move || store.visible_ids());
+    // While the pointer is over the list its rows hold still: a row that
+    // moved under the pointer as another conversation got busy would take
+    // the click meant for its neighbour. Leaving the list shows the order
+    // as it is.
+    let held = signal(false);
+    let shown = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let ids = computed(move || {
+        let fresh = store.visible_ids();
+        let next = if held.get() {
+            hold_order(&shown.borrow(), fresh)
+        } else {
+            fresh
+        };
+        shown.borrow_mut().clone_from(&next);
+        next
+    });
     // What waits on the owner first; the rest by time, each row saying
     // whether it works.
     let needs = computed(move || {
@@ -83,6 +98,8 @@ pub fn sidebar(store: Store) -> View {
                     .px_2()
                     .pb_2()
                     .gap(px(1.0))
+                    .on_mouse_enter(move |_: &MouseEvent| held.set(true))
+                    .on_mouse_leave(move |_: &MouseEvent| held.set(false))
                     .child(dynamic(move || {
                         // Searching lists every match flat, and so do the
                         // archived; otherwise the view the owner is in.
@@ -144,6 +161,21 @@ pub fn sidebar(store: Store) -> View {
                 .child(ui::separator())
                 .child(connection(store)),
         )
+}
+
+/// The list in the order it was shown, `fresh` being the order now: rows
+/// still listed keep their places, rows gone drop out and new ones go at
+/// the end, out of the way until the list is let go.
+fn hold_order(shown: &[String], fresh: Vec<String>) -> Vec<String> {
+    let now: std::collections::HashSet<&String> = fresh.iter().collect();
+    let mut held: Vec<String> = shown
+        .iter()
+        .filter(|id| now.contains(id))
+        .cloned()
+        .collect();
+    let kept: std::collections::HashSet<String> = held.iter().cloned().collect();
+    held.extend(fresh.into_iter().filter(|id| !kept.contains(id)));
+    held
 }
 
 /// A conversation's row, with its menu on a right click or a long press:
@@ -1794,4 +1826,26 @@ fn archived_page(store: Store, project: Option<String>, ids: Memo<Vec<String>>) 
             .text_color(colors::FAINT),
         )
         .child(listed(store, ids))
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::hold_order;
+
+    fn v(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn held_rows_keep_their_places_and_new_ones_go_last() {
+        let shown = v(&["a", "b", "c", "d"]);
+        // "c" got busy and moved up, "b" was archived, "e" is new.
+        let fresh = v(&["e", "c", "a", "d"]);
+        assert_eq!(hold_order(&shown, fresh), v(&["a", "c", "d", "e"]));
+    }
+
+    #[test]
+    fn nothing_shown_yet_takes_the_fresh_order() {
+        assert_eq!(hold_order(&[], v(&["b", "a"])), v(&["b", "a"]));
+    }
 }
