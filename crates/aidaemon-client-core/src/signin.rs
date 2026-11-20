@@ -464,8 +464,9 @@ mod tests {
 
 /// A pairing link's parts: the gateway's HTTP base, the offer, its code
 /// and the daemon's fingerprint. Read from the web link
-/// (`http://host/client/v1/next/#offer=…&code=…&fp=…`) or an
-/// `aidaemon-pair:?gateway=…` link.
+/// (`http://host/client/v1/next/#offer=…&code=…&fp=…`), an
+/// `aidaemon-pair:?gateway=…` link or the pairing page's
+/// (`https://aidaemon.ai/pair#gateway=…`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingLink {
     pub gateway: String,
@@ -545,6 +546,12 @@ mod pairing_link_tests {
         )
         .unwrap();
         assert_eq!(app.gateway, "https://d.example.invalid");
+        let page = PairingLink::parse(
+            "https://aidaemon.ai/pair#gateway=https%3A%2F%2Fd.example.invalid&offer=of-3&code=CD&fp=f",
+        )
+        .unwrap();
+        assert_eq!(page.gateway, "https://d.example.invalid");
+        assert_eq!(page.offer_id, "of-3");
         assert!(PairingLink::parse("hello").is_none());
     }
 }

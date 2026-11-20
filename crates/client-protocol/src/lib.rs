@@ -3009,6 +3009,24 @@ pub struct PairingOffer {
     pub public_url: Option<String>,
 }
 
+/// The page that opens the phone app on a pairing: tapped in a chat or
+/// read from a QR code by a phone's camera (which open `https` links, not
+/// the app's own scheme), it hands the link to the app, or to its store
+/// page when the app is missing.
+pub const PAIRING_PAGE: &str = "https://aidaemon.ai/pair";
+
+impl PairingOffer {
+    /// [`PairingOffer::link`] as a [`PAIRING_PAGE`] link. The offer rides
+    /// in the fragment, which browsers never send to the page's server.
+    pub fn page_link(&self) -> String {
+        let query = self
+            .link
+            .split_once('?')
+            .map_or(self.link.as_str(), |(_, query)| query);
+        format!("{PAIRING_PAGE}#{query}")
+    }
+}
+
 /// `POST /client/v1/enrollments/redeem`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct RedeemRequest {
@@ -3186,6 +3204,22 @@ pub fn schema_file() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pairing_page_link_carries_the_offer_in_its_fragment() {
+        let offer = PairingOffer {
+            offer_id: "of-1".into(),
+            code: "K7Q2-9FZD".into(),
+            expires_at_ms: 0,
+            link: "aidaemon-pair:?gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
+            fingerprint: "3b1f".into(),
+            public_url: None,
+        };
+        assert_eq!(
+            offer.page_link(),
+            "https://aidaemon.ai/pair#gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f"
+        );
+    }
 
     #[test]
     fn unknown_event_types_and_fields_are_ignored() {

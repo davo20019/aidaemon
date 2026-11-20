@@ -1001,7 +1001,7 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
         offer.fingerprint
     );
     if let Some(code) = (!open_web)
-        .then(|| qrcode::QrCode::new(link.as_bytes()).ok())
+        .then(|| qrcode::QrCode::new(offer.page_link().as_bytes()).ok())
         .flatten()
     {
         println!(
@@ -1010,6 +1010,7 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
                 .quiet_zone(true)
                 .build()
         );
+        println!("Scan it with your phone's camera to pair the AIDaemon app.");
     }
     if open_web {
         let local = format!(

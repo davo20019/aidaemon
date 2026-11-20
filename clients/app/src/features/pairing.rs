@@ -110,8 +110,8 @@ enum Phone {
 }
 
 /// Pair a phone from the daemon's own computer: a QR code of the offer's
-/// `aidaemon-pair:` link (the phone's camera opens it in the app, which
-/// pairs at once), then the owner approves the phone here.
+/// pairing page link (the phone's camera opens it, and the page opens the
+/// app, which pairs at once), then the owner approves the phone here.
 pub fn pair_phone(store: Store) -> View {
     use aidaemon_client_protocol::EnrollmentState;
     use link::owner_pairing;
@@ -208,12 +208,12 @@ pub fn pair_phone(store: Store) -> View {
                         Tone::Warning,
                     ));
                 }
-                if let Some(qr) = ui::qr_code(&offer.link, 200.0) {
+                if let Some(qr) = ui::qr_code(&offer.page_link(), 200.0) {
                     card = card.child(qr);
                 }
                 card.child(hint(
-                    "Scan this with your phone's camera and open it in AIDaemon. \
-                     Or paste the link into the app.",
+                    "Point your phone's camera at this code and tap the link it \
+                     shows. It opens the AIDaemon app.",
                 ))
                 .child(hint(format!(
                     "Code {} · valid 10 minutes · daemon {}",
@@ -225,7 +225,7 @@ pub fn pair_phone(store: Store) -> View {
                         .flex_row()
                         .gap_2()
                         .child(btn("Copy link", Variant::Ghost, Size::Sm, {
-                            let link = offer.link.clone();
+                            let link = offer.page_link();
                             move || set_clipboard(link.clone())
                         }))
                         .child(btn("Cancel", Variant::Ghost, Size::Sm, move || {
