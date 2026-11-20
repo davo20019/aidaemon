@@ -38,6 +38,8 @@ mod tls;
 pub mod tools;
 
 pub use client::{Client, Connection, Context, Effect, Felt, Read};
+#[cfg(target_os = "ios")]
+pub use keystore::KeychainKeyStore;
 pub use keystore::{FileKeyStore, KeyStore, StoredDevice};
 #[cfg(feature = "native")]
 pub use link::{Auth, LinkConfig};

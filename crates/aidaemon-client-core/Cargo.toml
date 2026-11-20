@@ -37,11 +37,20 @@ uuid = { version = "1", features = ["v4"] }
 getrandom = { version = "0.4", optional = true }
 uuid = { version = "1", features = ["v4", "rng-getrandom"] }
 
+# iOS keeps a paired device's key in the keychain.
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "3"
+
+# Android: the platform verifier needs a Java component the app does not
+# ship, so the link trusts the Mozilla root set bundled here instead.
+[target.'cfg(target_os = "android")'.dependencies]
+webpki-roots = { version = "1", optional = true }
+
 [features]
 default = ["native"]
 # The tokio link and reqwest sign-in. Without it the
 # crate has no I/O and builds for wasm32-unknown-unknown.
-native = ["dep:dirs", "dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite"]
+native = ["dep:dirs", "dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite", "dep:webpki-roots"]
 # wasm32 only: randomness from the page's Web Crypto, for a runtime that
 # registers no getrandom backend of its own.
 browser-random = ["dep:getrandom", "getrandom/wasm_js"]

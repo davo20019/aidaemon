@@ -96,7 +96,7 @@ async fn run(
         updates,
         commands,
         machine,
-        http: reqwest::Client::new(),
+        http: crate::tls::http_client(),
         grant: GrantCache::default(),
         started: tokio::time::Instant::now(),
     };

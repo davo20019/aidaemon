@@ -1,6 +1,6 @@
-//! The desktops and the terminal: the shared tokio link on nsh's
-//! background threads. Where to sign in, pairing and starting the daemon
-//! here are `aidaemon_client_core::local`'s.
+//! The desktops, the terminal and the phones: the shared tokio link on
+//! nsh's background threads. Where to sign in, pairing and starting the
+//! daemon here are `aidaemon_client_core::local`'s.
 
 use aidaemon_client_core::link::{self, LinkConfig};
 use aidaemon_client_core::local;
@@ -11,18 +11,38 @@ use nsh_core::prelude::*;
 
 use crate::store::Store;
 
+/// Which link is current: [`pair_again`] moves it on, and an older link's
+/// task stops at its next update (dropping its receiver ends the link).
+static LINK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What kind of client this is, for the daemon's device list and limits.
+fn client_kind() -> ClientKind {
+    if super::MOBILE {
+        ClientKind::Mobile
+    } else if idiom() == Idiom::Terminal {
+        ClientKind::Tui
+    } else {
+        ClientKind::Desktop
+    }
+}
+
 pub fn start(store: Store) {
+    use std::sync::atomic::Ordering;
+    // A phone has no home folder: its key file (Android) lives in the app's
+    // own data directory.
+    if super::MOBILE
+        && let Some(dir) = data_dir()
+    {
+        local::set_data_dir(dir);
+    }
+    let generation = LINK_GENERATION.load(Ordering::SeqCst);
     let Some((url, auth)) = local::sign_in() else {
         // Nothing to sign in to yet: where should the agent run?
         store.needs_daemon();
         return;
     };
     store.set_gateway_base(aidaemon_client_core::machine::http_base(&url));
-    let kind = if idiom() == Idiom::Terminal {
-        ClientKind::Tui
-    } else {
-        ClientKind::Desktop
-    };
+    let kind = client_kind();
     let config = LinkConfig {
         url,
         auth,
@@ -45,9 +65,31 @@ pub fn start(store: Store) {
             let _ = commands.send((id, command));
         }));
         while let Some(update) = updates.recv().await {
+            if LINK_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
             store.update(update);
         }
     });
+}
+
+/// Forget this device's pairing (the daemon refused its key) and show the
+/// screen to pair again. Only a paired device: the owner's local token is
+/// renewed by the daemon, not here.
+pub fn pair_again(store: Store) {
+    use std::sync::atomic::Ordering;
+    LINK_GENERATION.fetch_add(1, Ordering::SeqCst);
+    store.attach(Box::new(|_, _| {}));
+    spawn(async move {
+        let _ = background(async { local::unpair() }).await;
+        store.needs_daemon();
+    });
+}
+
+/// Whether this device signs in with a paired key (not the local token),
+/// so a refusal can be answered by pairing again.
+pub fn is_paired() -> bool {
+    local::local_token().is_none() && local::is_paired()
 }
 
 /// Run the daemon on this computer: install it to start at login (no
@@ -72,7 +114,7 @@ pub fn install_here(store: Store) {
 /// Pair with a daemon elsewhere from its pairing link, keep the key, then
 /// connect.
 pub async fn pair_remote(store: Store, link: String, name: String) -> Result<(), String> {
-    background(async move { local::pair_from_link(&link, &name, ClientKind::Desktop).await })
+    background(async move { local::pair_from_link(&link, &name, client_kind()).await })
         .await
         .map_err(|_| "Could not pair".to_string())??;
     store.update(Update::Connecting);

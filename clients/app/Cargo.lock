@@ -75,11 +75,13 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-platform-verifier",
+ "security-framework",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "uuid",
+ "webpki-roots 1.0.12",
 ]
 
 [[package]]

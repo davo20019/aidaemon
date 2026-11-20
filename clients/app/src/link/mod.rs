@@ -51,7 +51,7 @@ pub async fn pair(
 }
 
 /// Forget this device's pairing and show the pairing screen (the daemon
-/// refused it). Only the browser pairs from the app.
+/// refused it).
 pub fn pair_again(store: Store) {
     #[cfg(target_arch = "wasm32")]
     spawn(async move {
@@ -59,7 +59,17 @@ pub fn pair_again(store: Store) {
         store.needs_pairing();
     });
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = store;
+    native::pair_again(store);
+}
+
+/// Whether this app signs in with a key it paired (a phone, or a computer
+/// paired with a daemon elsewhere), so a refused key can be paired again.
+/// The browser re-pairs on its own when its link carries an offer.
+pub fn signs_in_paired() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return native::is_paired();
+    #[cfg(target_arch = "wasm32")]
+    false
 }
 
 /// Whether this platform pairs from the app (the browser does).
@@ -173,4 +183,12 @@ impl Speaking {
 }
 
 /// Whether this build can run the daemon on its own computer.
-pub const RUNS_DAEMON: bool = cfg!(not(target_arch = "wasm32"));
+pub const RUNS_DAEMON: bool = cfg!(not(any(
+    target_arch = "wasm32",
+    target_os = "ios",
+    target_os = "android"
+)));
+
+/// A phone or tablet app (iOS, Android): it never runs the daemon, only
+/// pairs with one elsewhere.
+pub const MOBILE: bool = cfg!(any(target_os = "ios", target_os = "android"));

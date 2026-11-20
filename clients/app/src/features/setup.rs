@@ -120,13 +120,18 @@ pub fn where_page(store: Store) -> View {
             .gap_4()
             .child(heading(if auto {
                 "Welcome to AIDaemon"
+            } else if link::MOBILE {
+                "Connect to your agent"
             } else {
                 "Where should your agent run?"
             }))
-            .child(lead(
+            .child(lead(if link::MOBILE {
                 "AIDaemon is an agent that works for you around the clock. It runs on a computer \
-                 you choose; this app is how you talk to it.",
-            ))
+                 or server you own; this app is how you talk to it from your phone."
+            } else {
+                "AIDaemon is an agent that works for you around the clock. It runs on a computer \
+                 you choose; this app is how you talk to it."
+            }))
             .child(when(link::RUNS_DAEMON, move || run_here(store, auto)))
             .child(when(
                 move || auto && !elsewhere.get(),
@@ -195,7 +200,7 @@ fn run_here(store: Store, auto: bool) -> View {
 /// A daemon elsewhere, paired with the link it printed.
 fn pair_elsewhere(store: Store) -> View {
     let link_text = signal(String::new());
-    let name = signal(String::from("Desktop"));
+    let name = signal(String::from(if link::MOBILE { "Phone" } else { "Desktop" }));
     let pairing = signal(None::<(String, Tone)>);
     let pair = move || {
         pairing.set(Some(("Pairing…".into(), Tone::Accent)));
@@ -207,23 +212,44 @@ fn pair_elsewhere(store: Store) -> View {
             }
         });
     };
+    // An `aidaemon-pair:` link opened on this device (a QR code, a tapped
+    // link) fills the field and pairs at once.
+    spawn(async move {
+        loop {
+            let opened = next_url_scheme_open().await;
+            if !link_text.try_set(opened) {
+                return;
+            }
+            pair();
+        }
+    });
     ui::surface()
         .p_4()
         .gap_2()
         .child(
-            text("On another machine")
-                .text_size(px(type_scale::BASE))
-                .font_weight(FontWeight::MEDIUM),
+            text(if link::MOBILE {
+                "Pair this phone"
+            } else {
+                "On another machine"
+            })
+            .text_size(px(type_scale::BASE))
+            .font_weight(FontWeight::MEDIUM),
         )
-        .child(lead(
+        .child(lead(if link::MOBILE {
+            "Send /pair_device to your agent (in the desktop app, Telegram, Slack or Discord). \
+             Paste the link it replies with here, then approve this phone in that chat."
+        } else {
             "A server or another computer that stays on. Start `aidaemon` there; it prints a link \
-             and a code. Paste the link here.",
-        ))
+             and a code. Paste the link here."
+        }))
         .child(labeled(
             "Pairing link",
             field("http://…/client/v1/next/#offer=…", link_text),
         ))
-        .child(labeled("This device's name", field("Desktop", name)))
+        .child(labeled(
+            "This device's name",
+            field(if link::MOBILE { "Phone" } else { "Desktop" }, name),
+        ))
         .child(
             view()
                 .flex_row()

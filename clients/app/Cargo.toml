@@ -33,7 +33,10 @@ tokio = { version = "1", features = ["sync", "time"] }
 reqwest = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 dirs = "6"
-# The terminal build (`--tui`): NSH's terminal surface and its input glue.
+
+# The terminal build (`--tui`, the desktops only): NSH's terminal surface
+# and its input glue. iOS and Android build the library alone.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 nsh-platform-tui = { version = "0.6.0", default-features = false, features = ["run-app"] }
 nsh-tui-host = "0.6.0"
 nsh-engine = "0.6.0"

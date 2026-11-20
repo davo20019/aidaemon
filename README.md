@@ -293,6 +293,12 @@ tunnel = "my-tunnel"         # created with `cloudflared tunnel create`
 
 Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` for a throwaway `trycloudflare.com` address, Client Gateway only), `manual` (`url` of a reverse proxy you run) and `command` (any program that prints `{"url": "https://..."}` on its first line and keeps running; argv only, `{port}`, `{addr}` and `{service}` are filled in). The Node Gateway needs an address that survives restarts, so it refuses `quick` and a `command` without `stable = true`. `cloudflared` or `tailscale` must be on `PATH` (or set `binary`). Changes apply after a restart; `/exposure` shows each tunnel's state, address and last failure. The agent can set this up for you (`manage_config enable_exposure`, with your approval), except `command`, which only you can write.
 
+### The phone app (iOS and Android)
+
+The app on a phone never runs the daemon; it pairs with yours. Expose the Client Gateway first (above), then send `/pair_device` to your agent from the desktop app, Telegram, Slack or Discord, paste the link it replies with into the phone app (an `aidaemon-pair:` link or QR code opens the app and pairs at once), and approve the phone in that chat. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
+
+Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI: `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
+
 ### Customize your agent
 
 Your agent's first message offers to change its name and personality: just tell it. It writes them to an editable `persona.md` next to `config.toml`.

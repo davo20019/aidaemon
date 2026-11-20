@@ -1727,6 +1727,10 @@ fn connection(store: Store) -> View {
                 } else {
                     "Reconnecting…".to_string()
                 };
+                // A paired key the daemon refused (revoked, or the daemon
+                // was reset) never comes back on its own: offer to pair
+                // again.
+                let repair = kind == DropKind::Unauthorized && crate::link::signs_in_paired();
                 view()
                     .flex_row()
                     .items_center()
@@ -1738,6 +1742,14 @@ fn connection(store: Store) -> View {
                             .text_size(px(type_scale::XS))
                             .text_color(colors::FAINT),
                     )
+                    .child(when(repair, move || {
+                        ui::btn(
+                            "Pair again",
+                            ui::Variant::Secondary,
+                            ui::Size::Sm,
+                            move || crate::link::pair_again(store),
+                        )
+                    }))
             }
         }))
     }))

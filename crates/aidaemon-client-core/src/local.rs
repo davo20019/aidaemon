@@ -1,14 +1,15 @@
-//! A client on a computer that may run the daemon itself (desktops, the
-//! terminal): where the gateway is, the owner's local token, the key kept
-//! after pairing with a daemon elsewhere, and starting the daemon here.
+//! A native client: where the gateway is, the owner's local token, the key
+//! kept after pairing with a daemon elsewhere, and (on a computer that may
+//! run the daemon itself: the desktops, the terminal) starting it here.
+//! A phone never runs the daemon; it only pairs.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use aidaemon_client_protocol::ClientKind;
 
-use crate::keystore::{FileKeyStore, KeyStore};
+use crate::keystore::KeyStore;
 use crate::link::Auth;
 use crate::signin::{PairRequest, PairingLink};
 
@@ -50,13 +51,59 @@ pub fn local_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Where the app keeps its key once paired with a daemon elsewhere.
-pub fn device_store() -> Option<Arc<FileKeyStore>> {
-    dirs::home_dir().map(|home| {
-        Arc::new(FileKeyStore::new(
-            home.join(".aidaemon").join("app-device.json"),
-        ))
+/// Set by an app with a data directory of its own (a phone's sandbox).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep this client's files in `dir` instead of `~/.aidaemon`: a phone app
+/// has no home folder of its own, only its data directory. Set once, before
+/// [`sign_in`]; a later call is ignored.
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+/// Where this client keeps its files: [`set_data_dir`]'s, else
+/// `~/.aidaemon`. (iOS keeps the key in the keychain, not here.)
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+fn data_dir() -> Option<PathBuf> {
+    DATA_DIR
+        .get()
+        .cloned()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".aidaemon")))
+}
+
+/// The keychain item of the iOS app's key.
+#[cfg(target_os = "ios")]
+const KEYCHAIN_SERVICE: &str = "ai.aidaemon.app";
+
+/// Where the app keeps its key once paired with a daemon elsewhere: the
+/// keychain on iOS, else an owner-only file in the data directory (on
+/// Android the app's private storage, which no other app can read).
+pub fn device_store() -> Option<Arc<dyn KeyStore>> {
+    #[cfg(target_os = "ios")]
+    return Some(Arc::new(crate::keystore::KeychainKeyStore::new(
+        KEYCHAIN_SERVICE,
+        "device",
+    )));
+    #[cfg(not(target_os = "ios"))]
+    data_dir().map(|dir| {
+        Arc::new(crate::keystore::FileKeyStore::new(
+            dir.join("app-device.json"),
+        )) as Arc<dyn KeyStore>
     })
+}
+
+/// Whether this device is paired with a daemon elsewhere.
+pub fn is_paired() -> bool {
+    device_store().is_some_and(|keys| matches!(keys.load(), Ok(Some(_))))
+}
+
+/// Forget this device's pairing (the daemon refused its key, or the owner
+/// unpaired it). The error is for the owner.
+pub fn unpair() -> Result<(), String> {
+    match device_store() {
+        Some(keys) => keys.clear().map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
 }
 
 /// How to sign in from here: the local token with the gateway's URL, else
@@ -84,7 +131,7 @@ pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<
         offer_id: link.offer_id,
         code: link.code,
         device_name: if name.trim().is_empty() {
-            "Desktop".into()
+            default_device_name(kind).into()
         } else {
             name.trim().into()
         },
@@ -92,14 +139,24 @@ pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<
         fingerprint: link.fingerprint,
     };
     let device = crate::signin::pair(
-        &reqwest::Client::new(),
+        &crate::tls::http_client(),
         &request,
         Duration::from_millis(500),
     )
     .await
     .map_err(|e| e.to_string())?;
-    let keys = device_store().ok_or("No home directory to keep the key in")?;
+    let keys = device_store().ok_or("No folder to keep the key in")?;
     keys.save(&device).map_err(|e| e.to_string())
+}
+
+/// The name a device pairs under when the owner gives none.
+pub fn default_device_name(kind: ClientKind) -> &'static str {
+    match kind {
+        ClientKind::Mobile => "Phone",
+        ClientKind::Tui => "Terminal",
+        ClientKind::Web => "Browser",
+        _ => "Desktop",
+    }
 }
 
 /// The `aidaemon` binary: beside this app (the bundled download), else on
@@ -170,4 +227,16 @@ pub async fn install_daemon() -> Result<(), String> {
         "See why with `journalctl --user -u aidaemon`."
     };
     Err(format!("AIDaemon did not start within a minute. {why}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_without_a_name_pairs_under_its_kind() {
+        assert_eq!(default_device_name(ClientKind::Mobile), "Phone");
+        assert_eq!(default_device_name(ClientKind::Desktop), "Desktop");
+        assert_eq!(default_device_name(ClientKind::Tui), "Terminal");
+    }
 }

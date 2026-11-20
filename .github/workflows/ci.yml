@@ -752,6 +752,88 @@ jobs:
           nsh package --target web
           test -f .nsh/out/AIdaemon/index.html
 
+  # The phone apps, as nsh packages them: an Android APK (debug key) and an
+  # iOS simulator build. They build the app's library alone, so a desktop- or
+  # wasm-only API in a shared path fails here first.
+  android-app:
+    name: App (Android)
+    runs-on: ubuntu-24.04
+    env:
+      NSH_VERSION: "0.6.0"
+      NSH_LINUX_SHA256: "19d360eb8dd1ba8847a3b3ad06082f6f3705eb04ae8178357a8cdad31880f0d9"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-linux-android
+      - name: Install a JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install nsh CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-linux-x86_64.tar.gz" -o nsh.tar.gz
+          echo "${NSH_LINUX_SHA256}  nsh.tar.gz" | sha256sum -c -
+          tar -xzf nsh.tar.gz -C "$HOME"
+          test -x "$HOME/nsh/bin/nsh"
+          rm nsh.tar.gz
+          echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+      - name: Install the nsh Android runtime
+        run: nsh component add android
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-android-app
+          workspaces: clients/app/.nsh/rust
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build the APK
+        working-directory: clients/app
+        run: |
+          set -euo pipefail
+          # The runner's SDK carries several NDKs; take its newest.
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          nsh package --target android --abi arm64-v8a
+          ls -l .nsh/out/*.apk
+
+  ios-app:
+    name: App (iOS simulator)
+    runs-on: macos-15
+    env:
+      NSH_VERSION: "0.6.0"
+      NSH_MACOS_SHA256: "b2a8370c8b44ca6059d2d8665b48b08472a4fee3956813b99223f4e3ce5491d9"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-ios-sim aarch64-apple-ios
+      - name: Install nsh CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-macos-arm64.tar.gz" -o nsh.tar.gz
+          echo "${NSH_MACOS_SHA256}  nsh.tar.gz" | shasum -a 256 -c -
+          tar -xzf nsh.tar.gz -C "$HOME"
+          test -x "$HOME/nsh/bin/nsh"
+          rm nsh.tar.gz
+          echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+      - name: Install the nsh iOS runtime
+        run: nsh component add ios
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-ios-app
+          workspaces: clients/app/.nsh/rust
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build for the simulator
+        working-directory: clients/app
+        run: |
+          set -euo pipefail
+          nsh package --target ios-simulator
+          ls -d .nsh/out/*.app
+
   # x86_64 and ARM64 Linux, the two Linux downloads.
   build-check:
     name: Build check (release, ${{ matrix.os }})

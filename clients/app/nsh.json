@@ -6,5 +6,11 @@
   "rust": ".",
   "root": "App",
   "theme": "theme.json",
-  "appearance": "system"
+  "appearance": "system",
+  "schemes": [
+    "aidaemon-pair"
+  ],
+  "android": {
+    "targetSdk": 36
+  }
 }
