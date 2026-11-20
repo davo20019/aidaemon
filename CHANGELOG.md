@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A phone connects right after pairing.** The link started by the pairing screen stopped when that screen gave way, so a newly paired phone stayed on "Connecting…" until the app was opened again; the link now outlives the screen that starts it.
 - **The app reconnects at once when you come back to it.** Back in the foreground (or a computer back from sleep), the app checks its connection right away and tries again now instead of after the retry wait it built up in the background, and a drop that happened while you were away does not show as an outage while it reconnects.
 - **The app no longer hangs on "Connecting…".** Signing in and opening the connection time out (30 s and 20 s) and the app shows why, instead of waiting forever on a network that drops packets; error messages name the underlying cause. The daemon logs each device sign-in, accepted or refused.
 

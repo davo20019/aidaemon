@@ -65,24 +65,31 @@ pub fn start(store: Store) {
         capabilities: vec![Capability::ViewActions, Capability::Surfaces],
     };
     let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel::<Update>();
-    spawn(async move {
-        // The link's tasks run on the runtime behind `background`.
-        let Ok((commands, waker)) =
-            background(async move { link::spawn_wakeable(config, updates_tx) }).await
-        else {
-            log::error!("could not start the link");
-            return;
-        };
-        *WAKER.lock().unwrap_or_else(|p| p.into_inner()) = Some(waker);
-        store.attach(Box::new(move |id, command| {
-            let _ = commands.send((id, command));
-        }));
-        while let Some(update) = updates.recv().await {
-            if LINK_GENERATION.load(Ordering::SeqCst) != generation {
+    // Owned by nothing: `start` runs from screens' tasks too (pairing, "Pair
+    // again", installing the daemon), and the link must outlive the screen
+    // that started it. A screen's tasks go with it: the link started from
+    // the pairing screen stopped as that screen gave way, and a phone stayed
+    // "connecting" until the app was opened again (live 2026-11-19).
+    Owner::detached().run(|| {
+        spawn(async move {
+            // The link's tasks run on the runtime behind `background`.
+            let Ok((commands, waker)) =
+                background(async move { link::spawn_wakeable(config, updates_tx) }).await
+            else {
+                log::error!("could not start the link");
                 return;
+            };
+            *WAKER.lock().unwrap_or_else(|p| p.into_inner()) = Some(waker);
+            store.attach(Box::new(move |id, command| {
+                let _ = commands.send((id, command));
+            }));
+            while let Some(update) = updates.recv().await {
+                if LINK_GENERATION.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                store.update(update);
             }
-            store.update(update);
-        }
+        })
     });
 }
 
