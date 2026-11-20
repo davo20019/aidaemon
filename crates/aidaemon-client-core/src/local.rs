@@ -159,6 +159,89 @@ pub fn default_device_name(kind: ClientKind) -> &'static str {
     }
 }
 
+/// The owner's side of pairing a device from this computer, signed in with
+/// the local token: make an offer (its `link` is what a QR code shows),
+/// watch it, and approve or deny the device that redeemed it. The errors
+/// are for the owner.
+pub mod owner_pairing {
+    use aidaemon_client_protocol::{Enrollment, OfferRequest, PairingDecision, PairingOffer};
+
+    use crate::signin::{HttpReply, read};
+
+    async fn call<T: serde::de::DeserializeOwned>(
+        method: reqwest::Method,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<T, String> {
+        let token =
+            super::local_token().ok_or("Pair devices from the computer AIDaemon runs on.")?;
+        let url = format!("{}{path}", crate::machine::http_base(&super::gateway_url()));
+        let mut request = crate::tls::http_client()
+            .request(method, url)
+            .bearer_auth(token);
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/json")
+                .body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("Could not reach AIDaemon: {e}"))?;
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        read(HttpReply { status, body }).map_err(|e| e.to_string())
+    }
+
+    /// A new offer, confirmed here (not in a chat).
+    pub async fn offer() -> Result<PairingOffer, String> {
+        let body = serde_json::to_string(&OfferRequest::default()).map_err(|e| e.to_string())?;
+        call(
+            reqwest::Method::POST,
+            "/client/v1/pairing/offers",
+            Some(body),
+        )
+        .await
+    }
+
+    /// Where the offer stands.
+    pub async fn status(offer_id: &str) -> Result<Enrollment, String> {
+        call(
+            reqwest::Method::GET,
+            &format!("/client/v1/pairing/offers/{offer_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// Approve or deny the device waiting on the offer.
+    pub async fn decide(offer_id: &str, approve: bool) -> Result<Enrollment, String> {
+        let body =
+            serde_json::to_string(&PairingDecision { approve }).map_err(|e| e.to_string())?;
+        call(
+            reqwest::Method::POST,
+            &format!("/client/v1/pairing/offers/{offer_id}/decision"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// Whether a device elsewhere can reach `gateway` (an offer's
+    /// `public_url`): not when it is this computer's loopback address.
+    pub fn reachable_elsewhere(gateway: &str) -> bool {
+        let host = crate::machine::http_base(gateway);
+        let host = host.split_once("://").map_or(host.as_str(), |(_, h)| h);
+        let host = host.rsplit_once(':').map_or(host, |(h, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                h
+            } else {
+                host
+            }
+        });
+        !matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0" | "")
+    }
+}
+
 /// The `aidaemon` binary: beside this app (the bundled download), else on
 /// `PATH`.
 pub fn daemon_binary() -> Option<PathBuf> {
@@ -238,5 +321,15 @@ mod tests {
         assert_eq!(default_device_name(ClientKind::Mobile), "Phone");
         assert_eq!(default_device_name(ClientKind::Desktop), "Desktop");
         assert_eq!(default_device_name(ClientKind::Tui), "Terminal");
+    }
+
+    #[test]
+    fn a_loopback_gateway_is_not_reachable_from_a_phone() {
+        use owner_pairing::reachable_elsewhere;
+        assert!(!reachable_elsewhere("http://127.0.0.1:8788"));
+        assert!(!reachable_elsewhere("http://localhost:8788/"));
+        assert!(!reachable_elsewhere("http://[::1]:8788"));
+        assert!(reachable_elsewhere("https://daemon.example.invalid"));
+        assert!(reachable_elsewhere("http://100.64.0.7:8788"));
     }
 }

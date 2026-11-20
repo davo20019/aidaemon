@@ -28,7 +28,8 @@ nsh run --target android                       # or ios: hot reload on a device 
 
 A phone never runs the daemon (`link::RUNS_DAEMON` is false, `link::MOBILE`
 true): it pairs from a `/pair_device` link or an opened `aidaemon-pair:`
-link (`nsh.json` `schemes`) as `ClientKind::Mobile`, keeps its key through
+link (`nsh.json` `schemes`; the desktop's Settings → Paired devices → Pair a
+phone shows one as a QR code, `features::pairing::pair_phone`) as `ClientKind::Mobile`, keeps its key through
 `aidaemon_client_core::local::device_store` (the iOS keychain; on Android a
 file in the app's data directory) and offers "Pair again" when the daemon
 refuses it. Android's TLS trusts the bundled Mozilla roots: its platform

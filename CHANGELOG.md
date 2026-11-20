@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The app runs on iOS and Android.** The phone app pairs with your daemon from a `/pair_device` link (or an opened `aidaemon-pair:` link), keeps its key in the iOS keychain or Android's private app storage, and offers "Pair again" when the daemon refuses its key. CI builds an Android APK and an iOS simulator build on every pull request; releases attach a signed APK and send an iOS build to TestFlight once their signing secrets are set. See "The phone app" in the README.
+- **Pair a phone with a QR code.** The desktop app on the daemon's computer shows Settings → Paired devices → Pair a phone: a QR code of the pairing link that the phone's camera opens in the app, then you approve the phone right there.
 
 ### Changed
 

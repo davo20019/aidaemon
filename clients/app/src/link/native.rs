@@ -169,3 +169,35 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
         }
     });
 }
+
+/// Whether the owner can pair a phone from here: a computer signed in with
+/// the local token (the daemon's own).
+pub fn can_offer_pairing() -> bool {
+    !super::MOBILE && local::local_token().is_some()
+}
+
+/// A new pairing offer, confirmed in this app.
+pub async fn offer_pairing() -> Result<aidaemon_client_protocol::PairingOffer, String> {
+    background(local::owner_pairing::offer())
+        .await
+        .map_err(|_| "Could not start pairing".to_string())?
+}
+
+/// Where the offer stands.
+pub async fn pairing_status(
+    offer_id: String,
+) -> Result<aidaemon_client_protocol::Enrollment, String> {
+    background(async move { local::owner_pairing::status(&offer_id).await })
+        .await
+        .map_err(|_| "Could not read the pairing".to_string())?
+}
+
+/// Approve or deny the device waiting on the offer.
+pub async fn decide_pairing(
+    offer_id: String,
+    approve: bool,
+) -> Result<aidaemon_client_protocol::Enrollment, String> {
+    background(async move { local::owner_pairing::decide(&offer_id, approve).await })
+        .await
+        .map_err(|_| "Could not answer the pairing".to_string())?
+}

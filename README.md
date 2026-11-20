@@ -295,7 +295,7 @@ Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` f
 
 ### The phone app (iOS and Android)
 
-The app on a phone never runs the daemon; it pairs with yours. Expose the Client Gateway first (above), then send `/pair_device` to your agent from the desktop app, Telegram, Slack or Discord, paste the link it replies with into the phone app (an `aidaemon-pair:` link or QR code opens the app and pairs at once), and approve the phone in that chat. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
+The app on a phone never runs the daemon; it pairs with yours. Expose the Client Gateway first (above). The quickest way: in the desktop app on the daemon's computer, open Settings → Paired devices → **Pair a phone**, scan the QR code with the phone's camera, open it in AIDaemon, and approve the phone on the desktop. Or send `/pair_device` to your agent from the desktop app, Telegram, Slack or Discord, paste the link it replies with into the phone app (an `aidaemon-pair:` link or QR code opens the app and pairs at once), and approve the phone in that chat. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
 
 Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI: `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
 

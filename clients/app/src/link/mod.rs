@@ -72,6 +72,60 @@ pub fn signs_in_paired() -> bool {
     false
 }
 
+/// The owner's side of pairing a phone from this computer (a QR code of the
+/// offer, approved here). Only the daemon's own computer offers it.
+pub mod owner_pairing {
+    use aidaemon_client_protocol::{Enrollment, PairingOffer};
+
+    pub fn available() -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::can_offer_pairing();
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    pub async fn offer() -> Result<PairingOffer, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::offer_pairing().await;
+        #[cfg(target_arch = "wasm32")]
+        Err("Pair phones from the computer AIDaemon runs on.".into())
+    }
+
+    pub async fn status(offer_id: String) -> Result<Enrollment, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::pairing_status(offer_id).await;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = offer_id;
+            Err("Pair phones from the computer AIDaemon runs on.".into())
+        }
+    }
+
+    pub async fn decide(offer_id: String, approve: bool) -> Result<Enrollment, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::decide_pairing(offer_id, approve).await;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (offer_id, approve);
+            Err("Pair phones from the computer AIDaemon runs on.".into())
+        }
+    }
+
+    /// Whether a phone can reach the gateway the offer names.
+    pub fn reachable_elsewhere(offer: &PairingOffer) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return offer
+            .public_url
+            .as_deref()
+            .is_none_or(aidaemon_client_core::local::owner_pairing::reachable_elsewhere);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = offer;
+            true
+        }
+    }
+}
+
 /// Whether this platform pairs from the app (the browser does).
 pub const PAIRS_IN_APP: bool = cfg!(target_arch = "wasm32");
 

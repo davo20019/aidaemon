@@ -1967,10 +1967,13 @@ fn devices(store: Store) -> View {
             Some(untracked(move || match read {
                 aidaemon_client_core::Read::Ready((devices, can_change)) => {
                     let devices: Vec<_> = devices.into_iter().filter(|d| !d.revoked).collect();
-                    if devices.is_empty() {
-                        return muted("No paired devices.").into_element();
-                    }
                     let mut list = view().gap_2();
+                    if can_change && crate::link::owner_pairing::available() {
+                        list = list.child(crate::features::pairing::pair_phone(store));
+                    }
+                    if devices.is_empty() {
+                        return list.child(muted("No paired devices.")).into_element();
+                    }
                     if !can_change {
                         list = list.child(muted(
                             "Change what a device may do in the app on the computer AIDaemon \
