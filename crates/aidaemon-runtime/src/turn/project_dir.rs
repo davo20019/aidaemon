@@ -246,6 +246,61 @@ pub fn project_dir_from_tool_args(
         .next()
 }
 
+/// The arguments that name a file or folder a workspace tool works on: a
+/// relative one names it inside the request's project.
+const FILE_ARGUMENT_KEYS: &[&str] = &["path", "paths", "file_path", "directory"];
+
+/// Resolves a workspace tool's relative file arguments against the known
+/// project directory, so the call the kernel judges, the tool runs and the
+/// receipt records all name the same file. Without it a relative path
+/// resolved against the daemon's own directory: the read failed, and the
+/// "project directory" taken from it moved later commands there. Returns
+/// whether an argument changed. Shells are anchored by `working_dir`
+/// instead (paths in a command are its data).
+pub fn anchor_relative_file_arguments(
+    argument: ProjectDirArgument,
+    arguments: &mut Value,
+    project_dir: &str,
+) -> bool {
+    let project_dir = project_dir.trim();
+    if argument == ProjectDirArgument::ShellWorkingDir || project_dir.is_empty() {
+        return false;
+    }
+    let Some(obj) = arguments.as_object_mut() else {
+        return false;
+    };
+    let anchor = |raw: &mut String| {
+        let path = raw.trim();
+        // Machine format: `~` is the home directory, not a relative name.
+        if path.is_empty()
+            || path.starts_with('~')
+            || aidaemon_tools::BackendPath::is_absolute(path)
+        {
+            return false;
+        }
+        *raw = std::path::Path::new(project_dir)
+            .join(path)
+            .to_string_lossy()
+            .into_owned();
+        true
+    };
+    let mut changed = false;
+    for key in FILE_ARGUMENT_KEYS {
+        match obj.get_mut(*key) {
+            Some(Value::String(raw)) => changed |= anchor(raw),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Value::String(raw) = item {
+                        changed |= anchor(raw);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
 pub fn maybe_inject_project_dir_into_tool_args(
     backend: &dyn aidaemon_tools::ExecutionBackend,
     argument: ProjectDirArgument,
@@ -516,6 +571,40 @@ mod tests {
         let parsed: Value = serde_json::from_str(&updated).expect("valid arguments");
         assert_eq!(parsed["working_dir"], project.to_string_lossy().as_ref());
         assert_eq!(parsed["command"], "pwd && ls dist");
+    }
+
+    #[test]
+    fn relative_file_arguments_resolve_in_the_project_and_nothing_else_moves() {
+        let mut args = json!({
+            "path": "src/lib.rs",
+            "paths": ["a.txt", "/abs/b.txt"],
+            "to": "alice@example.test",
+            "file_path": "~/notes.md",
+        });
+        assert!(super::anchor_relative_file_arguments(
+            ProjectDirArgument::AnyPath,
+            &mut args,
+            "/synthetic/project",
+        ));
+        let joined = |rel: &str| {
+            std::path::Path::new("/synthetic/project")
+                .join(rel)
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(args["path"], joined("src/lib.rs"));
+        assert_eq!(args["paths"][0], joined("a.txt"));
+        assert_eq!(args["paths"][1], "/abs/b.txt");
+        assert_eq!(args["to"], "alice@example.test");
+        assert_eq!(args["file_path"], "~/notes.md");
+        // A shell's paths are its data; it is anchored by working_dir.
+        let mut shell = json!({"command": "cat a.txt", "path": "a.txt"});
+        assert!(!super::anchor_relative_file_arguments(
+            ProjectDirArgument::ShellWorkingDir,
+            &mut shell,
+            "/synthetic/project",
+        ));
+        assert_eq!(shell["path"], "a.txt");
     }
 
     #[test]
