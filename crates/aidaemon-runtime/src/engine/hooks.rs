@@ -185,13 +185,21 @@ impl sdk::Hook for CutoffAdjust {
         response: &mut sdk::ModelResponse,
     ) -> sdk::ModelDecision {
         let produced_output = !response.tool_calls.is_empty() || !response.text.trim().is_empty();
-        if produced_output {
+        // Stopped at the output limit with no tool call: a call it was
+        // writing (a long file) was lost with the rest, whatever text came
+        // before it. The typed flag first; a provider that only says so in
+        // its note (machine marker: the adapters' own "truncated" wording)
+        // counts when nothing came out at all.
+        let cut_off_without_calls = response.tool_calls.is_empty()
+            && (response.cut_off
+                || (!produced_output
+                    && response
+                        .note
+                        .as_deref()
+                        .is_some_and(|note| note.contains("truncated"))));
+        if !cut_off_without_calls && produced_output {
             self.consecutive.store(0, Ordering::Relaxed);
-        } else if response
-            .note
-            .as_deref()
-            .is_some_and(|note| note.contains("truncated"))
-        {
+        } else if cut_off_without_calls {
             let count = self.consecutive.fetch_add(1, Ordering::Relaxed) + 1;
             let raised = raised_output_ceiling(
                 u32::try_from(response.usage.output_tokens).ok(),

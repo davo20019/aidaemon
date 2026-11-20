@@ -35,9 +35,11 @@ use crate::stuck::StuckSignal;
 use crate::tool::{SourceTrust, ToolAnnotations, ToolContext, ToolError, ToolInfo, ToolOutput};
 
 /// Sent when a final reply stopped at the output-token limit.
-const CUT_OFF_REPLY: &str = "Your last reply was cut off at the output limit, so the owner \
-     would get it unfinished. Send the complete answer again, shorter: keep what matters \
-     and drop detail.";
+const CUT_OFF_REPLY: &str = "Your last reply was cut off at the output limit. A tool call \
+     you were writing (a file, a long command) was cut off with it and did not run: do that \
+     work in smaller parts, one file or one section per call (append to a long file in \
+     pieces). If you were answering the owner, send the complete answer again, shorter: keep \
+     what matters and drop detail.";
 /// Ends a reply that stayed cut off after [`CUT_OFF_REPLY`].
 const CUT_OFF_NOTICE: &str = "\n\n(This reply was cut off at the model's output limit.)";
 
@@ -443,8 +445,15 @@ impl<'a> Driver<'a> {
             self.scrubber().message(&mut message);
             self.state.messages.push(message);
 
-            // A final reply cut off at the output limit would reach the
-            // owner mid-sentence: ask once for the whole answer, shorter.
+            // Work that went on since the last cut-off earns a new ask: a
+            // long task may run into the limit again much later.
+            if !calls.is_empty() {
+                cut_off_asks = 0;
+            }
+            // A reply cut off at the output limit would reach the owner
+            // mid-sentence, or lost the tool call it was writing (a long
+            // file): ask once for the work in smaller parts, or the whole
+            // answer shorter.
             if calls.is_empty() && response.cut_off && cut_off_asks < 1 {
                 cut_off_asks += 1;
                 self.state.messages.push(Message::from_origin(
