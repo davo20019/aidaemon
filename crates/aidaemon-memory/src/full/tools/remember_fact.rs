@@ -149,7 +149,7 @@ impl Tool for RememberFactTool {
     }
 
     fn description(&self) -> &str {
-        "Store or forget stable facts about the owner and their environment, not task research, generated content, goals, or schedules. Other people, family and relationships: manage_people remember."
+        "Store or forget stable facts about the owner and their environment, not task research, generated content, goals, schedules, or a rule the owner limits to this chat or task (it already applies here). Other people, family and relationships: manage_people remember."
     }
 
     fn schema(&self) -> Value {

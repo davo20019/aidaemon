@@ -48,8 +48,10 @@ impl<'de> serde::Deserialize<'de> for FactLifetime {
 /// Extractor prompt sentence that defines the `lifetime` field.
 pub const FACT_LIFETIME_INSTRUCTION: &str = "Set \"lifetime\":\"transient\" on any fact that \
      describes state likely to change within days: the last command run, a single run's status \
-     or result, current disk/CPU/queue numbers, a draft in progress, or today's plan. Omit \
-     \"lifetime\" for facts that stay true (names, preferences, project locations, tech stacks).";
+     or result, current disk/CPU/queue numbers, a draft in progress, or today's plan; and on any \
+     rule or constraint the user limits to this chat, this task or this request (\"for this chat\", \
+     \"this time\", \"don't install anything for this one\"). Omit \"lifetime\" for facts that stay \
+     true (names, preferences, project locations, tech stacks).";
 
 /// What a finished task did, as the host renders it.
 #[derive(Debug, Clone, Copy)]
