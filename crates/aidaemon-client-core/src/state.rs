@@ -173,7 +173,7 @@ pub fn status_text(status: &TurnStatus) -> String {
                 last.trim().chars().take(80).collect::<String>()
             )
         }
-        TurnStatus::ToolCompleted { name, summary } => format!("✓ {name} {summary}"),
+        TurnStatus::ToolCompleted { name, summary, .. } => format!("✓ {name} {summary}"),
         TurnStatus::PlanStep {
             step,
             total,
@@ -461,28 +461,24 @@ impl State {
             Event::TurnStatus { turn_id, status } => {
                 if let Some(live) = self.live_turn(&turn_id) {
                     match &status {
-                        TurnStatus::ToolStarted {
-                            name,
-                            summary,
-                            activity,
-                        } => {
+                        TurnStatus::ToolStarted { name, activity, .. } => {
                             live.tools.push(name.clone());
                             live.calls.push(ToolCallInfo {
                                 name: name.clone(),
-                                input: summary.clone(),
+                                input: status.call_detail().unwrap_or_default().to_string(),
                                 output: String::new(),
                                 kind: *activity,
                             });
                         }
                         // The latest call of that name still running.
-                        TurnStatus::ToolCompleted { name, summary } => {
+                        TurnStatus::ToolCompleted { name, .. } => {
                             if let Some(call) = live
                                 .calls
                                 .iter_mut()
                                 .rev()
                                 .find(|c| &c.name == name && c.output.is_empty())
                             {
-                                call.output = summary.clone();
+                                call.output = status.call_detail().unwrap_or_default().to_string();
                             }
                         }
                         _ => {}
@@ -957,17 +953,21 @@ mod tests {
         ));
         state.apply(status(TurnStatus::ToolStarted {
             name: "running a command".into(),
-            summary: "npm run typecheck".into(),
+            summary: "typechecking".into(),
             activity: Some(aidaemon_client_protocol::ToolKind::Run),
+            input: "{\n  \"command\": \"npm run typecheck\"\n}".into(),
         }));
         state.apply(status(TurnStatus::ToolCompleted {
             name: "running a command".into(),
             summary: "exit 0".into(),
+            output: "Found 0 errors.".into(),
         }));
+        // An older daemon sends no arguments: the summary stands in.
         state.apply(status(TurnStatus::ToolStarted {
             name: "reading a file".into(),
             summary: "src/synthetic.ts".into(),
             activity: None,
+            input: String::new(),
         }));
         state.apply(event(
             Some(1),
@@ -984,9 +984,10 @@ mod tests {
             panic!("{:?}", state.sessions["app:s1"].lines);
         };
         assert_eq!(tools.len(), 2);
-        assert_eq!(calls[0].input, "npm run typecheck");
+        // A live call shows what history would: its arguments and result.
+        assert_eq!(calls[0].input, "{\n  \"command\": \"npm run typecheck\"\n}");
         assert_eq!(calls[0].kind, Some(aidaemon_client_protocol::ToolKind::Run));
-        assert_eq!(calls[0].output, "exit 0");
+        assert_eq!(calls[0].output, "Found 0 errors.");
         assert_eq!(calls[1].input, "src/synthetic.ts");
         assert!(calls[1].output.is_empty());
     }
@@ -1055,6 +1056,7 @@ mod tests {
                     name: "read_file".into(),
                     summary: "notes.md".into(),
                     activity: None,
+                    input: String::new(),
                 },
             },
         ));

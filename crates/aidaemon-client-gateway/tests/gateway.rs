@@ -49,6 +49,7 @@ impl AgentIngress for ScriptedAgent {
                     name: "terminal".into(),
                     summary: "building the synthetic report".into(),
                     kind: aidaemon_core::card::ActivityKind::Run,
+                    input: String::new(),
                 })
                 .await;
             for chunk in ["Do", "ne."] {

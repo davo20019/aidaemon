@@ -1478,6 +1478,7 @@ mod tests {
                         name: "terminal".into(),
                         summary: "installing the blog".into(),
                         kind: aidaemon_core::card::ActivityKind::Run,
+                        input: String::new(),
                     })
                     .await;
             }
@@ -1959,6 +1960,7 @@ mod tests {
                     name: "spawn".into(),
                     summary: String::new(),
                     kind: ActivityKind::Delegate,
+                    input: String::new(),
                 },
                 helper("Count lines", RunPhase::Running),
                 helper("Count words", RunPhase::Running),
@@ -1988,6 +1990,7 @@ mod tests {
                 name: "read".into(),
                 summary: String::new(),
                 kind: ActivityKind::Read,
+                input: String::new(),
             }],
             "It says hello.",
             Default::default(),

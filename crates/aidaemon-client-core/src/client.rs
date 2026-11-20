@@ -1487,13 +1487,14 @@ impl Client {
             let last = turn.tools.len().saturating_sub(1);
             for (n, name) in turn.tools.iter().enumerate() {
                 // The current status names the last tool with its summary.
-                let (summary, activity) = match &turn.status {
+                let (summary, activity, input) = match &turn.status {
                     Some(TurnStatus::ToolStarted {
                         name: now,
                         summary,
                         activity,
-                    }) if n == last && now == name => (summary.clone(), *activity),
-                    _ => (String::new(), None),
+                        input,
+                    }) if n == last && now == name => (summary.clone(), *activity, input.clone()),
+                    _ => (String::new(), None, String::new()),
                 };
                 self.note_activity(
                     &Event::TurnStatus {
@@ -1502,6 +1503,7 @@ impl Client {
                             name: name.clone(),
                             summary,
                             activity,
+                            input,
                         },
                     },
                     now,
@@ -1555,7 +1557,7 @@ impl Client {
                     TurnStatus::ToolProgress { name, chunk } => {
                         (ActivityKind::Output, name.clone(), chunk.clone())
                     }
-                    TurnStatus::ToolCompleted { name, summary } => {
+                    TurnStatus::ToolCompleted { name, summary, .. } => {
                         (ActivityKind::ToolDone, name.clone(), summary.clone())
                     }
                     TurnStatus::PlanStep {

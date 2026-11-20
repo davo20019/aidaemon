@@ -7460,6 +7460,10 @@
               ],
               "description": "What kind of work it is (protocol 1.29)."
             },
+            "input": {
+              "description": "The call's arguments as history shows them, redacted and cut to\nsize (protocol 1.40); empty when the daemon gave none.",
+              "type": "string"
+            },
             "kind": {
               "const": "tool_started",
               "type": "string"
@@ -7504,6 +7508,10 @@
               "type": "string"
             },
             "name": {
+              "type": "string"
+            },
+            "output": {
+              "description": "The call's result as history shows it, redacted and cut to size\n(protocol 1.40); empty when the daemon gave none.",
               "type": "string"
             },
             "summary": {

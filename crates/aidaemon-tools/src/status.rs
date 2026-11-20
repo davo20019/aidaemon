@@ -29,6 +29,9 @@ pub enum StatusUpdate {
         name: String,
         summary: String,
         kind: aidaemon_core::card::ActivityKind,
+        /// The call's arguments as an app shows them
+        /// ([`crate::shown::call_input`]); empty when there are none to show.
+        input: String,
     },
     /// Streaming output chunk from a tool (e.g., CLI agent progress).
     ToolProgress { name: String, chunk: String },
@@ -37,7 +40,13 @@ pub enum StatusUpdate {
     /// progress, channels must deliver this immediately and without truncation.
     UserActionRequired { message: String },
     /// Tool execution completed with a brief summary.
-    ToolComplete { name: String, summary: String },
+    ToolComplete {
+        name: String,
+        summary: String,
+        /// The call's result as an app shows it
+        /// ([`crate::shown::call_output`]); empty when there is none to show.
+        output: String,
+    },
     /// Tool can be cancelled with the given task_id.
     ToolCancellable { name: String, task_id: String },
     /// Periodic summary for long-running tasks (emitted every 5 minutes).

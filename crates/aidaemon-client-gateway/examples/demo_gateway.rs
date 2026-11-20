@@ -51,6 +51,7 @@ impl AgentIngress for Agent {
                     name: "terminal".into(),
                     summary: "reading the synthetic notes".into(),
                     kind: aidaemon_core::card::ActivityKind::Read,
+                    input: String::new(),
                 })
                 .await;
             // "slow" keeps it working a while, to watch a working row.

@@ -513,6 +513,10 @@ impl TurnEngine<'_> {
                     name,
                     summary,
                     kind,
+                    // The same arguments a reloaded conversation shows.
+                    input: aidaemon_tools::shown::call_input(&serde_json::Value::String(
+                        arguments.to_string(),
+                    )),
                 });
             }
         }
@@ -1286,7 +1290,11 @@ impl TurnEngine<'_> {
                             }
                         },
                     );
-                    StatusUpdate::ToolComplete { name, summary }
+                    StatusUpdate::ToolComplete {
+                        name,
+                        summary,
+                        output: aidaemon_tools::shown::call_output(&output),
+                    }
                 })
             };
             if let Some(update) = update {

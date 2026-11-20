@@ -269,6 +269,7 @@ mod tests {
                 name: "terminal".into(),
                 summary: "installing the site".into(),
                 kind: ActivityKind::Run,
+                input: String::new(),
             },
         );
         // A late update from an earlier turn changes nothing.
@@ -279,6 +280,7 @@ mod tests {
                 name: "terminal".into(),
                 summary: "old step".into(),
                 kind: ActivityKind::Web,
+                input: String::new(),
             },
         );
         let records = crate::ports::ChatRuns {

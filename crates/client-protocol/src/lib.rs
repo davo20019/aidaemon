@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 39;
+pub const PROTOCOL_MINOR: u16 = 40;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2247,6 +2247,10 @@ pub enum TurnStatus {
         /// What kind of work it is (protocol 1.29).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<ToolKind>,
+        /// The call's arguments as history shows them, redacted and cut to
+        /// size (protocol 1.40); empty when the daemon gave none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        input: String,
     },
     ToolProgress {
         name: String,
@@ -2256,6 +2260,10 @@ pub enum TurnStatus {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
+        /// The call's result as history shows it, redacted and cut to size
+        /// (protocol 1.40); empty when the daemon gave none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output: String,
     },
     PlanStep {
         /// 0-based.
@@ -2275,6 +2283,26 @@ pub enum TurnStatus {
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+impl TurnStatus {
+    /// What a tool row shows for this status: a started call's arguments or
+    /// a completed call's result, else its summary when the daemon sent
+    /// none (an older daemon). `None` for a status that is not a call.
+    pub fn call_detail(&self) -> Option<&str> {
+        let (shown, summary) = match self {
+            TurnStatus::ToolStarted { input, summary, .. } => (input, summary),
+            TurnStatus::ToolCompleted {
+                output, summary, ..
+            } => (output, summary),
+            _ => return None,
+        };
+        Some(if shown.trim().is_empty() {
+            summary
+        } else {
+            shown
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

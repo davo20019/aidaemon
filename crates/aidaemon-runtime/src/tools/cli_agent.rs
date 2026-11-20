@@ -3529,6 +3529,7 @@ impl CliAgentTool {
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
                             summary,
+                            output: String::new(),
                         });
                     }
 
@@ -3563,6 +3564,7 @@ impl CliAgentTool {
                         let _ = tx.try_send(StatusUpdate::ToolComplete {
                             name: label,
                             summary,
+                            output: String::new(),
                         });
                     }
                     Self::quarantine_unavailable_tool(
@@ -3620,6 +3622,7 @@ impl CliAgentTool {
                     let _ = tx.try_send(StatusUpdate::ToolComplete {
                         name: label,
                         summary,
+                        output: String::new(),
                     });
                 }
 

@@ -840,6 +840,7 @@ mod tests {
         assert!(!live.note(&StatusUpdate::ToolComplete {
             name: "reading a file".into(),
             summary: "done".into(),
+            output: String::new(),
         }));
         assert!(live.note(&StatusUpdate::StepHandedOff {
             kind: ActivityKind::Delegate,

@@ -172,6 +172,7 @@ fn snapshot() -> Snapshot {
                 name: "terminal".into(),
                 summary: "cargo test -q".into(),
                 activity: Some(ToolKind::Run),
+                input: String::new(),
             }),
             tools: vec!["terminal".into()],
             calls: vec![ToolCallInfo {
@@ -751,6 +752,7 @@ fn server_samples() -> Vec<ServerFrame> {
                     name: "http_request".into(),
                     summary: "POST h.example.invalid".into(),
                     activity: None,
+                    input: String::new(),
                 },
             },
         ),
@@ -1652,6 +1654,7 @@ fn every_turn_status_round_trips() {
             name: "terminal".into(),
             summary: String::new(),
             activity: Some(ToolKind::Run),
+            input: "{\"command\": \"cargo test -q\"}".into(),
         },
         TurnStatus::ToolProgress {
             name: "terminal".into(),
@@ -1660,6 +1663,7 @@ fn every_turn_status_round_trips() {
         TurnStatus::ToolCompleted {
             name: "terminal".into(),
             summary: "ok".into(),
+            output: "test result: ok".into(),
         },
         TurnStatus::PlanStep {
             step: 1,

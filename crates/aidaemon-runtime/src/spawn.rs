@@ -2145,6 +2145,7 @@ mod tests {
                 name: "running the site installer".into(),
                 summary: String::new(),
                 kind: ActivityKind::Run,
+                input: String::new(),
             })
             .await
             .unwrap();
@@ -2152,6 +2153,7 @@ mod tests {
             .send(StatusUpdate::ToolComplete {
                 name: "running the site installer".into(),
                 summary: "done".into(),
+                output: String::new(),
             })
             .await
             .unwrap();
