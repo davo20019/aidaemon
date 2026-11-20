@@ -715,6 +715,87 @@ async fn test_upsert_fact_insert() {
     assert_eq!(facts[0].value, "Rust");
 }
 
+/// Background extraction reading an old conversation must not bring back a
+/// value the owner corrected after it: evidence older than a later value of
+/// the same knowledge is stale, in whatever category the extractor picks
+/// (live 2026-11-20: "class moved to Thursdays", then a later extraction of
+/// the earlier "class is on Tuesdays" made Tuesdays an active fact again).
+#[tokio::test]
+async fn extraction_of_old_evidence_does_not_undo_a_later_correction() {
+    let (store, _db) = setup_test_store().await;
+    let said_tuesday = chrono::Utc::now() - chrono::Duration::minutes(10);
+    store
+        .upsert_fact_with_provenance(
+            "schedule",
+            "synthetic_class_day",
+            "Tuesdays at 6pm",
+            "user_stated",
+            None,
+            FactPrivacy::Global,
+            Some(said_tuesday),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_fact(
+            "schedule",
+            "synthetic_class_day",
+            "Thursdays at 6pm",
+            "user_stated",
+            None,
+            FactPrivacy::Global,
+        )
+        .await
+        .unwrap();
+    // Extraction of the first conversation, after the correction.
+    store
+        .upsert_fact_with_provenance(
+            "user",
+            "synthetic_class_day",
+            "Tuesdays at 6pm",
+            "consolidation",
+            None,
+            FactPrivacy::Global,
+            Some(said_tuesday),
+            None,
+        )
+        .await
+        .unwrap();
+    let active: Vec<String> = store
+        .get_all_facts_with_provenance()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.key == "synthetic_class_day" && f.superseded_at.is_none())
+        .map(|f| f.value)
+        .collect();
+    assert_eq!(active, vec!["Thursdays at 6pm".to_string()]);
+
+    // Evidence newer than the correction is the owner changing it again.
+    store
+        .upsert_fact_with_provenance(
+            "user",
+            "synthetic_class_day",
+            "Tuesdays at 6pm",
+            "consolidation",
+            None,
+            FactPrivacy::Global,
+            Some(chrono::Utc::now()),
+            None,
+        )
+        .await
+        .unwrap();
+    let active = store
+        .get_all_facts_with_provenance()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.key == "synthetic_class_day" && f.superseded_at.is_none())
+        .count();
+    assert!(active >= 1);
+}
+
 #[tokio::test]
 async fn test_upsert_fact_with_provenance_round_trips() {
     let (store, _db) = setup_test_store().await;

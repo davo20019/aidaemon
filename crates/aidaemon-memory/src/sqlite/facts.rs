@@ -594,6 +594,38 @@ impl SqliteMemory {
     /// Retired rows, with no active row left for their key, that cover an
     /// automated write of one of `keys = value` in `category`
     /// ([`retirement_covers`]).
+    /// Whether a fact under one of `keys` (any category) took a value other
+    /// than `value` after `seen`: evidence from `seen` is older than it.
+    async fn corrected_since(
+        &self,
+        keys: &[&str],
+        value: &str,
+        seen: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let keys: Vec<&str> = keys
+            .iter()
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .collect();
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        // At most three spellings of one key; repeat the first to fill.
+        let key = |i: usize| keys.get(i).copied().unwrap_or(keys[0]);
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT value, created_at FROM facts WHERE key IN (?, ?, ?)")
+                .bind(key(0))
+                .bind(key(1))
+                .bind(key(2))
+                .fetch_all(&self.pool)
+                .await?;
+        let new_value = crate::text::normalize_fact_value(value);
+        Ok(rows.into_iter().any(|(other, created_at)| {
+            DateTime::parse_from_rfc3339(&created_at).is_ok_and(|at| at.with_timezone(&Utc) > seen)
+                && crate::text::normalize_fact_value(&other) != new_value
+        }))
+    }
+
     async fn retired_knowledge(
         &self,
         category: &str,
@@ -1422,6 +1454,24 @@ impl FactStore for SqliteMemory {
             .map(|v| encode_embedding(&v));
 
         let automated_source = !is_owner_authored_fact_source(source);
+        // Background extraction reads conversations after the fact: evidence
+        // older than a later, different value of the same knowledge (its key,
+        // in any category) is what the owner corrected since, and must not
+        // replace or compete with the correction.
+        if automated_source
+            && let Some(seen) = first_seen_at
+            && self
+                .corrected_since(&[key_clean, &canonical_key, &key_for_write], value, seen)
+                .await?
+        {
+            tracing::debug!(
+                category = category_clean,
+                key = key_clean,
+                source,
+                "Automated fact write skipped: a later value of this knowledge replaced it"
+            );
+            return Ok(());
+        }
         if existing.is_none() && automated_source {
             // Knowledge the owner deleted, or a key merged away, must not be
             // brought back by background extraction, in any category the
