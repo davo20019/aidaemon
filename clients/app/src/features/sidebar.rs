@@ -1426,11 +1426,15 @@ fn row_names(store: Store, id: String, d: String, f: String, g: String, h: Strin
                 .child(star),
         )
         .child(when(said, move || {
+            // The line shrinks with the row, and the project's name gives
+            // way (one line, ending in "…") before the source icons: a long
+            // name ran past the time and off a phone's screen.
             view()
                 .flex_row()
                 .items_center()
+                .min_w(px(0.0))
                 .gap_1()
-                .child(tag_text().min_w(px(0.0)))
+                .child(tag_text().min_w(px(0.0)).flex_shrink(1.0))
                 .child(mark())
         }))
 }
