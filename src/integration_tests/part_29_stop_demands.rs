@@ -191,3 +191,74 @@ async fn an_ignored_code_check_ask_stops_after_its_one_ask() {
         "after its ask the demand is spent: {verdicts:?}"
     );
 }
+
+/// An empty final reply after real work is sent back once for a written
+/// answer; the rewritten reply ships.
+#[tokio::test]
+async fn an_empty_reply_after_work_is_rewritten_once() {
+    let written = "phase=WRITTEN; the system info is in.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(""),
+        MockProvider::text_response(written),
+        MockProvider::text_response(written),
+    ]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, vec![])
+        .await
+        .unwrap();
+    let session_id = "stop_demand_empty_reply";
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            "What system is this running on?",
+            None,
+            UserRole::Owner,
+            owner_channel(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(response.contains("phase=WRITTEN"), "{response}");
+    assert_eq!(
+        stop_demand_verdicts(&harness, session_id, "final_reply_defect").await,
+        vec!["demand"],
+        "one rewrite: {:?}",
+        all_conditions(&harness, session_id).await
+    );
+}
+
+/// A model that answers the rewrite with another empty reply does not
+/// loop: the demand is spent after its one ask and the run ends.
+#[tokio::test]
+async fn a_second_empty_reply_does_not_loop() {
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("system_info", "{}"),
+        MockProvider::text_response(""),
+        MockProvider::text_response(""),
+        MockProvider::text_response(""),
+        MockProvider::text_response(""),
+    ]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, vec![])
+        .await
+        .unwrap();
+    let session_id = "stop_demand_empty_twice";
+    harness
+        .agent
+        .handle_message(
+            session_id,
+            "What system is this running on?",
+            None,
+            UserRole::Owner,
+            owner_channel(),
+            None,
+        )
+        .await
+        .unwrap();
+    let verdicts = stop_demand_verdicts(&harness, session_id, "final_reply_defect").await;
+    assert_eq!(
+        verdicts.iter().filter(|v| *v == "demand").count(),
+        1,
+        "one ask, never a loop: {verdicts:?}"
+    );
+}
