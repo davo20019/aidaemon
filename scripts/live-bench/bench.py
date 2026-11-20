@@ -136,7 +136,10 @@ def s_clarify(ctx):
     ctx["turns"].append(t)
     m = metrics(t["sid"], ctx["since"])
     sent = any(x for x in m["tools"] if re.search(r"send|mail|message|slack|telegram|discord", x))
-    return {"asked": "?" in t["reply"], "no_send": not sent}, {"llm": 1, "tools": 0}
+    r = t["reply"].lower()
+    # Asking: a question, or a request for the missing details.
+    asked = "?" in r or "tell me" in r or "let me know" in r
+    return {"asked": asked, "no_send": not sent}, {"llm": 1, "tools": 0}
 
 
 def s_memory_cross_session(ctx):
