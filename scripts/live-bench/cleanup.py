@@ -15,7 +15,7 @@ def q(sql):
 PROMPTS = ["hbench", "capital of Australia", "17 * 23", "Send the report to him now", "bike locker",
            "gym class", "grocery list for pancakes", "add one more item for a topping", "Scroll test",
            "The tests fail. Find the bug and fix it.", "Make slugify drop punctuation", "Add f_to_c(f) to temps.py",
-           "Rename fetch_items to load_items", "gym locker combination"]
+           "Rename fetch_items to load_items", "gym locker combination", "synthetic test pottery"]
 like = " or ".join(f"instr(data, '{p}') > 0" for p in PROMPTS)
 sids = [r[0] for r in q(f"select distinct session_id from events where event_type='user_message' and created_at >= '{W}' and session_id like 'app:%' and ({like})")]
 ins = ",".join(f"'{s}'" for s in sids) or "''"
