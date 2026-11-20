@@ -612,6 +612,7 @@ fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schem
             return true;
         }
         match value {
+            Value::Null => false,
             Value::String(text) => !text.trim().is_empty(),
             Value::Array(items) => !items.is_empty(),
             _ => true,
@@ -709,7 +710,8 @@ mod unset_argument_tests {
             "schedules": [],
             "tags": ["a"],
             "event_id": 0,
-            "include_subagents": false
+            "include_subagents": false,
+            "start_line": null
         }))
         .unwrap();
         drop_unset_optional_arguments(&mut args, &schema);
