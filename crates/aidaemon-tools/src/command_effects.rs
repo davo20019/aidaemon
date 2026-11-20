@@ -1038,6 +1038,88 @@ pub fn only_reads(command: &str) -> bool {
     })
 }
 
+/// For a command that runs another command somewhere else (`docker exec`,
+/// `podman exec`, `kubectl exec`, `ssh`): whether that inner command only
+/// reads. `None` when `command` is not one such single wrapper, or its inner
+/// command cannot be read structurally. The inner text is judged by
+/// [`only_reads`], so a redirection, a delete or an unknown program inside
+/// counts as a change. Read from token structure only (machine format: a
+/// shell command line), never from wording.
+pub fn remote_inner_only_reads(command: &str) -> Option<bool> {
+    remote_inner_script(command).map(|inner| only_reads(&inner))
+}
+
+/// The command a single remote-exec wrapper runs, as shell text.
+fn remote_inner_script(command: &str) -> Option<String> {
+    let segments: Vec<String> = scan(command)
+        .segments
+        .into_iter()
+        .filter(|segment| !segment.trim().is_empty())
+        .collect();
+    let [segment] = segments.as_slice() else {
+        return None;
+    };
+    let tokens = shell_words::split(segment).ok()?;
+    let program = basename(tokens.first()?);
+    // Options that take a separate value, per wrapper.
+    let (start, valued): (usize, &[&str]) = match program {
+        "docker" | "podman" if tokens.get(1).map(String::as_str) == Some("exec") => (
+            2,
+            &[
+                "-e",
+                "--env",
+                "-u",
+                "--user",
+                "-w",
+                "--workdir",
+                "--env-file",
+            ],
+        ),
+        "kubectl" if tokens.get(1).map(String::as_str) == Some("exec") => {
+            let dash = tokens.iter().position(|token| token == "--")?;
+            return inner_text(&tokens[dash + 1..]);
+        }
+        "ssh" => (
+            1,
+            &[
+                "-p", "-i", "-l", "-o", "-F", "-J", "-b", "-c", "-D", "-E", "-L", "-R", "-W", "-m",
+                "-O", "-Q", "-S", "-w",
+            ],
+        ),
+        _ => return None,
+    };
+    let mut index = start;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        index += if valued.contains(&token.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    // The container or host, then the command it runs.
+    inner_text(tokens.get(index + 1..)?)
+}
+
+/// `tokens` as one command line: the script of `sh -c '<script>'` (any
+/// shell, with `-c` among its single-dash flags), else the words rejoined.
+fn inner_text(tokens: &[String]) -> Option<String> {
+    let first = tokens.first()?;
+    if matches!(basename(first), "sh" | "bash" | "zsh" | "dash" | "ash") {
+        let flag = tokens[1..].iter().position(|token| {
+            token.starts_with('-') && !token.starts_with("--") && token.contains('c')
+        })?;
+        return tokens.get(flag + 2).cloned();
+    }
+    Some(shell_words::join(tokens))
+}
+
 /// Whether a `curl` call saves something to a file: an output, header,
 /// cookie or trace file. Output sent to `/dev/null` saves nothing.
 fn curl_saves_files(args: &[String]) -> bool {
@@ -4210,6 +4292,49 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
         && let Some(directory) = parsed.positionals.get(1)
     {
         out.path(EffectClass::Write, directory, cwd);
+    }
+}
+
+#[cfg(test)]
+mod remote_inner_tests {
+    use super::remote_inner_only_reads;
+
+    /// A look inside a container or host reads; a write there changes.
+    #[test]
+    fn the_command_inside_a_remote_exec_is_judged() {
+        assert_eq!(
+            remote_inner_only_reads("docker exec app-1 bash -lc 'ls -la /app; cat /app/a.txt'"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads(
+                "docker exec -w /app app-1 bash -lc 'printf x > /app/move.txt'"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("docker exec -e K=v app-1 rm -f /app/old.log"),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("ssh -p 2222 host cat /etc/hostname"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads("ssh host 'systemctl restart nginx'"),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("kubectl exec pod-1 -- sh -c 'ls /data'"),
+            Some(true)
+        );
+        // Not one remote wrapper: nothing to judge here.
+        assert_eq!(remote_inner_only_reads("ls /app"), None);
+        assert_eq!(remote_inner_only_reads("docker ps"), None);
+        assert_eq!(
+            remote_inner_only_reads("docker exec app-1 ls && rm -rf /tmp/x"),
+            None
+        );
     }
 }
 

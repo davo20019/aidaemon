@@ -7821,22 +7821,6 @@ fn deletion_observation_candidates(
 /// the process sandbox enforces. Shell source is program input, not a trusted
 /// declaration of effects: inspecting words in it cannot prove what an
 /// executable, script, trap, alias, or quoted expression will do.
-/// `semantics` plus a change static inspection cannot type: still the
-/// observation it was (its exit status and output), now also a mutation
-/// (`UNSPECIFIED`).
-fn claimed_opaque_change(semantics: &ToolCallSemantics) -> ToolCallSemantics {
-    let mut changed = semantics.clone();
-    changed.mutation_effects = changed
-        .mutation_effects
-        .union(ToolMutationEffects::UNSPECIFIED);
-    changed.effect = if changed.observes_state() {
-        crate::tools::traits::ToolCallEffect::ObservationAndMutation
-    } else {
-        crate::tools::traits::ToolCallEffect::Mutation
-    };
-    changed
-}
-
 fn terminal_run_semantics_from_access(
     confinement_active: bool,
     has_write_targets: bool,
@@ -8469,18 +8453,37 @@ impl Tool for TerminalTool {
         // only the items the call claims), or the ledger reads it as an
         // observation and keeps asking for the change (live 2026-11-20:
         // every container task got two passes that re-ran finished work).
-        let opaque_change = !checklist_items.is_empty()
-            && !self
-                .call_annotations_in(arguments, &crate::tools::traits::TrustRoots::new(&[]))
-                .read_only;
+        // Whether it changes something: inside a remote exec (`docker
+        // exec`, `ssh`) the command it runs decides, so a look inside a
+        // container is a look; otherwise the authority view does.
+        let run_text = serde_json::from_str::<TerminalArgs>(arguments)
+            .ok()
+            .and_then(|args| args.command.or(args.script));
+        let changes = match run_text
+            .as_deref()
+            .and_then(aidaemon_tools::command_effects::remote_inner_only_reads)
+        {
+            Some(only_reads) => !only_reads,
+            None => {
+                !self
+                    .call_annotations_in(arguments, &crate::tools::traits::TrustRoots::new(&[]))
+                    .read_only
+            }
+        };
+        let opaque_change = !checklist_items.is_empty() && changes;
         self.execute_terminal(arguments, status_tx, &exec_ctx)
             .await
             .map(|mut outcome| {
                 if outcome.metadata.checklist_items.is_empty() {
                     outcome.metadata.checklist_items = checklist_items;
                 }
-                if opaque_change && !outcome.metadata.semantics.mutates_state() {
-                    outcome.metadata.semantics = claimed_opaque_change(&outcome.metadata.semantics);
+                if !outcome.metadata.semantics.mutates_state() {
+                    if opaque_change {
+                        outcome.metadata.semantics =
+                            outcome.metadata.semantics.with_untyped_change();
+                    } else {
+                        outcome.metadata.changes_untyped = changes;
+                    }
                 }
                 outcome
             })

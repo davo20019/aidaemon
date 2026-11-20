@@ -1328,6 +1328,7 @@ impl TurnEngine<'_> {
             took_over: std::sync::Mutex::new(None),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
+            in_progress_change_item: AtomicU64::new(u64::MAX),
             checklist_declared: AtomicBool::new(false),
         };
         // A parent or goal cancellation stops the run at its next check.

@@ -86,6 +86,11 @@ pub struct TurnScope<'a> {
     /// Checklist items the model has not finished or set aside, as last
     /// declared through `track_requirements`.
     pub open_checklist_items: AtomicU64,
+    /// The one checklist item that changes something and that the model
+    /// marked `in_progress` in its latest checklist (`u64::MAX`: none, or
+    /// more than one): where a change a call made without naming an item
+    /// goes ([`aidaemon_tools::semantics::ToolCallMetadata::changes_untyped`]).
+    pub in_progress_change_item: AtomicU64,
     /// The model has declared a checklist in this run, finished or not.
     pub checklist_declared: AtomicBool,
     pub status_tx: Option<tokio::sync::mpsc::Sender<aidaemon_tools::status::StatusUpdate>>,

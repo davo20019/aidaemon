@@ -267,13 +267,23 @@ async fn a_second_empty_reply_does_not_loop() {
 /// cannot see into (here `sh -c`, live `docker exec`), and replies; returns
 /// the reply and the ledger's demands.
 async fn opaque_write_turn(session_id: &str, claim: bool) -> (String, Vec<String>) {
+    wrapped_turn(session_id, claim, "pending", "sh -c 'exit 0'").await
+}
+
+/// [`opaque_write_turn`] with the item's declared status and the command.
+async fn wrapped_turn(
+    session_id: &str,
+    claim: bool,
+    status: &str,
+    command: &str,
+) -> (String, Vec<String>) {
     let checklist = json!({"items": [{
         "text": "write the synthetic report inside the container",
-        "status": "pending",
+        "status": status,
         "mutation_effects": ["local_workspace_write"]
     }]})
     .to_string();
-    let mut run = json!({"action": "run", "command": "sh -c 'exit 0'"});
+    let mut run = json!({"action": "run", "command": command});
     if claim {
         run["checklist_items"] = json!([0]);
     }
@@ -341,4 +351,24 @@ async fn a_claimed_change_through_a_wrapper_closes_its_item() {
 async fn an_unclaimed_wrapped_command_does_not_close_the_item() {
     let (_, demands) = opaque_write_turn("opaque_change_unclaimed", false).await;
     assert!(!demands.is_empty(), "the item stays open without a claim");
+}
+
+/// A change through a wrapper that names no item, made while the model has
+/// exactly one change item in progress, is that item's work.
+#[tokio::test]
+#[cfg_attr(windows, ignore = "Unix shell wrapper; the typing is platform-neutral")]
+async fn an_unnamed_change_goes_to_the_item_in_progress() {
+    let (response, demands) =
+        wrapped_turn("unnamed_change_in_progress", false, "in_progress", "sh -c 'exit 0'").await;
+    assert!(response.contains("phase=DONE"), "{response}");
+    assert!(demands.is_empty(), "no extra pass: {demands:?}");
+}
+
+/// A look is never the work: a read-only command made while an item is in
+/// progress does not close it.
+#[tokio::test]
+async fn a_look_while_an_item_is_in_progress_does_not_close_it() {
+    let (_, demands) =
+        wrapped_turn("look_in_progress", false, "in_progress", "ls /").await;
+    assert!(!demands.is_empty(), "the item stays open after a look");
 }
