@@ -557,6 +557,13 @@ impl TurnEngine<'_> {
                     error: failure.map(|error| error.to_string()),
                     provider_error_kind: provider_error.map(|error| error.kind),
                     provider_status: provider_error.and_then(|error| error.status),
+                    reasoning: aidaemon_events::payloads::LlmCallData::kept_reasoning(
+                        result
+                            .as_ref()
+                            .ok()
+                            .and_then(|response| response.thinking.as_deref()),
+                    )
+                    .map(|reasoning| aidaemon_tools::sanitize::redact_for_owner(&reasoning)),
                 },
                 token_usage: usage.clone(),
             },

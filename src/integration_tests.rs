@@ -35,3 +35,4 @@ include!("integration_tests/part_26_session_model.rs");
 include!("integration_tests/part_27_project_memory.rs");
 include!("integration_tests/part_28_live_surfaces.rs");
 include!("integration_tests/part_29_stop_demands.rs");
+include!("integration_tests/part_30_llm_call_reasoning.rs");

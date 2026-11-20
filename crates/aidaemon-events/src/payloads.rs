@@ -835,6 +835,30 @@ pub struct LlmCallData {
     pub provider_error_kind: Option<crate::provider::ProviderErrorKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_status: Option<u16>,
+    /// The model's reasoning summary for this call, secrets redacted and
+    /// capped at [`LlmCallData::REASONING_MAX_CHARS`]: why it chose what it
+    /// did, for reading a run after the fact. Never fed back to a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+impl LlmCallData {
+    /// The longest reasoning summary an event keeps.
+    pub const REASONING_MAX_CHARS: usize = 8_000;
+
+    /// `reasoning` as an event keeps it: blank is none, a long summary keeps
+    /// its first [`Self::REASONING_MAX_CHARS`] characters and says so.
+    pub fn kept_reasoning(reasoning: Option<&str>) -> Option<String> {
+        let reasoning = reasoning?.trim();
+        if reasoning.is_empty() {
+            return None;
+        }
+        let mut chars = reasoning.char_indices();
+        Some(match chars.nth(Self::REASONING_MAX_CHARS) {
+            Some((cut, _)) => format!("{} [...]", &reasoning[..cut]),
+            None => reasoning.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1975,6 +1999,26 @@ mod tests {
         assert_eq!(data.risk_score, Some(0.72));
     }
 
+    /// An event keeps a reasoning summary whole up to the cap, cuts a longer
+    /// one on a character boundary, and keeps nothing for a blank one.
+    #[test]
+    fn llm_call_keeps_reasoning_up_to_the_cap() {
+        assert_eq!(LlmCallData::kept_reasoning(None), None);
+        assert_eq!(LlmCallData::kept_reasoning(Some("  \n")), None);
+        assert_eq!(
+            LlmCallData::kept_reasoning(Some(" Use member_ids as written. ")).as_deref(),
+            Some("Use member_ids as written.")
+        );
+        let long = "é".repeat(LlmCallData::REASONING_MAX_CHARS + 5);
+        let kept = LlmCallData::kept_reasoning(Some(&long)).unwrap();
+        assert_eq!(
+            kept,
+            format!("{} [...]", "é".repeat(LlmCallData::REASONING_MAX_CHARS))
+        );
+        let exact = "a".repeat(LlmCallData::REASONING_MAX_CHARS);
+        assert_eq!(LlmCallData::kept_reasoning(Some(&exact)), Some(exact));
+    }
+
     #[test]
     fn llm_call_data_serde_roundtrip() {
         let data = LlmCallData {
@@ -2017,6 +2061,7 @@ mod tests {
             error: None,
             provider_error_kind: Some(crate::provider::ProviderErrorKind::Auth),
             provider_status: Some(401),
+            reasoning: Some("Read the CSV header first.".to_string()),
         };
         let json = serde_json::to_value(&data).expect("serialize");
         let back: LlmCallData = serde_json::from_value(json).expect("deserialize");
@@ -2030,6 +2075,10 @@ mod tests {
         assert_eq!(back.decode_ms, Some(400.0));
         assert_eq!(back.input_tokens, 100);
         assert_eq!(back.output_tokens, 50);
+        assert_eq!(
+            back.reasoning.as_deref(),
+            Some("Read the CSV header first.")
+        );
         assert_eq!(back.cached_input_tokens, Some(60));
         assert_eq!(back.cache_creation_input_tokens, Some(10));
         assert_eq!(back.fresh_input_tokens, Some(40));

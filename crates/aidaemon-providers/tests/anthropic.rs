@@ -498,7 +498,11 @@ fn reasoning_effort_uses_adaptive_thinking_on_current_models() {
         req.model = model.into();
         req.options.reasoning_effort = Some("high".into());
         let body = p.request_body(&req);
-        assert_eq!(body["thinking"], json!({"type": "adaptive"}), "{model}");
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"}),
+            "{model}"
+        );
         assert_eq!(body["output_config"], json!({"effort": "high"}), "{model}");
         assert_eq!(body["max_tokens"], 16384 + 4096, "{model}");
         assert!(body["thinking"].get("budget_tokens").is_none());

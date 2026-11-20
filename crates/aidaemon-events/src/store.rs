@@ -6717,6 +6717,7 @@ mod tests {
             error: None,
             provider_error_kind: None,
             provider_status: None,
+            reasoning: None,
         };
         append_event_at(
             store,

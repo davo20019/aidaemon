@@ -527,7 +527,10 @@ fn build_body(
             body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
         (Some(effort), None) => {
-            body["thinking"] = json!({"type": "adaptive"});
+            // Claude 5 models omit the thinking text by default; a summary
+            // costs nothing extra (thinking bills the same either way) and is
+            // the only record of why the model chose what it did.
+            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
             body["output_config"] = json!({"effort": adaptive_effort(effort)});
         }
         (None, None) => {}
