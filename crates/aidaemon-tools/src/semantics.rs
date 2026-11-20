@@ -331,6 +331,10 @@ pub enum EvidenceSource {
     FileRead,
     /// A local file search.
     FileSearch,
+    /// A local file edited in place: the edit read the file under its write
+    /// fence and its result shows what the file now holds, so a successful
+    /// one observes the file's current state as well as the write's outcome.
+    FileWrite,
     /// A shell on this computer.
     Shell,
     /// This computer's state.
@@ -341,7 +345,7 @@ pub enum EvidenceSource {
 
 impl EvidenceSource {
     /// Every source with an evidence model.
-    pub const MODELED: [Self; 13] = [
+    pub const MODELED: [Self; 14] = [
         Self::GoalTrace,
         Self::Mandates,
         Self::GoalRecords,
@@ -352,6 +356,7 @@ impl EvidenceSource {
         Self::WebSearch,
         Self::FileRead,
         Self::FileSearch,
+        Self::FileWrite,
         Self::Shell,
         Self::HostInfo,
         Self::Diagnostics,

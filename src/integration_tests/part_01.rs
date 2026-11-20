@@ -1915,6 +1915,64 @@ async fn test_evidence_gate_shadow_skipped_on_autonomous_tier() {
     );
 }
 
+/// An edit of a file the request names proves that file's current state:
+/// the loop must not demand a read-back round after it (live 2026-11-19:
+/// "change the port in <path>" cost a re-read and two more model calls on
+/// every run).
+#[tokio::test]
+async fn edit_of_a_named_file_closes_without_a_read_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("config.ini");
+    std::fs::write(&file_path, "[server]\nport = 8080\nhost = localhost\n").unwrap();
+    let args = json!({
+        "path": file_path.to_str().unwrap(),
+        "old_text": "port = 8080",
+        "new_text": "port = 9090",
+    })
+    .to_string();
+
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("edit_file", &args),
+        MockProvider::text_response("Changed the port to 9090."),
+    ]);
+    let harness = setup_test_agent_with_policy(
+        provider,
+        crate::config::PolicyConfig::default(),
+        vec![Arc::new(EditFileTool::new(
+            crate::execution::active_execution_backend(),
+        ))],
+    )
+    .await
+    .unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "edit_named_file_session",
+            &format!(
+                "In {} change the port to 9090. Change nothing else.",
+                file_path.display()
+            ),
+            None,
+            UserRole::Owner,
+            ChannelContext::private("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        std::fs::read_to_string(&file_path)
+            .unwrap()
+            .contains("port = 9090")
+    );
+    assert_eq!(reply, "Changed the port to 9090.");
+    assert_eq!(
+        harness.provider.call_count().await,
+        2,
+        "the edit's receipt proves the file; no read-back round"
+    );
+}
+
 /// Scheduler simulation: messages from scheduled tasks use special session IDs.
 /// The agent treats `scheduler_trigger_*` sessions as untrusted.
 #[tokio::test]
