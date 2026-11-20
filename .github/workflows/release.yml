@@ -449,32 +449,14 @@ jobs:
           rm nsh.tar.gz
           echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
 
-      - name: Package the APK and the App Bundle
+      - name: Package the app and publish it to Google Play
         if: env.ANDROID_KEYSTORE_BASE64 != ''
-        working-directory: clients/app
         env:
           NSH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-        run: |
-          set -euo pipefail
-          nsh component add android
-          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
-          # Store versions are numeric: an rc tag's suffix is dropped. The
-          # run number only grows, as Android's versionCode must.
-          version="${GITHUB_REF_NAME#v}"
-          version="${version%%-*}"
-          # The app shows the same version it is published as.
-          export AIDAEMON_APP_VERSION="$version" AIDAEMON_APP_BUILD="$GITHUB_RUN_NUMBER"
-          args=(--keystore "$RUNNER_TEMP/release.jks" --key-alias "${ANDROID_KEY_ALIAS:-upload}"
-                --app-version "$version" --build "$GITHUB_RUN_NUMBER")
-          nsh package --target android "${args[@]}"
-          nsh package --target android --format aab "${args[@]}"
-          rm -f "$RUNNER_TEMP/release.jks"
-          cd "$GITHUB_WORKSPACE"
-          cp clients/app/.nsh/out/AIdaemon.apk aidaemon-android.apk
-          cp clients/app/.nsh/out/AIdaemon.aab aidaemon-android.aab
-          shasum -a 256 aidaemon-android.apk > aidaemon-android.apk.sha256
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          APP_VERSION: ${{ github.ref_name }}
+        run: APP_VERSION="${APP_VERSION#v}" scripts/ci-android-package.sh
 
       - name: Attach the APK to the release
         if: env.ANDROID_KEYSTORE_BASE64 != ''
@@ -482,7 +464,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" aidaemon-android.apk aidaemon-android.apk.sha256 --clobber
 
-      # The App Bundle is what Google Play takes; upload it in Play Console.
+      # Kept too: Play has it once PLAY_SERVICE_ACCOUNT_JSON is set; else upload it in Play Console.
       - name: Keep the App Bundle
         if: env.ANDROID_KEYSTORE_BASE64 != ''
         uses: actions/upload-artifact@v4

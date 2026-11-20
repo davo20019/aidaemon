@@ -297,6 +297,8 @@ Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` f
 
 The app on a phone never runs the daemon; it pairs with yours. Expose the Client Gateway first (above). The quickest way: in the desktop app on the daemon's computer, open Settings → Paired devices → **Pair a phone**, scan the QR code with the phone's camera, tap **Open AIDaemon**, and approve the phone on the desktop. Or send `/pair_device` to your agent from Telegram, Slack, Discord or the desktop app, open the link it replies with on the phone, tap **Open AIDaemon**, and approve the phone in that chat. Both links open your daemon's own pairing page (`/client/v1/pair`), which hands the pairing to the app (or its store page), or pairs that browser instead: the pairing details ride after the `#`, which browsers never send to the server. Pasting the link into the app works too. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
 
+Releases build the phone app themselves: with the `ANDROID_KEYSTORE_*` secrets and a Google Play service account key in `PLAY_SERVICE_ACCOUNT_JSON`, each release (and each run of the Android beta workflow, from any branch) is signed and sent to Play's internal testing track.
+
 Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI: `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
 
 ### Customize your agent
