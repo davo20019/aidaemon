@@ -706,7 +706,7 @@ fn every_property_required(schema: &mut Value) {
     let Some(map) = schema.as_object_mut() else {
         return;
     };
-    if let Some(Value::Object(properties)) = map.get_mut("properties") {
+    if matches!(map.get("properties"), Some(Value::Object(_))) {
         let required: Vec<String> = map
             .get("required")
             .and_then(Value::as_array)
