@@ -943,6 +943,12 @@ impl ClientHost for DaemonClientHost {
                 Some(caption) => caption.clone(),
                 None => m.content.unwrap_or_default(),
             };
+            // A helper's result as the owner was shown it, without the
+            // label that tells the model where it came from.
+            let text = match aidaemon_runtime::turn::notes::parent_note_shown_text(&text) {
+                Some(shown) if m.role == "assistant" => shown.to_string(),
+                _ => text,
+            };
             // A reply reads as it was shown when it arrived.
             let text = if delivered.is_some() {
                 text

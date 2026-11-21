@@ -38,6 +38,27 @@ impl ParentDeliveryKind {
     }
 }
 
+impl ParentDeliveryKind {
+    const ALL: [Self; 3] = [
+        Self::ExecutorResult,
+        Self::GoalNotification,
+        Self::BackgroundSpawnResult,
+    ];
+}
+
+/// The text the owner was shown, for a parent-visible note whose content is
+/// [`ParentDeliveryKind::note_prefix`] followed by it (the prefix is for the
+/// model). `None` for any other message.
+pub fn parent_note_shown_text(content: &str) -> Option<&str> {
+    // Marker the daemon itself writes (`record_parent_visible_result_note_in_turn`).
+    ParentDeliveryKind::ALL.iter().find_map(|kind| {
+        content
+            .strip_prefix(kind.note_prefix())
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim_start)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParentDeliveryOutcome {
     /// True when the text was actually emitted to the user via the channel hub.
@@ -440,3 +461,23 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
 }
 
 impl<T: TurnHost + ?Sized> TurnNotes for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The history shows a helper's result as the owner saw it; the label
+    /// is for the model.
+    #[test]
+    fn a_parent_note_shows_without_its_label() {
+        let note = format!(
+            "{}:\n\nStopped by you: Count 1-200",
+            ParentDeliveryKind::BackgroundSpawnResult.note_prefix()
+        );
+        assert_eq!(
+            parent_note_shown_text(&note),
+            Some("Stopped by you: Count 1-200")
+        );
+        assert_eq!(parent_note_shown_text("Started in the background."), None);
+    }
+}

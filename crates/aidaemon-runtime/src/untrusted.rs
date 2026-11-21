@@ -715,6 +715,28 @@ pub struct UntrustedVerifier<'a> {
     /// The files the request's own work produced, read when a call is
     /// judged (any run of the tree may have just made one).
     pub produced_files: &'a aidaemon_tools::semantics::ProducedFiles,
+    /// Messages the same sender sent while the run worked, taken into it:
+    /// read when a call is judged, so "stop the counting job" sent mid-run
+    /// is part of the request (live 2026-11-21: the `pkill` it asked for was
+    /// held as "you asked to start a second counting job, not stop it").
+    pub steered: Option<&'a std::sync::Mutex<Vec<crate::engine::scope::AbsorbedSteering>>>,
+}
+
+/// `request` followed by the messages the owner sent while the run worked,
+/// oldest first.
+fn with_steered(request: &str, steered: &[String]) -> String {
+    if steered.is_empty() {
+        return request.to_string();
+    }
+    let listed: Vec<String> = steered
+        .iter()
+        .map(|text| format!("- {}", Value::from(text.trim())))
+        .collect();
+    format!(
+        "{request}\n\nMessages the owner sent while this work ran, oldest first (the \
+         latest one wins where they differ):\n{}",
+        listed.join("\n")
+    )
 }
 
 impl UntrustedVerifier<'_> {
@@ -741,9 +763,22 @@ impl UntrustedVerifier<'_> {
                 )
             })
             .unwrap_or_default();
+        // Only an owner-authored request takes what the same sender added.
+        let steered: Vec<String> = self
+            .steered
+            .filter(|_| self.origin_trusted)
+            .and_then(|steered| steered.lock().ok())
+            .map(|steered| {
+                steered
+                    .iter()
+                    .map(|absorbed| absorbed.message.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let request = with_steered(self.origin_request, &steered);
         let verdict = verify_untrusted_call_with(
             self.gateway,
-            self.origin_request,
+            &request,
             self.origin_trusted,
             tool,
             &description,
@@ -836,6 +871,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// A message sent mid-run is part of the request a call is judged
+    /// against; with none, the request is unchanged.
+    #[test]
+    fn steered_messages_join_the_judged_request() {
+        assert_eq!(with_steered("Count to 200.", &[]), "Count to 200.");
+        let request = with_steered("Count to 200.", &["Stop the counting job.".to_string()]);
+        assert!(request.starts_with("Count to 200.\n\n"), "{request}");
+        assert!(
+            request.contains("- \"Stop the counting job.\""),
+            "{request}"
+        );
+    }
 
     /// The verifier sees what the arguments mean, not only the tool's
     /// one-line description: `remember_fact` documents `delete` as a forget.

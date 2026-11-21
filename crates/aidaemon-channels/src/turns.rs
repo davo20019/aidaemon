@@ -500,11 +500,15 @@ impl TurnRunner {
                         return;
                     }
                     let reply = self.cancel(&session_id, turn.user_role, request).await;
-                    let _ = surface.say(&reply).await;
                     if !also_asks {
+                        let _ = surface.say(&reply).await;
                         self.record_exchange(&turn, &reply).await;
                         return;
                     }
+                    // The turn below answers the whole message, the stop
+                    // included: a stop line said now would land above the
+                    // owner's message, which the turn shows (live
+                    // 2026-11-21), and be gone after a reload.
                     // "Stop it and delete it": the work is stopped, and the
                     // rest of the message runs as a turn of its own (which
                     // records it), never dropped with the stop.
@@ -563,8 +567,8 @@ impl TurnRunner {
                     let reply = self
                         .cancel(&session_id, turn.user_role, stop_request(&reading))
                         .await;
-                    let _ = surface.say(&reply).await;
                     if !reading.also_asks {
+                        let _ = surface.say(&reply).await;
                         self.record_exchange(&turn, &reply).await;
                         return;
                     }
