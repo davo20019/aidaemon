@@ -3619,6 +3619,18 @@ async fn run_continuation_turn(
     Ok(envelope)
 }
 
+/// Ends a foreground command's process group when the call that started it
+/// is dropped while the command still runs.
+struct StopWithCall(Option<u32>);
+
+impl Drop for StopWithCall {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            send_sigkill(pid);
+        }
+    }
+}
+
 /// Build the internal follow-up that re-engages the agent loop after a
 /// background command completes. Beyond replaying the output, it explicitly
 /// steers the model to finish any *deferred deliverable* the user requested
@@ -5661,6 +5673,12 @@ impl TerminalTool {
         };
         let mut spawned = self.backend.spawn(execution_request).await?;
         let process_handle = spawned.handle().clone();
+        // The process moves into the reader task below, so dropping this call
+        // (its run stopped) would leave it running: the guard ends its group
+        // unless the call sees it finish or hands it to background tracking
+        // (live 2026-11-21: a stopped sub-agent's `for … sleep 2` loop kept
+        // writing to the file the owner asked to delete).
+        let mut stop_with_call = StopWithCall(process_handle.local_pid());
         let pid = process_handle.display_id();
         let stdout_pipe = spawned.take_stdout().expect("stdout piped");
         let stderr_pipe = spawned.take_stderr().expect("stderr piped");
@@ -5737,7 +5755,10 @@ impl TerminalTool {
             }
         };
 
-        match tokio::time::timeout(foreground_wait, poll_finished).await {
+        let waited = tokio::time::timeout(foreground_wait, poll_finished).await;
+        // Finished, or kept running on purpose: no longer this call's to end.
+        stop_with_call.0 = None;
+        match waited {
             Ok(()) => {
                 // A command done before its first progress tick still shows
                 // what it printed in the owner's app (live 2026-11-15: a quick
@@ -11075,6 +11096,53 @@ mod tests {
         );
         assert!(!target.exists(), "the redirect must not have run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live 2026-11-21: a sub-agent stopped while its terminal call ran a
+    /// `for … sleep` loop; the call was dropped and the loop kept writing.
+    /// A dropped call ends the command it was waiting on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_call_stops_its_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = dir.path().join("marks");
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            aidaemon_tools::testing::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
+            30,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!(
+                "while true; do echo x >> '{}'; sleep 0.1; done",
+                marks.display()
+            ),
+        })
+        .to_string();
+        let call = tool.call_with_execution_context(
+            &args,
+            None,
+            aidaemon_tools::testing::call_facts("telegram:synthetic-owner"),
+        );
+        let marks_len = || std::fs::metadata(&marks).map(|m| m.len()).unwrap_or(0);
+        // Dropped mid-run, the way a stopped run drops its tool call.
+        let _ = tokio::time::timeout(Duration::from_millis(1500), call).await;
+        assert!(marks_len() > 0, "the command ran");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after_drop = marks_len();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(marks_len(), after_drop, "the command kept running");
     }
 
     #[tokio::test]

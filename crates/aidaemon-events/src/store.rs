@@ -2720,6 +2720,10 @@ impl EventStore {
             SELECT created_at FROM events
             WHERE session_id = ? AND event_type = 'user_message'
               AND json_extract(data, '$.user_role') = 'owner'
+              AND NOT EXISTS (
+                  SELECT 1 FROM json_each(data, '$.annotations')
+                  WHERE json_extract(value, '$.type') = 'internal_continuation'
+              )
             ORDER BY id DESC
             LIMIT 1
             "#,
@@ -4422,12 +4426,17 @@ mod tests {
             ("chat", "owner", 0),
             ("chat", "guest", 3),
             ("other", "owner", 4),
+            ("chat", "continuation", 4),
         ] {
-            let mut event = Event::new(
-                session,
-                EventType::UserMessage,
-                json!({"content": "synthetic message", "user_role": role}),
-            );
+            // A runtime continuation is stored as an owner message; it is
+            // not the owner writing.
+            let data = if role == "continuation" {
+                json!({"content": "synthetic continuation", "user_role": "owner",
+                       "annotations": [{"type": "internal_continuation"}]})
+            } else {
+                json!({"content": "synthetic message", "user_role": role})
+            };
+            let mut event = Event::new(session, EventType::UserMessage, data);
             event.created_at = at + Duration::minutes(offset);
             store.append(event).await.unwrap();
         }

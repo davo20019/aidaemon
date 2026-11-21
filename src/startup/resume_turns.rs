@@ -265,7 +265,7 @@ enum JobFate {
 /// (held through quiet hours unless the owner was just there).
 async fn notify_job(deps: &ResumeDeps, job: &crate::traits::BackgroundSpawn, fate: JobFate) {
     let mission = job.mission.trim();
-    let message = match fate {
+    let message = match &fate {
         JobFate::Restarted => format!(
             "\u{26a0}\u{fe0f} A restart stopped this background job before it finished: \
              {mission}\n\nStarting it again from where it stopped."
@@ -286,12 +286,19 @@ async fn notify_job(deps: &ResumeDeps, job: &crate::traits::BackgroundSpawn, fat
              {mission}\n\nIt may have done part of the work. Check before running it again."
         ),
     };
+    // An update for a job started again, a paused job for one the owner
+    // has to pick up: never "Run failed".
+    let kind = if matches!(fate, JobFate::Restarted) {
+        "progress"
+    } else {
+        "stalled"
+    };
     let queue = deps.state.clone() as Arc<dyn crate::traits::NotificationStore>;
     aidaemon_runtime::helper_run::delivery::enqueue_background_notification(
         Some(&queue),
         "global",
         &job.session_id,
-        "failed",
+        kind,
         &message,
         "interrupted background sub-agent notifier",
         true,
