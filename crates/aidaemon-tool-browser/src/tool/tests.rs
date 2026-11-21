@@ -162,7 +162,7 @@ async fn dispatch_observation_navigate_routes_through_backend() {
         .unwrap();
     assert_eq!(
         out,
-        "Navigated to https://example.com/\n\nPage text:\nmock text"
+        "Navigated to https://mock.example/ (redirected from https://example.com/) \u{b7} title \"Mock page\"\n\nPage text:\nmock text"
     );
 
     // Lock down the call ordering: ensure_ready, then create_page (this session's
@@ -172,7 +172,9 @@ async fn dispatch_observation_navigate_routes_through_backend() {
     // assert the create_page record exists and goto follows it.
     let calls = backend.calls();
     let calls = calls.lock().await;
-    assert_eq!(calls.len(), 6, "expected 6 recorded calls: {calls:?}");
+    // Then the document status read (evaluate) for the reply's header line,
+    // and the body text preview.
+    assert_eq!(calls.len(), 7, "expected 7 recorded calls: {calls:?}");
     assert_eq!(calls[0], MockCall::EnsureReady);
     assert!(
         matches!(calls[1], MockCall::CreatePage(_)),
@@ -193,8 +195,12 @@ async fn dispatch_observation_navigate_routes_through_backend() {
         MockCall::Url,
         "navigate must read the committed url to revalidate it: {calls:?}"
     );
+    assert!(
+        matches!(calls[5], MockCall::Evaluate(_)),
+        "navigate reads the document's HTTP status: {calls:?}"
+    );
     assert_eq!(
-        calls[5],
+        calls[6],
         MockCall::BodyText,
         "navigate returns a text preview of the page it opened: {calls:?}"
     );
@@ -2246,7 +2252,7 @@ async fn public_navigation_skips_approval_and_reaches_backend() {
 
     assert_eq!(
         out,
-        "Navigated to https://example.com/\n\nPage text:\nmock text"
+        "Navigated to https://mock.example/ (redirected from https://example.com/) \u{b7} title \"Mock page\"\n\nPage text:\nmock text"
     );
     assert!(
         calls_contains(
@@ -2287,7 +2293,7 @@ async fn trusted_scheduled_navigation_skips_prompt() {
 
     assert_eq!(
         out,
-        "Navigated to https://www.nist.gov/research\n\nPage text:\nmock text"
+        "Navigated to https://mock.example/ (redirected from https://www.nist.gov/research) \u{b7} title \"Mock page\"\n\nPage text:\nmock text"
     );
     assert_eq!(
         recorder.count().await,
@@ -4863,7 +4869,7 @@ async fn navigate_waits_for_navigation_readiness_not_a_fixed_sleep() {
         .unwrap();
     assert_eq!(
         out,
-        "Navigated to https://example.com/\n\nPage text:\nmock text"
+        "Navigated to https://mock.example/ (redirected from https://example.com/) \u{b7} title \"Mock page\"\n\nPage text:\nmock text"
     );
     let calls = backend.calls();
     let calls = calls.lock().await;
@@ -4900,7 +4906,7 @@ async fn navigate_bounds_when_navigation_never_settles() {
         .unwrap();
     assert_eq!(
         out,
-        "Navigated to https://example.com/\n\nPage text:\nmock text"
+        "Navigated to https://mock.example/ (redirected from https://example.com/) \u{b7} title \"Mock page\"\n\nPage text:\nmock text"
     );
     assert!(
         calls_contains(&backend, &MockCall::WaitForNavigation).await,

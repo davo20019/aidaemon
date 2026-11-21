@@ -662,6 +662,37 @@ const NAVIGATION_PREVIEW_CHARS: usize = 1500;
 /// call shows what loaded (a model otherwise spends a `get_text` or a
 /// screenshot, which is also posted to the chat, just to look). Best effort:
 /// a failed read yields no preview, never a failed navigation.
+/// The main document's HTTP status, from the page's own navigation timing
+/// entry (Chromium 109+); `0` or absent when the browser does not say.
+const DOCUMENT_STATUS_JS: &str = "(() => { const e = performance.getEntriesByType('navigation')[0]; \
+     return e && e.responseStatus ? e.responseStatus : null; })()";
+
+/// "Navigated to <reached URL> (HTTP <status>, redirected from <asked>) ·
+/// title \"<title>\"", leaving out what the browser did not say.
+fn navigated_line(
+    requested: &str,
+    reached: Option<&str>,
+    status: Option<u64>,
+    title: Option<&str>,
+) -> String {
+    let reached = reached.unwrap_or(requested);
+    let mut notes = Vec::new();
+    if let Some(status) = status {
+        notes.push(format!("HTTP {status}"));
+    }
+    if reached.trim_end_matches('/') != requested.trim_end_matches('/') {
+        notes.push(format!("redirected from {requested}"));
+    }
+    let mut line = format!("Navigated to {reached}");
+    if !notes.is_empty() {
+        line.push_str(&format!(" ({})", notes.join(", ")));
+    }
+    if let Some(title) = title {
+        line.push_str(&format!(" \u{b7} title \"{title}\""));
+    }
+    line
+}
+
 async fn page_text_preview(page: &dyn PageHandle) -> String {
     let Ok(text) = page.body_text().await else {
         return String::new();
@@ -1367,14 +1398,34 @@ impl BrowserTool {
             ));
         }
 
-        if let Some(final_url) = final_url {
+        if let Some(final_url) = final_url.clone() {
             self.sessions
                 .update_active_tab_url(session_id, final_url)
                 .await;
         }
 
+        // Where the navigation ended, its HTTP status and the page title, so
+        // the model need not check them with curl (live 2026-11-14 to 11-20:
+        // the reply named the URL asked for, never the one reached, and 9
+        // navigations were followed by a curl status check).
+        let status = page
+            .evaluate(DOCUMENT_STATUS_JS)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_u64())
+            .filter(|status| *status > 0);
+        let title = page
+            .title()
+            .await
+            .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|title| !title.is_empty());
         let preview = page_text_preview(page.as_ref()).await;
-        Ok(format!("Navigated to {}{}", url, preview))
+        Ok(format!(
+            "{}{}",
+            navigated_line(url, final_url.as_deref(), status, title.as_deref()),
+            preview
+        ))
     }
 
     async fn action_screenshot(
@@ -3205,6 +3256,7 @@ fn browser_script_has_mutation_signal(script: &str) -> bool {
 mod prompt_tests {
     use super::{
         browser_call_semantics, browser_script_has_mutation_signal, format_browser_approval_prompt,
+        navigated_line,
     };
     use crate::tool::policy::{self, BrowserRiskClass};
     use aidaemon_tools::semantics::ToolMutationEffects;
@@ -3287,6 +3339,32 @@ mod prompt_tests {
         );
         assert_eq!(semantics.target_hints.len(), 1);
         assert_eq!(semantics.target_hints[0].value, "investor-brief.pdf");
+    }
+
+    #[test]
+    fn navigation_names_the_reached_url_status_and_title() {
+        assert_eq!(
+            navigated_line(
+                "http://shop.example/old",
+                Some("https://shop.example/new"),
+                Some(200),
+                Some("Synthetic Shop")
+            ),
+            "Navigated to https://shop.example/new (HTTP 200, redirected from http://shop.example/old) \u{b7} title \"Synthetic Shop\""
+        );
+        assert_eq!(
+            navigated_line(
+                "https://shop.example/",
+                Some("https://shop.example"),
+                Some(404),
+                None
+            ),
+            "Navigated to https://shop.example (HTTP 404)"
+        );
+        assert_eq!(
+            navigated_line("https://shop.example/", None, None, None),
+            "Navigated to https://shop.example/"
+        );
     }
 
     #[test]

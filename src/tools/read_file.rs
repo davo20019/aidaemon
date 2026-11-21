@@ -353,6 +353,54 @@ mod tests {
         assert_eq!(outcome.metadata.attachments.len(), 1);
     }
 
+    /// Line ranges mean nothing for an image or a binary file: any range,
+    /// even an invalid one, is ignored and the file is read as it is (live
+    /// 2026-11-18: a PNG read with a range was rejected nine times in a row).
+    #[tokio::test]
+    async fn line_ranges_are_ignored_for_images_and_binary_files() {
+        let mut png = tempfile::NamedTempFile::new().unwrap();
+        png.write_all(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02])
+            .unwrap();
+        let mut binary = tempfile::NamedTempFile::new().unwrap();
+        binary.write_all(&[0x7F, 0x45, 0x00, 0x00, 0x01]).unwrap();
+        let tool = ReadFileTool::new(crate::execution::active_execution_backend());
+        for range in [
+            json!({"start_line": 5, "end_line": 2, "tail_lines": 3}),
+            json!({"start_line": 0}),
+            json!({"tail_lines": 10}),
+        ] {
+            let mut args = range.clone();
+            args["path"] = json!(png.path().to_str().unwrap());
+            let outcome = tool
+                .call_with_status_outcome(&args.to_string(), None)
+                .await
+                .unwrap();
+            assert!(
+                outcome.output.contains("image/png"),
+                "{range}: {}",
+                outcome.output
+            );
+            assert_eq!(outcome.metadata.attachments.len(), 1, "{range}");
+
+            args["path"] = json!(binary.path().to_str().unwrap());
+            let outcome = tool
+                .call_with_status_outcome(&args.to_string(), None)
+                .await
+                .unwrap();
+            assert!(
+                outcome.output.contains("Binary file"),
+                "{range}: {}",
+                outcome.output
+            );
+        }
+        // A text file still rejects an invalid range.
+        let mut text = tempfile::NamedTempFile::new().unwrap();
+        text.write_all(b"one\ntwo\n").unwrap();
+        let args = json!({"path": text.path().to_str().unwrap(), "start_line": 0}).to_string();
+        let outcome = tool.call_with_status_outcome(&args, None).await.unwrap();
+        assert!(outcome.output.contains("1-based"), "{}", outcome.output);
+    }
+
     #[tokio::test]
     async fn test_pdf_file_returns_extraction_hint_not_dead_end() {
         let mut f = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();

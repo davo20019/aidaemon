@@ -968,8 +968,13 @@ impl OutcomeTool for WebFetch {
             Fetch::Response(fetched) => fetched,
         };
         let reply = fetch_reply(&fetched, max_chars, offset);
+        let output = if reply.ok {
+            format!("{}\n{}", fetch_header(url, &fetched), reply.text)
+        } else {
+            reply.text
+        };
         Ok(ToolCallOutcome {
-            output: reply.text,
+            output,
             metadata: ToolCallMetadata {
                 truncation: reply.truncation,
                 ..Default::default()
@@ -1117,12 +1122,10 @@ impl Tool for WebFetch {
                 "\n\n[Content truncated: the body was larger than {MAX_FETCH_BODY_BYTES} bytes.]"
             ));
         }
-        Ok(ToolOutput::text(format!(
-            "Status: {}\nContent-Type: {}\n{text}",
-            fetched.status.as_u16(),
-            fetched.content_type
-        ))
-        .with_details(details))
+        Ok(
+            ToolOutput::text(format!("{}\n{text}", fetch_header(url.as_str(), &fetched)))
+                .with_details(details),
+        )
     }
 }
 
@@ -1524,6 +1527,32 @@ fn format_fetch_result(
     format_fetch_window(url, text, max_chars, 0)
 }
 
+/// One line stating what a fetch reached: status, content type, the final
+/// URL (and the URL asked for when a redirect moved it) and the page title,
+/// so the model need not check them with another request (live 2026-11-14
+/// to 11-20: 51 curl status checks, 9 right after a fetch).
+fn fetch_header(requested: &str, fetched: &Fetched) -> String {
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    let mut parts = vec![
+        format!("HTTP {}", fetched.status.as_u16()),
+        fetched.content_type.clone(),
+    ];
+    if same(requested, &fetched.final_url) {
+        parts.push(fetched.final_url.clone());
+    } else {
+        parts.push(format!(
+            "{} (redirected from {requested})",
+            fetched.final_url
+        ));
+    }
+    if fetched.content_type.contains("html")
+        && let Some(title) = first_element_text(&String::from_utf8_lossy(&fetched.body), "title")
+    {
+        parts.push(format!("title \"{title}\""));
+    }
+    parts.join(" \u{b7} ")
+}
+
 /// `max_chars` of `text` starting at character `offset`. A cut is reported
 /// as metadata, with the offset that continues it.
 fn format_fetch_window(
@@ -1633,6 +1662,55 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// The reply's first line says what the fetch reached: status, type,
+    /// final URL (with the URL asked for when a redirect moved it) and
+    /// title, on both entry points.
+    #[tokio::test]
+    async fn a_fetch_reports_status_final_url_and_title() {
+        let base = serve(vec![
+            (
+                "/page",
+                "200 OK",
+                "text/html; charset=utf-8",
+                "<html><head><title>Synthetic Shop</title></head><body><p>Hello.</p></body></html>"
+                    .into(),
+            ),
+            ("/hop", "302 Found", "text/plain", "/page".into()),
+        ])
+        .await;
+        let tool = WebFetch::new().without_proxy().allow_private_hosts();
+        let out = tool
+            .call(json!({"url": format!("{base}/page")}), &ctx())
+            .await
+            .unwrap();
+        let first = out.content.lines().next().unwrap_or("").to_string();
+        assert!(first.starts_with("HTTP 200 \u{b7} text/html"), "{first}");
+        assert!(first.contains(&format!("{base}/page")), "{first}");
+        assert!(first.contains("title \"Synthetic Shop\""), "{first}");
+        assert!(!first.contains("redirected"), "{first}");
+
+        let hop = format!("{base}/hop");
+        let out = tool.call(json!({"url": hop}), &ctx()).await.unwrap();
+        let first = out.content.lines().next().unwrap_or("").to_string();
+        assert!(
+            first.contains(&format!("{base}/page (redirected from {hop})")),
+            "{first}"
+        );
+
+        // The daemon's entry point carries the same line.
+        let outcome = OutcomeTool::execute(
+            &tool,
+            &json!({"url": hop}).to_string(),
+            &ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+        let first = outcome.output.lines().next().unwrap_or("").to_string();
+        assert!(first.starts_with("HTTP 200"), "{first}");
+        assert!(first.contains("redirected from"), "{first}");
+        assert!(first.contains("Synthetic Shop"), "{first}");
     }
 
     #[tokio::test]

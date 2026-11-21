@@ -6,7 +6,7 @@ use std::sync::Arc;
 use aidaemon_core::{AccessManifest, ToolAnnotations};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 
 use crate::backend::{BackendFileType, BackendPath};
@@ -60,6 +60,11 @@ const MAX_DEPTH: usize = 20;
 /// result. Keeps whole-home searches fast instead of watchdog-fatal.
 const MAX_ENTRIES_VISITED: usize = 150_000;
 const MAX_CONTENT_SEARCH_FILE_SIZE: u64 = 1024 * 1024; // 1 MiB per file
+/// Matching lines shown per file unless `max_per_file` asks for more.
+const DEFAULT_MATCHES_PER_FILE: usize = 5;
+const MAX_MATCHES_PER_FILE: usize = 50;
+/// The most `context_lines` a call may ask for around each match.
+const MAX_CONTEXT_LINES: usize = 5;
 
 #[async_trait]
 impl OutcomeTool for SearchFiles {
@@ -88,11 +93,25 @@ impl OutcomeTool for SearchFiles {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory to search in (default: current directory)"
+                        "description": "Directory to search in, or one file to search (default: current directory)"
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum results to return (default: 50, max: 200)"
+                        "description": "Maximum files to return (default: 50, max: 200)"
+                    },
+                    "max_per_file": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Matching lines shown per file (default: 5, max: 50); the rest are counted"
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Lines of context shown before and after each match (default: 0, max: 5)"
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "Match the pattern regardless of letter case (default: false)"
                     }
                 },
                 "additionalProperties": false
@@ -139,6 +158,17 @@ impl SearchFiles {
             .as_u64()
             .map(|n| (n as usize).min(MAX_RESULTS))
             .unwrap_or(DEFAULT_MAX_RESULTS);
+        let shape = MatchShape {
+            per_file: args["max_per_file"]
+                .as_u64()
+                .map(|n| (n as usize).clamp(1, MAX_MATCHES_PER_FILE))
+                .unwrap_or(DEFAULT_MATCHES_PER_FILE),
+            context: args["context_lines"]
+                .as_u64()
+                .map(|n| (n as usize).min(MAX_CONTEXT_LINES))
+                .unwrap_or(0),
+        };
+        let case_insensitive = args["case_insensitive"].as_bool().unwrap_or(false);
 
         if content_pattern.is_none() && glob_pattern.is_none() {
             anyhow::bail!(
@@ -172,9 +202,9 @@ impl SearchFiles {
             .metadata(&search_dir)
             .await
             .map_err(|_| crate::TargetNotFound(format!("Directory not found: {search_dir}")))?;
-        if !search_metadata.is_dir() {
-            anyhow::bail!("Not a directory: {}", search_dir);
-        }
+        // One file is searched on its own (live 2026-11-14 to 11-20: a file
+        // `path` failed "Not a directory" nine times and was redone with grep).
+        let single_file = !search_metadata.is_dir();
         let collaboration_root = if let Some(root) = facts.workspace_collaboration_root.as_deref() {
             anyhow::ensure!(
                 backend.kind() == crate::backend::BackendKind::Local,
@@ -199,7 +229,12 @@ impl SearchFiles {
         };
 
         let content_regex = if let Some(pat) = content_pattern {
-            Some(Regex::new(pat).map_err(|e| anyhow::anyhow!("Invalid regex '{}': {}", pat, e))?)
+            Some(
+                RegexBuilder::new(pat)
+                    .case_insensitive(case_insensitive)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Invalid regex '{}': {}", pat, e))?,
+            )
         } else {
             None
         };
@@ -213,19 +248,40 @@ impl SearchFiles {
         let mut results = Vec::new();
         let mut stats = SearchStats::default();
 
-        walk_dir(
-            backend,
-            self.policy.as_ref(),
-            &search_dir,
-            &content_regex,
-            &glob_matcher,
-            max_results,
-            MAX_ENTRIES_VISITED,
-            collaboration_root.as_ref(),
-            &mut results,
-            &mut stats,
-        )
-        .await;
+        if single_file {
+            if self
+                .policy
+                .is_sensitive(std::path::Path::new(search_dir.as_str()))
+            {
+                anyhow::bail!("Refusing to search a protected file: {}", search_dir);
+            }
+            search_one_file(
+                &backend,
+                &search_dir,
+                search_metadata.len,
+                &content_regex,
+                &glob_matcher,
+                shape,
+                &mut results,
+                &mut stats,
+            )
+            .await;
+        } else {
+            walk_dir(
+                backend,
+                self.policy.as_ref(),
+                &search_dir,
+                &content_regex,
+                &glob_matcher,
+                max_results,
+                MAX_ENTRIES_VISITED,
+                collaboration_root.as_ref(),
+                shape,
+                &mut results,
+                &mut stats,
+            )
+            .await;
+        }
 
         let default_path_note = used_default_path.then(|| {
             format!(
@@ -373,7 +429,112 @@ fn oversized_note(count: usize) -> String {
 
 struct SearchResult {
     path: BackendPath,
-    matches: Vec<(usize, String)>, // (line_number, line_content)
+    /// (line number, text, whether the line matched): matches and, with
+    /// `context_lines`, the lines around them.
+    lines: Vec<(usize, String, bool)>,
+    /// Matching lines past `max_per_file`, counted, not shown.
+    more: usize,
+}
+
+/// How much of each file's matches a result shows.
+#[derive(Clone, Copy)]
+struct MatchShape {
+    per_file: usize,
+    context: usize,
+}
+
+/// A file's shown lines before its path is known.
+struct FoundLines {
+    lines: Vec<(usize, String, bool)>,
+    more: usize,
+}
+
+impl FoundLines {
+    fn at(self, path: BackendPath) -> SearchResult {
+        SearchResult {
+            path,
+            lines: self.lines,
+            more: self.more,
+        }
+    }
+}
+
+/// The lines of `bytes` that match `re`, the first `shape.per_file` shown
+/// with `shape.context` lines around them (overlapping context merged), the
+/// rest counted. `None` when nothing matches.
+fn search_content(bytes: &[u8], re: &Regex, shape: MatchShape) -> Option<FoundLines> {
+    let content = String::from_utf8_lossy(bytes);
+    let all: Vec<&str> = content.lines().collect();
+    let matched: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| re.is_match(line))
+        .map(|(index, _)| index)
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    let shown = &matched[..matched.len().min(shape.per_file)];
+    let mut keep = std::collections::BTreeSet::new();
+    for &index in shown {
+        let from = index.saturating_sub(shape.context);
+        let to = (index + shape.context).min(all.len().saturating_sub(1));
+        keep.extend(from..=to);
+    }
+    let shown_set: std::collections::BTreeSet<usize> = shown.iter().copied().collect();
+    Some(FoundLines {
+        lines: keep
+            .into_iter()
+            .map(|index| {
+                (
+                    index + 1,
+                    all[index].to_string(),
+                    shown_set.contains(&index),
+                )
+            })
+            .collect(),
+        more: matched.len() - shown.len(),
+    })
+}
+
+/// A search whose `path` is one file: that file alone, by the same rules a
+/// walk applies to each file it finds.
+#[allow(clippy::too_many_arguments)]
+async fn search_one_file(
+    backend: &SharedBackend,
+    path: &BackendPath,
+    len: u64,
+    content_regex: &Option<Regex>,
+    glob_matcher: &Option<GlobMatcher>,
+    shape: MatchShape,
+    results: &mut Vec<SearchResult>,
+    stats: &mut SearchStats,
+) {
+    let file_name = path.file_name().unwrap_or_default().to_string();
+    if glob_matcher
+        .as_ref()
+        .is_some_and(|matcher| !matcher.is_match(&file_name))
+    {
+        return;
+    }
+    stats.files_scanned += 1;
+    let Some(content_re) = content_regex else {
+        results.push(SearchResult {
+            path: path.clone(),
+            lines: Vec::new(),
+            more: 0,
+        });
+        return;
+    };
+    if len > MAX_CONTENT_SEARCH_FILE_SIZE {
+        stats.oversized_files_skipped += 1;
+        return;
+    }
+    if let Ok(bytes) = backend.read(path).await
+        && let Some(found) = search_content(&bytes, content_re, shape)
+    {
+        results.push(found.at(path.clone()));
+    }
 }
 
 #[derive(Default)]
@@ -416,13 +577,28 @@ fn truncation_note(stats: &SearchStats) -> String {
 impl SearchResult {
     fn format(&self) -> String {
         let path_str = self.path.display();
-        if self.matches.is_empty() {
+        if self.lines.is_empty() {
             path_str.to_string()
         } else {
+            // grep's convention: ':' after a matching line's number, '-'
+            // after a context line's, "--" between separate blocks.
             let mut s = format!("{}:", path_str);
-            for (line_num, line) in &self.matches {
+            let mut previous: Option<usize> = None;
+            for (line_num, line, matched) in &self.lines {
+                if previous.is_some_and(|previous| *line_num > previous + 1) {
+                    s.push_str("\n  --");
+                }
                 let truncated = crate::util::truncate_str(line, 203);
-                s.push_str(&format!("\n  {:>4}: {}", line_num, truncated));
+                let mark = if *matched { ':' } else { '-' };
+                s.push_str(&format!("\n  {line_num:>4}{mark} {truncated}"));
+                previous = Some(*line_num);
+            }
+            if self.more > 0 {
+                s.push_str(&format!(
+                    "\n  (+{} more match{} in this file; raise max_per_file to see them)",
+                    self.more,
+                    if self.more == 1 { "" } else { "es" }
+                ));
             }
             s
         }
@@ -470,6 +646,7 @@ async fn walk_dir(
     max_results: usize,
     max_entries: usize,
     collaboration_root: Option<&BackendPath>,
+    shape: MatchShape,
     results: &mut Vec<SearchResult>,
     stats: &mut SearchStats,
 ) {
@@ -555,26 +732,17 @@ async fn walk_dir(
                     stats.truncated = true;
                     return;
                 };
-                if let Ok(bytes) = read {
-                    let content = String::from_utf8_lossy(&bytes);
-                    let mut matches = Vec::new();
-                    for (i, line) in content.lines().enumerate() {
-                        if content_re.is_match(line) {
-                            matches.push((i + 1, line.to_string()));
-                            if matches.len() >= 5 {
-                                break; // Cap matches per file
-                            }
-                        }
-                    }
-                    if !matches.is_empty() {
-                        results.push(SearchResult { path, matches });
-                    }
+                if let Ok(bytes) = read
+                    && let Some(found) = search_content(&bytes, content_re, shape)
+                {
+                    results.push(found.at(path));
                 }
             } else {
                 // Glob-only: just list the file
                 results.push(SearchResult {
                     path,
-                    matches: vec![],
+                    lines: Vec::new(),
+                    more: 0,
                 });
             }
         }
@@ -635,6 +803,10 @@ mod tests {
             10,
             50, // entry budget far smaller than the deep tree
             None,
+            MatchShape {
+                per_file: DEFAULT_MATCHES_PER_FILE,
+                context: 0,
+            },
             &mut results,
             &mut stats,
         )
@@ -665,6 +837,10 @@ mod tests {
             10,
             50,
             None,
+            MatchShape {
+                per_file: DEFAULT_MATCHES_PER_FILE,
+                context: 0,
+            },
             &mut results,
             &mut stats,
         )
@@ -696,6 +872,10 @@ mod tests {
             10,
             10,
             None,
+            MatchShape {
+                per_file: DEFAULT_MATCHES_PER_FILE,
+                context: 0,
+            },
             &mut results,
             &mut stats,
         )
@@ -735,6 +915,10 @@ mod tests {
             10,
             5,
             None,
+            MatchShape {
+                per_file: DEFAULT_MATCHES_PER_FILE,
+                context: 0,
+            },
             &mut results,
             &mut stats,
         )
@@ -769,5 +953,72 @@ mod tests {
         assert!(re.is_match("report,final.txt"));
         assert!(!re.is_match("report-draft.txt"));
         assert!(!re.is_match("final.txt"));
+    }
+
+    /// The tool over a temp folder holding a synthetic source file.
+    async fn search(args: Value) -> String {
+        let root = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        for i in 1..=30 {
+            if i % 3 == 0 {
+                text.push_str(&format!("let Value_{i} = compute({i});\n"));
+            } else {
+                text.push_str(&format!("// plain line {i}\n"));
+            }
+        }
+        std::fs::write(root.path().join("lib.rs"), &text).unwrap();
+        std::fs::write(root.path().join("other.rs"), "nothing here\n").unwrap();
+        let tool = SearchFiles::new(Workspace::new(root.path()).unwrap());
+        let mut args = args;
+        if let Some(name) = args.get("path").and_then(Value::as_str).map(str::to_string) {
+            args["path"] = json!(root.path().join(name).to_string_lossy());
+        } else {
+            args["path"] = json!(root.path().to_string_lossy());
+        }
+        tool.run(&args.to_string(), &ToolCallContext::default())
+            .await
+            .unwrap()
+    }
+
+    /// A file path searches that file (it used to fail "Not a directory").
+    #[tokio::test]
+    async fn a_file_path_searches_that_file() {
+        let out = search(json!({"pattern": "compute", "path": "lib.rs"})).await;
+        assert!(out.contains("lib.rs:"), "{out}");
+        assert!(out.contains("   3: let Value_3"), "{out}");
+        assert!(!out.contains("other.rs"), "{out}");
+    }
+
+    /// Matches past the per-file limit are counted, and `max_per_file`
+    /// shows more.
+    #[tokio::test]
+    async fn matches_past_the_limit_are_counted() {
+        let out = search(json!({"pattern": "compute"})).await;
+        assert!(out.contains("  15: let Value_15"), "{out}");
+        assert!(!out.contains("Value_18"), "{out}");
+        assert!(out.contains("(+5 more matches in this file"), "{out}");
+        let out = search(json!({"pattern": "compute", "max_per_file": 50})).await;
+        assert!(
+            out.contains("Value_30") && !out.contains("more match"),
+            "{out}"
+        );
+    }
+
+    /// Context lines come before and after each match, marked like grep.
+    #[tokio::test]
+    async fn context_lines_surround_each_match() {
+        let out = search(json!({"pattern": "Value_3 ", "context_lines": 1})).await;
+        assert!(out.contains("   2- // plain line 2"), "{out}");
+        assert!(out.contains("   3: let Value_3 "), "{out}");
+        assert!(out.contains("   4- // plain line 4"), "{out}");
+    }
+
+    /// The pattern can ignore letter case.
+    #[tokio::test]
+    async fn the_pattern_can_ignore_case() {
+        let out = search(json!({"pattern": "value_6"})).await;
+        assert!(out.starts_with("No matches"), "{out}");
+        let out = search(json!({"pattern": "value_6", "case_insensitive": true})).await;
+        assert!(out.contains("   6: let Value_6"), "{out}");
     }
 }
