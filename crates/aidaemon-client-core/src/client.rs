@@ -3034,9 +3034,10 @@ mod tests {
     #[test]
     fn send_now_is_never_sent_to_a_daemon_that_predates_it() {
         for (minor, supported) in [(40, false), (41, true)] {
-            let mut client = Client::default();
-            client.daemon_version =
-                Some(aidaemon_client_protocol::ProtocolVersion { major: 1, minor });
+            let client = Client {
+                daemon_version: Some(aidaemon_client_protocol::ProtocolVersion { major: 1, minor }),
+                ..Client::default()
+            };
             assert_eq!(client.can_send_queued_now(), supported, "1.{minor}");
         }
     }
