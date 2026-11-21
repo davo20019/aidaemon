@@ -2981,6 +2981,16 @@ impl Store {
         self.act(|c| c.edit_queued(session, message_id, text));
     }
 
+    /// Whether a waiting message can be given to the running work now.
+    pub fn can_send_queued_now(&self) -> bool {
+        self.read(|c| c.can_send_queued_now())
+    }
+
+    /// Give a message waiting for its own turn to the running work.
+    pub fn send_queued_now(&self, session: &str, message_id: u64) {
+        self.act(|c| c.send_queued_now(session, message_id));
+    }
+
     pub fn resolve(&self, approval: &str, decision: ApprovalDecision) {
         self.act(|c| c.resolve(approval, decision));
     }

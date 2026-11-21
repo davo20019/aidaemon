@@ -953,7 +953,27 @@ impl ClientGateway {
             Command::EditQueued {
                 session_id,
                 message_id,
+                now: true,
+                ..
+            } => {
+                if !self
+                    .turns
+                    .task_registry
+                    .send_queued_now(&session_id, message_id)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Conflict,
+                        "That message is no longer waiting for its own turn",
+                    ));
+                }
+                Ok(self.queued(session_id).await)
+            }
+            Command::EditQueued {
+                session_id,
+                message_id,
                 text,
+                now: false,
             } => {
                 let text = text.map(|t| t.trim().to_string());
                 if text.as_deref().is_some_and(str::is_empty) {

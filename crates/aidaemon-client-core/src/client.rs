@@ -108,6 +108,11 @@ impl Connection {
 /// The protocol minor that added `get_settings`.
 const GET_SETTINGS_MINOR: u16 = 4;
 
+/// The protocol minor that added `edit_queued`'s `now`. An older daemon
+/// ignores the field and would take the message out, so it is never sent
+/// to one.
+const SEND_QUEUED_NOW_MINOR: u16 = 41;
+
 /// Something read from the daemon, as last asked.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Read<T> {
@@ -2498,6 +2503,28 @@ impl Client {
             session_id: session.to_owned(),
             message_id,
             text,
+            now: false,
+        });
+    }
+
+    /// Whether the daemon can give a waiting message to the running work
+    /// ([`Self::send_queued_now`]).
+    pub fn can_send_queued_now(&self) -> bool {
+        self.daemon_version
+            .is_some_and(|v| v.major == 1 && v.minor >= SEND_QUEUED_NOW_MINOR)
+    }
+
+    /// Give a message waiting for its own turn to the running work, read at
+    /// its next step. Nothing is sent to a daemon that predates it.
+    pub fn send_queued_now(&mut self, session: &str, message_id: u64) {
+        if !self.can_send_queued_now() {
+            return;
+        }
+        self.send(Command::EditQueued {
+            session_id: session.to_owned(),
+            message_id,
+            text: None,
+            now: true,
         });
     }
 
@@ -3000,6 +3027,18 @@ mod tests {
                 )
             })
             .expect("a surface command")
+    }
+
+    /// "Send now" goes only to a daemon that knows it: an older one would
+    /// read the command as taking the message out.
+    #[test]
+    fn send_now_is_never_sent_to_a_daemon_that_predates_it() {
+        for (minor, supported) in [(40, false), (41, true)] {
+            let mut client = Client::default();
+            client.daemon_version =
+                Some(aidaemon_client_protocol::ProtocolVersion { major: 1, minor });
+            assert_eq!(client.can_send_queued_now(), supported, "1.{minor}");
+        }
     }
 
     #[test]

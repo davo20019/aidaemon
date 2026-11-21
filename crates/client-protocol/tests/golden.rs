@@ -566,6 +566,7 @@ fn client_samples() -> Vec<ClientFrame> {
                 session_id: "app:6c1f".into(),
                 message_id: 7,
                 text: Some("Also check the footer".into()),
+                now: false,
             },
         ),
         command("5d0c2b1e-0026", Command::ListSurfaces),

@@ -2108,6 +2108,7 @@ fn queued_list(store: Store, session: String) -> View {
                     )
                     .otherwise(move || {
                         let remove_session = remove_session.clone();
+                        let now_session = remove_session.clone();
                         ui::surface()
                             .flex_row()
                             .items_center()
@@ -2144,6 +2145,21 @@ fn queued_list(store: Store, session: String) -> View {
                                     .text_size(px(type_scale::SM))
                                     .text_color(colors::MUTED),
                             )
+                            // A message waiting for its own turn can be given
+                            // to the running work instead: read at its next
+                            // step, nothing it is doing interrupted.
+                            .child(when(
+                                move || message.with(|m| m.after) && store.can_send_queued_now(),
+                                move || {
+                                    let now_session = now_session.clone();
+                                    ui::with_hint(
+                                        "The running work reads it at its next step",
+                                        ui::btn("Send now", Variant::Ghost, ui::Size::Sm, move || {
+                                            store.send_queued_now(&now_session, id)
+                                        }),
+                                    )
+                                },
+                            ))
                             .child(ui::btn("Edit", Variant::Ghost, ui::Size::Sm, move || {
                                 draft.set(message.with_untracked(|m| m.text.clone()));
                                 editing.set(Some(id));

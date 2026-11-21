@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 40;
+pub const PROTOCOL_MINOR: u16 = 41;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -465,12 +465,17 @@ pub enum Command {
     /// 1.17). Answers with `queued`.
     ListQueued { session_id: String },
     /// Change a waiting message's text, or take it out (`text` absent)
-    /// (protocol 1.17). Answers with `queued`, as it is after.
+    /// (protocol 1.17). With `now` (protocol 1.41), a message sent to wait
+    /// for its own turn (`after`) is given to the running work instead, as
+    /// if it had been sent to be read now; `text` is then ignored and
+    /// nothing is taken out. Answers with `queued`, as it is after.
     EditQueued {
         session_id: String,
         message_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     /// Every live surface now (protocol 1.30, capability `surfaces`).
     /// Answers with `surfaces`.
