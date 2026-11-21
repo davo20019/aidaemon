@@ -1912,7 +1912,7 @@ async fn confined_terminal_execution_request_inner(
                 .map(|(name, value)| format!("{name}={value}")),
         );
         if script_via_stdin {
-            confined.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+            confined.extend(script_shell_argv());
         } else {
             confined.extend([
                 "/bin/sh".to_string(),
@@ -2251,7 +2251,7 @@ fn macos_manifest_sandbox_request(
             .map(|(name, value)| format!("{name}={value}")),
     );
     if script_via_stdin {
-        args.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+        args.extend(script_shell_argv());
     } else {
         args.extend([
             "/bin/sh".to_string(),
@@ -7348,6 +7348,29 @@ fn run_is_confined(confinement: aidaemon_tools::TerminalConfinement) -> bool {
 
 /// Host execution request: the command as the daemon's user, in the resolved
 /// working directory, with the daemon's own environment.
+/// The shell a multi-line script runs in, the script arriving on stdin (so
+/// it never shows in the process list, where any local user could read it).
+/// The shell reads the whole script first, closes stdin, then runs it: fed
+/// straight to `sh -s`, any command in it that reads input (ddev, drush, wp,
+/// mysql, ssh, `docker exec -i`, `read`) consumed the rest of the script,
+/// which then never ran while the run still exited 0 (live 2026-11-14 to
+/// 11-20: 23 of 148 stdin-fed scripts had such a command before their last
+/// line; Drupal installs needed reinstalls). With stdin closed such a
+/// command reads end of input, as in a terminal with nothing typed. `-e`
+/// still stops at the first failing step inside `eval`.
+fn script_shell_argv() -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-eu".to_string(),
+        "-c".to_string(),
+        SCRIPT_BOOTSTRAP.to_string(),
+    ]
+}
+
+/// Read the whole script from stdin, close stdin, run the script.
+const SCRIPT_BOOTSTRAP: &str =
+    "__aidaemon_script=$(cat); exec </dev/null; eval \"$__aidaemon_script\"";
+
 async fn host_terminal_execution_request(
     backend: &SharedExecutionBackend,
     shell_source: &str,
@@ -7384,10 +7407,9 @@ async fn host_terminal_execution_request(
         );
         request
     } else if script_via_stdin {
-        let mut request = ExecutionRequest::argv(
-            "/bin/sh".to_string(),
-            vec!["-eu".to_string(), "-s".to_string()],
-        );
+        let mut argv = script_shell_argv();
+        let program = argv.remove(0);
+        let mut request = ExecutionRequest::argv(program, argv);
         request.stdin = Some(shell_source.as_bytes().to_vec());
         request
     } else {
@@ -9300,14 +9322,58 @@ mod tests {
         match &script.command {
             aidaemon_tools::CommandSpec::Argv { program, args } => {
                 assert_eq!(program, "/bin/sh");
-                assert_eq!(args, &vec!["-eu".to_string(), "-s".to_string()]);
+                assert_eq!(
+                    args,
+                    &vec![
+                        "-eu".to_string(),
+                        "-c".to_string(),
+                        SCRIPT_BOOTSTRAP.to_string()
+                    ]
+                );
             }
-            other => panic!("expected sh -s, got {other:?}"),
+            other => panic!("expected the script bootstrap, got {other:?}"),
         }
         assert_eq!(
             script.stdin.as_deref(),
-            Some(b"echo one\necho two".as_slice())
+            Some(b"echo one\necho two".as_slice()),
+            "the script arrives on stdin, never in the process list"
         );
+    }
+
+    /// A command in a script that reads stdin no longer swallows the lines
+    /// after it: every line runs (live 2026-11-20: a `ddev` line ate the rest
+    /// of a Drupal setup script and the run still exited 0).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_reading_stdin_does_not_swallow_the_rest_of_a_script() {
+        let backend = aidaemon_tools::testing::active_execution_backend();
+        let script = "echo first\ncat >/dev/null\nread -r line || true\n\
+                      cat <<'EOF'\nfrom a heredoc\nEOF\necho last";
+        let request = host_terminal_execution_request(&backend, script, true, None)
+            .await
+            .expect("host script request");
+        let output = backend
+            .execute(request, std::time::Duration::from_secs(10))
+            .await
+            .expect("script runs");
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("first") && stdout.contains("last"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("from a heredoc"), "{stdout}");
+        // A failing step still stops the script.
+        let request =
+            host_terminal_execution_request(&backend, "echo a\nfalse\necho b", true, None)
+                .await
+                .expect("host script request");
+        let output = backend
+            .execute(request, std::time::Duration::from_secs(10))
+            .await
+            .expect("script runs");
+        assert_ne!(output.exit_code, 0);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains('b'));
     }
 
     #[cfg(target_os = "macos")]
