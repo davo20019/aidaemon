@@ -1361,6 +1361,58 @@ fn build_fetch_reply_at(
 /// Wikipedia fetches returning JS soup that consumed the whole max_chars
 /// window before any article content).
 fn extract_page_text(html: &str, url: &str) -> String {
+    let text = extract_page_body(html, url);
+    // Readability keeps the article body and drops a heading that repeats
+    // the page title, so a page whose one heading is its title came back
+    // without it (live 2026-11-20: every "what is the page's heading?" turn
+    // re-fetched the page with curl two or three times to find it). The
+    // page's heading leads the text when the text lacks it.
+    match page_heading(html) {
+        Some(heading) if !text.contains(&heading) => format!("# {heading}\n\n{text}"),
+        _ => text,
+    }
+}
+
+/// The page's main heading as plain text: its first `<h1>`, else its
+/// `<title>` (HTML markup, a machine format).
+fn page_heading(html: &str) -> Option<String> {
+    let cleaned = strip_nonvisible_blocks(html);
+    ["h1", "title"]
+        .into_iter()
+        .find_map(|tag| first_element_text(&cleaned, tag))
+}
+
+/// The text inside the first `<tag ...>...</tag>`, tags removed, entities
+/// decoded and whitespace collapsed; `None` when absent or empty.
+fn first_element_text(html: &str, tag: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let open = format!("<{tag}");
+    let mut from = 0;
+    let start = loop {
+        let at = find_ascii_ci(bytes, open.as_bytes(), from)?;
+        // "<h1" must end the tag name ("<h10" or "<titles" is another tag).
+        if matches!(
+            bytes.get(at + open.len()),
+            Some(b' ') | Some(b'>') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            break at;
+        }
+        from = at + open.len();
+    };
+    let inner_start = start + html[start..].find('>')? + 1;
+    let close = format!("</{tag}");
+    let inner_end = find_ascii_ci(bytes, close.as_bytes(), inner_start)?;
+    let inner = htmd::convert(&html[inner_start..inner_end]).unwrap_or_default();
+    let text = inner
+        .replace(['*', '_', '#', '`'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// [`extract_page_text`] before the page's heading is added.
+fn extract_page_body(html: &str, url: &str) -> String {
     let cleaned = strip_nonvisible_blocks(html);
     let parsed_url = reqwest::Url::parse(url)
         .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
@@ -1368,18 +1420,25 @@ fn extract_page_text(html: &str, url: &str) -> String {
     let full_page = || htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone());
     match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
         Ok(product) if !product.text.trim().is_empty() => {
+            // Readability's plain text runs its blocks together ("Example
+            // DomainThis domain ..."); its HTML as markdown keeps headings
+            // and paragraphs apart.
+            let article = htmd::convert(&strip_nonvisible_blocks(&product.content))
+                .ok()
+                .filter(|markdown| !markdown.trim().is_empty())
+                .unwrap_or_else(|| product.text.clone());
             // Readability keeps one block. On an article that is the content;
             // on a listing page (downloads, release lists, tables) it is a
             // side section, and the answer is in what it dropped. A short
             // extract cut from a much larger page gets the whole page.
-            let article_chars = product.text.trim().chars().count();
+            let article_chars = article.trim().chars().count();
             if article_chars >= MIN_ARTICLE_CHARS {
-                return product.text;
+                return article;
             }
             let full = full_page();
             let full_chars = full.trim().chars().count();
             if (article_chars as f64) >= MIN_ARTICLE_COVERAGE * full_chars as f64 {
-                product.text
+                article
             } else {
                 full
             }
@@ -2062,6 +2121,44 @@ mod format_tests {
              <div class=\"article\"><h2>Verifying downloads</h2>{prose}</div>\
              </body></html>"
         )
+    }
+
+    /// A page whose one heading is its title keeps that heading: readability
+    /// drops it, and the model would fetch the page again to find it.
+    #[test]
+    fn the_page_heading_survives_extraction() {
+        // Shaped like example.com: a title, no heading, one paragraph.
+        let html = "<!doctype html><html lang=en><head><meta charset=utf-8>\
+                    <title>Example Domain</title><style>body{margin:auto}</style></head>\
+                    <body><p>This domain is for use in synthetic documentation examples \
+                    without needing permission.</p><script src=/s.js></script></body></html>";
+        let text = extract_page_text(html, "https://example.com/");
+        let first = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        assert!(first.contains("Example Domain"), "{text}");
+        assert!(text.contains("synthetic documentation"), "{text}");
+        assert!(!text.contains("isReaderPage"), "{text}");
+        // A heading in the body stays apart from the paragraph after it, and
+        // is not added again.
+        let html = "<html><head><title>Example Domain</title></head><body><div>\
+                    <h1>Example Domain</h1><p>This domain is for use in synthetic \
+                    documentation examples without needing permission.</p></div></body></html>";
+        let text = extract_page_text(html, "https://example.com/");
+        assert!(text.contains("# Example Domain"), "{text}");
+        assert!(text.matches("Example Domain").count() <= 2, "{text}");
+        assert!(!text.contains("DomainThis"), "{text}");
+        // A title only, and a heading with markup inside.
+        assert_eq!(
+            page_heading("<title> Synthetic  Page </title><p>x</p>").as_deref(),
+            Some("Synthetic Page")
+        );
+        assert_eq!(
+            page_heading("<h10>no</h10><h1 class=\"t\">A <b>bold</b> &amp; plain</h1>").as_deref(),
+            Some("A bold & plain")
+        );
+        assert_eq!(page_heading("<p>nothing</p>"), None);
     }
 
     #[test]
