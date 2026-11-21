@@ -63,6 +63,24 @@ fn sanitize_session_id(session_id: &str) -> String {
         .collect()
 }
 
+/// Save `full_text` whole in `session_id`'s spill folder on this computer
+/// (the folder the session may read) and return its path; `None` if it
+/// could not be written. For a tool that shows its own cut of a long output
+/// and points the model at the rest.
+pub fn save_full_text_local(tool_name: &str, session_id: &str, full_text: &str) -> Option<PathBuf> {
+    let dir = spill_dir()?.join(sanitize_session_id(session_id));
+    std::fs::create_dir_all(&dir).ok()?;
+    let short_id: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect();
+    let path = dir.join(format!("{tool_name}-{short_id}.txt"));
+    std::fs::write(&path, full_text).ok()?;
+    Some(path)
+}
+
 /// Public entry: spill under `<temp_dir>/aidaemon/tool_results` where
 /// `<temp_dir>` is `std::env::temp_dir()` (honors `TMPDIR`/`%TEMP%`).
 pub fn build_spilled_preview(

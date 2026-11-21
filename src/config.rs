@@ -1282,7 +1282,9 @@ fn default_initial_timeout_secs() -> u64 {
     30
 }
 fn default_max_output_chars() -> usize {
-    4000
+    // 85% of the outputs cut at the old 4,000 fit in 16k (2026-11-20); the
+    // rest is kept whole in a file the cut points to.
+    16_000
 }
 fn parse_bool_like(value: &str) -> Option<bool> {
     let normalized = value.trim().to_ascii_lowercase();
