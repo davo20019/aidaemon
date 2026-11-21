@@ -98,8 +98,10 @@ trigger input, other people's messages, MCP results, files outside the trusted
 roots), its egress calls are interrupted by the kernel's `UntrustedHook` and
 run only if a clean, tool-less verifier
 (`src/agent/runtime/untrusted.rs`) that sees just the original request and the
-proposed call finds them consistent. Owner level `unrestricted` records these
-calls instead of checking them.
+proposed call finds them consistent. With a calibrated decision backend, a
+confident decision answer (`UntrustedEgressClear`, P >= 0.9) clears a call
+first and the full verifier judges only the rest; it never refuses one.
+Owner level `unrestricted` records these calls instead of checking them.
 
 - Source trust is typed per adapter: each tool declares `output_trust` from
   its capabilities and arguments. The result boundary

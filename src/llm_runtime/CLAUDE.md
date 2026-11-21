@@ -16,7 +16,13 @@ A closed question for the optional decision backend (`[decisions]`,
 `aidaemon_decisions::Decider`) is a `Decision` in
 `crates/aidaemon-runtime/src/llm/decisions.rs`, asked through `SideCallGateway::decide`; it
 may skip optional work, pick between equal-authority paths or make a check
-stricter, never grant authority or decide completion.
+stricter, never grant authority or decide completion. One exception, kept
+narrow: `UntrustedEgressClear` may clear an egress call after untrusted
+content without the full verifier, only on a calibrated P(consistent) of at
+least 0.9 from the backend and model it was measured on (Gemini's default
+decision model), and it never refuses a call; anything else runs the full
+check, and without a decision backend nothing changes. A new decision that
+clears a check needs its own measurement first.
 
 A safety judge refuses on any failure. A memory job skips, and never writes
 from a tainted run. A side call runs no tools. A request that forces one

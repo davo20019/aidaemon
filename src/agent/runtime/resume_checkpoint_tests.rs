@@ -21,6 +21,7 @@ fn resume_decided_yes(harness: &crate::testing::TestHarness) {
                 recall_filter: DecisionMode::Off,
                 model_route: DecisionMode::Off,
                 command_risk_second: DecisionMode::Off,
+                untrusted_egress_clear: DecisionMode::Off,
             },
         ),
     ));

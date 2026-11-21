@@ -642,3 +642,6 @@ timeout_seconds = 20
 # recall_filter = "shadow"
 # model_route = "off"
 # command_risk_second = "off"
+# # A confident answer clears a call after untrusted content without the full
+# # check (never refuses one). Only with Gemini's default decision model.
+# untrusted_egress_clear = "on"

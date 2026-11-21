@@ -33,6 +33,10 @@ enum Backend {
 pub struct DecisionLayer {
     backend: Backend,
     modes: DecisionModes,
+    /// The backend is one whose answers were measured for decisions that
+    /// clear a check ([`super::decisions::DecisionEffect::ClearCheck`]):
+    /// their thresholds hold only for that model.
+    clears_checks: bool,
 }
 
 impl DecisionLayer {
@@ -87,9 +91,18 @@ impl DecisionLayer {
                 Backend::Decider(Arc::new(decider))
             }
         };
+        // Measured 2026-11-20: Gemini's default decision model on 117
+        // labelled egress calls. Another backend or a pinned model has no
+        // measured threshold, so it never clears a check.
+        let clears_checks = config.backend == DecisionBackendKind::Gemini
+            && matches!(
+                config.model.trim(),
+                "" | aidaemon_decisions::GeminiDecider::DEFAULT_MODEL
+            );
         Some(Self {
             backend,
             modes: config.mode,
+            clears_checks,
         })
     }
 
@@ -99,6 +112,7 @@ impl DecisionLayer {
         Self {
             backend: Backend::Decider(decider),
             modes,
+            clears_checks: true,
         }
     }
 }
@@ -149,6 +163,10 @@ impl SideCallGateway {
     /// The decision's mode; `Off` when no backend is configured.
     pub fn decision_mode(&self, decision: Decision) -> DecisionMode {
         self.decision_layer()
+            .filter(|layer| {
+                layer.clears_checks
+                    || decision.spec().effect != super::decisions::DecisionEffect::ClearCheck
+            })
             .map(|layer| decision.mode_in(&layer.modes))
             .unwrap_or_default()
     }
@@ -375,6 +393,7 @@ fn decision_metadata(
             super::decisions::DecisionEffect::SkipOptional => "skip_optional",
             super::decisions::DecisionEffect::Route => "route",
             super::decisions::DecisionEffect::EscalateOnly => "escalate_only",
+            super::decisions::DecisionEffect::ClearCheck => "clear_check",
         },
         "mode": match mode {
             DecisionMode::Off => "off",
@@ -562,6 +581,52 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(recorded, "the decision point was not recorded");
+    }
+
+    /// Only the backend and model whose answers were measured may clear a
+    /// check; any other keeps the full check, and the other decisions keep
+    /// their modes.
+    #[tokio::test]
+    async fn only_the_measured_backend_clears_a_check() {
+        use crate::settings::{DecisionBackendKind, DecisionsConfig};
+        let cases = [
+            (DecisionBackendKind::Gemini, "", DecisionMode::On),
+            (
+                DecisionBackendKind::Gemini,
+                "gemini-decision-1",
+                DecisionMode::On,
+            ),
+            (
+                DecisionBackendKind::Gemini,
+                "gemini-decision-2",
+                DecisionMode::Off,
+            ),
+            (DecisionBackendKind::Typesafe, "", DecisionMode::Off),
+            (
+                DecisionBackendKind::Provider,
+                "cheap-model",
+                DecisionMode::Off,
+            ),
+        ];
+        for (backend, model, expected) in cases {
+            let (gateway, _events) = gateway_with(provider_answering("unused")).await;
+            gateway.set_decisions(DecisionLayer::from_config(&DecisionsConfig {
+                backend,
+                model: model.to_string(),
+                api_key: "synthetic-key".to_string(),
+                mode: DecisionModes::default(),
+            }));
+            assert_eq!(
+                gateway.decision_mode(Decision::UntrustedEgressClear),
+                expected,
+                "{backend:?} {model:?}"
+            );
+            assert_eq!(
+                gateway.decision_mode(Decision::TurnDigest),
+                DecisionMode::Shadow,
+                "{backend:?} {model:?}"
+            );
+        }
     }
 
     #[tokio::test]
