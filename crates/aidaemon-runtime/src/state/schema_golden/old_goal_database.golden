@@ -1628,6 +1628,7 @@ rows background_spawns = 0
 rows task_dependencies = 0
 rows history_message_index = 0
 rows history_projection_state = 0
-rows state_schema_versions = 2
+rows state_schema_versions = 3
 version 1 unversioned_baseline
 version 2 legacy_goals_imported
+version 3 work_backfills_done

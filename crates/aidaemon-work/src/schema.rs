@@ -24,17 +24,31 @@ pub async fn table_exists_in_pool(pool: &SqlitePool, name: &str) -> anyhow::Resu
     .is_some())
 }
 
-async fn legacy_goals_already_imported(pool: &SqlitePool) -> anyhow::Result<bool> {
+/// The version record that says the one-time backfills below have run with
+/// this release's code: mandate session links, task dependency rows and the
+/// legacy goal runs. Recorded by the host after the steps ran; before it they
+/// run on every start, as they always did.
+pub const WORK_BACKFILLS_DONE_VERSION: i64 = 3;
+
+async fn state_version_recorded(pool: &SqlitePool, version: i64) -> anyhow::Result<bool> {
     if !table_exists_in_pool(pool, "state_schema_versions").await? {
         return Ok(false);
     }
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT 1 FROM state_schema_versions WHERE version = ?")
-            .bind(LEGACY_GOALS_IMPORTED_VERSION)
+            .bind(version)
             .fetch_optional(pool)
             .await?
             .is_some(),
     )
+}
+
+async fn legacy_goals_already_imported(pool: &SqlitePool) -> anyhow::Result<bool> {
+    state_version_recorded(pool, LEGACY_GOALS_IMPORTED_VERSION).await
+}
+
+async fn work_backfills_done(pool: &SqlitePool) -> anyhow::Result<bool> {
+    state_version_recorded(pool, WORK_BACKFILLS_DONE_VERSION).await
 }
 
 /// The goal, mandate, task and notification tables, up to the host's own.
@@ -1017,44 +1031,48 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO mandate_principal_sessions
-            (principal_id, session_id, linked_at, linked_by_session)
-         SELECT owner_principal_id, created_by_session, created_at, created_by_session
-         FROM mandates",
-    )
-    .execute(pool)
-    .await?;
-    // Older mandates were assigned one random principal per mandate. Migrate
-    // only channel identities whose platform semantics prove they are the
-    // same private owner across bot routes; never infer group or arbitrary
-    // session-name equivalence.
-    let mandate_owner_rows = sqlx::query("SELECT id, created_by_session FROM mandates")
-        .fetch_all(pool)
-        .await?;
-    for row in mandate_owner_rows {
-        let mandate_id: String = row.get("id");
-        let created_by_session: String = row.get("created_by_session");
-        let Some(principal_id) =
-            aidaemon_events::session::stable_private_owner_principal_id(&created_by_session)
-        else {
-            continue;
-        };
-        sqlx::query("UPDATE mandates SET owner_principal_id = ? WHERE id = ?")
-            .bind(&principal_id)
-            .bind(&mandate_id)
-            .execute(pool)
-            .await?;
+    // Links for mandates made before links existed, once
+    // ([`WORK_BACKFILLS_DONE_VERSION`]): a link taken back must stay gone.
+    if !work_backfills_done(pool).await? {
         sqlx::query(
             "INSERT OR IGNORE INTO mandate_principal_sessions
                 (principal_id, session_id, linked_at, linked_by_session)
-             VALUES (?, ?, datetime('now'), ?)",
+             SELECT owner_principal_id, created_by_session, created_at, created_by_session
+             FROM mandates",
         )
-        .bind(&principal_id)
-        .bind(&created_by_session)
-        .bind(&created_by_session)
         .execute(pool)
         .await?;
+        // Older mandates were assigned one random principal per mandate. Migrate
+        // only channel identities whose platform semantics prove they are the
+        // same private owner across bot routes; never infer group or arbitrary
+        // session-name equivalence.
+        let mandate_owner_rows = sqlx::query("SELECT id, created_by_session FROM mandates")
+            .fetch_all(pool)
+            .await?;
+        for row in mandate_owner_rows {
+            let mandate_id: String = row.get("id");
+            let created_by_session: String = row.get("created_by_session");
+            let Some(principal_id) =
+                aidaemon_events::session::stable_private_owner_principal_id(&created_by_session)
+            else {
+                continue;
+            };
+            sqlx::query("UPDATE mandates SET owner_principal_id = ? WHERE id = ?")
+                .bind(&principal_id)
+                .bind(&mandate_id)
+                .execute(pool)
+                .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO mandate_principal_sessions
+                    (principal_id, session_id, linked_at, linked_by_session)
+                 VALUES (?, ?, datetime('now'), ?)",
+            )
+            .bind(&principal_id)
+            .bind(&created_by_session)
+            .bind(&created_by_session)
+            .execute(pool)
+            .await?;
+        }
     }
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_mandate_principal_sessions_session
@@ -1819,36 +1837,41 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    // Existing goal/task data gets one explicit legacy run. New scheduled
-    // firings create a fresh run before any task is inserted.
-    sqlx::query(
-        "INSERT OR IGNORE INTO goal_runs
-            (id, project_id, goal_id, trigger_type, status, outcome_summary,
-             started_at, completed_at, created_at, updated_at)
-         SELECT
-            'run-legacy-' || g.id,
-            COALESCE(NULLIF(g.project_id, ''), 'default'),
-            g.id,
-            'legacy',
-            CASE
-                WHEN g.status IN ('completed', 'failed', 'cancelled') THEN g.status
-                WHEN EXISTS (
-                    SELECT 1 FROM tasks t
-                    WHERE t.goal_id = g.id AND t.status = 'blocked'
-                ) THEN 'blocked'
-                ELSE 'running'
-            END,
-            NULL,
-            g.created_at,
-            CASE WHEN g.status IN ('completed', 'failed', 'cancelled')
-                 THEN COALESCE(g.completed_at, g.updated_at) ELSE NULL END,
-            g.created_at,
-            g.updated_at
-         FROM goals g
-         WHERE g.domain = 'orchestration'",
-    )
-    .execute(pool)
-    .await?;
+    // Once ([`WORK_BACKFILLS_DONE_VERSION`]): run on every start it gave each
+    // goal made since a task-less "legacy" run (4,304 of 4,365 in one owner's
+    // database on 2026-11-21).
+    if !work_backfills_done(pool).await? {
+        // Existing goal/task data gets one explicit legacy run. New scheduled
+        // firings create a fresh run before any task is inserted.
+        sqlx::query(
+            "INSERT OR IGNORE INTO goal_runs
+                (id, project_id, goal_id, trigger_type, status, outcome_summary,
+                 started_at, completed_at, created_at, updated_at)
+             SELECT
+                'run-legacy-' || g.id,
+                COALESCE(NULLIF(g.project_id, ''), 'default'),
+                g.id,
+                'legacy',
+                CASE
+                    WHEN g.status IN ('completed', 'failed', 'cancelled') THEN g.status
+                    WHEN EXISTS (
+                        SELECT 1 FROM tasks t
+                        WHERE t.goal_id = g.id AND t.status = 'blocked'
+                    ) THEN 'blocked'
+                    ELSE 'running'
+                END,
+                NULL,
+                g.created_at,
+                CASE WHEN g.status IN ('completed', 'failed', 'cancelled')
+                     THEN COALESCE(g.completed_at, g.updated_at) ELSE NULL END,
+                g.created_at,
+                g.updated_at
+             FROM goals g
+             WHERE g.domain = 'orchestration'",
+        )
+        .execute(pool)
+        .await?;
+    }
     sqlx::query(
         "UPDATE tasks
          SET goal_run_id = COALESCE(
@@ -2274,23 +2297,27 @@ pub async fn migrate_work_tail(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO task_dependencies(task_id, depends_on_task_id)
-         SELECT t.id, CAST(dep.value AS TEXT)
-         FROM tasks t
-         JOIN json_each(
-            CASE
-                WHEN json_valid(COALESCE(t.depends_on, '[]'))
-                 AND json_type(COALESCE(t.depends_on, '[]')) = 'array'
-                THEN COALESCE(t.depends_on, '[]')
-                ELSE '[]'
-            END
-         ) dep
-         JOIN tasks prerequisite ON prerequisite.id = CAST(dep.value AS TEXT)
-         WHERE CAST(dep.value AS TEXT) <> t.id",
-    )
-    .execute(pool)
-    .await?;
+    // The table from the tasks' own lists, once ([`WORK_BACKFILLS_DONE_VERSION`]):
+    // every task write keeps it (`replace_task_dependencies`).
+    if !work_backfills_done(pool).await? {
+        sqlx::query(
+            "INSERT OR IGNORE INTO task_dependencies(task_id, depends_on_task_id)
+             SELECT t.id, CAST(dep.value AS TEXT)
+             FROM tasks t
+             JOIN json_each(
+                CASE
+                    WHEN json_valid(COALESCE(t.depends_on, '[]'))
+                     AND json_type(COALESCE(t.depends_on, '[]')) = 'array'
+                    THEN COALESCE(t.depends_on, '[]')
+                    ELSE '[]'
+                END
+             ) dep
+             JOIN tasks prerequisite ON prerequisite.id = CAST(dep.value AS TEXT)
+             WHERE CAST(dep.value AS TEXT) <> t.id",
+        )
+        .execute(pool)
+        .await?;
+    }
     sqlx::query(
         "CREATE TRIGGER IF NOT EXISTS trg_task_dependencies_no_cycle
          BEFORE INSERT ON task_dependencies

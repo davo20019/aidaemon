@@ -496,6 +496,31 @@ impl<S: WorkDatabase> crate::traits::GoalStore for S {
     }
 }
 
+/// Make `task_id`'s rows in `task_dependencies` exactly `dependency_ids`.
+/// The table is the one source every reader uses (dispatch, claims, the work
+/// view); `tasks.depends_on` keeps the same list for the task as written.
+/// Every task write goes through here, in the write's own transaction
+/// (2026-11-21: mandate tasks were written without their rows, which only a
+/// rebuild at the next start filled in).
+pub(crate) async fn replace_task_dependencies(
+    conn: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    dependency_ids: &[String],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *conn)
+        .await?;
+    for dependency_id in dependency_ids {
+        sqlx::query("INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)")
+            .bind(task_id)
+            .bind(dependency_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl<S: WorkDatabase> crate::traits::TaskStore for S {
     async fn create_task(&self, task: &Task) -> anyhow::Result<()> {
@@ -561,13 +586,7 @@ impl<S: WorkDatabase> crate::traits::TaskStore for S {
         .bind(&task.created_at)
         .execute(&mut *tx)
         .await?;
-        for dependency_id in dependency_ids {
-            sqlx::query("INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)")
-                .bind(&task.id)
-                .bind(dependency_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        replace_task_dependencies(&mut tx, &task.id, &dependency_ids).await?;
 
         tx.commit().await?;
         Ok(())
@@ -668,17 +687,7 @@ impl<S: WorkDatabase> crate::traits::TaskStore for S {
             anyhow::bail!("task {} no longer exists", task.id);
         }
 
-        sqlx::query("DELETE FROM task_dependencies WHERE task_id = ?")
-            .bind(&task.id)
-            .execute(&mut *tx)
-            .await?;
-        for dependency_id in dependency_ids {
-            sqlx::query("INSERT INTO task_dependencies(task_id, depends_on_task_id) VALUES (?, ?)")
-                .bind(&task.id)
-                .bind(dependency_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        replace_task_dependencies(&mut tx, &task.id, &dependency_ids).await?;
 
         // A completed task counts as useful progress for its goal — refresh the
         // goal's freshness so the >30-day idle auto-skip never mis-fires on a
@@ -1340,10 +1349,11 @@ impl<S: WorkDatabase> crate::traits::TaskDispatchStore for S {
                          AND g.status IN ('active', 'stalled')
              WHERE t.status = 'pending'
              AND NOT EXISTS (
-                 SELECT 1 FROM json_each(COALESCE(t.depends_on, '[]')) AS dep
-                 WHERE NOT EXISTS (
+                 SELECT 1 FROM task_dependencies dep
+                 WHERE dep.task_id = t.id
+                   AND NOT EXISTS (
                      SELECT 1 FROM tasks d
-                     WHERE d.id = dep.value
+                     WHERE d.id = dep.depends_on_task_id
                        AND d.goal_run_id = t.goal_run_id
                        AND d.status IN ('completed', 'skipped', 'superseded')
                  )

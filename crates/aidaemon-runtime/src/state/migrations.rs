@@ -2,7 +2,9 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
 
-use aidaemon_work::schema::{LEGACY_GOALS_IMPORTED_VERSION, table_exists_in_pool};
+use aidaemon_work::schema::{
+    LEGACY_GOALS_IMPORTED_VERSION, WORK_BACKFILLS_DONE_VERSION, table_exists_in_pool,
+};
 
 async fn migrate_legacy_messages_to_events(pool: &SqlitePool) -> anyhow::Result<()> {
     let has_messages = sqlx::query_scalar::<_, i64>(
@@ -352,15 +354,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     // `cleared_after_id` from CONTEXT retrieval without deleting them, so the
     // conversation starts fresh while the event history stays intact for memory
     // and audit. `/wipe` remains the explicit destructive path.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS session_context_boundaries (
-            session_id TEXT PRIMARY KEY,
-            cleared_after_id INTEGER NOT NULL,
-            cleared_at TEXT NOT NULL
-        )",
-    )
-    .execute(pool)
-    .await?;
+    // `session_context_boundaries` belongs to the events schema (`migrate_events`, above).
 
     // Dynamic skills table - stores skills added via manage_skills tool
     sqlx::query(
@@ -610,6 +604,8 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     if table_exists_in_pool(pool, "_goals_legacy_deprecated").await? {
         record_state_version(pool, LEGACY_GOALS_IMPORTED_VERSION, "legacy_goals_imported").await?;
     }
+    // The work backfills above have run: what is removed later stays removed.
+    record_state_version(pool, WORK_BACKFILLS_DONE_VERSION, "work_backfills_done").await?;
 
     Ok(())
 }
@@ -648,6 +644,51 @@ async fn record_state_version(pool: &SqlitePool, version: i64, name: &str) -> an
 mod legacy_goal_import_tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    #[tokio::test]
+    async fn work_rows_removed_after_the_first_start_stay_removed() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(SqliteConnectOptions::new().filename(database.path()))
+            .await
+            .unwrap();
+        migrate_state(&pool).await.unwrap();
+        for statement in [
+            "INSERT INTO goals (id, description, domain, goal_type, status, session_id,
+                                created_at, updated_at)
+             VALUES ('goal-synthetic', 'Draft the Acme report', 'orchestration', 'finite',
+                     'active', 'telegram:synthetic-user-1',
+                     '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')",
+            "INSERT INTO tasks (id, goal_id, description, status, created_at)
+             VALUES ('task-a', 'goal-synthetic', 'outline', 'pending', '2026-11-21T00:00:00Z'),
+                    ('task-b', 'goal-synthetic', 'write', 'pending', '2026-11-21T00:00:00Z')",
+            "UPDATE tasks SET depends_on = '[\"task-a\"]' WHERE id = 'task-b'",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        let count = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        migrate_state(&pool).await.unwrap();
+        assert_eq!(
+            count("SELECT COUNT(*) FROM goal_runs WHERE trigger_type = 'legacy'").await,
+            0,
+            "a goal made after the first start gets no legacy run"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM task_dependencies").await,
+            0,
+            "the tasks' lists are not read back into the table on later starts"
+        );
+    }
 
     #[tokio::test]
     async fn goals_retention_removed_are_not_imported_again() {
@@ -1157,8 +1198,13 @@ mod state_version_tests {
 
         assert_eq!(snapshot(&pool).await, before);
         let first = recorded(&pool).await;
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].0, STATE_BASELINE_VERSION);
+        assert_eq!(
+            first
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
+            [STATE_BASELINE_VERSION, WORK_BACKFILLS_DONE_VERSION]
+        );
 
         // Later starts add nothing and keep the first record.
         migrate_state(&pool).await.unwrap();
@@ -1242,7 +1288,7 @@ mod state_version_tests {
         .await
         .unwrap();
         assert!(legacy.is_none());
-        assert_eq!(recorded(&pool).await.len(), 1);
+        assert_eq!(recorded(&pool).await.len(), 2);
     }
 }
 
