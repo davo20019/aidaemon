@@ -1050,3 +1050,108 @@ async fn a_response_hook_can_end_the_run_before_anything_acts_on_it() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(out.state.messages.iter().all(|m| m.tool_calls.is_empty()));
 }
+
+/// Appends a note after the transcript's last message at one turn.
+struct AppendAtTurn {
+    turn: u32,
+}
+#[async_trait]
+impl Hook for AppendAtTurn {
+    async fn edit_transcript(&self, ctx: &HookContext<'_>) -> Option<Vec<Message>> {
+        (ctx.turn == self.turn).then(|| {
+            let mut messages = ctx.messages.to_vec();
+            messages.push(Message::user("a synthetic note queued mid-run"));
+            messages
+        })
+    }
+}
+
+/// A tool loaded in a batch stays anchored to that batch when something is
+/// added after its results: the provider keeps one tool block, so the
+/// prompt cache survives the load.
+#[tokio::test]
+async fn a_load_stays_anchored_when_a_note_follows_its_batch() {
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("c1", "load_tools", json!({"names": ["write"]}))]),
+        text("done"),
+    ]));
+    let agent = agent(provider.clone())
+        .deferred_tool_arc(Arc::new(write_tool(Arc::default())))
+        .hook(AppendAtTurn { turn: 2 })
+        .build()
+        .unwrap();
+    agent.run("s", "go").await.unwrap();
+    let surfacing = provider.requests()[1].tool_surfacing.clone().unwrap();
+    assert_eq!(
+        surfacing.loads,
+        vec![aidaemon_core::ToolLoad {
+            after_tool_call: "c1".into(),
+            names: vec!["write".into()],
+        }]
+    );
+    assert_eq!(
+        surfacing
+            .deferred
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["write"]
+    );
+}
+
+/// Interrupts every call to `write`.
+struct InterruptWrite;
+#[async_trait]
+impl Hook for InterruptWrite {
+    async fn before_tool(
+        &self,
+        _ctx: &HookContext<'_>,
+        call: &ToolCall,
+        _info: &ToolInfo,
+    ) -> ToolDecision {
+        if call.name == "write" {
+            ToolDecision::Interrupt {
+                reason: "write needs a check".into(),
+                kind: InterruptKind::Untrusted,
+            }
+        } else {
+            ToolDecision::Allow
+        }
+    }
+}
+
+/// A run resumed after an interruption keeps the tools it loaded before it
+/// as loaded mid-run, anchored where they were: the tool block it sends is
+/// the one it sent before the pause, so the prompt cache survives.
+#[tokio::test]
+async fn a_resumed_run_keeps_its_tool_loads() {
+    let provider = Arc::new(ScriptedProvider::new([
+        tool_calls([call("c1", "load_tools", json!({"names": ["write"]}))]),
+        tool_calls([call("c2", "write", json!({}))]),
+        text("done"),
+    ]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = agent(provider.clone())
+        .deferred_tool_arc(Arc::new(write_tool(calls.clone())))
+        .hook(InterruptWrite)
+        .build()
+        .unwrap();
+    let paused = agent.run("s", "go").await.unwrap();
+    assert!(matches!(paused.status, RunStatus::Interrupted { .. }));
+    let saved = serde_json::to_string(&paused.state).unwrap();
+    let restored: RunState = serde_json::from_str(&saved).unwrap();
+    agent.resume(restored, Resolution::Approve).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let requests = provider.requests();
+    let before = requests[1].tool_surfacing.clone().unwrap();
+    let after = requests[2].tool_surfacing.clone().unwrap();
+    assert_eq!(after, before, "the same tool block after the resume");
+    assert_eq!(
+        after.loads,
+        vec![aidaemon_core::ToolLoad {
+            after_tool_call: "c1".into(),
+            names: vec!["write".into()],
+        }]
+    );
+}

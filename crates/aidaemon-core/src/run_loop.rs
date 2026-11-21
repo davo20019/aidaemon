@@ -59,12 +59,6 @@ pub(crate) struct Driver<'a> {
     /// tool waits; `None` when the run has no resolver (the call then goes
     /// unanswered).
     resolver: Option<&'a dyn crate::agent::InterruptResolver>,
-    /// Deferred tools loaded when this segment started: sent as ordinary
-    /// tools. Set at the segment's first request.
-    loaded_at_start: Option<std::collections::BTreeSet<String>>,
-    /// Deferred tools loaded during this segment, each placed after the
-    /// tool result the request ended with when it was first seen.
-    tool_loads: Vec<crate::provider::ToolLoad>,
 }
 
 const STUCK_SKIP_REASON: &str =
@@ -163,8 +157,6 @@ impl<'a> Driver<'a> {
             own_declines,
             report_run_end: true,
             resolver: None,
-            loaded_at_start: None,
-            tool_loads: Vec::new(),
         }
     }
 
@@ -1763,8 +1755,8 @@ impl<'a> Driver<'a> {
     }
 
     /// Record deferred tools loaded since the last request, anchored to the
-    /// tool result the transcript now ends with (the batch that loaded
-    /// them). Without such a result they join the ordinary tools.
+    /// latest tool result since the last assistant message (the batch that
+    /// loaded them). Without such a result they join the ordinary tools.
     fn note_tool_loads(&mut self) {
         if self.agent.deferred.is_empty() {
             return;
@@ -1776,15 +1768,19 @@ impl<'a> Driver<'a> {
             .into_iter()
             .filter(|name| self.agent.deferred.contains(name))
             .collect();
-        let Some(at_start) = &mut self.loaded_at_start else {
-            self.loaded_at_start = Some(loaded);
+        let Some(at_start) = &mut self.state.loaded_at_start else {
+            self.state.loaded_at_start = Some(loaded);
             return;
         };
         let new: Vec<String> = loaded
             .iter()
             .filter(|name| {
                 !at_start.contains(*name)
-                    && !self.tool_loads.iter().any(|load| load.names.contains(name))
+                    && !self
+                        .state
+                        .tool_loads
+                        .iter()
+                        .any(|load| load.names.contains(name))
             })
             .cloned()
             .collect();
@@ -1794,11 +1790,18 @@ impl<'a> Driver<'a> {
         match self
             .state
             .messages
-            .last()
-            .filter(|m| m.role == crate::Role::Tool)
+            .iter()
+            .rev()
+            // The batch that loaded them: the tool results since the last
+            // assistant message, whatever was added after them (a note
+            // queued mid-run, a hook's transcript edit). Requiring the
+            // transcript to end on a result made those loads join the
+            // ordinary tools and reset the provider's whole prompt cache.
+            .take_while(|m| m.role != crate::Role::Assistant)
+            .find(|m| m.role == crate::Role::Tool)
             .and_then(|m| m.tool_call_id.clone())
         {
-            Some(after_tool_call) => self.tool_loads.push(crate::provider::ToolLoad {
+            Some(after_tool_call) => self.state.tool_loads.push(crate::provider::ToolLoad {
                 after_tool_call,
                 names: new,
             }),
@@ -1827,7 +1830,7 @@ impl<'a> Driver<'a> {
                 .collect(),
             tool_choice: ToolChoice::Auto,
             max_output_tokens: self.agent.max_output_tokens,
-            tool_surfacing: self.loaded_at_start.as_ref().map(|at_start| {
+            tool_surfacing: self.state.loaded_at_start.as_ref().map(|at_start| {
                 crate::provider::ToolSurfacing {
                     deferred: self
                         .agent
@@ -1839,7 +1842,7 @@ impl<'a> Driver<'a> {
                         })
                         .cloned()
                         .collect(),
-                    loads: self.tool_loads.clone(),
+                    loads: self.state.tool_loads.clone(),
                 }
             }),
             ..Default::default()
