@@ -84,6 +84,41 @@ pub trait TurnNotes: TurnHost + crate::turn::turn_context::TurnHistory {
             .await
     }
 
+    /// A message the channel answered without a turn (a stop, a question
+    /// about running work) and its reply, kept as one turn of their own so
+    /// the chat shows what the owner sent and later turns can refer to it.
+    async fn record_control_exchange(
+        &self,
+        session_id: &str,
+        owner_text: &str,
+        user_role: aidaemon_tools::semantics::UserRole,
+        channel_ctx: &aidaemon_channels::context::ChannelContext,
+        reply: &str,
+    ) -> anyhow::Result<()> {
+        let text = owner_text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let turn_id = Uuid::new_v4().to_string();
+        let msg = Message {
+            content: Some(text.to_string()),
+            turn_id: Some(turn_id.clone()),
+            importance: aidaemon_memory::turn_importance("user", Some(text)),
+            ..Message::new_runtime(turn_id.clone(), session_id, "user")
+        };
+        let emitter = aidaemon_events::EventEmitter::new(self.event_log(), session_id);
+        self.append_user_message_with_event(&emitter, &msg, user_role, channel_ctx, false)
+            .await?;
+        self.record_assistant_note_with_files(
+            session_id,
+            reply,
+            Some(&turn_id),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
     /// `turn_id` stamps the note; `None` joins the session's current turn, or
     /// opens a turn of its own when none is running. History is fetched by
     /// turn, so a note with no turn would never reach the model: a goal

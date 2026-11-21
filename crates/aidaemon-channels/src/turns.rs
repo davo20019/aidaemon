@@ -486,6 +486,7 @@ impl TurnRunner {
                 .cancel(&turn.session_id, turn.user_role, StopRequest::Bare)
                 .await;
             let _ = surface.say(&reply).await;
+            self.record_exchange(&turn, &reply).await;
             return;
         }
 
@@ -494,12 +495,22 @@ impl TurnRunner {
         let dedup_key = turn.dedup_key.as_deref();
         if !registry.has_running_task(&session_id).await {
             match self.read_between_runs(&turn).await {
-                Some(BetweenRuns::Stop(request)) => {
-                    if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
-                        let reply = self.cancel(&session_id, turn.user_role, request).await;
-                        let _ = surface.say(&reply).await;
+                Some(BetweenRuns::Stop { request, also_asks }) => {
+                    if !registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                        return;
                     }
-                    return;
+                    let reply = self.cancel(&session_id, turn.user_role, request).await;
+                    let _ = surface.say(&reply).await;
+                    if !also_asks {
+                        self.record_exchange(&turn, &reply).await;
+                        return;
+                    }
+                    // "Stop it and delete it": the work is stopped, and the
+                    // rest of the message runs as a turn of its own (which
+                    // records it), never dropped with the stop.
+                    registry
+                        .unmark_seen(&session_id, &turn.text, dedup_key)
+                        .await;
                 }
                 // A question about the helpers and commands running for
                 // the chat: answered from their typed state, the same reply
@@ -511,9 +522,9 @@ impl TurnRunner {
                         let answer = crate::mid_run::running_work_reply(
                             &self.running_work(&session_id).await,
                         );
-                        let _ = surface
-                            .say(&crate::presentation::prepare_chat_message(&answer))
-                            .await;
+                        let reply = crate::presentation::prepare_chat_message(&answer);
+                        let _ = surface.say(&reply).await;
+                        self.record_exchange(&turn, &reply).await;
                     }
                     return;
                 }
@@ -546,13 +557,23 @@ impl TurnRunner {
                         ..
                     },
                 ) => {
-                    if registry.mark_seen(&session_id, &turn.text, dedup_key).await {
-                        let reply = self
-                            .cancel(&session_id, turn.user_role, stop_request(&reading))
-                            .await;
-                        let _ = surface.say(&reply).await;
+                    if !registry.mark_seen(&session_id, &turn.text, dedup_key).await {
+                        return;
                     }
-                    return;
+                    let reply = self
+                        .cancel(&session_id, turn.user_role, stop_request(&reading))
+                        .await;
+                    let _ = surface.say(&reply).await;
+                    if !reading.also_asks {
+                        self.record_exchange(&turn, &reply).await;
+                        return;
+                    }
+                    registry
+                        .unmark_seen(&session_id, &turn.text, dedup_key)
+                        .await;
+                    // The rest of the message waits for the stopped run to
+                    // end, then runs as its own turn.
+                    steerable = false;
                 }
                 Some(MidRunReading {
                     intent: MidRunIntent::AboutRunningWork,
@@ -564,9 +585,9 @@ impl TurnRunner {
                         let answer = crate::mid_run::running_work_reply(
                             &self.running_work(&session_id).await,
                         );
-                        let _ = surface
-                            .say(&crate::presentation::prepare_chat_message(&answer))
-                            .await;
+                        let reply = crate::presentation::prepare_chat_message(&answer);
+                        let _ = surface.say(&reply).await;
+                        self.record_exchange(&turn, &reply).await;
                     }
                     return;
                 }
@@ -741,6 +762,21 @@ impl TurnRunner {
         .await
     }
 
+    /// Keep a message the channel answered itself, and its reply, in the
+    /// conversation.
+    async fn record_exchange(&self, turn: &Turn, reply: &str) {
+        self.deps
+            .agent
+            .record_control_exchange(
+                &turn.session_id,
+                &turn.text,
+                turn.user_role,
+                &turn.channel_ctx,
+                reply,
+            )
+            .await;
+    }
+
     /// Read a message sent while the chat has sub-agents or background
     /// commands running but no turn: a stop request stops them (the same
     /// stop as `/cancel`), a question about them is answered from their
@@ -781,7 +817,10 @@ impl TurnRunner {
             "Read a message sent while background work runs"
         );
         match reading.intent {
-            MidRunIntent::StopsWork => Some(BetweenRuns::Stop(stop_request(&reading))),
+            MidRunIntent::StopsWork => Some(BetweenRuns::Stop {
+                request: stop_request(&reading),
+                also_asks: reading.also_asks,
+            }),
             MidRunIntent::AboutRunningWork => Some(BetweenRuns::Status),
             MidRunIntent::ChangesWork | MidRunIntent::Unrelated => None,
         }
@@ -1124,8 +1163,12 @@ pub fn is_cancel_word(text: &str) -> bool {
 
 /// What a message sent while only background work runs asks for.
 enum BetweenRuns {
-    /// Stop that work.
-    Stop(StopRequest),
+    /// Stop that work; `also_asks` when the message asks for more than
+    /// the stop, which then runs as a turn.
+    Stop {
+        request: StopRequest,
+        also_asks: bool,
+    },
     /// Where that work stands.
     Status,
 }
@@ -1464,6 +1507,10 @@ mod tests {
         reading: std::sync::Mutex<Option<MidRunReading>>,
         /// The chat's sub-agents and background commands; a stop removes one.
         work: std::sync::Mutex<Vec<crate::ports::ChatWork>>,
+        /// Exchanges kept in history without a turn: (owner text, reply).
+        recorded: std::sync::Mutex<Vec<(String, String)>>,
+        /// The text of each turn started.
+        turns: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1472,6 +1519,7 @@ mod tests {
             &self,
             request: InboundMessageRequest,
         ) -> anyhow::Result<AgentResponseEnvelope> {
+            self.turns.lock().unwrap().push(request.user_text.clone());
             if let Some(status) = request.status_tx.as_ref() {
                 let _ = status
                     .send(StatusUpdate::tool_start(
@@ -1503,6 +1551,19 @@ mod tests {
             _work: &RunningWork,
         ) -> Option<MidRunReading> {
             self.reading.lock().unwrap().clone()
+        }
+        async fn record_control_exchange(
+            &self,
+            _session_id: &str,
+            owner_text: &str,
+            _user_role: UserRole,
+            _channel_ctx: &crate::context::ChannelContext,
+            reply: &str,
+        ) {
+            self.recorded
+                .lock()
+                .unwrap()
+                .push((owner_text.to_string(), reply.to_string()));
         }
         async fn chat_work(&self, _session_id: &str) -> crate::ports::ChatWorkView {
             crate::ports::ChatWorkView {
@@ -1612,6 +1673,8 @@ mod tests {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
             work: std::sync::Mutex::new(Vec::new()),
+            recorded: Default::default(),
+            turns: Default::default(),
         });
         let registry = Arc::new(TaskRegistry::new(10));
         let runner = TurnRunner::new(TurnDeps {
@@ -1650,6 +1713,7 @@ mod tests {
         set(Some(MidRunReading {
             intent: MidRunIntent::AboutRunningWork,
             stop: Vec::new(),
+            also_asks: false,
         }));
         runner
             .submit(surface.clone(), owner_turn("How is it going so far?", "m2"))
@@ -1678,6 +1742,7 @@ mod tests {
         set(Some(MidRunReading {
             intent: MidRunIntent::Unrelated,
             stop: Vec::new(),
+            also_asks: false,
         }));
         runner
             .submit(
@@ -1706,6 +1771,7 @@ mod tests {
                 Some(MidRunReading {
                     intent: MidRunIntent::ChangesWork,
                     stop: Vec::new(),
+                    also_asks: false,
                 }),
                 "m5",
             ),
@@ -1742,6 +1808,7 @@ mod tests {
         set(Some(MidRunReading {
             intent: MidRunIntent::AboutRunningWork,
             stop: Vec::new(),
+            also_asks: false,
         }));
         runner
             .submit_placed(
@@ -2061,6 +2128,8 @@ mod tests {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
             work: std::sync::Mutex::new(two_counting_jobs()),
+            recorded: Default::default(),
+            turns: Default::default(),
         });
         let registry = Arc::new(TaskRegistry::new(10));
         let runner = TurnRunner::new(TurnDeps {
@@ -2095,6 +2164,7 @@ mod tests {
         *agent.reading.lock().unwrap() = Some(MidRunReading {
             intent: MidRunIntent::StopsWork,
             stop: Vec::new(),
+            also_asks: false,
         });
         runner
             .submit(
@@ -2112,6 +2182,70 @@ mod tests {
         assert!(agent.work.lock().unwrap().is_empty());
     }
 
+    /// Live 2026-11-21: "stop it and delete it, I don't need it" sent while
+    /// a background job ran stopped the job, but the message never reached
+    /// the chat's history and the delete was dropped. A plain stop is kept
+    /// as an exchange; a stop that asks for more stops the work and runs
+    /// the message as a turn.
+    #[tokio::test]
+    async fn a_stop_is_kept_in_history_and_what_else_it_asks_runs_as_a_turn() {
+        let agent = Arc::new(ScriptedAgent {
+            release: tokio::sync::Notify::new(),
+            reading: std::sync::Mutex::new(Some(MidRunReading {
+                intent: MidRunIntent::StopsWork,
+                stop: Vec::new(),
+                also_asks: false,
+            })),
+            work: std::sync::Mutex::new(two_counting_jobs()),
+            recorded: Default::default(),
+            turns: Default::default(),
+        });
+        let runner = TurnRunner::new(TurnDeps {
+            agent: agent.clone(),
+            session_map: Arc::default(),
+            sessions: Arc::new(NoSessions),
+            task_registry: Arc::new(TaskRegistry::new(10)),
+            watchdog_stale_threshold_secs: 0,
+            watch: TurnWatch::default(),
+        });
+        let surface = Arc::new(Said::default());
+        runner
+            .submit(surface.clone(), owner_turn("Stop the counting jobs.", "k1"))
+            .await;
+        let recorded = agent.recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "Stop the counting jobs.");
+        assert!(recorded[0].1.starts_with("⏹️ Stopped:"), "{recorded:?}");
+        assert!(agent.turns.lock().unwrap().is_empty());
+
+        *agent.work.lock().unwrap() = two_counting_jobs();
+        *agent.reading.lock().unwrap() = Some(MidRunReading {
+            intent: MidRunIntent::StopsWork,
+            stop: Vec::new(),
+            also_asks: true,
+        });
+        agent.release.notify_one();
+        runner
+            .submit(
+                surface.clone(),
+                owner_turn("Stop it and delete what it made.", "k2"),
+            )
+            .await;
+        assert!(agent.work.lock().unwrap().is_empty());
+        assert_eq!(agent.recorded.lock().unwrap().len(), 1);
+        // The turn runs on its own task.
+        for _ in 0..200 {
+            if !agent.turns.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            agent.turns.lock().unwrap().as_slice(),
+            ["Stop it and delete what it made."]
+        );
+    }
+
     /// Only helpers and background commands run, no turn (live 2026-11-13:
     /// "how's it going?" became a turn that said "Still working on
     /// \"how's it going?\" (1s so far)"). A question about them is answered
@@ -2125,8 +2259,11 @@ mod tests {
             reading: std::sync::Mutex::new(Some(MidRunReading {
                 intent: MidRunIntent::AboutRunningWork,
                 stop: Vec::new(),
+                also_asks: false,
             })),
             work: std::sync::Mutex::new(two_counting_jobs()),
+            recorded: Default::default(),
+            turns: Default::default(),
         });
         let registry = Arc::new(TaskRegistry::new(10));
         let runner = TurnRunner::new(TurnDeps {
@@ -2161,6 +2298,7 @@ mod tests {
         *agent.reading.lock().unwrap() = Some(MidRunReading {
             intent: MidRunIntent::Unrelated,
             stop: Vec::new(),
+            also_asks: false,
         });
         runner
             .submit(
@@ -2188,6 +2326,8 @@ mod tests {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
             work: std::sync::Mutex::new(work),
+            recorded: Default::default(),
+            turns: Default::default(),
         });
         let registry = TaskRegistry::new(10);
         let reply =
@@ -2219,6 +2359,8 @@ mod tests {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
             work: std::sync::Mutex::new(two_counting_jobs()),
+            recorded: Default::default(),
+            turns: Default::default(),
         });
         let registry = TaskRegistry::new(10);
         let stopped =
@@ -2244,6 +2386,8 @@ mod tests {
             release: tokio::sync::Notify::new(),
             reading: std::sync::Mutex::new(None),
             work: std::sync::Mutex::new(work),
+            recorded: Default::default(),
+            turns: Default::default(),
         };
         let registry = TaskRegistry::new(10);
         let running = crate::stop::running_work(&registry, &agent, "s1").await;

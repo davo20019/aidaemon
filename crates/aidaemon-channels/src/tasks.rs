@@ -506,6 +506,17 @@ impl TaskRegistry {
         }
     }
 
+    /// Undo [`Self::mark_seen`] for a message handled in two steps (a stop
+    /// done now, the rest of the message then run or queued), so its second
+    /// step is not taken for a duplicate delivery.
+    pub async fn unmark_seen(&self, session_id: &str, text: &str, dedup_key: Option<&str>) {
+        let hash = Self::text_hash(dedup_key.unwrap_or(text));
+        self.recently_seen
+            .write()
+            .await
+            .remove(&(session_id.to_string(), hash));
+    }
+
     /// Queue a message for later processing.
     /// Returns `Some(position)` if queued, or `None` if deduplicated (identical message
     /// already exists in the queue or was recently processed).

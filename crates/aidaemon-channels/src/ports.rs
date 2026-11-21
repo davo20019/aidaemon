@@ -196,6 +196,10 @@ pub struct MidRunReading {
     /// [`RunningWork::running`] items to stop; empty for what bare `/cancel`
     /// stops.
     pub stop: Vec<u64>,
+    /// For [`MidRunIntent::StopsWork`]: the message also asks for something
+    /// besides stopping ("stop it and delete the project"), which then runs
+    /// as its own turn once the work is stopped.
+    pub also_asks: bool,
 }
 
 /// A sub-agent running for a chat, as `/status` and `/tasks` list it.
@@ -252,6 +256,20 @@ pub trait ChannelAgentRuntime: AgentIngress {
         _work: &RunningWork,
     ) -> Option<MidRunReading> {
         None
+    }
+
+    /// Keep an exchange the channel answered itself (a stop, a status
+    /// question) in the conversation: the owner's message and the reply,
+    /// as one turn, so the chat shows what they sent and later turns can
+    /// refer to it. Default: nothing kept.
+    async fn record_control_exchange(
+        &self,
+        _session_id: &str,
+        _owner_text: &str,
+        _user_role: aidaemon_tools::semantics::UserRole,
+        _channel_ctx: &ChannelContext,
+        _reply: &str,
+    ) {
     }
 
     /// The sub-agents running now for `session_id` (waited on by a turn or

@@ -333,6 +333,28 @@ impl AgentIngress for Agent {
 
 #[async_trait]
 impl ChannelAgentRuntime for Agent {
+    async fn record_control_exchange(
+        &self,
+        session_id: &str,
+        owner_text: &str,
+        user_role: aidaemon_tools::semantics::UserRole,
+        channel_ctx: &aidaemon_channels::context::ChannelContext,
+        reply: &str,
+    ) {
+        if let Err(error) = crate::turn::notes::TurnNotes::record_control_exchange(
+            self,
+            session_id,
+            owner_text,
+            user_role,
+            channel_ctx,
+            reply,
+        )
+        .await
+        {
+            tracing::warn!(session_id, %error, "Could not keep a stop or status exchange in history");
+        }
+    }
+
     async fn read_mid_run_message(
         &self,
         _session_id: &str,
