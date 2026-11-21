@@ -1191,7 +1191,10 @@ impl TurnEngine<'_> {
             let dialogue =
                 crate::turn::dialogue_state::get_or_rebuild_dialogue_state(self.host, session_id)
                     .await;
-            if internal_continuation {
+            let owner_only_chat = channel_ctx.visibility
+                == aidaemon_core::ChannelVisibility::Private
+                && crate::untrusted::origin_is_owner_authored(user_role, session_id);
+            let lineage = if internal_continuation {
                 // A continuation's text is the runtime's report of work that
                 // ended, never the owner's follow-up: the request is the
                 // owner's own unfinished one (live 2026-11-13: a CLI agent's
@@ -1208,7 +1211,13 @@ impl TurnEngine<'_> {
                     user_text,
                     chrono::Utc::now(),
                 )
-            }
+            };
+            crate::turn::dialogue_state::verifier_context(
+                &dialogue,
+                lineage,
+                (!internal_continuation).then_some(user_text),
+                owner_only_chat,
+            )
         } else {
             None
         };
