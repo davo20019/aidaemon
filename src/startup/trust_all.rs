@@ -72,31 +72,34 @@ mod tests {
     use super::*;
 
     /// The owner's command turns trust-all on and off, persisted for the
-    /// terminal's backend, and reports the state with no argument.
+    /// terminal's backend, and reports the state with no argument. Off stays
+    /// off after a restart (2026-11-21: an old table copied `*` back on every
+    /// start).
     #[tokio::test]
     async fn the_owner_switches_trust_all_on_and_off() {
         let pool_file = tempfile::NamedTempFile::new().unwrap();
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
             .await
             .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let terminal = TerminalTool::new(
-            crate::execution::active_execution_backend(),
-            Vec::new(),
-            crate::tools::ApprovalBroker::new(tx),
-            1,
-            1000,
-            crate::types::PermissionMode::Default,
-            pool.clone(),
-        )
-        .await;
-        let persisted = || async {
-            sqlx::query_scalar::<_, String>(
-                "SELECT prefix FROM terminal_backend_allowed_prefixes WHERE prefix = '*'",
+        let start = || async {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            TerminalTool::new(
+                crate::execution::active_execution_backend(),
+                Vec::new(),
+                crate::tools::ApprovalBroker::new(tx),
+                1,
+                1000,
+                crate::types::PermissionMode::Default,
+                pool.clone(),
             )
-            .fetch_all(&pool)
             .await
-            .unwrap()
+        };
+        let terminal = start().await;
+        let persisted = || async {
+            sqlx::query_scalar::<_, String>("SELECT backend_scope FROM terminal_trust_all")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
         };
 
         assert!(run_with(&terminal, "").await.contains("is off"));
@@ -106,5 +109,16 @@ mod tests {
         assert!(run_with(&terminal, "off").await.contains("is off"));
         assert!(!terminal.trust_all_enabled().await);
         assert!(persisted().await.is_empty());
+        // The next start reads it off, and saves no `*` prefix anywhere.
+        assert!(!start().await.trust_all_enabled().await);
+        let stars: Vec<String> = sqlx::query_scalar(
+            "SELECT prefix FROM terminal_backend_allowed_prefixes WHERE prefix = '*'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(stars.is_empty());
+        assert!(run_with(&start().await, "on").await.contains("is on"));
+        assert!(start().await.trust_all_enabled().await);
     }
 }

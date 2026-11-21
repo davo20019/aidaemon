@@ -836,6 +836,9 @@ pub struct TerminalTool {
     /// `read:<path>`, `write:<path>`). Session grants live here only;
     /// Allow-Always grants are also persisted.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
+    /// Every command is allowed: the owner's `/trustall` (stored apart from
+    /// the prefixes, see `terminal_grants`) or YOLO mode.
+    trust_all: Arc<std::sync::atomic::AtomicBool>,
     /// Permission persistence mode: picks the buttons on the owner's cards.
     permission_mode: PermissionMode,
     /// Host vs sandbox execution.
@@ -3728,92 +3731,43 @@ impl TerminalTool {
             }
         }
 
-        // Load persisted prefixes from DB and merge with config defaults
-        let mut merged = allowed_prefixes;
-
-        // YOLO mode: auto-approve everything
-        if permission_mode == PermissionMode::Yolo && !merged.contains(&"*".to_string()) {
-            merged.push("*".to_string());
-        }
-        if let Err(error) = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS terminal_backend_allowed_prefixes (
-                backend_scope TEXT NOT NULL,
-                prefix TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (backend_scope, prefix)
-            )",
-        )
-        .execute(&pool)
-        .await
-        {
-            warn!(%error, "Failed to initialize backend-scoped terminal approvals");
-        }
-
-        // Preserve historical local approvals only for the local target. They
-        // are deliberately never inherited by Docker or SSH.
-        if backend.kind() == BackendKind::Local {
-            let _ = sqlx::query(
-                "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                    (backend_scope, prefix)
-                 SELECT 'local', prefix FROM terminal_allowed_prefixes",
-            )
-            .execute(&pool)
-            .await;
-        }
-        match sqlx::query_scalar::<_, String>(
-            "SELECT prefix FROM terminal_backend_allowed_prefixes WHERE backend_scope = ?",
-        )
-        .bind(backend.approval_scope())
-        .fetch_all(&pool)
-        .await
-        {
-            Ok(persisted) => {
-                let mut loaded = 0usize;
-                for p in persisted {
-                    if !merged.contains(&p) {
-                        merged.push(p);
-                        loaded += 1;
-                    }
-                }
-                // A count, not the entries: some are whole command lines.
-                info!(loaded, "Loaded persisted allowed prefixes");
-            }
-            Err(e) => {
-                warn!("Failed to load persisted terminal prefixes: {}", e);
+        // Configured prefixes, then the ones the owner allowed for good. A
+        // configured `*` (and YOLO mode) is trust-all, never a prefix.
+        let mut trust_all = permission_mode == PermissionMode::Yolo;
+        let mut merged: Vec<String> = Vec::new();
+        for prefix in allowed_prefixes {
+            if prefix == "*" {
+                trust_all = true;
+            } else if !merged.contains(&prefix) {
+                merged.push(prefix);
             }
         }
         let mut persisted_capabilities = HashSet::new();
-        if let Err(error) = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS terminal_capability_grants (
-                backend_scope TEXT NOT NULL,
-                prefix TEXT NOT NULL,
-                capability TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (backend_scope, prefix, capability)
-            )",
-        )
-        .execute(&pool)
-        .await
-        {
-            warn!(
-                "Failed to create terminal_capability_grants table: {}",
-                error
-            );
+        let loaded = async {
+            super::terminal_grants::ensure_schema(&pool).await?;
+            super::terminal_grants::load(&pool, backend.approval_scope()).await
         }
-        match sqlx::query_as::<_, (String, String)>(
-            "SELECT prefix, capability FROM terminal_capability_grants WHERE backend_scope = ?",
-        )
-        .bind(backend.approval_scope())
-        .fetch_all(&pool)
-        .await
-        {
-            Ok(rows) => {
-                for (prefix, capability) in rows {
-                    info!(prefix = %prefix, capability = %capability, "Loaded persisted capability grant");
-                    persisted_capabilities.insert((prefix, capability));
+        .await;
+        match loaded {
+            Ok(grants) => {
+                let mut loaded = 0usize;
+                for prefix in grants.prefixes {
+                    if !merged.contains(&prefix) {
+                        merged.push(prefix);
+                        loaded += 1;
+                    }
                 }
+                persisted_capabilities = grants.capabilities;
+                trust_all |= grants.trust_all;
+                // Counts, not the entries: some are whole command lines.
+                info!(
+                    loaded,
+                    capabilities = persisted_capabilities.len(),
+                    trust_all,
+                    "Loaded the terminal's standing approvals"
+                );
             }
-            Err(e) => warn!("Failed to load persisted capability grants: {}", e),
+            Err(error) => warn!(%error, "Could not load the terminal's standing approvals"),
         }
 
         Self {
@@ -3821,6 +3775,7 @@ impl TerminalTool {
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
+            trust_all: Arc::new(std::sync::atomic::AtomicBool::new(trust_all)),
             permission_mode,
             confinement: aidaemon_tools::TerminalConfinement::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -3946,10 +3901,10 @@ impl TerminalTool {
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
-        let prefixes = self.allowed_prefixes.read().await;
-        if prefixes.iter().any(|p| p == "*") {
+        if self.trust_all_enabled().await {
             return true;
         }
+        let prefixes = self.allowed_prefixes.read().await;
         let trimmed = command.trim();
         // A grant names a program. A command that launches another program
         // through it, writes a file by redirection or sets variables for it
@@ -3994,7 +3949,7 @@ impl TerminalTool {
                     if binary.is_empty() {
                         return true;
                     }
-                    prefixes.iter().any(|p| p == "*" || binary == p.as_str())
+                    prefixes.iter().any(|p| binary == p.as_str())
                 });
             }
             return false;
@@ -4674,13 +4629,7 @@ impl TerminalTool {
         if capabilities.is_empty() {
             return true;
         }
-        if self
-            .allowed_prefixes
-            .read()
-            .await
-            .iter()
-            .any(|prefix| prefix == "*")
-        {
+        if self.trust_all_enabled().await {
             return true;
         }
         let grants = self.capability_grants.read().await;
@@ -4704,14 +4653,12 @@ impl TerminalTool {
                     continue;
                 }
                 if let Some(ref pool) = self.pool
-                    && let Err(e) = sqlx::query(
-                        "INSERT OR IGNORE INTO terminal_capability_grants
-                            (backend_scope, prefix, capability) VALUES (?, ?, ?)",
+                    && let Err(e) = super::terminal_grants::add_capability(
+                        pool,
+                        self.backend.approval_scope(),
+                        &key,
+                        capability,
                     )
-                    .bind(self.backend.approval_scope())
-                    .bind(&key)
-                    .bind(capability)
-                    .execute(pool)
                     .await
                 {
                     warn!(prefix = %key, capability = %capability, "Failed to persist capability grant: {}", e);
@@ -4734,13 +4681,11 @@ impl TerminalTool {
 
                 // Persist to SQLite
                 if let Some(ref pool) = self.pool
-                    && let Err(e) = sqlx::query(
-                        "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                            (backend_scope, prefix) VALUES (?, ?)",
+                    && let Err(e) = super::terminal_grants::add_prefix(
+                        pool,
+                        self.backend.approval_scope(),
+                        &key,
                     )
-                    .bind(self.backend.approval_scope())
-                    .bind(&key)
-                    .execute(pool)
                     .await
                 {
                     warn!(prefix = %key, "Failed to persist allowed prefix: {}", e);
@@ -4992,35 +4937,17 @@ impl TerminalTool {
     /// Whether trust-all mode (every command auto-approved) is on for this
     /// backend.
     pub async fn trust_all_enabled(&self) -> bool {
-        self.allowed_prefixes.read().await.iter().any(|p| p == "*")
+        self.trust_all.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Turn trust-all mode on or off. Only the owner's `/trustall` command
     /// calls this; the model has no way to.
     pub async fn set_trust_all(&self, on: bool) -> anyhow::Result<()> {
-        let mut prefixes = self.allowed_prefixes.write().await;
-        let enabled = prefixes.iter().any(|p| p == "*");
-        if on == enabled {
-            return Ok(());
-        }
-        if on {
-            prefixes.push("*".to_string());
-        } else {
-            prefixes.retain(|p| p != "*");
-        }
         if let Some(ref pool) = self.pool {
-            let query = if on {
-                "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                    (backend_scope, prefix) VALUES (?, '*')"
-            } else {
-                "DELETE FROM terminal_backend_allowed_prefixes
-                    WHERE backend_scope = ? AND prefix = '*'"
-            };
-            sqlx::query(query)
-                .bind(self.backend.approval_scope())
-                .execute(pool)
-                .await?;
+            super::terminal_grants::set_trust_all(pool, self.backend.approval_scope(), on).await?;
         }
+        self.trust_all
+            .store(on, std::sync::atomic::Ordering::SeqCst);
         info!(on, "Trust-all mode changed by the owner");
         Ok(())
     }

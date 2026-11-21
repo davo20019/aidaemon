@@ -209,35 +209,9 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     // Long-term memory's tables belong to its store.
     aidaemon_memory::sqlite::migrate(pool).await?;
 
-    // Terminal allowed prefixes (persisted "Allow Always" approvals)
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS terminal_allowed_prefixes (
-            prefix TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    // Backend-scoped terminal approvals. Historical approvals apply only to
-    // local execution; Docker and SSH targets must establish their own trust.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS terminal_backend_allowed_prefixes (
-            backend_scope TEXT NOT NULL,
-            prefix TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (backend_scope, prefix)
-        )",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-            (backend_scope, prefix)
-         SELECT 'local', prefix FROM terminal_allowed_prefixes",
-    )
-    .execute(pool)
-    .await?;
+    // The terminal's standing approvals (prefixes, capabilities,
+    // trust-all) have one owner, which converts older shapes once.
+    crate::tools::terminal_grants::ensure_schema(pool).await?;
 
     // Command patterns for learning command safety over time
     sqlx::query(
@@ -1161,8 +1135,8 @@ mod state_version_tests {
              VALUES ('telegram:synthetic-user-1', 'user_message',
                      '{\"content\":\"Book the Acme Corp review, Alice Rivera\"}',
                      '2026-10-01T09:00:00Z')",
-            "INSERT INTO terminal_allowed_prefixes (prefix, created_at)
-             VALUES ('git status', '2026-10-01 09:00:01')",
+            "INSERT INTO terminal_backend_allowed_prefixes (backend_scope, prefix, created_at)
+             VALUES ('local', 'git status', '2026-10-01 09:00:01')",
             "INSERT INTO settings (key, value) VALUES ('synthetic_setting', 'kept')",
             "INSERT INTO session_context_boundaries (session_id, cleared_after_id, cleared_at)
              VALUES ('telegram:synthetic-user-1', 0, '2026-10-01T09:00:02Z')",
@@ -1176,7 +1150,7 @@ mod state_version_tests {
             .unwrap();
         let before = snapshot(&pool).await;
         assert_eq!(before["rows:settings"].len(), 1);
-        assert_eq!(before["rows:terminal_allowed_prefixes"].len(), 1);
+        assert_eq!(before["rows:terminal_backend_allowed_prefixes"].len(), 1);
         assert!(!before["rows:events"].is_empty());
 
         migrate_state(&pool).await.unwrap();
@@ -1245,15 +1219,29 @@ mod state_version_tests {
             "2026-01-03T00:00:00Z"
         );
         assert!(connection.get::<Option<String>, _>("account_id").is_none());
-        let prefixes: Vec<(String, String)> =
-            sqlx::query_as("SELECT prefix, created_at FROM terminal_allowed_prefixes")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        // The unscoped table's approvals moved to the local backend, with
+        // their dates, and the old table is gone.
+        let prefixes: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT backend_scope, prefix, created_at FROM terminal_backend_allowed_prefixes",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             prefixes,
-            vec![("cargo test".to_string(), "2026-01-02 00:00:00".to_string())]
+            vec![(
+                "local".to_string(),
+                "cargo test".to_string(),
+                "2026-01-02 00:00:00".to_string()
+            )]
         );
+        let legacy: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE name = 'terminal_allowed_prefixes'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(legacy.is_none());
         assert_eq!(recorded(&pool).await.len(), 1);
     }
 }
