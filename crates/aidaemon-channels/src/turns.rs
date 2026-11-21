@@ -630,17 +630,25 @@ impl TurnRunner {
                     // in parts can arrive as many.
                     if position <= 3 {
                         let notice = if steerable && crate::owner_wait::approval_open(&session_id) {
-                            crate::presentation::after_approval_notice()
+                            Some(crate::presentation::after_approval_notice())
                         } else if unread {
-                            crate::mid_run::unread_message_notice(
+                            Some(crate::mid_run::unread_message_notice(
                                 &self.running_work(&session_id).await,
-                            )
+                            ))
+                        } else if placement.is_some() {
+                            // The owner placed it themselves (an app's Now or
+                            // After), and the app lists it under "Waiting to
+                            // send": a "Got it" line would only sit in the
+                            // chat above the message it answers (live
+                            // 2026-11-21).
+                            None
                         } else {
-                            crate::presentation::queued_message_notice(
+                            Some(crate::presentation::queued_message_notice(
                                 !turn.attachments.is_empty() || !steerable,
-                            )
+                            ))
                         };
-                        if let Ok(ids) = surface.say(&notice).await
+                        if let Some(notice) = notice
+                            && let Ok(ids) = surface.say(&notice).await
                             && let [message_id] = ids.as_slice()
                         {
                             self.remember_queued_notice(
@@ -1809,11 +1817,14 @@ mod tests {
 
         // The owner's own placement wins over any reading: even a message
         // read as a question goes where the owner put it.
+        // The app lists a placed message under "Waiting to send": no "Got
+        // it" line is said for it.
         set(Some(MidRunReading {
             intent: MidRunIntent::AboutRunningWork,
             stop: Vec::new(),
             also_asks: false,
         }));
+        let said_before = surface.0.lock().unwrap().len();
         runner
             .submit_placed(
                 surface.clone(),
@@ -1821,10 +1832,7 @@ mod tests {
                 Some(MidRunPlacement::Queue),
             )
             .await;
-        assert_eq!(
-            last(&surface),
-            crate::presentation::queued_message_notice(true)
-        );
+        assert_eq!(surface.0.lock().unwrap().len(), said_before);
         assert!(
             registry
                 .take_steering_messages(session, UserRole::Owner, &ctx)
@@ -1840,10 +1848,7 @@ mod tests {
                 Some(MidRunPlacement::Steer),
             )
             .await;
-        assert_eq!(
-            last(&surface),
-            crate::presentation::queued_message_notice(false)
-        );
+        assert_eq!(surface.0.lock().unwrap().len(), said_before);
         let taken = registry
             .take_steering_messages(session, UserRole::Owner, &ctx)
             .await;
