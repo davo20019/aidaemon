@@ -128,6 +128,26 @@ pub fn out_of_credit(status: u16, body: &str) -> bool {
             .is_some_and(|message| message.starts_with("Your credit balance is too low"))
 }
 
+/// Whether a rejection says the account's own spending limit is reached
+/// until a reset: Anthropic answers it with a 400 whose `error.type` is the
+/// generic `invalid_request_error`, and its fixed message ("You have
+/// reached your specified API usage limits. You will regain access on
+/// ...") is the only signal (external text with no structured signal,
+/// read for that status and type only). Waiting seconds or retrying the
+/// same account does not help; another provider may (live 2026-11-20: the
+/// safety check read it as a bad request and refused calls instead of
+/// asking the failover provider).
+fn spend_limit_reached(status: u16, body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    status == 400
+        && error_field(&value, "type") == Some("invalid_request_error")
+        && error_field(&value, "message").is_some_and(|message| {
+            message.starts_with("You have reached your specified API usage limits")
+        })
+}
+
 /// Whether a rejection names the request's tool definitions as the part at
 /// fault: OpenAI's `error.param` (`tools[9].parameters`), or, when the
 /// backend sends only a message, its fixed "Invalid schema for 'tools["
@@ -159,6 +179,14 @@ pub fn error_for_status(status: u16, body: &str, detail: String) -> ProviderErro
             affordable_tokens: None,
         };
     }
+    if spend_limit_reached(status, body) {
+        return ProviderError::QuotaExhausted {
+            message: detail,
+            resets_at: None,
+            per_model: false,
+            in_stream: false,
+        };
+    }
     if let Some(limit) = context_overflow(status, body) {
         return ProviderError::ContextOverflow {
             message: detail,
@@ -183,6 +211,27 @@ pub fn error_for_status(status: u16, body: &str, detail: String) -> ProviderErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An account's own spending limit is a used-up quota on every model,
+    /// so callers go to another provider; a different bad request is not.
+    #[test]
+    fn a_reached_spend_limit_is_a_used_up_quota() {
+        let limit = r#"{"type":"error","error":{"type":"invalid_request_error","message":"You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC."}}"#;
+        assert!(matches!(
+            error_for_status(400, limit, "HTTP 400".into()),
+            ProviderError::QuotaExhausted {
+                per_model: false,
+                in_stream: false,
+                ..
+            }
+        ));
+        let other = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: roles must alternate"}}"#;
+        assert!(matches!(
+            error_for_status(400, other, "HTTP 400".into()),
+            ProviderError::InvalidRequest(_)
+        ));
+        assert!(!spend_limit_reached(500, limit));
+    }
 
     #[test]
     fn overflow_reads_each_providers_wording_and_limit() {

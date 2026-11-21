@@ -47,11 +47,11 @@ impl AgentIngress for Agent {
         let text = request.user_text.to_lowercase();
         if let Some(status) = request.status_tx.as_ref() {
             let _ = status
-                .send(StatusUpdate::ToolStart {
-                    name: "terminal".into(),
-                    summary: "reading the synthetic notes".into(),
-                    kind: aidaemon_core::card::ActivityKind::Read,
-                })
+                .send(StatusUpdate::tool_start(
+                    "terminal",
+                    "reading the synthetic notes",
+                    aidaemon_core::card::ActivityKind::Read,
+                ))
                 .await;
             // "slow" keeps it working a while, to watch a working row.
             let pause = if text.contains("slow") { 30_000 } else { 600 };
@@ -304,7 +304,7 @@ impl ClientHost for Host {
                         .post_greeting(
                             &aidaemon_client_gateway::new_app_session_id(),
                             "Welcome",
-                            "Hi, I'm AIdaemon. I research, write, organize files, run commands \
+                            "Hi, I'm AIDaemon. I research, write, organize files, run commands \
                              and keep an eye on things for you on a schedule. I run on this \
                              computer. While it sleeps, I'm offline.\n\nI read and look things \
                              up on my own. Before anything that sends, posts, deletes or spends, \

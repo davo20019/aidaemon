@@ -219,6 +219,7 @@ async fn record_background_call(
                 error: failure.map(str::to_string),
                 provider_error_kind: None,
                 provider_status: None,
+                reasoning: None,
             },
             token_usage: response.usage.clone(),
         },

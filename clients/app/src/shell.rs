@@ -30,7 +30,21 @@ pub fn shell(store: Store) -> View {
     });
     // Back after a while away (a phone that froze the page, a minimized
     // window), everything is read again.
-    effect(move || store.note_lifecycle(lifecycle()));
+    effect(move || {
+        let now = lifecycle();
+        if now == nsh_core::platform::Lifecycle::Active {
+            // The link's socket may have died in the background: check it
+            // now, or try again now instead of after the backoff.
+            crate::link::woke();
+        }
+        store.note_lifecycle(now);
+    });
+    // A computer back from sleep: its connections may not have lived through it.
+    effect(move || {
+        if wake_count() > 0 {
+            crate::link::woke();
+        }
+    });
     let palette = signal(false);
     // Only entering and leaving setup remakes the page, not each step's news.
     let in_setup = computed(move || {

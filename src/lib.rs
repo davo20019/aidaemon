@@ -217,7 +217,14 @@ pub fn run() -> anyhow::Result<()> {
                 println!("{}\n", env!("CARGO_PKG_DESCRIPTION"));
                 println!("Usage: aidaemon [COMMAND]\n");
                 println!("Commands:");
-                println!("  install-service       Install as a system service (launchd/systemd)");
+                println!("  setup                 Connect a model in this terminal (first run)");
+                println!(
+                    "  service install       Run at login and start now (per user, no admin password)"
+                );
+                println!("  service uninstall     Stop it and remove it from login");
+                println!(
+                    "  install-service       Legacy: a system-wide service (sudo on Linux; not Windows)"
+                );
                 println!("  check-update          Check for available updates");
                 println!("  migrate [--config]    Run DB migrations and exit");
                 println!(
@@ -227,7 +234,7 @@ pub fn run() -> anyhow::Result<()> {
                 println!(
                     "  browser login          Launch Chrome to log into services for the agent"
                 );
-                println!("  share-screen          Share this computer's screen with your AIdaemon");
+                println!("  share-screen          Share this computer's screen with your AIDaemon");
                 println!("  attach <code>         Attach native terminal to /agent session");
                 println!("  agent attach <code>   Legacy alias for attach");
                 println!("  share [session_id]    Generate a Telegram /agent resume code");
@@ -248,8 +255,8 @@ pub fn run() -> anyhow::Result<()> {
                     "  client-token          Mint the local Client Gateway token (revokes the old)"
                 );
                 println!("  pair                  Pair a phone or browser with the Client Gateway");
-                println!("  app                   Open the AIdaemon app in a window");
-                println!("  tui                   Run the AIdaemon app in this terminal");
+                println!("  app                   Open the AIDaemon app in a window");
+                println!("  tui                   Run the AIDaemon app in this terminal");
                 println!("  keychain set <key>    Store a secret in the OS keychain");
                 println!("  keychain get <key>    Retrieve a secret from the OS keychain");
                 println!("  keychain delete <key> Remove a secret from the OS keychain");
@@ -313,7 +320,7 @@ pub fn run() -> anyhow::Result<()> {
             }
             "dashboard" => {
                 anyhow::bail!(
-                    "The dashboard page is gone: its status lives in the AIdaemon app \
+                    "The dashboard page is gone: its status lives in the AIDaemon app \
                      (aidaemon app, aidaemon tui, or the web app the gateway serves)."
                 );
             }
@@ -324,22 +331,33 @@ pub fn run() -> anyhow::Result<()> {
                 return nodes::cli::handle_node_command(&args[2..], config_path.as_path());
             }
             "client-token" => {
-                return handle_client_token_command(&args[2..], config_path.as_path());
+                return handle_client_token_command(
+                    &args[2..],
+                    client_config_path(&config_path).as_path(),
+                );
             }
             "pair" => {
-                return handle_pair_command(&args[2..], config_path.as_path(), false);
+                return handle_pair_command(
+                    &args[2..],
+                    client_config_path(&config_path).as_path(),
+                    false,
+                );
             }
             "share-screen" => {
                 return share_screen::run(&args[2..]);
             }
             "web" => {
-                return handle_pair_command(&args[2..], config_path.as_path(), true);
+                return handle_pair_command(
+                    &args[2..],
+                    client_config_path(&config_path).as_path(),
+                    true,
+                );
             }
             "tui" => {
-                return handle_tui_command(&args[2..], config_path.as_path());
+                return handle_tui_command(&args[2..], client_config_path(&config_path).as_path());
             }
             "app" => {
-                return handle_app_command(&args[2..], config_path.as_path());
+                return handle_app_command(&args[2..], client_config_path(&config_path).as_path());
             }
             other => {
                 if let Some(agent) = normalize_terminal_agent_name(other) {
@@ -606,14 +624,14 @@ fn handle_service_command(args: &[String]) -> anyhow::Result<()> {
             };
             daemon::install_user_service(&dir)?;
             println!(
-                "AIdaemon runs at login from {} and is starting now.",
+                "AIDaemon runs at login from {} and is starting now.",
                 dir.display()
             );
             Ok(())
         }
         Some("uninstall") => {
             daemon::uninstall_user_service()?;
-            println!("AIdaemon no longer runs at login. Its files are kept.");
+            println!("AIDaemon no longer runs at login. Its files are kept.");
             Ok(())
         }
         _ => {
@@ -766,6 +784,21 @@ fn handle_client_token_command(args: &[String], config_path: &Path) -> anyhow::R
 }
 
 /// The gateway's settings for a client command, or the steps to turn it on.
+/// The config a client command (`app`, `tui`, `pair`, `web`, `client-token`)
+/// reads: this folder's `config.toml`, else the per-user install's
+/// (`~/.aidaemon/config.toml`, where `aidaemon service install` runs the
+/// daemon), so these commands work from any folder.
+fn client_config_path(here: &Path) -> PathBuf {
+    if here.is_file() {
+        return here.to_path_buf();
+    }
+    daemon::default_home()
+        .map(|home| home.join("config.toml"))
+        .ok()
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| here.to_path_buf())
+}
+
 fn client_gateway_ready(
     config_path: &Path,
 ) -> anyhow::Result<aidaemon_client_gateway::ClientGatewayConfig> {
@@ -787,9 +820,9 @@ fn handle_tui_command(args: &[String], config_path: &Path) -> anyhow::Result<()>
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("Usage: aidaemon tui");
         println!();
-        println!("The AIdaemon app in this terminal: chat, every chat's turns and approvals.");
-        println!("Needs [client_gateway] enabled and the aidaemon-app binary (it ships with");
-        println!("releases and install.sh).");
+        println!("The AIDaemon app in this terminal: chat, every chat's turns and approvals.");
+        println!("Needs the aidaemon-app binary (it ships with releases and install.sh).");
+        println!("With no config yet, the app sets AIDaemon up the first time.");
         return Ok(());
     }
     if let Some(other) = args.first() {
@@ -798,13 +831,13 @@ fn handle_tui_command(args: &[String], config_path: &Path) -> anyhow::Result<()>
     launch_app(config_path, true)
 }
 
-/// `aidaemon app`: the AIdaemon app in a window on this machine.
+/// `aidaemon app`: the AIDaemon app in a window on this machine.
 fn handle_app_command(args: &[String], config_path: &Path) -> anyhow::Result<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("Usage: aidaemon app");
         println!();
-        println!("The AIdaemon app in a window: chat, approvals and running work.");
-        println!("Needs [client_gateway] enabled and the aidaemon-app binary.");
+        println!("The AIDaemon app in a window: chat, approvals and running work.");
+        println!("Needs the aidaemon-app binary. With no config yet, it sets AIDaemon up.");
         return Ok(());
     }
     if let Some(other) = args.first() {
@@ -836,7 +869,6 @@ fn app_binary() -> Option<std::path::PathBuf> {
 /// Start the app against this machine's gateway, signed in with the owner's
 /// local token; the terminal build takes over this terminal until it quits.
 fn launch_app(config_path: &Path, terminal: bool) -> anyhow::Result<()> {
-    let settings = client_gateway_ready(config_path)?;
     let Some(binary) = app_binary() else {
         anyhow::bail!(
             "The aidaemon-app binary is not installed. It ships with each release (install.sh \
@@ -844,6 +876,20 @@ fn launch_app(config_path: &Path, terminal: bool) -> anyhow::Result<()> {
              --manifest-path clients/app/Cargo.toml"
         );
     };
+    // A fresh install has no config yet: the app's own first run sets the
+    // daemon up (Run it here), so open it as it is rather than refuse.
+    if !config_path.is_file() {
+        let mut command = std::process::Command::new(binary);
+        if terminal {
+            let status = command.arg("--tui").status()?;
+            anyhow::ensure!(status.success(), "the app exited with {status}");
+        } else {
+            command.spawn()?;
+            println!("Opened the AIDaemon app to set it up.");
+        }
+        return Ok(());
+    }
+    let settings = client_gateway_ready(config_path)?;
     let token = crate::startup::client_gateway::local_token_or_mint(&settings)?;
     let mut command = std::process::Command::new(binary);
     command
@@ -857,7 +903,7 @@ fn launch_app(config_path: &Path, terminal: bool) -> anyhow::Result<()> {
         anyhow::ensure!(status.success(), "the app exited with {status}");
     } else {
         command.spawn()?;
-        println!("Opened the AIdaemon app.");
+        println!("Opened the AIDaemon app.");
     }
     Ok(())
 }
@@ -955,7 +1001,7 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
         offer.fingerprint
     );
     if let Some(code) = (!open_web)
-        .then(|| qrcode::QrCode::new(link.as_bytes()).ok())
+        .then(|| qrcode::QrCode::new(offer.page_link().as_bytes()).ok())
         .flatten()
     {
         println!(
@@ -964,6 +1010,7 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
                 .quiet_zone(true)
                 .build()
         );
+        println!("Scan it with your phone's camera to pair the AIDaemon app.");
     }
     if open_web {
         let local = format!(

@@ -1,6 +1,6 @@
 [package]
 name = "nsh-app-aidaemon"
-description = "AIdaemon: chat, coding and agent management on desktop, web and terminal"
+description = "AIDaemon: chat, coding and agent management on desktop, web and terminal"
 license = "MIT"
 version = "0.1.0"
 edition = "2024"
@@ -23,6 +23,7 @@ serde_json = "1"
 base64 = "0.23"
 aidaemon-client-core = { path = "../../crates/aidaemon-client-core", default-features = false }
 aidaemon-client-protocol = { path = "../../crates/client-protocol" }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Timestamps in the owner's time.
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
@@ -33,7 +34,10 @@ tokio = { version = "1", features = ["sync", "time"] }
 reqwest = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 dirs = "6"
-# The terminal build (`--tui`): NSH's terminal surface and its input glue.
+
+# The terminal build (`--tui`, the desktops only): NSH's terminal surface
+# and its input glue. iOS and Android build the library alone.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 nsh-platform-tui = { version = "0.6.0", default-features = false, features = ["run-app"] }
 nsh-tui-host = "0.6.0"
 nsh-engine = "0.6.0"
@@ -52,6 +56,7 @@ wasm-bindgen-futures = "0.4"
 [dev-dependencies]
 nsh-engine = "0.6.0"
 nsh-testing = "0.6.0"
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
@@ -61,3 +66,6 @@ nsh-platform-macos = { version = "0.6.0", default-features = false, features = [
 
 [target.'cfg(target_os = "windows")'.dependencies]
 nsh-platform-windows = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+
+[build-dependencies]
+serde_json = "1"

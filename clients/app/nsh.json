@@ -1,10 +1,16 @@
 {
   "name": "AIdaemon",
   "id": "ai.aidaemon.app",
-  "version": "1.0.0",
+  "version": "0.21.0",
   "build": 1,
   "rust": ".",
   "root": "App",
   "theme": "theme.json",
-  "appearance": "system"
+  "appearance": "system",
+  "schemes": [
+    "aidaemon-pair"
+  ],
+  "android": {
+    "targetSdk": 36
+  }
 }

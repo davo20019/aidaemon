@@ -385,7 +385,7 @@ pub fn start(store: Store) {
             ClientIdentity {
                 kind: ClientKind::Web,
                 name: "aidaemon-app".into(),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
+                version: Some(crate::link::app_version()),
             },
             None,
             vec![Capability::ViewActions, Capability::Surfaces],

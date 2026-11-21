@@ -178,10 +178,12 @@ pub fn obligation_admissible(
     visible_tools.iter().any(|tool| admits(tool))
 }
 
-/// A bounded extra pass requested at stop time by something other than the
-/// ledger's expectations. These share the ledger's rule: the loop may ask for
-/// more only when something admissible could satisfy the request, and only
-/// within the demand's budget.
+/// Every bounded extra pass a stop can ask for, and the one held wait. Each
+/// has its budget here and its spend in the run's one
+/// [`crate::engine::scope::StopBudgets`] table: a new stop-time ask is a new
+/// variant, never a counter of its own on the turn's scope. The loop may ask
+/// only when something admissible could satisfy the ask
+/// ([`stop_demand_verdict`]) and only within its budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopDemand {
     /// A mandate task lead must commit its decision with `manage_mandates
@@ -200,6 +202,24 @@ pub enum StopDemand {
     /// The run changed source files in a repository and ran no command
     /// since; a command (a build, type-check or test) closes it.
     CodeChangeUnchecked,
+    /// The ledger still holds reachable expectations; its own closeout
+    /// (`closeout_demands_work`) judges which.
+    LedgerExpectations,
+    /// A change succeeded and an observation of it is still reachable: the
+    /// verify-once pass, part of a ledger demand.
+    VerifyAfterMutation,
+    /// A failure nothing credited, with nothing reachable left: the
+    /// recovery pass, part of a ledger demand.
+    FailureRecovery,
+    /// The run declared work and attempted none of it
+    /// (`RunAggregate::unattempted_declared_work`).
+    UnattemptedWork,
+    /// A `partial` verdict with nothing typed in its way and declared items
+    /// still open.
+    PartialWithoutObstacle,
+    /// A job this run started still runs with nothing to report it: the
+    /// stop is held (a wait, not a model pass) until it ends.
+    UnreportedJobWait,
 }
 
 /// The exact call that satisfies `StopDemand::MandateDecisionCommit`.
@@ -207,6 +227,26 @@ pub const MANDATE_DECISION_TOOL: &str = aidaemon_work::tools::mandate_review::MA
 pub const MANDATE_DECISION_CALL: &str = r#"{"action":"record_decision"}"#;
 
 impl StopDemand {
+    /// Every stop-time ask, in the budget table's order.
+    pub const ALL: [StopDemand; 11] = [
+        Self::MandateDecisionCommit,
+        Self::GuiClickVerification,
+        Self::ReplyRepair,
+        Self::CombinedVerification,
+        Self::CodeChangeUnchecked,
+        Self::LedgerExpectations,
+        Self::VerifyAfterMutation,
+        Self::FailureRecovery,
+        Self::UnattemptedWork,
+        Self::PartialWithoutObstacle,
+        Self::UnreportedJobWait,
+    ];
+
+    /// Its row in the budget table.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
     /// The decision-point condition each verdict is recorded under.
     pub fn condition(self) -> &'static str {
         match self {
@@ -215,17 +255,29 @@ impl StopDemand {
             Self::ReplyRepair => "final_reply_defect",
             Self::CombinedVerification => "combined_changes_unverified",
             Self::CodeChangeUnchecked => "code_change_unchecked",
+            Self::LedgerExpectations => "ledger_expectations_required",
+            Self::VerifyAfterMutation => "verification_after_mutation",
+            Self::FailureRecovery => "external_mutation_recovery_required",
+            Self::UnattemptedWork => "declared_work_unattempted",
+            Self::PartialWithoutObstacle => "partial_without_obstacle",
+            Self::UnreportedJobWait => "unreported_job_running_at_stop",
         }
     }
 
     /// How many times one run may ask for this demand.
     pub fn budget(self) -> u32 {
         match self {
+            Self::GuiClickVerification => 3,
+            Self::LedgerExpectations => crate::engine::stop::MAX_CLOSEOUT_DEMANDS,
             Self::MandateDecisionCommit
             | Self::ReplyRepair
             | Self::CombinedVerification
-            | Self::CodeChangeUnchecked => 1,
-            Self::GuiClickVerification => 3,
+            | Self::CodeChangeUnchecked
+            | Self::VerifyAfterMutation
+            | Self::FailureRecovery
+            | Self::UnattemptedWork
+            | Self::PartialWithoutObstacle
+            | Self::UnreportedJobWait => 1,
         }
     }
 }
@@ -276,6 +328,14 @@ pub fn stop_demand_verdict(
         StopDemand::GuiClickVerification => !authority.forbids_tool_use,
         StopDemand::ReplyRepair => true,
         StopDemand::CombinedVerification => !authority.forbids_tool_use,
+        // Judged where they arise from the ledger and the run's typed
+        // state (each needs a change or an observation, so tools), or a
+        // wait that asks the model nothing.
+        StopDemand::LedgerExpectations | StopDemand::UnreportedJobWait => true,
+        StopDemand::VerifyAfterMutation
+        | StopDemand::FailureRecovery
+        | StopDemand::UnattemptedWork
+        | StopDemand::PartialWithoutObstacle => !authority.forbids_tool_use,
         // Only a tool that runs a shell command line can build or test, and
         // only when this run may call it.
         StopDemand::CodeChangeUnchecked => {

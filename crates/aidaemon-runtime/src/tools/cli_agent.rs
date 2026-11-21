@@ -3526,10 +3526,7 @@ impl CliAgentTool {
                             &aidaemon_tools::semantics::ToolDispatchFacts::default(),
                             false,
                         );
-                        let _ = tx.try_send(StatusUpdate::ToolComplete {
-                            name: label,
-                            summary,
-                        });
+                        let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                     }
 
                     return Ok(with_left(format!(
@@ -3560,10 +3557,7 @@ impl CliAgentTool {
                             &aidaemon_tools::semantics::ToolDispatchFacts::default(),
                             false,
                         );
-                        let _ = tx.try_send(StatusUpdate::ToolComplete {
-                            name: label,
-                            summary,
-                        });
+                        let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                     }
                     Self::quarantine_unavailable_tool(
                         &self.tools,
@@ -3617,10 +3611,7 @@ impl CliAgentTool {
                         &aidaemon_tools::semantics::ToolDispatchFacts::default(),
                         false,
                     );
-                    let _ = tx.try_send(StatusUpdate::ToolComplete {
-                        name: label,
-                        summary,
-                    });
+                    let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                 }
 
                 if exit_code != Some(0) {
@@ -4093,6 +4084,11 @@ impl CliAgentTool {
 
 #[derive(Deserialize)]
 struct CliAgentArgs {
+    /// The indices of the caller's checklist items this run carries out
+    /// (the same typed link `terminal` takes): a change the run makes
+    /// settles them.
+    #[serde(default)]
+    checklist_items: Vec<usize>,
     #[serde(default)]
     action: Option<String>,
     tool: Option<String>,
@@ -4737,6 +4733,12 @@ impl Tool for CliAgentTool {
                     "async_mode": {
                         "type": "boolean",
                         "description": "Run in background; use true to dispatch independent sub-tasks in parallel"
+                    },
+                    "checklist_items": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "uniqueItems": true,
+                        "description": "The indices of your checklist items this run carries out, so a change it makes settles them."
                     }
                 },
                 "required": ["action"],
@@ -5158,6 +5160,25 @@ impl CliAgentTool {
         if changed && outcome.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded) {
             outcome.metadata.semantics = changed_locally_semantics(true)
                 .with_verification_mode(ToolVerificationMode::ResultContent);
+            // The change receipt says the run's write roots changed, not
+            // which files or what kind of write: a delegated agent's edits
+            // are untyped. The items the run says it carries out are settled
+            // by it (`UNSPECIFIED`); without a claim, the one change item in
+            // progress may be (live 2026-11-20: an agy run that built the
+            // site was read as not proving its "write the source" item, and
+            // the turn spent four more model calls ticking it).
+            let claimed = parsed
+                .as_ref()
+                .map(|args| args.checklist_items.clone())
+                .unwrap_or_default();
+            if claimed.is_empty() {
+                outcome.metadata.changes_untyped = true;
+            } else {
+                outcome.metadata.semantics = outcome.metadata.semantics.with_untyped_change();
+                if outcome.metadata.checklist_items.is_empty() {
+                    outcome.metadata.checklist_items = claimed;
+                }
+            }
         }
         outcome.metadata.background_settled = settled && !left_in_background;
         if outcome.metadata.background_started {
@@ -7824,6 +7845,56 @@ mod tests {
             Some(ToolOutcomeStatus::Backgrounded)
         );
         assert!(started.metadata.background_started);
+    }
+
+    /// A run that changed its write roots is an untyped change: the items
+    /// it names are settled by it, and without a claim the runtime may give
+    /// it to the one item in progress.
+    #[tokio::test]
+    #[cfg_attr(windows, ignore = "Unix shell agent; the typing is platform-neutral")]
+    async fn a_run_that_changed_its_folder_settles_the_items_it_names() {
+        let (tool, _db) = setup_bash_tool().await;
+        for (claim, session) in [
+            (true, "session-cli-claim"),
+            (false, "session-cli-unclaimed"),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let root = dir.path().to_string_lossy().to_string();
+            let mut args = json!({
+                "action": "run",
+                "tool": "bash-agent",
+                "prompt": format!("echo site > {root}/index.html"),
+                "working_dir": root,
+                "workspace_mode": "read_write",
+                "write_paths": [root],
+            });
+            if claim {
+                args["checklist_items"] = json!([1]);
+            }
+            let outcome = tool
+                .outcome_with_facts(
+                    &args.to_string(),
+                    None,
+                    false,
+                    &aidaemon_tools::testing::call_facts(session),
+                )
+                .await
+                .unwrap();
+            assert!(dir.path().join("index.html").exists(), "{}", outcome.output);
+            let semantics = &outcome.metadata.semantics;
+            assert!(semantics.mutates_state(), "{}", outcome.output);
+            if claim {
+                assert_eq!(outcome.metadata.checklist_items, vec![1]);
+                assert!(
+                    semantics
+                        .mutation_effects
+                        .intersects(aidaemon_tools::semantics::ToolMutationEffects::UNSPECIFIED)
+                );
+            } else {
+                assert!(outcome.metadata.checklist_items.is_empty());
+                assert!(outcome.metadata.changes_untyped);
+            }
+        }
     }
 
     fn started_task_id(output: &str) -> String {

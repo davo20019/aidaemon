@@ -837,10 +837,7 @@ mod tests {
             true,
             Some(Step::Doing(ActivityKind::Run)),
         ))));
-        assert!(!live.note(&StatusUpdate::ToolComplete {
-            name: "reading a file".into(),
-            summary: "done".into(),
-        }));
+        assert!(!live.note(&StatusUpdate::tool_complete("reading a file", "done")));
         assert!(live.note(&StatusUpdate::StepHandedOff {
             kind: ActivityKind::Delegate,
         }));

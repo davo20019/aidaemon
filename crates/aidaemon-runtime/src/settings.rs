@@ -96,10 +96,19 @@ pub struct DecisionModes {
     pub model_route: DecisionMode,
     #[serde(default)]
     pub command_risk_second: DecisionMode,
+    /// A calibrated answer may clear an egress call after untrusted
+    /// content without the full check (`Decision::UntrustedEgressClear`).
+    /// On by default; with no calibrated backend it does nothing.
+    #[serde(default = "decision_mode_on")]
+    pub untrusted_egress_clear: DecisionMode,
 }
 
 fn decision_mode_shadow() -> DecisionMode {
     DecisionMode::Shadow
+}
+
+fn decision_mode_on() -> DecisionMode {
+    DecisionMode::On
 }
 
 impl Default for DecisionModes {
@@ -110,6 +119,7 @@ impl Default for DecisionModes {
             recall_filter: DecisionMode::Shadow,
             model_route: DecisionMode::Off,
             command_risk_second: DecisionMode::Off,
+            untrusted_egress_clear: DecisionMode::On,
         }
     }
 }

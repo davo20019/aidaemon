@@ -237,6 +237,36 @@ async fn a_cutoff_raises_output_room_then_lowers_reasoning() {
     assert_eq!(requests[2].options.reasoning_effort.as_deref(), Some("low"));
 }
 
+/// A reply that stopped at the output limit while writing a tool call (some
+/// text, then a file cut off mid-call) raises the output room too: the
+/// typed flag counts, whatever text came before (live 2026-11-20: a whole
+/// package written in one call was cut off twice at the same ceiling).
+#[tokio::test]
+async fn a_cut_off_tool_call_after_text_raises_output_room() {
+    let cut_with_text = sdk::ModelResponse {
+        text: "Writing the package now.".into(),
+        usage: sdk::Usage {
+            output_tokens: 12_288,
+            ..Default::default()
+        },
+        cut_off: true,
+        ..Default::default()
+    };
+    let provider = Arc::new(ScriptedProvider::new([
+        cut_with_text,
+        text("done"),
+        text("after"),
+    ]));
+    let agent = builder(provider.clone())
+        .hook(CutoffAdjust::default())
+        .build()
+        .unwrap();
+
+    agent.run("s", "go").await.unwrap();
+
+    assert_eq!(provider.requests()[1].max_output_tokens, Some(24_576));
+}
+
 #[tokio::test]
 async fn output_clears_the_cutoff_count() {
     let hook = Arc::new(CutoffAdjust::default());

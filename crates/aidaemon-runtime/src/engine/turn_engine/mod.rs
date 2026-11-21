@@ -1191,7 +1191,10 @@ impl TurnEngine<'_> {
             let dialogue =
                 crate::turn::dialogue_state::get_or_rebuild_dialogue_state(self.host, session_id)
                     .await;
-            if internal_continuation {
+            let owner_only_chat = channel_ctx.visibility
+                == aidaemon_core::ChannelVisibility::Private
+                && crate::untrusted::origin_is_owner_authored(user_role, session_id);
+            let lineage = if internal_continuation {
                 // A continuation's text is the runtime's report of work that
                 // ended, never the owner's follow-up: the request is the
                 // owner's own unfinished one (live 2026-11-13: a CLI agent's
@@ -1208,7 +1211,13 @@ impl TurnEngine<'_> {
                     user_text,
                     chrono::Utc::now(),
                 )
-            }
+            };
+            crate::turn::dialogue_state::verifier_context(
+                &dialogue,
+                lineage,
+                (!internal_continuation).then_some(user_text),
+                owner_only_chat,
+            )
         } else {
             None
         };
@@ -1249,7 +1258,7 @@ impl TurnEngine<'_> {
             learning_consent: memory_turn.learning_consent.clone(),
             project: memory_turn.project.clone(),
             latest_tool_output: std::sync::Mutex::new(None),
-            reply_retry_used: AtomicBool::new(false),
+            stop_budgets: crate::engine::scope::StopBudgets::default(),
             text_only_next_call: text_only_next_call.clone(),
             pending_charge: std::sync::Mutex::new(None),
             known_project_dir: known_project_dir.clone(),
@@ -1277,12 +1286,7 @@ impl TurnEngine<'_> {
             placed_directives: std::sync::Mutex::new(Vec::new()),
             absorbed_steering: std::sync::Mutex::new(Vec::new()),
             sent_files: std::sync::Mutex::new(HashSet::new()),
-            combined_verification_demands: std::sync::atomic::AtomicU32::new(0),
             unchecked_code: std::sync::Mutex::new(Vec::new()),
-            code_check_demands: std::sync::atomic::AtomicU32::new(0),
-            mandate_commit_retries: std::sync::atomic::AtomicU32::new(0),
-            gui_verify_demands: std::sync::atomic::AtomicU32::new(0),
-            unreported_jobs_wait_spent: AtomicBool::new(false),
             budget_warning_sent: AtomicBool::new(false),
             model_call_timeouts: std::sync::atomic::AtomicU32::new(0),
             context_overflowed: AtomicBool::new(false),
@@ -1325,19 +1329,15 @@ impl TurnEngine<'_> {
             prefix_len,
             budget_goal,
             model_calls: AtomicU64::new(0),
-            closeout_demands: std::sync::atomic::AtomicU32::new(0),
             closeout_ended_unmet: AtomicBool::new(false),
             user_spoke_since_demand: AtomicBool::new(false),
-            verification_demanded: AtomicBool::new(false),
-            recovery_demanded: AtomicBool::new(false),
-            unattempted_work_demanded: AtomicBool::new(false),
-            partial_demanded: AtomicBool::new(false),
             not_attempted: std::sync::Mutex::new(Vec::new()),
             answered_past_quota: std::sync::Mutex::new(None),
             answered_by: std::sync::Mutex::new(None),
             took_over: std::sync::Mutex::new(None),
             executor_demanded_at: AtomicU64::new(u64::MAX),
             open_checklist_items: AtomicU64::new(0),
+            in_progress_change_item: AtomicU64::new(u64::MAX),
             checklist_declared: AtomicBool::new(false),
         };
         // A parent or goal cancellation stops the run at its next check.
@@ -1364,6 +1364,7 @@ impl TurnEngine<'_> {
                 working_area: scope.project_scope.as_deref(),
                 owned_folders: scope.spawn_family.owned_folders(),
                 produced_files: scope.spawn_family.produced_files(),
+                steered: Some(&scope.absorbed_steering),
             },
             owner: crate::approvals::OwnerApprovalResolver {
                 decisions: self.host,

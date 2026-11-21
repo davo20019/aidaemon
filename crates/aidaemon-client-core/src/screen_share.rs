@@ -52,7 +52,7 @@ async fn token(base: &str, auth: &Auth) -> Result<String, String> {
                 .ok_or("This computer is not paired: pair it first")?;
             let _ = base;
             GrantCache::default()
-                .token(&reqwest::Client::new(), &device, crate::signin::now_ms())
+                .token(&crate::tls::http_client(), &device, crate::signin::now_ms())
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -72,7 +72,7 @@ pub async fn share(
     let base = gateway.trim_end_matches('/').to_string();
     let token = token(&base, auth).await?;
     let (width, height) = source.size();
-    let reply: ServerFrame = reqwest::Client::new()
+    let reply: ServerFrame = crate::tls::http_client()
         .post(format!("{base}/client/v1/commands"))
         .bearer_auth(&token)
         .json(&ClientFrame::Command {

@@ -181,7 +181,7 @@ fn notify_at_the_computer(text: &str) {
     let _ = std::process::Command::new("osascript")
         .args([
             "-e",
-            &format!("display notification \"{text}\" with title \"AIdaemon\""),
+            &format!("display notification \"{text}\" with title \"AIDaemon\""),
         ])
         .spawn();
 }

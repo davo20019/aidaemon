@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The app runs on iOS and Android.** The phone app pairs with your daemon from a `/pair_device` link (or an opened `aidaemon-pair:` link), keeps its key in the iOS keychain or Android's private app storage, and offers "Pair again" when the daemon refuses its key. CI builds an Android APK and an iOS simulator build on every pull request; releases attach a signed APK and send an iOS build to TestFlight once their signing secrets are set. See "The phone app" in the README.
+- **Pair a phone from the desktop app.** Settings → Paired devices → Pair a phone shows a QR code the phone's camera opens, a **Send to my phone** button (the system's share menu: Messages, mail, AirDrop) and **Copy link**; you approve the phone right there. The phone app also picks up a pairing link you copied.
+- **The app shows its own version.** The System page lists "This app" (for example `0.22.0 (57)`) beside the daemon's version.
+- **Pairing links open the phone app.** `/pair_device` replies with a link to your own daemon's pairing page (`/client/v1/pair#…` at its public address) to tap on the phone, and the QR codes (the desktop app's and `aidaemon pair`'s) carry it too: chat apps and phone cameras open it, and the page opens the AIDaemon app (or its store page when it is missing) or pairs the browser instead. The pairing details stay in the link's fragment, which the browser never sends to the server.
+
+### Changed
+
+- **Android builds publish themselves.** Releases, and the new "Android beta" workflow (run by hand from any branch), build the signed app and upload it to Google Play's internal testing track once a service account key is set (`PLAY_SERVICE_ACCOUNT_JSON`); `scripts/ci-android-package.sh` holds the steps for both.
+
+- **The name is AIDaemon.** The app, messages, help text, README and crate descriptions say AIDaemon. Commands, crate names and the domain stay lowercase `aidaemon`; release file names (`AIdaemon-macos-*.dmg`, `AIdaemon.app`) and the Windows scheduled task keep their current names so downloads and existing installs keep working.
+- **`--help` and the installer point to the current commands.** `aidaemon --help` lists `setup`, `service install` and `service uninstall`, and marks `install-service` as the legacy system-wide service. `install.sh` suggests `aidaemon-app`, `aidaemon setup` and `aidaemon service install` instead of the old setup wizard and `install-service` (#21).
+- **README:** the SDK installs from crates.io (`aidaemon-sdk = "0.21"`) and the daemon with `cargo install --locked aidaemon`.
+
+### Fixed
+
+- **A phone connects right after pairing.** The link started by the pairing screen stopped when that screen gave way, so a newly paired phone stayed on "Connecting…" until the app was opened again; the link now outlives the screen that starts it.
+- **The app reconnects at once when you come back to it.** Back in the foreground (or a computer back from sleep), the app checks its connection right away and tries again now instead of after the retry wait it built up in the background, and a drop that happened while you were away does not show as an outage while it reconnects.
+- **The app no longer hangs on "Connecting…".** Signing in and opening the connection time out (30 s and 20 s) and the app shows why, instead of waiting forever on a network that drops packets; error messages name the underlying cause. The daemon logs each device sign-in, accepted or refused.
+
+- **`aidaemon app` and `aidaemon tui` work on a fresh install.** With no config yet they open `aidaemon-app`, whose first run sets AIDaemon up, instead of failing with "The Client Gateway is off". `app`, `tui`, `pair`, `web` and `client-token` also find `~/.aidaemon/config.toml` when run from another folder (#20).
+- **Settings nothing reads now say so.** `[provider] streaming` and `[people] auto_extract`, `auto_extract_categories` and `restricted_categories` log a warning at startup; `restricted_categories` never kept any category out of memory (#22).
+- **An API key sent over plain HTTP is flagged.** An OpenAI-compatible provider whose `base_url` is plain `http://` to another machine logs a warning at startup, since the key crosses the network unencrypted. Local servers (`localhost`, `127.0.0.1`, `::1`) and keyless servers are unaffected (#23).
+
 ## [0.21.0] - 2026-11-18
 
 ### Added

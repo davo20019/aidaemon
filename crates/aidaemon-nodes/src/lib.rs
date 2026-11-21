@@ -1,4 +1,4 @@
-//! First-class AIdaemon Node domain and protocol.
+//! First-class AIDaemon Node domain and protocol.
 //!
 //! A Node is a persistent participant with server-issued identity, observed
 //! hardware capabilities, explicit authorization, policy, and one or more

@@ -183,7 +183,10 @@ pub async fn record_approval(pool: &SqlitePool, command: &str) -> anyhow::Result
         .bind(&now)
         .execute(pool)
         .await?;
-        info!(pattern = %pattern, "Learned new command pattern from approval");
+        info!(
+            pattern = %crate::tools::terminal::LoggedCommand(&pattern),
+            "Learned new command pattern from approval"
+        );
     } else {
         debug!(pattern = %pattern, "Updated existing pattern approval count");
     }

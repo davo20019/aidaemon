@@ -1,5 +1,5 @@
 {
-  "description": "Deliver a short owner-requested spoken announcement to an enrolled, explicitly authorized audio-capable Node. Use when the owner asks AIdaemon to tell or announce something on a Companion.",
+  "description": "Deliver a short owner-requested spoken announcement to an enrolled, explicitly authorized audio-capable Node. Use when the owner asks AIDaemon to tell or announce something on a Companion.",
   "name": "send_node_audio",
   "schema": {
     "description": "Generate and deliver a short spoken announcement to an enrolled Node. This is owner-only external delivery; use only when the owner explicitly asks to play or say something on a Node.",

@@ -119,34 +119,6 @@ pub fn job_end(
     }
 }
 
-/// Tell each chat which of its background sub-agents the last shutdown lost.
-pub async fn report_interrupted_background_children(state: &Arc<dyn StateStore>) {
-    let spawns = match state.take_background_spawns().await {
-        Ok(spawns) => spawns,
-        Err(error) => {
-            warn!(%error, "Could not read interrupted background sub-agents");
-            return;
-        }
-    };
-    for spawn in spawns {
-        let message = format!(
-            "\u{26a0}\u{fe0f} A restart stopped this background job before it finished: {}\n\n\
-             It may have done part of the work. Check before running it again.",
-            spawn.mission
-        );
-        enqueue_background_notification(
-            Some(state),
-            "global",
-            &spawn.session_id,
-            "failed",
-            &message,
-            "interrupted background sub-agent notifier",
-            true,
-        )
-        .await;
-    }
-}
-
 /// Queue a background job's notification for later delivery.
 #[allow(clippy::too_many_arguments)]
 pub async fn enqueue_background_notification(

@@ -362,11 +362,28 @@ mod native {
     }
 
     fn classify(error: reqwest::Error) -> SignInError {
+        let why = with_causes(&error);
         if error.is_connect() || error.is_timeout() {
-            SignInError::Unreachable(error.to_string())
+            SignInError::Unreachable(why)
         } else {
-            SignInError::Failed(error.to_string())
+            SignInError::Failed(why)
         }
+    }
+
+    /// `error` with what caused it ("error sending request: … : connection
+    /// refused"): reqwest's own words alone do not say why.
+    fn with_causes(error: &dyn std::error::Error) -> String {
+        let mut text = error.to_string();
+        let mut cause = error.source();
+        while let Some(next) = cause {
+            let more = next.to_string();
+            if !text.contains(&more) {
+                text.push_str(": ");
+                text.push_str(&more);
+            }
+            cause = next.source();
+        }
+        text
     }
 
     async fn reply(response: reqwest::Response) -> Result<HttpReply, SignInError> {
@@ -464,8 +481,9 @@ mod tests {
 
 /// A pairing link's parts: the gateway's HTTP base, the offer, its code
 /// and the daemon's fingerprint. Read from the web link
-/// (`http://host/client/v1/next/#offer=…&code=…&fp=…`) or an
-/// `aidaemon-pair:?gateway=…` link.
+/// (`http://host/client/v1/next/#offer=…&code=…&fp=…`), an
+/// `aidaemon-pair:?gateway=…` link or the gateway's pairing page's
+/// (`https://host/client/v1/pair#gateway=…`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingLink {
     pub gateway: String,
@@ -545,6 +563,12 @@ mod pairing_link_tests {
         )
         .unwrap();
         assert_eq!(app.gateway, "https://d.example.invalid");
+        let page = PairingLink::parse(
+            "https://d.example.invalid/client/v1/pair#gateway=https%3A%2F%2Fd.example.invalid&offer=of-3&code=CD&fp=f",
+        )
+        .unwrap();
+        assert_eq!(page.gateway, "https://d.example.invalid");
+        assert_eq!(page.offer_id, "of-3");
         assert!(PairingLink::parse("hello").is_none());
     }
 }

@@ -308,7 +308,7 @@ async fn test_full_stack_status_updates_received() {
     let dm_start_shows_command = updates.iter().any(|u| {
         matches!(
             u,
-            StatusUpdate::ToolStart { name, summary, kind }
+            StatusUpdate::ToolStart { name, summary, kind, .. }
                 if name == "running a command"
                     && summary.is_empty()
                     && *kind == aidaemon_core::card::ActivityKind::Run
@@ -661,7 +661,7 @@ async fn test_successful_external_action_timeout_returns_deterministic_completio
     assert!(
         updates.iter().any(|update| matches!(
             update,
-            StatusUpdate::ToolComplete { name, summary }
+            StatusUpdate::ToolComplete { name, summary, .. }
                 if name == "external action" && summary.contains("Created remote record id=abc123")
         )),
         "expected ToolComplete status update for external action, got: {:?}",

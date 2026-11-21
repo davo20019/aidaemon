@@ -146,6 +146,42 @@ async fn a_final_reply_cut_off_at_the_output_limit_is_asked_for_again() {
     assert_eq!(calls, 2);
 }
 
+/// A long task that hits the output limit, recovers by working in smaller
+/// calls, and hits it again later gets the ask again: the one ask is per
+/// stretch of work, not per run (live 2026-11-20: a whole package written
+/// in one call was cut off twice and the run ended with nothing built).
+#[tokio::test]
+async fn a_cut_off_after_progress_is_asked_for_again() {
+    let cut = |body: &str| aidaemon_core::ModelResponse {
+        cut_off: true,
+        ..text(body)
+    };
+    let provider = Arc::new(ScriptedProvider::new([
+        cut("Writing the module"),
+        tool_calls([call("c1", "echo", json!({"text": "part one"}))]),
+        cut("Writing the tests"),
+        text("Done."),
+    ]));
+    let agent = Agent::builder("test-agent")
+        .allow_unguarded()
+        .model("scripted")
+        .provider(provider.clone())
+        .tool(echo_tool())
+        .build()
+        .unwrap();
+
+    let out = agent.run("s1", "build it").await.unwrap();
+
+    assert_eq!(out.final_text.as_deref(), Some("Done."));
+    assert_eq!(provider.requests().len(), 4);
+    let asks = provider.requests()[3]
+        .messages
+        .iter()
+        .filter(|m| m.content.contains("cut off at the output limit"))
+        .count();
+    assert_eq!(asks, 2, "each cut-off was answered with the ask");
+}
+
 #[tokio::test]
 async fn tool_results_are_appended_and_receipted() {
     let agent = base(ScriptedProvider::new([

@@ -475,13 +475,13 @@ impl Tool for NodeRestartTool {
     }
 
     fn description(&self) -> &str {
-        "Restart a connected AIdaemon Node after the owner approves it, or check the last restart's status."
+        "Restart a connected AIDaemon Node after the owner approves it, or check the last restart's status."
     }
 
     fn schema(&self) -> Value {
         json!({
             "name": "node_restart",
-            "description": "Ask a connected AIdaemon Node to restart, or read the status of its latest restart. Each request needs the owner's approval, a device_restart grant and firmware that reports the runtime.restart capability. A request only queues the restart for the Node's next heartbeat; it is done only when status reports confirmed. This cannot reach an offline Device.",
+            "description": "Ask a connected AIDaemon Node to restart, or read the status of its latest restart. Each request needs the owner's approval, a device_restart grant and firmware that reports the runtime.restart capability. A request only queues the restart for the Node's next heartbeat; it is done only when status reports confirmed. This cannot reach an offline Device.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -536,7 +536,7 @@ impl Tool for NodeRestartTool {
             serde_json::from_str(arguments).context("node_restart arguments must be valid JSON")?;
         anyhow::ensure!(
             facts.user_role == Some(UserRole::Owner),
-            "Only the AIdaemon owner may restart a Node or read its restart status"
+            "Only the AIDaemon owner may restart a Node or read its restart status"
         );
         let (output, outcome_status) = match args.action.as_str() {
             "request" => (

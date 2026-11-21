@@ -1038,6 +1038,159 @@ pub fn only_reads(command: &str) -> bool {
     })
 }
 
+/// For a command that runs another command somewhere else (`docker exec`,
+/// `podman exec`, `kubectl exec`, `ssh`): whether that inner command only
+/// reads. `None` when `command` is not one such single wrapper, or its inner
+/// command cannot be read structurally. The inner text is judged by
+/// [`only_reads`], so a redirection, a delete or an unknown program inside
+/// counts as a change. Read from token structure only (machine format: a
+/// shell command line), never from wording.
+pub fn remote_inner_only_reads(command: &str) -> Option<bool> {
+    remote_inner_script(command).map(|inner| only_reads(&inner))
+}
+
+/// Whether `command` recognizably changes something: a redirection into a
+/// file, a delete, a remote write, a known file-changing program (`cp`,
+/// `mkdir`, `chmod`, `tee`, `sed -i`, ...), or a package install. Behind a
+/// remote-exec wrapper the command it runs is judged. Unlike "not
+/// read-only", an unknown program is not a recognized change, so a caller
+/// that credits work from this can only miss a change, never invent one.
+/// Read from token structure only (machine format: a shell command line).
+pub fn recognizably_changes(command: &str) -> bool {
+    let text = remote_inner_script(command).unwrap_or_else(|| command.to_string());
+    if command_effects(&text).deletes || scan(&text).writes_file || sends_remote_write(&text) {
+        return true;
+    }
+    expanded_commands(&text).iter().any(|tokens| {
+        let args = &tokens[1..];
+        match basename(&tokens[0]) {
+            "mkdir" | "touch" | "cp" | "mv" | "ln" | "chmod" | "chown" | "tee" | "install"
+            | "patch" | "truncate" => true,
+            "sed" => args
+                .iter()
+                .any(|arg| arg.starts_with("-i") || arg == "--in-place"),
+            "apt" | "apt-get" | "yum" | "dnf" | "pip" | "pip3" | "npm" | "pnpm" | "yarn"
+            | "gem" | "brew" => args.iter().any(|arg| arg == "install" || arg == "add"),
+            "apk" => args.iter().any(|arg| arg == "add"),
+            "git" => matches!(
+                git_subcommand(args),
+                Some("commit" | "add" | "apply" | "checkout" | "switch" | "merge" | "init")
+            ),
+            _ => false,
+        }
+    })
+}
+
+/// The command a single remote-exec wrapper runs, as shell text.
+fn remote_inner_script(command: &str) -> Option<String> {
+    let segments: Vec<String> = scan(command)
+        .segments
+        .into_iter()
+        .filter(|segment| !segment.trim().is_empty())
+        .collect();
+    let [segment] = segments.as_slice() else {
+        return None;
+    };
+    let tokens = shell_words::split(segment).ok()?;
+    let program = basename(tokens.first()?);
+    let second = tokens.get(1).map(String::as_str);
+    let third = tokens.get(2).map(String::as_str);
+    // Options that take a separate value, per wrapper.
+    let (start, valued): (usize, &[&str]) = match program {
+        "docker" | "podman" if tokens.get(1).map(String::as_str) == Some("exec") => (
+            2,
+            &[
+                "-e",
+                "--env",
+                "-u",
+                "--user",
+                "-w",
+                "--workdir",
+                "--env-file",
+            ],
+        ),
+        // `docker compose exec <service> <command>`.
+        "docker" | "podman" if second == Some("compose") && third == Some("exec") => (
+            3,
+            &["-e", "--env", "-u", "--user", "-w", "--workdir", "--index"],
+        ),
+        "docker-compose" | "podman-compose" if second == Some("exec") => (
+            2,
+            &["-e", "--env", "-u", "--user", "-w", "--workdir", "--index"],
+        ),
+        // `lxc exec <instance> -- <command>` (and Incus, its fork).
+        "lxc" | "incus" if second == Some("exec") => {
+            let dash = tokens.iter().position(|token| token == "--")?;
+            return inner_text(&tokens[dash + 1..]);
+        }
+        // `vagrant ssh [machine] -c '<command>'`.
+        "vagrant" if second == Some("ssh") => {
+            let flag = tokens
+                .iter()
+                .position(|token| token == "-c" || token == "--command")?;
+            return tokens.get(flag + 1).cloned();
+        }
+        // `gcloud compute ssh <instance> --command='<command>'`.
+        "gcloud" if second == Some("compute") && third == Some("ssh") => {
+            return tokens.iter().enumerate().find_map(|(index, token)| {
+                if token == "--command" {
+                    tokens.get(index + 1).cloned()
+                } else {
+                    token.strip_prefix("--command=").map(str::to_string)
+                }
+            });
+        }
+        "kubectl" if tokens.get(1).map(String::as_str) == Some("exec") => {
+            let dash = tokens.iter().position(|token| token == "--")?;
+            return inner_text(&tokens[dash + 1..]);
+        }
+        "ssh" => (
+            1,
+            &[
+                "-p", "-i", "-l", "-o", "-F", "-J", "-b", "-c", "-D", "-E", "-L", "-R", "-W", "-m",
+                "-O", "-Q", "-S", "-w",
+            ],
+        ),
+        _ => return None,
+    };
+    let mut index = start;
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        index += if valued.contains(&token.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    let rest = tokens.get(index + 1..)?;
+    // `ssh` joins its remaining words with spaces and the remote shell parses
+    // the result; a container runtime runs them as one argument vector.
+    if program == "ssh" {
+        return (!rest.is_empty()).then(|| rest.join(" "));
+    }
+    // The container, then the command it runs.
+    inner_text(rest)
+}
+
+/// `tokens` as one command line: the script of `sh -c '<script>'` (any
+/// shell, with `-c` among its single-dash flags), else the words rejoined.
+fn inner_text(tokens: &[String]) -> Option<String> {
+    let first = tokens.first()?;
+    if matches!(basename(first), "sh" | "bash" | "zsh" | "dash" | "ash") {
+        let flag = tokens[1..].iter().position(|token| {
+            token.starts_with('-') && !token.starts_with("--") && token.contains('c')
+        })?;
+        return tokens.get(flag + 2).cloned();
+    }
+    Some(shell_words::join(tokens))
+}
+
 /// Whether a `curl` call saves something to a file: an output, header,
 /// cookie or trace file. Output sent to `/dev/null` saves nothing.
 fn curl_saves_files(args: &[String]) -> bool {
@@ -4210,6 +4363,107 @@ fn git(args: &[String], cwd: Option<&str>, out: &mut ShellAnalysis) {
         && let Some(directory) = parsed.positionals.get(1)
     {
         out.path(EffectClass::Write, directory, cwd);
+    }
+}
+
+#[cfg(test)]
+mod remote_inner_tests {
+    use super::{recognizably_changes, remote_inner_only_reads};
+
+    /// Only a change the classifier can name counts; an unknown program or
+    /// a look does not, so crediting from it never invents work.
+    #[test]
+    fn only_a_recognized_change_counts() {
+        for change in [
+            "docker exec app-1 bash -lc 'printf x > /app/move.txt'",
+            "docker exec app-1 chmod +x /app/run.sh",
+            "ssh host 'sudo apt-get install -y nginx'",
+            "sed -i 's/a/b/' notes.txt",
+            "mkdir -p out && cp a.txt out/",
+            "git commit -m synthetic",
+        ] {
+            assert!(recognizably_changes(change), "{change}");
+        }
+        for not_recognized in [
+            "docker exec app-1 bash -lc 'ls /app; cat /app/a'",
+            "docker exec app-1 python3 /app/run.py",
+            "./deploy.sh",
+            "ls -la",
+            "sed 's/a/b/' notes.txt",
+        ] {
+            assert!(!recognizably_changes(not_recognized), "{not_recognized}");
+        }
+    }
+
+    /// A file written with a here-document inside `docker exec ... bash -lc`
+    /// is a recognized change, however the delimiter is quoted (live
+    /// 2026-11-20: a script written this way read as "nothing attempted",
+    /// and the run was sent back to redo it).
+    #[test]
+    fn a_heredoc_write_inside_a_remote_exec_is_a_change() {
+        for change in [
+            "docker exec app-1 bash -lc 'cat > /app/proc.py <<\"EOF\"\nimport csv\nprint(1)\nEOF'",
+            "docker exec app-1 bash -lc 'cat > /app/proc.py <<'\"'\"'EOF'\"'\"'\nimport csv\nEOF\ncd /app && python3 proc.py'",
+            "docker exec app-1 bash -lc 'cat > /app/proc.py <<EOF\nx = {\"a\": 1}\nEOF'",
+            "docker exec app-1 bash -lc 'cd /app && cat <<EOF > out.txt\nhello\nEOF'",
+        ] {
+            assert!(recognizably_changes(change), "{change}");
+            assert_eq!(remote_inner_only_reads(change), Some(false), "{change}");
+        }
+    }
+
+    /// A look inside a container or host reads; a write there changes.
+    #[test]
+    fn the_command_inside_a_remote_exec_is_judged() {
+        assert_eq!(
+            remote_inner_only_reads("docker exec app-1 bash -lc 'ls -la /app; cat /app/a.txt'"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads(
+                "docker exec -w /app app-1 bash -lc 'printf x > /app/move.txt'"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("docker exec -e K=v app-1 rm -f /app/old.log"),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("ssh -p 2222 host cat /etc/hostname"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads("ssh host 'systemctl restart nginx'"),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("kubectl exec pod-1 -- sh -c 'ls /data'"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads("docker compose exec -T web sh -c 'cat /srv/a'"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads("lxc exec box -- touch /tmp/a"),
+            Some(false)
+        );
+        assert_eq!(
+            remote_inner_only_reads("vagrant ssh -c 'ls /vagrant'"),
+            Some(true)
+        );
+        assert_eq!(
+            remote_inner_only_reads("gcloud compute ssh vm-1 --command='rm -f /tmp/a'"),
+            Some(false)
+        );
+        // Not one remote wrapper: nothing to judge here.
+        assert_eq!(remote_inner_only_reads("ls /app"), None);
+        assert_eq!(remote_inner_only_reads("docker ps"), None);
+        assert_eq!(
+            remote_inner_only_reads("docker exec app-1 ls && rm -rf /tmp/x"),
+            None
+        );
     }
 }
 

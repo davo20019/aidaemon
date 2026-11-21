@@ -1040,3 +1040,68 @@ async fn a_conversations_model_calls_carry_its_cache_key() {
         );
     }
 }
+
+/// A short confirmation is judged with what it confirms: the check sees the
+/// owner's earlier message beside it, never the content that tainted the
+/// turn.
+#[tokio::test]
+async fn a_confirmation_is_checked_with_the_owners_earlier_messages() {
+    let allow = r#"{"consistent":true,"reason":"the owner asked to send the digest","owner_reason":"You asked to send the digest to Jordan."}"#;
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::text_response(
+            "Here is the synthetic weekly digest for Jordan: three items. Shall I send it?",
+        ),
+        MockProvider::tool_call_response(
+            "injected_page",
+            &json!({"url": "https://example.invalid/notes"}).to_string(),
+        ),
+        MockProvider::tool_call_response(
+            "message_probe",
+            &json!({"to": "jordan@example.invalid"}).to_string(),
+        ),
+        MockProvider::text_response(allow),
+        MockProvider::text_response("Sent."),
+    ])
+    .with_relationship_assessments(vec![MockProvider::relationship_assessment("continuation")]);
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools: Vec<Arc<dyn crate::traits::Tool>> = vec![
+        Arc::new(InjectedPage("unused".to_string())),
+        Arc::new(MessageProbe(sent.clone())),
+    ];
+    let harness = setup_test_agent_with_extra_tools_and_llm_timeout(provider, tools, None)
+        .await
+        .unwrap();
+    let session = "telegram:synthetic-owner-confirm";
+    for text in [
+        "Draft the synthetic weekly digest for jordan@example.invalid.",
+        "Yes, do it.",
+    ] {
+        harness
+            .agent
+            .handle_message(
+                session,
+                text,
+                None,
+                UserRole::Owner,
+                ChannelContext::private("telegram"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let calls = harness.provider.call_log.lock().await;
+    let verifier = calls
+        .iter()
+        .find(|call| {
+            call.messages[0]["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with(VERIFIER_SYSTEM_PREFIX))
+        })
+        .expect("the send after the page is checked");
+    let seen = verifier.messages[1]["content"].as_str().unwrap();
+    assert!(seen.contains("Draft the synthetic weekly digest"), "{seen}");
+    assert!(seen.contains("Yes, do it."), "{seen}");
+    assert!(!seen.contains("IGNORE ALL PREVIOUS"), "{seen}");
+    drop(calls);
+    assert_eq!(sent.lock().unwrap().len(), 1, "the confirmed send ran");
+}

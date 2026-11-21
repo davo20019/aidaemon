@@ -13,6 +13,14 @@
 //! the hub can reach. A turn this pass continued that was cut off again is
 //! not continued a second time (a turn that crashes the daemon would loop):
 //! the chat is told instead.
+//!
+//! Background sub-agents the stop cut off are started again once, through
+//! their chat (whose history holds the launch), told to pick up from what
+//! the stopped run left. A job whose run was in the middle of a call that
+//! reaches outside the machine (sending, publishing, deploying) or whose
+//! effects are unknown is not started again: repeating it could do that
+//! twice, so the chat is only told. A job started again that is cut off
+//! again is not started a third time.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
@@ -34,6 +42,17 @@ struct BootRecord {
     boot_at: String,
     /// Chats that boot continued; cut off again, they are not continued.
     continued: Vec<String>,
+    /// Chats whose background job that boot started again.
+    #[serde(default)]
+    restarted_jobs: Vec<String>,
+}
+
+/// The previous boot's mark, the chats it continued and the chats whose
+/// background jobs it started again.
+pub struct PreviousBoot {
+    since: String,
+    continued: Vec<String>,
+    restarted_jobs: Vec<String>,
 }
 
 pub struct ResumeDeps {
@@ -43,6 +62,12 @@ pub struct ResumeDeps {
     pub sessions: SessionMap,
     pub hub: Weak<dyn OutboundRouter>,
     pub agent: Arc<dyn ChildAgentRuntime>,
+    /// The background sub-agents the last stop cut off, as recorded at
+    /// their launch (taken from the store at boot).
+    pub interrupted_jobs: Vec<crate::traits::BackgroundSpawn>,
+    /// The agent's tools, whose declared effects say whether a call the
+    /// stop cut off is safe to repeat.
+    pub tools: Vec<Arc<dyn aidaemon_tools::OutcomeTool>>,
 }
 
 /// Reads the previous boot's record and writes this boot's mark. Called
@@ -51,7 +76,7 @@ pub struct ResumeDeps {
 pub async fn mark_boot(
     store: &SqliteStore,
     state: &dyn crate::traits::StateStore,
-) -> Option<(String, Vec<String>)> {
+) -> Option<PreviousBoot> {
     let previous = match state.get_setting(BOOT_KEY).await {
         Ok(Some(raw)) => serde_json::from_str::<BootRecord>(&raw).ok(),
         Ok(None) => None,
@@ -71,11 +96,15 @@ pub async fn mark_boot(
         state,
         &BootRecord {
             boot_at,
-            continued: Vec::new(),
+            ..BootRecord::default()
         },
     )
     .await;
-    previous.map(|record| (record.boot_at, record.continued))
+    previous.map(|record| PreviousBoot {
+        since: record.boot_at,
+        continued: record.continued,
+        restarted_jobs: record.restarted_jobs,
+    })
 }
 
 /// Read-modify-write of this boot's record, one at a time.
@@ -105,10 +134,20 @@ async fn write_record(state: &dyn crate::traits::StateStore, record: &BootRecord
 }
 
 /// Continues each chat turn the last stop cut off (see the module docs).
-pub async fn resume_cut_off_turns(deps: ResumeDeps, previous: Option<(String, Vec<String>)>) {
-    let Some((since, continued_last_boot)) = previous else {
+pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<PreviousBoot>) {
+    let jobs = std::mem::take(&mut deps.interrupted_jobs);
+    let Some(PreviousBoot {
+        since,
+        continued: continued_last_boot,
+        restarted_jobs,
+    }) = previous
+    else {
+        for job in &jobs {
+            notify_job(&deps, job, JobFate::Lost).await;
+        }
         return;
     };
+    let mut job_notes = plan_jobs(&deps, jobs, &since, &restarted_jobs).await;
     let runs = match deps.store.unfinished_runs_since(&since).await {
         Ok(runs) => runs,
         Err(error) => {
@@ -120,6 +159,10 @@ pub async fn resume_cut_off_turns(deps: ResumeDeps, previous: Option<(String, Ve
     let Some(hub) = deps.hub.upgrade() else {
         return;
     };
+    if !job_notes.is_empty() {
+        let chats: Vec<String> = job_notes.keys().cloned().collect();
+        update_record(&*deps.state, |record| record.restarted_jobs = chats).await;
+    }
     let mut to_continue = Vec::new();
     for run in runs {
         let chat = run.session_id.clone();
@@ -140,7 +183,30 @@ pub async fn resume_cut_off_turns(deps: ResumeDeps, previous: Option<(String, Ve
         }
         to_continue.push(run);
     }
-    if to_continue.is_empty() {
+    // A chat with both a cut-off turn and jobs to start again gets one
+    // continuation, the jobs' note after the turn's.
+    let mut continuations: Vec<(String, Option<String>, String)> = Vec::new();
+    for run in &to_continue {
+        let mut followup = recovery::resume_note(run);
+        if let Some(note) = job_notes.remove(&run.session_id) {
+            followup.push_str("\n\n");
+            followup.push_str(&note);
+        }
+        let parent_task_id = deps
+            .event_store
+            .get_active_task(&run.session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|event| event.task_id);
+        info!(session_id = %run.session_id, run_id = %run.run_id, "Continuing a turn the last stop cut off");
+        continuations.push((run.session_id.clone(), parent_task_id, followup));
+    }
+    for (chat, note) in job_notes {
+        info!(session_id = %chat, "Starting again a background job the last stop cut off");
+        continuations.push((chat, None, note));
+    }
+    if continuations.is_empty() {
         return;
     }
     // Recorded before the turns run: if one takes the daemon down, the next
@@ -152,18 +218,8 @@ pub async fn resume_cut_off_turns(deps: ResumeDeps, previous: Option<(String, Ve
             .collect();
     })
     .await;
-    for run in to_continue {
-        let chat = run.session_id.clone();
-        let parent_task_id = deps
-            .event_store
-            .get_active_task(&chat)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|event| event.task_id);
-        info!(session_id = %chat, run_id = %run.run_id, "Continuing a turn the last stop cut off");
+    for (chat, parent_task_id, followup) in continuations {
         let agent = deps.agent.clone();
-        let followup = recovery::resume_note(&run);
         let hub = Arc::downgrade(&hub);
         let state = deps.state.clone();
         // Chats are continued side by side, each on its own task.
@@ -190,6 +246,206 @@ pub async fn resume_cut_off_turns(deps: ResumeDeps, previous: Option<(String, Ve
             }
         });
     }
+}
+
+/// What happens to a background job the last stop cut off.
+enum JobFate {
+    /// Started again through its chat.
+    Restarted,
+    /// Not started again: its run was in the middle of these calls, which
+    /// reach outside the machine or whose effects are unknown.
+    RiskyToRepeat(Vec<String>),
+    /// Started again last boot and cut off again.
+    CutOffAgain,
+    /// Its chat cannot be reached, or the boot has nothing to compare with.
+    Lost,
+}
+
+/// Tell the job's chat what became of it, through the notification queue
+/// (held through quiet hours unless the owner was just there).
+async fn notify_job(deps: &ResumeDeps, job: &crate::traits::BackgroundSpawn, fate: JobFate) {
+    let mission = job.mission.trim();
+    let message = match &fate {
+        JobFate::Restarted => format!(
+            "\u{26a0}\u{fe0f} A restart stopped this background job before it finished: \
+             {mission}\n\nStarting it again from where it stopped."
+        ),
+        JobFate::RiskyToRepeat(calls) => format!(
+            "\u{26a0}\u{fe0f} A restart stopped this background job while it was running {}: \
+             {mission}\n\nThat step may have gone through, so I did not start the job again. \
+             Check what it did, then say continue to pick it up.",
+            calls.join(", ")
+        ),
+        JobFate::CutOffAgain => format!(
+            "\u{26a0}\u{fe0f} The daemon restarted again while this background job was running \
+             after its restart, so I stopped restarting it: {mission}\n\nSay continue to \
+             pick it up."
+        ),
+        JobFate::Lost => format!(
+            "\u{26a0}\u{fe0f} A restart stopped this background job before it finished: \
+             {mission}\n\nIt may have done part of the work. Check before running it again."
+        ),
+    };
+    // An update for a job started again, a paused job for one the owner
+    // has to pick up: never "Run failed".
+    let kind = if matches!(fate, JobFate::Restarted) {
+        "progress"
+    } else {
+        "stalled"
+    };
+    let queue = deps.state.clone() as Arc<dyn crate::traits::NotificationStore>;
+    aidaemon_runtime::helper_run::delivery::enqueue_background_notification(
+        Some(&queue),
+        "global",
+        &job.session_id,
+        kind,
+        &message,
+        "interrupted background sub-agent notifier",
+        true,
+    )
+    .await;
+}
+
+/// The calls a cut-off run was in the middle of that are not safe to run
+/// twice: a call whose declared effects reach a host outside this machine,
+/// or a call whose tool declares nothing about what it does.
+fn risky_in_flight_calls(
+    run: &aidaemon_core::RunState,
+    tools: &[Arc<dyn aidaemon_tools::OutcomeTool>],
+) -> Vec<String> {
+    let Some(in_flight) = &run.in_flight else {
+        return Vec::new();
+    };
+    in_flight
+        .calls
+        .iter()
+        .filter(|call| in_flight.started.contains(&call.id) && !in_flight.done.contains(&call.id))
+        .filter(|call| {
+            let Some(tool) = tools.iter().find(|tool| tool.name() == call.name) else {
+                return true;
+            };
+            let effects = tool.call_effects(&call.arguments.to_string());
+            let undeclared = effects.keys.is_empty() && !effects.complete;
+            undeclared
+                || effects.keys.iter().any(|key| {
+                    key.class == aidaemon_core::EffectClass::Egress && !loopback_target(&key.target)
+                })
+        })
+        .map(|call| format!("`{}`", call.name))
+        .collect()
+}
+
+/// Whether an egress target (`host:port`, a bare host or a URL host) names
+/// this machine.
+fn loopback_target(target: &str) -> bool {
+    // Machine format: `host:port`, `[v6]:port` or a bare host.
+    let host = target
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| target.rsplit_once(':').map_or(target, |(host, _)| host));
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Each interrupted job's fate, the chat told for each one not started
+/// again; returns the note that starts the rest again, per chat.
+async fn plan_jobs(
+    deps: &ResumeDeps,
+    mut jobs: Vec<crate::traits::BackgroundSpawn>,
+    since: &str,
+    restarted_last_boot: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut notes: std::collections::HashMap<String, String> = Default::default();
+    if jobs.is_empty() {
+        return notes;
+    }
+    // The cut-off sub-agent runs, by the chat whose run started them, oldest
+    // first: paired with the chat's jobs in launch order.
+    let mut runs_by_chat: std::collections::HashMap<String, Vec<aidaemon_core::RunState>> =
+        Default::default();
+    match deps.store.unfinished_background_runs_since(since).await {
+        Ok(runs) => {
+            for run in runs {
+                let Some(parent) = run.parent_run else {
+                    continue;
+                };
+                if let Ok(Some(parent)) = deps.store.state(parent).await {
+                    runs_by_chat.entry(parent.session_id).or_default().push(run);
+                }
+            }
+        }
+        Err(error) => warn!(%error, "Could not list the background runs the last stop cut off"),
+    }
+    jobs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    for job in jobs {
+        let run = runs_by_chat
+            .get_mut(&job.session_id)
+            .and_then(|runs| (!runs.is_empty()).then(|| runs.remove(0)));
+        let risky = run
+            .as_ref()
+            .map(|run| risky_in_flight_calls(run, &deps.tools))
+            .unwrap_or_default();
+        let reachable = deps.sessions.read().await.contains_key(&job.session_id);
+        let fate = if !reachable {
+            JobFate::Lost
+        } else if restarted_last_boot.contains(&job.session_id) {
+            JobFate::CutOffAgain
+        } else if !risky.is_empty() {
+            JobFate::RiskyToRepeat(risky)
+        } else {
+            JobFate::Restarted
+        };
+        if matches!(fate, JobFate::Restarted) {
+            let note = restart_note(&job, run.as_ref());
+            notes
+                .entry(job.session_id.clone())
+                .and_modify(|existing| {
+                    existing.push_str("\n\n");
+                    existing.push_str(&note);
+                })
+                .or_insert(note);
+        }
+        notify_job(deps, &job, fate).await;
+    }
+    notes
+}
+
+/// The internal message that starts a cut-off background job again in its
+/// chat.
+fn restart_note(
+    job: &crate::traits::BackgroundSpawn,
+    run: Option<&aidaemon_core::RunState>,
+) -> String {
+    let mut note = format!(
+        "The daemon restarted while a background job you started in this conversation was \
+         still running, and the restart stopped it: \"{}\". Start it again once, the same \
+         way as its launch above, and add to its task that an earlier run was stopped by a \
+         restart: it must first check what that run already did (files, installs, settings) \
+         and continue from there instead of redoing it. Programs that run left going \
+         (servers, tunnels, watchers) stopped with the restart and need starting again. \
+         The owner was already told the job is being started again; reply only if \
+         something needs their attention.",
+        job.mission.trim()
+    );
+    if let Some(in_flight) = run.and_then(|run| run.in_flight.as_ref()) {
+        let running: Vec<String> = in_flight
+            .calls
+            .iter()
+            .filter(|call| {
+                in_flight.started.contains(&call.id) && !in_flight.done.contains(&call.id)
+            })
+            .map(|call| format!("`{}`", call.name))
+            .collect();
+        if !running.is_empty() {
+            note.push_str(&format!(
+                " It was running {} when it stopped; that step may or may not have finished.",
+                running.join(", ")
+            ));
+        }
+    }
+    note
 }
 
 #[cfg(test)]
@@ -325,6 +581,17 @@ mod tests {
         agent: &Arc<Answers>,
         hub: &Arc<Sent>,
     ) {
+        boot_with_jobs(store, state, sessions, agent, hub, Vec::new()).await;
+    }
+
+    async fn boot_with_jobs(
+        store: &SqliteStore,
+        state: &Arc<SqliteStateStore>,
+        sessions: &SessionMap,
+        agent: &Arc<Answers>,
+        hub: &Arc<Sent>,
+        interrupted_jobs: Vec<crate::traits::BackgroundSpawn>,
+    ) {
         let dyn_state = state.clone() as Arc<dyn crate::traits::StateStore>;
         let previous = mark_boot(store, &*dyn_state).await;
         let router: Arc<dyn OutboundRouter> = hub.clone();
@@ -336,6 +603,8 @@ mod tests {
                 sessions: sessions.clone(),
                 hub: Arc::downgrade(&router),
                 agent: agent.clone(),
+                interrupted_jobs,
+                tools: Vec::new(),
             },
             previous,
         )
@@ -410,5 +679,138 @@ mod tests {
         let sent = hub.0.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].1.contains("stopped retrying"), "{}", sent[0].1);
+    }
+
+    fn job(chat: &str, mission: &str, minute: u32) -> crate::traits::BackgroundSpawn {
+        crate::traits::BackgroundSpawn {
+            id: format!("background_spawn:{mission}"),
+            session_id: chat.to_string(),
+            mission: mission.to_string(),
+            started_at: format!("2026-11-21T05:{minute:02}:00+00:00"),
+        }
+    }
+
+    /// The cut-off sub-agent run of a job started from `chat` by a turn
+    /// that has ended, mid `call` when `call` is given.
+    async fn cut_off_child(store: &SqliteStore, chat: &str, call: Option<&str>) {
+        let parent = aidaemon_core::RunState::new("aidaemon", chat, "Build the site.");
+        store.upsert_state(&parent).await.unwrap();
+        store
+            .append(
+                parent.run_id,
+                &aidaemon_core::Event::Finished {
+                    status: aidaemon_core::RunStatus::Completed,
+                    usage: Default::default(),
+                    turns: 1,
+                    elapsed_ms: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let mut child =
+            aidaemon_core::RunState::new("aidaemon", "specialist:executor:synthetic", "Build it.")
+                .with_parent(parent.run_id);
+        if let Some(name) = call {
+            child.in_flight = Some(aidaemon_core::InFlight {
+                calls: vec![aidaemon_core::ToolCall::new(
+                    "call-1",
+                    name,
+                    serde_json::json!({}),
+                )],
+                started: vec!["call-1".to_string()],
+                done: Vec::new(),
+            });
+        }
+        store.upsert_state(&child).await.unwrap();
+    }
+
+    /// Live 2026-11-20: a deploy restart stopped the owner's background
+    /// site build, and nothing started it again. A job is started again
+    /// once through its chat; one mid a call whose effects are not known
+    /// to be safe to repeat, or in a chat no channel reaches, is only told.
+    #[tokio::test]
+    async fn a_cut_off_background_job_is_started_again_once_unless_risky_to_repeat() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let state = settings().await;
+        let safe = "app:synthetic-chat-1";
+        let risky = "app:synthetic-chat-2";
+        let sessions: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::from([
+            (safe.to_string(), "app".to_string()),
+            (risky.to_string(), "app".to_string()),
+        ])));
+        let agent = Arc::new(Answers::default());
+        let hub = Arc::new(Sent::default());
+        boot(&store, &state, &sessions, &agent, &hub).await;
+
+        cut_off_child(&store, safe, None).await;
+        cut_off_child(&store, risky, Some("synthetic_publish")).await;
+        boot_with_jobs(
+            &store,
+            &state,
+            &sessions,
+            &agent,
+            &hub,
+            vec![
+                job(safe, "Build the synthetic site", 1),
+                job(risky, "Publish the synthetic post", 2),
+                job("goal:synthetic", "Tidy the synthetic notes", 3),
+            ],
+        )
+        .await;
+        {
+            let answers = agent.0.lock().unwrap();
+            assert_eq!(answers.len(), 1, "only the safe job is started again");
+            assert_eq!(answers[0].chat, safe);
+            assert!(
+                answers[0].followup.contains("Build the synthetic site"),
+                "{}",
+                answers[0].followup
+            );
+        }
+        let notices = state.get_pending_notifications(10).await.unwrap();
+        let notice = |chat: &str| {
+            notices
+                .iter()
+                .find(|entry| entry.session_id == chat)
+                .map(|entry| entry.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            notice(safe).contains("Starting it again"),
+            "{}",
+            notice(safe)
+        );
+        assert!(
+            notice(risky).contains("did not start the job again"),
+            "{}",
+            notice(risky)
+        );
+        assert!(notice(risky).contains("`synthetic_publish`"));
+        assert!(
+            notice("goal:synthetic").contains("Check before running it again"),
+            "{}",
+            notice("goal:synthetic")
+        );
+
+        // The job started again is cut off again: told, not started a
+        // third time.
+        cut_off_child(&store, safe, None).await;
+        boot_with_jobs(
+            &store,
+            &state,
+            &sessions,
+            &agent,
+            &hub,
+            vec![job(safe, "Build the synthetic site", 4)],
+        )
+        .await;
+        assert_eq!(agent.0.lock().unwrap().len(), 1, "not started a third time");
+        let notices = state.get_pending_notifications(10).await.unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|entry| entry.message.contains("stopped restarting it")),
+            "{notices:#?}"
+        );
     }
 }

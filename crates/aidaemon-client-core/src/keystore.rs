@@ -1,7 +1,7 @@
 //! Where a paired device keeps its identity: the gateway it paired with, the
 //! device id it was given and its private key. [`FileKeyStore`] keeps it in
-//! one file readable by the owner only; a client may add an OS keychain
-//! implementation.
+//! one file readable by the owner only; `KeychainKeyStore` (iOS) keeps it
+//! in the system keychain.
 
 use std::path::{Path, PathBuf};
 
@@ -111,6 +111,75 @@ impl KeyStore for MemoryKeyStore {
     fn clear(&self) -> anyhow::Result<()> {
         *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
+    }
+}
+
+/// The iOS keychain: one generic-password item, readable after the first
+/// unlock (so the link can reconnect while the phone is locked) and never
+/// synced or restored to another device.
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone)]
+pub struct KeychainKeyStore {
+    service: String,
+    account: String,
+}
+
+#[cfg(target_os = "ios")]
+impl KeychainKeyStore {
+    /// The item for `service` (the app's id) and `account`.
+    pub fn new(service: impl Into<String>, account: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            account: account.into(),
+        }
+    }
+
+    fn options(&self) -> security_framework::passwords::PasswordOptions {
+        security_framework::passwords::PasswordOptions::new_generic_password(
+            &self.service,
+            &self.account,
+        )
+    }
+}
+
+/// `errSecItemNotFound`.
+#[cfg(target_os = "ios")]
+const ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(target_os = "ios")]
+impl KeyStore for KeychainKeyStore {
+    fn load(&self) -> anyhow::Result<Option<StoredDevice>> {
+        match security_framework::passwords::generic_password(self.options()) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("keychain: {error}")),
+        }
+    }
+
+    fn save(&self, device: &StoredDevice) -> anyhow::Result<()> {
+        use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        self.clear()?;
+        let mut options = self.options();
+        let access = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+            0,
+        )
+        .map_err(|e| anyhow::anyhow!("keychain: {e}"))?;
+        options.set_access_control(access);
+        security_framework::passwords::set_generic_password_options(
+            &serde_json::to_vec(device)?,
+            options,
+        )
+        .map_err(|e| anyhow::anyhow!("keychain: {e}"))
+    }
+
+    fn clear(&self) -> anyhow::Result<()> {
+        match security_framework::passwords::delete_generic_password_options(self.options()) {
+            Err(error) if error.code() != ITEM_NOT_FOUND => {
+                Err(anyhow::anyhow!("keychain: {error}"))
+            }
+            _ => Ok(()),
+        }
     }
 }
 

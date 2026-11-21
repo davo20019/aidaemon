@@ -509,11 +509,10 @@ impl TurnEngine<'_> {
                 });
             let kind = step_kind(&facts, mutates);
             if let Some(status_tx) = &scope.status_tx {
-                let _ = status_tx.try_send(StatusUpdate::ToolStart {
-                    name,
-                    summary,
-                    kind,
-                });
+                // The same arguments a reloaded conversation shows.
+                let _ = status_tx.try_send(
+                    StatusUpdate::tool_start(name, summary, kind).showing_arguments(arguments),
+                );
             }
         }
         // Where its declared writes land that does not exist yet: a folder
@@ -576,6 +575,20 @@ impl TurnEngine<'_> {
                     &mut outcome.metadata.semantics,
                     &folders,
                 );
+                // A change the tool could not type, from a call that named
+                // no item while the model has exactly one change item in
+                // progress, is that item's work: the call carries it out as
+                // if it had named it (live 2026-11-20: work done inside
+                // `docker exec` without `checklist_items` was sent back as
+                // "not started" in 7 of 19 tasks, and redone).
+                let in_progress = scope.in_progress_change_item.load(Ordering::Relaxed);
+                if outcome.metadata.changes_untyped
+                    && outcome.metadata.checklist_items.is_empty()
+                    && in_progress != u64::MAX
+                {
+                    outcome.metadata.checklist_items = vec![in_progress as usize];
+                    outcome.metadata.semantics = outcome.metadata.semantics.with_untyped_change();
+                }
                 let status = crate::turn::loop_utils::classify_tool_outcome_status(
                     &request.name,
                     &outcome.output,
@@ -1286,7 +1299,7 @@ impl TurnEngine<'_> {
                             }
                         },
                     );
-                    StatusUpdate::ToolComplete { name, summary }
+                    StatusUpdate::tool_complete(name, summary).showing_result(&output)
                 })
             };
             if let Some(update) = update {
@@ -1393,6 +1406,20 @@ impl TurnEngine<'_> {
             scope
                 .open_checklist_items
                 .store(open as u64, Ordering::Relaxed);
+            // `in_progress` is the checklist schema's own status value.
+            let in_progress: Vec<usize> = declared
+                .items
+                .iter()
+                .filter(|item| item.status == "in_progress" && !item.mutation_effects.is_empty())
+                .map(|item| item.index)
+                .collect();
+            scope.in_progress_change_item.store(
+                match in_progress.as_slice() {
+                    [one] => *one as u64,
+                    _ => u64::MAX,
+                },
+                Ordering::Relaxed,
+            );
             scope.checklist_declared.store(true, Ordering::Relaxed);
             if let Err(error) = scope
                 .emitter

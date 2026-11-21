@@ -1,6 +1,6 @@
 //! # aidaemon-client-protocol
 //!
-//! The wire types of the AIdaemon Client Protocol v1, spoken between the
+//! The wire types of the AIDaemon Client Protocol v1, spoken between the
 //! daemon's Client Gateway (`/client/v1`) and the owner's own clients: a
 //! terminal UI, a web page, a desktop or phone app, a watch.
 //!
@@ -37,7 +37,7 @@ pub mod media;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 39;
+pub const PROTOCOL_MINOR: u16 = 41;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -465,12 +465,17 @@ pub enum Command {
     /// 1.17). Answers with `queued`.
     ListQueued { session_id: String },
     /// Change a waiting message's text, or take it out (`text` absent)
-    /// (protocol 1.17). Answers with `queued`, as it is after.
+    /// (protocol 1.17). With `now` (protocol 1.41), a message sent to wait
+    /// for its own turn (`after`) is given to the running work instead, as
+    /// if it had been sent to be read now; `text` is then ignored and
+    /// nothing is taken out. Answers with `queued`, as it is after.
     EditQueued {
         session_id: String,
         message_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     /// Every live surface now (protocol 1.30, capability `surfaces`).
     /// Answers with `surfaces`.
@@ -2240,6 +2245,9 @@ pub enum TurnState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TurnStatus {
     Thinking,
+    /// Built with [`TurnStatus::tool_started`]: non-exhaustive so a new
+    /// field changes one constructor, not every sender.
+    #[non_exhaustive]
     ToolStarted {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2247,15 +2255,25 @@ pub enum TurnStatus {
         /// What kind of work it is (protocol 1.29).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<ToolKind>,
+        /// The call's arguments as history shows them, redacted and cut to
+        /// size (protocol 1.40); empty when the daemon gave none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        input: String,
     },
     ToolProgress {
         name: String,
         chunk: String,
     },
+    /// Built with [`TurnStatus::tool_completed`].
+    #[non_exhaustive]
     ToolCompleted {
         name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         summary: String,
+        /// The call's result as history shows it, redacted and cut to size
+        /// (protocol 1.40); empty when the daemon gave none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output: String,
     },
     PlanStep {
         /// 0-based.
@@ -2275,6 +2293,60 @@ pub enum TurnStatus {
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+impl TurnStatus {
+    /// A call starting; [`Self::with_detail`] adds its shown arguments.
+    pub fn tool_started(
+        name: impl Into<String>,
+        summary: impl Into<String>,
+        activity: Option<ToolKind>,
+    ) -> Self {
+        TurnStatus::ToolStarted {
+            name: name.into(),
+            summary: summary.into(),
+            activity,
+            input: String::new(),
+        }
+    }
+
+    /// A call finished; [`Self::with_detail`] adds its shown result.
+    pub fn tool_completed(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        TurnStatus::ToolCompleted {
+            name: name.into(),
+            summary: summary.into(),
+            output: String::new(),
+        }
+    }
+
+    /// A started call with its shown arguments, or a finished one with its
+    /// shown result. Other statuses are unchanged.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        match &mut self {
+            TurnStatus::ToolStarted { input: shown, .. }
+            | TurnStatus::ToolCompleted { output: shown, .. } => *shown = detail.into(),
+            _ => {}
+        }
+        self
+    }
+
+    /// What a tool row shows for this status: a started call's arguments or
+    /// a completed call's result, else its summary when the daemon sent
+    /// none (an older daemon). `None` for a status that is not a call.
+    pub fn call_detail(&self) -> Option<&str> {
+        let (shown, summary) = match self {
+            TurnStatus::ToolStarted { input, summary, .. } => (input, summary),
+            TurnStatus::ToolCompleted {
+                output, summary, ..
+            } => (output, summary),
+            _ => return None,
+        };
+        Some(if shown.trim().is_empty() {
+            summary
+        } else {
+            shown
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3009,6 +3081,34 @@ pub struct PairingOffer {
     pub public_url: Option<String>,
 }
 
+/// The gateway's page that opens the phone app on a pairing: tapped in a
+/// chat or read from a QR code by a phone's camera (which open `https`
+/// links, not the app's own scheme), it hands the offer to the app, or to
+/// its store page when the app is missing, or pairs the browser instead.
+pub const PAIRING_PAGE_PATH: &str = "/client/v1/pair";
+
+impl PairingOffer {
+    /// [`PairingOffer::link`] as a link to [`PAIRING_PAGE_PATH`] on the
+    /// gateway's own address. The offer rides in the fragment, which
+    /// browsers never send to the server. An older daemon that does not
+    /// say its address gets the app link itself.
+    pub fn page_link(&self) -> String {
+        let Some(base) = self
+            .public_url
+            .as_deref()
+            .map(|url| url.trim().trim_end_matches('/'))
+            .filter(|url| !url.is_empty())
+        else {
+            return self.link.clone();
+        };
+        let query = self
+            .link
+            .split_once('?')
+            .map_or(self.link.as_str(), |(_, query)| query);
+        format!("{base}{PAIRING_PAGE_PATH}#{query}")
+    }
+}
+
 /// `POST /client/v1/enrollments/redeem`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct RedeemRequest {
@@ -3147,7 +3247,7 @@ pub fn schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://aidaemon.ai/schemas/client-protocol/v1.schema.json",
-        "title": "AIdaemon Client Protocol v1",
+        "title": "AIDaemon Client Protocol v1",
         "oneOf": [client, server],
         "$defs": defs,
     })
@@ -3186,6 +3286,24 @@ pub fn schema_file() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pairing_page_link_is_on_the_gateway_with_the_offer_in_its_fragment() {
+        let mut offer = PairingOffer {
+            offer_id: "of-1".into(),
+            code: "K7Q2-9FZD".into(),
+            expires_at_ms: 0,
+            link: "aidaemon-pair:?gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
+            fingerprint: "3b1f".into(),
+            public_url: Some("https://d.example.invalid/".into()),
+        };
+        assert_eq!(
+            offer.page_link(),
+            "https://d.example.invalid/client/v1/pair#gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f"
+        );
+        offer.public_url = None;
+        assert_eq!(offer.page_link(), offer.link);
+    }
 
     #[test]
     fn unknown_event_types_and_fields_are_ignored() {

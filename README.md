@@ -29,11 +29,11 @@ curl -sSfL https://get.aidaemon.ai | bash
 
 ### macOS download
 
-Get `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIdaemon to Applications and open it. No terminal needed. Until the download is notarized, macOS asks once: open it, then **System Settings → Privacy & Security → Open Anyway**.
+Get `AIdaemon-macos-aarch64.dmg` (Apple silicon) or `AIdaemon-macos-x86_64.dmg` (Intel) from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), drag AIDaemon to Applications and open it. No terminal needed. Until the download is notarized, macOS asks once: open it, then **System Settings → Privacy & Security → Open Anyway**.
 
 ### Windows download
 
-Get `aidaemon-windows-x86_64.zip` from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), extract it to a folder you keep (for example `%LOCALAPPDATA%\AIdaemon`) and open `aidaemon-app.exe`. Windows SmartScreen may warn about an unrecognized app: **More info → Run anyway**.
+Get `aidaemon-windows-x86_64.zip` from the [latest release](https://github.com/davo20019/aidaemon/releases/latest), extract it to a folder you keep (for example `%LOCALAPPDATA%\AIDaemon`) and open `aidaemon-app.exe`. Windows SmartScreen may warn about an unrecognized app: **More info → Run anyway**.
 
 ### Homebrew
 
@@ -44,10 +44,12 @@ brew install davo20019/tap/aidaemon
 ### Cargo
 
 ```bash
-cargo install --locked --git https://github.com/davo20019/aidaemon aidaemon
+cargo install --locked aidaemon
 ```
 
-Then open the AIdaemon app (`aidaemon app`, or `aidaemon-app` from a release). The first time it opens, the desktop app starts the daemon on this computer right away, now and at login, with no administrator password (**Run it on another machine instead** pairs with a server; `aidaemon service uninstall` stops it, and the app then asks before starting it again). It finds a model already on the computer (a ChatGPT sign-in, a provider key in the environment, Ollama or llama.cpp running locally) and offers it in one click, or connects one you pick; each is tested before anything is saved, and each provider says whether it uses your plan, bills per token or runs on your own machine. Self-hosted models need no key: pick **Ollama (local)** or **llama.cpp (local)**, or **Another OpenAI-compatible service** with your server's address (LM Studio, vLLM) and the key left empty. `llama-server` and this daemon's health check both default to port 8080: start one of them elsewhere (`llama-server --port 8081`, or `[daemon] health_port`) and give llama.cpp's address in its form. Your first conversation opens next. To talk to your agent from Telegram, Slack or Discord later, use **Settings → Reach it from your phone**.
+This installs the daemon only; the app comes with the downloads above.
+
+Then open the AIDaemon app (`aidaemon app`, or `aidaemon-app` from a release). The first time it opens, the desktop app starts the daemon on this computer right away, now and at login, with no administrator password (**Run it on another machine instead** pairs with a server; `aidaemon service uninstall` stops it, and the app then asks before starting it again). It finds a model already on the computer (a ChatGPT sign-in, a provider key in the environment, Ollama or llama.cpp running locally) and offers it in one click, or connects one you pick; each is tested before anything is saved, and each provider says whether it uses your plan, bills per token or runs on your own machine. Self-hosted models need no key: pick **Ollama (local)** or **llama.cpp (local)**, or **Another OpenAI-compatible service** with your server's address (LM Studio, vLLM) and the key left empty. `llama-server` and this daemon's health check both default to port 8080: start one of them elsewhere (`llama-server --port 8081`, or `[daemon] health_port`) and give llama.cpp's address in its form. Your first conversation opens next. To talk to your agent from Telegram, Slack or Discord later, use **Settings → Reach it from your phone**.
 
 On a server, run `aidaemon` there with no config: it prints a link and a one-time code. Reach the machine's port 8788 through an SSH tunnel or your own HTTPS tunnel, open the link on your laptop or phone, and set it up from there (the code pairs the first device only). Prefer a terminal? `aidaemon setup` connects the model right there.
 
@@ -291,6 +293,14 @@ tunnel = "my-tunnel"         # created with `cloudflared tunnel create`
 
 Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` for a throwaway `trycloudflare.com` address, Client Gateway only), `manual` (`url` of a reverse proxy you run) and `command` (any program that prints `{"url": "https://..."}` on its first line and keeps running; argv only, `{port}`, `{addr}` and `{service}` are filled in). The Node Gateway needs an address that survives restarts, so it refuses `quick` and a `command` without `stable = true`. `cloudflared` or `tailscale` must be on `PATH` (or set `binary`). Changes apply after a restart; `/exposure` shows each tunnel's state, address and last failure. The agent can set this up for you (`manage_config enable_exposure`, with your approval), except `command`, which only you can write.
 
+### The phone app (iOS and Android)
+
+The app on a phone never runs the daemon; it pairs with yours. Expose the Client Gateway first (above). The quickest way: in the desktop app on the daemon's computer, open Settings → Paired devices → **Pair a phone**, scan the QR code with the phone's camera, tap **Open AIDaemon**, and approve the phone on the desktop. Or send `/pair_device` to your agent from Telegram, Slack, Discord or the desktop app, open the link it replies with on the phone, tap **Open AIDaemon**, and approve the phone in that chat. Both links open your daemon's own pairing page (`/client/v1/pair`), which hands the pairing to the app (or its store page), or pairs that browser instead: the pairing details ride after the `#`, which browsers never send to the server. Pasting the link into the app works too. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
+
+Releases build the phone app themselves: with the `ANDROID_KEYSTORE_*` secrets and a Google Play service account key in `PLAY_SERVICE_ACCOUNT_JSON`, each release (and each run of the Android beta workflow, from any branch) is signed and sent to Play's internal testing track.
+
+Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI: `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
+
 ### Customize your agent
 
 Your agent's first message offers to change its name and personality: just tell it. It writes them to an editable `persona.md` next to `config.toml`.
@@ -400,12 +410,14 @@ For external APIs, the built-in auth flow is:
 
 The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every SDK crate shares one version (0.21.0); the public-contract crates are semver-checked in CI.
 
-The SDK is not on crates.io yet, so depend on the repository:
+The SDK crates are on [crates.io](https://crates.io/crates/aidaemon-sdk):
 
 ```toml
 [dependencies]
-aidaemon-sdk = { git = "https://github.com/davo20019/aidaemon" }
+aidaemon-sdk = "0.21"
 ```
+
+Or follow `master`: `aidaemon-sdk = { git = "https://github.com/davo20019/aidaemon" }`.
 
 ```rust
 use aidaemon_sdk::prelude::*;

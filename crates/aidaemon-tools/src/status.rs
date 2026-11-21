@@ -24,11 +24,17 @@ pub enum StatusUpdate {
     Thinking(usize),
     /// Sent before each tool execution. `kind` is what every card shows;
     /// `name` and `summary` are the call's own words for clients that list
-    /// calls.
+    /// calls. Built with [`StatusUpdate::tool_start`]: the variant is
+    /// non-exhaustive so a new field changes one constructor, not every
+    /// sender.
+    #[non_exhaustive]
     ToolStart {
         name: String,
         summary: String,
         kind: aidaemon_core::card::ActivityKind,
+        /// The call's arguments as an app shows them
+        /// ([`crate::shown::call_input`]); empty when there are none to show.
+        input: String,
     },
     /// Streaming output chunk from a tool (e.g., CLI agent progress).
     ToolProgress { name: String, chunk: String },
@@ -36,8 +42,16 @@ pub enum StatusUpdate {
     /// authorizing an OAuth connection in their browser. Unlike ordinary tool
     /// progress, channels must deliver this immediately and without truncation.
     UserActionRequired { message: String },
-    /// Tool execution completed with a brief summary.
-    ToolComplete { name: String, summary: String },
+    /// Tool execution completed with a brief summary. Built with
+    /// [`StatusUpdate::tool_complete`].
+    #[non_exhaustive]
+    ToolComplete {
+        name: String,
+        summary: String,
+        /// The call's result as an app shows it
+        /// ([`crate::shown::call_output`]); empty when there is none to show.
+        output: String,
+    },
     /// Tool can be cancelled with the given task_id.
     ToolCancellable { name: String, task_id: String },
     /// Periodic summary for long-running tasks (emitted every 5 minutes).
@@ -155,6 +169,49 @@ pub fn command_output_tail(stdout: &[u8], stderr: &[u8]) -> Option<String> {
 }
 
 impl StatusUpdate {
+    /// A call starting, with nothing to show of its arguments yet
+    /// ([`Self::showing_arguments`] adds them).
+    pub fn tool_start(
+        name: impl Into<String>,
+        summary: impl Into<String>,
+        kind: aidaemon_core::card::ActivityKind,
+    ) -> Self {
+        Self::ToolStart {
+            name: name.into(),
+            summary: summary.into(),
+            kind,
+            input: String::new(),
+        }
+    }
+
+    /// A call finished, with nothing to show of its result yet
+    /// ([`Self::showing_result`] adds it).
+    pub fn tool_complete(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self::ToolComplete {
+            name: name.into(),
+            summary: summary.into(),
+            output: String::new(),
+        }
+    }
+
+    /// A started call that shows its raw JSON arguments the way history
+    /// does ([`crate::shown::call_input`]). Other updates are unchanged.
+    pub fn showing_arguments(mut self, arguments: &str) -> Self {
+        if let Self::ToolStart { input, .. } = &mut self {
+            *input = crate::shown::call_input(&serde_json::Value::String(arguments.to_string()));
+        }
+        self
+    }
+
+    /// A finished call that shows its raw result the way history does
+    /// ([`crate::shown::call_output`]). Other updates are unchanged.
+    pub fn showing_result(mut self, result: &str) -> Self {
+        if let Self::ToolComplete { output, .. } = &mut self {
+            *output = crate::shown::call_output(result);
+        }
+        self
+    }
+
     /// Whether a channel must deliver this update immediately instead of
     /// treating it as optional, rate-limited progress.
     pub fn requires_immediate_delivery(&self) -> bool {

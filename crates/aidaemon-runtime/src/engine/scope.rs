@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
+use crate::turn::closeout::StopDemand;
+
 use serde_json::Value;
 
 use crate::engine::outcome::TurnVerdict;
@@ -48,15 +50,8 @@ pub struct TurnScope<'a> {
     pub budget_goal: Option<BudgetGoal>,
     /// Set once the goal budget is used up; later model calls are refused.
     pub model_calls: AtomicU64,
-    /// The verify-once and failure-recovery passes have been used.
-    pub verification_demanded: AtomicBool,
-    pub recovery_demanded: AtomicBool,
-    /// The run was sent back once because declared work was never
-    /// attempted (`RunAggregate::unattempted_declared_work`).
-    pub unattempted_work_demanded: AtomicBool,
-    /// The run was sent back once after a `partial` verdict with nothing in
-    /// its way ([`crate::turn::system_directives::SystemDirective::PartialWithoutObstacle`]).
-    pub partial_demanded: AtomicBool,
+    /// What each stop-time ask has spent in this run (`StopDemand`).
+    pub stop_budgets: StopBudgets,
     /// Declared items the run ended without attempting, after its one pass
     /// (index, the step in the model's own words): their typed reason, "not
     /// attempted", reaches the card and the reply.
@@ -75,8 +70,6 @@ pub struct TurnScope<'a> {
     /// at the one that answered, instead of asking the failed one again
     /// first and bouncing between them.
     pub took_over: std::sync::Mutex<Option<(String, String)>>,
-    /// Extra passes the ledger demanded so far.
-    pub closeout_demands: std::sync::atomic::AtomicU32,
     /// The latest closeout let the run stop after a demand while the ledger
     /// still held reachable expectations: the reply in hand was written to
     /// the daemon's demand, not to the user.
@@ -93,6 +86,11 @@ pub struct TurnScope<'a> {
     /// Checklist items the model has not finished or set aside, as last
     /// declared through `track_requirements`.
     pub open_checklist_items: AtomicU64,
+    /// The one checklist item that changes something and that the model
+    /// marked `in_progress` in its latest checklist (`u64::MAX`: none, or
+    /// more than one): where a change a call made without naming an item
+    /// goes ([`aidaemon_tools::semantics::ToolCallMetadata::changes_untyped`]).
+    pub in_progress_change_item: AtomicU64,
     /// The model has declared a checklist in this run, finished or not.
     pub checklist_declared: AtomicBool,
     pub status_tx: Option<tokio::sync::mpsc::Sender<aidaemon_tools::status::StatusUpdate>>,
@@ -110,8 +108,6 @@ pub struct TurnScope<'a> {
     pub learning_consent: aidaemon_policies::TurnLearning,
     /// The model-visible output of the latest tool call, for paste checks.
     pub latest_tool_output: std::sync::Mutex<Option<String>>,
-    /// The one reply retry has been spent.
-    pub reply_retry_used: AtomicBool,
     /// The next model call runs with tools disabled (empty-reply retry).
     pub text_only_next_call: Arc<AtomicBool>,
     /// The usage of the latest model call, until its budget check takes it.
@@ -186,20 +182,9 @@ pub struct TurnScope<'a> {
     /// The goal's effective daily budget after extensions, and their count.
     pub goal_daily_budget: std::sync::Mutex<Option<i64>>,
     pub goal_budget_extensions: std::sync::atomic::AtomicU32,
-    /// The one ask to check a file more than one member changed was made.
-    pub combined_verification_demands: std::sync::atomic::AtomicU32,
     /// Source files this run changed in a repository since its last
     /// command (`StopDemand::CodeChangeUnchecked`).
     pub unchecked_code: std::sync::Mutex<Vec<String>>,
-    /// The one ask to check changed code was made.
-    pub code_check_demands: std::sync::atomic::AtomicU32,
-    /// Mandate decision correction turns used.
-    pub mandate_commit_retries: std::sync::atomic::AtomicU32,
-    /// Verify-before-claim demands for an unverified GUI coordinate click.
-    pub gui_verify_demands: std::sync::atomic::AtomicU32,
-    /// A stop held for the run's unreported jobs waited its longest once:
-    /// the next stop is not held again.
-    pub unreported_jobs_wait_spent: std::sync::atomic::AtomicBool,
     /// The one 80% budget warning (task or scheduled run) was given.
     pub budget_warning_sent: AtomicBool,
     /// Timed-out model calls retried in this run.
@@ -303,5 +288,70 @@ mod checkable_code_tests {
         assert!(!is_checkable_code(&repo.join("README.md")));
         assert!(!is_checkable_code(&repo.join("notes/Plan.TXT")));
         assert!(!is_checkable_code(&tmp.path().join("loose.rs")));
+    }
+}
+
+/// What each stop-time ask has spent in this run, one row per
+/// [`StopDemand`]: budgets live in [`StopDemand::budget`], spends here.
+pub struct StopBudgets([std::sync::atomic::AtomicU32; StopDemand::ALL.len()]);
+
+impl Default for StopBudgets {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| {
+            std::sync::atomic::AtomicU32::new(0)
+        }))
+    }
+}
+
+impl StopBudgets {
+    /// How many times `demand` was asked in this run.
+    pub fn used(&self, demand: StopDemand) -> u32 {
+        self.0[demand.index()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether `demand` has no ask left.
+    pub fn spent(&self, demand: StopDemand) -> bool {
+        self.used(demand) >= demand.budget()
+    }
+
+    /// Count one ask of `demand`; returns the asks so far.
+    pub fn spend(&self, demand: StopDemand) -> u32 {
+        self.0[demand.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
+    /// Spend one ask of `demand` if any is left.
+    pub fn try_spend(&self, demand: StopDemand) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let row = &self.0[demand.index()];
+        let mut used = row.load(Relaxed);
+        while used < demand.budget() {
+            match row.compare_exchange_weak(used, used + 1, Relaxed, Relaxed) {
+                Ok(_) => return true,
+                Err(now) => used = now,
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod stop_budget_tests {
+    use super::{StopBudgets, StopDemand};
+
+    /// Every ask has its own row, and an ask past its budget is refused.
+    #[test]
+    fn each_ask_spends_its_own_budget() {
+        for (row, demand) in StopDemand::ALL.into_iter().enumerate() {
+            assert_eq!(demand.index(), row, "{demand:?} out of order");
+        }
+        let budgets = StopBudgets::default();
+        assert!(budgets.try_spend(StopDemand::PartialWithoutObstacle));
+        assert!(!budgets.try_spend(StopDemand::PartialWithoutObstacle));
+        assert!(budgets.spent(StopDemand::PartialWithoutObstacle));
+        assert_eq!(budgets.used(StopDemand::ReplyRepair), 0);
+        for _ in 0..3 {
+            assert!(budgets.try_spend(StopDemand::GuiClickVerification));
+        }
+        assert!(budgets.spent(StopDemand::GuiClickVerification));
     }
 }

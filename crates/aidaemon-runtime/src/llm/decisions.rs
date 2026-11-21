@@ -3,9 +3,12 @@
 //! decision has one spec saying what acting on it may do, how long it may
 //! take, and which answers are trusted enough to act on.
 //!
-//! A decision never grants authority, decides completion or loosens a
-//! safety check. With no backend configured, its mode `off`, in `shadow`
-//! mode, or on any failure, the caller does what it did without one.
+//! A decision never grants authority or decides completion, and loosens a
+//! safety check in one place only: a calibrated, confident answer may clear
+//! an egress call after untrusted content without the full check
+//! ([`DecisionEffect::ClearCheck`]); it can never refuse one. With no backend
+//! configured, its mode `off`, in `shadow` mode, or on any failure, the
+//! caller does what it did without one.
 //! Every decision runs through `SideCallGateway::decide`.
 
 use std::time::Duration;
@@ -31,6 +34,10 @@ pub enum Decision {
     /// A second look at a terminal command's effects. May only add an
     /// approval, never remove one.
     CommandRiskSecond,
+    /// Whether an egress call after untrusted content is consistent with
+    /// the owner's request, asked before the full check: a confident
+    /// calibrated yes clears the call, anything else goes to the full check.
+    UntrustedEgressClear,
 }
 
 /// What acting on a decision may do.
@@ -43,6 +50,11 @@ pub enum DecisionEffect {
     Route,
     /// May only make a check stricter.
     EscalateOnly,
+    /// May pass a call a safety check would otherwise judge, never refuse
+    /// one: below its threshold the full check runs as without a backend.
+    /// Calibrated answers only (measured 2026-11-20 on 117 labelled calls:
+    /// every call that should be held scored at most 0.29).
+    ClearCheck,
 }
 
 /// The minimum confidence and the confidence sources an answer needs
@@ -75,6 +87,9 @@ const ANY_SOURCE: &[ConfidenceSource] = &[
     ConfidenceSource::SelfReported,
 ];
 
+/// [`Decision::UntrustedEgressClear`]'s one question.
+pub const UNTRUSTED_EGRESS_CONSISTENT: &str = "consistent";
+
 /// Turn-digest question keys.
 pub mod digest_keys {
     pub const RELATIONSHIP: &str = "relationship";
@@ -87,12 +102,13 @@ pub mod digest_keys {
 
 impl Decision {
     #[cfg(test)]
-    pub const ALL: [Decision; 5] = [
+    pub const ALL: [Decision; 6] = [
         Decision::TurnDigest,
         Decision::Resume,
         Decision::RecallFilter,
         Decision::ModelRoute,
         Decision::CommandRiskSecond,
+        Decision::UntrustedEgressClear,
     ];
 
     pub const fn spec(self) -> DecisionSpec {
@@ -172,6 +188,20 @@ impl Decision {
                     sources: CALIBRATED,
                 }],
             },
+            // Clears a call only on a calibrated P(consistent) of 0.9 or
+            // more; a "no" at any confidence is never acted on (the full
+            // check decides it). The deadline is about four times the
+            // measured p90 (285 ms).
+            Decision::UntrustedEgressClear => DecisionSpec {
+                purpose: "untrusted_egress_clear",
+                effect: ClearCheck,
+                deadline: Duration::from_millis(1200),
+                acts_on: &[ActsOn {
+                    key: UNTRUSTED_EGRESS_CONSISTENT,
+                    min_confidence: 0.9,
+                    sources: CALIBRATED,
+                }],
+            },
         }
     }
 
@@ -183,6 +213,7 @@ impl Decision {
             Decision::RecallFilter => modes.recall_filter,
             Decision::ModelRoute => modes.model_route,
             Decision::CommandRiskSecond => modes.command_risk_second,
+            Decision::UntrustedEgressClear => modes.untrusted_egress_clear,
         }
     }
 }
@@ -317,6 +348,7 @@ mod tests {
             Decision::RecallFilter,
             Decision::CommandRiskSecond,
             Decision::Resume,
+            Decision::UntrustedEgressClear,
         ] {
             for rule in decision.spec().acts_on {
                 assert_eq!(rule.sources, CALIBRATED, "{decision:?}");

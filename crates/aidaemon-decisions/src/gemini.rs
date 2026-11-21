@@ -43,6 +43,9 @@ impl std::fmt::Debug for GeminiDecider {
 }
 
 impl GeminiDecider {
+    /// The model a decider uses unless [`Self::with_model`] picks another.
+    pub const DEFAULT_MODEL: &'static str = DEFAULT_MODEL;
+
     pub fn new(api_key: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))

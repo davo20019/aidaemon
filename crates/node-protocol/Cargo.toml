@@ -3,7 +3,7 @@ name = "aidaemon-node-protocol"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Language-neutral AIdaemon Node Protocol v1 Rust models"
+description = "Language-neutral AIDaemon Node Protocol v1 Rust models"
 repository = "https://github.com/davo20019/aidaemon"
 homepage = "https://aidaemon.ai/"
 

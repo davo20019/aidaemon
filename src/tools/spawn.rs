@@ -1777,36 +1777,6 @@ mod child_runtime_tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_restart_tells_each_chat_what_it_lost() {
-        let store = notification_store().await;
-        let state: Arc<dyn StateStore> = store.clone();
-        state
-            .record_background_spawn(&crate::traits::BackgroundSpawn {
-                id: "background_spawn:1".to_string(),
-                session_id: "telegram:synthetic-user-1".to_string(),
-                mission: "Publish the synthetic report".to_string(),
-                started_at: chrono::Utc::now().to_rfc3339(),
-            })
-            .await
-            .unwrap();
-
-        report_interrupted_background_children(
-            &(state.clone() as Arc<dyn crate::traits::NotificationStore>),
-        )
-        .await;
-
-        let entry = wait_for_notification(&store).await;
-        assert_eq!(entry.session_id, "telegram:synthetic-user-1");
-        assert!(
-            entry
-                .message
-                .contains("A restart stopped this background job")
-        );
-        assert!(entry.message.contains("Publish the synthetic report"));
-        assert!(store.take_background_spawns().await.unwrap().is_empty());
-    }
-
     /// A task that merely starts like a delay reaches the child at once and
     /// word for word: wording never decides whether to wait.
     #[tokio::test]

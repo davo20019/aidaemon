@@ -184,6 +184,14 @@ pub fn evidence_capabilities_for_tool_call(
             Direct,
             Current,
         )],
+        // An edit, succeeded: the file holds what the call wrote (live 2026-11-19: without this every edit of a file the
+        // request names cost a read-back round and two model calls).
+        EvidenceSource::FileWrite => vec![capability(
+            LocalWorkspace,
+            &[CurrentState, Outcome],
+            Direct,
+            Current,
+        )],
         EvidenceSource::Shell => vec![
             capability(
                 LocalWorkspace,

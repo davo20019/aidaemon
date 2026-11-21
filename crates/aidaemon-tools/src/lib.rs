@@ -77,6 +77,7 @@ mod search_files;
 pub mod semantics;
 pub mod services;
 mod shell;
+pub mod shown;
 pub mod status;
 pub mod stt_setup;
 pub mod system;

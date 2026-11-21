@@ -53,6 +53,10 @@ pub struct QueuedMessage {
     /// The owner sent it to wait for its own turn (an app's Queue): the
     /// running work takes messages sent after it to be read now past it.
     pub placed_for_later: bool,
+    /// The owner placed it from an app (its Now or After), which lists it
+    /// while it waits and shows it in the chat once it runs: the channel
+    /// says nothing about it.
+    pub listed_by_client: bool,
 }
 
 impl QueuedMessage {
@@ -73,7 +77,15 @@ impl QueuedMessage {
             ingress_timing: None,
             steerable: true,
             placed_for_later: false,
+            listed_by_client: false,
         }
+    }
+
+    /// Placed by the owner from an app that lists it (see
+    /// [`Self::listed_by_client`]).
+    pub fn listed_by_client(mut self) -> Self {
+        self.listed_by_client = true;
+        self
     }
 
     /// Keep it out of the running turn: it runs as its own turn.
@@ -506,6 +518,17 @@ impl TaskRegistry {
         }
     }
 
+    /// Undo [`Self::mark_seen`] for a message handled in two steps (a stop
+    /// done now, the rest of the message then run or queued), so its second
+    /// step is not taken for a duplicate delivery.
+    pub async fn unmark_seen(&self, session_id: &str, text: &str, dedup_key: Option<&str>) {
+        let hash = Self::text_hash(dedup_key.unwrap_or(text));
+        self.recently_seen
+            .write()
+            .await
+            .remove(&(session_id.to_string(), hash));
+    }
+
     /// Queue a message for later processing.
     /// Returns `Some(position)` if queued, or `None` if deduplicated (identical message
     /// already exists in the queue or was recently processed).
@@ -580,6 +603,7 @@ impl TaskRegistry {
             combined.text.push('\n');
             combined.text.push_str(&msg.text);
             combined.attachments.extend(msg.attachments);
+            combined.listed_by_client &= msg.listed_by_client;
         }
         Some(combined)
     }
@@ -694,6 +718,26 @@ impl TaskRegistry {
                 queue.remove(at);
             }
         }
+        true
+    }
+
+    /// Give queued message `id`, sent to wait for its own turn, to the
+    /// running work: it is read at the work's next step, the same as a
+    /// message sent to be read now. Nothing running is interrupted. `false`
+    /// when it is no longer waiting or was not sent to wait.
+    pub async fn send_queued_now(&self, session_id: &str, id: u64) -> bool {
+        let mut queues = self.queues.write().await;
+        let Some(message) = queues
+            .get_mut(session_id)
+            .and_then(|queue| queue.iter_mut().find(|m| m.id == id))
+        else {
+            return false;
+        };
+        if !message.placed_for_later {
+            return false;
+        }
+        message.placed_for_later = false;
+        message.steerable = true;
         true
     }
 
@@ -1553,5 +1597,45 @@ mod queue_edit_tests {
         assert_eq!(first.text, "also this");
         let second = registry.pop_all_queued_messages(session).await.unwrap();
         assert_eq!(second.text, "after this");
+    }
+
+    /// "Send now" on a message waiting for its own turn: the running work
+    /// takes it at its next step, as it takes one sent to be read now. A
+    /// message that was not sent to wait (or is gone) is left as it is.
+    #[tokio::test]
+    async fn a_message_queued_for_later_can_be_given_to_the_running_work() {
+        let registry = TaskRegistry::new(10);
+        let session = "app:synthetic-send-now";
+        let ctx = ChannelContext::private("app");
+        let later = QueuedMessage::new("after this", UserRole::Owner, ctx.clone(), Vec::new())
+            .placed_for_later();
+        let later_id = later.id;
+        let unrelated =
+            QueuedMessage::new("another task", UserRole::Owner, ctx.clone(), Vec::new())
+                .not_steerable();
+        let unrelated_id = unrelated.id;
+        registry.queue_message(session, later, None).await;
+        registry.queue_message(session, unrelated, None).await;
+        assert!(
+            registry
+                .take_steering_messages(session, UserRole::Owner, &ctx)
+                .await
+                .is_empty()
+        );
+
+        assert!(registry.send_queued_now(session, later_id).await);
+        assert!(!registry.send_queued_now(session, unrelated_id).await);
+        assert!(!registry.send_queued_now(session, 0).await);
+        let taken = registry
+            .take_steering_messages(session, UserRole::Owner, &ctx)
+            .await;
+        assert_eq!(
+            taken.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["after this"]
+        );
+        assert!(
+            !registry.send_queued_now(session, later_id).await,
+            "already taken"
+        );
     }
 }

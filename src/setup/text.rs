@@ -14,7 +14,7 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
     let model = super::model::ModelSetup::new(config_path.to_path_buf(), stop.clone());
     let host = super::model::Host(model.clone());
     println!();
-    println!("  AIdaemon setup: connect a model. Nothing is saved until it answers a test.");
+    println!("  AIDaemon setup: connect a model. Nothing is saved until it answers a test.");
     println!("  Looking for models on this computer...");
     model.detect().await;
     loop {
@@ -42,7 +42,7 @@ pub(crate) async fn run(config_path: &Path) -> anyhow::Result<()> {
             actions.push(None);
         }
         let choice = Select::new()
-            .with_prompt("Which model should AIdaemon use?")
+            .with_prompt("Which model should AIDaemon use?")
             .items(&items)
             .default(0)
             .interact()?;

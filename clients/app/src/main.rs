@@ -27,7 +27,7 @@ fn main() -> impl std::process::Termination {
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<nsh_app_aidaemon::App>()),
         platform::AppOptions {
-            title: "AIdaemon".to_owned(),
+            title: "AIDaemon".to_owned(),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             app_id: "ai.aidaemon.app".to_owned(),
             size: (1180, 780),
@@ -38,5 +38,5 @@ fn main() -> impl std::process::Termination {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!(
-    "Run this binary on macOS, Windows or Linux; use the TSX entry with nsh run for iOS and Android."
+    "Run this binary on macOS, Windows or Linux; `nsh run` / `nsh package --target ios|android` build the library for the phones."
 );

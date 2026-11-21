@@ -369,12 +369,6 @@ fn outcome_words(outcome: &str) -> Option<String> {
         .map(|first| first.to_uppercase().chain(chars).collect())
 }
 
-/// The tool names in a stored `tool_calls_json`, in order.
-/// How much of a call's arguments the app is sent.
-const CALL_INPUT_CHARS: usize = 600;
-/// How much of a call's result the app is sent.
-const CALL_OUTPUT_CHARS: usize = 1_500;
-
 /// A call of a reply's turn, still waiting for its result.
 struct PendingCall {
     id: String,
@@ -432,37 +426,12 @@ fn raw_arguments(arguments: &serde_json::Value) -> String {
 /// secrets redacted, trimmed. A string holding JSON (the nested shape)
 /// reads as that JSON; `{}` reads as nothing.
 fn shown_input(arguments: &serde_json::Value) -> String {
-    let mut value = match arguments {
-        serde_json::Value::String(text) => {
-            serde_json::from_str(text).unwrap_or_else(|_| arguments.clone())
-        }
-        other => other.clone(),
-    };
-    if value.as_object().is_some_and(|o| o.is_empty()) || value.is_null() {
-        return String::new();
-    }
-    aidaemon_tools::sanitize::redact_json_for_owner(&mut value);
-    let text = match &value {
-        serde_json::Value::String(text) => text.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_default(),
-    };
-    aidaemon_tools::text::truncate_with_note(&text, CALL_INPUT_CHARS)
+    aidaemon_tools::shown::call_input(arguments)
 }
 
-/// A call's result as the owner's app shows it: without the untrusted-data
-/// frame the model saw it in, secrets redacted, trimmed.
+/// A call's result as the owner's app shows it (`aidaemon_tools::shown`).
 fn shown_output(content: &str) -> String {
-    let mut text = content.trim();
-    if let Some(rest) = text.strip_prefix(aidaemon_policies::UNTRUSTED_PREFIX)
-        && let Some(rest) = rest
-            .trim_end()
-            .strip_suffix(aidaemon_policies::UNTRUSTED_SUFFIX)
-    {
-        // The frame's first line names the tool; the data follows it.
-        text = rest.split_once('\n').map_or("", |(_, data)| data).trim();
-    }
-    let text = aidaemon_tools::sanitize::redact_for_owner(text);
-    aidaemon_tools::text::truncate_with_note(&text, CALL_OUTPUT_CHARS)
+    aidaemon_tools::shown::call_output(content)
 }
 
 /// Markdown as the words a reader sees: links keep their text, emphasis
@@ -974,6 +943,12 @@ impl ClientHost for DaemonClientHost {
                 Some(caption) => caption.clone(),
                 None => m.content.unwrap_or_default(),
             };
+            // A helper's result as the owner was shown it, without the
+            // label that tells the model where it came from.
+            let text = match aidaemon_runtime::turn::notes::parent_note_shown_text(&text) {
+                Some(shown) if m.role == "assistant" => shown.to_string(),
+                _ => text,
+            };
             // A reply reads as it was shown when it arrived.
             let text = if delivered.is_some() {
                 text
@@ -1360,9 +1335,13 @@ impl aidaemon_channels::slash::SlashCommand for DeviceCommands {
         match cmd {
             "/pair_device" => match pairing.offer(Some(call.session_id.to_string())).await {
                 Ok(offer) => format!(
-                    "To pair a device, open {} on it and enter the code **{}** \
-                     (valid 10 minutes). I'll ask you here before it can do anything.\n\n\
+                    "To pair your phone, open this link on it (it opens the AIDaemon \
+                     app): {}\n\n\
+                     To pair a browser instead, open {} in it.\n\n\
+                     The code is **{}**, valid 10 minutes. I'll ask you here before the \
+                     device can do anything.\n\n\
                      Daemon fingerprint: `{}`",
+                    offer.page_link(),
                     web_link(&gateway, &offer),
                     offer.code,
                     offer.fingerprint
@@ -1431,10 +1410,8 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CALL_OUTPUT_CHARS, outcome_words, run_outcome, session_ends, shown_output, snippet,
-        tool_calls,
-    };
+    use super::{outcome_words, run_outcome, session_ends, shown_output, snippet, tool_calls};
+    use aidaemon_tools::shown::CALL_OUTPUT_CHARS;
 
     /// A run the scheduler skipped reaches the app as `missed`, never as
     /// `failed`; a status this build does not know stays `unknown`.

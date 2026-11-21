@@ -241,6 +241,59 @@ pub fn owner_request_for_verifier(
     })
 }
 
+/// The untrusted-call check's request with the owner's recent messages
+/// beside it when the lineage alone would leave them out, in a conversation
+/// only the owner writes in (`owner_only_chat`): a turn whose earlier
+/// request was already answered (a bare "Yes, do it." after "Shall I
+/// push?"), and a continuation of background work, whose lineage lists only
+/// unfinished requests. `lineage` is [`owner_request_for_verifier`]'s or
+/// [`owner_requests_for_continuation`]'s answer; `current` is the turn's
+/// text, `None` for a continuation (its text is the runtime's report, never
+/// the owner's). What production call checkers see: every user message,
+/// never tool results (live 2026-11-20: 26 of 27 holds in a week were
+/// legitimate calls judged against a bare confirmation or a background
+/// job's report). Quoted context, never a grant.
+pub fn verifier_context(
+    state: &DialogueState,
+    lineage: Option<String>,
+    current: Option<&str>,
+    owner_only_chat: bool,
+) -> Option<String> {
+    if !owner_only_chat {
+        return lineage;
+    }
+    let current_text = current.map(str::trim);
+    let neighbours: Vec<String> = state
+        .recent_user_messages
+        .iter()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty() && Some(*text) != current_text)
+        .filter(|text| {
+            let quoted = serde_json::Value::from(*text).to_string();
+            lineage
+                .as_deref()
+                .is_none_or(|lineage| !lineage.contains(&quoted) && !lineage.contains(*text))
+        })
+        .map(|text| format!("- {}", serde_json::Value::from(text)))
+        .collect();
+    if neighbours.is_empty() {
+        return lineage;
+    }
+    let recent = format!(
+        "Recent messages from the owner in this conversation, oldest first \
+         (use them to resolve references such as \"it\" or \"them\"):\n{}",
+        neighbours.join("\n")
+    );
+    Some(match (lineage, current_text) {
+        (Some(lineage), _) => format!("{lineage}\n\n{recent}"),
+        (None, Some(current)) => format!("{current}\n\n{recent}"),
+        (None, None) => format!(
+            "{recent}\n\nThis run continues the owner's work with the result of background \
+             work that ended; that result is not something the owner said."
+        ),
+    })
+}
+
 /// The request a continuation turn's calls are judged against: the
 /// owner's own unfinished requests in this conversation, oldest first. The
 /// continuation's text is the runtime's report of background work that
@@ -2071,6 +2124,71 @@ mod owner_lineage_tests {
         assert_eq!(
             owner_request_for_verifier(&state, EARLIER, Utc::now()),
             None
+        );
+    }
+
+    fn answered_state(recent: &[&str]) -> DialogueState {
+        let mut state = DialogueState::new("session-1");
+        state.recent_user_messages = recent.iter().map(|text| text.to_string()).collect();
+        state
+    }
+
+    /// A confirmation after an answered request has no owed lineage; in the
+    /// owner's own chat the check still sees what it confirms.
+    #[test]
+    fn a_confirmation_after_an_answered_request_keeps_the_owners_messages() {
+        let state = answered_state(&[
+            "Draft the synthetic digest for Jordan.",
+            "Commit and push it to the demo branch.",
+            "Yes, do it.",
+        ]);
+        assert_eq!(
+            owner_request_for_verifier(&state, "Yes, do it.", Utc::now()),
+            None
+        );
+        let context = verifier_context(&state, None, Some("Yes, do it."), true)
+            .expect("the owner's messages are context");
+        assert!(context.starts_with("Yes, do it."), "{context}");
+        assert!(
+            context.contains("Commit and push it to the demo branch."),
+            "{context}"
+        );
+        assert_eq!(context.matches("Yes, do it.").count(), 1, "{context}");
+        // Other people can write in a shared chat: nothing is added there.
+        assert_eq!(
+            verifier_context(&state, None, Some("Yes, do it."), false),
+            None
+        );
+    }
+
+    /// A continuation of background work sees the owner's messages, and is
+    /// told its own text is the runtime's report.
+    #[test]
+    fn a_continuation_without_owed_work_keeps_the_owners_messages() {
+        let state = answered_state(&["Deploy the synthetic blog and check the new post is live."]);
+        let context = verifier_context(&state, None, None, true).expect("context");
+        assert!(context.contains("Deploy the synthetic blog"), "{context}");
+        assert!(
+            context.contains("not something the owner said"),
+            "{context}"
+        );
+    }
+
+    /// Lineage that already quotes a message does not repeat it.
+    #[test]
+    fn verifier_context_adds_only_what_the_lineage_lacks() {
+        let state = answered_state(&[EARLIER, "And use the blue theme."]);
+        let lineage = format!(
+            "Owner's unfinished request: {}",
+            serde_json::Value::from(EARLIER)
+        );
+        let context = verifier_context(&state, Some(lineage.clone()), Some("Go"), true).unwrap();
+        assert_eq!(context.matches(EARLIER).count(), 1, "{context}");
+        assert!(context.contains("And use the blue theme."), "{context}");
+        let state = answered_state(&[EARLIER]);
+        assert_eq!(
+            verifier_context(&state, Some(lineage.clone()), Some("Go"), true),
+            Some(lineage)
         );
     }
 

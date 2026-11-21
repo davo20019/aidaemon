@@ -459,7 +459,8 @@ pub fn owner_units_note(units: &[aidaemon_events::traits::RequestWorkUnit]) -> O
         "[What the owner asked for] Compiled from the owner's message, apart from your plan:\n{}\n\
          Your checklist answers for each of these: give every item the owner_units it carries out. \
          What earlier work, memory or existing files show is context for these, never their result. \
-         If one cannot start without the owner's choice (for example, what exists might be what they meant), \
+         If one cannot start without the owner's choice (what exists might be what they meant, the only way to do it breaks \
+         an instruction of theirs, or what they describe is not so, such as a bug you checked and found absent), \
          ask that one question with outcome needs_owner instead of doing something else in its place.",
         lines.join("\n")
     ))

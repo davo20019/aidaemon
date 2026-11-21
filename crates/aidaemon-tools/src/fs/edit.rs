@@ -451,6 +451,7 @@ impl crate::semantics::ToolSemantics for EditFile {
             semantic_scope: Some(crate::semantics::ToolSemanticScope::LocalWorkspace),
             low_signal_result: true,
             status_label: Some("editing a file"),
+            evidence: crate::semantics::EvidenceSource::FileWrite,
             ..Default::default()
         }
     }
@@ -485,7 +486,10 @@ impl crate::semantics::ToolSemantics for EditFile {
             })
             .unwrap_or_default();
 
-        ToolCallSemantics::mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
+        // It reads the file under its write fence and returns what the file
+        // now holds around each change: a write and an observation of the
+        // result, so a successful edit proves the file's current state.
+        ToolCallSemantics::observation_and_mutation_with(ToolMutationEffects::LOCAL_SOURCE_WRITE)
             .with_target_hint(ToolTargetHintKind::Path, path)
     }
 

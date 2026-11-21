@@ -95,10 +95,6 @@ impl OutcomeTool for ReadFile {
                     }
                 },
                 "required": ["path"],
-                "allOf": [
-                    {"not": {"required": ["tail_lines", "start_line"]}},
-                    {"not": {"required": ["tail_lines", "end_line"]}}
-                ],
                 "additionalProperties": false
             }
         })
@@ -219,18 +215,6 @@ impl ReadFile {
         let tail_value = tail_value.filter(|_| !(has_start || has_end));
         let requested_start = args.get("start_line").and_then(Value::as_u64);
         let requested_end = args.get("end_line").and_then(Value::as_u64);
-        if requested_start.is_some_and(|line| line == 0)
-            || requested_end.is_some_and(|line| line == 0)
-        {
-            return Ok(ToolCallOutcome::contract_rejection(
-                "read_file line numbers are 1-based and must be positive",
-            ));
-        }
-        if matches!((requested_start, requested_end), (Some(start), Some(end)) if end < start) {
-            return Ok(ToolCallOutcome::contract_rejection(
-                "read_file end_line must be greater than or equal to start_line",
-            ));
-        }
 
         let backend = self.backend.clone();
         let path = backend.resolve_path(path_str).await?;
@@ -298,6 +282,21 @@ impl ReadFile {
             return Ok(ToolCallOutcome::from_output(out));
         }
 
+        // Line ranges apply to text only: an image, document or binary file
+        // above ignores them, so a range sent with one is never an error
+        // (live 2026-11-18: a PNG read with a range was rejected nine times).
+        if requested_start.is_some_and(|line| line == 0)
+            || requested_end.is_some_and(|line| line == 0)
+        {
+            return Ok(ToolCallOutcome::contract_rejection(
+                "read_file line numbers are 1-based and must be positive",
+            ));
+        }
+        if matches!((requested_start, requested_end), (Some(start), Some(end)) if end < start) {
+            return Ok(ToolCallOutcome::contract_rejection(
+                "read_file end_line must be greater than or equal to start_line",
+            ));
+        }
         let start = args["start_line"]
             .as_u64()
             .map(|n| (n as usize).saturating_sub(1))

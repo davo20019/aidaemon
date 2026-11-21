@@ -608,6 +608,9 @@ pub async fn verify_untrusted_call_with(
         owner_authored = origin_trusted,
         "Untrusted call verifier sees"
     );
+    if let Some(cleared) = fast_clearance(gateway, &messages, cancel).await {
+        return cleared;
+    }
     let options = verifier_options();
     let outcome = tokio::select! {
         outcome = gateway.ask(SideCall::UntrustedVerifier, &messages, &options, None) => outcome,
@@ -627,6 +630,61 @@ pub async fn verify_untrusted_call_with(
             could_not_verify()
         }
     }
+}
+
+/// The decision layer's clearance of a call before the full check, when a
+/// calibrated backend is configured: the same rules and inputs as the
+/// check, one yes/no question, about 0.25 s instead of a model call. Only
+/// a confident yes (P(consistent) at the decision's threshold, 0.9) clears
+/// the call; a no, an unsure answer, no backend, a self-reported source or
+/// any failure returns `None` and the full check decides (measured
+/// 2026-11-20 on 117 labelled calls: every call that should be held scored
+/// at most 0.29, and 64% of legitimate calls cleared).
+async fn fast_clearance(
+    gateway: &SideCallGateway,
+    messages: &[Value],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<VerifierVerdict> {
+    use crate::llm::decisions::{Decision, UNTRUSTED_EGRESS_CONSISTENT};
+    let decision = Decision::UntrustedEgressClear;
+    if gateway.decision_mode(decision) == crate::settings::DecisionMode::Off {
+        return None;
+    }
+    let call = messages.get(1)?.get("content")?.as_str()?;
+    let rules = VERIFIER_SYSTEM_PROMPT
+        .split("Reply with JSON")
+        .next()
+        .unwrap_or(VERIFIER_SYSTEM_PROMPT);
+    let mut request = aidaemon_decisions::DecisionRequest::new(format!(
+        "Rules for the judgment:\n{rules}\n\n{call}"
+    ));
+    request.insert(
+        UNTRUSTED_EGRESS_CONSISTENT,
+        aidaemon_decisions::Question::yes_no_described(
+            "Is performing exactly this call, with these arguments, consistent with the owner's request?",
+            "consistent: a step a careful person carrying out this request would take",
+            "not consistent: it sends data, acts on other places, uses secrets or deletes beyond what the request asks",
+        ),
+    );
+    let outcome = tokio::select! {
+        outcome = gateway.decide(decision, request, crate::llm::decide::DecisionContext::default()) => outcome,
+        _ = cancel.cancelled() => return None,
+    };
+    // `acted` holds the threshold on confidence, which a confident "no" also
+    // meets: only the probability of "yes" clears.
+    let threshold = decision.spec().acts_on.first()?.min_confidence;
+    let p = outcome
+        .acted(UNTRUSTED_EGRESS_CONSISTENT)?
+        .p_yes()
+        .filter(|p| *p >= threshold)?;
+    Some(VerifierVerdict {
+        consistent: true,
+        reason: format!(
+            "a calibrated fast check found the call consistent with the request (p = {p:.2})"
+        ),
+        owner_reason: None,
+        decided: true,
+    })
 }
 
 /// Settles the kernel's untrusted-egress interruptions with the verifier:
@@ -657,6 +715,28 @@ pub struct UntrustedVerifier<'a> {
     /// The files the request's own work produced, read when a call is
     /// judged (any run of the tree may have just made one).
     pub produced_files: &'a aidaemon_tools::semantics::ProducedFiles,
+    /// Messages the same sender sent while the run worked, taken into it:
+    /// read when a call is judged, so "stop the counting job" sent mid-run
+    /// is part of the request (live 2026-11-21: the `pkill` it asked for was
+    /// held as "you asked to start a second counting job, not stop it").
+    pub steered: Option<&'a std::sync::Mutex<Vec<crate::engine::scope::AbsorbedSteering>>>,
+}
+
+/// `request` followed by the messages the owner sent while the run worked,
+/// oldest first.
+fn with_steered(request: &str, steered: &[String]) -> String {
+    if steered.is_empty() {
+        return request.to_string();
+    }
+    let listed: Vec<String> = steered
+        .iter()
+        .map(|text| format!("- {}", Value::from(text.trim())))
+        .collect();
+    format!(
+        "{request}\n\nMessages the owner sent while this work ran, oldest first (the \
+         latest one wins where they differ):\n{}",
+        listed.join("\n")
+    )
 }
 
 impl UntrustedVerifier<'_> {
@@ -683,9 +763,22 @@ impl UntrustedVerifier<'_> {
                 )
             })
             .unwrap_or_default();
+        // Only an owner-authored request takes what the same sender added.
+        let steered: Vec<String> = self
+            .steered
+            .filter(|_| self.origin_trusted)
+            .and_then(|steered| steered.lock().ok())
+            .map(|steered| {
+                steered
+                    .iter()
+                    .map(|absorbed| absorbed.message.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let request = with_steered(self.origin_request, &steered);
         let verdict = verify_untrusted_call_with(
             self.gateway,
-            self.origin_request,
+            &request,
             self.origin_trusted,
             tool,
             &description,
@@ -778,6 +871,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// A message sent mid-run is part of the request a call is judged
+    /// against; with none, the request is unchanged.
+    #[test]
+    fn steered_messages_join_the_judged_request() {
+        assert_eq!(with_steered("Count to 200.", &[]), "Count to 200.");
+        let request = with_steered("Count to 200.", &["Stop the counting job.".to_string()]);
+        assert!(request.starts_with("Count to 200.\n\n"), "{request}");
+        assert!(
+            request.contains("- \"Stop the counting job.\""),
+            "{request}"
+        );
+    }
 
     /// The verifier sees what the arguments mean, not only the tool's
     /// one-line description: `remember_fact` documents `delete` as a forget.
@@ -1165,6 +1271,114 @@ mod tests {
         let purpose = SideCall::UntrustedVerifier.spec().purpose;
         assert_eq!(ok_calls(&events, purpose).await, 1);
         assert_eq!(failed_calls(&events, purpose).await, 0);
+    }
+
+    /// A gateway whose full check refuses, with `decider` as its decision
+    /// backend in `mode`.
+    async fn gateway_deciding(
+        decider: Arc<aidaemon_decisions::testing::ScriptedDecider>,
+        mode: crate::settings::DecisionMode,
+    ) -> (SideCallGateway, std::sync::Arc<aidaemon_events::EventStore>) {
+        use crate::llm::gateway::test_support::*;
+        let (gateway, events) = gateway_with(provider_answering(
+            r#"{"consistent":false,"reason":"the full check refused"}"#,
+        ))
+        .await;
+        gateway.set_decisions(Some(crate::llm::decide::DecisionLayer::with_decider(
+            decider,
+            crate::settings::DecisionModes {
+                untrusted_egress_clear: mode,
+                ..crate::settings::DecisionModes::default()
+            },
+        )));
+        (gateway, events)
+    }
+
+    /// A confident calibrated yes clears the call without the full check.
+    #[tokio::test]
+    async fn a_confident_calibrated_yes_clears_without_the_full_check() {
+        use crate::llm::gateway::test_support::*;
+        let decider = Arc::new(
+            aidaemon_decisions::testing::ScriptedDecider::new(
+                aidaemon_decisions::ConfidenceSource::Calibrated,
+            )
+            .always(0.95),
+        );
+        let (gateway, events) =
+            gateway_deciding(decider.clone(), crate::settings::DecisionMode::On).await;
+        let verdict = verify(&gateway, "send the report to Alice Rivera").await;
+        assert!(verdict.consistent && verdict.decided, "{verdict:?}");
+        assert_eq!(decider.calls().len(), 1);
+        let asked = format!("{:?}", decider.calls()[0].input);
+        assert!(asked.contains("alice.rivera@example.invalid"), "{asked}");
+        let purpose = SideCall::UntrustedVerifier.spec().purpose;
+        assert_eq!(
+            ok_calls(&events, purpose).await,
+            0,
+            "the full check did not run"
+        );
+    }
+
+    /// Anything short of a confident calibrated yes leaves the call to the
+    /// full check: a confident no, an unsure answer, a self-reported one, a
+    /// failing backend, the decision turned off.
+    #[tokio::test]
+    async fn anything_else_leaves_the_call_to_the_full_check() {
+        use crate::settings::DecisionMode::{Off, On, Shadow};
+        use aidaemon_decisions::ConfidenceSource::{Calibrated, SelfReported};
+        use aidaemon_decisions::testing::ScriptedDecider;
+        let cases = [
+            (
+                ScriptedDecider::new(Calibrated).always(0.02),
+                On,
+                "a confident no",
+            ),
+            (
+                ScriptedDecider::new(Calibrated).always(0.7),
+                On,
+                "an unsure yes",
+            ),
+            (
+                ScriptedDecider::new(SelfReported).always(0.99),
+                On,
+                "a self-reported yes",
+            ),
+            (
+                ScriptedDecider::new(Calibrated).then(Err(
+                    aidaemon_decisions::DecisionError::Transient("down".into()),
+                )),
+                On,
+                "a failing backend",
+            ),
+            (
+                ScriptedDecider::new(Calibrated).always(0.99),
+                Off,
+                "the decision off",
+            ),
+            (
+                ScriptedDecider::new(Calibrated).always(0.99),
+                Shadow,
+                "shadow mode",
+            ),
+        ];
+        for (decider, mode, case) in cases {
+            let (gateway, _) = gateway_deciding(Arc::new(decider), mode).await;
+            let verdict = verify(&gateway, "send the report to Alice Rivera").await;
+            assert!(!verdict.consistent, "{case}: the full check decides");
+            assert_eq!(verdict.reason, "the full check refused", "{case}");
+        }
+    }
+
+    /// With no decision backend the check is exactly the full check.
+    #[tokio::test]
+    async fn without_a_decision_backend_the_full_check_decides() {
+        use crate::llm::gateway::test_support::*;
+        let (gateway, _) = gateway_with(provider_answering(
+            r#"{"consistent":false,"reason":"the full check refused"}"#,
+        ))
+        .await;
+        let verdict = verify(&gateway, "send the report to Alice Rivera").await;
+        assert_eq!(verdict.reason, "the full check refused");
     }
 
     #[tokio::test]

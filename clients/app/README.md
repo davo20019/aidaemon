@@ -1,4 +1,4 @@
-# AIdaemon app
+# AIDaemon app
 
 One Rust app for chat, approvals and the agent's running work, on the desktops, the web and a terminal, built on [Native Shell](https://nsh.dev) (nsh 0.5). It replaces the TUI, the TypeScript web page and the Tauri shell over time.
 

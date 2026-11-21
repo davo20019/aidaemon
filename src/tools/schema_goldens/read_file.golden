@@ -6,24 +6,6 @@
     "name": "read_file",
     "parameters": {
       "additionalProperties": false,
-      "allOf": [
-        {
-          "not": {
-            "required": [
-              "tail_lines",
-              "start_line"
-            ]
-          }
-        },
-        {
-          "not": {
-            "required": [
-              "tail_lines",
-              "end_line"
-            ]
-          }
-        }
-      ],
       "properties": {
         "end_line": {
           "description": "End line number (1-based, inclusive). Omit to read to end.",

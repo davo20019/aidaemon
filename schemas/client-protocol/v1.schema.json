@@ -2027,12 +2027,15 @@
           "type": "object"
         },
         {
-          "description": "Change a waiting message's text, or take it out (`text` absent)\n(protocol 1.17). Answers with `queued`, as it is after.",
+          "description": "Change a waiting message's text, or take it out (`text` absent)\n(protocol 1.17). With `now` (protocol 1.41), a message sent to wait\nfor its own turn (`after`) is given to the running work instead, as\nif it had been sent to be read now; `text` is then ignored and\nnothing is taken out. Answers with `queued`, as it is after.",
           "properties": {
             "message_id": {
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "now": {
+              "type": "boolean"
             },
             "session_id": {
               "type": "string"
@@ -7448,6 +7451,7 @@
           "type": "object"
         },
         {
+          "description": "Built with [`TurnStatus::tool_started`]: non-exhaustive so a new\nfield changes one constructor, not every sender.",
           "properties": {
             "activity": {
               "anyOf": [
@@ -7459,6 +7463,10 @@
                 }
               ],
               "description": "What kind of work it is (protocol 1.29)."
+            },
+            "input": {
+              "description": "The call's arguments as history shows them, redacted and cut to\nsize (protocol 1.40); empty when the daemon gave none.",
+              "type": "string"
             },
             "kind": {
               "const": "tool_started",
@@ -7498,12 +7506,17 @@
           "type": "object"
         },
         {
+          "description": "Built with [`TurnStatus::tool_completed`].",
           "properties": {
             "kind": {
               "const": "tool_completed",
               "type": "string"
             },
             "name": {
+              "type": "string"
+            },
+            "output": {
+              "description": "The call's result as history shows it, redacted and cut to size\n(protocol 1.40); empty when the daemon gave none.",
               "type": "string"
             },
             "summary": {
@@ -7826,5 +7839,5 @@
       "$ref": "#/$defs/ServerFrame"
     }
   ],
-  "title": "AIdaemon Client Protocol v1"
+  "title": "AIDaemon Client Protocol v1"
 }

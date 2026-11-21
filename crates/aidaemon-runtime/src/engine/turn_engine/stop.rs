@@ -87,8 +87,12 @@ pub fn closeout_visible_tools<'a>(
 
 /// How often a held stop rereads whether the run's jobs have ended.
 const UNREPORTED_JOB_POLL: std::time::Duration = std::time::Duration::from_millis(500);
-/// The longest one held stop waits for the run's jobs.
-const UNREPORTED_JOB_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// The longest one held stop waits for the run's jobs. The stop hook's
+/// own timeout ([`super::super::hooks::LedgerStop`]) is this plus room for
+/// the rest of the judgment, so the wait ends first and the run ends held
+/// rather than with an unanswered check.
+pub(crate) const UNREPORTED_JOB_MAX_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 
 impl TurnEngine<'_> {
     /// Judge a stop. A stop sent back for more work holds the reply the
@@ -249,7 +253,8 @@ impl TurnEngine<'_> {
     /// stops them and says so) before it answers. Read from the tools' typed
     /// process state, never from the reply.
     pub async fn sdk_wait_for_unreported_jobs(&self, scope: &TurnScope<'_>) -> Option<bool> {
-        if scope.unreported_jobs_wait_spent.load(Ordering::Relaxed) {
+        use crate::turn::closeout::StopDemand;
+        if scope.stop_budgets.spent(StopDemand::UnreportedJobWait) {
             return None;
         }
         let mut waited = false;
@@ -266,9 +271,7 @@ impl TurnEngine<'_> {
                 return waited.then_some(true);
             }
             if waited && started.elapsed() >= UNREPORTED_JOB_MAX_WAIT {
-                scope
-                    .unreported_jobs_wait_spent
-                    .store(true, Ordering::Relaxed);
+                scope.stop_budgets.spend(StopDemand::UnreportedJobWait);
                 return Some(false);
             }
             if !waited {
@@ -313,11 +316,9 @@ impl TurnEngine<'_> {
             return sdk::StopDecision::Accept;
         }
         let demand = StopDemand::GuiClickVerification;
-        let used = scope.gui_verify_demands.load(Ordering::Relaxed);
-        if self.sdk_stop_demand_verdict(scope, demand, used).await != StopDemandVerdict::Demand {
+        if self.sdk_stop_demand(scope, demand).await != StopDemandVerdict::Demand {
             return sdk::StopDecision::Accept;
         }
-        scope.gui_verify_demands.fetch_add(1, Ordering::Relaxed);
         self.emit_warning_decision_point(
             scope.emitter,
             scope.task_id,
@@ -352,13 +353,9 @@ impl TurnEngine<'_> {
             return sdk::StopDecision::Accept;
         }
         let demand = StopDemand::CombinedVerification;
-        let used = scope.combined_verification_demands.load(Ordering::Relaxed);
-        if self.sdk_stop_demand_verdict(scope, demand, used).await != StopDemandVerdict::Demand {
+        if self.sdk_stop_demand(scope, demand).await != StopDemandVerdict::Demand {
             return sdk::StopDecision::Accept;
         }
-        scope
-            .combined_verification_demands
-            .fetch_add(1, Ordering::Relaxed);
         sdk::StopDecision::Continue {
             message: format!(
                 "More than one agent changed these files: {}. Read them or run a check on the \
@@ -383,11 +380,9 @@ impl TurnEngine<'_> {
             return sdk::StopDecision::Accept;
         }
         let demand = StopDemand::CodeChangeUnchecked;
-        let used = scope.code_check_demands.load(Ordering::Relaxed);
-        if self.sdk_stop_demand_verdict(scope, demand, used).await != StopDemandVerdict::Demand {
+        if self.sdk_stop_demand(scope, demand).await != StopDemandVerdict::Demand {
             return sdk::StopDecision::Accept;
         }
-        scope.code_check_demands.fetch_add(1, Ordering::Relaxed);
         const SHOWN: usize = 8;
         let mut files = unchecked
             .iter()
@@ -433,10 +428,8 @@ impl TurnEngine<'_> {
             }
             MandateDecisionCommitState::Missing => {
                 let demand = StopDemand::MandateDecisionCommit;
-                let used = scope.mandate_commit_retries.load(Ordering::Relaxed);
-                match self.sdk_stop_demand_verdict(scope, demand, used).await {
+                match self.sdk_stop_demand(scope, demand).await {
                     StopDemandVerdict::Demand => {
-                        scope.mandate_commit_retries.fetch_add(1, Ordering::Relaxed);
                         self.emit_warning_decision_point(
                             scope.emitter,
                             scope.task_id,
@@ -446,7 +439,7 @@ impl TurnEngine<'_> {
                                 .to_string(),
                             serde_json::json!({
                                 "condition": demand.condition(),
-                                "retry": used + 1,
+                                "retry": scope.stop_budgets.used(demand),
                                 "engine": "sdk",
                             }),
                         )
@@ -476,14 +469,15 @@ impl TurnEngine<'_> {
     }
 
     /// Ask the closeout arbiter whether `demand` may be made now, against the
-    /// same authority and visible tools the ledger closeout uses, and record
-    /// the verdict.
-    pub async fn sdk_stop_demand_verdict(
+    /// same authority and visible tools the ledger closeout uses, record the
+    /// verdict, and spend one ask of the run's budget when it is `Demand`.
+    /// The one place a stop-time ask is judged and counted.
+    pub async fn sdk_stop_demand(
         &self,
         scope: &TurnScope<'_>,
         demand: crate::turn::closeout::StopDemand,
-        used: u32,
     ) -> crate::turn::closeout::StopDemandVerdict {
+        let used = scope.stop_budgets.used(demand);
         let authority =
             crate::turn::closeout::ClosingAuthority::from_resolved(&scope.authority.authority)
                 .without_tool_demands(scope.contract.forbids_tool_use);
@@ -526,6 +520,9 @@ impl TurnEngine<'_> {
             }),
         )
         .await;
+        if verdict == crate::turn::closeout::StopDemandVerdict::Demand {
+            scope.stop_budgets.spend(demand);
+        }
         verdict
     }
 
@@ -551,15 +548,13 @@ impl TurnEngine<'_> {
         let Some(defect) = defect else {
             return sdk::StopDecision::Accept;
         };
-        let used = u32::from(scope.reply_retry_used.load(Ordering::Relaxed));
         if self
-            .sdk_stop_demand_verdict(scope, crate::turn::closeout::StopDemand::ReplyRepair, used)
+            .sdk_stop_demand(scope, crate::turn::closeout::StopDemand::ReplyRepair)
             .await
             != crate::turn::closeout::StopDemandVerdict::Demand
         {
             return sdk::StopDecision::Accept;
         }
-        scope.reply_retry_used.store(true, Ordering::Relaxed);
         warn!(
             session_id = scope.session_id,
             task_id = scope.task_id,
@@ -608,8 +603,8 @@ impl TurnEngine<'_> {
         iteration: usize,
     ) -> sdk::StopDecision {
         scope
-            .unattempted_work_demanded
-            .store(true, Ordering::Relaxed);
+            .stop_budgets
+            .spend(crate::turn::closeout::StopDemand::UnattemptedWork);
         scope.closeout_ended_unmet.store(false, Ordering::Relaxed);
         let declared = aggregate.unattempted_declared_work();
         self.emit_decision_point(
@@ -667,7 +662,9 @@ impl TurnEngine<'_> {
             aggregate.executor_claimed_outcome,
             true,
             changes_permitted,
-            scope.unattempted_work_demanded.load(Ordering::Relaxed),
+            scope
+                .stop_budgets
+                .spent(crate::turn::closeout::StopDemand::UnattemptedWork),
         ) {
             UnattemptedWorkVerdict::NotApplicable => None,
             UnattemptedWorkVerdict::Demand => {
@@ -731,7 +728,9 @@ impl TurnEngine<'_> {
                 Some(claim),
                 true,
                 changes_permitted,
-                scope.unattempted_work_demanded.load(Ordering::Relaxed),
+                scope
+                    .stop_budgets
+                    .spent(crate::turn::closeout::StopDemand::UnattemptedWork),
             );
             if unattempted == UnattemptedWorkVerdict::Demand {
                 return self
@@ -751,7 +750,9 @@ impl TurnEngine<'_> {
                 && aggregate.executor_short_of.is_none()
                 && !aggregate.terminal_policy_denial()
                 && !aggregate.has_background_in_flight()
-                && !scope.partial_demanded.swap(true, Ordering::Relaxed)
+                && scope
+                    .stop_budgets
+                    .try_spend(crate::turn::closeout::StopDemand::PartialWithoutObstacle)
             {
                 self.emit_decision_point(
                     scope.emitter,
@@ -857,7 +858,9 @@ impl TurnEngine<'_> {
             aggregate.executor_claimed_outcome,
             !decision.work_reachable() || owner_units_uncovered,
             changes_permitted,
-            scope.unattempted_work_demanded.load(Ordering::Relaxed),
+            scope
+                .stop_budgets
+                .spent(crate::turn::closeout::StopDemand::UnattemptedWork),
         ) {
             UnattemptedWorkVerdict::Demand => {
                 return self
@@ -887,7 +890,9 @@ impl TurnEngine<'_> {
         });
         let verification_after_mutation = mutation_succeeded
             && observation_reachable
-            && !scope.verification_demanded.load(Ordering::Relaxed);
+            && !scope
+                .stop_budgets
+                .spent(crate::turn::closeout::StopDemand::VerifyAfterMutation);
         // A failure that is itself the expected observation satisfies its
         // obligation; only an uncredited failure earns the recovery pass.
         let failure_credited = aggregate.obligations.values().any(|obligation| {
@@ -895,7 +900,9 @@ impl TurnEngine<'_> {
         });
         let unrecovered_failure = failed_without_success
             && !failure_credited
-            && !scope.recovery_demanded.load(Ordering::Relaxed);
+            && !scope
+                .stop_budgets
+                .spent(crate::turn::closeout::StopDemand::FailureRecovery);
         let facts = StopFacts {
             reachable_obligation_ids: reachable.clone(),
             completed_results,
@@ -905,11 +912,17 @@ impl TurnEngine<'_> {
             unrecovered_failure,
         };
         if !closeout_demands_work(&facts)
-            || scope.closeout_demands.load(Ordering::Relaxed) >= MAX_CLOSEOUT_DEMANDS
+            || scope
+                .stop_budgets
+                .spent(crate::turn::closeout::StopDemand::LedgerExpectations)
         {
             scope.closeout_ended_unmet.store(
-                closeout_ended_unmet(&facts, scope.closeout_demands.load(Ordering::Relaxed))
-                    && !scope.user_spoke_since_demand.load(Ordering::Relaxed),
+                closeout_ended_unmet(
+                    &facts,
+                    scope
+                        .stop_budgets
+                        .used(crate::turn::closeout::StopDemand::LedgerExpectations),
+                ) && !scope.user_spoke_since_demand.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
             return sdk::StopDecision::Accept;
@@ -918,12 +931,18 @@ impl TurnEngine<'_> {
         scope
             .user_spoke_since_demand
             .store(false, Ordering::Relaxed);
-        let demands = scope.closeout_demands.fetch_add(1, Ordering::Relaxed) + 1;
+        let demands = scope
+            .stop_budgets
+            .spend(crate::turn::closeout::StopDemand::LedgerExpectations);
         if verification_after_mutation {
-            scope.verification_demanded.store(true, Ordering::Relaxed);
+            scope
+                .stop_budgets
+                .spend(crate::turn::closeout::StopDemand::VerifyAfterMutation);
         }
         if unrecovered_failure && reachable.is_empty() {
-            scope.recovery_demanded.store(true, Ordering::Relaxed);
+            scope
+                .stop_budgets
+                .spend(crate::turn::closeout::StopDemand::FailureRecovery);
             let evidence = scope
                 .latest_tool_output
                 .lock()

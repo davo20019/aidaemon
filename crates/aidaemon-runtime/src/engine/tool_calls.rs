@@ -131,6 +131,22 @@ pub fn canonicalize_call(
         .map(|tool| tool.dispatch_facts().project_dir_argument)
         .unwrap_or_default();
     let mut known = facts.known_project_dir.map(str::to_string);
+    // A workspace tool's relative file names the file in the project, not
+    // in the daemon's own directory (a channel workspace grant scopes the
+    // file tools itself).
+    if !facts.workspace_grant
+        && let Some(dir) = facts.known_project_dir
+        && tool.is_some_and(|tool| {
+            tool.dispatch_facts().semantic_scope
+                == Some(aidaemon_tools::semantics::ToolSemanticScope::LocalWorkspace)
+        })
+    {
+        crate::turn::project_dir::anchor_relative_file_arguments(
+            argument,
+            &mut call.arguments,
+            dir,
+        );
+    }
     if !facts.workspace_grant
         && let Ok(text) = serde_json::to_string(&call.arguments)
     {
@@ -596,6 +612,7 @@ fn drop_unset_optional_arguments(map: &mut serde_json::Map<String, Value>, schem
             return true;
         }
         match value {
+            Value::Null => false,
             Value::String(text) => !text.trim().is_empty(),
             Value::Array(items) => !items.is_empty(),
             _ => true,
@@ -693,7 +710,8 @@ mod unset_argument_tests {
             "schedules": [],
             "tags": ["a"],
             "event_id": 0,
-            "include_subagents": false
+            "include_subagents": false,
+            "start_line": null
         }))
         .unwrap();
         drop_unset_optional_arguments(&mut args, &schema);

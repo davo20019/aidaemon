@@ -865,8 +865,50 @@ fn transcript(store: Store, session: String) -> View {
     let last_seen = signal(usize::MAX);
     let list = element_ref();
     let unfolding = ui::Unfolding::provide();
+    let loading_id = session.clone();
+    // Following the end. Sending a message or a reply starting brings
+    // the end into view, as any chat does; other rows added follow it
+    // while the reader is at the end. The list's own follow lost the end
+    // when a reply started in a long conversation: the composer changing
+    // height moved it to an old reply (live 2026-11-19).
+    let shown_len = std::cell::Cell::new(untracked(|| all.with(Vec::len)));
+    effect(move || {
+        let (len, starts) = all.with(|rows| {
+            let before = shown_len.get().min(rows.len());
+            (
+                rows.len(),
+                rows[before..]
+                    .iter()
+                    .any(|row| matches!(row, Row::User(..) | Row::Live)),
+            )
+        });
+        let before = shown_len.replace(len);
+        if before == 0 {
+            // It opened (or its history came): at its end.
+            last_seen.set(usize::MAX);
+            return;
+        }
+        let seen = untracked(|| last_seen.get());
+        let at_end = seen == usize::MAX || seen + 2 >= before;
+        if len > before && (starts || at_end) {
+            list.scroll_to_end(false);
+            last_seen.set(usize::MAX);
+        }
+    });
     view()
         .flex_1()
+        // Opened before its history came (a phone restoring the last
+        // conversation): say so instead of showing an empty page.
+        .child(when(
+            move || all.with(Vec::is_empty) && store.history_pending(&loading_id),
+            || {
+                view().flex_1().items_center().justify_center().child(
+                    text("Loading…")
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::FAINT),
+                )
+            },
+        ))
         .child(ui::refreshable(
             transcript_list(store, session, all, last_seen, unfolding)
                 .element_ref(&list)
@@ -2066,6 +2108,7 @@ fn queued_list(store: Store, session: String) -> View {
                     )
                     .otherwise(move || {
                         let remove_session = remove_session.clone();
+                        let now_session = remove_session.clone();
                         ui::surface()
                             .flex_row()
                             .items_center()
@@ -2102,6 +2145,21 @@ fn queued_list(store: Store, session: String) -> View {
                                     .text_size(px(type_scale::SM))
                                     .text_color(colors::MUTED),
                             )
+                            // A message waiting for its own turn can be given
+                            // to the running work instead: read at its next
+                            // step, nothing it is doing interrupted.
+                            .child(when(
+                                move || message.with(|m| m.after) && store.can_send_queued_now(),
+                                move || {
+                                    let now_session = now_session.clone();
+                                    ui::with_hint(
+                                        "The running work reads it at its next step",
+                                        ui::btn("Send now", Variant::Ghost, ui::Size::Sm, move || {
+                                            store.send_queued_now(&now_session, id)
+                                        }),
+                                    )
+                                },
+                            ))
                             .child(ui::btn("Edit", Variant::Ghost, ui::Size::Sm, move || {
                                 draft.set(message.with_untracked(|m| m.text.clone()));
                                 editing.set(Some(id));
@@ -2418,7 +2476,7 @@ fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
     match error {
         SpeechError::NoSpeech => None,
         SpeechError::NotAllowed => Some(
-            "The microphone or speech recognition is not allowed for AIdaemon in the system's settings",
+            "The microphone or speech recognition is not allowed for AIDaemon in the system's settings",
         ),
         SpeechError::AudioCapture => Some("No microphone could be used"),
         SpeechError::LanguageNotSupported => Some("Speech in this language is not recognized here"),

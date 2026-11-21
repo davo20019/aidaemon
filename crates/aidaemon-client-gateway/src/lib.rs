@@ -2,7 +2,7 @@
 //!
 //! **Tier: internal.** Internal to aidaemon, no stability promise.
 //!
-//! The Client Gateway serves the AIdaemon Client Protocol v1
+//! The Client Gateway serves the AIDaemon Client Protocol v1
 //! ([`aidaemon_client_protocol`]) so the owner's own apps (a terminal UI, a
 //! web page, a phone, a watch) drive and watch the daemon:
 //!
@@ -50,6 +50,7 @@ pub mod client_view;
 mod config;
 pub mod files;
 mod observer;
+mod pair_page;
 pub mod pairing;
 pub mod project_files;
 pub mod remote_screens;
@@ -952,7 +953,27 @@ impl ClientGateway {
             Command::EditQueued {
                 session_id,
                 message_id,
+                now: true,
+                ..
+            } => {
+                if !self
+                    .turns
+                    .task_registry
+                    .send_queued_now(&session_id, message_id)
+                    .await
+                {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Conflict,
+                        "That message is no longer waiting for its own turn",
+                    ));
+                }
+                Ok(self.queued(session_id).await)
+            }
+            Command::EditQueued {
+                session_id,
+                message_id,
                 text,
+                now: false,
             } => {
                 let text = text.map(|t| t.trim().to_string());
                 if text.as_deref().is_some_and(str::is_empty) {
@@ -1429,7 +1450,7 @@ impl ClientGateway {
                 if caller.principal.device_id.is_some() {
                     return Err(ProtocolError::new(
                         ErrorCode::Forbidden,
-                        "Change what devices may do on the computer AIdaemon runs on",
+                        "Change what devices may do on the computer AIDaemon runs on",
                     ));
                 }
                 if !self.pairing.set_scopes(&device_id, &scopes).await? {
@@ -1841,7 +1862,7 @@ impl ClientGateway {
             }
         };
         self.hub
-            .send_text(&session_id, &format!("↪ From the AIdaemon app: {text}"))
+            .send_text(&session_id, &format!("↪ From the AIDaemon app: {text}"))
             .await
             .map_err(|error| {
                 ProtocolError::new(

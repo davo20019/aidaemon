@@ -192,7 +192,7 @@ pub fn router(gateway: Arc<SetupGateway>) -> Router {
 pub async fn bind(gateway: &SetupGateway) -> anyhow::Result<tokio::net::TcpListener> {
     let addr = gateway.config.bind_addr()?;
     tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        anyhow::anyhow!("could not listen on {addr} ({e}); is another AIdaemon running?")
+        anyhow::anyhow!("could not listen on {addr} ({e}); is another AIDaemon running?")
     })
 }
 

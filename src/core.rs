@@ -351,12 +351,16 @@ pub async fn run(
     )
     .await;
 
-    // Background sub-agents do not survive a restart: tell their chats. Done
-    // before channels start, so nothing running now can be mistaken for lost.
-    aidaemon_runtime::helper_run::delivery::report_interrupted_background_children(
-        &(state.clone() as Arc<dyn crate::traits::NotificationStore>),
-    )
-    .await;
+    // Background sub-agents do not survive a restart: taken before channels
+    // start, so nothing running now can be mistaken for lost. Once channels
+    // are up each is started again or its chat is told (`resume_turns`).
+    let interrupted_jobs = match state.take_background_spawns().await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(%error, "Could not read interrupted background sub-agents");
+            Vec::new()
+        }
+    };
 
     // 9c. Heartbeat coordinator (replaces individual background task loops)
     let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<()>(16);
@@ -582,6 +586,8 @@ pub async fn run(
             sessions: resume_sessions,
             hub: Arc::downgrade(&hub),
             agent: agent.clone(),
+            interrupted_jobs,
+            tools: aidaemon_runtime::host::TurnHost::tools(&*agent).to_vec(),
         };
         tokio::spawn(crate::startup::resume_turns::resume_cut_off_turns(
             deps,

@@ -331,6 +331,10 @@ pub enum EvidenceSource {
     FileRead,
     /// A local file search.
     FileSearch,
+    /// A local file edited in place: the edit read the file under its write
+    /// fence and its result shows what the file now holds, so a successful
+    /// one observes the file's current state as well as the write's outcome.
+    FileWrite,
     /// A shell on this computer.
     Shell,
     /// This computer's state.
@@ -341,7 +345,7 @@ pub enum EvidenceSource {
 
 impl EvidenceSource {
     /// Every source with an evidence model.
-    pub const MODELED: [Self; 13] = [
+    pub const MODELED: [Self; 14] = [
         Self::GoalTrace,
         Self::Mandates,
         Self::GoalRecords,
@@ -352,6 +356,7 @@ impl EvidenceSource {
         Self::WebSearch,
         Self::FileRead,
         Self::FileSearch,
+        Self::FileWrite,
         Self::Shell,
         Self::HostInfo,
         Self::Diagnostics,
@@ -1092,6 +1097,22 @@ pub struct ToolCallAccessManifest {
 }
 
 impl ToolCallSemantics {
+    /// These semantics plus a change static inspection cannot type: still
+    /// the observation they were, now also a mutation (`UNSPECIFIED`, which
+    /// proves only the checklist items the call carries out).
+    pub fn with_untyped_change(&self) -> Self {
+        let mut changed = self.clone();
+        changed.mutation_effects = changed
+            .mutation_effects
+            .union(ToolMutationEffects::UNSPECIFIED);
+        changed.effect = if changed.observes_state() {
+            ToolCallEffect::ObservationAndMutation
+        } else {
+            ToolCallEffect::Mutation
+        };
+        changed
+    }
+
     pub fn administrative() -> Self {
         Self {
             effect: ToolCallEffect::Administrative,
@@ -1706,6 +1727,12 @@ pub struct ToolCallMetadata {
     /// names no items is two attempts, never one.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub launched_runs: usize,
+    /// The call changed something its semantics could not type (a write
+    /// inside `docker exec` or `ssh`, judged from the command's structure):
+    /// the runtime may attribute it to the one checklist item in progress.
+    /// Never itself a typed change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changes_untyped: bool,
     /// Completion semantics for this specific tool call.
     #[serde(default, skip_serializing_if = "ToolCallSemantics::is_empty")]
     pub semantics: ToolCallSemantics,

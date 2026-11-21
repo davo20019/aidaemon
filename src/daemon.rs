@@ -385,7 +385,7 @@ pub fn install_user_service(dir: &std::path::Path) -> anyhow::Result<()> {
             .join("systemd/user");
         std::fs::create_dir_all(&units)?;
         let unit = format!(
-            "[Unit]\nDescription=AIdaemon\nAfter=network-online.target\n\n[Service]\nType=simple\n\
+            "[Unit]\nDescription=AIDaemon\nAfter=network-online.target\n\n[Service]\nType=simple\n\
              ExecStart={}\nWorkingDirectory={}\nRestart=on-failure\nRestartSec=10\n\n\
              [Install]\nWantedBy=default.target\n",
             exe.display(),

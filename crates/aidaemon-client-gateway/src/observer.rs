@@ -175,19 +175,20 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
             name,
             summary,
             kind,
-        } => TurnStatus::ToolStarted {
-            name: name.clone(),
-            summary: summary.clone(),
-            activity: Some(crate::tool_kind(*kind)),
-        },
+            input,
+            ..
+        } => TurnStatus::tool_started(name.clone(), summary.clone(), Some(crate::tool_kind(*kind)))
+            .with_detail(input.clone()),
         StatusUpdate::ToolProgress { name, chunk } => TurnStatus::ToolProgress {
             name: name.clone(),
             chunk: chunk.clone(),
         },
-        StatusUpdate::ToolComplete { name, summary } => TurnStatus::ToolCompleted {
-            name: name.clone(),
-            summary: summary.clone(),
-        },
+        StatusUpdate::ToolComplete {
+            name,
+            summary,
+            output,
+            ..
+        } => TurnStatus::tool_completed(name.clone(), summary.clone()).with_detail(output.clone()),
         StatusUpdate::PlanStepStart {
             step_index,
             total_steps,
@@ -389,29 +390,25 @@ impl TurnObserver for GatewayObserver {
                 && let Some(state) = live.get_mut(&turn)
             {
                 match &status {
-                    TurnStatus::ToolStarted {
-                        name,
-                        summary,
-                        activity,
-                    } => {
+                    TurnStatus::ToolStarted { name, activity, .. } => {
                         state.tools.push(name.clone());
                         state.calls.push(ToolCallInfo {
                             name: name.clone(),
-                            input: summary.clone(),
+                            input: status.call_detail().unwrap_or_default().to_string(),
                             output: String::new(),
                             kind: *activity,
                         });
                     }
                     // The latest call of that name still running, as the
                     // client marks it.
-                    TurnStatus::ToolCompleted { name, summary } => {
+                    TurnStatus::ToolCompleted { name, .. } => {
                         if let Some(call) = state
                             .calls
                             .iter_mut()
                             .rev()
                             .find(|c| &c.name == name && c.output.is_empty())
                         {
-                            call.output = summary.clone();
+                            call.output = status.call_detail().unwrap_or_default().to_string();
                         }
                     }
                     _ => {}

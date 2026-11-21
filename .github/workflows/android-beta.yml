@@ -1,0 +1,75 @@
+# A test build of the Android app from any branch, signed and sent to Google
+# Play's internal testing track: `gh workflow run android-beta.yml --ref <branch>`
+# (or Actions → Android beta → Run workflow). Releases publish on their own
+# (release.yml). Needs the ANDROID_KEYSTORE_* secrets and
+# PLAY_SERVICE_ACCOUNT_JSON.
+name: Android beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-beta
+  cancel-in-progress: false
+
+env:
+  NSH_VERSION: "0.6.0"
+  NSH_LINUX_SHA256: "19d360eb8dd1ba8847a3b3ad06082f6f3705eb04ae8178357a8cdad31880f0d9"
+
+jobs:
+  android-beta:
+    name: Android beta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+    steps:
+      - name: Check the secrets
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::Set the ANDROID_KEYSTORE_* secrets first"; exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+
+      - name: Install a JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install nsh CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}/nsh-linux-x86_64.tar.gz" -o nsh.tar.gz
+          echo "${NSH_LINUX_SHA256}  nsh.tar.gz" | sha256sum -c -
+          tar -xzf nsh.tar.gz -C "$HOME"
+          rm nsh.tar.gz
+          echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+
+      - name: Package the app and publish it to Google Play
+        env:
+          NSH_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          # The daemon's version: the app ships with it.
+          APP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" \
+            scripts/ci-android-package.sh
+
+      - name: Keep the App Bundle and APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aidaemon-android-beta
+          path: |
+            aidaemon-android.aab
+            aidaemon-android.apk

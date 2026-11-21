@@ -12,6 +12,12 @@ stability promise.
 
 ## [Unreleased]
 
+### Added
+- `aidaemon-client-core`: iOS and Android clients. `KeychainKeyStore` (iOS) keeps a paired device's key in the keychain, readable after first unlock and never synced; `local::set_data_dir` puts the key file in an app's own data directory (Android); `local::is_paired`, `local::unpair` and `local::default_device_name`. On Android the link and its HTTP calls trust the bundled Mozilla roots (`webpki-roots`), since the platform verifier needs a Java component an nsh app does not ship.
+
+### Changed
+- `aidaemon-client-core`: `local::device_store` returns `Arc<dyn KeyStore>` (the keychain on iOS, a file elsewhere) instead of `Arc<FileKeyStore>`. Sign-in, pairing and screen-share HTTP calls use the link's own TLS configuration.
+
 ## [0.21.0] - 2026-11-18: first release on crates.io
 
 ### Added

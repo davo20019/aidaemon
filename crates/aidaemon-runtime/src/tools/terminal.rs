@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::spawn::{ConversationRequest, ConversationRuntime};
 use crate::tools::traits::{
@@ -836,6 +836,9 @@ pub struct TerminalTool {
     /// `read:<path>`, `write:<path>`). Session grants live here only;
     /// Allow-Always grants are also persisted.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
+    /// Every command is allowed: the owner's `/trustall` (stored apart from
+    /// the prefixes, see `terminal_grants`) or YOLO mode.
+    trust_all: Arc<std::sync::atomic::AtomicBool>,
     /// Permission persistence mode: picks the buttons on the owner's cards.
     permission_mode: PermissionMode,
     /// Host vs sandbox execution.
@@ -1334,6 +1337,7 @@ fn format_output(
     stdout: &str,
     stderr: &str,
     max_chars: usize,
+    spill_session: Option<&str>,
 ) -> (String, Option<crate::tools::traits::TruncationInfo>) {
     let mut result = String::new();
     if !stdout.is_empty() {
@@ -1351,11 +1355,39 @@ fn format_output(
     let mut truncation = None;
     if result.len() > max_chars {
         let total_chars = result.chars().count();
-        result = keep_head_and_tail(&result, max_chars);
+        // The whole output is kept in the session's spill folder, which the
+        // session may read, and the cut says which lines it left out and
+        // where they are: without it the model re-ran a narrower command to
+        // see more (live 2026-11-14 to 11-20: 22% of cut outputs).
+        let saved = spill_session.and_then(|session| {
+            aidaemon_tools::result_spill::save_full_text_local("terminal", session, &result)
+        });
+        result = keep_head_and_tail_marked(&result, max_chars, |cut| match &saved {
+            Some(path) => format!(
+                "\n[... lines {}-{} of {} omitted ({} characters). The full output is saved at {}: \
+                 read those lines with read_file (start_line/end_line) or grep the file; do not \
+                 re-run the command to see them ...]\n",
+                cut.first_line,
+                cut.last_line,
+                cut.total_lines,
+                cut.omitted_chars,
+                path.display()
+            ),
+            None => format!(
+                "\n[... lines {}-{} of {} omitted ({} characters) ...]\n",
+                cut.first_line, cut.last_line, cut.total_lines, cut.omitted_chars
+            ),
+        });
         truncation = Some(crate::tools::traits::TruncationInfo {
             shown_chars: result.chars().count(),
             total_chars,
-            remediation_hint: None,
+            remediation_hint: saved.as_ref().map(|path| {
+                format!(
+                    "The full output is saved at {}: read the omitted lines from it with \
+                     read_file (start_line/end_line) or grep, instead of re-running the command.",
+                    path.display()
+                )
+            }),
         });
     }
     (result, truncation)
@@ -1367,7 +1399,36 @@ fn format_output(
 /// end is kept in preference to the middle. Cuts land on line breaks when
 /// one is near, and always on char boundaries.
 pub(crate) fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
-    const MARKER: &str = "\n[... middle of the output omitted ...]\n";
+    keep_head_and_tail_marked(text, max_bytes, |_| GENERIC_OMITTED_MARKER.to_string())
+}
+
+const GENERIC_OMITTED_MARKER: &str = "\n[... middle of the output omitted ...]\n";
+
+/// What a head-and-tail cut left out, for its marker.
+pub(crate) struct OmittedRange {
+    /// First and last omitted line, 1-based.
+    pub first_line: usize,
+    pub last_line: usize,
+    pub total_lines: usize,
+    pub omitted_chars: usize,
+}
+
+/// [`keep_head_and_tail`] with a marker built from what was cut; the result
+/// still fits `max_bytes`.
+pub(crate) fn keep_head_and_tail_marked(
+    text: &str,
+    max_bytes: usize,
+    marker: impl Fn(&OmittedRange) -> String,
+) -> String {
+    // The marker's longest form: every number it can name is at most the
+    // text's length, so a marker built from those fits the real one.
+    let marker_len = marker(&OmittedRange {
+        first_line: text.len(),
+        last_line: text.len(),
+        total_lines: text.len(),
+        omitted_chars: text.len(),
+    })
+    .len();
     if text.len() <= max_bytes {
         return text.to_string();
     }
@@ -1378,7 +1439,7 @@ pub(crate) fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
         }
         at
     };
-    if max_bytes <= MARKER.len() * 2 {
+    if max_bytes <= marker_len * 2 {
         // Too small for a marker: the end alone.
         let mut start = text.len() - max_bytes;
         while start < text.len() && !text.is_char_boundary(start) {
@@ -1390,7 +1451,7 @@ pub(crate) fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
         }
         return text[start..].to_string();
     }
-    let budget = max_bytes - MARKER.len();
+    let budget = max_bytes - marker_len;
     let head_end = floor(budget / 4);
     // Prefer ending the head at a line break in its last third.
     let head_end = text[..head_end]
@@ -1407,7 +1468,18 @@ pub(crate) fn keep_head_and_tail(text: &str, max_bytes: usize) -> String {
     let tail_start = text[tail_start..window_end]
         .find('\n')
         .map_or(tail_start, |at| tail_start + at + 1);
-    format!("{}{MARKER}{}", &text[..head_end], &text[tail_start..])
+    let omitted = OmittedRange {
+        first_line: text[..head_end].matches('\n').count() + 1,
+        last_line: text[..tail_start].matches('\n').count(),
+        total_lines: text.matches('\n').count() + usize::from(!text.ends_with('\n')),
+        omitted_chars: text[head_end..tail_start].chars().count(),
+    };
+    format!(
+        "{}{}{}",
+        &text[..head_end],
+        marker(&omitted),
+        &text[tail_start..]
+    )
 }
 
 /// A confined command that exits non-zero while producing no output at all is
@@ -1912,7 +1984,7 @@ async fn confined_terminal_execution_request_inner(
                 .map(|(name, value)| format!("{name}={value}")),
         );
         if script_via_stdin {
-            confined.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+            confined.extend(script_shell_argv());
         } else {
             confined.extend([
                 "/bin/sh".to_string(),
@@ -2251,7 +2323,7 @@ fn macos_manifest_sandbox_request(
             .map(|(name, value)| format!("{name}={value}")),
     );
     if script_via_stdin {
-        args.extend(["/bin/sh".to_string(), "-eu".to_string(), "-s".to_string()]);
+        args.extend(script_shell_argv());
     } else {
         args.extend([
             "/bin/sh".to_string(),
@@ -3334,6 +3406,63 @@ fn format_background_continuation_failure(unchecked: &[String]) -> String {
 static REENGAGE_SERIALIZER: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// A command as INFO and WARN logs show it: its program and a fingerprint,
+/// never the full text. The agent reads the daemon's own log when it
+/// troubleshoots, and a full command line there (`grep trigger_pattern …`)
+/// is later found as if it were what the command searched for. The full
+/// command stays in the tool call's record and at DEBUG ("Approval check").
+pub(crate) struct LoggedCommand<'a>(pub(crate) &'a str);
+
+/// The program a shell command line runs, for a log label: past leading
+/// `NAME=value` settings and redirects, without a trailing `;`, `&` or `|`,
+/// its last path part. "shell" when that is not a plain program name.
+fn logged_program(command: &str) -> &str {
+    // Machine format: shell command line words.
+    let mut words = command.split_whitespace();
+    let mut word = None;
+    while let Some(next) = words.next() {
+        let is_setting = next.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        });
+        let redirect = next.trim_start_matches(|c: char| c.is_ascii_digit());
+        if is_setting {
+            continue;
+        }
+        if redirect.starts_with('<') || redirect.starts_with('>') {
+            // A bare operator's target is the next word.
+            if redirect.trim_start_matches(['<', '>', '&', '|']).is_empty() {
+                words.next();
+            }
+            continue;
+        }
+        word = Some(next);
+        break;
+    }
+    let word = word.unwrap_or("").trim_end_matches([';', '&', '|']);
+    let program = word.rsplit('/').next().unwrap_or(word);
+    let plain = !program.is_empty()
+        && !program.starts_with('-')
+        && program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
+    if plain { program } else { "shell" }
+}
+
+impl std::fmt::Display for LoggedCommand<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use sha2::{Digest, Sha256};
+        let program = truncate_str(logged_program(self.0), 40);
+        let digest = Sha256::digest(self.0.as_bytes());
+        write!(f, "{program} [{} chars, ", self.0.chars().count())?;
+        for byte in &digest[..4] {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, "]")
+    }
+}
+
 #[cfg(test)]
 pub async fn acquire_reengagement_slot() -> tokio::sync::MutexGuard<'static, ()> {
     REENGAGE_SERIALIZER.lock().await
@@ -3526,6 +3655,18 @@ async fn run_continuation_turn(
     Ok(envelope)
 }
 
+/// Ends a foreground command's process group when the call that started it
+/// is dropped while the command still runs.
+struct StopWithCall(Option<u32>);
+
+impl Drop for StopWithCall {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            send_sigkill(pid);
+        }
+    }
+}
+
 /// Build the internal follow-up that re-engages the agent loop after a
 /// background command completes. Beyond replaying the output, it explicitly
 /// steers the model to finish any *deferred deliverable* the user requested
@@ -3590,89 +3731,43 @@ impl TerminalTool {
             }
         }
 
-        // Load persisted prefixes from DB and merge with config defaults
-        let mut merged = allowed_prefixes;
-
-        // YOLO mode: auto-approve everything
-        if permission_mode == PermissionMode::Yolo && !merged.contains(&"*".to_string()) {
-            merged.push("*".to_string());
-        }
-        if let Err(error) = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS terminal_backend_allowed_prefixes (
-                backend_scope TEXT NOT NULL,
-                prefix TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (backend_scope, prefix)
-            )",
-        )
-        .execute(&pool)
-        .await
-        {
-            warn!(%error, "Failed to initialize backend-scoped terminal approvals");
-        }
-
-        // Preserve historical local approvals only for the local target. They
-        // are deliberately never inherited by Docker or SSH.
-        if backend.kind() == BackendKind::Local {
-            let _ = sqlx::query(
-                "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                    (backend_scope, prefix)
-                 SELECT 'local', prefix FROM terminal_allowed_prefixes",
-            )
-            .execute(&pool)
-            .await;
-        }
-        match sqlx::query_scalar::<_, String>(
-            "SELECT prefix FROM terminal_backend_allowed_prefixes WHERE backend_scope = ?",
-        )
-        .bind(backend.approval_scope())
-        .fetch_all(&pool)
-        .await
-        {
-            Ok(persisted) => {
-                for p in persisted {
-                    if !merged.contains(&p) {
-                        info!(prefix = %p, "Loaded persisted allowed prefix");
-                        merged.push(p);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to load persisted terminal prefixes: {}", e);
+        // Configured prefixes, then the ones the owner allowed for good. A
+        // configured `*` (and YOLO mode) is trust-all, never a prefix.
+        let mut trust_all = permission_mode == PermissionMode::Yolo;
+        let mut merged: Vec<String> = Vec::new();
+        for prefix in allowed_prefixes {
+            if prefix == "*" {
+                trust_all = true;
+            } else if !merged.contains(&prefix) {
+                merged.push(prefix);
             }
         }
         let mut persisted_capabilities = HashSet::new();
-        if let Err(error) = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS terminal_capability_grants (
-                backend_scope TEXT NOT NULL,
-                prefix TEXT NOT NULL,
-                capability TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (backend_scope, prefix, capability)
-            )",
-        )
-        .execute(&pool)
-        .await
-        {
-            warn!(
-                "Failed to create terminal_capability_grants table: {}",
-                error
-            );
+        let loaded = async {
+            super::terminal_grants::ensure_schema(&pool).await?;
+            super::terminal_grants::load(&pool, backend.approval_scope()).await
         }
-        match sqlx::query_as::<_, (String, String)>(
-            "SELECT prefix, capability FROM terminal_capability_grants WHERE backend_scope = ?",
-        )
-        .bind(backend.approval_scope())
-        .fetch_all(&pool)
-        .await
-        {
-            Ok(rows) => {
-                for (prefix, capability) in rows {
-                    info!(prefix = %prefix, capability = %capability, "Loaded persisted capability grant");
-                    persisted_capabilities.insert((prefix, capability));
+        .await;
+        match loaded {
+            Ok(grants) => {
+                let mut loaded = 0usize;
+                for prefix in grants.prefixes {
+                    if !merged.contains(&prefix) {
+                        merged.push(prefix);
+                        loaded += 1;
+                    }
                 }
+                persisted_capabilities = grants.capabilities;
+                trust_all |= grants.trust_all;
+                // Counts, not the entries: some are whole command lines.
+                info!(
+                    loaded,
+                    capabilities = persisted_capabilities.len(),
+                    trust_all,
+                    "Loaded the terminal's standing approvals"
+                );
             }
-            Err(e) => warn!("Failed to load persisted capability grants: {}", e),
+            Err(error) => warn!(%error, "Could not load the terminal's standing approvals"),
         }
 
         Self {
@@ -3680,6 +3775,7 @@ impl TerminalTool {
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
+            trust_all: Arc::new(std::sync::atomic::AtomicBool::new(trust_all)),
             permission_mode,
             confinement: aidaemon_tools::TerminalConfinement::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -3805,10 +3901,10 @@ impl TerminalTool {
     }
 
     async fn is_allowed(&self, command: &str) -> bool {
-        let prefixes = self.allowed_prefixes.read().await;
-        if prefixes.iter().any(|p| p == "*") {
+        if self.trust_all_enabled().await {
             return true;
         }
+        let prefixes = self.allowed_prefixes.read().await;
         let trimmed = command.trim();
         // A grant names a program. A command that launches another program
         // through it, writes a file by redirection or sets variables for it
@@ -3853,7 +3949,7 @@ impl TerminalTool {
                     if binary.is_empty() {
                         return true;
                     }
-                    prefixes.iter().any(|p| p == "*" || binary == p.as_str())
+                    prefixes.iter().any(|p| binary == p.as_str())
                 });
             }
             return false;
@@ -4044,11 +4140,19 @@ impl TerminalTool {
 
     /// Run a confined-tier command: in the confined sandbox with the tier's
     /// access, whatever the terminal's own confinement.
+    /// Where a cut output's full text is saved: `session`'s spill folder,
+    /// on the local backend only (the folder is on this computer).
+    fn spill_session<'s>(&self, session: &'s str) -> Option<&'s str> {
+        let session = session.trim();
+        (self.backend.kind() == BackendKind::Local && !session.is_empty()).then_some(session)
+    }
+
     async fn run_confined_tier(
         &self,
         args: &TerminalArgs,
         command: &str,
         access: ConfinedAccess,
+        session: &str,
     ) -> anyhow::Result<ToolCallOutcome> {
         let mut read_paths = args.read_paths.clone();
         read_paths.extend(args.read_roots.iter().cloned());
@@ -4065,6 +4169,7 @@ impl TerminalTool {
             &run.output.stdout,
             &run.output.stderr,
             self.max_output_chars,
+            self.spill_session(session),
         );
         push_exit_status(&mut output, exit_code);
         if let Some(hint) =
@@ -4152,6 +4257,7 @@ impl TerminalTool {
             && !self
                 .capabilities_granted(command, &requested_capabilities)
                 .await;
+        debug!(command = %command, "Approval check");
         let needs_approval = if capability_escalation_pending {
             // Elevated capability is new authority; no command-prefix grant
             // or dispatcher preapproval stands in for the user seeing exactly
@@ -4160,7 +4266,7 @@ impl TerminalTool {
                 "Requests elevated capabilities beyond the task scope: {}",
                 Self::describe_capabilities(&requested_capabilities)
             ));
-            info!(command = %command, capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
+            info!(command = %LoggedCommand(command), capabilities = ?requested_capabilities, "Forcing approval: capability escalation");
             true
         } else if daemonization {
             false
@@ -4168,15 +4274,15 @@ impl TerminalTool {
             // External triggers always need approval regardless of mode
             approval_warnings
                 .push("Command originated from an untrusted external trigger.".to_string());
-            info!(command = %command, risk = %approval_risk, "Forcing approval: untrusted source");
+            info!(command = %LoggedCommand(command), risk = %approval_risk, "Forcing approval: untrusted source");
             true
         } else if args.detach && !is_allowed {
             // Allowlisted commands (permanent or session approvals) may run
             // detached without asking again; only novel detached commands do.
-            info!(command = %command, "Forcing approval: detach=true and command not pre-approved");
+            info!(command = %LoggedCommand(command), "Forcing approval: detach=true and command not pre-approved");
             true
         } else if trust.trusted_session {
-            info!(command = %command, session = %trust.session_id, "Auto-approved: trusted scheduled task");
+            info!(command = %LoggedCommand(command), session = %trust.session_id, "Auto-approved: trusted scheduled task");
             false
         } else if let Some(reason) = deterministic_approval_floor {
             // Before the explicit allow (owner ruling): an allowlisted or
@@ -4184,10 +4290,10 @@ impl TerminalTool {
             approval_warnings.push(reason);
             true
         } else if is_allowed {
-            info!(command = %command, "Auto-approved: explicit command grant");
+            info!(command = %LoggedCommand(command), "Auto-approved: explicit command grant");
             false
         } else if self.confined_tier(args, command, trust).await.is_some() {
-            info!(command = %command, "Auto-approved: allowlisted command runs confined");
+            info!(command = %LoggedCommand(command), "Auto-approved: allowlisted command runs confined");
             false
         } else if let Some(side_calls) = self.side_calls.get() {
             match assess_command(side_calls, command, &self.backend).await {
@@ -4195,15 +4301,15 @@ impl TerminalTool {
                     approval_risk = semantic.risk_level;
                     approval_warnings = semantic.warnings;
                     if semantic.requires_approval {
-                        info!(command = %command, risk = %approval_risk, "Semantic command assessment requires owner approval");
+                        info!(command = %LoggedCommand(command), risk = %approval_risk, "Semantic command assessment requires owner approval");
                         true
                     } else {
-                        info!(command = %command, risk = %approval_risk, "Auto-approved by semantic command assessment");
+                        info!(command = %LoggedCommand(command), risk = %approval_risk, "Auto-approved by semantic command assessment");
                         false
                     }
                 }
                 Err(error) => {
-                    warn!(command = %command, %error, "Semantic command assessment failed; requesting approval");
+                    warn!(command = %LoggedCommand(command), %error, "Semantic command assessment failed; requesting approval");
                     approval_risk = RiskLevel::Critical;
                     approval_warnings.push(format!(
                         "Semantic safety assessment unavailable; failed closed: {}",
@@ -4523,13 +4629,7 @@ impl TerminalTool {
         if capabilities.is_empty() {
             return true;
         }
-        if self
-            .allowed_prefixes
-            .read()
-            .await
-            .iter()
-            .any(|prefix| prefix == "*")
-        {
+        if self.trust_all_enabled().await {
             return true;
         }
         let grants = self.capability_grants.read().await;
@@ -4553,14 +4653,12 @@ impl TerminalTool {
                     continue;
                 }
                 if let Some(ref pool) = self.pool
-                    && let Err(e) = sqlx::query(
-                        "INSERT OR IGNORE INTO terminal_capability_grants
-                            (backend_scope, prefix, capability) VALUES (?, ?, ?)",
+                    && let Err(e) = super::terminal_grants::add_capability(
+                        pool,
+                        self.backend.approval_scope(),
+                        &key,
+                        capability,
                     )
-                    .bind(self.backend.approval_scope())
-                    .bind(&key)
-                    .bind(capability)
-                    .execute(pool)
                     .await
                 {
                     warn!(prefix = %key, capability = %capability, "Failed to persist capability grant: {}", e);
@@ -4583,13 +4681,11 @@ impl TerminalTool {
 
                 // Persist to SQLite
                 if let Some(ref pool) = self.pool
-                    && let Err(e) = sqlx::query(
-                        "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                            (backend_scope, prefix) VALUES (?, ?)",
+                    && let Err(e) = super::terminal_grants::add_prefix(
+                        pool,
+                        self.backend.approval_scope(),
+                        &key,
                     )
-                    .bind(self.backend.approval_scope())
-                    .bind(&key)
-                    .execute(pool)
                     .await
                 {
                     warn!(prefix = %key, "Failed to persist allowed prefix: {}", e);
@@ -4710,6 +4806,7 @@ impl TerminalTool {
         reason: &str,
     ) -> anyhow::Result<(String, Option<crate::tools::traits::TruncationInfo>, bool)> {
         proc.notify_on_completion.store(false, Ordering::Relaxed);
+        let notify_session = proc.notify_session_id.clone();
         let started_at = proc.started_at;
         let command = proc.command.clone();
         let stdout_buf = proc.stdout_buf.clone();
@@ -4754,7 +4851,12 @@ impl TerminalTool {
             reason,
             command
         );
-        let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
+        let (formatted, truncation) = format_output(
+            &stdout,
+            &stderr,
+            self.max_output_chars,
+            self.spill_session(&notify_session),
+        );
         output.push_str(&formatted);
         Ok((output, truncation, exited))
     }
@@ -4796,7 +4898,7 @@ impl TerminalTool {
                 info!(
                     pid,
                     task_id,
-                    command = %proc.command,
+                    command = %LoggedCommand(&proc.command),
                     "Disowning background process from task (notifier active, will deliver completion)"
                 );
                 proc.owner_task_id = None;
@@ -4835,35 +4937,17 @@ impl TerminalTool {
     /// Whether trust-all mode (every command auto-approved) is on for this
     /// backend.
     pub async fn trust_all_enabled(&self) -> bool {
-        self.allowed_prefixes.read().await.iter().any(|p| p == "*")
+        self.trust_all.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Turn trust-all mode on or off. Only the owner's `/trustall` command
     /// calls this; the model has no way to.
     pub async fn set_trust_all(&self, on: bool) -> anyhow::Result<()> {
-        let mut prefixes = self.allowed_prefixes.write().await;
-        let enabled = prefixes.iter().any(|p| p == "*");
-        if on == enabled {
-            return Ok(());
-        }
-        if on {
-            prefixes.push("*".to_string());
-        } else {
-            prefixes.retain(|p| p != "*");
-        }
         if let Some(ref pool) = self.pool {
-            let query = if on {
-                "INSERT OR IGNORE INTO terminal_backend_allowed_prefixes
-                    (backend_scope, prefix) VALUES (?, '*')"
-            } else {
-                "DELETE FROM terminal_backend_allowed_prefixes
-                    WHERE backend_scope = ? AND prefix = '*'"
-            };
-            sqlx::query(query)
-                .bind(self.backend.approval_scope())
-                .execute(pool)
-                .await?;
+            super::terminal_grants::set_trust_all(pool, self.backend.approval_scope(), on).await?;
         }
+        self.trust_all
+            .store(on, std::sync::atomic::Ordering::SeqCst);
         info!(on, "Trust-all mode changed by the owner");
         Ok(())
     }
@@ -4927,7 +5011,12 @@ impl TerminalTool {
                 pid,
                 proc.started_at.elapsed().as_secs_f64()
             );
-            let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
+            let (formatted, truncation) = format_output(
+                &stdout,
+                &stderr,
+                self.max_output_chars,
+                self.spill_session(&proc.notify_session_id),
+            );
             output.push_str(&formatted);
             push_exit_status(&mut output, exit_code);
 
@@ -4944,7 +5033,7 @@ impl TerminalTool {
                 },
             );
             Self::prune_completed_map(&mut completed);
-            info!(pid, command = %proc.command, "Reaped finished background process");
+            info!(pid, command = %LoggedCommand(&proc.command), "Reaped finished background process");
         }
     }
 
@@ -5547,6 +5636,12 @@ impl TerminalTool {
         };
         let mut spawned = self.backend.spawn(execution_request).await?;
         let process_handle = spawned.handle().clone();
+        // The process moves into the reader task below, so dropping this call
+        // (its run stopped) would leave it running: the guard ends its group
+        // unless the call sees it finish or hands it to background tracking
+        // (live 2026-11-21: a stopped sub-agent's `for … sleep 2` loop kept
+        // writing to the file the owner asked to delete).
+        let mut stop_with_call = StopWithCall(process_handle.local_pid());
         let pid = process_handle.display_id();
         let stdout_pipe = spawned.take_stdout().expect("stdout piped");
         let stderr_pipe = spawned.take_stderr().expect("stderr piped");
@@ -5623,7 +5718,10 @@ impl TerminalTool {
             }
         };
 
-        match tokio::time::timeout(foreground_wait, poll_finished).await {
+        let waited = tokio::time::timeout(foreground_wait, poll_finished).await;
+        // Finished, or kept running on purpose: no longer this call's to end.
+        stop_with_call.0 = None;
+        match waited {
             Ok(()) => {
                 // A command done before its first progress tick still shows
                 // what it printed in the owner's app (live 2026-11-15: a quick
@@ -5659,7 +5757,7 @@ impl TerminalTool {
                         terminating_signal = ?terminating_signal,
                         stdout_bytes = stdout.len(),
                         stderr_bytes = stderr.len(),
-                        command = %command.chars().take(200).collect::<String>(),
+                        command = %LoggedCommand(command),
                         "Confined command finished with a non-zero result"
                     );
                 }
@@ -5710,8 +5808,12 @@ impl TerminalTool {
                         }
                     }
                 }
-                let (mut output, truncation) =
-                    format_output(&stdout, &stderr, self.max_output_chars);
+                let (mut output, truncation) = format_output(
+                    &stdout,
+                    &stderr,
+                    self.max_output_chars,
+                    self.spill_session(request.notify_session_id),
+                );
                 push_exit_status(&mut output, exit_code);
                 if !self_heal_note.is_empty() {
                     output.push_str(&self_heal_note);
@@ -5803,8 +5905,12 @@ impl TerminalTool {
                         let b = stderr_buf.lock().await;
                         String::from_utf8_lossy(&b).to_string()
                     };
-                    let (formatted, truncation) =
-                        format_output(&partial_stdout, &partial_stderr, self.max_output_chars);
+                    let (formatted, truncation) = format_output(
+                        &partial_stdout,
+                        &partial_stderr,
+                        self.max_output_chars,
+                        self.spill_session(request.notify_session_id),
+                    );
                     reader_handle.abort();
                     let output = format!(
                         "Detached background command launched (pid={}).\n\
@@ -5968,6 +6074,7 @@ impl TerminalTool {
                     let task_id = owner_task_id_for_notify.clone();
                     let call_id = tool_call_id_for_notify.clone();
                     let session = notify_session_id.trim().to_string();
+                    let spill_session = self.spill_session(&session).map(str::to_string);
                     let semantics = completion_semantics_for_notify.clone();
                     let max_output_chars = self.max_output_chars;
                     let started = Instant::now() - foreground_wait;
@@ -6004,8 +6111,12 @@ impl TerminalTool {
                         };
                         let stdout = String::from_utf8_lossy(&stdout_buf.lock().await).to_string();
                         let stderr = String::from_utf8_lossy(&stderr_buf.lock().await).to_string();
-                        let (mut output, truncation) =
-                            format_output(&stdout, &stderr, max_output_chars);
+                        let (mut output, truncation) = format_output(
+                            &stdout,
+                            &stderr,
+                            max_output_chars,
+                            spill_session.as_deref(),
+                        );
                         if let Some(info) = truncation.as_ref() {
                             output.push('\n');
                             output.push_str(&crate::turn::helpers::render_truncation_notice(info));
@@ -6030,6 +6141,8 @@ impl TerminalTool {
                 } else if state_for_notify.is_some() || hub_for_notify.is_some() {
                     let goal_id_for_notify = notify_goal_id.unwrap_or("").to_string();
                     let session_for_notify = notify_session_id.trim().to_string();
+                    let notify_spill_session =
+                        self.spill_session(&session_for_notify).map(str::to_string);
                     let command_for_notify = command.to_string();
                     let stdout_for_notify = {
                         let running = self.running.lock().await;
@@ -6078,7 +6191,7 @@ impl TerminalTool {
                             if session_for_notify.is_empty() {
                                 warn!(
                                     pid,
-                                    command = %command_for_notify,
+                                    command = %LoggedCommand(&command_for_notify),
                                     "Terminal background notifier skipped enqueue due to empty session id"
                                 );
                                 notify_on_completion.store(false, Ordering::Relaxed);
@@ -6130,7 +6243,7 @@ impl TerminalTool {
                                             warn!(
                                                 pid,
                                                 error = %e,
-                                                command = %command_for_notify,
+                                                command = %LoggedCommand(&command_for_notify),
                                                 "Terminal background notifier lost completion signal"
                                             );
                                             None
@@ -6163,7 +6276,7 @@ impl TerminalTool {
                                 // the run ends on its card, with no message.
                                 warn!(
                                     pid,
-                                    command = %command_for_notify,
+                                    command = %LoggedCommand(&command_for_notify),
                                     "Terminal background notifier suppressed (check/kill already handled notification)"
                                 );
                                 if let Some(run) = run {
@@ -6221,8 +6334,12 @@ impl TerminalTool {
                             // Background delivery bypasses the agent loop
                             // entirely, so the truncation notice is rendered
                             // inline here.
-                            let (formatted, truncation) =
-                                format_output(&stdout, &stderr, max_output_chars);
+                            let (formatted, truncation) = format_output(
+                                &stdout,
+                                &stderr,
+                                max_output_chars,
+                                notify_spill_session.as_deref(),
+                            );
                             let mut with_notice = formatted;
                             if let Some(ref info) = truncation {
                                 with_notice.push('\n');
@@ -6466,7 +6583,7 @@ impl TerminalTool {
                                         warn!(
                                             pid,
                                             session_id = %session_for_notify,
-                                            command = %command_for_notify,
+                                            command = %LoggedCommand(&command_for_notify),
                                             "Background re-engagement budget exhausted; delivering raw output instead of re-entering agent loop"
                                         );
                                     }
@@ -6494,7 +6611,7 @@ impl TerminalTool {
                                         info!(
                                             pid,
                                             session_id = %session_for_notify,
-                                            command = %command_for_notify,
+                                            command = %LoggedCommand(&command_for_notify),
                                             "Re-engaging agent loop to process background command output"
                                         );
                                         let (continued, _followup_end) = run_background_continuation(
@@ -6728,7 +6845,7 @@ impl TerminalTool {
                     } else {
                         warn!(
                             pid,
-                            command = %command,
+                            command = %LoggedCommand(command),
                             "Terminal background notifier not started because process buffers were unavailable"
                         );
                         notify_on_completion.store(false, Ordering::Relaxed);
@@ -6736,7 +6853,7 @@ impl TerminalTool {
                 } else {
                     warn!(
                         pid,
-                        command = %command,
+                        command = %LoggedCommand(command),
                         "Terminal background notifier disabled: neither state queue nor channel hub is configured"
                     );
                     notify_on_completion.store(false, Ordering::Relaxed);
@@ -6872,7 +6989,12 @@ impl TerminalTool {
                 pid,
                 proc.started_at.elapsed().as_secs_f64()
             );
-            let (formatted, truncation) = format_output(&stdout, &stderr, self.max_output_chars);
+            let (formatted, truncation) = format_output(
+                &stdout,
+                &stderr,
+                self.max_output_chars,
+                self.spill_session(&proc.notify_session_id),
+            );
             output.push_str(&formatted);
             push_exit_status(&mut output, exit_code);
             let mut metadata = background_completion_metadata(exit_code);
@@ -7089,7 +7211,9 @@ impl TerminalTool {
 
                 // The confined tier runs confined, as the ladder judged it.
                 if let Some(access) = self.confined_tier(&args, command, &trust).await {
-                    return self.run_confined_tier(&args, command, access).await;
+                    return self
+                        .run_confined_tier(&args, command, access, &exec_ctx.session_id)
+                        .await;
                 }
 
                 // A typed root grant is allowed to name a future directory.
@@ -7323,6 +7447,29 @@ fn run_is_confined(confinement: aidaemon_tools::TerminalConfinement) -> bool {
 
 /// Host execution request: the command as the daemon's user, in the resolved
 /// working directory, with the daemon's own environment.
+/// The shell a multi-line script runs in, the script arriving on stdin (so
+/// it never shows in the process list, where any local user could read it).
+/// The shell reads the whole script first, closes stdin, then runs it: fed
+/// straight to `sh -s`, any command in it that reads input (ddev, drush, wp,
+/// mysql, ssh, `docker exec -i`, `read`) consumed the rest of the script,
+/// which then never ran while the run still exited 0 (live 2026-11-14 to
+/// 11-20: 23 of 148 stdin-fed scripts had such a command before their last
+/// line; Drupal installs needed reinstalls). With stdin closed such a
+/// command reads end of input, as in a terminal with nothing typed. `-e`
+/// still stops at the first failing step inside `eval`.
+fn script_shell_argv() -> Vec<String> {
+    vec![
+        "/bin/sh".to_string(),
+        "-eu".to_string(),
+        "-c".to_string(),
+        SCRIPT_BOOTSTRAP.to_string(),
+    ]
+}
+
+/// Read the whole script from stdin, close stdin, run the script.
+const SCRIPT_BOOTSTRAP: &str =
+    "__aidaemon_script=$(cat); exec </dev/null; eval \"$__aidaemon_script\"";
+
 async fn host_terminal_execution_request(
     backend: &SharedExecutionBackend,
     shell_source: &str,
@@ -7359,10 +7506,9 @@ async fn host_terminal_execution_request(
         );
         request
     } else if script_via_stdin {
-        let mut request = ExecutionRequest::argv(
-            "/bin/sh".to_string(),
-            vec!["-eu".to_string(), "-s".to_string()],
-        );
+        let mut argv = script_shell_argv();
+        let program = argv.remove(0);
+        let mut request = ExecutionRequest::argv(program, argv);
         request.stdin = Some(shell_source.as_bytes().to_vec());
         request
     } else {
@@ -8421,11 +8567,59 @@ impl Tool for TerminalTool {
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
 
+        // A run that says it carries out declared items and is not provably
+        // read-only changed something, even when no declared write path says
+        // what: work inside `docker exec` or `ssh` names paths this computer
+        // does not have. Its receipt says so (`UNSPECIFIED`, which proves
+        // only the items the call claims), or the ledger reads it as an
+        // observation and keeps asking for the change (live 2026-11-20:
+        // every container task got two passes that re-ran finished work).
+        // Whether it changes something: inside a remote exec (`docker
+        // exec`, `ssh`) the command it runs decides, so a look inside a
+        // container is a look; otherwise the authority view does.
+        let run_text = serde_json::from_str::<TerminalArgs>(arguments)
+            .ok()
+            .and_then(|args| args.command.or(args.script));
+        let changes = match run_text
+            .as_deref()
+            .and_then(aidaemon_tools::command_effects::remote_inner_only_reads)
+        {
+            Some(only_reads) => !only_reads,
+            None => {
+                !self
+                    .call_annotations_in(arguments, &crate::tools::traits::TrustRoots::new(&[]))
+                    .read_only
+            }
+        };
+        let opaque_change = !checklist_items.is_empty() && changes;
         self.execute_terminal(arguments, status_tx, &exec_ctx)
             .await
             .map(|mut outcome| {
                 if outcome.metadata.checklist_items.is_empty() {
                     outcome.metadata.checklist_items = checklist_items;
+                }
+                if !outcome.metadata.semantics.mutates_state() {
+                    if opaque_change {
+                        outcome.metadata.semantics =
+                            outcome.metadata.semantics.with_untyped_change();
+                    } else if run_text
+                        .as_deref()
+                        .is_some_and(aidaemon_tools::command_effects::recognizably_changes)
+                    {
+                        // A recognized change is work done even before any
+                        // checklist exists: its receipt is a change
+                        // (`UNSPECIFIED`, which proves no item it does not
+                        // name), so the owner's request reads as attempted
+                        // (live 2026-11-20: a script written with a
+                        // here-document inside `docker exec` before the
+                        // checklist read as "nothing attempted", and the run
+                        // was sent back). The one item in progress may be
+                        // credited with it. An unknown command stays a look:
+                        // it can miss a credit, never invent one.
+                        outcome.metadata.semantics =
+                            outcome.metadata.semantics.with_untyped_change();
+                        outcome.metadata.changes_untyped = true;
+                    }
                 }
                 outcome
             })
@@ -8795,6 +8989,33 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log label names the program, never a fragment or the command's
+    /// text (live 2026-11-21: `>/…/count3.txt; for …` was labelled
+    /// `count3.txt;`).
+    #[test]
+    fn a_log_label_names_the_program_and_never_the_command() {
+        for (command, program) in [
+            ("mkdir -p /tmp/site && cd /tmp/site", "mkdir"),
+            ("/usr/bin/git status", "git"),
+            ("FOO=1 BAR=two npm run dev", "npm"),
+            (
+                ">/Users/alice/count3.txt; for i in 1 2; do echo $i; done",
+                "for",
+            ),
+            ("> out.txt echo hi", "echo"),
+            ("2>/dev/null ls", "ls"),
+            ("ls;", "ls"),
+            ("$(secret) arg", "shell"),
+            ("'quoted thing' x", "shell"),
+            ("", "shell"),
+        ] {
+            assert_eq!(logged_program(command), program, "{command}");
+        }
+        let label = LoggedCommand("curl -H 'Authorization: Bearer synthetic' x").to_string();
+        assert!(label.starts_with("curl ["), "{label}");
+        assert!(!label.contains("Bearer"), "{label}");
+    }
     use crate::tools::traits::NotificationStore;
     use crate::tools::traits::ToolSemantics;
     use aidaemon_core::testing::ScriptedProvider;
@@ -9227,14 +9448,58 @@ mod tests {
         match &script.command {
             aidaemon_tools::CommandSpec::Argv { program, args } => {
                 assert_eq!(program, "/bin/sh");
-                assert_eq!(args, &vec!["-eu".to_string(), "-s".to_string()]);
+                assert_eq!(
+                    args,
+                    &vec![
+                        "-eu".to_string(),
+                        "-c".to_string(),
+                        SCRIPT_BOOTSTRAP.to_string()
+                    ]
+                );
             }
-            other => panic!("expected sh -s, got {other:?}"),
+            other => panic!("expected the script bootstrap, got {other:?}"),
         }
         assert_eq!(
             script.stdin.as_deref(),
-            Some(b"echo one\necho two".as_slice())
+            Some(b"echo one\necho two".as_slice()),
+            "the script arrives on stdin, never in the process list"
         );
+    }
+
+    /// A command in a script that reads stdin no longer swallows the lines
+    /// after it: every line runs (live 2026-11-20: a `ddev` line ate the rest
+    /// of a Drupal setup script and the run still exited 0).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_reading_stdin_does_not_swallow_the_rest_of_a_script() {
+        let backend = aidaemon_tools::testing::active_execution_backend();
+        let script = "echo first\ncat >/dev/null\nread -r line || true\n\
+                      cat <<'EOF'\nfrom a heredoc\nEOF\necho last";
+        let request = host_terminal_execution_request(&backend, script, true, None)
+            .await
+            .expect("host script request");
+        let output = backend
+            .execute(request, std::time::Duration::from_secs(10))
+            .await
+            .expect("script runs");
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("first") && stdout.contains("last"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("from a heredoc"), "{stdout}");
+        // A failing step still stops the script.
+        let request =
+            host_terminal_execution_request(&backend, "echo a\nfalse\necho b", true, None)
+                .await
+                .expect("host script request");
+        let output = backend
+            .execute(request, std::time::Duration::from_secs(10))
+            .await
+            .expect("script runs");
+        assert_ne!(output.exit_code, 0);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains('b'));
     }
 
     #[cfg(target_os = "macos")]
@@ -10821,6 +11086,53 @@ mod tests {
         );
         assert!(!target.exists(), "the redirect must not have run");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live 2026-11-21: a sub-agent stopped while its terminal call ran a
+    /// `for … sleep` loop; the call was dropped and the loop kept writing.
+    /// A dropped call ends the command it was waiting on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_call_stops_its_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = dir.path().join("marks");
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let pool = SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
+            .await
+            .unwrap();
+        let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
+        let tool = TerminalTool::new(
+            aidaemon_tools::testing::active_execution_backend(),
+            vec!["*".to_string()],
+            crate::approvals::broker::ApprovalBroker::new(approval_tx),
+            30,
+            1000,
+            PermissionMode::Yolo,
+            pool,
+        )
+        .await;
+        aidaemon_tools::testing::delete_at_exit(db_file.into_temp_path().keep().unwrap());
+        let args = serde_json::json!({
+            "action": "run",
+            "command": format!(
+                "while true; do echo x >> '{}'; sleep 0.1; done",
+                marks.display()
+            ),
+        })
+        .to_string();
+        let call = tool.call_with_execution_context(
+            &args,
+            None,
+            aidaemon_tools::testing::call_facts("telegram:synthetic-owner"),
+        );
+        let marks_len = || std::fs::metadata(&marks).map(|m| m.len()).unwrap_or(0);
+        // Dropped mid-run, the way a stopped run drops its tool call.
+        let _ = tokio::time::timeout(Duration::from_millis(1500), call).await;
+        assert!(marks_len() > 0, "the command ran");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after_drop = marks_len();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(marks_len(), after_drop, "the command kept running");
     }
 
     #[tokio::test]
@@ -13456,7 +13768,7 @@ mod tests {
     #[test]
     fn format_output_returns_truncation_info_instead_of_embedding_notice() {
         let long = "x".repeat(5000);
-        let (text, truncation) = format_output(&long, "", 4000);
+        let (text, truncation) = format_output(&long, "", 4000, None);
         assert!(
             !text.contains("OUTPUT TRUNCATED"),
             "notice must not be embedded"
@@ -13466,9 +13778,52 @@ mod tests {
         assert!(info.shown_chars <= 4000);
     }
 
+    /// A long output keeps its head and tail inline, names the lines it
+    /// left out, and is saved whole where the session can read it.
+    #[test]
+    fn a_cut_output_is_saved_whole_and_points_at_the_lines_left_out() {
+        let long: String = (1..=2000)
+            .map(|n| format!("synthetic output line {n}\n"))
+            .collect();
+        let session = format!("synthetic-spill-{}", std::process::id());
+        let (text, truncation) = format_output(&long, "", 16_000, Some(&session));
+        assert!(text.len() <= 16_000, "{}", text.len());
+        assert!(
+            text.starts_with("synthetic output line 1\n"),
+            "{}",
+            &text[..80]
+        );
+        assert!(
+            text.contains("synthetic output line 2000"),
+            "the tail is kept"
+        );
+        let marker = text
+            .lines()
+            .find(|line| line.starts_with("[... lines "))
+            .expect("a marker naming the omitted lines");
+        assert!(marker.contains("of 2000 omitted"), "{marker}");
+        let path = marker
+            .split("saved at ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .expect("the saved path");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), long, "saved whole");
+        let hint = truncation.unwrap().remediation_hint.unwrap();
+        assert!(
+            hint.contains(path) && hint.contains("instead of re-running"),
+            "{hint}"
+        );
+        let _ = std::fs::remove_file(path);
+
+        // Without a session (another backend) the cut still names the lines.
+        let (text, truncation) = format_output(&long, "", 16_000, None);
+        assert!(text.contains("of 2000 omitted"), "{}", &text[..200]);
+        assert!(truncation.unwrap().remediation_hint.is_none());
+    }
+
     #[test]
     fn format_output_no_truncation_for_small_output() {
-        let (text, truncation) = format_output("hello", "", 4000);
+        let (text, truncation) = format_output("hello", "", 4000, None);
         assert!(text.contains("hello"));
         assert!(truncation.is_none());
     }
@@ -13487,41 +13842,41 @@ mod tests {
 
     #[test]
     fn test_format_stdout_only() {
-        let (result, truncation) = format_output("hello", "", 1000);
+        let (result, truncation) = format_output("hello", "", 1000, None);
         assert_eq!(result, "hello");
         assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_stderr_appended() {
-        let (result, truncation) = format_output("out", "err", 1000);
+        let (result, truncation) = format_output("out", "err", 1000, None);
         assert_eq!(result, "out\n--- stderr ---\nerr");
         assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_empty_no_output() {
-        let (result, truncation) = format_output("", "", 1000);
+        let (result, truncation) = format_output("", "", 1000, None);
         assert_eq!(result, "(no output)");
         assert!(truncation.is_none());
     }
 
     #[test]
     fn test_format_truncation() {
-        let long_output = "a".repeat(200);
-        let (result, truncation) = format_output(&long_output, "", 100);
+        let long_output = "a".repeat(2000);
+        let (result, truncation) = format_output(&long_output, "", 400, None);
         // The returned text is the raw content only — no embedded notice.
         // The notice is rendered by the caller (foreground: from metadata;
         // background: inline at the delivery site).
         assert!(!result.contains("OUTPUT TRUNCATED"));
-        assert!(result.len() <= 100, "{} bytes", result.len());
-        assert!(result.contains("middle of the output omitted"));
+        assert!(result.len() <= 400, "{} bytes", result.len());
+        assert!(result.contains("omitted"), "{result}");
         // The structured info must report the omitted amount so a caller
         // rendering the notice can't silently let the model fabricate the
-        // rest (100 shown of 200 total).
+        // rest.
         let info = truncation.expect("truncation info for oversized output");
         assert_eq!(info.shown_chars, result.chars().count());
-        assert_eq!(info.total_chars, 200);
+        assert_eq!(info.total_chars, 2000);
     }
 
     #[test]
@@ -13531,15 +13886,19 @@ mod tests {
             out.push_str(&format!("test tests::case_{n} ... ok\n"));
         }
         out.push_str("test result: FAILED. 399 passed; 1 failed\n");
-        let (result, truncation) =
-            format_output(&out, "error: test failed, to rerun pass `--lib`", 4000);
+        let (result, truncation) = format_output(
+            &out,
+            "error: test failed, to rerun pass `--lib`",
+            4000,
+            None,
+        );
         assert!(truncation.is_some());
         assert!(result.len() <= 4000, "{} bytes", result.len());
         assert!(result.starts_with("   Compiling acme"));
         assert!(result.contains("test result: FAILED. 399 passed; 1 failed"));
         assert!(result.ends_with("error: test failed, to rerun pass `--lib`"));
         // Cut on line boundaries: no half test line after the marker.
-        let after = result.split("omitted ...]\n").nth(1).unwrap();
+        let after = result.split("...]\n").nth(1).unwrap();
         assert!(after.starts_with("test tests::case_"), "{after:.40}");
     }
 
@@ -13549,7 +13908,7 @@ mod tests {
         let output = "aé日🎉".repeat(50); // mixed multi-byte chars
         // Truncate at various positions that may land mid-char
         for max in [1, 2, 3, 4, 5, 10, 50, 100] {
-            let (result, truncation) = format_output(&output, "", max);
+            let (result, truncation) = format_output(&output, "", max, None);
             // Must not panic and must be valid UTF-8 (String guarantees this)
             assert!(!result.is_empty());
             if output.len() > max {

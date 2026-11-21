@@ -6,7 +6,7 @@ use nsh_core::prelude::*;
 
 use crate::link;
 use crate::store::Store;
-use crate::ui::{self, Size, Tone, Variant, btn, colors, field, status, type_scale};
+use crate::ui::{self, Size, Tone, Variant, btn, colors, field, status_message, type_scale};
 
 pub fn pairing(store: Store) -> View {
     let offered = link::offered_pairing();
@@ -69,19 +69,17 @@ pub fn pairing(store: Store) -> View {
             .child(labeled("Code", field("Pairing code", code)))
             .child(labeled("Device name", field("How the daemon will list this device", name)))
             .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        btn("Pair", Variant::Primary, Size::Md, submit)
-                            .disabled(move || busy.get() || code.with(|c| c.trim().is_empty())),
-                    )
-                    .child(dynamic(move || {
-                        let (message, tone) = state.get()?;
-                        Some(untracked(move || status(message, tone).flex_1().min_w(px(0.0))))
-                    })),
-            ),
+                view().flex_row().child(
+                    btn("Pair", Variant::Primary, Size::Md, submit)
+                        .disabled(move || busy.get() || code.with(|c| c.trim().is_empty())),
+                ),
+            )
+            // Its own row, every line of it: a refusal's reason is what
+            // the owner acts on (it was cut to two lines beside the button).
+            .child(dynamic(move || {
+                let (message, tone) = state.get()?;
+                Some(untracked(move || status_message(message, tone)))
+            })),
     )
 }
 
@@ -95,4 +93,209 @@ fn labeled(label: &'static str, control: impl IntoElement) -> View {
                 .text_color(colors::MUTED),
         )
         .child(control)
+}
+
+/// Where pairing a phone from this computer stands.
+#[derive(Clone, PartialEq)]
+enum Phone {
+    Idle,
+    Starting,
+    /// The QR code is up; nothing has redeemed it yet.
+    Showing(aidaemon_client_protocol::PairingOffer),
+    /// A device redeemed it and waits for the owner.
+    Asking(aidaemon_client_protocol::PairingOffer, String),
+    Ended(String, Tone),
+}
+
+/// Pair a phone from the daemon's own computer: a QR code of the offer's
+/// pairing page link (the phone's camera opens it, and the page opens the
+/// app, which pairs at once), then the owner approves the phone here.
+pub fn pair_phone(store: Store) -> View {
+    use aidaemon_client_protocol::EnrollmentState;
+    use link::owner_pairing;
+
+    let phase = signal(Phone::Idle);
+    let start = move || {
+        if phase.with_untracked(|p| matches!(p, Phone::Starting)) {
+            return;
+        }
+        phase.set(Phone::Starting);
+        spawn(async move {
+            let offer = match owner_pairing::offer().await {
+                Ok(offer) => offer,
+                Err(why) => {
+                    let _ = phase.try_set(Phone::Ended(why, Tone::Danger));
+                    return;
+                }
+            };
+            let id = offer.offer_id.clone();
+            if !phase.try_set(Phone::Showing(offer.clone())) {
+                return;
+            }
+            // Watch the offer while this one is on screen.
+            loop {
+                timer(std::time::Duration::from_secs(1)).await;
+                let current = phase.try_get().is_some_and(|p| match p {
+                    Phone::Showing(o) | Phone::Asking(o, _) => o.offer_id == id,
+                    _ => false,
+                });
+                if !current {
+                    return;
+                }
+                let Ok(enrollment) = owner_pairing::status(id.clone()).await else {
+                    continue;
+                };
+                let next = match enrollment.state {
+                    EnrollmentState::Open => continue,
+                    EnrollmentState::Pending => {
+                        if phase.with_untracked(|p| matches!(p, Phone::Asking(..))) {
+                            continue;
+                        }
+                        Phone::Asking(
+                            offer.clone(),
+                            enrollment.device_name.unwrap_or_else(|| "A device".into()),
+                        )
+                    }
+                    EnrollmentState::Approved => {
+                        store.refresh_devices();
+                        Phone::Ended("Paired.".into(), Tone::Success)
+                    }
+                    EnrollmentState::Denied => Phone::Ended("Not paired.".into(), Tone::Neutral),
+                    _ => Phone::Ended("The code expired. Show a new one.".into(), Tone::Neutral),
+                };
+                if !phase.try_set(next) {
+                    return;
+                }
+            }
+        });
+    };
+    let decide = move |approve: bool| {
+        let Some(id) = phase.with_untracked(|p| match p {
+            Phone::Asking(o, _) => Some(o.offer_id.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        spawn(async move {
+            let next = match owner_pairing::decide(id, approve).await {
+                Ok(e) if e.state == EnrollmentState::Approved => {
+                    store.refresh_devices();
+                    Phone::Ended("Paired.".into(), Tone::Success)
+                }
+                Ok(_) => Phone::Ended("Not paired.".into(), Tone::Neutral),
+                Err(why) => Phone::Ended(why, Tone::Danger),
+            };
+            let _ = phase.try_set(next);
+        });
+    };
+
+    view().gap_2().child(dynamic(move || {
+        let now = phase.get();
+        Some(untracked(move || match now {
+            Phone::Idle | Phone::Starting => view().flex_row().child(
+                btn("Pair a phone", Variant::Secondary, Size::Sm, start)
+                    .disabled(move || phase.with(|p| matches!(p, Phone::Starting))),
+            ),
+            Phone::Showing(offer) => {
+                let mut card = ui::inset().gap_3().items_start();
+                if !owner_pairing::reachable_elsewhere(&offer) {
+                    card = card.child(ui::banner(
+                        "A phone cannot reach AIDaemon yet: it listens only on this computer. \
+                         Turn on remote access (Tailscale or a Cloudflare tunnel, \
+                         [exposure.client_gateway] in config.toml) first.",
+                        Tone::Warning,
+                    ));
+                }
+                if let Some(qr) = ui::qr_code(&offer.page_link(), 200.0) {
+                    card = card.child(qr);
+                }
+                card.child(hint(
+                    "Point your phone's camera at this code and tap the link it \
+                     shows. It opens the AIDaemon app. No camera? Send the link to \
+                     your phone in a message or mail and tap it there.",
+                ))
+                .child(hint(format!(
+                    "Code {} · valid 10 minutes · daemon {}",
+                    offer.code,
+                    short(&offer.fingerprint)
+                )))
+                .child(
+                    view()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(when(!in_terminal(), {
+                            let link = offer.page_link();
+                            move || {
+                                let link = link.clone();
+                                btn(
+                                    "Send to my phone",
+                                    Variant::Secondary,
+                                    Size::Sm,
+                                    move || send_to_phone(link.clone()),
+                                )
+                            }
+                        }))
+                        .child(btn("Copy link", Variant::Ghost, Size::Sm, {
+                            let link = offer.page_link();
+                            move || set_clipboard(link.clone())
+                        }))
+                        .child(btn("Cancel", Variant::Ghost, Size::Sm, move || {
+                            phase.set(Phone::Idle)
+                        })),
+                )
+            }
+            Phone::Asking(_, name) => ui::inset()
+                .gap_3()
+                .child(text(format!("Pair “{name}” with this AIDaemon?")))
+                .child(hint(
+                    "It will see your chats and can send messages and answer approvals.",
+                ))
+                .child(
+                    view()
+                        .flex_row()
+                        .gap_2()
+                        .child(btn("Pair", Variant::Primary, Size::Sm, move || {
+                            decide(true)
+                        }))
+                        .child(btn("Deny", Variant::Ghost, Size::Sm, move || decide(false))),
+                ),
+            Phone::Ended(message, tone) => view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .child(status_message(message, tone))
+                .child(btn("Pair another", Variant::Ghost, Size::Sm, start)),
+        }))
+    }))
+}
+
+fn hint(words: impl Into<SharedString>) -> Text {
+    text(words.into())
+        .text_size(px(type_scale::SM))
+        .line_height(px(type_scale::LH_SM))
+        .text_color(colors::MUTED)
+}
+
+/// The fingerprint's first characters, enough to tell daemons apart.
+fn short(fingerprint: &str) -> &str {
+    fingerprint.get(..8).unwrap_or(fingerprint)
+}
+
+fn in_terminal() -> bool {
+    idiom() == nsh_core::platform::Idiom::Terminal
+}
+
+/// The system's share sheet with the pairing link, to send it to the
+/// owner's phone (Messages, mail, AirDrop, a chat app).
+fn send_to_phone(link: String) {
+    let request = nsh_core::share::ShareRequest::new()
+        .title("Pair your phone with AIDaemon")
+        .text("Open this on your phone to pair it with AIDaemon:")
+        .url(link);
+    spawn(async move {
+        if let Err(why) = share(request).await {
+            log::warn!("could not share the pairing link: {why:?}");
+        }
+    });
 }

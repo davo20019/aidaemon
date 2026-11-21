@@ -1,4 +1,4 @@
-//! AIdaemon's app: chat, approvals and the agent's running work, on the
+//! AIDaemon's app: chat, approvals and the agent's running work, on the
 //! desktops, the web and a terminal, from one Rust crate.
 
 use nsh_core::prelude::*;
@@ -107,6 +107,7 @@ pub fn Offline() -> impl IntoElement {
         }
         for kind in [
             "get_changes",
+            "get_history",
             "get_settings",
             "list_models",
             "set_session_model",

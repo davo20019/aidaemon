@@ -16,6 +16,23 @@ mod voice;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
+/// This app's version as the store and the daemon know it: "1.2.0 (14)".
+pub fn app_version() -> String {
+    let version = env!("AIDAEMON_APP_VERSION");
+    match env!("AIDAEMON_APP_BUILD") {
+        "" => version.to_owned(),
+        build => format!("{version} ({build})"),
+    }
+}
+
+/// The device woke (the app back in front, a computer back from sleep):
+/// the link checks its socket, or tries again now. The browser's link
+/// watches the page itself.
+pub fn woke() {
+    #[cfg(not(target_arch = "wasm32"))]
+    native::woke();
+}
+
 /// Start the link for this platform.
 pub fn start(store: Store) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -51,7 +68,7 @@ pub async fn pair(
 }
 
 /// Forget this device's pairing and show the pairing screen (the daemon
-/// refused it). Only the browser pairs from the app.
+/// refused it).
 pub fn pair_again(store: Store) {
     #[cfg(target_arch = "wasm32")]
     spawn(async move {
@@ -59,7 +76,71 @@ pub fn pair_again(store: Store) {
         store.needs_pairing();
     });
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = store;
+    native::pair_again(store);
+}
+
+/// Whether this app signs in with a key it paired (a phone, or a computer
+/// paired with a daemon elsewhere), so a refused key can be paired again.
+/// The browser re-pairs on its own when its link carries an offer.
+pub fn signs_in_paired() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return native::is_paired();
+    #[cfg(target_arch = "wasm32")]
+    false
+}
+
+/// The owner's side of pairing a phone from this computer (a QR code of the
+/// offer, approved here). Only the daemon's own computer offers it.
+pub mod owner_pairing {
+    use aidaemon_client_protocol::{Enrollment, PairingOffer};
+
+    pub fn available() -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::can_offer_pairing();
+        #[cfg(target_arch = "wasm32")]
+        false
+    }
+
+    pub async fn offer() -> Result<PairingOffer, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::offer_pairing().await;
+        #[cfg(target_arch = "wasm32")]
+        Err("Pair phones from the computer AIDaemon runs on.".into())
+    }
+
+    pub async fn status(offer_id: String) -> Result<Enrollment, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::pairing_status(offer_id).await;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = offer_id;
+            Err("Pair phones from the computer AIDaemon runs on.".into())
+        }
+    }
+
+    pub async fn decide(offer_id: String, approve: bool) -> Result<Enrollment, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        return super::native::decide_pairing(offer_id, approve).await;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (offer_id, approve);
+            Err("Pair phones from the computer AIDaemon runs on.".into())
+        }
+    }
+
+    /// Whether a phone can reach the gateway the offer names.
+    pub fn reachable_elsewhere(offer: &PairingOffer) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        return offer
+            .public_url
+            .as_deref()
+            .is_none_or(aidaemon_client_core::local::owner_pairing::reachable_elsewhere);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = offer;
+            true
+        }
+    }
 }
 
 /// Whether this platform pairs from the app (the browser does).
@@ -173,4 +254,12 @@ impl Speaking {
 }
 
 /// Whether this build can run the daemon on its own computer.
-pub const RUNS_DAEMON: bool = cfg!(not(target_arch = "wasm32"));
+pub const RUNS_DAEMON: bool = cfg!(not(any(
+    target_arch = "wasm32",
+    target_os = "ios",
+    target_os = "android"
+)));
+
+/// A phone or tablet app (iOS, Android): it never runs the daemon, only
+/// pairs with one elsewhere.
+pub const MOBILE: bool = cfg!(any(target_os = "ios", target_os = "android"));

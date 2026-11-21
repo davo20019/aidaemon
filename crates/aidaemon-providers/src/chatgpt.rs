@@ -692,7 +692,77 @@ fn build_tools(tools: &[ToolSpec]) -> Vec<Value> {
 /// combinator (`allOf`/`anyOf`/`oneOf`) left with only empty branches is
 /// dropped too. Property names are never filtered.
 fn tool_parameters(schema: &Value) -> Value {
-    sanitize_schema(schema, false)
+    let mut schema = sanitize_schema(schema, false);
+    every_property_required(&mut schema);
+    schema
+}
+
+/// Strict compilation makes the model send every property. One the tool
+/// leaves optional becomes required and nullable, so the model can say
+/// "unset" with `null` (which the dispatcher drops) instead of inventing a
+/// value: live 2026-11-20, `read_file` got `start_line: 0, end_line: 0,
+/// tail_lines: 1` and refused the call. Nested objects alike.
+fn every_property_required(schema: &mut Value) {
+    let Some(map) = schema.as_object_mut() else {
+        return;
+    };
+    if matches!(map.get("properties"), Some(Value::Object(_))) {
+        let required: Vec<String> = map
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(Value::Object(properties)) = map.get_mut("properties") else {
+            return;
+        };
+        let mut names = Vec::with_capacity(properties.len());
+        for (name, property) in properties.iter_mut() {
+            every_property_required(property);
+            if !required.contains(name) {
+                make_nullable(property);
+            }
+            names.push(Value::String(name.clone()));
+        }
+        map.insert("required".into(), Value::Array(names));
+    }
+    if let Some(items) = map.get_mut("items") {
+        every_property_required(items);
+    }
+}
+
+/// `property` also accepts `null`.
+fn make_nullable(property: &mut Value) {
+    let Some(map) = property.as_object_mut() else {
+        return;
+    };
+    match map.get_mut("type") {
+        Some(Value::String(kind)) if kind != "null" => {
+            let kind = kind.clone();
+            map.insert("type".into(), json!([kind, "null"]));
+        }
+        Some(Value::Array(kinds)) => {
+            if !kinds.iter().any(|k| k == "null") {
+                kinds.push(json!("null"));
+            }
+        }
+        Some(_) => {}
+        None => {
+            let original = Value::Object(std::mem::take(map));
+            map.insert("anyOf".into(), json!([original, {"type": "null"}]));
+            return;
+        }
+    }
+    if let Some(Value::Array(values)) = map.get_mut("enum")
+        && !values.iter().any(Value::is_null)
+    {
+        values.push(Value::Null);
+    }
 }
 
 const UNCOMPILED_KEYWORDS: [&str; 2] = ["uniqueItems", "not"];
@@ -1064,6 +1134,48 @@ fn parse_usage(completed: &Value) -> Usage {
         output_tokens: count("/output_tokens"),
         cached_input_tokens: count("/input_tokens_details/cached_tokens"),
         cache_creation_tokens: 0,
+    }
+}
+
+#[cfg(test)]
+mod strict_tool_tests {
+    use super::*;
+
+    #[test]
+    fn optional_properties_become_required_and_nullable() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "mode": {"type": "string", "enum": ["overwrite", "append"]},
+                "opts": {"type": "object", "properties": {"deep": {"type": "boolean"}}, "required": []}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let out = tool_parameters(&schema);
+        let required: Vec<&str> = out["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required.len(), 4);
+        assert_eq!(out["properties"]["path"]["type"], "string");
+        assert_eq!(
+            out["properties"]["start_line"]["type"],
+            json!(["integer", "null"])
+        );
+        assert_eq!(
+            out["properties"]["mode"]["enum"],
+            json!(["overwrite", "append", null])
+        );
+        assert_eq!(
+            out["properties"]["opts"]["properties"]["deep"]["type"],
+            json!(["boolean", "null"])
+        );
+        assert_eq!(out["properties"]["opts"]["required"], json!(["deep"]));
     }
 }
 
@@ -1505,7 +1617,11 @@ mod tests {
         let body = build_body(&req, None);
         let params = &body["tools"][0]["parameters"];
         assert!(params.get("allOf").is_none());
-        assert_eq!(params["properties"]["not"]["type"], "string");
+        // Optional, so nullable under strict compilation.
+        assert_eq!(
+            params["properties"]["not"]["type"],
+            json!(["string", "null"])
+        );
         assert_eq!(params["anyOf"], json!([{"required": ["tail"]}, {}]));
         assert!(!params.to_string().contains("\"not\":{\"required"));
     }

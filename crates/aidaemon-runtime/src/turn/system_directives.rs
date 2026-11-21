@@ -292,7 +292,8 @@ impl SystemDirective {
                  What memory, history or existing files show was done before is context for the work, never its result, \
                  so reporting the state of earlier work does not answer the instruction. \
                  Do the work now with the available tools; when earlier results exist, work alongside them under fresh names and say so up front. \
-                 Only if the work truly cannot start without the owner's choice (redoing it would replace or duplicate results they may want kept, or what exists might be what they meant), \
+                 Only if the work truly cannot start without the owner's choice (redoing it would replace or duplicate results they may want kept, what exists might be what they meant, \
+                 the only way to do it breaks an instruction of theirs, or what they describe is not so, such as a bug you checked and found absent), \
                  pass track_requirements once more with outcome needs_owner and make your next reply that one question. \
                  Your next reply without tool calls is sent to the user; do not mention this check, the checklist, receipts or the ledger.",
                 if items.is_empty() {

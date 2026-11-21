@@ -968,8 +968,13 @@ impl OutcomeTool for WebFetch {
             Fetch::Response(fetched) => fetched,
         };
         let reply = fetch_reply(&fetched, max_chars, offset);
+        let output = if reply.ok {
+            format!("{}\n{}", fetch_header(url, &fetched), reply.text)
+        } else {
+            reply.text
+        };
         Ok(ToolCallOutcome {
-            output: reply.text,
+            output,
             metadata: ToolCallMetadata {
                 truncation: reply.truncation,
                 ..Default::default()
@@ -1117,12 +1122,10 @@ impl Tool for WebFetch {
                 "\n\n[Content truncated: the body was larger than {MAX_FETCH_BODY_BYTES} bytes.]"
             ));
         }
-        Ok(ToolOutput::text(format!(
-            "Status: {}\nContent-Type: {}\n{text}",
-            fetched.status.as_u16(),
-            fetched.content_type
-        ))
-        .with_details(details))
+        Ok(
+            ToolOutput::text(format!("{}\n{text}", fetch_header(url.as_str(), &fetched)))
+                .with_details(details),
+        )
     }
 }
 
@@ -1361,6 +1364,58 @@ fn build_fetch_reply_at(
 /// Wikipedia fetches returning JS soup that consumed the whole max_chars
 /// window before any article content).
 fn extract_page_text(html: &str, url: &str) -> String {
+    let text = extract_page_body(html, url);
+    // Readability keeps the article body and drops a heading that repeats
+    // the page title, so a page whose one heading is its title came back
+    // without it (live 2026-11-20: every "what is the page's heading?" turn
+    // re-fetched the page with curl two or three times to find it). The
+    // page's heading leads the text when the text lacks it.
+    match page_heading(html) {
+        Some(heading) if !text.contains(&heading) => format!("# {heading}\n\n{text}"),
+        _ => text,
+    }
+}
+
+/// The page's main heading as plain text: its first `<h1>`, else its
+/// `<title>` (HTML markup, a machine format).
+fn page_heading(html: &str) -> Option<String> {
+    let cleaned = strip_nonvisible_blocks(html);
+    ["h1", "title"]
+        .into_iter()
+        .find_map(|tag| first_element_text(&cleaned, tag))
+}
+
+/// The text inside the first `<tag ...>...</tag>`, tags removed, entities
+/// decoded and whitespace collapsed; `None` when absent or empty.
+fn first_element_text(html: &str, tag: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let open = format!("<{tag}");
+    let mut from = 0;
+    let start = loop {
+        let at = find_ascii_ci(bytes, open.as_bytes(), from)?;
+        // "<h1" must end the tag name ("<h10" or "<titles" is another tag).
+        if matches!(
+            bytes.get(at + open.len()),
+            Some(b' ') | Some(b'>') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            break at;
+        }
+        from = at + open.len();
+    };
+    let inner_start = start + html[start..].find('>')? + 1;
+    let close = format!("</{tag}");
+    let inner_end = find_ascii_ci(bytes, close.as_bytes(), inner_start)?;
+    let inner = htmd::convert(&html[inner_start..inner_end]).unwrap_or_default();
+    let text = inner
+        .replace(['*', '_', '#', '`'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// [`extract_page_text`] before the page's heading is added.
+fn extract_page_body(html: &str, url: &str) -> String {
     let cleaned = strip_nonvisible_blocks(html);
     let parsed_url = reqwest::Url::parse(url)
         .unwrap_or_else(|_| reqwest::Url::parse("http://example.com").unwrap());
@@ -1368,18 +1423,25 @@ fn extract_page_text(html: &str, url: &str) -> String {
     let full_page = || htmd::convert(&cleaned).unwrap_or_else(|_| cleaned.clone());
     match llm_readability::extractor::extract(&mut cursor, &parsed_url) {
         Ok(product) if !product.text.trim().is_empty() => {
+            // Readability's plain text runs its blocks together ("Example
+            // DomainThis domain ..."); its HTML as markdown keeps headings
+            // and paragraphs apart.
+            let article = htmd::convert(&strip_nonvisible_blocks(&product.content))
+                .ok()
+                .filter(|markdown| !markdown.trim().is_empty())
+                .unwrap_or_else(|| product.text.clone());
             // Readability keeps one block. On an article that is the content;
             // on a listing page (downloads, release lists, tables) it is a
             // side section, and the answer is in what it dropped. A short
             // extract cut from a much larger page gets the whole page.
-            let article_chars = product.text.trim().chars().count();
+            let article_chars = article.trim().chars().count();
             if article_chars >= MIN_ARTICLE_CHARS {
-                return product.text;
+                return article;
             }
             let full = full_page();
             let full_chars = full.trim().chars().count();
             if (article_chars as f64) >= MIN_ARTICLE_COVERAGE * full_chars as f64 {
-                product.text
+                article
             } else {
                 full
             }
@@ -1463,6 +1525,32 @@ fn format_fetch_result(
     max_chars: usize,
 ) -> (String, Option<crate::semantics::TruncationInfo>) {
     format_fetch_window(url, text, max_chars, 0)
+}
+
+/// One line stating what a fetch reached: status, content type, the final
+/// URL (and the URL asked for when a redirect moved it) and the page title,
+/// so the model need not check them with another request (live 2026-11-14
+/// to 11-20: 51 curl status checks, 9 right after a fetch).
+fn fetch_header(requested: &str, fetched: &Fetched) -> String {
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    let mut parts = vec![
+        format!("HTTP {}", fetched.status.as_u16()),
+        fetched.content_type.clone(),
+    ];
+    if same(requested, &fetched.final_url) {
+        parts.push(fetched.final_url.clone());
+    } else {
+        parts.push(format!(
+            "{} (redirected from {requested})",
+            fetched.final_url
+        ));
+    }
+    if fetched.content_type.contains("html")
+        && let Some(title) = first_element_text(&String::from_utf8_lossy(&fetched.body), "title")
+    {
+        parts.push(format!("title \"{title}\""));
+    }
+    parts.join(" \u{b7} ")
 }
 
 /// `max_chars` of `text` starting at character `offset`. A cut is reported
@@ -1574,6 +1662,55 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    /// The reply's first line says what the fetch reached: status, type,
+    /// final URL (with the URL asked for when a redirect moved it) and
+    /// title, on both entry points.
+    #[tokio::test]
+    async fn a_fetch_reports_status_final_url_and_title() {
+        let base = serve(vec![
+            (
+                "/page",
+                "200 OK",
+                "text/html; charset=utf-8",
+                "<html><head><title>Synthetic Shop</title></head><body><p>Hello.</p></body></html>"
+                    .into(),
+            ),
+            ("/hop", "302 Found", "text/plain", "/page".into()),
+        ])
+        .await;
+        let tool = WebFetch::new().without_proxy().allow_private_hosts();
+        let out = tool
+            .call(json!({"url": format!("{base}/page")}), &ctx())
+            .await
+            .unwrap();
+        let first = out.content.lines().next().unwrap_or("").to_string();
+        assert!(first.starts_with("HTTP 200 \u{b7} text/html"), "{first}");
+        assert!(first.contains(&format!("{base}/page")), "{first}");
+        assert!(first.contains("title \"Synthetic Shop\""), "{first}");
+        assert!(!first.contains("redirected"), "{first}");
+
+        let hop = format!("{base}/hop");
+        let out = tool.call(json!({"url": hop}), &ctx()).await.unwrap();
+        let first = out.content.lines().next().unwrap_or("").to_string();
+        assert!(
+            first.contains(&format!("{base}/page (redirected from {hop})")),
+            "{first}"
+        );
+
+        // The daemon's entry point carries the same line.
+        let outcome = OutcomeTool::execute(
+            &tool,
+            &json!({"url": hop}).to_string(),
+            &ToolCallContext::default(),
+        )
+        .await
+        .unwrap();
+        let first = outcome.output.lines().next().unwrap_or("").to_string();
+        assert!(first.starts_with("HTTP 200"), "{first}");
+        assert!(first.contains("redirected from"), "{first}");
+        assert!(first.contains("Synthetic Shop"), "{first}");
     }
 
     #[tokio::test]
@@ -2062,6 +2199,44 @@ mod format_tests {
              <div class=\"article\"><h2>Verifying downloads</h2>{prose}</div>\
              </body></html>"
         )
+    }
+
+    /// A page whose one heading is its title keeps that heading: readability
+    /// drops it, and the model would fetch the page again to find it.
+    #[test]
+    fn the_page_heading_survives_extraction() {
+        // Shaped like example.com: a title, no heading, one paragraph.
+        let html = "<!doctype html><html lang=en><head><meta charset=utf-8>\
+                    <title>Example Domain</title><style>body{margin:auto}</style></head>\
+                    <body><p>This domain is for use in synthetic documentation examples \
+                    without needing permission.</p><script src=/s.js></script></body></html>";
+        let text = extract_page_text(html, "https://example.com/");
+        let first = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        assert!(first.contains("Example Domain"), "{text}");
+        assert!(text.contains("synthetic documentation"), "{text}");
+        assert!(!text.contains("isReaderPage"), "{text}");
+        // A heading in the body stays apart from the paragraph after it, and
+        // is not added again.
+        let html = "<html><head><title>Example Domain</title></head><body><div>\
+                    <h1>Example Domain</h1><p>This domain is for use in synthetic \
+                    documentation examples without needing permission.</p></div></body></html>";
+        let text = extract_page_text(html, "https://example.com/");
+        assert!(text.contains("# Example Domain"), "{text}");
+        assert!(text.matches("Example Domain").count() <= 2, "{text}");
+        assert!(!text.contains("DomainThis"), "{text}");
+        // A title only, and a heading with markup inside.
+        assert_eq!(
+            page_heading("<title> Synthetic  Page </title><p>x</p>").as_deref(),
+            Some("Synthetic Page")
+        );
+        assert_eq!(
+            page_heading("<h10>no</h10><h1 class=\"t\">A <b>bold</b> &amp; plain</h1>").as_deref(),
+            Some("A bold & plain")
+        );
+        assert_eq!(page_heading("<p>nothing</p>"), None);
     }
 
     #[test]

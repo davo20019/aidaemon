@@ -539,6 +539,11 @@ const DECISIONS: &[(&str, &str, &str)] = &[
         "A second opinion on risky commands",
         "off",
     ),
+    (
+        "untrusted_egress_clear",
+        "A fast pass on safe calls after reading outside content",
+        "on",
+    ),
 ];
 
 /// What a decision backend is, in a sentence.

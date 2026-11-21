@@ -108,6 +108,11 @@ impl Connection {
 /// The protocol minor that added `get_settings`.
 const GET_SETTINGS_MINOR: u16 = 4;
 
+/// The protocol minor that added `edit_queued`'s `now`. An older daemon
+/// ignores the field and would take the message out, so it is never sent
+/// to one.
+const SEND_QUEUED_NOW_MINOR: u16 = 41;
+
 /// Something read from the daemon, as last asked.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Read<T> {
@@ -1487,22 +1492,18 @@ impl Client {
             let last = turn.tools.len().saturating_sub(1);
             for (n, name) in turn.tools.iter().enumerate() {
                 // The current status names the last tool with its summary.
-                let (summary, activity) = match &turn.status {
-                    Some(TurnStatus::ToolStarted {
-                        name: now,
-                        summary,
-                        activity,
-                    }) if n == last && now == name => (summary.clone(), *activity),
-                    _ => (String::new(), None),
+                let status = match &turn.status {
+                    Some(status @ TurnStatus::ToolStarted { name: now, .. })
+                        if n == last && now == name =>
+                    {
+                        status.clone()
+                    }
+                    _ => TurnStatus::tool_started(name.clone(), "", None),
                 };
                 self.note_activity(
                     &Event::TurnStatus {
                         turn_id: turn.turn_id.clone(),
-                        status: TurnStatus::ToolStarted {
-                            name: name.clone(),
-                            summary,
-                            activity,
-                        },
+                        status,
                     },
                     now,
                 );
@@ -1555,7 +1556,7 @@ impl Client {
                     TurnStatus::ToolProgress { name, chunk } => {
                         (ActivityKind::Output, name.clone(), chunk.clone())
                     }
-                    TurnStatus::ToolCompleted { name, summary } => {
+                    TurnStatus::ToolCompleted { name, summary, .. } => {
                         (ActivityKind::ToolDone, name.clone(), summary.clone())
                     }
                     TurnStatus::PlanStep {
@@ -2164,6 +2165,16 @@ impl Client {
         let Some(since) = self.away_since.take() else {
             return false;
         };
+        // A drop while out of sight (a phone suspends a backgrounded app's
+        // sockets) is not news: it gets the quiet grace from now, while the
+        // link reconnects, instead of reading as a long outage at once.
+        if let Connection::Offline {
+            since_ms: Some(lost),
+            ..
+        } = &mut self.connection
+        {
+            *lost = (*lost).max(cx.now_ms);
+        }
         cx.now_ms.saturating_sub(since) >= AWAY_REFRESH_MS && self.refresh_all(cx)
     }
 
@@ -2492,6 +2503,28 @@ impl Client {
             session_id: session.to_owned(),
             message_id,
             text,
+            now: false,
+        });
+    }
+
+    /// Whether the daemon can give a waiting message to the running work
+    /// ([`Self::send_queued_now`]).
+    pub fn can_send_queued_now(&self) -> bool {
+        self.daemon_version
+            .is_some_and(|v| v.major == 1 && v.minor >= SEND_QUEUED_NOW_MINOR)
+    }
+
+    /// Give a message waiting for its own turn to the running work, read at
+    /// its next step. Nothing is sent to a daemon that predates it.
+    pub fn send_queued_now(&mut self, session: &str, message_id: u64) {
+        if !self.can_send_queued_now() {
+            return;
+        }
+        self.send(Command::EditQueued {
+            session_id: session.to_owned(),
+            message_id,
+            text: None,
+            now: true,
         });
     }
 
@@ -2994,6 +3027,19 @@ mod tests {
                 )
             })
             .expect("a surface command")
+    }
+
+    /// "Send now" goes only to a daemon that knows it: an older one would
+    /// read the command as taking the message out.
+    #[test]
+    fn send_now_is_never_sent_to_a_daemon_that_predates_it() {
+        for (minor, supported) in [(40, false), (41, true)] {
+            let client = Client {
+                daemon_version: Some(aidaemon_client_protocol::ProtocolVersion { major: 1, minor }),
+                ..Client::default()
+            };
+            assert_eq!(client.can_send_queued_now(), supported, "1.{minor}");
+        }
     }
 
     #[test]
@@ -4233,6 +4279,31 @@ mod tests {
         assert!(client.came_back(&at(10_000 + AWAY_REFRESH_MS)));
         assert!(!reads(&mut client).is_empty());
         assert!(!client.came_back(&at(100_000)), "once per return");
+    }
+
+    /// A connection lost while the app was in the background reads as
+    /// connected for a moment on return, while the link reconnects.
+    #[test]
+    fn a_drop_while_away_is_quiet_on_return() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.went_away(1_000);
+        client.connection = Connection::Offline {
+            kind: DropKind::Dropped,
+            reason: "lost".into(),
+            retry_at_ms: 0,
+            since_ms: Some(2_000),
+        };
+        let back = 2_000 + LONG_DROP_MS * 4;
+        client.came_back(&Context {
+            now_ms: back,
+            ..Context::default()
+        });
+        assert_eq!(client.connection.felt(back + 1_000), Felt::Online);
+        assert!(matches!(
+            client.connection.felt(back + LONG_DROP_MS),
+            Felt::Down { .. }
+        ));
     }
 
     /// A reconnect reads the open conversation again even when it shows

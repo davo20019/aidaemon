@@ -603,18 +603,27 @@ CREATE TRIGGER memory_spans_ad AFTER DELETE ON memory_spans BEGIN INSERT INTO me
 trigger memory_spans_au on memory_spans
 CREATE TRIGGER memory_spans_au AFTER UPDATE OF content ON memory_spans WHEN old.content IS NOT new.content BEGIN INSERT INTO memory_spans_fts(memory_spans_fts, rowid, content) VALUES ('delete', old.id, old.content); INSERT INTO memory_spans_fts(rowid, content) VALUES (new.id, new.content); END
 
-table terminal_allowed_prefixes on terminal_allowed_prefixes
-CREATE TABLE terminal_allowed_prefixes (
-            prefix TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-
 table terminal_backend_allowed_prefixes on terminal_backend_allowed_prefixes
 CREATE TABLE terminal_backend_allowed_prefixes (
             backend_scope TEXT NOT NULL,
             prefix TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (backend_scope, prefix)
+        )
+
+table terminal_capability_grants on terminal_capability_grants
+CREATE TABLE terminal_capability_grants (
+            backend_scope TEXT NOT NULL,
+            prefix TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (backend_scope, prefix, capability)
+        )
+
+table terminal_trust_all on terminal_trust_all
+CREATE TABLE terminal_trust_all (
+            backend_scope TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
 
 table command_patterns on command_patterns
@@ -1563,8 +1572,9 @@ rows memory_write_audit = 0
 rows memory_edges = 0
 rows memory_embeddings = 0
 rows memory_embedding_generation = 1
-rows terminal_allowed_prefixes = 0
 rows terminal_backend_allowed_prefixes = 0
+rows terminal_capability_grants = 0
+rows terminal_trust_all = 0
 rows command_patterns = 0
 rows macros = 0
 rows token_usage = 0
@@ -1618,6 +1628,7 @@ rows background_spawns = 0
 rows task_dependencies = 0
 rows history_message_index = 0
 rows history_projection_state = 0
-rows state_schema_versions = 2
+rows state_schema_versions = 3
 version 1 unversioned_baseline
 version 2 legacy_goals_imported
+version 3 work_backfills_done

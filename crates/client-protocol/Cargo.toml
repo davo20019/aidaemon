@@ -1,6 +1,6 @@
 [package]
 name = "aidaemon-client-protocol"
-description = "Wire types of the AIdaemon Client Protocol v1 (/client/v1): the frames a TUI, web, desktop, mobile or watch client exchanges with the daemon's Client Gateway, with a generated JSON Schema"
+description = "Wire types of the AIDaemon Client Protocol v1 (/client/v1): the frames a TUI, web, desktop, mobile or watch client exchanges with the daemon's Client Gateway, with a generated JSON Schema"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -2141,18 +2141,18 @@ mod tests {
             .await
             .unwrap();
         drupal
-            .send(StatusUpdate::ToolStart {
-                name: "running the site installer".into(),
-                summary: String::new(),
-                kind: ActivityKind::Run,
-            })
+            .send(StatusUpdate::tool_start(
+                "running the site installer",
+                "",
+                ActivityKind::Run,
+            ))
             .await
             .unwrap();
         drupal
-            .send(StatusUpdate::ToolComplete {
-                name: "running the site installer".into(),
-                summary: "done".into(),
-            })
+            .send(StatusUpdate::tool_complete(
+                "running the site installer",
+                "done",
+            ))
             .await
             .unwrap();
         drupal

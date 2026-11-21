@@ -1,14 +1,15 @@
-//! A client on a computer that may run the daemon itself (desktops, the
-//! terminal): where the gateway is, the owner's local token, the key kept
-//! after pairing with a daemon elsewhere, and starting the daemon here.
+//! A native client: where the gateway is, the owner's local token, the key
+//! kept after pairing with a daemon elsewhere, and (on a computer that may
+//! run the daemon itself: the desktops, the terminal) starting it here.
+//! A phone never runs the daemon; it only pairs.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use aidaemon_client_protocol::ClientKind;
 
-use crate::keystore::{FileKeyStore, KeyStore};
+use crate::keystore::KeyStore;
 use crate::link::Auth;
 use crate::signin::{PairRequest, PairingLink};
 
@@ -50,13 +51,59 @@ pub fn local_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// Where the app keeps its key once paired with a daemon elsewhere.
-pub fn device_store() -> Option<Arc<FileKeyStore>> {
-    dirs::home_dir().map(|home| {
-        Arc::new(FileKeyStore::new(
-            home.join(".aidaemon").join("app-device.json"),
-        ))
+/// Set by an app with a data directory of its own (a phone's sandbox).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep this client's files in `dir` instead of `~/.aidaemon`: a phone app
+/// has no home folder of its own, only its data directory. Set once, before
+/// [`sign_in`]; a later call is ignored.
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+/// Where this client keeps its files: [`set_data_dir`]'s, else
+/// `~/.aidaemon`. (iOS keeps the key in the keychain, not here.)
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+fn data_dir() -> Option<PathBuf> {
+    DATA_DIR
+        .get()
+        .cloned()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".aidaemon")))
+}
+
+/// The keychain item of the iOS app's key.
+#[cfg(target_os = "ios")]
+const KEYCHAIN_SERVICE: &str = "ai.aidaemon.app";
+
+/// Where the app keeps its key once paired with a daemon elsewhere: the
+/// keychain on iOS, else an owner-only file in the data directory (on
+/// Android the app's private storage, which no other app can read).
+pub fn device_store() -> Option<Arc<dyn KeyStore>> {
+    #[cfg(target_os = "ios")]
+    return Some(Arc::new(crate::keystore::KeychainKeyStore::new(
+        KEYCHAIN_SERVICE,
+        "device",
+    )));
+    #[cfg(not(target_os = "ios"))]
+    data_dir().map(|dir| {
+        Arc::new(crate::keystore::FileKeyStore::new(
+            dir.join("app-device.json"),
+        )) as Arc<dyn KeyStore>
     })
+}
+
+/// Whether this device is paired with a daemon elsewhere.
+pub fn is_paired() -> bool {
+    device_store().is_some_and(|keys| matches!(keys.load(), Ok(Some(_))))
+}
+
+/// Forget this device's pairing (the daemon refused its key, or the owner
+/// unpaired it). The error is for the owner.
+pub fn unpair() -> Result<(), String> {
+    match device_store() {
+        Some(keys) => keys.clear().map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
 }
 
 /// How to sign in from here: the local token with the gateway's URL, else
@@ -84,7 +131,7 @@ pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<
         offer_id: link.offer_id,
         code: link.code,
         device_name: if name.trim().is_empty() {
-            "Desktop".into()
+            default_device_name(kind).into()
         } else {
             name.trim().into()
         },
@@ -92,14 +139,107 @@ pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<
         fingerprint: link.fingerprint,
     };
     let device = crate::signin::pair(
-        &reqwest::Client::new(),
+        &crate::tls::http_client(),
         &request,
         Duration::from_millis(500),
     )
     .await
     .map_err(|e| e.to_string())?;
-    let keys = device_store().ok_or("No home directory to keep the key in")?;
+    let keys = device_store().ok_or("No folder to keep the key in")?;
     keys.save(&device).map_err(|e| e.to_string())
+}
+
+/// The name a device pairs under when the owner gives none.
+pub fn default_device_name(kind: ClientKind) -> &'static str {
+    match kind {
+        ClientKind::Mobile => "Phone",
+        ClientKind::Tui => "Terminal",
+        ClientKind::Web => "Browser",
+        _ => "Desktop",
+    }
+}
+
+/// The owner's side of pairing a device from this computer, signed in with
+/// the local token: make an offer (its `link` is what a QR code shows),
+/// watch it, and approve or deny the device that redeemed it. The errors
+/// are for the owner.
+pub mod owner_pairing {
+    use aidaemon_client_protocol::{Enrollment, OfferRequest, PairingDecision, PairingOffer};
+
+    use crate::signin::{HttpReply, read};
+
+    async fn call<T: serde::de::DeserializeOwned>(
+        method: reqwest::Method,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<T, String> {
+        let token =
+            super::local_token().ok_or("Pair devices from the computer AIDaemon runs on.")?;
+        let url = format!("{}{path}", crate::machine::http_base(&super::gateway_url()));
+        let mut request = crate::tls::http_client()
+            .request(method, url)
+            .bearer_auth(token);
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/json")
+                .body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("Could not reach AIDaemon: {e}"))?;
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        read(HttpReply { status, body }).map_err(|e| e.to_string())
+    }
+
+    /// A new offer, confirmed here (not in a chat).
+    pub async fn offer() -> Result<PairingOffer, String> {
+        let body = serde_json::to_string(&OfferRequest::default()).map_err(|e| e.to_string())?;
+        call(
+            reqwest::Method::POST,
+            "/client/v1/pairing/offers",
+            Some(body),
+        )
+        .await
+    }
+
+    /// Where the offer stands.
+    pub async fn status(offer_id: &str) -> Result<Enrollment, String> {
+        call(
+            reqwest::Method::GET,
+            &format!("/client/v1/pairing/offers/{offer_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// Approve or deny the device waiting on the offer.
+    pub async fn decide(offer_id: &str, approve: bool) -> Result<Enrollment, String> {
+        let body =
+            serde_json::to_string(&PairingDecision { approve }).map_err(|e| e.to_string())?;
+        call(
+            reqwest::Method::POST,
+            &format!("/client/v1/pairing/offers/{offer_id}/decision"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// Whether a device elsewhere can reach `gateway` (an offer's
+    /// `public_url`): not when it is this computer's loopback address.
+    pub fn reachable_elsewhere(gateway: &str) -> bool {
+        let host = crate::machine::http_base(gateway);
+        let host = host.split_once("://").map_or(host.as_str(), |(_, h)| h);
+        let host = host.rsplit_once(':').map_or(host, |(h, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                h
+            } else {
+                host
+            }
+        });
+        !matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0" | "")
+    }
 }
 
 /// The `aidaemon` binary: beside this app (the bundled download), else on
@@ -141,17 +281,17 @@ pub async fn install_daemon() -> Result<(), String> {
             .ok()
             .is_some_and(|exe| exe.starts_with("/Volumes"))
     {
-        return Err("Drag AIdaemon to Applications first, then open it from there.".to_string());
+        return Err("Drag AIDaemon to Applications first, then open it from there.".to_string());
     }
     let binary = daemon_binary().ok_or_else(|| {
-        "The aidaemon program is not beside this app. Reinstall the app, or install AIdaemon \
+        "The aidaemon program is not beside this app. Reinstall the app, or install AIDaemon \
          with the install script."
             .to_string()
     })?;
     let output = std::process::Command::new(binary)
         .args(["service", "install"])
         .output()
-        .map_err(|e| format!("Could not start AIdaemon: {e}"))?;
+        .map_err(|e| format!("Could not start AIDaemon: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -169,5 +309,27 @@ pub async fn install_daemon() -> Result<(), String> {
     } else {
         "See why with `journalctl --user -u aidaemon`."
     };
-    Err(format!("AIdaemon did not start within a minute. {why}"))
+    Err(format!("AIDaemon did not start within a minute. {why}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_without_a_name_pairs_under_its_kind() {
+        assert_eq!(default_device_name(ClientKind::Mobile), "Phone");
+        assert_eq!(default_device_name(ClientKind::Desktop), "Desktop");
+        assert_eq!(default_device_name(ClientKind::Tui), "Terminal");
+    }
+
+    #[test]
+    fn a_loopback_gateway_is_not_reachable_from_a_phone() {
+        use owner_pairing::reachable_elsewhere;
+        assert!(!reachable_elsewhere("http://127.0.0.1:8788"));
+        assert!(!reachable_elsewhere("http://localhost:8788/"));
+        assert!(!reachable_elsewhere("http://[::1]:8788"));
+        assert!(reachable_elsewhere("https://daemon.example.invalid"));
+        assert!(reachable_elsewhere("http://100.64.0.7:8788"));
+    }
 }

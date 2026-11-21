@@ -210,6 +210,15 @@ pub struct RunState {
     /// Successful calls of this run when `idle_continuations` last changed.
     #[serde(default)]
     pub(crate) continued_at_successes: usize,
+    /// The deferred tools already loaded when this run first built a
+    /// request; `None` before that. Kept with the state so a run resumed
+    /// after an interruption sends the same tool block (the front of the
+    /// provider's prompt cache) instead of treating its own loads as old.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) loaded_at_start: Option<std::collections::BTreeSet<String>>,
+    /// The deferred tools this run loaded, each after the batch that did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tool_loads: Vec<crate::provider::ToolLoad>,
 }
 
 impl RunState {
@@ -242,6 +251,8 @@ impl RunState {
             parent_run: None,
             idle_continuations: 0,
             continued_at_successes: 0,
+            loaded_at_start: None,
+            tool_loads: Vec::new(),
         }
     }
 
@@ -282,6 +293,8 @@ impl RunState {
         self.limit_grants = LimitGrants::default();
         self.idle_continuations = 0;
         self.continued_at_successes = 0;
+        self.loaded_at_start = None;
+        self.tool_loads.clear();
         self
     }
 

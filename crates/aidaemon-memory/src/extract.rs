@@ -24,8 +24,9 @@ and relationships they mention, stable preferences, ongoing projects, decisions,
 details about their tools and environment.
 
 Do not record: the task being worked on right now, transient state (\"is debugging X today\"), \
-anything only the assistant claimed, guesses, secrets such as passwords or API keys, or content \
-quoted from tool output.
+anything only the assistant claimed, guesses, secrets such as passwords or API keys, content \
+quoted from tool output, or a rule or constraint the user limits to this chat, this task or this \
+request (\"for this chat\", \"this time\", \"don't install anything for this one\").
 
 Rules:
 - One fact per entry: a lowercase `category` (user, preference, person, project, technical, or \

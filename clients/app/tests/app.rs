@@ -629,7 +629,7 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
         r#"{"type":"event","at_ms":1,"event":{"type":"setup_updated","setup":{"step":"starting","model":"OpenRouter · synthetic/model-1"}}}"#,
     )]);
     app.wait_for(
-        "OpenRouter · synthetic/model-1 answered its test. AIdaemon is starting with it…",
+        "OpenRouter · synthetic/model-1 answered its test. AIDaemon is starting with it…",
     )?;
     feed([frame(
         r#"{"type":"event","at_ms":2,"event":{"type":"setup_updated","setup":{"step":"channel","model":"OpenRouter · synthetic/model-1","channels":[{"platform":"telegram","name":"Telegram","help_url":"https://t.me/BotFather"}]}}}"#,
@@ -648,10 +648,10 @@ fn first_run_connects_a_model_then_greets_with_the_phone_step_left_for_later() -
             r#"{"type":"event","seq":1,"at_ms":5,"session_id":"app:welcome","event":{"type":"session_created","session":{"id":"app:welcome","channel":"app","title":"Welcome","writable":true}}}"#,
         ),
         frame(
-            r#"{"type":"event","seq":2,"at_ms":6,"session_id":"app:welcome","event":{"type":"assistant_message","session_id":"app:welcome","text":"Hi, I'm AIdaemon.","suggestions":["What can you do on this computer?"]}}"#,
+            r#"{"type":"event","seq":2,"at_ms":6,"session_id":"app:welcome","event":{"type":"assistant_message","session_id":"app:welcome","text":"Hi, I'm AIDaemon.","suggestions":["What can you do on this computer?"]}}"#,
         ),
     ]);
-    app.wait_for("Hi, I'm AIdaemon.")?;
+    app.wait_for("Hi, I'm AIDaemon.")?;
     app.wait_for("What can you do on this computer?")?;
     Ok(())
 }
@@ -1632,5 +1632,40 @@ fn a_sent_message_can_be_sent_again_or_edited_first() -> Result<(), String> {
     )]);
     app.wait_for_gone("Send again", std::time::Duration::from_secs(2))?;
     assert!(app.press("Edit and send again").is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_reply_starting_in_a_long_conversation_is_in_view() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-long","channel":"app","title":"A long synthetic chat","writable":true}]}}"#,
+        ),
+    ]);
+    app.wait_for("A long synthetic chat")?;
+    let before = sent("get_history");
+    app.press("A long synthetic chat >> nth=0")?;
+    let id = wait_sent_new("get_history", before)?;
+    let messages = (0..120)
+        .map(|i| {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            serde_json::json!({"id": format!("m{i}"), "role": role, "text": format!("Synthetic message {i}.\n\nWith a second paragraph."), "at_ms": 1000 + i})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"history","session_id":"app:synthetic-long","messages":[{messages}]}}}}"#
+    ))]);
+    app.wait_for("Synthetic message 119.")?;
+    feed([frame(
+        r#"{"type":"event","seq":1,"at_ms":5000,"session_id":"app:synthetic-long","event":{"type":"turn_started","turn_id":"t1","session_id":"app:synthetic-long","origin":"app"}}"#,
+    )]);
+    // The reply's working line, at the end, in view: not an old message.
+    app.wait_for("Working…")?;
     Ok(())
 }
