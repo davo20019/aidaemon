@@ -8481,13 +8481,23 @@ impl Tool for TerminalTool {
                     if opaque_change {
                         outcome.metadata.semantics =
                             outcome.metadata.semantics.with_untyped_change();
-                    } else {
-                        // Credited without a claim only when the change is
-                        // recognized: an unknown command can miss a credit,
-                        // never invent one.
-                        outcome.metadata.changes_untyped = run_text
-                            .as_deref()
-                            .is_some_and(aidaemon_tools::command_effects::recognizably_changes);
+                    } else if run_text
+                        .as_deref()
+                        .is_some_and(aidaemon_tools::command_effects::recognizably_changes)
+                    {
+                        // A recognized change is work done even before any
+                        // checklist exists: its receipt is a change
+                        // (`UNSPECIFIED`, which proves no item it does not
+                        // name), so the owner's request reads as attempted
+                        // (live 2026-11-20: a script written with a
+                        // here-document inside `docker exec` before the
+                        // checklist read as "nothing attempted", and the run
+                        // was sent back). The one item in progress may be
+                        // credited with it. An unknown command stays a look:
+                        // it can miss a credit, never invent one.
+                        outcome.metadata.semantics =
+                            outcome.metadata.semantics.with_untyped_change();
+                        outcome.metadata.changes_untyped = true;
                     }
                 }
                 outcome

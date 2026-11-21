@@ -385,3 +385,49 @@ async fn a_look_while_an_item_is_in_progress_does_not_close_it() {
         wrapped_turn("look_in_progress", false, "in_progress", "ls /").await;
     assert!(!demands.is_empty(), "the item stays open after a look");
 }
+
+/// A recognized change made before any checklist exists is work done: the
+/// run is not sent back as if nothing had been attempted.
+#[tokio::test]
+#[cfg_attr(windows, ignore = "Unix shell wrapper; the typing is platform-neutral")]
+async fn a_recognized_change_before_any_checklist_counts_as_attempted() {
+    let dir = tempfile::tempdir().expect("container stand-in");
+    let file = dir.path().join("report.txt").to_string_lossy().to_string();
+    let run = json!({"action": "run", "command": format!("sh -c 'touch {file}'")}).to_string();
+    let done = "phase=DONE; the report is written in the container.";
+    let provider = MockProvider::with_responses(vec![
+        MockProvider::tool_call_response("terminal", &run),
+        MockProvider::text_response(done),
+        MockProvider::text_response(done),
+        MockProvider::text_response(done),
+    ])
+    .with_owner_units(vec![MockProvider::owner_units(&[(
+        "Write the synthetic report inside the container",
+        true,
+    )])]);
+    let harness = setup_full_stack_test_agent_with_extra_tools(provider, vec![])
+        .await
+        .unwrap();
+    let session_id = "recognized_change_no_checklist";
+    let response = harness
+        .agent
+        .handle_message(
+            session_id,
+            "Write the synthetic report inside the container.",
+            None,
+            UserRole::Owner,
+            owner_channel(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(response.contains("phase=DONE"), "{response}");
+    let conditions = all_conditions(&harness, session_id).await;
+    assert!(
+        !conditions
+            .iter()
+            .any(|c| c.starts_with("\"declared_work_unattempted\"")),
+        "{conditions:?}"
+    );
+    assert!(std::path::Path::new(&file).exists());
+}

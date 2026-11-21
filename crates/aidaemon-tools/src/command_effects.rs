@@ -4395,6 +4395,23 @@ mod remote_inner_tests {
         }
     }
 
+    /// A file written with a here-document inside `docker exec ... bash -lc`
+    /// is a recognized change, however the delimiter is quoted (live
+    /// 2026-11-20: a script written this way read as "nothing attempted",
+    /// and the run was sent back to redo it).
+    #[test]
+    fn a_heredoc_write_inside_a_remote_exec_is_a_change() {
+        for change in [
+            "docker exec app-1 bash -lc 'cat > /app/proc.py <<\"EOF\"\nimport csv\nprint(1)\nEOF'",
+            "docker exec app-1 bash -lc 'cat > /app/proc.py <<'\"'\"'EOF'\"'\"'\nimport csv\nEOF\ncd /app && python3 proc.py'",
+            "docker exec app-1 bash -lc 'cat > /app/proc.py <<EOF\nx = {\"a\": 1}\nEOF'",
+            "docker exec app-1 bash -lc 'cd /app && cat <<EOF > out.txt\nhello\nEOF'",
+        ] {
+            assert!(recognizably_changes(change), "{change}");
+            assert_eq!(remote_inner_only_reads(change), Some(false), "{change}");
+        }
+    }
+
     /// A look inside a container or host reads; a write there changes.
     #[test]
     fn the_command_inside_a_remote_exec_is_judged() {
