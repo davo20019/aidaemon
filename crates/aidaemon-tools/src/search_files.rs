@@ -325,12 +325,28 @@ impl SearchFiles {
             output.push_str(note);
             output.push_str("\n\n");
         }
-        output.push_str(&format!(
-            "Found {} match{}. {} files scanned in {}\n\n",
+        // Content matches are counted as lines, files as files: "1 match"
+        // over ten matching lines read as a contradiction (live 2026-11-21).
+        let matching_lines: usize = results
+            .iter()
+            .map(|result| result.lines.iter().filter(|line| line.2).count() + result.more)
+            .sum();
+        let files = format!(
+            "{} file{}",
             results.len(),
-            if results.len() == 1 { "" } else { "es" },
-            stats.files_scanned,
-            search_dir
+            if results.len() == 1 { "" } else { "s" }
+        );
+        let found = if matching_lines > 0 {
+            format!(
+                "Found {matching_lines} matching line{} in {files}",
+                if matching_lines == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("Found {files}")
+        };
+        output.push_str(&format!(
+            "{found}. {} files scanned in {}\n\n",
+            stats.files_scanned, search_dir
         ));
         if stats.oversized_files_skipped > 0 {
             output.push_str(&oversized_note(stats.oversized_files_skipped));
@@ -585,7 +601,10 @@ impl SearchResult {
             let mut s = format!("{}:", path_str);
             let mut previous: Option<usize> = None;
             for (line_num, line, matched) in &self.lines {
-                if previous.is_some_and(|previous| *line_num > previous + 1) {
+                // Blocks are separated only when context lines make them
+                // blocks; plain matches need no separator.
+                let has_context = self.lines.iter().any(|line| !line.2);
+                if has_context && previous.is_some_and(|previous| *line_num > previous + 1) {
                     s.push_str("\n  --");
                 }
                 let truncated = crate::util::truncate_str(line, 203);
