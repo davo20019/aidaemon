@@ -175,12 +175,16 @@ impl AgentTaskLeads {
     }
 }
 
-/// The channel hub, as the goal cycle sends notices.
-struct HubDelivery(Weak<dyn OutboundRouter>);
+/// The channel hub, as the goal cycle sends notices, and the agent whose
+/// history says when the owner last wrote in a chat.
+struct HubDelivery {
+    hub: Weak<dyn OutboundRouter>,
+    agent: Option<Weak<dyn TurnHost>>,
+}
 
 impl HubDelivery {
     fn hub(&self) -> anyhow::Result<Arc<dyn OutboundRouter>> {
-        self.0
+        self.hub
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("the channel hub has stopped"))
     }
@@ -198,6 +202,24 @@ impl NoticeDelivery for HubDelivery {
         text: &str,
     ) -> anyhow::Result<Option<String>> {
         self.hub()?.send_text_tracked(session_id, text).await
+    }
+
+    async fn owner_active_since(
+        &self,
+        session_id: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let Some(agent) = self.agent.as_ref().and_then(Weak::upgrade) else {
+            return false;
+        };
+        match agent.event_log().last_owner_message_at(session_id).await {
+            Ok(Some(at)) => at >= since,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "Could not read the owner's last message time");
+                false
+            }
+        }
     }
 }
 
@@ -262,8 +284,6 @@ impl HeartbeatCoordinator {
 
     /// Set the hub reference (deferred, since hub is created after heartbeat).
     pub fn set_hub(&mut self, hub: Weak<dyn OutboundRouter>) {
-        self.cycle
-            .set_delivery(Some(Arc::new(HubDelivery(hub.clone()))));
         self.hub = Some(hub);
         self.wire_agent();
     }
@@ -276,6 +296,12 @@ impl HeartbeatCoordinator {
     }
 
     fn wire_agent(&mut self) {
+        if let Some(hub) = self.hub.clone() {
+            self.cycle.set_delivery(Some(Arc::new(HubDelivery {
+                hub,
+                agent: self.agent.clone(),
+            })));
+        }
         let host = self.agent.clone().map(|agent| {
             Arc::new(AgentTaskLeads {
                 agent,

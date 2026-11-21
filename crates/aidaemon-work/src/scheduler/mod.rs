@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aidaemon_core::{Schedule, Service, ServiceContext, ServiceError};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 
 use crate::goal_tokens::GoalTokenRegistry;
@@ -114,6 +114,13 @@ pub trait NoticeDelivery: Send + Sync {
         session_id: &str,
         text: &str,
     ) -> anyhow::Result<Option<String>>;
+
+    /// Whether the owner sent a message in `session_id` at or after
+    /// `since`: they are awake there, so quiet hours do not hold its
+    /// notices. Default: not known, quiet hours hold.
+    async fn owner_active_since(&self, _session_id: &str, _since: DateTime<Utc>) -> bool {
+        false
+    }
 }
 
 /// How the host shows work to the owner.

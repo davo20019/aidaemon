@@ -259,6 +259,30 @@ impl GoalCycle {
         }
     }
 
+    /// How recently an owner message in a chat counts as the owner being
+    /// awake there (a restart notice for a job they were just talking
+    /// about, sent at 12:15 AM, is not held until 7 AM).
+    const OWNER_AWAKE_WINDOW_MINUTES: i64 = 30;
+
+    /// Whether the owner wrote in `session_id` within the awake window,
+    /// asked once per chat per pass.
+    async fn owner_awake_in<'a>(
+        &self,
+        session_id: &'a str,
+        known: &mut std::collections::HashMap<&'a str, bool>,
+    ) -> bool {
+        if let Some(awake) = known.get(session_id) {
+            return *awake;
+        }
+        let since = Utc::now() - chrono::Duration::minutes(Self::OWNER_AWAKE_WINDOW_MINUTES);
+        let awake = match self.hub.as_ref() {
+            Some(hub) => hub.owner_active_since(session_id, since).await,
+            None => false,
+        };
+        known.insert(session_id, awake);
+        awake
+    }
+
     /// Process the notification queue: attempt delivery, track attempts.
     pub async fn process_notification_queue(&self) {
         // Read past the normal delivery batch so quiet-hour routine entries at
@@ -272,9 +296,12 @@ impl GoalCycle {
         };
 
         let mut delivery_attempts = 0usize;
+        let mut awake: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
         for entry in &pending {
             let local_hour = chrono::Timelike::hour(&chrono::Local::now());
-            if !entry.should_deliver_at_local_hour(local_hour) {
+            if !entry.should_deliver_at_local_hour(local_hour)
+                && !self.owner_awake_in(&entry.session_id, &mut awake).await
+            {
                 tracing::debug!(
                     notification_id = %entry.id,
                     notification_type = %entry.notification_type,

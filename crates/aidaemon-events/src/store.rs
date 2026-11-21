@@ -2710,6 +2710,29 @@ impl EventStore {
     // Read Operations - Specific Queries for Context
     // =========================================================================
 
+    /// When the owner last sent a message in `session_id`, if ever.
+    pub async fn last_owner_message_at(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let created: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT created_at FROM events
+            WHERE session_id = ? AND event_type = 'user_message'
+              AND json_extract(data, '$.user_role') = 'owner'
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(created
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc)))
+    }
+
     /// Get the most recent error for a session
     pub async fn get_last_error(&self, session_id: &str) -> anyhow::Result<Option<Event>> {
         let rows = sqlx::query(
@@ -4387,6 +4410,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Only the owner's messages count, the latest one, in that chat only.
+    #[tokio::test]
+    async fn last_owner_message_at_reads_the_owners_latest_message() {
+        let (store, _database) = setup_store().await;
+        assert!(store.last_owner_message_at("chat").await.unwrap().is_none());
+        let at = Utc::now() - Duration::minutes(5);
+        for (session, role, offset) in [
+            ("chat", "owner", 0),
+            ("chat", "guest", 3),
+            ("other", "owner", 4),
+        ] {
+            let mut event = Event::new(
+                session,
+                EventType::UserMessage,
+                json!({"content": "synthetic message", "user_role": role}),
+            );
+            event.created_at = at + Duration::minutes(offset);
+            store.append(event).await.unwrap();
+        }
+        let last = store.last_owner_message_at("chat").await.unwrap().unwrap();
+        assert_eq!(last.timestamp(), at.timestamp());
     }
 
     #[tokio::test]
