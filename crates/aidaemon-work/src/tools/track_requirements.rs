@@ -319,9 +319,11 @@ impl Tool for TrackRequirementsTool {
          once more before your final answer with outcome partial or blocked; the request is \
          reported that way. When it stopped because this machine ran out of disk, Docker disk or \
          memory, add short_of. \
-         Use needs_owner only when the work cannot start without the owner's choice (for \
-         example, earlier results exist and redoing the work would replace or duplicate them): \
-         your final answer is then that one question. Earlier results are never by themselves \
+         Use needs_owner only when the work cannot start without the owner's choice (earlier \
+         results exist and redoing the work would replace or duplicate them; the only way to do \
+         it breaks an instruction of theirs, such as installing something they said not to; or \
+         what they describe is not so, such as a bug you checked and found absent): your final \
+         answer is then that one question. Earlier results are never by themselves \
          the answer to an instruction to do the work. \
          Skip this for a request that only looks or reports (finding, listing, counting, reading, \
          checking, however many lookups it takes: answer every part in your reply), a plain \
