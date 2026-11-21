@@ -375,6 +375,33 @@ impl SqliteStore {
         Ok(unfinished)
     }
 
+    /// Sub-agent runs that never ended, were last checkpointed at or after
+    /// `since` and whose parent run has ended: background sub-agents a
+    /// process stop cut off (a child of a cut-off turn is held by that
+    /// turn's run, which has not ended). Oldest checkpoint first.
+    pub async fn unfinished_background_runs_since(
+        &self,
+        since: &str,
+    ) -> Result<Vec<RunState>, Error> {
+        let candidates = self
+            .states_where_since(
+                "json_extract(state, '$.parent_run') IS NOT NULL AND updated_at >= ?",
+                since,
+            )
+            .await?;
+        let mut unfinished = Vec::new();
+        for state in candidates {
+            let Some(parent) = state.parent_run else {
+                continue;
+            };
+            if self.run_ended(state.run_id).await? || !self.run_ended(parent).await? {
+                continue;
+            }
+            unfinished.push(state);
+        }
+        Ok(unfinished)
+    }
+
     async fn states_where_since(
         &self,
         predicate: &str,
