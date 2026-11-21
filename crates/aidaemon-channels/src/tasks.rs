@@ -53,6 +53,10 @@ pub struct QueuedMessage {
     /// The owner sent it to wait for its own turn (an app's Queue): the
     /// running work takes messages sent after it to be read now past it.
     pub placed_for_later: bool,
+    /// The owner placed it from an app (its Now or After), which lists it
+    /// while it waits and shows it in the chat once it runs: the channel
+    /// says nothing about it.
+    pub listed_by_client: bool,
 }
 
 impl QueuedMessage {
@@ -73,7 +77,15 @@ impl QueuedMessage {
             ingress_timing: None,
             steerable: true,
             placed_for_later: false,
+            listed_by_client: false,
         }
+    }
+
+    /// Placed by the owner from an app that lists it (see
+    /// [`Self::listed_by_client`]).
+    pub fn listed_by_client(mut self) -> Self {
+        self.listed_by_client = true;
+        self
     }
 
     /// Keep it out of the running turn: it runs as its own turn.
@@ -591,6 +603,7 @@ impl TaskRegistry {
             combined.text.push('\n');
             combined.text.push_str(&msg.text);
             combined.attachments.extend(msg.attachments);
+            combined.listed_by_client &= msg.listed_by_client;
         }
         Some(combined)
     }

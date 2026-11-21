@@ -616,6 +616,9 @@ impl TurnRunner {
             } else if !steerable {
                 queued = queued.not_steerable();
             }
+            if placement.is_some() {
+                queued = queued.listed_by_client();
+            }
             if let Some(timing) = turn.ingress_timing.clone() {
                 queued = queued.with_ingress_timing(timing);
             }
@@ -1135,7 +1138,9 @@ impl TurnRunner {
                 Some(message_id) => matches!(surface.edit(&message_id, &starting).await, Ok(true)),
                 None => false,
             };
-            if !edited {
+            // An app shows the message itself as its turn starts: a "Now
+            // on" line would sit just above it (live 2026-11-21).
+            if !edited && !queued.listed_by_client {
                 let _ = surface.say(&starting).await;
             }
             text = queued.text;
@@ -1854,6 +1859,47 @@ mod tests {
             .await;
         assert_eq!(taken.len(), 1);
 
+        // A placed message runs as its own turn once the work ends with no
+        // "Now on" line: the app shows the message itself.
+        runner
+            .submit_placed(
+                surface.clone(),
+                owner_turn("Then list the files", "m9"),
+                Some(MidRunPlacement::Queue),
+            )
+            .await;
+        agent.release.notify_one();
+        for _ in 0..200 {
+            if agent
+                .turns
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t == "Then list the files")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            agent
+                .turns
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t == "Then list the files"),
+            "the placed message ran as a turn"
+        );
+        assert!(
+            !surface
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|said| said.starts_with("▶️ Now on")),
+            "{:?}",
+            surface.0.lock().unwrap()
+        );
         agent.release.notify_one();
     }
 
