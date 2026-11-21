@@ -3408,16 +3408,49 @@ static REENGAGE_SERIALIZER: LazyLock<tokio::sync::Mutex<()>> =
 /// troubleshoots, and a full command line there (`grep trigger_pattern …`)
 /// is later found as if it were what the command searched for. The full
 /// command stays in the tool call's record and at DEBUG ("Approval check").
-struct LoggedCommand<'a>(&'a str);
+pub(crate) struct LoggedCommand<'a>(pub(crate) &'a str);
+
+/// The program a shell command line runs, for a log label: past leading
+/// `NAME=value` settings and redirects, without a trailing `;`, `&` or `|`,
+/// its last path part. "shell" when that is not a plain program name.
+fn logged_program(command: &str) -> &str {
+    // Machine format: shell command line words.
+    let mut words = command.split_whitespace();
+    let mut word = None;
+    while let Some(next) = words.next() {
+        let is_setting = next.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        });
+        let redirect = next.trim_start_matches(|c: char| c.is_ascii_digit());
+        if is_setting {
+            continue;
+        }
+        if redirect.starts_with('<') || redirect.starts_with('>') {
+            // A bare operator's target is the next word.
+            if redirect.trim_start_matches(['<', '>', '&', '|']).is_empty() {
+                words.next();
+            }
+            continue;
+        }
+        word = Some(next);
+        break;
+    }
+    let word = word.unwrap_or("").trim_end_matches([';', '&', '|']);
+    let program = word.rsplit('/').next().unwrap_or(word);
+    let plain = !program.is_empty()
+        && !program.starts_with('-')
+        && program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
+    if plain { program } else { "shell" }
+}
 
 impl std::fmt::Display for LoggedCommand<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use sha2::{Digest, Sha256};
-        // Machine format: the first whitespace-separated word of a shell
-        // command line is its program.
-        let program = self.0.split_whitespace().next().unwrap_or("");
-        let program = program.rsplit('/').next().unwrap_or(program);
-        let program = truncate_str(program, 40);
+        let program = truncate_str(logged_program(self.0), 40);
         let digest = Sha256::digest(self.0.as_bytes());
         write!(f, "{program} [{} chars, ", self.0.chars().count())?;
         for byte in &digest[..4] {
@@ -3735,12 +3768,15 @@ impl TerminalTool {
         .await
         {
             Ok(persisted) => {
+                let mut loaded = 0usize;
                 for p in persisted {
                     if !merged.contains(&p) {
-                        info!(prefix = %p, "Loaded persisted allowed prefix");
                         merged.push(p);
+                        loaded += 1;
                     }
                 }
+                // A count, not the entries: some are whole command lines.
+                info!(loaded, "Loaded persisted allowed prefixes");
             }
             Err(e) => {
                 warn!("Failed to load persisted terminal prefixes: {}", e);
@@ -4917,7 +4953,7 @@ impl TerminalTool {
                 info!(
                     pid,
                     task_id,
-                    command = %proc.command,
+                    command = %LoggedCommand(&proc.command),
                     "Disowning background process from task (notifier active, will deliver completion)"
                 );
                 proc.owner_task_id = None;
@@ -9026,6 +9062,33 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log label names the program, never a fragment or the command's
+    /// text (live 2026-11-21: `>/…/count3.txt; for …` was labelled
+    /// `count3.txt;`).
+    #[test]
+    fn a_log_label_names_the_program_and_never_the_command() {
+        for (command, program) in [
+            ("mkdir -p /tmp/site && cd /tmp/site", "mkdir"),
+            ("/usr/bin/git status", "git"),
+            ("FOO=1 BAR=two npm run dev", "npm"),
+            (
+                ">/Users/alice/count3.txt; for i in 1 2; do echo $i; done",
+                "for",
+            ),
+            ("> out.txt echo hi", "echo"),
+            ("2>/dev/null ls", "ls"),
+            ("ls;", "ls"),
+            ("$(secret) arg", "shell"),
+            ("'quoted thing' x", "shell"),
+            ("", "shell"),
+        ] {
+            assert_eq!(logged_program(command), program, "{command}");
+        }
+        let label = LoggedCommand("curl -H 'Authorization: Bearer synthetic' x").to_string();
+        assert!(label.starts_with("curl ["), "{label}");
+        assert!(!label.contains("Bearer"), "{label}");
+    }
     use crate::tools::traits::NotificationStore;
     use crate::tools::traits::ToolSemantics;
     use aidaemon_core::testing::ScriptedProvider;
