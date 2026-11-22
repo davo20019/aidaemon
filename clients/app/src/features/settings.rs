@@ -14,11 +14,13 @@ use std::rc::Rc;
 use nsh_core::prelude::*;
 
 use crate::features::settings_general;
-use crate::store::{SettingsRead, Store};
+use crate::store::{SettingsRead, SettingsTab, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, type_scale};
 
 /// The page's tabs.
 const TABS: [&str; 4] = ["General", "Models", "Connections", "Advanced"];
+/// Bots, paired devices and MCP servers.
+const CONNECTIONS: usize = 2;
 /// The tab with every setting, the database and Reload or Restart.
 const ADVANCED: usize = 3;
 /// The terminal's one page: the models and this device, no tabs. The
@@ -33,6 +35,17 @@ pub fn page(store: Store) -> View {
     let filter = signal(String::new());
     let terminal = in_terminal();
     let tab = signal(if terminal { TERMINAL } else { 0_usize });
+    // A view move (the agent showing the paired devices) picks the tab,
+    // also while the page is open. The terminal's one page has no tabs.
+    effect(move || {
+        if let Some(asked) = store.take_settings_tab()
+            && !terminal
+        {
+            tab.set(match asked {
+                SettingsTab::Connections => CONNECTIONS,
+            });
+        }
+    });
     // Open groups survive a refresh (a change landing rereads the page).
     let open = signal(Vec::<SharedString>::new());
     // The Providers tab's form, kept while the settings are read again.
@@ -335,7 +348,7 @@ fn ready(
                 .child(providers(store, &settings, form))
                 .child(settings_general::decisions(store, &settings));
         }
-        2 => {
+        CONNECTIONS => {
             return page
                 .child(bots(store, &settings.bots))
                 .child(devices(store))

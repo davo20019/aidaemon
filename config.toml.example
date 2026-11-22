@@ -25,6 +25,11 @@ name = "aidaemon"
 backend = "local" # local | docker | ssh
 # workspace_root = "/absolute/path/to/workspace"
 # allow_outside_workspace = true # path tools: defaults true locally, false remotely
+# Local commands get PATH and only a short list of host variables (HOME,
+# USER, SHELL, locale, terminal, XDG_*, SSH_AUTH_SOCK, toolchain homes such as
+# CARGO_HOME, JAVA_HOME and NVM_DIR, ...), never the daemon's own (provider
+# keys, the encryption key). Add names here; a trailing * matches a prefix.
+# env_allowlist = ["ANDROID_HOME", "MYTOOL_*"]
 
 # Docker is built in (the default `execution-docker` feature) and needed only
 # when this backend is selected. The backend creates/reuses one persistent container and bind-mounts a host
@@ -575,6 +580,29 @@ include_raw_tool_args = false
 # enabled = true
 # relays = []    # your own iroh-relay URLs (see deploy/relay); empty: the
 #                # project's relay, relay.aidaemon.ai, and its address lookup
+
+# Tunnels the daemon runs itself, so the gateways are reachable from elsewhere
+# (see "Reaching the gateways" in the README). Each table needs its gateway on
+# (client_gateway.enabled, nodes.gateway.enabled); changes apply after a
+# restart, and /exposure shows each tunnel's state. No table: nothing exposed.
+# [exposure.client_gateway]
+# adapter = "tailscale"          # tailscale | cloudflare | manual | command
+# mode = "serve"                 # serve (your tailnet) | funnel (public)
+# https_port = 443               # default 443 here, 8443 for the Node Gateway
+# binary = "/usr/local/bin/tailscale"   # when not on PATH
+#
+# [exposure.node_gateway]
+# adapter = "cloudflare"
+# mode = "named"                 # named | quick (Client Gateway only, throwaway)
+# hostname = "nodes.example.com"
+# tunnel = "my-tunnel"           # from `cloudflared tunnel create`; one per gateway
+# credentials_file = "~/.cloudflared/<id>.json"   # when not in ~/.cloudflared
+#
+# adapter = "manual" takes url = "https://..." (a reverse proxy you run).
+# adapter = "command" takes command = ["prog", "--port", "{port}"] ({port},
+# {addr} and {service} are filled in): a program that prints
+# {"url": "https://..."} on its first line and keeps running. The Node
+# Gateway needs stable = true with it. Only you can write a command adapter.
 
 # Nodes are disabled by default. The Gateway binds to loopback; Nodes reach it
 # on the local network through [nodes.gateway.lan] below, and from elsewhere

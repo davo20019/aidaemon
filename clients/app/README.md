@@ -1,6 +1,6 @@
 # AIDaemon app
 
-One Rust app for chat, approvals and the agent's running work, on the desktops, the web and a terminal, built on [Native Shell](https://nsh.dev) (nsh 0.5). It replaces the TUI, the TypeScript web page and the Tauri shell over time.
+One Rust app for chat, approvals and the agent's running work, on the desktops, the web and a terminal, built on [Native Shell](https://nsh.dev) (nsh 0.6). It replaces the TUI, the TypeScript web page and the Tauri shell over time.
 
 - `src/ui/`: the design system (tokens, motion, styled controls). Features never style `nsh_base` controls directly. See `DESIGN.md`.
 - `src/store/`: the shared reducer from `aidaemon-client-core` in signals, plus selection, drafts and each turn's activity.

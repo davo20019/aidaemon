@@ -41,6 +41,13 @@ pub type MemoryRead = Read<Vec<MemoryItem>>;
 pub type SettingsRead = Read<Box<Settings>>;
 
 /// What the main area shows.
+/// A Settings tab a view move can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    /// Bots, paired devices and MCP servers.
+    Connections,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
     #[default]
@@ -361,6 +368,9 @@ pub struct Store {
     files_from: Signal<Option<String>>,
     /// The file the next files browser opens with.
     files_start: Signal<Option<(String, String)>>,
+    /// The Settings tab the next view move asks for (the agent showing the
+    /// paired devices); the Settings page takes it.
+    settings_tab: Signal<Option<SettingsTab>>,
     /// The sidebar's search.
     filter: Signal<String>,
     /// Conversations kept at the top of the list (this device's storage).
@@ -485,6 +495,7 @@ impl Store {
             files_of: signal(None),
             files_from: signal(None),
             files_start: signal(None),
+            settings_tab: signal(None),
             filter: signal(String::new()),
             pins: signal(BTreeSet::new()),
             project_pins: signal(BTreeSet::new()),
@@ -1472,6 +1483,23 @@ impl Store {
         self.refresh_settings();
     }
 
+    /// Open Settings on `tab`, even when Settings is open already.
+    pub fn open_settings_tab(&self, tab: SettingsTab) {
+        self.settings_tab.set(Some(tab));
+        if self.page.get_untracked() != Page::Settings {
+            self.open_settings();
+        }
+    }
+
+    /// The tab a view move asked Settings for, once (tracked, so an open
+    /// Settings page follows it).
+    pub fn take_settings_tab(&self) -> Option<SettingsTab> {
+        let tab = self.settings_tab.get()?;
+        // Clearing reruns the caller's effect once, which then finds None.
+        self.settings_tab.set(None);
+        Some(tab)
+    }
+
     pub fn refresh_settings(&self) {
         self.act(Client::refresh_settings);
     }
@@ -2328,7 +2356,8 @@ impl Store {
                 "Ready for a new conversation".into()
             }
             ViewAction::ShowDevices => {
-                "Paired devices: ask your agent for /devices (not shown in this app yet)".into()
+                self.open_settings_tab(SettingsTab::Connections);
+                "Paired devices are in Settings → Connections".into()
             }
             // A view move opens no stream: the conversation comes up with
             // its browser button, and the owner opens the live view.
