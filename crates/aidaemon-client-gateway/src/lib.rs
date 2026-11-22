@@ -53,6 +53,7 @@ mod observer;
 mod pair_page;
 pub mod pairing;
 pub mod project_files;
+mod remote;
 pub mod remote_screens;
 mod server;
 pub mod setup;
@@ -87,6 +88,7 @@ pub use bus::{EventBus, OWNER};
 pub use config::ClientGatewayConfig;
 pub use observer::{AppChannel, AppSurface, GatewayObserver, Ids};
 pub use pairing::{Pairing, Principal};
+pub use remote::remote_router;
 pub use server::{router, serve};
 pub use views::{ViewError, ViewTargets};
 

@@ -15,16 +15,22 @@ categories = ["network-programming", "asynchronous"]
 # Integration tests need dev-dependencies that are not published with the crate.
 exclude = ["tests/"]
 
+[features]
+default = ["server"]
+# The daemon's side: serve an axum router over iroh.
+server = ["dep:axum", "hyper/server", "hyper-util/service"]
+
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", optional = true }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # aws-lc-rs: the crypto provider the rest of the tree already builds (no ring).
 iroh = { version = "1.5", default-features = false, features = ["tls-aws-lc-rs", "portmapper", "fast-apple-datapath"] }
+sha2 = "0.11"
 tokio = { version = "1", features = ["io-util", "rt", "sync"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing = "0.1"

@@ -185,6 +185,15 @@ fn connect_failure(error: tokio_tungstenite::tungstenite::Error) -> Failure {
     }
 }
 
+/// What a failed sign-in means for the owner.
+fn sign_in_failure(error: SignInError) -> Failure {
+    match error {
+        SignInError::Unreachable(why) => (DropKind::DaemonNotRunning, why),
+        SignInError::Refused(why) => (DropKind::Unauthorized, why),
+        SignInError::Failed(why) => (DropKind::Dropped, why),
+    }
+}
+
 impl Link {
     fn now_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -199,14 +208,22 @@ impl Link {
                     .load()
                     .map_err(failed)?
                     .ok_or((DropKind::Unauthorized, "this device is not paired".into()))?;
+                #[cfg(feature = "remote")]
+                if crate::remote::is_remote(&device.gateway) {
+                    let dialer =
+                        crate::remote::Dialer::for_device(&device).map_err(sign_in_failure)?;
+                    let http = crate::remote::RemoteHttp::new(&device.gateway, dialer)
+                        .map_err(sign_in_failure)?;
+                    return self
+                        .grant
+                        .token_with(&http, &device, signin::now_ms())
+                        .await
+                        .map_err(sign_in_failure);
+                }
                 self.grant
                     .token(&self.http, &device, signin::now_ms())
                     .await
-                    .map_err(|error| match error {
-                        SignInError::Unreachable(why) => (DropKind::DaemonNotRunning, why),
-                        SignInError::Refused(why) => (DropKind::Unauthorized, why),
-                        SignInError::Failed(why) => (DropKind::Dropped, why),
-                    })
+                    .map_err(sign_in_failure)
             }
         }
     }
@@ -222,6 +239,37 @@ impl Link {
                     "signing in to the daemon timed out".to_string(),
                 )
             })??;
+        #[cfg(feature = "remote")]
+        if crate::remote::is_remote(&self.config.url) {
+            let dialer = match &self.config.auth {
+                Auth::Device(store) => {
+                    let device = store
+                        .load()
+                        .map_err(failed)?
+                        .ok_or((DropKind::Unauthorized, "this device is not paired".into()))?;
+                    crate::remote::Dialer::for_device(&device).map_err(sign_in_failure)?
+                }
+                Auth::LocalToken(_) => {
+                    return Err((
+                        DropKind::Unauthorized,
+                        "the local token is for the daemon's own machine; pair this device".into(),
+                    ));
+                }
+            };
+            let socket = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                crate::remote::websocket(&self.config.url, &token, &dialer),
+            )
+            .await
+            .map_err(|_| {
+                (
+                    DropKind::DaemonNotRunning,
+                    "connecting to the daemon timed out".to_string(),
+                )
+            })?
+            .map_err(sign_in_failure)?;
+            return self.drive(socket).await;
+        }
         let mut request = self
             .config
             .url
@@ -233,7 +281,7 @@ impl Link {
             format!("Bearer {token}").parse().map_err(failed)?,
         );
         let tls = crate::tls::client_config().map_err(failed)?;
-        let (mut socket, _) = tokio::time::timeout(
+        let (socket, _) = tokio::time::timeout(
             CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async_tls_with_config(
                 request,
@@ -250,6 +298,18 @@ impl Link {
             )
         })?
         .map_err(connect_failure)?;
+        self.drive(socket).await
+    }
+
+    /// Say hello on an open socket, then pass frames both ways until it
+    /// ends.
+    async fn drive<S>(
+        &mut self,
+        mut socket: tokio_tungstenite::WebSocketStream<S>,
+    ) -> Result<Ended, Failure>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let send = |frame: &ClientFrame| {
             serde_json::to_string(frame)
                 .map(Message::text)

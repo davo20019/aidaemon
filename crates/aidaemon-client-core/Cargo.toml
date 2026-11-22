@@ -15,9 +15,13 @@ exclude = ["tests/"]
 
 [dependencies]
 aidaemon-client-protocol = { version = "0.21.0", path = "../client-protocol" }
+aidaemon-remote = { version = "0.21.0", path = "../aidaemon-remote", default-features = false, optional = true }
 anyhow = "1"
 dirs = { version = "6", optional = true }
 base64 = "0.23"
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"
@@ -47,10 +51,13 @@ security-framework = "3"
 webpki-roots = { version = "1", optional = true }
 
 [features]
-default = ["native"]
+default = ["native", "remote"]
 # The tokio link and reqwest sign-in. Without it the
 # crate has no I/O and builds for wasm32-unknown-unknown.
 native = ["dep:dirs", "dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite", "dep:webpki-roots"]
+# Dialing a daemon by key over iroh (`iroh://…` addresses): sign-in, pairing
+# and the link, directly when the network allows, else through a relay.
+remote = ["native", "dep:aidaemon-remote", "dep:bytes", "dep:http", "dep:http-body-util"]
 # wasm32 only: randomness from the page's Web Crypto, for a runtime that
 # registers no getrandom backend of its own.
 browser-random = ["dep:getrandom", "getrandom/wasm_js"]

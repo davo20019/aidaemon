@@ -850,41 +850,144 @@ async fn http_mode_refuses_a_missing_or_wrong_token() {
     assert_eq!(response.status(), 401);
 }
 
-/// The same routes over iroh: a paired app far from home sends a command
-/// with its token, and the gateway's sign-in still refuses one without.
+/// Sign-in's HTTP over one iroh connection, as a phone far from home makes
+/// it.
+struct IrohHttp(aidaemon_remote::RemoteConnection);
+
+impl IrohHttp {
+    async fn call(
+        &self,
+        request: http::Request<http_body_util::Full<bytes::Bytes>>,
+    ) -> Result<aidaemon_client_core::signin::HttpReply, aidaemon_client_core::signin::SignInError>
+    {
+        let response =
+            self.0.send(request).await.map_err(|e| {
+                aidaemon_client_core::signin::SignInError::Unreachable(e.to_string())
+            })?;
+        Ok(aidaemon_client_core::signin::HttpReply {
+            status: response.status().as_u16(),
+            body: String::from_utf8_lossy(response.body()).into_owned(),
+        })
+    }
+}
+
+fn path_of(url: &str) -> &str {
+    &url[url.find("/client/").unwrap()..]
+}
+
+impl aidaemon_client_core::signin::Http for IrohHttp {
+    async fn post_json(
+        &self,
+        url: &str,
+        body: String,
+    ) -> Result<aidaemon_client_core::signin::HttpReply, aidaemon_client_core::signin::SignInError>
+    {
+        self.call(
+            http::Request::post(path_of(url))
+                .header("content-type", "application/json")
+                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn get(
+        &self,
+        url: &str,
+    ) -> Result<aidaemon_client_core::signin::HttpReply, aidaemon_client_core::signin::SignInError>
+    {
+        self.call(
+            http::Request::get(path_of(url))
+                .body(http_body_util::Full::default())
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+fn glance_request(token: &str) -> http::Request<http_body_util::Full<bytes::Bytes>> {
+    http::Request::post("/client/v1/commands")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            serde_json::to_vec(&command("r-iroh", Command::GetGlance)).unwrap(),
+        )))
+        .unwrap()
+}
+
+/// Over iroh a phone pairs and signs in with its key, and its session
+/// works only from the endpoint that signed in for it: the same token from
+/// another endpoint is refused, and so is the owner's local token.
 #[tokio::test]
-async fn the_gateway_serves_its_routes_over_iroh() {
-    use aidaemon_remote::{Access, Relays, RemoteClient, RemoteListener, SecretKey};
+async fn over_iroh_a_device_pairs_signs_in_and_keeps_its_session_to_itself() {
+    use aidaemon_remote::{Access, Relays, RemoteClient, RemoteListener, RemotePeer, SecretKey};
     let f = fixture(RiskLevel::Medium).await;
     let listener = RemoteListener::bind(
         SecretKey::generate(),
         &Relays::Disabled,
         Access::Any,
-        aidaemon_client_gateway::router(f.gateway.clone()),
+        aidaemon_client_gateway::remote_router::<RemotePeer>(f.gateway.clone()),
     )
     .await
     .unwrap();
-    let client = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
+    let daemon = listener.url().to_string();
+    f.gateway.pairing().set_remote_url(Some(daemon.clone()));
+
+    let phone = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
         .await
         .unwrap();
-    let conn = client.connect(listener.addr()).await.unwrap();
-    let post = |token: Option<&str>| {
-        let mut request =
-            http::Request::post("/client/v1/commands").header("content-type", "application/json");
-        if let Some(token) = token {
-            request = request.header("authorization", format!("Bearer {token}"));
-        }
-        request
-            .body(http_body_util::Full::new(bytes::Bytes::from(
-                serde_json::to_vec(&command("r-iroh", Command::GetGlance)).unwrap(),
-            )))
-            .unwrap()
-    };
+    let conn = phone.connect(listener.addr()).await.unwrap();
 
-    let refused = conn.send(post(None)).await.unwrap();
+    // The owner's local token is for the daemon's own machine.
+    let refused = conn.send(glance_request(&f.token)).await.unwrap();
     assert_eq!(refused.status(), 401);
 
-    let response = conn.send(post(Some(&f.token))).await.unwrap();
+    // Pair over iroh from the offer's link, which names the daemon's
+    // address; the owner approves.
+    let offer = f.gateway.pairing().offer(None).await.unwrap();
+    let link = aidaemon_client_core::signin::PairingLink::parse(&offer.link).unwrap();
+    assert_eq!(link.remote.as_deref(), Some(daemon.as_str()));
+    let request = aidaemon_client_core::signin::PairRequest {
+        gateway: daemon.clone(),
+        offer_id: link.offer_id.clone(),
+        code: link.code.clone(),
+        device_name: "Synthetic Phone".into(),
+        device_kind: ClientKind::Mobile,
+        fingerprint: link.fingerprint.clone(),
+    };
+    let http = IrohHttp(conn.clone());
+    let pairing = tokio::spawn(async move {
+        aidaemon_client_core::signin::pair_with(&http, &request, Duration::from_millis(20)).await
+    });
+    let mut approved = false;
+    for _ in 0..100 {
+        if f.gateway
+            .pairing()
+            .decide(&offer.offer_id, true)
+            .await
+            .is_ok()
+        {
+            approved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(approved, "the redeem never reached the owner");
+    let device = pairing.await.unwrap().unwrap();
+    assert_eq!(device.gateway, daemon);
+
+    // Sign in with the device key; the session works from this endpoint.
+    let grant = aidaemon_client_core::signin::sign_in_with(&IrohHttp(conn.clone()), &device)
+        .await
+        .unwrap();
+    let response = conn
+        .send(glance_request(&grant.access_token))
+        .await
+        .unwrap();
     assert_eq!(response.status(), 200);
     let frame: ServerFrame = serde_json::from_slice(response.body()).unwrap();
     assert!(
@@ -897,8 +1000,129 @@ async fn the_gateway_serves_its_routes_over_iroh() {
         ),
         "{frame:?}"
     );
+    let mut auth = http::HeaderMap::new();
+    auth.insert(
+        "authorization",
+        format!("Bearer {}", grant.access_token).parse().unwrap(),
+    );
+    assert!(conn.websocket("/client/v1/ws", &auth).await.is_ok());
+    // A socket that would give its token in `hello` is not taken.
+    assert!(
+        conn.websocket("/client/v1/ws", &http::HeaderMap::new())
+            .await
+            .is_err()
+    );
 
-    client.close().await;
+    // The same token from another endpoint is refused.
+    let thief = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
+        .await
+        .unwrap();
+    let stolen = thief.connect(listener.addr()).await.unwrap();
+    let response = stolen
+        .send(glance_request(&grant.access_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+
+    phone.close().await;
+    thief.close().await;
+    listener.close().await;
+}
+
+/// Live, through n0's relays: the app's own pairing and link (sign-in, the
+/// socket, hello and resume) against a daemon known only by its
+/// `iroh://` address. Needs the internet:
+/// `cargo test -p aidaemon-client-gateway --test gateway the_app_link -- --ignored`.
+#[tokio::test]
+#[ignore = "needs the internet and n0's public relays"]
+async fn the_app_link_runs_over_iroh_through_a_relay() {
+    use aidaemon_client_core::KeyStore as _;
+    use aidaemon_client_core::link::{self, Auth, LinkConfig};
+    use aidaemon_client_core::machine::{ClientIdentity, Update};
+    use aidaemon_client_core::remote::{Dialer, RemoteHttp};
+    use aidaemon_remote::{Access, Relays, RemoteListener, RemotePeer, SecretKey};
+    let f = fixture(RiskLevel::Medium).await;
+    let listener = RemoteListener::bind(
+        SecretKey::generate(),
+        &Relays::N0,
+        Access::Any,
+        aidaemon_client_gateway::remote_router::<RemotePeer>(f.gateway.clone()),
+    )
+    .await
+    .unwrap();
+    listener.online().await;
+    let daemon = listener.url().to_string();
+    println!("daemon at {daemon}");
+    f.gateway.pairing().set_remote_url(Some(daemon.clone()));
+
+    let offer = f.gateway.pairing().offer(None).await.unwrap();
+    let link = aidaemon_client_core::signin::PairingLink::parse(&offer.link).unwrap();
+    let request = aidaemon_client_core::signin::PairRequest {
+        gateway: link.remote.clone().unwrap(),
+        offer_id: link.offer_id.clone(),
+        code: link.code.clone(),
+        device_name: "Synthetic Phone".into(),
+        device_kind: ClientKind::Mobile,
+        fingerprint: link.fingerprint.clone(),
+    };
+    let pairing = tokio::spawn(async move {
+        let http = RemoteHttp::new(&request.gateway, Dialer::Pairing).unwrap();
+        aidaemon_client_core::signin::pair_with(&http, &request, Duration::from_millis(200)).await
+    });
+    let mut approved = false;
+    for _ in 0..150 {
+        if f.gateway
+            .pairing()
+            .decide(&offer.offer_id, true)
+            .await
+            .is_ok()
+        {
+            approved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(approved, "the redeem never reached the owner");
+    let device = pairing.await.unwrap().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(aidaemon_client_core::FileKeyStore::new(
+        dir.path().join("device.json"),
+    ));
+    store.save(&device).unwrap();
+    let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel();
+    let _commands = link::spawn(
+        LinkConfig {
+            url: aidaemon_client_core::machine::socket_url(&device.gateway),
+            auth: Auth::Device(store),
+            client: ClientIdentity {
+                kind: ClientKind::Mobile,
+                name: "test".into(),
+                version: None,
+            },
+            device: None,
+            capabilities: Vec::new(),
+        },
+        updates_tx,
+    );
+    let mut connected = false;
+    let mut framed = false;
+    while let Ok(Some(update)) = tokio::time::timeout(Duration::from_secs(30), updates.recv()).await
+    {
+        match update {
+            Update::Connected => connected = true,
+            Update::Frame(_) if connected => {
+                framed = true;
+                break;
+            }
+            Update::Disconnected(why) => panic!("{why:?}"),
+            _ => {}
+        }
+    }
+    assert!(
+        connected && framed,
+        "connected {connected}, framed {framed}"
+    );
     listener.close().await;
 }
 

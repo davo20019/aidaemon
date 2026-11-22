@@ -110,6 +110,9 @@ pub struct Pairing {
     approvals: Option<mpsc::Sender<ApprovalRequest>>,
     /// What the offer link names as the gateway, read per offer.
     public_url: crate::PublicUrl,
+    /// The daemon's peer-to-peer address (`iroh://…`), put in offer links
+    /// beside `public_url` once remote access is up.
+    remote_url: Mutex<Option<String>>,
     fingerprint: String,
     access: Mutex<HashMap<String, Access>>,
     challenges: Mutex<HashMap<String, PendingChallenge>>,
@@ -243,12 +246,26 @@ impl Pairing {
             log,
             approvals,
             public_url,
+            remote_url: Mutex::default(),
             fingerprint,
             access: Mutex::default(),
             challenges: Mutex::default(),
             revocations: Mutex::default(),
             watch_ceiling,
         }
+    }
+
+    /// Offer links from now on carry `url` (`iroh://…`) as `remote`: a
+    /// device that can dial it pairs and signs in over it. `None` stops.
+    pub fn set_remote_url(&self, url: Option<String>) {
+        *self.remote_url.lock().unwrap_or_else(|p| p.into_inner()) = url;
+    }
+
+    fn remote_url(&self) -> Option<String> {
+        self.remote_url
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     fn code_hash(offer_id: &str, code: &str) -> String {
@@ -283,11 +300,14 @@ impl Pairing {
             .await
             .map_err(internal)?;
         let public_url = self.public_url.get();
-        let link = format!(
+        let mut link = format!(
             "aidaemon-pair:?gateway={}&offer={offer_id}&code={code}&fp={}",
             percent(&public_url),
             self.fingerprint
         );
+        if let Some(remote) = self.remote_url() {
+            link.push_str(&format!("&remote={}", percent(&remote)));
+        }
         Ok(PairingOffer {
             offer_id,
             code,

@@ -27,6 +27,8 @@ pub mod link;
 #[cfg(feature = "native")]
 pub mod local;
 pub mod machine;
+#[cfg(feature = "remote")]
+pub mod remote;
 #[cfg(feature = "native")]
 pub mod screen_share;
 pub mod shells;

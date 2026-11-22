@@ -63,7 +63,10 @@ async fn http_and_websocket_reach_the_router_with_the_peer_key() {
     let missing = conn.send(get_request("/nowhere")).await.unwrap();
     assert_eq!(missing.status(), http::StatusCode::NOT_FOUND);
 
-    let mut socket = conn.websocket("/echo").await.unwrap();
+    let mut socket = conn
+        .websocket("/echo", &http::HeaderMap::new())
+        .await
+        .unwrap();
     socket
         .send(tokio_tungstenite::tungstenite::Message::text("ping"))
         .await

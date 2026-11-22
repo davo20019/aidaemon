@@ -126,8 +126,15 @@ pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<
     let link = PairingLink::parse(link).ok_or_else(|| {
         "That is not a pairing link. Paste the whole link the daemon printed.".to_string()
     })?;
+    // A daemon that offers remote access is paired (and later reached)
+    // over it: its `gateway` is often loopback, which only its own machine
+    // can reach.
+    #[cfg(feature = "remote")]
+    let gateway = link.remote.clone().unwrap_or(link.gateway);
+    #[cfg(not(feature = "remote"))]
+    let gateway = link.gateway;
     let request = PairRequest {
-        gateway: link.gateway,
+        gateway,
         offer_id: link.offer_id,
         code: link.code,
         device_name: if name.trim().is_empty() {
@@ -138,13 +145,18 @@ pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<
         device_kind: kind,
         fingerprint: link.fingerprint,
     };
-    let device = crate::signin::pair(
-        &crate::tls::http_client(),
-        &request,
-        Duration::from_millis(500),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let poll = Duration::from_millis(500);
+    #[cfg(feature = "remote")]
+    let paired = if crate::remote::is_remote(&request.gateway) {
+        let http = crate::remote::RemoteHttp::new(&request.gateway, crate::remote::Dialer::Pairing)
+            .map_err(|e| e.to_string())?;
+        crate::signin::pair_with(&http, &request, poll).await
+    } else {
+        crate::signin::pair(&crate::tls::http_client(), &request, poll).await
+    };
+    #[cfg(not(feature = "remote"))]
+    let paired = crate::signin::pair(&crate::tls::http_client(), &request, poll).await;
+    let device = paired.map_err(|e| e.to_string())?;
     let keys = device_store().ok_or("No folder to keep the key in")?;
     keys.save(&device).map_err(|e| e.to_string())
 }

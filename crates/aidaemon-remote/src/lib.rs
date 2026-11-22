@@ -5,32 +5,41 @@
 //! Connections go directly between the devices when the network allows and
 //! through a relay otherwise; either way they are QUIC with TLS 1.3 and raw
 //! public keys, so a relay sees only ciphertext. Each bidirectional stream
-//! carries one HTTP/1.1 connection (with upgrades, so WebSockets work),
-//! served by the gateway's own [`axum::Router`].
+//! carries one HTTP/1.1 connection (with upgrades, so WebSockets work).
 //!
-//! The transport authenticates the peer's key; it never authorizes. The
-//! gateway's tokens and signed challenges still decide what a caller may do.
-//! [`Access`] only narrows which keys may open a connection, and handlers
-//! see the peer's key as a [`RemotePeer`] request extension.
+//! A daemon's address is a [`RemoteUrl`], `iroh://<endpoint-id>@<relay>`,
+//! which clients keep where they would keep an `https://` gateway address.
+//!
+//! The daemon's side ([`server`], feature `server`) serves the gateway's
+//! own router; the transport authenticates the peer's key and never
+//! authorizes, so the gateway's sign-in still decides every request. An
+//! app's side is [`RemoteClient`].
 
 use std::fmt;
-use std::sync::Arc;
 
 use anyhow::Context as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
-use iroh::{Endpoint, RelayMode};
+use iroh::{Endpoint, RelayMode, TransportAddr};
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 
+#[cfg(feature = "server")]
+pub mod server;
+#[cfg(feature = "server")]
+pub use server::{Access, RemoteListener, RemotePeer, load_or_create_key};
+
 /// The protocol both ends name in the handshake: the client gateway's
 /// HTTP, one HTTP/1.1 connection per stream.
 pub const ALPN: &[u8] = b"aidaemon/client/1";
+
+/// The URL scheme of a [`RemoteUrl`].
+pub const SCHEME: &str = "iroh";
 
 /// The `Host` a request carries when it names none; the gateway serves the
 /// same routes whatever the host.
@@ -59,93 +68,85 @@ impl Relays {
             Self::Disabled => RelayMode::Disabled,
         }
     }
-}
 
-/// Which peers may open a connection.
-#[derive(Clone, Default)]
-pub enum Access {
-    /// Any key; the gateway's own sign-in still applies.
-    #[default]
-    Any,
-    /// Only keys the check accepts, e.g. paired devices.
-    Only(Arc<dyn Fn(&EndpointId) -> bool + Send + Sync>),
-}
-
-impl Access {
-    fn allows(&self, peer: &EndpointId) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Only(check) => check(peer),
-        }
+    /// Every relay in the set.
+    pub fn urls(&self) -> Vec<RelayUrl> {
+        self.mode().relay_map().urls()
     }
 }
 
-impl fmt::Debug for Access {
+/// A daemon's address as clients keep it: `iroh://<endpoint-id>`, with its
+/// home relay as `@<host>[:port]` (an `https` relay). The key is the
+/// address; the relay is a hint, and dialing also tries every relay of the
+/// dialer's own set, so a daemon that moved to another relay of that set is
+/// still found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteUrl {
+    pub id: EndpointId,
+    pub relay: Option<RelayUrl>,
+}
+
+impl RemoteUrl {
+    /// Whether `url` names a daemon by key (`iroh://…`).
+    pub fn is_remote(url: &str) -> bool {
+        url.trim()
+            .strip_prefix(SCHEME)
+            .is_some_and(|rest| rest.starts_with("://"))
+    }
+
+    /// Read `iroh://<id>[@<relay-host>][/path…]`; a path is ignored, so a
+    /// socket URL reads as its daemon.
+    pub fn parse(url: &str) -> Option<Self> {
+        let rest = url.trim().strip_prefix(SCHEME)?.strip_prefix("://")?;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        let (id, relay) = match authority.split_once('@') {
+            Some((id, host)) => (id, Some(host)),
+            None => (authority, None),
+        };
+        let id: EndpointId = id.parse().ok()?;
+        let relay = match relay.filter(|host| !host.is_empty()) {
+            Some(host) => Some(format!("https://{host}/").parse::<RelayUrl>().ok()?),
+            None => None,
+        };
+        Some(Self { id, relay })
+    }
+
+    /// Where to dial: the key, the relay hint, and every relay in `relays`.
+    pub fn addr(&self, relays: &Relays) -> EndpointAddr {
+        let mut addr = EndpointAddr::new(self.id);
+        for relay in self.relay.iter().cloned().chain(relays.urls()) {
+            addr.addrs.insert(TransportAddr::Relay(relay));
+        }
+        addr
+    }
+}
+
+impl fmt::Display for RemoteUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Any => "Access::Any",
-            Self::Only(_) => "Access::Only(..)",
-        })
-    }
-}
-
-/// The endpoint key kept at `path` (hex, owner-only), made on first use.
-/// The key is the daemon's address for life: a new one unpairs every app.
-pub fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<SecretKey> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let key: SecretKey = text
-                .trim()
-                .parse()
-                .with_context(|| format!("{} holds no endpoint key", path.display()))?;
-            Ok(key)
+        write!(f, "{SCHEME}://{}", self.id)?;
+        if let Some(host) = self.relay.as_ref().and_then(|relay| relay.host_str()) {
+            write!(f, "@{host}")?;
+            if let Some(port) = self.relay.as_ref().and_then(|relay| relay.port()) {
+                write!(f, ":{port}")?;
+            }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = SecretKey::generate();
-            write_owner_only(path, &hex(&key.to_bytes())).with_context(|| {
-                format!("could not save the endpoint key at {}", path.display())
-            })?;
-            Ok(key)
-        }
-        Err(error) => Err(error)
-            .with_context(|| format!("could not read the endpoint key at {}", path.display())),
+        Ok(())
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// An endpoint key derived from `seed` (a device's own secret key): the
+/// same seed always gives the same key, so a paired device needs nothing
+/// more kept to have a stable endpoint identity.
+pub fn derive_key(seed: &[u8]) -> SecretKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aidaemon/remote/device-key/1\0");
+    hasher.update(seed);
+    SecretKey::from_bytes(&hasher.finalize().into())
 }
-
-fn write_owner_only(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp");
-    // Created owner-only, never widened and narrowed after.
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    {
-        use std::io::Write;
-        let mut file = options.open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
-/// The key of the peer a request came from, as a request extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RemotePeer(pub EndpointId);
 
 async fn bind(secret: SecretKey, relays: &Relays) -> anyhow::Result<Endpoint> {
-    // Minimal: no address publishing to a DNS server; peers dial the
-    // address they were given (key, relay, direct addresses).
+    // Minimal: nothing published to a DNS server; peers dial the address
+    // they were given (key, relays, direct addresses).
     Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
@@ -155,96 +156,17 @@ async fn bind(secret: SecretKey, relays: &Relays) -> anyhow::Result<Endpoint> {
         .context("could not bind the iroh endpoint")
 }
 
-/// The daemon's side: serves a router to the peers [`Access`] lets in.
-pub struct RemoteListener {
-    endpoint: Endpoint,
-    accept: tokio::task::JoinHandle<()>,
-}
-
-impl RemoteListener {
-    pub async fn bind(
-        secret: SecretKey,
-        relays: &Relays,
-        access: Access,
-        app: axum::Router,
-    ) -> anyhow::Result<Self> {
-        let endpoint = bind(secret, relays).await?;
-        let accept = tokio::spawn(accept_loop(endpoint.clone(), access, app));
-        Ok(Self { endpoint, accept })
-    }
-
-    /// The daemon's key: its address for life.
-    pub fn id(&self) -> EndpointId {
-        self.endpoint.id()
-    }
-
-    /// Where peers dial now: the key, the home relay once connected, and
-    /// direct addresses.
-    pub fn addr(&self) -> EndpointAddr {
-        self.endpoint.addr()
-    }
-
-    /// Wait until the endpoint is connected to its home relay.
-    pub async fn online(&self) {
-        self.endpoint.online().await;
-    }
-
-    pub async fn close(self) {
-        self.accept.abort();
-        self.endpoint.close().await;
-    }
-}
-
-async fn accept_loop(endpoint: Endpoint, access: Access, app: axum::Router) {
-    while let Some(incoming) = endpoint.accept().await {
-        let access = access.clone();
-        let app = app.clone();
-        tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    debug!(%error, "Remote connection failed during the handshake");
-                    return;
-                }
-            };
-            let peer = conn.remote_id();
-            if !access.allows(&peer) {
-                debug!(peer = %peer.fmt_short(), "Remote connection refused: key not allowed");
-                conn.close(1u32.into(), b"not allowed");
-                return;
-            }
-            debug!(peer = %peer.fmt_short(), "Remote connection accepted");
-            serve_connection(conn, peer, app).await;
-        });
-    }
-}
-
-async fn serve_connection(conn: Connection, peer: EndpointId, app: axum::Router) {
-    let app = app.layer(axum::Extension(RemotePeer(peer)));
-    while let Ok((send, recv)) = conn.accept_bi().await {
-        let service = TowerToHyperService::new(app.clone());
-        tokio::spawn(async move {
-            let io = TokioIo::new(tokio::io::join(recv, send));
-            if let Err(error) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .with_upgrades()
-                .await
-            {
-                debug!(%error, "Remote stream ended with an error");
-            }
-        });
-    }
-}
-
 /// An app's side: dials daemons by address.
 pub struct RemoteClient {
     endpoint: Endpoint,
+    relays: Relays,
 }
 
 impl RemoteClient {
     pub async fn bind(secret: SecretKey, relays: &Relays) -> anyhow::Result<Self> {
         Ok(Self {
             endpoint: bind(secret, relays).await?,
+            relays: relays.clone(),
         })
     }
 
@@ -267,6 +189,11 @@ impl RemoteClient {
         Ok(RemoteConnection { conn })
     }
 
+    /// Connect to the daemon at `url`, trying this client's relays too.
+    pub async fn connect_url(&self, url: &RemoteUrl) -> anyhow::Result<RemoteConnection> {
+        self.connect(url.addr(&self.relays)).await
+    }
+
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
@@ -282,6 +209,11 @@ impl RemoteConnection {
     /// The daemon's key (verified in the handshake).
     pub fn daemon(&self) -> EndpointId {
         self.conn.remote_id()
+    }
+
+    /// Whether the connection has ended (closed, timed out, lost).
+    pub fn is_closed(&self) -> bool {
+        self.conn.close_reason().is_some()
     }
 
     /// A fresh stream, for a caller that speaks HTTP itself.
@@ -317,41 +249,110 @@ impl RemoteConnection {
         Ok(http::Response::from_parts(parts, body))
     }
 
-    /// Open a WebSocket at `path` (e.g. `/client/v1/ws`).
-    pub async fn websocket(&self, path: &str) -> anyhow::Result<WebSocketStream<RemoteStream>> {
-        let stream = self.open_stream().await?;
-        let (socket, _) = tokio_tungstenite::client_async(format!("ws://{HOST}{path}"), stream)
+    /// Open a WebSocket at `path` (e.g. `/client/v1/ws`) with `headers`
+    /// (e.g. `authorization`).
+    pub async fn websocket(
+        &self,
+        path: &str,
+        headers: &http::HeaderMap,
+    ) -> Result<WebSocketStream<RemoteStream>, WebSocketError> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let stream = self
+            .open_stream()
             .await
-            .context("the WebSocket handshake failed")?;
+            .map_err(|e| WebSocketError::Stream(format!("{e:#}")))?;
+        let mut request = format!("ws://{HOST}{path}")
+            .into_client_request()
+            .map_err(WebSocketError::Handshake)?;
+        for (name, value) in headers {
+            request.headers_mut().insert(name.clone(), value.clone());
+        }
+        let (socket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .map_err(WebSocketError::Handshake)?;
         Ok(socket)
     }
 }
+
+/// Why a WebSocket over iroh did not open.
+#[derive(Debug)]
+pub enum WebSocketError {
+    /// No stream to the daemon (the connection is gone).
+    Stream(String),
+    /// The daemon answered the upgrade with a refusal or nonsense; a 401 is
+    /// `Handshake(Error::Http(response))`.
+    Handshake(tokio_tungstenite::tungstenite::Error),
+}
+
+impl fmt::Display for WebSocketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stream(why) => write!(f, "no stream to the daemon: {why}"),
+            Self::Handshake(error) => write!(f, "the WebSocket handshake failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WebSocketError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_key_is_made_once_and_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("remote-key");
-        let first = load_or_create_key(&path).unwrap();
-        let again = load_or_create_key(&path).unwrap();
-        assert_eq!(first.public(), again.public());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
+    fn a_remote_url_reads_back_and_ignores_its_path() {
+        let id = SecretKey::generate().public();
+        let url = RemoteUrl {
+            id,
+            relay: Some("https://relay.example.invalid./".parse().unwrap()),
+        };
+        let text = url.to_string();
+        assert_eq!(text, format!("iroh://{id}@relay.example.invalid."));
+        assert_eq!(RemoteUrl::parse(&text), Some(url.clone()));
+        assert_eq!(RemoteUrl::parse(&format!("{text}/client/v1/ws")), Some(url));
+        let bare = RemoteUrl::parse(&format!("iroh://{id}")).unwrap();
+        assert_eq!(bare.relay, None);
+        assert!(RemoteUrl::is_remote(&text));
+        assert!(!RemoteUrl::is_remote("https://relay.example.invalid"));
+        assert!(RemoteUrl::parse("iroh://not-a-key@relay.example.invalid").is_none());
     }
 
     #[test]
-    fn a_damaged_key_file_is_an_error_not_a_new_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("remote-key");
-        std::fs::write(&path, "not a key").unwrap();
-        assert!(load_or_create_key(&path).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a key");
+    fn a_custom_relay_keeps_its_port() {
+        let id = SecretKey::generate().public();
+        let url = RemoteUrl::parse(&format!("iroh://{id}@relay.example.invalid:8443")).unwrap();
+        assert_eq!(
+            url.to_string(),
+            format!("iroh://{id}@relay.example.invalid:8443")
+        );
+    }
+
+    #[test]
+    fn dialing_tries_the_hint_and_the_set() {
+        let id = SecretKey::generate().public();
+        let hint: RelayUrl = "https://hint.example.invalid./".parse().unwrap();
+        let own: RelayUrl = "https://own.example.invalid./".parse().unwrap();
+        let addr = RemoteUrl {
+            id,
+            relay: Some(hint.clone()),
+        }
+        .addr(&Relays::Custom(vec![own.clone()]));
+        let relays: Vec<_> = addr.relay_urls().cloned().collect();
+        assert!(
+            relays.contains(&hint) && relays.contains(&own),
+            "{relays:?}"
+        );
+    }
+
+    #[test]
+    fn a_derived_key_is_stable_and_seed_bound() {
+        assert_eq!(
+            derive_key(b"seed-1").public(),
+            derive_key(b"seed-1").public()
+        );
+        assert_ne!(
+            derive_key(b"seed-1").public(),
+            derive_key(b"seed-2").public()
+        );
     }
 }

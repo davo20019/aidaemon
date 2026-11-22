@@ -490,6 +490,10 @@ pub struct PairingLink {
     pub offer_id: String,
     pub code: String,
     pub fingerprint: Option<String>,
+    /// The daemon's peer-to-peer address (`iroh://<key>@<relay>`), when it
+    /// offers remote access: reachable from anywhere, unlike a loopback
+    /// `gateway`.
+    pub remote: Option<String>,
 }
 
 impl PairingLink {
@@ -502,7 +506,7 @@ impl PairingLink {
             (Some(crate::machine::http_base(url)), fragment)
         };
         let mut gateway = base;
-        let (mut offer, mut code, mut fp) = (None, None, None);
+        let (mut offer, mut code, mut fp, mut remote) = (None, None, None, None);
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=')?;
             let value = percent_decode(value);
@@ -511,6 +515,7 @@ impl PairingLink {
                 "offer" => offer = Some(value),
                 "code" => code = Some(value),
                 "fp" => fp = Some(value),
+                "remote" => remote = Some(value),
                 _ => {}
             }
         }
@@ -519,6 +524,7 @@ impl PairingLink {
             offer_id: offer?,
             code: code?,
             fingerprint: fp,
+            remote,
         })
     }
 }
@@ -569,6 +575,16 @@ mod pairing_link_tests {
         .unwrap();
         assert_eq!(page.gateway, "https://d.example.invalid");
         assert_eq!(page.offer_id, "of-3");
+        assert_eq!(page.remote, None);
+        let remote = PairingLink::parse(
+            "aidaemon-pair:?gateway=http%3A%2F%2F127.0.0.1%3A8788&offer=of-4&code=EF&fp=f&remote=iroh%3A%2F%2Fk%40relay.example.invalid",
+        )
+        .unwrap();
+        assert_eq!(remote.gateway, "http://127.0.0.1:8788");
+        assert_eq!(
+            remote.remote.as_deref(),
+            Some("iroh://k@relay.example.invalid")
+        );
         assert!(PairingLink::parse("hello").is_none());
     }
 }

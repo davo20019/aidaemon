@@ -1292,13 +1292,9 @@ pub async fn start(
     Ok(())
 }
 
-static REMOTE: std::sync::OnceLock<aidaemon_remote::RemoteListener> = std::sync::OnceLock::new();
-
-/// The daemon's iroh endpoint, when remote access is on.
-#[allow(dead_code)] // read by pairing once links carry the endpoint
-pub(crate) fn remote() -> Option<&'static aidaemon_remote::RemoteListener> {
-    REMOTE.get()
-}
+/// The daemon's iroh endpoint, while remote access is on.
+static REMOTE: std::sync::OnceLock<Arc<aidaemon_remote::RemoteListener>> =
+    std::sync::OnceLock::new();
 
 /// The relays `[client_gateway.remote] relays` names; none: n0's public
 /// relays.
@@ -1319,29 +1315,45 @@ fn remote_relays(config: &ClientGatewayConfig) -> anyhow::Result<aidaemon_remote
     Ok(aidaemon_remote::Relays::Custom(urls))
 }
 
-/// `[client_gateway.remote]`: the same routes over iroh, for the owner's
-/// apps anywhere. The gateway's sign-in still decides every request; any
-/// key may connect. A failure leaves the loopback gateway serving.
+/// `[client_gateway.remote]`: the gateway over iroh, for the owner's apps
+/// anywhere, behind the peer guard (pairing and sign-in for any key, the
+/// rest only with a token issued to that key). Pairing links carry its
+/// address once it is online. A failure leaves the loopback gateway
+/// serving.
 async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>) {
     let key_path = aidaemon_client_gateway::token::token_file(config).with_file_name("remote-key");
+    let router =
+        aidaemon_client_gateway::remote_router::<aidaemon_remote::RemotePeer>(gateway.clone());
     let started = async {
         let key = aidaemon_remote::load_or_create_key(&key_path)?;
         let relays = remote_relays(config)?;
-        aidaemon_remote::RemoteListener::bind(
-            key,
-            &relays,
-            aidaemon_remote::Access::Any,
-            aidaemon_client_gateway::router(gateway),
-        )
-        .await
+        aidaemon_remote::RemoteListener::bind(key, &relays, aidaemon_remote::Access::Any, router)
+            .await
     };
-    match started.await {
-        Ok(listener) => {
-            tracing::info!(endpoint = %listener.id(), "Remote access listening (iroh)");
-            let _ = REMOTE.set(listener);
+    let listener = match started.await {
+        Ok(listener) => Arc::new(listener),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "Remote access is off");
+            return;
         }
-        Err(error) => tracing::warn!(error = %format!("{error:#}"), "Remote access is off"),
-    }
+    };
+    tracing::info!(endpoint = %listener.id(), "Remote access listening (iroh)");
+    let _ = REMOTE.set(listener.clone());
+    // The address names the home relay, known once connected; follow it
+    // when the endpoint moves to another.
+    tokio::spawn(async move {
+        listener.online().await;
+        let mut shown: Option<String> = None;
+        loop {
+            let url = listener.url().to_string();
+            if shown.as_deref() != Some(url.as_str()) {
+                tracing::info!(%url, "Remote access address");
+                gateway.pairing().set_remote_url(Some(url.clone()));
+                shown = Some(url);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 /// `/pair_device`, `/devices` and `/revoke_device <id>`: the owner's devices
