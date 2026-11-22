@@ -1738,9 +1738,14 @@ impl Fixture {
     }
 
     async fn sign_in(&self, device: &Device) -> reqwest::Response {
+        self.sign_in_at(&self.url, device).await
+    }
+
+    /// Sign `device` in at `url` (another listener of this gateway).
+    async fn sign_in_at(&self, url: &str, device: &Device) -> reqwest::Response {
         let response = self
             .http()
-            .post(format!("http://{}/client/v1/sessions/challenge", self.url))
+            .post(format!("http://{url}/client/v1/sessions/challenge"))
             .json(&ChallengeRequest {
                 device_id: device.device_id.clone(),
                 endpoint: None,
@@ -1756,7 +1761,7 @@ impl Fixture {
             .key
             .sign(challenge_message(&challenge.challenge_id, &challenge.nonce).as_bytes());
         self.http()
-            .post(format!("http://{}/client/v1/sessions", self.url))
+            .post(format!("http://{url}/client/v1/sessions"))
             .json(&SessionRequest {
                 challenge_id: challenge.challenge_id,
                 signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
@@ -1845,6 +1850,63 @@ async fn a_tunnel_takes_paired_devices_never_the_local_token() {
     let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
     let works = glance(&tunnel, &grant.access_token).send().await.unwrap();
     assert_eq!(works.status(), 200);
+}
+
+/// iroh is one transport of several: any transport that puts its peer's
+/// key on each request gets the same guard. Here a stand-in transport
+/// (a fixed 32-byte key) serves the routes; the local token is refused and
+/// a paired device's token works only from the key that signed in for it.
+#[tokio::test]
+async fn any_transport_with_a_peer_key_gets_the_remote_guard() {
+    #[derive(Clone)]
+    struct Key([u8; 32]);
+    async fn tag(
+        axum::extract::State(key): axum::extract::State<Key>,
+        mut request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        request.extensions_mut().insert(key.0);
+        next.run(request).await
+    }
+    let f = fixture(RiskLevel::Medium).await;
+    let serve = |key: [u8; 32]| {
+        let app = aidaemon_client_gateway::remote_router::<[u8; 32]>(f.gateway.clone())
+            .layer(axum::middleware::from_fn_with_state(Key(key), tag));
+        async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        }
+    };
+    let mine = serve([7; 32]).await;
+    let other = serve([8; 32]).await;
+    let glance = |url: &str, token: &str| {
+        reqwest::Client::new()
+            .post(format!("http://{url}/client/v1/commands"))
+            .bearer_auth(token)
+            .json(&command("r-any", Command::GetGlance))
+    };
+    assert_eq!(glance(&mine, &f.token).send().await.unwrap().status(), 401);
+
+    let phone = f.pair(vec![Scope::Observe, Scope::Chat]).await;
+    let grant: AccessGrant = f.sign_in_at(&mine, &phone).await.json().await.unwrap();
+    assert_eq!(
+        glance(&mine, &grant.access_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        glance(&other, &grant.access_token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
 }
 
 /// The daemon's iroh handshake admits only what pairing admits: a stranger

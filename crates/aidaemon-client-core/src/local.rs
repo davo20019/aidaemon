@@ -147,6 +147,7 @@ pub async fn reachable_base(url: &str, auth: &Auth) -> Result<String, String> {
 /// for a peer-to-peer address, whether its connection goes direct or
 /// through a relay at this moment.
 pub async fn transport(url: &str, auth: &Auth) -> crate::machine::Transport {
+    #[cfg(feature = "remote")]
     use crate::machine::Transport;
     let kind = crate::machine::transport_of(url);
     #[cfg(feature = "remote")]

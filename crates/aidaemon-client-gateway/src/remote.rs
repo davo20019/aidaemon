@@ -1,5 +1,10 @@
-//! The gateway as a peer-to-peer transport serves it (iroh): the same
-//! routes, behind a guard keyed on the peer's transport key.
+//! The gateway as a peer-to-peer transport serves it: the same routes,
+//! behind a guard keyed on the peer's transport key. iroh
+//! (`aidaemon-remote`) is the transport the daemon ships, behind its
+//! `remote` feature; any other that authenticates its peers plugs in the
+//! same way: serve [`remote_router`] with each request's peer key as a `P`
+//! extension, and admit peers at the handshake with
+//! [`crate::pairing::Pairing::admits`].
 //!
 //! Over such a transport the gateway is reachable from the internet, so:
 //! - a peer with no session may reach only pairing and sign-in;

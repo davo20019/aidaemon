@@ -131,10 +131,11 @@ aidaemon-nodes = { version = "=0.21.0", path = "crates/aidaemon-nodes" }
 # The Client Gateway (`/client/v1`) and its wire types, for the owner's apps.
 aidaemon-client-gateway = { version = "=0.21.0", path = "crates/aidaemon-client-gateway" }
 aidaemon-exposure = { version = "=0.21.0", path = "crates/aidaemon-exposure" }
-aidaemon-remote = { version = "=0.21.0", path = "crates/aidaemon-remote" }
+# Remote access over iroh: one transport of several, behind the `remote` feature.
+aidaemon-remote = { version = "=0.21.0", path = "crates/aidaemon-remote", optional = true }
 aidaemon-client-protocol = { version = "=0.21.0", path = "crates/client-protocol" }
 # Sharing this computer's screen with a daemon elsewhere (`aidaemon share-screen`).
-aidaemon-client-core = { version = "=0.21.0", path = "crates/aidaemon-client-core", optional = true }
+aidaemon-client-core = { version = "=0.21.0", path = "crates/aidaemon-client-core", default-features = false, features = ["native"], optional = true }
 # The terminal bridge (`/agent` sessions and the local attach/share/start CLIs).
 aidaemon-terminal-bridge = { version = "=0.21.0", path = "crates/aidaemon-terminal-bridge", optional = true }
 aidaemon-tool-browser = { version = "=0.21.0", path = "crates/aidaemon-tool-browser" }
@@ -167,8 +168,12 @@ xcap = { version = "0.9", optional = true }
 tikv-jemallocator = "0.7"
 
 [features]
-default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel", "execution-docker"]
+default = ["discord", "slack", "encryption", "browser", "terminal-bridge", "otel", "execution-docker", "remote"]
 browser = ["aidaemon-tool-browser/chromium"]
+# Remote access over iroh (`[client_gateway.remote]`). Without it the
+# gateway is reached on loopback and through tunnels (`[exposure]`) only;
+# any other transport plugs in through `aidaemon_client_gateway::remote_router`.
+remote = ["dep:aidaemon-remote", "aidaemon-client-core?/remote"]
 discord = ["dep:aidaemon-channel-discord"]
 slack = ["dep:aidaemon-channel-slack"]
 # The Docker execution backend: code only (it drives the `docker` CLI, no

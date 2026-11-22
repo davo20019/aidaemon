@@ -1282,11 +1282,19 @@ pub async fn start(
         gateway.attach_shells(crate::startup::shells::registry(config));
     }
     let _ = GATEWAY.set(gateway.clone());
-    if config.client_gateway.remote.enabled {
     if config.exposure.client_gateway.is_some() {
         start_exposed(gateway.clone()).await;
     }
+    #[cfg(feature = "remote")]
+    if config.client_gateway.remote.enabled {
         start_remote(&config.client_gateway, gateway.clone()).await;
+    }
+    #[cfg(not(feature = "remote"))]
+    if config.client_gateway.remote.enabled {
+        tracing::info!(
+            "Remote access over iroh is not in this build (feature `remote`); \
+             the gateway is reached on loopback and through tunnels"
+        );
     }
     tokio::spawn(async move {
         if let Err(error) = aidaemon_client_gateway::serve(gateway).await {
@@ -1296,7 +1304,6 @@ pub async fn start(
     Ok(())
 }
 
-/// The daemon's iroh endpoint, while remote access is on.
 /// The loopback listener tunnels publish: the gateway as it is served off
 /// this computer ([`aidaemon_client_gateway::exposed_router`]).
 static EXPOSED: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
@@ -1331,11 +1338,14 @@ async fn start_exposed(gateway: Arc<ClientGateway>) {
     });
 }
 
+/// The daemon's iroh endpoint, while remote access is on.
+#[cfg(feature = "remote")]
 static REMOTE: std::sync::OnceLock<Arc<aidaemon_remote::RemoteListener>> =
     std::sync::OnceLock::new();
 
 /// The relays `[client_gateway.remote] relays` names; none: n0's public
 /// relays.
+#[cfg(feature = "remote")]
 fn remote_relays(config: &ClientGatewayConfig) -> anyhow::Result<aidaemon_remote::Relays> {
     if config.remote.relays.is_empty() {
         return Ok(aidaemon_remote::Relays::N0);
@@ -1360,12 +1370,12 @@ fn remote_relays(config: &ClientGatewayConfig) -> anyhow::Result<aidaemon_remote
 /// and the rest only with a token issued to that key. Pairing links carry
 /// its address once it is online. A failure leaves the loopback gateway
 /// serving.
+#[cfg(feature = "remote")]
 async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>) {
     let key_path = aidaemon_client_gateway::token::token_file(config).with_file_name("remote-key");
     let router =
         aidaemon_client_gateway::remote_router::<aidaemon_remote::RemotePeer>(gateway.clone());
     let started = async {
-        let key = aidaemon_remote::load_or_create_key(&key_path)?;
         // Unread, nobody but an open pairing would be admitted: stay off
         // rather than admit every key.
         gateway
@@ -1373,6 +1383,7 @@ async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>)
             .load_admission()
             .await
             .map_err(|error| anyhow::anyhow!("remote admission: {}", error.message))?;
+        let key = aidaemon_remote::load_or_create_key(&key_path)?;
         let relays = remote_relays(config)?;
         let pairing = gateway.pairing().clone();
         let access = aidaemon_remote::Access::Only(Arc::new(move |peer| {
