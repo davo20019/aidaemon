@@ -415,6 +415,9 @@ pub struct Store {
     /// A [`Self::keyboard_ask`] no composer has answered yet: the new
     /// conversation's composer, built after it, raises the keyboard.
     keyboard_wanted: Stored<bool>,
+    /// A new conversation was started from a drawer: the page under it
+    /// takes no focus until it has gone, so the ask is made again then.
+    keyboard_after_drawer: Stored<bool>,
     /// The sidebar lists archived conversations instead of the others.
     show_archived: Signal<bool>,
     /// The conversation that was on screen when it was archived: Undo
@@ -522,6 +525,7 @@ impl Store {
             composer_edit: signal(0),
             keyboard_ask: signal(0),
             keyboard_wanted: stored(false),
+            keyboard_after_drawer: stored(false),
             show_archived: signal(false),
             archived_open: signal(None),
             sent_at: signal(0),
@@ -1770,9 +1774,25 @@ impl Store {
     /// told after, so one already on screen answers then (and the one
     /// going away, built for another conversation, does not).
     pub fn with_keyboard(&self, start: impl FnOnce()) {
+        let drawer = self.compact.get_untracked()
+            && (self.sidebar.get_untracked() || self.inspector.get_untracked());
         self.keyboard_wanted.replace(true);
         start();
         self.keyboard_ask.update(|n| *n += 1);
+        self.keyboard_after_drawer.replace(drawer);
+    }
+
+    /// A drawer (a narrow window's pane) has gone: a new conversation
+    /// started from it asks for the keyboard again, now that the page
+    /// under it takes the focus.
+    pub fn drawer_gone(&self) {
+        if self.keyboard_after_drawer.replace(false)
+            && self.selected.get_untracked().is_none()
+            && self.page.get_untracked() == Page::Conversation
+        {
+            self.keyboard_wanted.replace(true);
+            self.keyboard_ask.update(|n| *n += 1);
+        }
     }
 
     /// Changes when a new conversation asks for the keyboard.
@@ -2799,6 +2819,7 @@ impl Store {
         if picked {
             // Opening a conversation is reading it: no keyboard over it.
             self.keyboard_wanted.replace(false);
+            self.keyboard_after_drawer.replace(false);
         }
         self.selected.set(id);
         // Its changes say whether it works on code (and are ready to show).

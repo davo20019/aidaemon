@@ -998,11 +998,13 @@ fn note_body(
 /// A pane at an edge of a narrow window: it slides in from `side` over the
 /// page, which dims behind it, and back out (in place when the owner asked
 /// for less motion). A press on the dimmed page, Escape or the back button
-/// close it (`close`). Its content's own heading names it.
+/// close it (`close`); `gone` hears it once it has slid out. Its content's
+/// own heading names it.
 pub fn drawer(
     side: Placement,
     open: impl Fn() -> bool + 'static,
     close: impl Fn() + 'static,
+    gone: impl Fn() + 'static,
     content: impl IntoElement,
 ) -> nsh_base::SheetElement {
     sheet()
@@ -1013,6 +1015,8 @@ pub fn drawer(
                 close();
             }
         })
+        // All gone, its slide out done: the page takes the focus again.
+        .on_close(gone)
         .popup_style(|s| {
             s.h_full()
                 .py_safe_area()

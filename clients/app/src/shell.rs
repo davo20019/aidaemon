@@ -164,6 +164,7 @@ pub fn shell(store: Store) -> View {
                         Placement::Left,
                         move || store.sidebar_open(),
                         move || store.close_panes(),
+                        move || store.drawer_gone(),
                         view()
                             .w_full()
                             .h_full()
@@ -174,6 +175,7 @@ pub fn shell(store: Store) -> View {
                         Placement::Right,
                         move || store.details_open(),
                         move || store.close_panes(),
+                        move || store.drawer_gone(),
                         inspector(store),
                     ))
             },
