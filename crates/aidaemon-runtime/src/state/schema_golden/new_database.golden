@@ -613,12 +613,6 @@ CREATE TABLE terminal_capability_grants (
             PRIMARY KEY (backend_scope, prefix, capability)
         )
 
-table terminal_trust_all on terminal_trust_all
-CREATE TABLE terminal_trust_all (
-            backend_scope TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-
 table command_patterns on command_patterns
 CREATE TABLE command_patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1566,7 +1560,6 @@ rows memory_embeddings = 0
 rows memory_embedding_generation = 1
 rows terminal_backend_allowed_prefixes = 0
 rows terminal_capability_grants = 0
-rows terminal_trust_all = 0
 rows command_patterns = 0
 rows macros = 0
 rows token_usage = 0
