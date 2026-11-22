@@ -56,18 +56,27 @@ On a server, run `aidaemon` there with no config: it prints a link and a one-tim
 ## Features
 
 ### Channels
-Talk to it on **Telegram**, **Slack** (Socket Mode), or **Discord**. Run multiple bots, add new ones at runtime with `/connect`, no restart needed.
+Talk to it on **Telegram**, **Slack** (Socket Mode), or **Discord**. Run multiple bots; on Telegram, add new ones at runtime with `/connect`, no restart needed.
 Send images with a caption and the agent analyzes them via vision-capable LLMs (toggle with `[files] vision_enabled` in config).
 Ask it to create an image and the provider-neutral `generate_image` tool saves and attaches the result, ready for `send_file`. The bundled image backend uses a connected ChatGPT subscription and works even when the conversational model is Anthropic, Gemini, or another configured provider.
 Send voice notes or audio files on Telegram, Slack, or Discord. Audio-capable models receive native `input_audio` blocks; otherwise enable local Whisper STT fallback under `[files.stt]` (requires `whisper-cli`, a GGUF model, and `ffmpeg` for OGG/Opus). See `config.toml.example` for settings. Restart after config changes.
-Telegram owners can also run `/terminal [agent] [working_dir]` to launch the hosted terminal Mini App (`https://terminal.aidaemon.ai`) for direct CLI-agent sessions with automatic secure daemon pairing.
+Telegram owners can also run `/terminal` to open the hosted terminal Mini App (`https://terminal.aidaemon.ai`) with automatic secure daemon pairing, or `/agent [codex|claude|gemini|opencode] [dir]` for a direct CLI-agent session; `aidaemon attach <code>` continues that session in a terminal on your computer, and `aidaemon share` makes a code to resume one from Telegram.
 
 ### Tools & Agents
 40+ built-in tools including terminal execution, file operations, git, web browser (headless Chrome), web search, HTTP requests with auth profiles, and MCP server integration. Tools declare their risk level — read-only operations run freely, side effects require approval.
 
-Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude, Gemini, Codex, Aider, Antigravity — auto-discovered). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first, so every one can be judged.
+Delegate complex tasks to **sub-agents** or external **CLI agents** (Claude Code, Codex, Antigravity, Gemini CLI, GitHub Copilot CLI, Aider — auto-discovered). Any other agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) works too: add it under `[cli_agents.tools.<name>]` with `protocol = "acp"`, and each action it takes is asked first, so every one can be judged.
 
 `manage_api` onboards an API from its OpenAPI spec or GraphQL schema and derives a safe verification probe from it (GraphQL reuses introspection when no `verify_url` is given). Credentials stay in the OS keychain by default, or in the configured `.env` file when `AIDAEMON_NO_KEYCHAIN=1`.
+
+### The app
+The AIDaemon app (desktop, web, terminal, iOS and Android) is where you can see and steer everything:
+
+- **Conversation details** show a conversation's Changes, Files, Steps, Terminal and Browser. The Terminal tab is that conversation's own shell on the daemon's computer, started in its folder; the agent can read it and type into it once you allow (`shared_terminal`). The Browser tab shows the agent's browser live: take control, give it back, or point at something for it. The Terminal tab is not in the terminal build of the app.
+- **Messages sent while work runs** wait under "Waiting to send", where you can edit or remove them, or press **Send now** to give one to the running work. A setting picks whether Enter tells the running work now or sends after it.
+- **Model and effort per conversation:** the composer picks Auto or a model you pin, and Auto, Low, Medium or High effort.
+- **The System page** shows the daemon's and the app's versions, the model and its fallbacks, how the app reaches the daemon (this computer, peer to peer direct or via relay, or a tunnel), token use, background jobs, health checks, chat bots, and your devices (Nodes) with whether each is online and how it connects.
+- **`aidaemon share-screen`** shares a Mac's screen with your daemon elsewhere so you can watch and drive it from the app (`--pair <link>` the first time, with a link from `aidaemon pair`; needs the `computer_use-macos` build). It shares only while it runs.
 
 ### Computer use (macOS)
 Built with `--features computer_use-macos`, the agent can operate native macOS apps: it reads an app's accessibility tree, takes a screenshot, and clicks, types and scrolls to finish a task. It is off by default: build with the feature and enable it in config. Setup and permissions: [COMPUTER_USE_MACOS.md](COMPUTER_USE_MACOS.md).
@@ -80,13 +89,13 @@ SQLite-backed persistent memory with local vector embeddings (quantized AllMiniL
 A project conversation also gets the repository's own skills (`.agents/skills`, `.claude/skills`) and can start the MCP servers its `.mcp.json` declares with `manage_mcp project_start`, each only after you approve its exact command; those tools stay in that project's conversations.
 
 ### Skills
-Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. Successful procedures auto-promote to skills after enough consistent use.
+Instructions that teach it new workflows, loaded when a task needs them or when you ask by name. Load from files, URLs, or remote registries. A procedure that keeps working becomes a skill draft for you to review, approve or dismiss (`manage_skills review`).
 
 ### Automation
 Everything that runs on its own is an automation, of two kinds. **Scheduled** automations run a fixed instruction at set times: reminders and recurring tasks, with natural language time parsing and multi-schedule support. **Watching** automations work toward an objective within limits you approve, deciding each time whether to act, wait, ask you, or stop. Ask for what you want; the agent picks the kind. Your automations show in one list, each as the same five-line card (what, how often, what it can do, when it tells you, when it ends), and you pause, resume or cancel any of them by name. Email triggers via IMAP IDLE.
 
 ### Security
-Terminal command allowlists, inline approval flow (Allow Once / Allow Session / Allow Always / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
+Terminal command allowlists, inline approval flow (Allow / Allow until restart or Always allow / Deny), SSRF protection, input sanitization, encrypted state, secrets in OS keychain, and role-based access control. See the [security docs](https://docs.aidaemon.ai/) for the full model.
 
 ## Running as a Service
 
@@ -96,6 +105,26 @@ aidaemon service uninstall
 ```
 
 This is what the app's **Run it here** does: a launchd agent on macOS, a systemd user unit on Linux (lingering is turned on so it outlives your login session), a logon task on Windows. `aidaemon install-service` still writes the system-wide unit (Linux, needs sudo) or the launch agent without starting it (macOS).
+
+### Other commands
+
+`aidaemon --help` lists them all. Besides the ones above:
+
+| Command | What it does |
+|---|---|
+| `aidaemon app` / `tui` / `web` | Open the app in a window, in this terminal, or in the browser |
+| `aidaemon pair` | Pair a phone or browser (QR code or code) |
+| `aidaemon client-token` | Mint a new local Client Gateway token (revokes the old one) |
+| `aidaemon node <command>` | Pair, inspect, authorize or revoke Nodes |
+| `aidaemon share-screen` | Share this Mac's screen with your daemon (see The app) |
+| `aidaemon browser login` | Open Chrome to sign in to services the agent will use |
+| `aidaemon agent start <agent>`, `codex`, `claude`, `gemini`, `opencode` | Start a coding agent through aidaemon |
+| `aidaemon attach <code>` / `share [session_id]` | Continue a Telegram `/agent` session here, or make a code to resume one there |
+| `aidaemon keychain set\|get\|delete <key>` | Manage a secret in the OS keychain |
+| `aidaemon memory-export DIR` | Write a readable copy of memory to a new directory |
+| `aidaemon setup low-latency` | Set up Telegram's webhook low-latency mode |
+| `aidaemon migrate` | Run database migrations and exit |
+| `aidaemon check-update` | Check for a newer release |
 
 ## Configuration
 
@@ -183,10 +212,24 @@ read the content is still in its context.
 
 ```toml
 [authority]
-owner_default = "full"   # full | unrestricted
+owner_default = "full"   # read_only | full (Standard) | full_access
 # Your own folders: reading files here does not count as untrusted content.
 trusted_roots = ["~/projects"]
 ```
+
+`owner_default` is AIdaemon's permission level, the most it, its helper
+agents and every coding agent it starts may do. **Read only** allows only
+tools that read. **Standard** (`full`, the default) allows every tool and
+asks before risky terminal commands. **Full access** runs every terminal
+command without asking; `/trustall on` and `/trustall off` switch it, as
+does Settings → AIdaemon permissions in the app. Lowering the level applies
+at once. Raising it to Full access is approved on another paired device, or,
+with none, by sending `/trustall on confirm`. Each coding agent follows the
+level ("Same as AIdaemon") or a stricter mode you pick under
+`[cli_agents.permissions]`; a mode above the level runs at the most the level
+allows. Older settings move into this key at startup without widening
+anything: trust-all becomes `full_access`, and `owner_default =
+"unrestricted"` becomes `full` (or `full_access` if trust-all was on).
 
 Your own folders are only the ones you grant on purpose: `[authority]
 trusted_roots`, the daemon's working directory, a scheduled goal's workspace
@@ -201,10 +244,10 @@ folder and its parents, and the shared temp folders. A symlink counts as the
 folder it points to. At startup the daemon logs the trusted roots it uses
 and any it dropped as too broad.
 
-With `owner_default = "full"` (the default) the check above applies to your
-own turns too. `unrestricted` skips the check on the owner's turns and only
-records each outward action taken after untrusted content; guests' turns are
-always checked.
+At every level, Full access included, the check above applies to your own
+turns too. Only a chat's own `/mode unrestricted` skips it on your turns and
+just records each outward action taken after untrusted content; guests'
+turns are always checked.
 
 Chat commands (owner only) change one chat for four hours:
 
@@ -212,7 +255,7 @@ Chat commands (owner only) change one chat for four hours:
   the helper agents it started: aidaemon can look but not change anything.
 - `/mode full | unrestricted | readonly` switches the chat's mode; `/mode` on
   its own shows the current one. `/mode full` ends a read-only or unrestricted
-  period early.
+  period early and returns the chat to AIdaemon's level.
 
 To keep one message out of memory, send `/private` first (anyone can):
 aidaemon still uses what it knows to answer, but learns nothing from that
@@ -233,8 +276,8 @@ knowing. You are asked when the agent wants to:
 - run a terminal command that needs a look whatever the allowlist says:
   reading sensitive files such as `~/.ssh`, starting a program that keeps
   running in the background, running a new command detached from the task,
-  reaching outside the task's folders in a sandboxed terminal, or turning on
-  trust-all mode;
+  reaching outside the task's folders in a sandboxed terminal (`[terminal]
+  confinement = "sandbox"`), or raising AIdaemon to Full access;
 - run any terminal command in a chat started by an automated trigger, such as
   an incoming email.
 
@@ -250,19 +293,21 @@ carrying one is blocked, not asked about.
 
 How to answer:
 
-- **Allow Once** runs this one action.
-- **Allow Session** also allows the same action again without asking, until
+- **Allow** runs this one action.
+- **Allow until restart** also allows the same action again without asking, until
   the daemon restarts. For a web request this covers the same method to the
   same address, from this chat and the helper agents it starts. For a terminal command it covers
   commands that start the same way, from any chat.
-- **Allow Always** (terminal commands) saves the command's start to your
+- **Always allow** (terminal commands) saves the command's start to your
   allowlist, so commands like it run without a card from now on.
 - **Deny** stops the action.
 
-Web request cards offer Allow Session. Terminal cards offer either Allow
-Session or Allow Always, depending on the terminal's permission mode and the
-command's risk (by default, Allow Session for critical commands and Allow
-Always for the rest). A card waits five minutes; no answer, or a card that
+Web request cards offer Allow until restart. Terminal cards offer either
+Allow until restart or Always allow, depending on `[terminal]
+permission_mode` and the command's risk: `default` offers Allow until restart
+for critical commands and Always allow for the rest, `cautious` only Allow
+until restart. An approval that can only be given once shows just Allow and
+Deny. A card waits five minutes; no answer, or a card that
 could not be delivered, counts as Deny.
 
 A Deny holds for the rest of the task. The agent cannot get around it by
@@ -273,13 +318,13 @@ Deny, the agent tries something that sends data out or deletes, and whose
 effects cannot be worked out in advance (an unfamiliar script, for example),
 you are asked again; it is never let through quietly. A task in which you
 declined something is recorded as only partly done, never as a success. A
-message you send while the task is still running joins that task, and the
-Deny still holds. Once the task has finished, your next message starts a new
+message you send about the task while it is still running joins that task,
+and the Deny still holds. Once the task has finished, your next message starts a new
 task, so you can change your mind and ask again.
 
 ### Reaching the gateways from your other devices
 
-The Client Gateway (`/client/v1`, for `aidaemon tui`, `aidaemon web` and paired phones) and the Node Gateway (`/node/v1`) only listen on loopback. To reach them from elsewhere, let the daemon run the tunnel itself: it starts with the daemon, stops with it, restarts with backoff when it drops, and feeds its address into pairing links and Node heartbeats. The tunnel only moves bytes; devices still pair with their own keys.
+The Client Gateway (`/client/v1`, for `aidaemon tui`, `aidaemon web` and paired phones) listens only on loopback; the apps reach it from elsewhere over iroh (see the phone app below). The Node Gateway (`/node/v1`) listens on loopback and, once Nodes are enabled, on this computer's local network over HTTPS (`[nodes.gateway.lan]`, port 8443, on by default), with a certificate from the daemon's own CA that Nodes learn over the channel they already use. To reach either from elsewhere through a tunnel instead, let the daemon run the tunnel itself: it starts with the daemon, stops with it, restarts with backoff when it drops, and feeds its address into pairing links and Node heartbeats. The tunnel only moves bytes; devices still pair with their own keys.
 
 ```toml
 [exposure.client_gateway]
@@ -295,15 +340,15 @@ Adapters: `tailscale` (`serve` or `funnel`), `cloudflare` (`named`, or `quick` f
 
 ### The phone app (iOS and Android)
 
-The app on a phone never runs the daemon; it pairs with yours, and reaches it from anywhere with no tunnel, account or domain: remote access over [iroh](https://iroh.computer) is on whenever the Client Gateway is. The phone connects straight to your computer when the network allows, and through a relay (n0's public ones, or your own in `[client_gateway.remote] relays`) otherwise; traffic is end-to-end encrypted, so a relay sees your computer's address but never what it says. Turn it off with `[client_gateway.remote] enabled = false`. The quickest way to pair: in the desktop app on the daemon's computer, open Settings → Paired devices → **Pair a phone**, scan the QR code with the phone's camera, tap **Open AIDaemon**, and approve the phone on the desktop. Or send `/pair_device` to your agent from Telegram, Slack, Discord or the desktop app, open the link it replies with on the phone, tap **Open AIDaemon**, and approve the phone in that chat. Both links open your daemon's own pairing page (`/client/v1/pair`), which hands the pairing to the app (or its store page), or pairs that browser instead: the pairing details ride after the `#`, which browsers never send to the server. Pasting the link into the app works too. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
+The app on a phone never runs the daemon; it pairs with yours, and reaches it from anywhere with no tunnel, account or domain: remote access over [iroh](https://iroh.computer) is on whenever the Client Gateway is. The phone connects straight to your computer when the network allows, and through a relay otherwise: the project's own `relay.aidaemon.ai` by default, or your own `iroh-relay` servers in `[client_gateway.remote] relays` ([deploy/](deploy/README.md) shows how the project's relay and its address lookup are set up). Traffic is end-to-end encrypted, so a relay sees your computer's address but never what it says. On the project's relay the daemon also publishes which relay it is on, signed with its key, so an app whose saved relay went stale still finds it. Phones paired earlier through n0's public relays keep working. The daemon's iroh key lives in `~/.aidaemon/remote-key`. Turn it off with `[client_gateway.remote] enabled = false`. The quickest way to pair: in the desktop app on the daemon's computer, open Settings → Paired devices → **Pair a phone**, scan the QR code with the phone's camera, tap **Open AIDaemon**, and approve the phone on the desktop. Or run `aidaemon pair` on the daemon's computer for a QR code, or send `/pair_device` to your agent from Telegram, Slack, Discord or the desktop app, open the link it replies with on the phone, tap **Open AIDaemon**, and approve the phone in that chat. Both links open your daemon's own pairing page (`/client/v1/pair`), which hands the pairing to the app (or its store page), or pairs that browser instead: the pairing details ride after the `#`, which browsers never send to the server. Pasting the link into the app works too. The phone keeps its key in the iOS keychain or Android's private app storage; `/devices` lists it and `/revoke_device` unpairs it, after which the app offers to pair again.
 
-Releases build the phone app themselves: with the `ANDROID_KEYSTORE_*` secrets and a Google Play service account key in `PLAY_SERVICE_ACCOUNT_JSON`, each release (and each run of the Android beta workflow, from any branch) is signed and sent to Play's internal testing track.
+Releases build the phone app themselves. With the `ANDROID_KEYSTORE_*` secrets set, each release attaches a signed `aidaemon-android.apk`; a Google Play service account key in `PLAY_SERVICE_ACCOUNT_JSON` also sends it, and each run of the Android beta workflow (started by hand, from any branch), to Play's internal testing track. With the `IOS_*` and `APPSTORE_*` signing secrets set, releases also send an iOS build to TestFlight.
 
-Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI: `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
+Build it from `clients/app` with the [nsh](https://github.com/longbridge/nsh) CLI (after `nsh component add android` or `ios`): `nsh package --target android` (an `.apk`; `--keystore` to sign for release, `--format aab` for Google Play) or `nsh package --target ios --sign "<identity>" --profile <profile>.mobileprovision` (needs Xcode). `nsh run --target ios` or `--target android` runs it in a simulator or on a device.
 
 ### Customize your agent
 
-Your agent's first message offers to change its name and personality: just tell it. It writes them to an editable `persona.md` next to `config.toml`.
+Your agent's first message offers to change its name and personality: just tell it, and it can save them to a persona file (setting `persona_file` asks for your approval).
 
 You can also configure it manually:
 
@@ -331,7 +376,7 @@ Relative persona paths resolve next to `config.toml`; absolute paths are also su
 
 The built-in policy profiles `cheap`, `balanced`, and `strong` are execution presets, not separate model tiers. They all use your configured default model; the differences are context budget, tool budget, verification depth, and approval behavior. The open-source default auto-routing now floors at `balanced` for better reliability, while `cheap` remains available as a lower-budget preset for custom forks and policy tweaks.
 
-Model supervision is trust-tiered. By default (`trust_tier = "auto"` under `[policy]`), recognized frontier models (Claude, GPT-4/5, o-series, Gemini 2.5+, Grok 3/4) run a thin loop where behavioral supervision gates are telemetry-only, while every other model gets the full supervision scaffolding. The auto list matches known model families, so a capable open model it doesn't recognize (for example kimi-k2.5 or a large qwen/deepseek variant) lands in the supervised tier, where a gate misfire can cost extra LLM round-trips before an answer is accepted. If you run such a model, set `trust_tier = "autonomous"` to opt out of the supervision gates; anti-fabrication checks and hard safety caps (iteration/token/wall-clock limits, repetition guards) remain active on every tier. The override is global — it applies to every configured model, including fallbacks — so keep `"auto"` if your fallback chain mixes a strong cloud model with a small local one. See [`config.toml.example`](config.toml.example) for details.
+Model supervision is trust-tiered. By default (`trust_tier = "auto"` under `[policy]`), recognized frontier models (Claude, GPT-4 and later, o-series, Gemini 2.5+, Grok 3+) run a thin loop where behavioral supervision gates are telemetry-only, while every other model gets the full supervision scaffolding. The auto list matches known model families, so a capable open model it doesn't recognize (for example kimi-k2.5 or a large qwen/deepseek variant) lands in the supervised tier, where a gate misfire can cost extra LLM round-trips before an answer is accepted. If you run such a model, set `trust_tier = "autonomous"` to opt out of the supervision gates; anti-fabrication checks and hard safety caps (iteration/token/wall-clock limits, repetition guards) remain active on every tier. The override is global — it applies to every configured model, including fallbacks — so keep `"auto"` if your fallback chain mixes a strong cloud model with a small local one. See [`config.toml.example`](config.toml.example) for details.
 
 ### Using a ChatGPT subscription instead of an API key
 
@@ -354,9 +399,8 @@ api_key = ""                        # unused; credentials come from the OAuth st
 reasoning_effort = "medium"         # none | minimal | low | medium | high | xhigh | max | ultra
 
 [provider.models]
-primary = "gpt-5.6-terra"           # sol = flagship, terra = balanced, luna = fast
-fast = "gpt-5.6-luna"
-smart = "gpt-5.6-sol"
+default = "gpt-6-sol"               # also gpt-6-astra, gpt-6-luna, gpt-5.6-*, ...
+fallback = ["gpt-6-luna"]
 ```
 
 Model and reasoning effort are both yours to pick. Effort is passed through
@@ -408,7 +452,7 @@ For external APIs, the built-in auth flow is:
 
 ## Build your own agent (SDK)
 
-The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every SDK crate shares one version (0.22.0); the public-contract crates are semver-checked in CI.
+The daemon is built on a Rust agent SDK that you can use on its own: an agent loop driven by hooks, tools with risk annotations and approvals, providers, receipts for every tool call, and run state you can pause and resume. Every agent SDK crate shares one version (0.22.0; the Node SDK and protocol, `aidaemon-node-sdk` and `aidaemon-node-protocol`, have their own); the public-contract crates are semver-checked in CI.
 
 The SDK crates are on [crates.io](https://crates.io/crates/aidaemon-sdk):
 
@@ -429,7 +473,7 @@ async fn forecast(city: String) -> String {
 }
 
 let agent = preset("weather")
-    .provider_from_env() // ANTHROPIC_API_KEY or OPENAI_API_KEY
+    .provider_from_env() // the first key set: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, ...
     .instructions("Answer in one sentence.")
     .tool(Forecast)
     .build()
@@ -437,7 +481,9 @@ let agent = preset("weather")
 let outcome = agent.run("cli:me", "Weather in Lisbon?").await?;
 ```
 
-Try it without an API key: `cargo run -p aidaemon-sdk --example quickstart --features testing`. Other examples cover sub-agents, approvals, scheduled workers, your own channel, resuming after a crash and a coding agent ([crates/aidaemon-sdk/examples](crates/aidaemon-sdk/examples)). Guide: [docs.aidaemon.ai](https://docs.aidaemon.ai/).
+Run it inside an async runtime of your own (for example `#[tokio::main]`, as [`examples/quickstart.rs`](crates/aidaemon-sdk/examples/quickstart.rs) does).
+
+Try it without an API key: `cargo run -p aidaemon-sdk --example quickstart --features testing`. Other examples cover custom tools, sub-agents, approvals, scheduled workers, your own channel and an SSE server, swapping memory, OpenTelemetry traces, resuming after a crash and a coding agent ([crates/aidaemon-sdk/examples](crates/aidaemon-sdk/examples)). Guide: [docs.aidaemon.ai](https://docs.aidaemon.ai/).
 
 ## Building from Source
 
@@ -447,7 +493,7 @@ cargo build --release --features computer_use-macos     # add macOS computer use
 cargo test                                              # run tests
 ```
 
-The default build includes Slack, Discord, the headless browser, database encryption, the Docker execution backend, the terminal bridge and OpenTelemetry export (`otel`).
+The default build includes Slack, Discord, the headless browser, database encryption, the Docker execution backend, the terminal bridge, OpenTelemetry export (`otel`) and remote access over iroh (`remote`). A build without `remote` serves the Client Gateway on loopback and through `[exposure]` tunnels only.
 
 See [CLAUDE.md](CLAUDE.md) for architecture details, module map, and contributor guidance.
 

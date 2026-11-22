@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The name is AIDaemon.** The app, messages, help text, README and crate descriptions say AIDaemon. Commands, crate names and the domain stay lowercase `aidaemon`; release file names (`AIdaemon-macos-*.dmg`, `AIdaemon.app`) and the Windows scheduled task keep their current names so downloads and existing installs keep working.
 - **`--help` and the installer point to the current commands.** `aidaemon --help` lists `setup`, `service install` and `service uninstall`, and marks `install-service` as the legacy system-wide service. `install.sh` suggests `aidaemon-app`, `aidaemon setup` and `aidaemon service install` instead of the old setup wizard and `install-service` (#21).
-- **README:** the SDK installs from crates.io (`aidaemon-sdk = "0.21"`) and the daemon with `cargo install --locked aidaemon`.
+- **README:** the SDK installs from crates.io (`aidaemon-sdk = "0.22"`) and the daemon with `cargo install --locked aidaemon`.
 
 ### Fixed
 

@@ -573,10 +573,12 @@ include_raw_tool_args = false
 # Pairing links carry the address, so a phone needs no tunnel or account.
 # [client_gateway.remote]
 # enabled = true
-# relays = []    # your own iroh-relay URLs; empty: n0's public relays
+# relays = []    # your own iroh-relay URLs (see deploy/relay); empty: the
+#                # project's relay, relay.aidaemon.ai, and its address lookup
 
-# Nodes are disabled by default. The Gateway binds only to loopback; publish
-# this narrow service through a separately managed HTTPS transport adapter.
+# Nodes are disabled by default. The Gateway binds to loopback; Nodes reach it
+# on the local network through [nodes.gateway.lan] below, and from elsewhere
+# through an HTTPS tunnel ([exposure.node_gateway], see the README).
 [nodes.gateway]
 enabled = false
 bind = "127.0.0.1"
@@ -587,7 +589,8 @@ heartbeat_interval_seconds = 30
 pairing_ttl_seconds = 600
 # Optional ordered HTTPS origins for this same Gateway instance. A typical
 # deployment lists the existing remote adapter first and a separately managed
-# split-DNS/LAN TLS adapter second. The listener itself remains loopback-only.
+# split-DNS/LAN TLS adapter second. This listener stays on loopback; the LAN
+# listener below is a separate one.
 # advertised_endpoints = ["https://nodes.example.com", "https://nodes-lan.example.com"]
 
 # The Node Gateway on this computer's local network too (on whenever the Node
