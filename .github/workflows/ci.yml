@@ -781,6 +781,12 @@ jobs:
           test -x "$HOME/nsh/bin/nsh"
           rm nsh.tar.gz
           echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
+      # `nsh package` builds the app for this machine too (its Linux
+      # desktop dependencies: GTK, GStreamer, Wayland) before the phone.
+      - name: Install Linux dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libgtk-4-dev clang pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
       - name: Install the nsh Android runtime
         run: nsh component add android
       - name: Cache cargo registry and dependencies

@@ -449,6 +449,14 @@ jobs:
           rm nsh.tar.gz
           echo "$HOME/nsh/bin" >> "$GITHUB_PATH"
 
+      # `nsh package` builds the app for this machine too (its Linux
+      # desktop dependencies: GTK, GStreamer, Wayland) before the phone.
+      - name: Install Linux dependencies
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libgtk-4-dev clang pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libwayland-dev
+
       - name: Package the app and publish it to Google Play
         if: env.ANDROID_KEYSTORE_BASE64 != ''
         env:
