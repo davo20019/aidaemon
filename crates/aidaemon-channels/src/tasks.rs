@@ -29,6 +29,7 @@ const MAX_RUNNING_TASK_AGE_SECS: i64 = 3600;
 
 /// A queued message waiting to be processed.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct QueuedMessage {
     /// Its id while it waits: what an app names to edit or remove it.
     pub id: u64,

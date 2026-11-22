@@ -158,19 +158,11 @@ fn parse(raw: &str) -> Option<MidRunReading> {
         _ => body,
     };
     let verdict: Verdict = serde_json::from_str(object).ok()?;
-    let plain = |intent| MidRunReading {
-        intent,
-        stop: Vec::new(),
-        also_asks: false,
-    };
+    let plain = MidRunReading::new;
     Some(match verdict.intent()? {
         Intent::AboutRunningWork => plain(MidRunIntent::AboutRunningWork),
         Intent::ChangesWork => plain(MidRunIntent::ChangesWork),
-        Intent::StopWork => MidRunReading {
-            stop: verdict.stop,
-            also_asks: verdict.also_asks,
-            ..plain(MidRunIntent::StopsWork)
-        },
+        Intent::StopWork => MidRunReading::stops(verdict.stop, verdict.also_asks),
         Intent::Unrelated => plain(MidRunIntent::Unrelated),
     })
 }
@@ -276,14 +268,7 @@ mod tests {
         let reading = read_mid_run_message(&gateway, "how's it going?", &work())
             .await
             .unwrap();
-        assert_eq!(
-            reading,
-            MidRunReading {
-                intent: MidRunIntent::AboutRunningWork,
-                stop: Vec::new(),
-                also_asks: false,
-            }
-        );
+        assert_eq!(reading, MidRunReading::new(MidRunIntent::AboutRunningWork));
         assert_eq!(
             ok_calls(&events, SideCall::MidRunMessage.spec().purpose).await,
             1

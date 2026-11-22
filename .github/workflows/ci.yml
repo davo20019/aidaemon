@@ -301,7 +301,17 @@ jobs:
               echo "::error::crates.io lookup for $crate returned HTTP $status"
               exit 1
             fi
-            cargo semver-checks check-release -p "$crate"
+            # The published 0.21.0 baselines ask for fastembed "7" without its
+            # `onig` feature, which 7.8 needs (tokenizers will not build
+            # otherwise), so every feature that pulls fastembed in is left
+            # out of both sides. Drop this once a release with fastembed 7.8
+            # is the baseline.
+            features="$(cargo metadata --no-deps --format-version 1 | jq -r --arg crate "$crate" \
+              '.packages[] | select(.name == $crate) | .features | keys[]
+               | select(. != "fastembed" and . != "runtime" and . != "full")' | paste -sd, -)"
+            args=(--only-explicit-features)
+            if [ -n "$features" ]; then args+=(--features "$features"); fi
+            cargo semver-checks check-release -p "$crate" "${args[@]}"
           done
 
   # Windows builds and passes the suite like macOS and Linux; a failure

@@ -188,8 +188,11 @@ pub struct RunningItem {
     pub run: Option<String>,
 }
 
-/// How a message sent mid-run is handled.
+/// How a message sent mid-run is handled. Built with [`MidRunReading::new`]
+/// or [`MidRunReading::stops`], so a field added later is not a breaking
+/// change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MidRunReading {
     pub intent: MidRunIntent,
     /// For [`MidRunIntent::StopsWork`]: the numbers of the
@@ -200,6 +203,28 @@ pub struct MidRunReading {
     /// besides stopping ("stop it and delete the project"), which then runs
     /// as its own turn once the work is stopped.
     pub also_asks: bool,
+}
+
+impl MidRunReading {
+    /// A reading of `intent` that stops nothing.
+    pub fn new(intent: MidRunIntent) -> Self {
+        Self {
+            intent,
+            stop: Vec::new(),
+            also_asks: false,
+        }
+    }
+
+    /// A [`MidRunIntent::StopsWork`] reading: the `stop` items to stop
+    /// (empty for what bare `/cancel` stops) and whether the message
+    /// `also_asks` for something besides stopping.
+    pub fn stops(stop: Vec<u64>, also_asks: bool) -> Self {
+        Self {
+            intent: MidRunIntent::StopsWork,
+            stop,
+            also_asks,
+        }
+    }
 }
 
 /// A sub-agent running for a chat, as `/status` and `/tasks` list it.
