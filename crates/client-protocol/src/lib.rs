@@ -3366,6 +3366,11 @@ pub struct PairingDecision {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct ChallengeRequest {
     pub device_id: String,
+    /// The endpoint key (64 hex digits) this device dials the daemon's
+    /// peer-to-peer address with, recorded once the sign-in verifies so
+    /// that address admits it. Absent from clients that have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3404,11 +3409,6 @@ pub struct AccessGrant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct DeviceInfo {
     pub device_id: String,
-    /// The endpoint key (64 hex digits) this device dials the daemon's
-    /// peer-to-peer address with, recorded once the sign-in verifies so
-    /// that address admits it. Absent from clients that have none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
     pub name: String,
     pub kind: ClientKind,
     pub scopes: Vec<Scope>,
