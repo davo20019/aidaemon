@@ -202,14 +202,27 @@ fn pair_elsewhere(store: Store) -> View {
     let link_text = signal(String::new());
     let name = signal(String::from(if link::MOBILE { "Phone" } else { "Desktop" }));
     let pairing = signal(None::<(String, Tone)>);
+    // One pairing at a time: a second (Connect tapped again, the link
+    // opened twice) would redeem a used code and be refused.
+    let busy = stored(false);
+    let owner = Owner::current();
     let pair = move || {
-        pairing.set(Some(("Pairing…".into(), Tone::Accent)));
-        spawn(async move {
-            let result =
-                link::pair_remote(store, link_text.get_untracked(), name.get_untracked()).await;
-            if let Err(why) = result {
-                let _ = pairing.try_set(Some((why, Tone::Danger)));
-            }
+        if busy.replace(true) {
+            return;
+        }
+        pairing.set(Some((
+            "Pairing… If your computer asks, approve this phone there.".into(),
+            Tone::Accent,
+        )));
+        owner.run(|| {
+            spawn(async move {
+                let result =
+                    link::pair_remote(store, link_text.get_untracked(), name.get_untracked()).await;
+                let _ = busy.try_with(|b| *b = false);
+                if let Err(why) = result {
+                    let _ = pairing.try_set(Some((why, Tone::Danger)));
+                }
+            })
         });
     };
     // An `aidaemon-pair:` link opened on this device (a QR code, a tapped

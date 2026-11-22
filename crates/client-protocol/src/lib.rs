@@ -3170,8 +3170,10 @@ pub const ALL_SCOPES: [Scope; 4] = [Scope::Observe, Scope::Chat, Scope::Approve,
 /// `POST /client/v1/pairing/offers`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct OfferRequest {
-    /// The chat where the owner confirms the device; `None` to confirm
-    /// with `POST /client/v1/pairing/offers/{id}/decision`.
+    /// The chat where the owner confirms the device; `None` for a code
+    /// shown on the owner's own screen, which pairs the device that redeems
+    /// it at once (older daemons: confirm with
+    /// `POST /client/v1/pairing/offers/{id}/decision`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_in_session: Option<String>,
 }

@@ -1720,19 +1720,16 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Pair a device, confirmed by the owner's decision call.
+    /// Pair a device from a code shown on the owner's screen: redeeming it
+    /// pairs at once.
     async fn pair(&self, scopes: Vec<Scope>) -> Device {
         let offer: PairingOffer = self
             .owner_post("/client/v1/pairing/offers", serde_json::json!({}))
             .await;
         let key = SigningKey::generate_from_rng(&mut rand::rng());
-        assert_eq!(self.redeem(&offer, &key, scopes).await.status(), 202);
-        let enrollment: Enrollment = self
-            .owner_post(
-                &format!("/client/v1/pairing/offers/{}/decision", offer.offer_id),
-                serde_json::json!({"approve": true}),
-            )
-            .await;
+        let response = self.redeem(&offer, &key, scopes).await;
+        assert_eq!(response.status(), 202);
+        let enrollment: Enrollment = response.json().await.unwrap();
         assert_eq!(enrollment.state, EnrollmentState::Approved);
         Device {
             key,
@@ -2024,31 +2021,10 @@ async fn the_client_core_pairs_and_signs_in_with_a_device_key() {
         device_kind: ClientKind::Desktop,
         fingerprint: Some(offer.fingerprint.clone()),
     };
-    let pairing = tokio::spawn(async move {
-        signin::pair(&reqwest::Client::new(), &request, Duration::from_millis(20)).await
-    });
-    // The owner confirms once the device has redeemed the offer.
-    let mut decided = false;
-    for _ in 0..200 {
-        let response = f
-            .http()
-            .post(format!(
-                "{base}/client/v1/pairing/offers/{}/decision",
-                offer.offer_id
-            ))
-            .bearer_auth(&f.token)
-            .json(&serde_json::json!({"approve": true}))
-            .send()
-            .await
-            .unwrap();
-        if response.status().is_success() {
-            decided = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(decided, "the offer was never redeemed");
-    let device = pairing.await.unwrap().unwrap();
+    // A code shown on the owner's screen pairs without asking.
+    let device = signin::pair(&reqwest::Client::new(), &request, Duration::from_millis(20))
+        .await
+        .unwrap();
     assert_eq!(device.gateway, base);
 
     // A direct sign-in gets a grant for this device.

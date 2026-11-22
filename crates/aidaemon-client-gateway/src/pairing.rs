@@ -8,7 +8,7 @@
 //! the device's scopes and risk ceiling. Revoking a device ends its tokens
 //! and its open sockets at once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -113,6 +113,10 @@ pub struct Pairing {
     /// The daemon's peer-to-peer address (`iroh://…`), put in offer links
     /// beside `public_url` once remote access is up.
     remote_url: Mutex<Option<String>>,
+    /// Offers shown on the owner's own screen ([`Self::offer_shown_here`]):
+    /// redeeming one pairs at once. Kept in memory only: after a restart
+    /// such an offer asks like any other.
+    shown_here: Mutex<HashSet<String>>,
     fingerprint: String,
     access: Mutex<HashMap<String, Access>>,
     challenges: Mutex<HashMap<String, PendingChallenge>>,
@@ -247,6 +251,7 @@ impl Pairing {
             approvals,
             public_url,
             remote_url: Mutex::default(),
+            shown_here: Mutex::default(),
             fingerprint,
             access: Mutex::default(),
             challenges: Mutex::default(),
@@ -318,8 +323,21 @@ impl Pairing {
         })
     }
 
-    /// A device redeems an offer. The owner is then asked; the device polls
-    /// [`Self::enrollment`].
+    /// An offer for the owner's own screen (the desktop app's QR code,
+    /// `aidaemon pair`): whoever redeems it is paired at once, since only
+    /// the owner at this computer can show it and the code never leaves the
+    /// screen. Offers sent through a chat ask there instead.
+    pub async fn offer_shown_here(&self) -> Result<PairingOffer, ProtocolError> {
+        let offer = self.offer(None).await?;
+        self.shown_here
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(offer.offer_id.clone());
+        Ok(offer)
+    }
+
+    /// A device redeems an offer. The owner is then asked (unless the offer
+    /// was shown on their screen); the device polls [`Self::enrollment`].
     pub async fn redeem(
         self: &std::sync::Arc<Self>,
         request: RedeemRequest,
@@ -369,6 +387,15 @@ impl Pairing {
             .await
             .map_err(internal)?
             .ok_or_else(|| not_found("No such offer"))?;
+        let shown_here = self
+            .shown_here
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&request.offer_id);
+        if shown_here {
+            info!(offer_id = %request.offer_id, "Paired from a code shown on the owner's screen");
+            return self.decide(&request.offer_id, true).await;
+        }
         if let Some(session) = row.origin_session.clone() {
             let pairing = self.clone();
             tokio::spawn(async move { pairing.confirm_in_chat(row, session).await });

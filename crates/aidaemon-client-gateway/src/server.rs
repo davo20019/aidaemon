@@ -338,7 +338,12 @@ async fn create_offer(
             Err(refused) => return refused,
         }
     };
-    reply(gateway.pairing.offer(request.confirm_in_session).await)
+    // Without a chat to confirm in, the offer is the owner's at this
+    // computer (only the local token makes one): it pairs when redeemed.
+    reply(match request.confirm_in_session {
+        Some(session) => gateway.pairing.offer(Some(session)).await,
+        None => gateway.pairing.offer_shown_here().await,
+    })
 }
 
 async fn offer_status(

@@ -4832,7 +4832,7 @@
       "description": "The owner's offer to pair a device (owner only:\n`POST /client/v1/pairing/offers`).",
       "properties": {
         "confirm_in_session": {
-          "description": "The chat where the owner confirms the device; `None` to confirm\nwith `POST /client/v1/pairing/offers/{id}/decision`.",
+          "description": "The chat where the owner confirms the device; `None` for a code\nshown on the owner's own screen, which pairs the device that redeems\nit at once (older daemons: confirm with\n`POST /client/v1/pairing/offers/{id}/decision`).",
           "type": [
             "string",
             "null"
