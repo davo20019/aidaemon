@@ -2775,3 +2775,124 @@ async fn another_computer_shares_its_screen_and_the_owner_drives_it() {
         "the computer is told"
     );
 }
+
+/// Opening a conversation shell, typing into it on its socket and reading
+/// what it writes; a device that may not answer approvals is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_conversation_shell_opens_on_its_socket_and_only_for_a_trusted_device() {
+    use aidaemon_client_protocol::shell::{ShellClientMessage, ShellServerMessage};
+
+    let f = fixture(RiskLevel::Medium).await;
+    let shells = aidaemon_shells::ShellRegistry::new(aidaemon_shells::ShellsConfig::default());
+    f.gateway.attach_shells(shells.clone());
+
+    let mut main = socket_with(&f, vec![Capability::Shells]).await;
+    let (result, _) = command_on(
+        &mut main,
+        &command(
+            "sh-1",
+            Command::OpenShell {
+                session_id: "app:shell-test".into(),
+                cols: 80,
+                rows: 24,
+            },
+        ),
+    )
+    .await;
+    let CommandResult::ShellOpened { shell, transport } = result else {
+        panic!("expected shell_opened, got {result:?}");
+    };
+    assert_eq!(shell.session_id, "app:shell-test");
+    assert!(transport.url.starts_with("/client/v1/shells/"));
+
+    let (mut term, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}{}", f.url, transport.url))
+            .await
+            .unwrap();
+    let say = |m: ShellClientMessage| Message::text(serde_json::to_string(&m).unwrap());
+    term.send(say(ShellClientMessage::Auth {
+        ticket: transport.ticket.clone(),
+    }))
+    .await
+    .unwrap();
+    term.send(say(ShellClientMessage::Input {
+        data: "printf 'sum:%s\\n' $((40+2))\n".into(),
+    }))
+    .await
+    .unwrap();
+    let mut seen = String::new();
+    let mut ready = false;
+    let read = tokio::time::timeout(Duration::from_secs(30), async {
+        while !seen.contains("sum:42") {
+            let text = match term.next().await {
+                Some(Ok(Message::Text(text))) => text,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                other => panic!("the shell socket closed ({other:?}); it wrote {seen:?}"),
+            };
+            match serde_json::from_str::<ShellServerMessage>(&text).unwrap() {
+                ShellServerMessage::Ready { .. } => ready = true,
+                ShellServerMessage::Output { data } => seen.push_str(&data),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(read.is_ok(), "no output; saw {seen:?}");
+    assert!(ready, "ready comes first");
+
+    // The ticket was single use.
+    let (mut again, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}{}", f.url, transport.url))
+            .await
+            .unwrap();
+    again
+        .send(say(ShellClientMessage::Auth {
+            ticket: transport.ticket,
+        }))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(text))) = again.next().await else {
+        panic!("expected a refusal");
+    };
+    assert!(matches!(
+        serde_json::from_str::<ShellServerMessage>(&text).unwrap(),
+        ShellServerMessage::Closed { .. }
+    ));
+
+    // A phone that may chat and approve but not control: refused.
+    let phone = f
+        .pair(vec![Scope::Observe, Scope::Chat, Scope::Approve])
+        .await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let refused = f
+        .post_as(
+            &grant.access_token,
+            &command(
+                "sh-2",
+                Command::OpenShell {
+                    session_id: "app:shell-test".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+            ),
+        )
+        .await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+
+    // Closing it ends it.
+    let (_, _) = command_on(
+        &mut main,
+        &command(
+            "sh-3",
+            Command::CloseShell {
+                shell_id: shell.id.clone(),
+            },
+        ),
+    )
+    .await;
+    assert!(shells.list().is_empty());
+}

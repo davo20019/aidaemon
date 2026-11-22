@@ -714,6 +714,26 @@ impl Pairing {
             .map_or_else(|| principal.may(scope), |a| a.principal.may(scope))
     }
 
+    /// Whether `principal` may use a shell on this computer now: it may
+    /// control and approve, with no risk ceiling. A device that may allow
+    /// any command the agent asks to run may type one itself; one that may
+    /// not, may not.
+    pub fn may_shell_now(&self, principal: &Principal) -> bool {
+        let may =
+            |p: &Principal| p.may(Scope::Control) && p.may(Scope::Approve) && p.ceiling.is_none();
+        let Some(device_id) = principal.device_id.as_deref() else {
+            return may(principal);
+        };
+        if principal.revoked.is_cancelled() {
+            return false;
+        }
+        let access = self.access.lock().unwrap_or_else(|p| p.into_inner());
+        access
+            .values()
+            .find(|a| a.principal.device_id.as_deref() == Some(device_id))
+            .map_or_else(|| may(principal), |a| may(&a.principal))
+    }
+
     /// Revoke a device: its tokens stop working and its sockets close now.
     pub async fn revoke(&self, device_id: &str) -> Result<bool, ProtocolError> {
         let revoked = self

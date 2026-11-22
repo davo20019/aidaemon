@@ -686,6 +686,11 @@
           "const": "surfaces",
           "description": "Live surfaces (protocol 1.30): `snapshot.surfaces`,\n`surface_updated` and `surface_closed` events, and the surface\ncommands. Watching and controlling a surface also needs\n[`Scope::Control`].",
           "type": "string"
+        },
+        {
+          "const": "shells",
+          "description": "Conversation shells (protocol 1.42): `snapshot.shells`,\n`shell_updated` and `shell_closed` events, and the shell commands.\nOpening one also needs [`Scope::Control`] and a device that may\nanswer every approval.",
+          "type": "string"
         }
       ]
     },
@@ -2114,6 +2119,54 @@
           "type": "object"
         },
         {
+          "description": "The conversation's shell, started in its folder when none runs\n(protocol 1.42, capability `shells`; scope `control` and a device\nthat may answer every approval). `cols` and `rows` are the\nterminal's size in cells. Answers with `shell_opened`: where to\nconnect for its output.",
+          "properties": {
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "open_shell",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "End a conversation's shell (protocol 1.42). Answers with `reply`;\n`shell_closed` follows.",
+          "properties": {
+            "shell_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "close_shell",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "shell_id"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Take control of a surface (protocol 1.30; scope `control`).\nAnswers with `surface_control`.",
           "properties": {
             "surface_id": {
@@ -2818,6 +2871,27 @@
           "required": [
             "type",
             "surface"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`open_shell` (protocol 1.42): connect to `transport`.",
+          "properties": {
+            "shell": {
+              "$ref": "#/$defs/ShellInfo"
+            },
+            "transport": {
+              "$ref": "#/$defs/ShellTransport"
+            },
+            "type": {
+              "const": "shell_opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "shell",
+            "transport"
           ],
           "type": "object"
         },
@@ -3674,6 +3748,44 @@
           "required": [
             "type",
             "surface_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral, capability `shells` (protocol 1.42): a shell started,\nwas retitled or ended.",
+          "properties": {
+            "shell": {
+              "$ref": "#/$defs/ShellInfo"
+            },
+            "type": {
+              "const": "shell_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "shell"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral, capability `shells` (protocol 1.42): a shell is gone.",
+          "properties": {
+            "session_id": {
+              "type": "string"
+            },
+            "shell_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "shell_closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "shell_id",
+            "session_id"
           ],
           "type": "object"
         }
@@ -6711,6 +6823,234 @@
         }
       ]
     },
+    "ShellClientMessage": {
+      "description": "What the client sends.",
+      "oneOf": [
+        {
+          "description": "First, and only first.",
+          "properties": {
+            "ticket": {
+              "type": "string"
+            },
+            "type": {
+              "const": "auth",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ticket"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "What the owner typed or pasted, and the terminal's answers to the\nprogram's queries.",
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "type": {
+              "const": "input",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The terminal's size in cells changed.",
+          "properties": {
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "resize",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ShellInfo": {
+      "description": "A conversation's shell (protocol 1.42): a terminal on the daemon's\ncomputer, started in the conversation's folder, that the owner and the\nagent share.",
+      "properties": {
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exit_code": {
+          "description": "Absent while it runs; its exit code once it ended.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "folder": {
+          "description": "The folder it started in.",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "description": "What the program called its window; show it as data.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "session_id",
+        "folder",
+        "cols",
+        "rows",
+        "started_at_ms"
+      ],
+      "type": "object"
+    },
+    "ShellServerMessage": {
+      "description": "What the server sends.",
+      "oneOf": [
+        {
+          "description": "The ticket was good: output follows.",
+          "properties": {
+            "shell": {
+              "$ref": "#/$defs/ShellInfo"
+            },
+            "type": {
+              "const": "ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "shell"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "What the shell wrote, to write into the terminal as it is.",
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "type": {
+              "const": "output",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Clear the terminal: the output so far comes next.",
+          "properties": {
+            "type": {
+              "const": "reset",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The shell's program ended.",
+          "properties": {
+            "exit_code": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The socket closes, and why.",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "const": "closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ShellTransport": {
+      "description": "Where a client connects for a shell's output (protocol 1.42); see\n[`shell`].",
+      "properties": {
+        "ticket": {
+          "description": "Sent as the first message on the socket, never in the URL. Single\nuse, short lived, bound to this device and shell.",
+          "type": "string"
+        },
+        "url": {
+          "description": "A path on the gateway's own origin.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "ticket"
+      ],
+      "type": "object"
+    },
     "SignIn": {
       "description": "A subscription sign-in waiting for the owner.",
       "properties": {
@@ -6771,6 +7111,13 @@
         "sessions": {
           "items": {
             "$ref": "#/$defs/SessionSummary"
+          },
+          "type": "array"
+        },
+        "shells": {
+          "description": "Conversation shells (protocol 1.42, capability `shells`).",
+          "items": {
+            "$ref": "#/$defs/ShellInfo"
           },
           "type": "array"
         },

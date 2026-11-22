@@ -1,0 +1,10 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "session_id": "app:6c1f",
+    "shell_id": "sh_4b2e",
+    "type": "shell_closed"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

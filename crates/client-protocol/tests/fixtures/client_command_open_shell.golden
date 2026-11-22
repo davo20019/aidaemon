@@ -1,0 +1,10 @@
+{
+  "command": {
+    "cols": 100,
+    "rows": 30,
+    "session_id": "app:6c1f",
+    "type": "open_shell"
+  },
+  "request_id": "5d0c2b1e-0061",
+  "type": "command"
+}

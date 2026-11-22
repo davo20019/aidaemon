@@ -838,6 +838,10 @@ impl ClientHost for DaemonClientHost {
         super::client_changes::session_changes(&self.system.pool, session_id).await
     }
 
+    async fn shell_folder(&self, session_id: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
+        super::shells::session_folder(self.state.as_ref(), session_id).await
+    }
+
     async fn settings(&self) -> anyhow::Result<Option<aidaemon_client_protocol::Settings>> {
         self.settings.settings().await.map(Some)
     }
@@ -1272,6 +1276,9 @@ pub async fn start(
     .await?;
     if config.surfaces.enabled {
         gateway.attach_surfaces(crate::startup::surfaces::registry(config));
+    }
+    if config.shells.enabled {
+        gateway.attach_shells(crate::startup::shells::registry(config));
     }
     let _ = GATEWAY.set(gateway.clone());
     tokio::spawn(async move {

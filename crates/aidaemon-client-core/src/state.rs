@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use aidaemon_client_protocol::{
     Approval, AttachmentRef, CommandResult, ErrorCode, Event, Feature, HistoryMessage,
-    ProjectSummary, ServedBy, ServerFrame, SessionSummary, SetupState, Snapshot, SurfaceInfo,
-    TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
+    ProjectSummary, ServedBy, ServerFrame, SessionSummary, SetupState, ShellInfo, Snapshot,
+    SurfaceInfo, TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -135,6 +135,10 @@ pub struct State {
     /// screens the agent works on that the owner can watch or control.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub surfaces: BTreeMap<String, SurfaceInfo>,
+    /// Conversation shells, by conversation (protocol 1.42, capability
+    /// `shells`): one per conversation at most.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shells: BTreeMap<String, ShellInfo>,
 }
 
 /// The agent needs a feature that is off.
@@ -219,6 +223,11 @@ impl State {
             .surfaces
             .into_iter()
             .map(|surface| (surface.id.clone(), surface))
+            .collect();
+        self.shells = state
+            .shells
+            .into_iter()
+            .map(|shell| (shell.session_id.clone(), shell))
             .collect();
         for summary in state.sessions {
             let id = summary.id.clone();
@@ -439,6 +448,21 @@ impl State {
             }
             Event::SurfaceClosed { surface_id } => {
                 self.surfaces.remove(&surface_id);
+            }
+            Event::ShellUpdated { shell } => {
+                self.shells.insert(shell.session_id.clone(), shell);
+            }
+            Event::ShellClosed {
+                shell_id,
+                session_id,
+            } => {
+                if self
+                    .shells
+                    .get(&session_id)
+                    .is_some_and(|shell| shell.id == shell_id)
+                {
+                    self.shells.remove(&session_id);
+                }
             }
             Event::TurnStarted {
                 turn_id,

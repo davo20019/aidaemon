@@ -72,6 +72,10 @@ pub fn router(gateway: Arc<ClientGateway>) -> Router {
             get(crate::surfaces::media_socket),
         )
         .route(
+            "/client/v1/shells/{shell_id}/ws",
+            get(crate::shells::shell_socket),
+        )
+        .route(
             "/client/v1/surfaces/provide/{surface_id}/ws",
             get(crate::surfaces::provider_socket),
         )
@@ -260,6 +264,9 @@ fn server_capabilities(gateway: &ClientGateway) -> Vec<Capability> {
     let mut offered = vec![Capability::Compact, Capability::ViewActions];
     if gateway.surface_desk().is_some() {
         offered.push(Capability::Surfaces);
+    }
+    if gateway.shell_desk().is_some() {
+        offered.push(Capability::Shells);
     }
     offered
 }
@@ -745,8 +752,9 @@ async fn http_events(
         Some(since) if gateway.bus.can_resume(since).await => since,
         _ => {
             let (seq, mut state) = gateway.snapshot().await;
-            // The HTTP mode has no live surfaces.
+            // The HTTP mode has no live surfaces or shells.
             state.surfaces.clear();
+            state.shells.clear();
             let frame = ServerFrame::Snapshot { seq, state };
             let frames = fit(&frame, caller.compact).into_iter().collect();
             return Json(EventsPage {
@@ -898,6 +906,9 @@ async fn run_socket(
     let wants_surfaces = capabilities.contains(&Capability::Surfaces)
         && gateway.surface_desk().is_some()
         && gateway.pairing.may_now(&caller.principal, Scope::Control);
+    let wants_shells = capabilities.contains(&Capability::Shells)
+        && gateway.shell_desk().is_some()
+        && gateway.pairing.may_shell_now(&caller.principal);
 
     // Subscribe before reading the log, so nothing falls between them.
     let mut live = gateway.bus.subscribe();
@@ -923,6 +934,9 @@ async fn run_socket(
             let (seq, mut state) = gateway.snapshot().await;
             if !wants_surfaces {
                 state.surfaces.clear();
+            }
+            if !wants_shells {
+                state.shells.clear();
             }
             if let Some(frame) = fit(&ServerFrame::Snapshot { seq, state }, caller.compact) {
                 send(&mut socket, &frame).await?;
@@ -1032,6 +1046,14 @@ async fn run_socket(
                         ..
                     } = &*frame
                         && !wants_surfaces
+                    {
+                        continue;
+                    }
+                    if let ServerFrame::Event {
+                        event: Event::ShellUpdated { .. } | Event::ShellClosed { .. },
+                        ..
+                    } = &*frame
+                        && !wants_shells
                     {
                         continue;
                     }

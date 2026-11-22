@@ -1,0 +1,20 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "shell": {
+      "cols": 100,
+      "folder": "/home/synthetic/acme",
+      "id": "sh_4b2e",
+      "rows": 30,
+      "session_id": "app:6c1f",
+      "started_at_ms": 1767225600000,
+      "title": "acme"
+    },
+    "transport": {
+      "ticket": "tkt_synthetic_0003",
+      "url": "/client/v1/shells/sh_4b2e/ws"
+    },
+    "type": "shell_opened"
+  },
+  "type": "ack"
+}

@@ -289,6 +289,10 @@ pub struct AppConfig {
     /// paired app (`[surfaces]`).
     #[serde(default)]
     pub surfaces: SurfacesSettings,
+    /// Conversation shells: a terminal per conversation in the owner's
+    /// apps, shared with the agent (`[shells]`).
+    #[serde(default)]
+    pub shells: ShellsSettings,
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
@@ -1576,6 +1580,43 @@ impl Default for BrowserConfig {
 }
 
 pub use aidaemon_runtime::settings::ComputerUseConfig;
+
+/// `[shells]`: a terminal per conversation, started in its project's
+/// folder, that the owner opens from an app and the agent can read. A
+/// shell ends when closed, when its program exits or when its conversation
+/// is archived, never on a clock.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ShellsSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Shells running at once, across conversations.
+    #[serde(default = "default_max_shells")]
+    pub max_shells: usize,
+}
+
+fn default_max_shells() -> usize {
+    16
+}
+
+impl Default for ShellsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_shells: default_max_shells(),
+        }
+    }
+}
+
+impl ShellsSettings {
+    /// What the shell registry runs with.
+    pub fn registry_config(&self) -> aidaemon_shells::ShellsConfig {
+        aidaemon_shells::ShellsConfig {
+            enabled: self.enabled,
+            max_shells: self.max_shells.clamp(1, 64),
+            ..aidaemon_shells::ShellsConfig::default()
+        }
+    }
+}
 
 /// `[surfaces]`: the screens the agent works on (its browser tabs), which
 /// the owner can watch and control from a paired app. Every limit on a

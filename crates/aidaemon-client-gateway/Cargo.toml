@@ -23,6 +23,7 @@ aidaemon-core = { version = "0.21.0", path = "../aidaemon-core" }
 aidaemon-events = { version = "0.21.0", path = "../aidaemon-events" }
 aidaemon-store-sqlite = { version = "0.21.0", path = "../aidaemon-store-sqlite", features = ["client-events"] }
 aidaemon-surfaces = { version = "0.21.0", path = "../aidaemon-surfaces" }
+aidaemon-shells = { version = "0.21.0", path = "../aidaemon-shells" }
 aidaemon-tools = { version = "0.21.0", path = "../aidaemon-tools" }
 anyhow = "1"
 async-trait = "0.1"

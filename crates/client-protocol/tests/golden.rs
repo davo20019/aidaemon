@@ -158,6 +158,19 @@ fn surface() -> SurfaceInfo {
     }
 }
 
+fn shell() -> ShellInfo {
+    ShellInfo {
+        id: "sh_4b2e".into(),
+        session_id: "app:6c1f".into(),
+        folder: "/home/synthetic/acme".into(),
+        title: "acme".into(),
+        cols: 100,
+        rows: 30,
+        exit_code: None,
+        started_at_ms: 1_767_225_600_000,
+    }
+}
+
 fn snapshot() -> Snapshot {
     Snapshot {
         sessions: vec![session()],
@@ -182,6 +195,7 @@ fn snapshot() -> Snapshot {
             }],
         }],
         surfaces: vec![surface()],
+        shells: vec![shell()],
     }
 }
 
@@ -238,6 +252,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::ListSurfaces => "list_surfaces",
         Command::OpenSurface { .. } => "open_surface",
         Command::CloseSurface { .. } => "close_surface",
+        Command::OpenShell { .. } => "open_shell",
+        Command::CloseShell { .. } => "close_shell",
         Command::TakeControl { .. } => "take_control",
         Command::ReleaseControl { .. } => "release_control",
         Command::PointAt { .. } => "point_at",
@@ -290,6 +306,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::Surfaces { .. } => "surfaces",
         CommandResult::SurfaceOpened { .. } => "surface_opened",
         CommandResult::SurfaceControl { .. } => "surface_control",
+        CommandResult::ShellOpened { .. } => "shell_opened",
         CommandResult::ScreenShared { .. } => "screen_shared",
         CommandResult::Devices { .. } => "devices",
         CommandResult::Unknown => "unknown",
@@ -593,6 +610,20 @@ fn client_samples() -> Vec<ClientFrame> {
             },
         ),
         command(
+            "5d0c2b1e-0061",
+            Command::OpenShell {
+                session_id: "app:6c1f".into(),
+                cols: 100,
+                rows: 30,
+            },
+        ),
+        command(
+            "5d0c2b1e-0062",
+            Command::CloseShell {
+                shell_id: "sh_4b2e".into(),
+            },
+        ),
+        command(
             "5d0c2b1e-0029",
             Command::TakeControl {
                 surface_id: "srf_7d1c".into(),
@@ -859,6 +890,22 @@ fn server_samples() -> Vec<ServerFrame> {
             None,
             Event::SurfaceClosed {
                 surface_id: "srf_7d1c".into(),
+            },
+        ),
+        event(
+            None,
+            Event::ShellUpdated {
+                shell: ShellInfo {
+                    exit_code: Some(0),
+                    ..shell()
+                },
+            },
+        ),
+        event(
+            None,
+            Event::ShellClosed {
+                shell_id: "sh_4b2e".into(),
+                session_id: "app:6c1f".into(),
             },
         ),
         ack(CommandResult::MessageAccepted {
@@ -1393,6 +1440,13 @@ fn server_samples() -> Vec<ServerFrame> {
                 ticket: "tkt_synthetic_0001".into(),
                 codecs: vec!["jpeg".into()],
             }],
+        }),
+        ack(CommandResult::ShellOpened {
+            shell: shell(),
+            transport: ShellTransport {
+                url: "/client/v1/shells/sh_4b2e/ws".into(),
+                ticket: "tkt_synthetic_0003".into(),
+            },
         }),
         ack(CommandResult::SurfaceControl {
             surface: SurfaceInfo {

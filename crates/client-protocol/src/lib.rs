@@ -33,11 +33,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod media;
+pub mod shell;
 
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 41;
+pub const PROTOCOL_MINOR: u16 = 42;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -206,6 +207,11 @@ pub enum Capability {
     /// commands. Watching and controlling a surface also needs
     /// [`Scope::Control`].
     Surfaces,
+    /// Conversation shells (protocol 1.42): `snapshot.shells`,
+    /// `shell_updated` and `shell_closed` events, and the shell commands.
+    /// Opening one also needs [`Scope::Control`] and a device that may
+    /// answer every approval.
+    Shells,
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -491,6 +497,19 @@ pub enum Command {
     },
     /// Stop watching (protocol 1.30). Answers with `reply`.
     CloseSurface { live_id: String },
+    /// The conversation's shell, started in its folder when none runs
+    /// (protocol 1.42, capability `shells`; scope `control` and a device
+    /// that may answer every approval). `cols` and `rows` are the
+    /// terminal's size in cells. Answers with `shell_opened`: where to
+    /// connect for its output.
+    OpenShell {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// End a conversation's shell (protocol 1.42). Answers with `reply`;
+    /// `shell_closed` follows.
+    CloseShell { shell_id: String },
     /// Take control of a surface (protocol 1.30; scope `control`).
     /// Answers with `surface_control`.
     TakeControl { surface_id: String },
@@ -654,6 +673,37 @@ pub enum TransportKind {
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
+}
+
+/// A conversation's shell (protocol 1.42): a terminal on the daemon's
+/// computer, started in the conversation's folder, that the owner and the
+/// agent share.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ShellInfo {
+    pub id: String,
+    pub session_id: String,
+    /// The folder it started in.
+    pub folder: String,
+    /// What the program called its window; show it as data.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// Absent while it runs; its exit code once it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    pub started_at_ms: u64,
+}
+
+/// Where a client connects for a shell's output (protocol 1.42); see
+/// [`shell`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ShellTransport {
+    /// A path on the gateway's own origin.
+    pub url: String,
+    /// Sent as the first message on the socket, never in the URL. Single
+    /// use, short lived, bound to this device and shell.
+    pub ticket: String,
 }
 
 /// The model a conversation answers with (protocol 1.16).
@@ -916,6 +966,11 @@ pub enum CommandResult {
     /// as it is after.
     SurfaceControl {
         surface: SurfaceInfo,
+    },
+    /// `open_shell` (protocol 1.42): connect to `transport`.
+    ShellOpened {
+        shell: ShellInfo,
+        transport: ShellTransport,
     },
     /// `share_screen` (protocol 1.31): connect to `url` (a path on the
     /// gateway) and send `ticket` first.
@@ -2134,6 +2189,16 @@ pub enum Event {
     SurfaceClosed {
         surface_id: String,
     },
+    /// Ephemeral, capability `shells` (protocol 1.42): a shell started,
+    /// was retitled or ended.
+    ShellUpdated {
+        shell: ShellInfo,
+    },
+    /// Ephemeral, capability `shells` (protocol 1.42): a shell is gone.
+    ShellClosed {
+        shell_id: String,
+        session_id: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -2151,6 +2216,8 @@ impl Event {
                 | Event::SetupUpdated { .. }
                 | Event::SurfaceUpdated { .. }
                 | Event::SurfaceClosed { .. }
+                | Event::ShellUpdated { .. }
+                | Event::ShellClosed { .. }
         )
     }
 
@@ -2178,6 +2245,8 @@ impl Event {
             Event::FeatureRequested { .. } => "feature_requested",
             Event::SurfaceUpdated { .. } => "surface_updated",
             Event::SurfaceClosed { .. } => "surface_closed",
+            Event::ShellUpdated { .. } => "shell_updated",
+            Event::ShellClosed { .. } => "shell_closed",
             Event::Unknown => "unknown",
         }
     }
@@ -2789,6 +2858,9 @@ pub struct Snapshot {
     /// Live surfaces (protocol 1.30, capability `surfaces`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<SurfaceInfo>,
+    /// Conversation shells (protocol 1.42, capability `shells`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<ShellInfo>,
 }
 
 /// A running turn as far as it has got: the text streamed so far, what it
@@ -3242,6 +3314,8 @@ pub fn schema() -> serde_json::Value {
     let _ = generator.subschema_for::<media::MediaHeader>();
     let _ = generator.subschema_for::<media::MediaClientMessage>();
     let _ = generator.subschema_for::<media::ProviderCommand>();
+    let _ = generator.subschema_for::<shell::ShellClientMessage>();
+    let _ = generator.subschema_for::<shell::ShellServerMessage>();
     let mut defs = serde_json::Value::Object(generator.take_definitions(true));
     drop_empty_alternatives(&mut defs);
     serde_json::json!({

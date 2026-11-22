@@ -296,6 +296,7 @@ dependencies = [
  "aidaemon-client-protocol",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-shells",
  "aidaemon-store-sqlite",
  "aidaemon-surfaces",
  "aidaemon-tools",

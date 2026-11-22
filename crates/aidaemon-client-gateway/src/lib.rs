@@ -56,6 +56,7 @@ pub mod project_files;
 pub mod remote_screens;
 mod server;
 pub mod setup;
+pub mod shells;
 pub mod surfaces;
 pub mod token;
 pub mod views;
@@ -145,6 +146,12 @@ pub trait ClientHost: Send + Sync {
     /// `session_id` worked in; empty when it worked in none.
     async fn changes(&self, _session_id: &str) -> anyhow::Result<SessionChanges> {
         Ok(SessionChanges::default())
+    }
+
+    /// The folder conversation `session_id`'s shell starts in (its
+    /// project's); `None`: the owner's home folder.
+    async fn shell_folder(&self, _session_id: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
+        Ok(None)
     }
 
     /// Name conversation `session_id` (`None` or blank: back to the name
@@ -473,6 +480,8 @@ pub struct ClientGateway {
     pub(crate) files: Option<Arc<files::FileStore>>,
     /// Live surfaces, once the daemon attaches its registry.
     pub(crate) surfaces: std::sync::OnceLock<Arc<surfaces::SurfaceDesk>>,
+    /// Conversation shells, once the daemon attaches its registry.
+    pub(crate) shells: std::sync::OnceLock<Arc<shells::ShellDesk>>,
 }
 
 impl ClientGateway {
@@ -618,6 +627,7 @@ impl ClientGateway {
             in_flight: Mutex::default(),
             files: deps.files,
             surfaces: std::sync::OnceLock::new(),
+            shells: std::sync::OnceLock::new(),
         });
         let upkeep = Arc::downgrade(&gateway);
         tokio::spawn(async move {
@@ -675,6 +685,20 @@ impl ClientGateway {
         if self.surfaces.set(desk.clone()).is_ok() {
             desk.spawn_pump(self.publisher.clone(), self.views.clone());
         }
+    }
+
+    /// Offer conversation shells to the owner's apps (protocol 1.42):
+    /// their events, the shell commands and the shell socket. Once only.
+    pub fn attach_shells(&self, registry: aidaemon_shells::ShellRegistry) {
+        let desk = shells::ShellDesk::new(registry);
+        if self.shells.set(desk.clone()).is_ok() {
+            desk.spawn_pump(self.publisher.clone());
+        }
+    }
+
+    /// The shells desk, when shells are attached and turned on.
+    pub(crate) fn shell_desk(&self) -> Option<Arc<shells::ShellDesk>> {
+        self.shells.get().filter(|desk| desk.enabled()).cloned()
     }
 
     /// The surfaces desk, when surfaces are attached and turned on.
@@ -863,6 +887,8 @@ impl ClientGateway {
             | Command::CloseSurface { .. }
             | Command::TakeControl { .. }
             | Command::ReleaseControl { .. } => Some(Scope::Control),
+            // A shell runs anything here: checked below, beyond a scope.
+            Command::OpenShell { .. } | Command::CloseShell { .. } => Some(Scope::Control),
             Command::Unknown => None,
         };
         if let Some(scope) = needs
@@ -871,6 +897,16 @@ impl ClientGateway {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 format!("This device may not {scope:?}"),
+            ));
+        }
+        if matches!(
+            command,
+            Command::OpenShell { .. } | Command::CloseShell { .. }
+        ) && !self.pairing.may_shell_now(&caller.principal)
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "Only a device that may answer every approval may use a shell",
             ));
         }
         // A setup step can connect a chat bot (a new way in, with an owner
@@ -934,6 +970,9 @@ impl ClientGateway {
                     .await
                     .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
                 self.publish_session(&session_id).await;
+                if archived && let Some(desk) = self.shells.get() {
+                    desk.registry().close_session(&session_id);
+                }
                 Ok(CommandResult::Reply {
                     text: if archived { "Archived" } else { "Brought back" }.to_string(),
                 })
@@ -1094,6 +1133,9 @@ impl ClientGateway {
                 let (seq, mut state) = self.snapshot().await;
                 if !self.pairing.may_now(&caller.principal, Scope::Control) {
                     state.surfaces.clear();
+                }
+                if !self.pairing.may_shell_now(&caller.principal) {
+                    state.shells.clear();
                 }
                 Ok(CommandResult::Snapshot { seq, state })
             }
@@ -1473,6 +1515,33 @@ impl ClientGateway {
                     .open(&caller.principal, surface_id, mode, accept)
                     .await
             }
+            Command::OpenShell {
+                session_id,
+                cols,
+                rows,
+            } => {
+                let desk = self.shell_desk().ok_or_else(|| {
+                    ProtocolError::new(ErrorCode::Forbidden, "Shells are turned off")
+                })?;
+                let folder = match self.host.shell_folder(&session_id).await {
+                    Ok(Some(folder)) => folder,
+                    Ok(None) => dirs::home_dir().ok_or_else(|| {
+                        ProtocolError::new(ErrorCode::Internal, "No home folder for the shell")
+                    })?,
+                    Err(error) => {
+                        warn!(%error, "Finding a conversation's folder failed");
+                        return Err(ProtocolError::new(
+                            ErrorCode::Internal,
+                            "Could not find the conversation's folder",
+                        ));
+                    }
+                };
+                desk.open(&caller.principal, &session_id, &folder, cols, rows)
+            }
+            Command::CloseShell { shell_id } => self
+                .shell_desk()
+                .ok_or_else(|| ProtocolError::new(ErrorCode::Forbidden, "Shells are turned off"))?
+                .close(&shell_id),
             Command::CloseSurface { live_id } => {
                 self.need_surfaces()?.close(&caller.principal, &live_id)
             }
@@ -2203,6 +2272,10 @@ impl ClientGateway {
                 live_turns: self.live_turns(),
                 surfaces: self
                     .surface_desk()
+                    .map(|desk| desk.list())
+                    .unwrap_or_default(),
+                shells: self
+                    .shell_desk()
                     .map(|desk| desk.list())
                     .unwrap_or_default(),
             },
