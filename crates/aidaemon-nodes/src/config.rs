@@ -180,12 +180,12 @@ pub struct NodeGatewayConfig {
 
 /// `[nodes.gateway.lan]`: an HTTPS listener on this computer's network
 /// address, with a certificate from the daemon's own CA, which Nodes learn
-/// over a channel they already trust (USB, a tunnel) and verify. Off by
-/// default.
+/// over a channel they already trust (USB, a tunnel) and verify. On whenever
+/// the Node Gateway is; `enabled = false` turns it off.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NodeLanConfig {
-    #[serde(default)]
+    #[serde(default = "default_node_lan_enabled")]
     pub enabled: bool,
     #[serde(default = "default_node_lan_port")]
     pub port: u16,
@@ -195,10 +195,14 @@ fn default_node_lan_port() -> u16 {
     8443
 }
 
+fn default_node_lan_enabled() -> bool {
+    true
+}
+
 impl Default for NodeLanConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_node_lan_enabled(),
             port: default_node_lan_port(),
         }
     }
@@ -377,4 +381,20 @@ fn default_node_speech_rate() -> u32 {
 }
 fn default_node_speech_timeout() -> u64 {
     20
+}
+
+#[cfg(test)]
+mod lan_config_tests {
+    use super::*;
+
+    #[test]
+    fn the_local_listener_is_on_unless_turned_off() {
+        let gateway: NodeGatewayConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(gateway.lan.enabled);
+        assert_eq!(gateway.lan.port, 8443);
+        assert!(NodeGatewayConfig::default().lan.enabled);
+        let off: NodeGatewayConfig =
+            serde_json::from_str(r#"{"enabled": true, "lan": {"enabled": false}}"#).unwrap();
+        assert!(!off.lan.enabled);
+    }
 }
