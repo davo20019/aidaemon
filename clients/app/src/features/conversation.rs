@@ -1658,6 +1658,27 @@ fn composer(store: Store, session: Option<String>) -> View {
             }
         });
     }
+    // A new conversation the owner started: they asked to write, so the
+    // keyboard comes up on a phone too. A composer built for it answers at
+    // once; one already on screen (a new conversation started from a new
+    // conversation) when asked. A composer going away with another
+    // conversation leaves the ask to the new one.
+    let raise_now = session.is_none() && untracked(|| store.take_keyboard());
+    {
+        let own = session.clone();
+        let first = std::cell::Cell::new(true);
+        effect(move || {
+            store.keyboard_ask();
+            if first.replace(false) {
+                return;
+            }
+            untracked(|| {
+                if store.selected_untracked() == own && store.take_keyboard() {
+                    field.focus();
+                }
+            });
+        });
+    }
     // A sent message put back to change: the owner asked to write, so the
     // keyboard comes up on a phone too.
     effect(move || {
@@ -1785,8 +1806,9 @@ fn composer(store: Store, session: Option<String>) -> View {
                                 store.submit();
                             }
                         })
-                        // A phone would raise its keyboard over the page.
-                        .auto_focus(!touch)
+                        // A phone would raise its keyboard over the page,
+                        // unless the owner just started this conversation.
+                        .auto_focus(!touch || raise_now)
                         // A drop of a few seconds is not news: the field
                         // reads as usual, and what is sent goes on reconnect.
                         .placeholder(move || match store.felt() {

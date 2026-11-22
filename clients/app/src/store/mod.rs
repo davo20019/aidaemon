@@ -409,6 +409,12 @@ pub struct Store {
     composer_focus: Signal<u64>,
     /// Counts messages put back in the composer to change.
     composer_edit: Signal<u64>,
+    /// Advanced when the owner starts a new conversation: the keyboard
+    /// comes up, on a phone too (they asked to write).
+    keyboard_ask: Signal<u64>,
+    /// A [`Self::keyboard_ask`] no composer has answered yet: the new
+    /// conversation's composer, built after it, raises the keyboard.
+    keyboard_wanted: Stored<bool>,
     /// The sidebar lists archived conversations instead of the others.
     show_archived: Signal<bool>,
     /// The conversation that was on screen when it was archived: Undo
@@ -514,6 +520,8 @@ impl Store {
             automation_editing: signal(None),
             composer_focus: signal(0),
             composer_edit: signal(0),
+            keyboard_ask: signal(0),
+            keyboard_wanted: stored(false),
             show_archived: signal(false),
             archived_open: signal(None),
             sent_at: signal(0),
@@ -1747,11 +1755,35 @@ impl Store {
 
     /// Start a new conversation in `project` (`None`: in no project).
     pub fn new_in_project(&self, project: Option<String>) {
-        self.select(None);
-        if let Some(id) = &project {
-            let _ = nsh_core::storage::Storage::set_item(LAST_PROJECT_KEY, id.clone());
-        }
-        self.new_project.set(project);
+        self.with_keyboard(|| {
+            self.select(None);
+            if let Some(id) = &project {
+                let _ = nsh_core::storage::Storage::set_item(LAST_PROJECT_KEY, id.clone());
+            }
+            self.new_project.set(project);
+        });
+    }
+
+    /// The owner starts a new conversation with `start`: its composer
+    /// takes the keyboard on every device, a phone's included. Asked
+    /// before `start`, so a composer it builds answers as it is built;
+    /// told after, so one already on screen answers then (and the one
+    /// going away, built for another conversation, does not).
+    pub fn with_keyboard(&self, start: impl FnOnce()) {
+        self.keyboard_wanted.replace(true);
+        start();
+        self.keyboard_ask.update(|n| *n += 1);
+    }
+
+    /// Changes when a new conversation asks for the keyboard.
+    pub fn keyboard_ask(&self) -> u64 {
+        self.keyboard_ask.get()
+    }
+
+    /// Whether a new conversation's keyboard is still to raise; answering
+    /// it here clears it.
+    pub fn take_keyboard(&self) -> bool {
+        self.keyboard_wanted.replace(false)
     }
 
     /// Choose the project the new conversation on screen starts in; then
@@ -2759,6 +2791,10 @@ impl Store {
         });
         self.new_code.set(false);
         let picked = id.is_some();
+        if picked {
+            // Opening a conversation is reading it: no keyboard over it.
+            self.keyboard_wanted.replace(false);
+        }
         self.selected.set(id);
         // Its changes say whether it works on code (and are ready to show).
         if picked {

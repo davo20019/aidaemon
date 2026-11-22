@@ -1758,3 +1758,56 @@ fn the_system_page_lists_devices_and_how_they_connect() -> Result<(), String> {
     app.wait_for("Online")?;
     Ok(())
 }
+
+#[test]
+fn a_new_conversation_on_a_phone_raises_the_keyboard() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    no_local_daemon();
+    let mut config = EngineConfig::new(Root::of::<Offline>());
+    config.viewport = Size::new(Points(390.0), Points(844.0));
+    config.environment.idiom = nsh_core::platform::Idiom::Phone;
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("What can I help you with?")?;
+    // Opening the app reads: no keyboard over the page.
+    app.press_keys(&["z", "q"])?;
+    if app.shows("zq") {
+        return Err("the phone's composer took the keyboard on opening".into());
+    }
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-1","channel":"app","title":"Plan the trip","writable":true}]}}"#,
+        ),
+    ]);
+    let open = |app: &mut Headless| -> Result<(), String> {
+        app.press("label:Conversations")?;
+        app.wait_for("Plan the trip")?;
+        app.press("Plan the trip >> nth=0")?;
+        app.wait_for_gone("Search conversations", std::time::Duration::from_secs(2))
+    };
+    // Opening a conversation reads it: no keyboard either.
+    open(&mut app)?;
+    app.press_keys(&["z", "q"])?;
+    if app.shows("zq") {
+        return Err("opening a conversation raised the phone's keyboard".into());
+    }
+    // Starting a new one from the conversation's header asks to write:
+    // typing goes in at once.
+    app.press("label:New conversation")?;
+    app.wait_for("What can I help you with?")?;
+    app.press_keys(&["a", "b"])?;
+    app.wait_for("ab")?;
+    // From the list of conversations too.
+    open(&mut app)?;
+    app.press("label:Conversations")?;
+    app.press("label:New conversation >> nth=0")?;
+    app.wait_for("What can I help you with?")?;
+    app.press_keys(&["c", "d"])?;
+    app.wait_for("abcd")?;
+    // And a new one from the new one on screen: its composer stays and
+    // takes the keyboard back.
+    app.press("label:New conversation")?;
+    app.press_keys(&["e"])?;
+    app.wait_for("abcde")?;
+    Ok(())
+}
