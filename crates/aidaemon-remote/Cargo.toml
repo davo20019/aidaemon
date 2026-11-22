@@ -34,6 +34,7 @@ sha2 = "0.11"
 tokio = { version = "1", features = ["io-util", "rt", "sync"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing = "0.1"
+url = "2"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }

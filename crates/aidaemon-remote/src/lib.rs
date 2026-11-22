@@ -21,6 +21,7 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
+use iroh::address_lookup::pkarr::{PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, RelayMode, TransportAddr};
 use sha2::{Digest, Sha256};
@@ -52,6 +53,12 @@ pub type RemoteStream = tokio::io::Join<RecvStream, SendStream>;
 /// discovery on its default port.
 pub const AIDAEMON_RELAYS: &[&str] = &["https://relay.aidaemon.ai/"];
 
+/// The project's address lookup (a pkarr relay): a daemon on the project's
+/// relays publishes which relay it is on, signed with its key (the relay URL
+/// only, never an IP address), and an app looks the daemon's key up when it
+/// dials, so a daemon that moved relays is still found from an old address.
+pub const AIDAEMON_LOOKUP: &str = "https://dns.aidaemon.ai/pkarr";
+
 /// Which relays an endpoint uses to be found and to fall back on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Relays {
@@ -74,6 +81,20 @@ impl Relays {
             Self::N0 => RelayMode::Default,
             Self::Custom(urls) => RelayMode::custom(urls.iter().cloned()),
             Self::Disabled => RelayMode::Disabled,
+        }
+    }
+
+    /// The address lookup that goes with these relays: the project's for
+    /// its relays; none for your own (your devices dial the relay they
+    /// paired with) or for none.
+    fn lookup(&self) -> Option<url::Url> {
+        match self {
+            Self::Aidaemon => Some(
+                AIDAEMON_LOOKUP
+                    .parse()
+                    .expect("AIDAEMON_LOOKUP is a valid URL"),
+            ),
+            Self::N0 | Self::Custom(_) | Self::Disabled => None,
         }
     }
 
@@ -126,11 +147,12 @@ impl RemoteUrl {
     }
 
     /// The relays a client reaching this daemon should use: the project's
-    /// when the daemon's home relay is one of them or unknown; for an
-    /// address from before the project ran its own (an n0 relay), the
-    /// project's and n0's, since that daemon may have moved or not; else
-    /// only the daemon's own, so a daemon on self-hosted relays never puts
-    /// the devices that reach it on anyone else's.
+    /// (and its address lookup) when the daemon's home relay is one of them,
+    /// unknown, or an n0 relay from before the project ran its own (the
+    /// hint stays in [`Self::addr`], so a daemon still there is reached
+    /// there and one that moved is found by its key); else only the
+    /// daemon's own, so a daemon on self-hosted relays never puts the
+    /// devices that reach it on anyone else's.
     pub fn dial_relays(&self) -> Relays {
         fn host(url: &RelayUrl) -> Option<String> {
             url.host_str()
@@ -139,12 +161,10 @@ impl RemoteUrl {
         let among =
             |set: &Relays, relay: &RelayUrl| set.urls().iter().any(|u| host(u) == host(relay));
         match &self.relay {
-            None => Relays::Aidaemon,
-            Some(relay) if among(&Relays::Aidaemon, relay) => Relays::Aidaemon,
-            Some(relay) if among(&Relays::N0, relay) => {
-                Relays::Custom(aidaemon_relays().chain(Relays::N0.urls()).collect())
+            Some(relay) if !among(&Relays::Aidaemon, relay) && !among(&Relays::N0, relay) => {
+                Relays::Custom(vec![relay.clone()])
             }
-            Some(relay) => Relays::Custom(vec![relay.clone()]),
+            _ => Relays::Aidaemon,
         }
     }
 
@@ -187,13 +207,30 @@ pub fn derive_key(seed: &[u8]) -> SecretKey {
     SecretKey::from_bytes(&hasher.finalize().into())
 }
 
-async fn bind(secret: SecretKey, relays: &Relays) -> anyhow::Result<Endpoint> {
-    // Minimal: nothing published to a DNS server; peers dial the address
-    // they were given (key, relays, direct addresses).
-    Endpoint::builder(presets::Minimal)
+/// Which end of a connection an endpoint is: a daemon publishes where it
+/// is, an app only looks daemons up (so no lookup learns of the device).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    Daemon,
+    App,
+}
+
+async fn bind(secret: SecretKey, relays: &Relays, side: Side) -> anyhow::Result<Endpoint> {
+    // Minimal: no n0 services. Peers dial the address they were given
+    // (key, relays, direct addresses), plus the address lookup that goes
+    // with the relay set, if any.
+    let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
-        .relay_mode(relays.mode())
+        .relay_mode(relays.mode());
+    if let Some(lookup) = relays.lookup() {
+        builder = match side {
+            Side::Daemon => builder.address_lookup(PkarrPublisher::builder(lookup)),
+            Side::App => builder.address_lookup(PkarrResolver::builder(lookup)),
+        };
+    }
+    builder
         .bind()
         .await
         .context("could not bind the iroh endpoint")
@@ -208,7 +245,7 @@ pub struct RemoteClient {
 impl RemoteClient {
     pub async fn bind(secret: SecretKey, relays: &Relays) -> anyhow::Result<Self> {
         Ok(Self {
-            endpoint: bind(secret, relays).await?,
+            endpoint: bind(secret, relays, Side::App).await?,
             relays: relays.clone(),
         })
     }
@@ -381,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn an_address_from_n0_days_dials_the_projects_relays_and_n0s() {
+    fn an_address_from_n0_days_dials_the_projects_relays_and_keeps_its_hint() {
         let id = SecretKey::generate().public();
         let n0 = Relays::N0.urls()[0].clone();
         let on_n0 = RemoteUrl::parse(&format!(
@@ -389,12 +426,26 @@ mod tests {
             n0.host_str().unwrap().trim_end_matches('.')
         ))
         .unwrap();
-        let urls = on_n0.dial_relays().urls();
+        let relays = on_n0.dial_relays();
+        assert_eq!(relays, Relays::Aidaemon);
+        assert!(relays.lookup().is_some());
+        let tried: Vec<_> = on_n0.addr(&relays).relay_urls().cloned().collect();
+        let bare = |u: &RelayUrl| u.host_str().map(|h| h.trim_end_matches('.').to_owned());
+        assert!(tried.iter().any(|u| bare(u) == bare(&n0)));
         assert!(
-            urls.iter()
+            tried
+                .iter()
                 .any(|u| u.host_str() == Some("relay.aidaemon.ai"))
         );
-        assert!(Relays::N0.urls().iter().all(|u| urls.contains(u)));
+    }
+
+    #[test]
+    fn only_the_projects_relays_come_with_its_lookup() {
+        assert_eq!(Relays::Aidaemon.lookup().unwrap().as_str(), AIDAEMON_LOOKUP);
+        let own = Relays::Custom(vec!["https://relay.example.test/".parse().unwrap()]);
+        assert_eq!(own.lookup(), None);
+        assert_eq!(Relays::N0.lookup(), None);
+        assert_eq!(Relays::Disabled.lookup(), None);
     }
 
     #[test]

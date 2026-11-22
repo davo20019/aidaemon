@@ -11,7 +11,7 @@ use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use tracing::{debug, warn};
 
-use crate::{EndpointAddr, EndpointId, Relays, RemoteUrl, SecretKey, bind};
+use crate::{EndpointAddr, EndpointId, Relays, RemoteUrl, SecretKey, Side, bind};
 
 /// Which peers may open a connection.
 #[derive(Clone, Default)]
@@ -64,7 +64,7 @@ impl RemoteListener {
         access: Access,
         app: axum::Router,
     ) -> anyhow::Result<Self> {
-        let endpoint = bind(secret, relays).await?;
+        let endpoint = bind(secret, relays, Side::Daemon).await?;
         let accept = tokio::spawn(accept_loop(endpoint.clone(), access, app));
         Ok(Self { endpoint, accept })
     }
