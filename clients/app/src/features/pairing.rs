@@ -115,58 +115,68 @@ pub fn pair_phone(store: Store) -> View {
     use link::owner_pairing;
 
     let phase = signal(Phone::Idle);
+    // The tasks run under this view, not the pressed button: setting the
+    // phase rebuilds the button, and a task under it ended before it sent
+    // anything (the press did nothing).
+    let owner = Owner::current();
     let start = move || {
         if phase.with_untracked(|p| matches!(p, Phone::Starting)) {
             return;
         }
         phase.set(Phone::Starting);
-        spawn(async move {
-            let offer = match owner_pairing::offer().await {
-                Ok(offer) => offer,
-                Err(why) => {
-                    let _ = phase.try_set(Phone::Ended(why, Tone::Danger));
-                    return;
-                }
-            };
-            let id = offer.offer_id.clone();
-            if !phase.try_set(Phone::Showing(offer.clone())) {
-                return;
-            }
-            // Watch the offer while this one is on screen.
-            loop {
-                timer(std::time::Duration::from_secs(1)).await;
-                let current = phase.try_get().is_some_and(|p| match p {
-                    Phone::Showing(o) | Phone::Asking(o, _) => o.offer_id == id,
-                    _ => false,
-                });
-                if !current {
-                    return;
-                }
-                let Ok(enrollment) = owner_pairing::status(id.clone()).await else {
-                    continue;
+        owner.run(|| {
+            spawn(async move {
+                let offer = match owner_pairing::offer().await {
+                    Ok(offer) => offer,
+                    Err(why) => {
+                        let _ = phase.try_set(Phone::Ended(why, Tone::Danger));
+                        return;
+                    }
                 };
-                let next = match enrollment.state {
-                    EnrollmentState::Open => continue,
-                    EnrollmentState::Pending => {
-                        if phase.with_untracked(|p| matches!(p, Phone::Asking(..))) {
-                            continue;
+                let id = offer.offer_id.clone();
+                if !phase.try_set(Phone::Showing(offer.clone())) {
+                    return;
+                }
+                // Watch the offer while this one is on screen.
+                loop {
+                    timer(std::time::Duration::from_secs(1)).await;
+                    let current = phase.try_get().is_some_and(|p| match p {
+                        Phone::Showing(o) | Phone::Asking(o, _) => o.offer_id == id,
+                        _ => false,
+                    });
+                    if !current {
+                        return;
+                    }
+                    let Ok(enrollment) = owner_pairing::status(id.clone()).await else {
+                        continue;
+                    };
+                    let next = match enrollment.state {
+                        EnrollmentState::Open => continue,
+                        EnrollmentState::Pending => {
+                            if phase.with_untracked(|p| matches!(p, Phone::Asking(..))) {
+                                continue;
+                            }
+                            Phone::Asking(
+                                offer.clone(),
+                                enrollment.device_name.unwrap_or_else(|| "A device".into()),
+                            )
                         }
-                        Phone::Asking(
-                            offer.clone(),
-                            enrollment.device_name.unwrap_or_else(|| "A device".into()),
-                        )
+                        EnrollmentState::Approved => {
+                            store.refresh_devices();
+                            Phone::Ended("Paired.".into(), Tone::Success)
+                        }
+                        EnrollmentState::Denied => {
+                            Phone::Ended("Not paired.".into(), Tone::Neutral)
+                        }
+                        _ => {
+                            Phone::Ended("The code expired. Show a new one.".into(), Tone::Neutral)
+                        }
+                    };
+                    if !phase.try_set(next) {
+                        return;
                     }
-                    EnrollmentState::Approved => {
-                        store.refresh_devices();
-                        Phone::Ended("Paired.".into(), Tone::Success)
-                    }
-                    EnrollmentState::Denied => Phone::Ended("Not paired.".into(), Tone::Neutral),
-                    _ => Phone::Ended("The code expired. Show a new one.".into(), Tone::Neutral),
-                };
-                if !phase.try_set(next) {
-                    return;
                 }
-            }
+            })
         });
     };
     let decide = move |approve: bool| {
@@ -176,16 +186,18 @@ pub fn pair_phone(store: Store) -> View {
         }) else {
             return;
         };
-        spawn(async move {
-            let next = match owner_pairing::decide(id, approve).await {
-                Ok(e) if e.state == EnrollmentState::Approved => {
-                    store.refresh_devices();
-                    Phone::Ended("Paired.".into(), Tone::Success)
-                }
-                Ok(_) => Phone::Ended("Not paired.".into(), Tone::Neutral),
-                Err(why) => Phone::Ended(why, Tone::Danger),
-            };
-            let _ = phase.try_set(next);
+        owner.run(|| {
+            spawn(async move {
+                let next = match owner_pairing::decide(id, approve).await {
+                    Ok(e) if e.state == EnrollmentState::Approved => {
+                        store.refresh_devices();
+                        Phone::Ended("Paired.".into(), Tone::Success)
+                    }
+                    Ok(_) => Phone::Ended("Not paired.".into(), Tone::Neutral),
+                    Err(why) => Phone::Ended(why, Tone::Danger),
+                };
+                let _ = phase.try_set(next);
+            })
         });
     };
 
@@ -201,8 +213,8 @@ pub fn pair_phone(store: Store) -> View {
                 if !owner_pairing::reachable_elsewhere(&offer) {
                     card = card.child(ui::banner(
                         "A phone cannot reach AIDaemon yet: it listens only on this computer. \
-                         Turn on remote access (Tailscale or a Cloudflare tunnel, \
-                         [exposure.client_gateway] in config.toml) first.",
+                         Turn on remote access ([client_gateway.remote] in config.toml, or \
+                         Tailscale or a Cloudflare tunnel) first.",
                         Tone::Warning,
                     ));
                 }

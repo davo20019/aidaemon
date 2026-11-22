@@ -1449,14 +1449,7 @@ pub(crate) fn web_link(
     gateway: &ClientGateway,
     offer: &aidaemon_client_protocol::PairingOffer,
 ) -> String {
-    format!(
-        "{}{}#offer={}&code={}&fp={}",
-        gateway.public_url(),
-        gateway.web_app_path(),
-        offer.offer_id,
-        offer.code,
-        offer.fingerprint
-    )
+    offer.web_link(&gateway.public_url(), gateway.web_app_path())
 }
 
 fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {

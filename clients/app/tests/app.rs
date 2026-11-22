@@ -1669,3 +1669,47 @@ fn a_reply_starting_in_a_long_conversation_is_in_view() -> Result<(), String> {
     app.wait_for("Working…")?;
     Ok(())
 }
+
+/// "Pair a phone" answers the press: it shows the code, or here (no
+/// daemon at the address) why not. Its task ran under the button that
+/// setting the phase rebuilds, so it ended before it sent anything and the
+/// press did nothing.
+#[test]
+fn pair_a_phone_answers_the_press() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    // A port nothing listens on, and a token: this computer runs the daemon.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map_err(|e| e.to_string())?
+        .port();
+    // SAFETY: the tests take turns (TURN), and no other thread reads these.
+    unsafe {
+        std::env::set_var("AIDAEMON_CLIENT_TOKEN", "acg_synthetic");
+        std::env::set_var("AIDAEMON_GATEWAY_URL", format!("http://127.0.0.1:{port}"));
+    }
+    let mut app = start_desktop();
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    let before = sent("get_settings");
+    app.press("Settings: change how the daemon runs")?;
+    let id = wait_sent_new("get_settings", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{SETTINGS}}}"#
+    ))]);
+    let before = sent("list_devices");
+    app.press("Connections")?;
+    let id = wait_sent_new("list_devices", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"devices","devices":[],"can_change":true}}}}"#
+    ))]);
+    app.wait_for("Pair a phone")?;
+    app.press("Pair a phone")?;
+    let answered = app.wait_for("text:/^Could not reach AIDaemon/");
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var("AIDAEMON_CLIENT_TOKEN");
+        std::env::remove_var("AIDAEMON_GATEWAY_URL");
+    }
+    answered?;
+    Ok(())
+}

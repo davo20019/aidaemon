@@ -992,14 +992,7 @@ fn handle_pair_command(args: &[String], config_path: &Path, open_web: bool) -> a
         .clone()
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| settings.public_url());
-    let link = format!(
-        "{}{}#offer={}&code={}&fp={}",
-        public_url.trim_end_matches('/'),
-        settings.web_app_path(),
-        offer.offer_id,
-        offer.code,
-        offer.fingerprint
-    );
+    let link = offer.web_link(&public_url, settings.web_app_path());
     if let Some(code) = (!open_web)
         .then(|| qrcode::QrCode::new(offer.page_link().as_bytes()).ok())
         .flatten()

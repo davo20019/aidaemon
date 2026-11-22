@@ -3222,6 +3222,32 @@ impl PairingOffer {
             .map_or(self.link.as_str(), |(_, query)| query);
         format!("{base}{PAIRING_PAGE_PATH}#{query}")
     }
+
+    /// The web client at `base` + `app_path` with this offer in its
+    /// fragment, which pairs a browser, and the phone app when pasted
+    /// there: it carries the daemon's peer-to-peer address (`remote`, from
+    /// [`PairingOffer::link`]) too, so the app pairs over it.
+    pub fn web_link(&self, base: &str, app_path: &str) -> String {
+        let mut link = format!(
+            "{}{app_path}#offer={}&code={}&fp={}",
+            base.trim().trim_end_matches('/'),
+            self.offer_id,
+            self.code,
+            self.fingerprint
+        );
+        // The query of our own `aidaemon-pair:` link (a machine format).
+        if let Some(remote) = self
+            .link
+            .split_once('?')
+            .into_iter()
+            .flat_map(|(_, query)| query.split('&'))
+            .find(|pair| pair.starts_with("remote="))
+        {
+            link.push('&');
+            link.push_str(remote);
+        }
+        link
+    }
 }
 
 /// Whether `url`'s host is this machine only (`127.x`, `localhost`,
@@ -3447,6 +3473,16 @@ mod tests {
             offer.public_url = Some(loopback.into());
             assert_eq!(offer.page_link(), offer.link, "{loopback}");
         }
+        assert_eq!(
+            offer.web_link("https://d.example.invalid/", "/client/v1/next/"),
+            "https://d.example.invalid/client/v1/next/#offer=of-1&code=K7Q2-9FZD&fp=3b1f"
+        );
+        offer.link.push_str("&remote=iroh%3A%2F%2Fk%40relay.example.invalid");
+        assert!(
+            offer
+                .web_link("https://d.example.invalid", "/client/v1/next/")
+                .ends_with("&fp=3b1f&remote=iroh%3A%2F%2Fk%40relay.example.invalid")
+        );
         offer.public_url = Some("http://192.168.1.20:8788".into());
         assert!(
             offer

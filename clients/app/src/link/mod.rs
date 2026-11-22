@@ -128,13 +128,16 @@ pub mod owner_pairing {
         }
     }
 
-    /// Whether a phone can reach the gateway the offer names.
+    /// Whether a phone can reach the daemon the offer names: its
+    /// peer-to-peer address (remote access), else its gateway address.
     pub fn reachable_elsewhere(offer: &PairingOffer) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
-        return offer
-            .public_url
-            .as_deref()
-            .is_none_or(aidaemon_client_core::local::owner_pairing::reachable_elsewhere);
+        return aidaemon_client_core::signin::PairingLink::parse(&offer.link)
+            .is_some_and(|link| link.remote.is_some())
+            || offer
+                .public_url
+                .as_deref()
+                .is_none_or(aidaemon_client_core::local::owner_pairing::reachable_elsewhere);
         #[cfg(target_arch = "wasm32")]
         {
             let _ = offer;
