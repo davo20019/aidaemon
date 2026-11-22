@@ -2148,9 +2148,12 @@ fn queued_list(store: Store, session: String) -> View {
                                     let now_session = now_session.clone();
                                     ui::with_hint(
                                         "The running work reads it at its next step",
-                                        ui::btn("Send now", Variant::Ghost, ui::Size::Sm, move || {
-                                            store.send_queued_now(&now_session, id)
-                                        }),
+                                        ui::btn(
+                                            "Send now",
+                                            Variant::Ghost,
+                                            ui::Size::Sm,
+                                            move || store.send_queued_now(&now_session, id),
+                                        ),
                                     )
                                 },
                             ))
