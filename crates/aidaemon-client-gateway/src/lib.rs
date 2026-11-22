@@ -1124,6 +1124,11 @@ impl ClientGateway {
                 args,
             } => {
                 let command = command.trim().trim_start_matches('/').to_string();
+                // Exact command words: `/trustall on` raises AIdaemon's
+                // level, so it takes the same check (and card) as Settings.
+                if command == "trustall" && args.trim().eq_ignore_ascii_case("on") {
+                    return self.trust_all_on(caller).await;
+                }
                 self.slash(&session_id, &command, &args).await
             }
             Command::GetGlance => Ok(CommandResult::Glance {
@@ -1617,66 +1622,22 @@ impl ClientGateway {
                 let mut not_from = other_device
                     .then(|| caller.principal.device_id.clone())
                     .flatten();
-                // With no other device or chat to ask, the device asking
-                // confirms it itself, on a card that says what widens.
+                // With no other device to ask, the device asking confirms
+                // it itself, on a card that says what widens.
                 if let Some(device) = not_from.as_deref()
                     && !self.another_approver(device).await
                 {
                     not_from = None;
                     warnings.push(
-                        "No other device or chat is connected, so this device confirms it. \
-                         Only allow it if you asked for it just now."
+                        "No other device is paired, so this device confirms it. Only allow it \
+                         if you asked for it just now."
                             .to_string(),
                     );
                 }
                 let other_device = not_from.is_some();
-                self.runner
-                    .register_session(SETTINGS_SESSION, APP_CHANNEL)
+                let approval_id = self
+                    .ask_settings_change(change, summary, warnings, risk, not_from, None)
                     .await;
-                let (approval_id, answer) = self.approvals.ask(approvals::OwnAsk {
-                    session_id: SETTINGS_SESSION.to_string(),
-                    summary,
-                    warnings,
-                    risk,
-                    expires_at_ms: bus::now_ms()
-                        .saturating_add(SETTINGS_APPROVAL_WAIT.as_millis() as u64),
-                    not_from,
-                });
-                let host = self.host.clone();
-                let approvals = self.approvals.clone();
-                let publisher = self.publisher.clone();
-                let id = approval_id.clone();
-                tokio::spawn(async move {
-                    let answer = tokio::time::timeout(SETTINGS_APPROVAL_WAIT, answer)
-                        .await
-                        .ok()
-                        .and_then(Result::ok);
-                    let approved = matches!(
-                        answer,
-                        Some((
-                            aidaemon_tools::semantics::ApprovalResponse::AllowOnce
-                                | aidaemon_tools::semantics::ApprovalResponse::AllowSession
-                                | aidaemon_tools::semantics::ApprovalResponse::AllowAlways,
-                            _
-                        ))
-                    );
-                    let answered = answer.is_some();
-                    approvals.settle(&id, answer);
-                    let (ok, message) = if approved {
-                        match host.change_settings(change, true).await {
-                            Ok(done) => (true, done.message),
-                            Err(reason) => (false, reason),
-                        }
-                    } else if answered {
-                        (false, "Declined: nothing was changed.".to_string())
-                    } else {
-                        (
-                            false,
-                            "Nobody approved it in time: nothing was changed.".to_string(),
-                        )
-                    };
-                    publisher.publish(None, Event::SettingsUpdated { ok, message });
-                });
                 Ok(CommandResult::SettingsChanged {
                     outcome: SettingsOutcome::AwaitingApproval {
                         approval_id,
@@ -1687,21 +1648,129 @@ impl ClientGateway {
         }
     }
 
-    /// Whether anyone but device `device_id` can answer an approval: another
-    /// paired device, or a chat.
+    /// Open a card for `change` on the owner's apps (not on device
+    /// `not_from`), and make it when one approves; what happened is
+    /// announced to the apps and, when `chat` names the chat that asked,
+    /// told there too. Returns the card's id.
+    async fn ask_settings_change(
+        &self,
+        change: SettingsChange,
+        summary: String,
+        warnings: Vec<String>,
+        risk: Risk,
+        not_from: Option<String>,
+        chat: Option<String>,
+    ) -> String {
+        self.runner
+            .register_session(SETTINGS_SESSION, APP_CHANNEL)
+            .await;
+        let (approval_id, answer) = self.approvals.ask(approvals::OwnAsk {
+            session_id: SETTINGS_SESSION.to_string(),
+            summary,
+            warnings,
+            risk,
+            expires_at_ms: bus::now_ms().saturating_add(SETTINGS_APPROVAL_WAIT.as_millis() as u64),
+            not_from,
+        });
+        let host = self.host.clone();
+        let approvals = self.approvals.clone();
+        let publisher = self.publisher.clone();
+        let hub = self.hub.clone();
+        let id = approval_id.clone();
+        tokio::spawn(async move {
+            let answer = tokio::time::timeout(SETTINGS_APPROVAL_WAIT, answer)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            let approved = matches!(
+                answer,
+                Some((
+                    aidaemon_tools::semantics::ApprovalResponse::AllowOnce
+                        | aidaemon_tools::semantics::ApprovalResponse::AllowSession
+                        | aidaemon_tools::semantics::ApprovalResponse::AllowAlways,
+                    _
+                ))
+            );
+            let answered = answer.is_some();
+            approvals.settle(&id, answer);
+            let (ok, message) = if approved {
+                match host.change_settings(change, true).await {
+                    Ok(done) => (true, done.message),
+                    Err(reason) => (false, reason),
+                }
+            } else if answered {
+                (false, "Declined: nothing was changed.".to_string())
+            } else {
+                (
+                    false,
+                    "Nobody approved it in time: nothing was changed.".to_string(),
+                )
+            };
+            if let Some(chat) = chat
+                && let Err(error) = hub.send_text(&chat, &message).await
+            {
+                warn!(%error, "Could not tell the chat how its settings change ended");
+            }
+            publisher.publish(None, Event::SettingsUpdated { ok, message });
+        });
+        approval_id
+    }
+
+    /// Ask the owner's paired devices to approve `change` for a chat that
+    /// cannot answer an app's card itself (a slash command sent in
+    /// Telegram): the chat is never the one that approves. `None` when no
+    /// paired device can answer; else what to tell the chat now, or why
+    /// nothing was asked.
+    pub async fn ask_devices_for_chat(
+        &self,
+        change: SettingsChange,
+        chat_session: &str,
+    ) -> Option<Result<String, String>> {
+        let devices = self.pairing.devices().await.unwrap_or_default();
+        if !devices.iter().any(|device| !device.revoked) {
+            return None;
+        }
+        Some(match self.host.settings_gate(&change).await {
+            Err(reason) => Err(reason),
+            Ok(SettingsGate::Free) => match self.host.change_settings(change, false).await {
+                Ok(done) => {
+                    self.settings_updated(true, done.message.clone());
+                    Ok(done.message)
+                }
+                Err(reason) => Err(reason),
+            },
+            Ok(SettingsGate::Ask {
+                summary,
+                warnings,
+                risk,
+                ..
+            }) => {
+                self.ask_settings_change(
+                    change,
+                    summary,
+                    warnings,
+                    risk,
+                    None,
+                    Some(chat_session.to_string()),
+                )
+                .await;
+                Ok(
+                    "Approve it in the AIdaemon app on one of your paired devices; I'll say \
+                     here when it's done."
+                        .to_string(),
+                )
+            }
+        })
+    }
+
+    /// Whether a device other than `device_id` can answer an approval this
+    /// gateway opens: another paired device. A chat cannot (these cards
+    /// reach the owner's apps only), so it does not count.
     async fn another_approver(&self, device_id: &str) -> bool {
         let devices = self.pairing.devices().await.unwrap_or_default();
-        if devices
+        devices
             .iter()
             .any(|d| !d.revoked && d.device_id != device_id)
-        {
-            return true;
-        }
-        self.hub
-            .channel_names()
-            .await
-            .iter()
-            .any(|name| name != APP_CHANNEL)
     }
 
     /// Start an app conversation with a message from the daemon itself (the
@@ -2202,6 +2271,31 @@ impl ClientGateway {
             messages,
             more,
         })
+    }
+
+    /// `/trustall on` from an app: Settings' change to Full access, through
+    /// its check, answered as the command's reply.
+    async fn trust_all_on(&self, caller: &Caller) -> Result<CommandResult, ProtocolError> {
+        let change = SettingsChange::SetPermissionLevel {
+            level: aidaemon_client_protocol::PermissionLevel::FullAccess,
+        };
+        let text = match self.change_settings(change, caller).await {
+            Ok(CommandResult::SettingsChanged {
+                outcome: SettingsOutcome::Done { message, .. },
+            }) => message,
+            Ok(CommandResult::SettingsChanged {
+                outcome: SettingsOutcome::AwaitingApproval { other_device, .. },
+            }) => if other_device {
+                "Approve it on another of your devices: raising AIdaemon to Full access \
+                 needs a second device."
+            } else {
+                "Confirm it on the card: raising AIdaemon to Full access asks first."
+            }
+            .to_string(),
+            Ok(_) => "Nothing was changed.".to_string(),
+            Err(error) => error.message,
+        };
+        Ok(CommandResult::Reply { text })
     }
 
     async fn slash(

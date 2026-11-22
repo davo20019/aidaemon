@@ -14,7 +14,9 @@ use aidaemon_channels::ports::{
     AgentIngress, AgentResponseEnvelope, ChannelAgentRuntime, InboundMessageRequest,
 };
 use aidaemon_channels::turns::{TurnDeps, TurnWatch};
-use aidaemon_client_gateway::{ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps};
+use aidaemon_client_gateway::{
+    ClientGateway, ClientGatewayConfig, ClientHost, GatewayDeps, SettingsDone, SettingsGate,
+};
 use aidaemon_client_protocol::*;
 use aidaemon_store_sqlite::SqliteClientEventLog;
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -172,6 +174,24 @@ impl ClientHost for Host {
     }
     async fn slash(&self, _: &str, command: &str, _: &str) -> Option<String> {
         (command == "clear").then(|| "Context cleared.".to_string())
+    }
+    /// Raising the permission level asks, as the daemon's Settings does.
+    async fn settings_gate(&self, change: &SettingsChange) -> Result<SettingsGate, String> {
+        match change {
+            SettingsChange::SetPermissionLevel { .. } => Ok(SettingsGate::Ask {
+                summary: "Give AIdaemon full access".into(),
+                warnings: Vec::new(),
+                risk: Risk::High,
+                other_device: true,
+            }),
+            _ => Err("Not in this test".into()),
+        }
+    }
+    async fn change_settings(&self, _: SettingsChange, _: bool) -> Result<SettingsDone, String> {
+        Ok(SettingsDone {
+            message: "AIdaemon's permission level is now Full access.".into(),
+            applies: Some(Applies::Now),
+        })
     }
     async fn create_project(
         &self,
@@ -2895,4 +2915,70 @@ async fn a_conversation_shell_opens_on_its_socket_and_only_for_a_trusted_device(
     )
     .await;
     assert!(shells.list().is_empty());
+}
+
+/// `/trustall on` from an app takes Settings' check: a device that is the
+/// only one paired confirms it itself (a chat cannot answer the card, so it
+/// does not count), and with another device paired, only that one may.
+#[tokio::test]
+async fn trust_all_on_from_an_app_asks_like_settings() {
+    let f = fixture(RiskLevel::Medium).await;
+    // A chat is connected, but it cannot answer this card.
+    let (_answer_tx, answer_rx) = oneshot::channel();
+    f.hub
+        .register_channel(Arc::new(Chat {
+            answer: Mutex::new(Some(answer_rx)),
+            asked: AtomicUsize::new(0),
+        }))
+        .await;
+    let phone = f.pair(vec![Scope::Chat, Scope::Control]).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let trust_all = |id: &str| {
+        command(
+            id,
+            Command::RunSlash {
+                session_id: "app:synthetic".into(),
+                command: "/trustall".into(),
+                args: "on".into(),
+            },
+        )
+    };
+    let reply = |frame: ServerFrame| match frame {
+        ServerFrame::Ack {
+            result: CommandResult::Reply { text },
+            ..
+        } => text,
+        other => panic!("{other:?}"),
+    };
+    let alone = reply(f.post_as(&grant.access_token, &trust_all("t-1")).await);
+    assert!(alone.contains("Confirm it on the card"), "{alone}");
+
+    let _laptop = f.pair(vec![Scope::Chat]).await;
+    let other = reply(f.post_as(&grant.access_token, &trust_all("t-2")).await);
+    assert!(other.contains("another of your devices"), "{other}");
+}
+
+/// `/trustall on` from a chat: the owner's paired devices approve it, never
+/// the chat; with no paired device there is no one to ask here.
+#[tokio::test]
+async fn trust_all_on_from_a_chat_asks_the_paired_devices() {
+    let f = fixture(RiskLevel::Medium).await;
+    let change = || SettingsChange::SetPermissionLevel {
+        level: PermissionLevel::FullAccess,
+    };
+    let chat = "telegram:synthetic-user-1";
+    assert!(
+        f.gateway
+            .ask_devices_for_chat(change(), chat)
+            .await
+            .is_none()
+    );
+    let _phone = f.pair(vec![Scope::Chat]).await;
+    let asked = f
+        .gateway
+        .ask_devices_for_chat(change(), chat)
+        .await
+        .expect("a paired device is asked")
+        .unwrap();
+    assert!(asked.contains("Approve it in the AIdaemon app"), "{asked}");
 }
