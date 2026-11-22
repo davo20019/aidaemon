@@ -352,6 +352,7 @@ enum OptionalToolId {
     RequestFeature,
     #[cfg(feature = "browser")]
     HandOver,
+    SharedTerminal,
     #[cfg(feature = "slack")]
     SlackChannelHistory,
 }
@@ -410,6 +411,10 @@ fn optional_enabled_cli_agents(config: &AppConfig) -> bool {
 
 fn optional_enabled_client_gateway(config: &AppConfig) -> bool {
     config.client_gateway.enabled
+}
+
+fn optional_enabled_shared_terminal(config: &AppConfig) -> bool {
+    config.client_gateway.enabled && config.shells.enabled
 }
 
 fn optional_enabled_always(_: &AppConfig) -> bool {
@@ -504,6 +509,11 @@ const OPTIONAL_TOOL_REGISTRY: &[OptionalToolSpec] = &[
         id: OptionalToolId::HandOver,
         name: "hand_over",
         enabled_if: optional_enabled_hand_over,
+    },
+    OptionalToolSpec {
+        id: OptionalToolId::SharedTerminal,
+        name: "shared_terminal",
+        enabled_if: optional_enabled_shared_terminal,
     },
     #[cfg(feature = "slack")]
     OptionalToolSpec {
@@ -934,6 +944,14 @@ pub async fn register_optional_tools(
                 tools.push(Arc::new(aidaemon_surfaces::tool::HandOverTool::new(
                     crate::startup::surfaces::registry(config),
                     crate::startup::surfaces::live_view_link(),
+                )));
+            }
+            OptionalToolId::SharedTerminal => {
+                if !config.tools.is_enabled("shared_terminal") {
+                    continue;
+                }
+                tools.push(Arc::new(aidaemon_shells::tool::SharedTerminalTool::new(
+                    crate::startup::shells::registry(config),
                 )));
             }
             OptionalToolId::RequestFeature => {
@@ -1581,6 +1599,10 @@ pub(crate) mod lint_catalog {
             "mandate_review" => Arc::new(
                 aidaemon_work::tools::mandate_review::MandateReviewTool::new(state.clone()),
             ),
+            // Registered by startup only with the Client Gateway on.
+            "shared_terminal" => Arc::new(aidaemon_shells::tool::SharedTerminalTool::new(
+                aidaemon_shells::ShellRegistry::new(aidaemon_shells::ShellsConfig::default()),
+            )),
             other => anyhow::bail!(
                 "{other} is in tool_manifest's catalog but startup does not register it in \
                  the test build and the lint catalog has no instance of it"

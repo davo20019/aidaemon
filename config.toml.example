@@ -354,6 +354,15 @@ health_port = 8080
 # disconnect_grace_secs = 30      # control returns to the agent this long after your device stops watching
 # idle_release_secs = 900         # control returns to the agent after this long with no input
 
+# [shells]
+# A terminal per conversation in the app (the details' Terminal tab): a shell started
+# in the conversation's project folder that you and the agent share. The agent reads it
+# with `shared_terminal` and types into it only once you allow each line. Only a device
+# that may answer every approval can open one. A shell ends when you close it, when it
+# exits or when its conversation is archived.
+# enabled = true
+# max_shells = 16                 # shells running at once, across conversations
+
 # [computer_use]
 # Native macOS desktop control: the agent inspects and operates GUI apps via the
 # accessibility tree + screenshots (click, type, scroll). macOS-only and

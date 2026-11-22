@@ -707,7 +707,14 @@ dependencies = [
 name = "aidaemon-shells"
 version = "0.21.0"
 dependencies = [
+ "aidaemon-core",
+ "aidaemon-shells",
+ "aidaemon-tools",
+ "anyhow",
+ "async-trait",
  "portable-pty",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

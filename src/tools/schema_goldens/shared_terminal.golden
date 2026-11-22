@@ -1,0 +1,39 @@
+{
+  "description": "Read the terminal the owner has open in this conversation, or type a command into it once the owner allows.",
+  "name": "shared_terminal",
+  "schema": {
+    "description": "The terminal the owner has open in this conversation's details in their app (a shell started in the conversation's project folder, which you share with the owner). `read` shows what is on it: use it when the owner refers to something in their terminal (an error, a command's output). `type` types a line into it, for something the owner wants run in their own shell (its environment, a program they are running); the owner allows each line first, and the call returns what the shell wrote. For your own commands use the terminal tool, not this one.",
+    "name": "shared_terminal",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "read: what the terminal shows. type: type `text` into it.",
+          "enum": [
+            "read",
+            "type"
+          ],
+          "type": "string"
+        },
+        "enter": {
+          "description": "type: press Enter after the text (default true). False to answer a prompt in parts.",
+          "type": "boolean"
+        },
+        "lines_above": {
+          "description": "read: lines above the screen to include (default 40).",
+          "maximum": 400,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "description": "type: the text to type, e.g. a command line.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+}

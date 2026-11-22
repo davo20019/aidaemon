@@ -174,6 +174,7 @@ pub const TOOL_MANIFEST: &[ToolEntry] = &[
         feature: Some("browser"),
         ..optional("hand_over", "browser.enabled and surfaces.enabled")
     },
+    optional("shared_terminal", "client_gateway.enabled and shells.enabled"),
     optional("generate_image", "files.enabled"),
     optional("send_file", "files.enabled"),
     ToolEntry {

@@ -663,5 +663,9 @@ impl Drop for Inner {
     }
 }
 
+/// `shared_terminal`, the agent's side of a conversation's shell.
+#[cfg(feature = "tool")]
+pub mod tool;
+
 #[cfg(test)]
 mod tests;
