@@ -26,6 +26,7 @@ hyper = { version = "1", features = ["client", "server", "http1"], optional = tr
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 tracing = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
+n0-future = { version = "0.3", optional = true }
 p256 = { version = "0.14", features = ["ecdsa"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
@@ -60,7 +61,12 @@ default = ["native", "remote"]
 native = ["dep:dirs", "dep:futures", "dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:tokio", "dep:tokio-tungstenite", "dep:webpki-roots"]
 # Dialing a daemon by key over iroh (`iroh://…` addresses): sign-in, pairing
 # and the link, directly when the network allows, else through a relay.
-remote = ["native", "dep:aidaemon-remote", "dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:tracing"]
+# Adds the loopback bridge for whatever addresses the gateway by URL.
+remote = ["native", "dial", "dep:hyper", "dep:hyper-util", "dep:tracing"]
+# The dialing alone ([`remote`]), with no native I/O: it builds for
+# wasm32-unknown-unknown, where the web app on its own site reaches the
+# daemon through a relay.
+dial = ["dep:aidaemon-remote", "dep:bytes", "dep:futures", "dep:http", "dep:http-body-util", "dep:n0-future"]
 # wasm32 only: randomness from the page's Web Crypto, for a runtime that
 # registers no getrandom backend of its own.
 browser-random = ["dep:getrandom", "getrandom/wasm_js"]

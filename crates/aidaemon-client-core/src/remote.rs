@@ -12,15 +12,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use aidaemon_remote::tokio_tungstenite::{self, WebSocketStream};
 use aidaemon_remote::{
     EndpointId, Relays, RemoteClient, RemoteConnection, RemoteStream, SecretKey, WebSocketError,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
+use futures::lock::Mutex;
 use http_body_util::Full;
-use tokio::sync::Mutex;
-use tokio_tungstenite::WebSocketStream;
 
 pub use aidaemon_remote::RemoteUrl;
 
@@ -51,6 +51,17 @@ impl Dialer {
             .decode(device.secret_key.trim())
             .map_err(|_| SignInError::Refused("the stored device key is damaged".into()))?;
         Ok(Self::Device(Box::new(aidaemon_remote::derive_key(&seed))))
+    }
+
+    /// The dialer with endpoint key `secret` (32 bytes): a browser keeps
+    /// one of its own, apart from its signing key.
+    pub fn with_key(secret: [u8; 32]) -> Self {
+        Self::Device(Box::new(SecretKey::from_bytes(&secret)))
+    }
+
+    /// The endpoint key (hex) this dialer dials with, as sign-in names it.
+    pub fn endpoint(&self) -> String {
+        aidaemon_remote::endpoint_hex(&self.key().public())
     }
 
     pub(crate) fn key(&self) -> SecretKey {
@@ -149,7 +160,7 @@ pub(crate) async fn connection(
     {
         addr.addrs.extend(known.addrs.iter().cloned());
     }
-    let conn = tokio::time::timeout(DIAL_TIMEOUT, client.connect(addr))
+    let conn = n0_future::time::timeout(DIAL_TIMEOUT, client.connect(addr))
         .await
         .map_err(|_| SignInError::Unreachable("reaching the daemon over iroh timed out".into()))?
         .map_err(|e| SignInError::Unreachable(format!("{e:#}")))?;
@@ -229,7 +240,7 @@ impl Http for RemoteHttp {
     }
 
     async fn sleep(&self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+        n0_future::time::sleep(duration).await;
     }
 }
 

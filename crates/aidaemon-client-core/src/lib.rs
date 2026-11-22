@@ -18,7 +18,8 @@
 //! With default features off, what is left has no I/O and builds for
 //! `wasm32-unknown-unknown`: the reducer, the link's rules ([`machine`]),
 //! device keys, and sign-in over any [`signin::Http`]. Feature `native`
-//! (on by default) adds the tokio link and reqwest.
+//! (on by default) adds the tokio link and reqwest; feature `dial` alone
+//! dials a daemon by key over iroh ([`remote`]) and also builds there.
 
 #[cfg(feature = "remote")]
 pub mod bridge;
@@ -29,7 +30,7 @@ pub mod link;
 #[cfg(feature = "native")]
 pub mod local;
 pub mod machine;
-#[cfg(feature = "remote")]
+#[cfg(feature = "dial")]
 pub mod remote;
 #[cfg(feature = "native")]
 pub mod screen_share;

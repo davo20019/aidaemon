@@ -28,13 +28,22 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-# aws-lc-rs: the crypto provider the rest of the tree already builds (no ring).
-iroh = { version = "1.5", default-features = false, features = ["tls-aws-lc-rs", "portmapper", "fast-apple-datapath"] }
 sha2 = "0.11"
 tokio = { version = "1", features = ["io-util", "rt", "sync"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# Spawns on tokio natively and on the page's event loop in a browser.
+n0-future = "0.3"
 tracing = "0.1"
 url = "2"
+
+# aws-lc-rs: the crypto provider the rest of the tree already builds (no ring).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iroh = { version = "1.5", default-features = false, features = ["tls-aws-lc-rs", "portmapper", "fast-apple-datapath"] }
+
+# A browser (the web app on its own site): aws-lc does not build for wasm,
+# ring does; iroh reaches the relay over a WebSocket there, never UDP.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }

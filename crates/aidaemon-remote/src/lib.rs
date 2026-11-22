@@ -29,6 +29,8 @@ use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
+/// The WebSocket crate [`RemoteConnection::websocket`]'s types come from.
+pub use tokio_tungstenite;
 
 #[cfg(feature = "server")]
 pub mod server;
@@ -339,7 +341,8 @@ impl RemoteConnection {
         }
         let io = TokioIo::new(self.open_stream().await?);
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
-        tokio::spawn(async move {
+        // tokio natively, the page's event loop in a browser.
+        n0_future::task::spawn(async move {
             if let Err(error) = connection.await {
                 debug!(%error, "Remote request stream ended with an error");
             }
