@@ -418,6 +418,9 @@ pub struct Store {
     /// A new conversation was started from a drawer: the page under it
     /// takes no focus until it has gone, so the ask is made again then.
     keyboard_after_drawer: Stored<bool>,
+    /// Where a choice in a narrow window's drawer goes, once the drawer
+    /// has slid out ([`Self::leave_drawer`]).
+    after_drawer: Stored<Option<Box<dyn FnOnce()>>>,
     /// The sidebar lists archived conversations instead of the others.
     show_archived: Signal<bool>,
     /// The conversation that was on screen when it was archived: Undo
@@ -526,6 +529,7 @@ impl Store {
             keyboard_ask: signal(0),
             keyboard_wanted: stored(false),
             keyboard_after_drawer: stored(false),
+            after_drawer: stored(None),
             show_archived: signal(false),
             archived_open: signal(None),
             sent_at: signal(0),
@@ -1782,10 +1786,26 @@ impl Store {
         self.keyboard_after_drawer.replace(drawer);
     }
 
+    /// A choice in a narrow window's drawer that leaves it (a
+    /// conversation, a new one, another page): the drawer slides out
+    /// first and the page changes once it has gone, so building the page
+    /// does not stall the slide. Anywhere else it goes at once.
+    pub fn leave_drawer(&self, go: impl FnOnce() + 'static) {
+        if self.compact.get_untracked() && self.sidebar.get_untracked() {
+            self.after_drawer.replace(Some(Box::new(go)));
+            self.close_panes();
+        } else {
+            go();
+        }
+    }
+
     /// A drawer (a narrow window's pane) has gone: a new conversation
     /// started from it asks for the keyboard again, now that the page
     /// under it takes the focus.
     pub fn drawer_gone(&self) {
+        if let Some(go) = self.after_drawer.replace(None) {
+            go();
+        }
         if self.keyboard_after_drawer.replace(false)
             && self.selected.get_untracked().is_none()
             && self.page.get_untracked() == Page::Conversation

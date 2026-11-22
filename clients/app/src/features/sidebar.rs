@@ -199,7 +199,10 @@ fn menu_row(store: Store, id: String, dated: bool) -> View {
     let pinned = untracked(|| store.is_pinned(&id));
     let current = untracked(|| store.session_project(&id));
     let mut actions = vec![
-        ui::MenuAction::new("Open", move || store.select(Some(open.clone()))),
+        ui::MenuAction::new("Open", move || {
+            let open = open.clone();
+            store.leave_drawer(move || store.select(Some(open)))
+        }),
         ui::MenuAction::new(if pinned { "Unpin" } else { "Pin" }, move || {
             store.toggle_pin(&pin)
         }),
@@ -372,7 +375,7 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
                     // conversation.
                     .child(ui::name_btn("AIDaemon", NAME_INSET, move || {
                         store.show_sidebar_view(SidebarView::Home);
-                        store.select(None);
+                        store.leave_drawer(move || store.select(None));
                     }))
                     // The connection at a glance; its words come to the
                     // footer only when something is wrong.
@@ -414,10 +417,11 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
 /// New conversation from the sidebar: inside a project's page it starts
 /// there.
 fn new_here(store: Store) {
-    match untracked(|| store.sidebar_view()) {
+    let view = untracked(|| store.sidebar_view());
+    store.leave_drawer(move || match view {
         SidebarView::Project(id) => store.new_in_project(Some(id)),
         _ => store.with_keyboard(|| store.select(None)),
-    }
+    });
 }
 
 /// Home lists every project up to this many; past it, the pinned and the
@@ -609,7 +613,8 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
     };
     let actions = vec![
         ui::MenuAction::new("New conversation here", move || {
-            store.new_in_project(Some(start.clone()))
+            let start = start.clone();
+            store.leave_drawer(move || store.new_in_project(Some(start)))
         }),
         ui::MenuAction::new(pin_label, move || store.toggle_project_pin(&pin)),
         ui::MenuAction::new("Move up", move || store.move_project_by(&up, -1))
@@ -955,15 +960,21 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
         // a new Code conversation in this project's folder.
         .child(when(ui::touch(), move || {
             let start = empty.clone();
-            row(|| false, move || store.new_in_project(Some(start.clone())))
-                .accessibility_label("New conversation in this project")
-                .child(icon(Glyph::Compose).text_color(colors::MUTED))
-                .child(
-                    text("New conversation")
-                        .flex_1()
-                        .number_of_lines(1)
-                        .text_size(px(type_scale::BASE)),
-                )
+            row(
+                || false,
+                move || {
+                    let start = start.clone();
+                    store.leave_drawer(move || store.new_in_project(Some(start)))
+                },
+            )
+            .accessibility_label("New conversation in this project")
+            .child(icon(Glyph::Compose).text_color(colors::MUTED))
+            .child(
+                text("New conversation")
+                    .flex_1()
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::BASE)),
+            )
         }))
         .child(when(
             move || mine.with(Vec::is_empty),
@@ -1280,7 +1291,10 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         move || {
             store.page() == Page::Conversation && store.selected().as_deref() == Some(a.as_str())
         },
-        move || store.select(Some(b.clone())),
+        move || {
+            let b = b.clone();
+            store.leave_drawer(move || store.select(Some(b)))
+        },
     )
     // Read as one item: its name, where it lives and whether it is working.
     .accessibility_label(move || {
@@ -1515,19 +1529,22 @@ fn pages(store: Store) -> View {
                    name: &'static str,
                    page: Page,
                    open: fn(&Store)| {
-            ui::row(move || store.page() == page, move || open(&store))
-                .flex_1()
-                .flex_col()
-                .justify_center()
-                .gap(px(2.0))
-                .accessibility_label(name)
-                .child(icon(glyph).text_color(colors::MUTED))
-                .child(
-                    text(label)
-                        .number_of_lines(1)
-                        .text_size(px(type_scale::XS))
-                        .text_color(colors::MUTED),
-                )
+            ui::row(
+                move || store.page() == page,
+                move || store.leave_drawer(move || open(&store)),
+            )
+            .flex_1()
+            .flex_col()
+            .justify_center()
+            .gap(px(2.0))
+            .accessibility_label(name)
+            .child(icon(glyph).text_color(colors::MUTED))
+            .child(
+                text(label)
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::MUTED),
+            )
         };
         return view()
             .flex_row()
@@ -1688,29 +1705,35 @@ fn search_hits(store: Store) -> View {
                         title
                     };
                     list = list.child(
-                        row(|| false, move || store.select(Some(open.clone())))
-                            .accessibility_label(format!("{title}: {}", hit.snippet))
-                            .child(
-                                view()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .py_1()
-                                    .child(
-                                        text(hit.snippet.clone())
-                                            .number_of_lines(2)
-                                            .text_size(px(type_scale::SM))
-                                            .text_color(colors::TEXT),
-                                    )
-                                    .child(
-                                        text(format!(
-                                            "{who} · {title} · {}",
-                                            ui::time::ago(hit.at_ms, now_ms())
-                                        ))
-                                        .number_of_lines(1)
-                                        .text_size(px(type_scale::XS))
-                                        .text_color(colors::FAINT),
-                                    ),
-                            ),
+                        row(
+                            || false,
+                            move || {
+                                let open = open.clone();
+                                store.leave_drawer(move || store.select(Some(open)))
+                            },
+                        )
+                        .accessibility_label(format!("{title}: {}", hit.snippet))
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .py_1()
+                                .child(
+                                    text(hit.snippet.clone())
+                                        .number_of_lines(2)
+                                        .text_size(px(type_scale::SM))
+                                        .text_color(colors::TEXT),
+                                )
+                                .child(
+                                    text(format!(
+                                        "{who} · {title} · {}",
+                                        ui::time::ago(hit.at_ms, now_ms())
+                                    ))
+                                    .number_of_lines(1)
+                                    .text_size(px(type_scale::XS))
+                                    .text_color(colors::FAINT),
+                                ),
+                        ),
                     );
                 }
                 list
