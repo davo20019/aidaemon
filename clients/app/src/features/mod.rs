@@ -2,6 +2,7 @@
 
 pub mod approvals;
 pub mod automations;
+pub mod browser_tab;
 pub mod code;
 pub mod conversation;
 pub mod files;
@@ -16,3 +17,4 @@ pub mod settings_general;
 pub mod setup;
 pub mod sidebar;
 pub mod system;
+pub mod terminal;

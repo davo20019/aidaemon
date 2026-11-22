@@ -62,7 +62,11 @@ pub fn start(store: Store) {
             version: Some(crate::link::app_version()),
         },
         device: None,
-        capabilities: vec![Capability::ViewActions, Capability::Surfaces],
+        capabilities: vec![
+            Capability::ViewActions,
+            Capability::Surfaces,
+            Capability::Shells,
+        ],
     };
     let (updates_tx, mut updates) = tokio::sync::mpsc::unbounded_channel::<Update>();
     // Owned by nothing: `start` runs from screens' tasks too (pairing, "Pair
@@ -186,6 +190,51 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
         }
         if !closed {
             store.media_event(epoch, MediaEvent::Closed("the connection dropped".into()));
+        }
+    });
+}
+
+/// Open a conversation shell's socket on the background runtime; its
+/// events come back to the engine thread and into the [`Store`].
+pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
+    use aidaemon_client_core::shells::{self, ShellEvent};
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<ShellEvent>();
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Closing drops the only sender: the socket task closes and ends.
+    let sender = std::rc::Rc::new(std::cell::RefCell::new(Some(out_tx)));
+    let send = {
+        let sender = sender.clone();
+        move |text: String| {
+            if let Some(tx) = sender.borrow().as_ref() {
+                let _ = tx.send(text);
+            }
+        }
+    };
+    store.shell_attached(
+        epoch,
+        crate::store::ShellLink {
+            send: Box::new(send),
+            close: Box::new(move || {
+                sender.borrow_mut().take();
+            }),
+        },
+    );
+    spawn(async move {
+        let started = background(async move {
+            tokio::spawn(shells::run(url, ticket, events_tx, out_rx));
+        })
+        .await;
+        if started.is_err() {
+            store.shell_event(epoch, ShellEvent::Closed("could not start the shell".into()));
+            return;
+        }
+        let mut closed = false;
+        while let Some(event) = events.recv().await {
+            closed |= matches!(event, ShellEvent::Closed(_));
+            store.shell_event(epoch, event);
+        }
+        if !closed {
+            store.shell_event(epoch, ShellEvent::Closed("the connection dropped".into()));
         }
     });
 }

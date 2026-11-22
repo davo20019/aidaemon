@@ -466,6 +466,11 @@ impl ClientHost for Host {
     ) -> Result<(bool, String), String> {
         Ok((true, format!("{change:?} {id}: done (demo).")))
     }
+    async fn shell_folder(&self, _session_id: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
+        Ok(std::env::var("AIDAEMON_DEMO_PROJECT_DIR")
+            .ok()
+            .map(std::path::PathBuf::from))
+    }
     async fn projects(&self) -> anyhow::Result<Vec<ProjectSummary>> {
         Ok(vec![ProjectSummary {
             id: "project-acme".into(),
@@ -1086,6 +1091,10 @@ async fn main() -> anyhow::Result<()> {
         endpoints: aidaemon_core::EndpointSource::fixed(Vec::new()),
     })
     .await?;
+    // Conversation shells, started in the demo project's folder.
+    gateway.attach_shells(aidaemon_shells::ShellRegistry::new(
+        aidaemon_shells::ShellsConfig::default(),
+    ));
     let _ = GATEWAY.set(gateway.clone());
     let offer = gateway
         .pairing()

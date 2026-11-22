@@ -174,6 +174,14 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
     web::open_live(store, epoch, url, ticket);
 }
 
+/// Open a conversation shell's socket for opening `epoch` (protocol 1.42).
+pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
+    #[cfg(not(target_arch = "wasm32"))]
+    native::open_shell(store, epoch, url, ticket);
+    #[cfg(target_arch = "wasm32")]
+    web::open_shell(store, epoch, url, ticket);
+}
+
 /// Whether speech can be recognized here, to await in a task: the
 /// platform's recognizer (macOS, iOS) or, in the browser, the page's Web
 /// Speech API (NSH's web build wires no recognizer of its own).

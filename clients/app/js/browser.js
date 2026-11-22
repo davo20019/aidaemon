@@ -210,6 +210,30 @@ export class MediaSocket {
 }
 
 /**
+ * A conversation shell's socket (protocol 1.42): JSON text both ways. The
+ * ticket goes first; a close comes back as a `closed` message.
+ */
+export class ShellSocket {
+  constructor(url, ticket, event) {
+    this.ws = new WebSocket(url);
+    this.ws.onopen = () => this.ws.send(JSON.stringify({ type: "auth", ticket }));
+    this.ws.onmessage = (m) => {
+      if (typeof m.data === "string") event(m.data);
+    };
+    this.ws.onclose = (c) =>
+      event(JSON.stringify({ type: "closed", reason: c.reason || "the shell's connection dropped" }));
+    this.ws.onerror = () => {};
+  }
+  send(text) {
+    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(text);
+  }
+  close() {
+    this.ws.onclose = null;
+    this.ws.close();
+  }
+}
+
+/**
  * Take a picture with the device's camera (a phone's browser opens it for a
  * file input with `capture`): its JPEG bytes, scaled to fit `maxDimension`
  * and upright, or null when nothing was taken.

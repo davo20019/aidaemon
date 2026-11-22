@@ -66,6 +66,14 @@ extern "C" {
     #[wasm_bindgen(method, js_name = close)]
     fn close_media(this: &MediaSocket);
 
+    type ShellSocket;
+    #[wasm_bindgen(constructor)]
+    fn new(url: &str, ticket: &str, event: &Closure<dyn FnMut(String)>) -> ShellSocket;
+    #[wasm_bindgen(method, js_name = send)]
+    fn send_shell(this: &ShellSocket, text: &str);
+    #[wasm_bindgen(method, js_name = close)]
+    fn close_shell(this: &ShellSocket);
+
     type KeyCapture;
     #[wasm_bindgen(constructor)]
     fn new(event: &Closure<dyn FnMut(bool, String, String, String) -> bool>) -> KeyCapture;
@@ -388,7 +396,7 @@ pub fn start(store: Store) {
                 version: Some(crate::link::app_version()),
             },
             None,
-            vec![Capability::ViewActions, Capability::Surfaces],
+            vec![Capability::ViewActions, Capability::Surfaces, Capability::Shells],
         );
         let (commands_tx, mut commands) = mpsc::unbounded::<(String, Command)>();
         store.attach(Box::new(move |id, command| {
@@ -557,6 +565,43 @@ async fn grant_token(
             SignInError::Refused(why) => (DropKind::Unauthorized, why),
             SignInError::Failed(why) => (DropKind::Dropped, why),
         })
+}
+
+/// Open a conversation shell's socket on the page's own WebSocket
+/// (protocol 1.42): its JSON messages come back as text.
+pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
+    use aidaemon_client_core::shells::{self, ShellEvent};
+    let (events_tx, mut events) = mpsc::unbounded::<String>();
+    let on_event = Closure::<dyn FnMut(String)>::new(move |text: String| {
+        let _ = events_tx.unbounded_send(text);
+    });
+    let socket = std::rc::Rc::new(ShellSocket::new(&url, &ticket, &on_event));
+    let keep = std::rc::Rc::new(std::cell::RefCell::new(Some(on_event)));
+    store.shell_attached(
+        epoch,
+        crate::store::ShellLink {
+            send: Box::new({
+                let socket = socket.clone();
+                move |text: String| socket.send_shell(&text)
+            }),
+            close: Box::new(move || {
+                socket.close_shell();
+                keep.borrow_mut().take();
+            }),
+        },
+    );
+    spawn(async move {
+        while let Some(text) = events.next().await {
+            let Some(event) = shells::read(&text) else {
+                continue;
+            };
+            let ended = matches!(event, ShellEvent::Closed(_));
+            store.shell_event(epoch, event);
+            if ended {
+                return;
+            }
+        }
+    });
 }
 
 /// Open a live view's frame socket on the page's own WebSocket (protocol

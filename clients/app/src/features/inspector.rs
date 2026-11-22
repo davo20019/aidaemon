@@ -1,14 +1,15 @@
 //! The details pane beside a conversation: for a coding conversation its
-//! Changes (`features::code`), its project's Files (`features::files`)
-//! and Steps, for any other its Steps alone:
-//! the work running for it and what its current turn did, step by step.
+//! Changes (`features::code`) and its project's Files (`features::files`);
+//! for any, its Steps (the work running for it and what its current turn
+//! did, step by step), its Terminal (`features::terminal`, the shell it
+//! shares with the agent) and its Browser (`features::browser_tab`).
 //! What waits on the owner across conversations is the sidebar's Needs
 //! you, not here.
 
 use nsh_core::prelude::*;
 
 use crate::store::{
-    ActivityKind, CHANGES_TAB, COMPACT_DETAIL_TABS, DETAIL_TABS, FILES_TAB, STEPS_TAB, Store,
+    ActivityKind, BROWSER_TAB, CHANGES_TAB, FILES_TAB, STEPS_TAB, Store, TERMINAL_TAB, detail_tabs,
 };
 use crate::ui::{self, Glyph, Size, Tone, Variant, btn, colors, section_label, type_scale};
 
@@ -27,34 +28,13 @@ pub fn inspector(store: Store) -> View {
                 .items_center()
                 .px_4()
                 .child(
-                    // Only a coding conversation has this pane. A phone
-                    // shows its changes and files (the steps are under each
-                    // reply, and a pane over the chat hides them as they
-                    // run); a desktop has Steps beside them, to watch a
-                    // turn's commands and output next to the chat.
-                    view().flex_1().child(
-                        when(
-                            move || coding.get(),
-                            move || {
-                                view().child(dynamic(move || {
-                                    let compact = store.is_compact();
-                                    Some(untracked(move || {
-                                        if compact {
-                                            ui::tab_bar(store.inspector_tab(), &COMPACT_DETAIL_TABS)
-                                        } else {
-                                            ui::tab_bar(store.inspector_tab(), &DETAIL_TABS)
-                                        }
-                                    }))
-                                }))
-                            },
-                        )
-                        .otherwise(move || {
-                            text("Steps")
-                                .role(AccessibilityRole::Header)
-                                .text_size(px(ui::fit::body()))
-                                .font_weight(FontWeight::SEMIBOLD)
-                        }),
-                    ),
+                    // Code has its changes and files; a desktop has Steps
+                    // beside the chat (a phone has them under each reply);
+                    // every conversation has its terminal and browser.
+                    view().flex_1().child(dynamic(move || {
+                        let tabs = detail_tabs(coding.get(), store.is_compact());
+                        Some(untracked(move || ui::tab_bar_of(store.inspector_tab(), &tabs)))
+                    })),
                 )
                 .child(when(
                     move || store.is_compact(),
@@ -66,15 +46,19 @@ pub fn inspector(store: Store) -> View {
                 )),
         )
         .child(dynamic(move || {
-            // A phone has no Steps tab: there it is the changes.
-            let tab = match store.inspector_tab().get() {
-                STEPS_TAB if store.is_compact() => CHANGES_TAB,
-                tab => tab,
+            // A tab this conversation does not show falls back to its first.
+            let tabs = detail_tabs(coding.get(), store.is_compact());
+            let picked = store.inspector_tab().get();
+            let tab = if tabs.iter().any(|(i, _)| *i == picked) {
+                picked
+            } else {
+                tabs.first().map_or(STEPS_TAB, |(i, _)| *i)
             };
-            let tab = if coding.get() { tab } else { STEPS_TAB };
             Some(untracked(move || match tab {
                 CHANGES_TAB => super::code::code(store),
                 FILES_TAB => super::files::files(store),
+                TERMINAL_TAB => super::terminal::terminal_tab(store),
+                BROWSER_TAB => super::browser_tab::browser_tab(store),
                 _ => steps(store),
             }))
         }))

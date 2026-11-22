@@ -19,6 +19,9 @@ use aidaemon_client_protocol::{
 use aidaemon_client_protocol::{Pane, ViewAction};
 use nsh_core::prelude::*;
 
+mod shells;
+pub use shells::{ShellLink, ShellSink};
+
 pub use aidaemon_client_core::client::{
     Activity, ActivityKind, Bot, Connection, DraftFile, DraftFileState, Felt, Read, SearchRead,
     Source, SystemRead, TurnLog, channel_name, platform_name, platform_of,
@@ -101,17 +104,35 @@ impl ActivityMode {
     }
 }
 
-/// The details pane's tabs for a coding conversation, in order; any other
-/// conversation shows only its steps.
-pub const DETAIL_TABS: [&str; 3] = ["Changes", "Files", "Steps"];
-/// A phone's details: the steps are under each reply there.
-pub const COMPACT_DETAIL_TABS: [&str; 2] = ["Changes", "Files"];
+/// The details pane's tabs, by index: [`detail_tabs`] says which a
+/// conversation shows.
+pub const DETAIL_TABS: [&str; 5] = ["Changes", "Files", "Steps", "Terminal", "Browser"];
 /// The Changes tab's index in [`DETAIL_TABS`].
 pub const CHANGES_TAB: usize = 0;
 /// The Files tab's index: the project's files, read-only.
 pub const FILES_TAB: usize = 1;
 /// The Steps tab's index in [`DETAIL_TABS`].
 pub const STEPS_TAB: usize = 2;
+/// The conversation's shell, shared with the agent.
+pub const TERMINAL_TAB: usize = 3;
+/// The agent's browser in this conversation, watched in the pane.
+pub const BROWSER_TAB: usize = 4;
+
+/// The details tabs a conversation shows, as `(index, label)`: Changes and
+/// Files only for code, Steps only on a wide window (a phone has them
+/// under each reply), Terminal and Browser always.
+pub fn detail_tabs(coding: bool, compact: bool) -> Vec<(usize, &'static str)> {
+    DETAIL_TABS
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, _)| match *index {
+            CHANGES_TAB | FILES_TAB => coding,
+            STEPS_TAB => !compact,
+            _ => true,
+        })
+        .collect()
+}
 
 /// Where drafts are kept between runs.
 const DRAFT_KEY: &str = "aidaemon.draft.";
@@ -430,6 +451,10 @@ pub struct Store {
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
     media_epoch: Stored<u64>,
+    /// The terminal attached to a conversation's shell, its socket and the
+    /// opening it belongs to (`shells`).
+    shell: Stored<Option<shells::Attached>>,
+    shell_epoch: Stored<u64>,
     /// A pull to refresh is under way: its indicator shows until the
     /// reads answer (a refresh on the app's return shows none).
     pulled: Signal<bool>,
@@ -504,6 +529,8 @@ impl Store {
             live_room_sent: stored(None),
             media: stored(None),
             media_epoch: stored(0),
+            shell: stored(None),
+            shell_epoch: stored(0),
             pulled: signal(false),
         }
     }
@@ -712,6 +739,11 @@ impl Store {
                 crate::link::open_live(*self, epoch, url, transport.ticket);
             }
             Effect::CloseLive => self.close_media(),
+            Effect::OpenShell {
+                session_id,
+                transport,
+                ..
+            } => self.connect_shell(&session_id, &transport),
         }
     }
 
@@ -2440,12 +2472,45 @@ impl Store {
     /// The details pane, which only a coding conversation has.
     pub fn details_open(&self) -> bool {
         // A file full screen has the window: no details beside it.
-        self.inspector.get() && self.coding_on_screen() && self.page.get() != Page::Files
+        self.inspector.get() && self.selected.get().is_some() && self.page.get() != Page::Files
+    }
+
+    /// The details pane shows the agent's browser now: the live view goes
+    /// there instead of over the window.
+    pub fn live_docked(&self) -> bool {
+        self.details_open() && self.inspector_tab.get() == BROWSER_TAB
+    }
+
+    /// Open the details on tab `tab` (an index of [`DETAIL_TABS`]), when
+    /// the conversation on screen shows it.
+    pub fn show_detail(&self, tab: usize) {
+        let coding = untracked(|| self.coding_on_screen());
+        let compact = self.compact.get_untracked();
+        if untracked(|| self.selected.get()).is_none()
+            || !detail_tabs(coding, compact).iter().any(|(i, _)| *i == tab)
+        {
+            self.say(NO_DETAILS);
+            return;
+        }
+        self.inspector_tab.set(tab);
+        if compact {
+            self.sidebar.set(false);
+        }
+        self.inspector.set(true);
     }
 
     pub fn open_inspector(&self) {
         if !untracked(|| self.coding_on_screen()) {
-            self.say(NO_DETAILS);
+            // Away from code the details are the terminal and the browser
+            // (and, on a wide window, the steps).
+            if self.compact.get_untracked() {
+                self.show_detail(TERMINAL_TAB);
+            } else {
+                if !matches!(self.inspector_tab.get_untracked(), STEPS_TAB | TERMINAL_TAB | BROWSER_TAB) {
+                    self.inspector_tab.set(STEPS_TAB);
+                }
+                self.toggle_inspector();
+            }
             return;
         }
         if self.compact.get_untracked() {
@@ -2597,11 +2662,17 @@ impl Store {
         let coding = id
             .as_deref()
             .is_some_and(|id| self.client.with_untracked(|c| c.is_coding(id)));
-        if id.is_some() {
+        // The terminal and the browser go with the conversation: one open
+        // stays open on the next conversation's own.
+        let tab = self.inspector_tab.get_untracked();
+        let follows = self.inspector.get_untracked() && matches!(tab, TERMINAL_TAB | BROWSER_TAB);
+        if id.is_some() && !follows {
             self.inspector_tab
                 .set(if coding { CHANGES_TAB } else { STEPS_TAB });
         }
-        self.show_details(coding);
+        if !follows {
+            self.show_details(coding);
+        }
         let _ = nsh_core::storage::Storage::set_item(OPEN_KEY, id.clone().unwrap_or_default());
         // A plain new conversation starts in no project (or the project of
         // the folder the app runs in); `new_in_project` places it after.

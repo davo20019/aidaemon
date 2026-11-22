@@ -388,13 +388,20 @@ impl Unfolding {
 /// A row of tabs over one page at a time: `labels` in order, `selected`
 /// the open one's index.
 pub fn tab_bar(selected: Signal<usize>, labels: &[&'static str]) -> View {
+    let tabs: Vec<(usize, &'static str)> = labels.iter().copied().enumerate().collect();
+    tab_bar_of(selected, &tabs)
+}
+
+/// [`tab_bar`] of some tabs: each `(index, label)`, `selected` holding an
+/// index.
+pub fn tab_bar_of(selected: Signal<usize>, tabs_shown: &[(usize, &'static str)]) -> View {
     let mut bar = tabs()
         .flex_row()
         .gap_1()
         .border_b_1()
         .border_color(colors::LINE)
         .indicator_style(|s| s.bottom(px(-1.0)).h(px(2.0)).bg(colors::ACCENT));
-    for (index, label) in labels.iter().copied().enumerate() {
+    for (index, label) in tabs_shown.iter().copied() {
         bar = bar.child(
             tab()
                 .selected(move || selected.get() == index)
@@ -2113,6 +2120,9 @@ pub struct LiveScreen {
     /// The room for the picture changed (a phone turned), as
     /// [`live_room`] gives it.
     pub room_changed: std::rc::Rc<dyn Fn((u32, u32))>,
+    /// Drawn in its place in a pane (the details' Browser tab), not over
+    /// the window.
+    pub docked: bool,
 }
 
 /// The live view, over everything while it is open.
@@ -2143,8 +2153,9 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
         move || c()
     };
     // A phone that turns between portrait and landscape: its new room goes
-    // to the daemon, which lays the page out again for it.
-    {
+    // to the daemon, which lays the page out again for it. A docked view
+    // keeps the page's own size: the pane is not the device's room.
+    if !screen.docked {
         let changed = screen.room_changed.clone();
         effect(move || {
             if let Some(room) = live_room() {
@@ -2824,13 +2835,7 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     // Held sideways the status goes in the column beside the picture.
     let sideways = live_sideways;
     let top_bar = bar.clone();
-    view().child(
-        dialog()
-            .label("The agent's screen")
-            .on_cancel(move || close())
-            .bg(colors::LIVE_BACKDROP)
-            .child(
-                view()
+    let body = view()
                     .flex_1()
                     .w_full()
                     .h_full()
@@ -2873,8 +2878,16 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
                             ))
                             .child(answers)
                             .child(view().h(px(8.0))),
-                    ),
-            ),
+                    );
+    if screen.docked {
+        return view().flex_1().w_full().h_full().child(body);
+    }
+    view().child(
+        dialog()
+            .label("The agent's screen")
+            .on_cancel(move || close())
+            .bg(colors::LIVE_BACKDROP)
+            .child(body),
     )
 }
 

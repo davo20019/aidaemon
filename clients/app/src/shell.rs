@@ -204,7 +204,8 @@ pub fn shell(store: Store) -> View {
                             ui::Edge::Right,
                             ui::size::INSPECTOR,
                             260.0,
-                            520.0,
+                            // Room for a terminal or the agent's browser.
+                            1100.0,
                             move || store.details_open() && wide.get(),
                             inspector(store),
                         )),
@@ -217,7 +218,7 @@ pub fn shell(store: Store) -> View {
             store.viewing(),
             picture_actions(store),
         ))
-        .child(crate::ui::live_screen(live_screen(store)))
+        .child(crate::ui::live_screen(live_screen(store, false)))
         // A phone's open list is a surface of its own, over this one: a
         // note about what was done there shows in it (see the drawer).
         .child(when(
@@ -354,12 +355,15 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
         CommandItem::new("sidebar", "Show or hide the sidebar")
             .group("View")
             .shortcut("mod+b"),
-        CommandItem::new("inspector", "Show or hide the changes and steps")
+        CommandItem::new("inspector", "Show or hide the details")
             .group("View")
             .shortcut(steps_key()),
         CommandItem::new("changes", "Show the changes of this conversation")
             .group("View")
             .shortcut("mod+d"),
+        CommandItem::new("terminal", "Open this conversation's terminal").group("View"),
+        CommandItem::new("browser", "Watch the agent's browser in this conversation")
+            .group("View"),
     ];
     let system = CommandItem::new("system", "System: how the daemon is doing").group("View");
     items.push(match SYSTEM_KEY {
@@ -460,6 +464,8 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                 "sidebar" => store.open_sidebar(),
                                 "inspector" => store.open_inspector(),
                                 "changes" => store.show_changes(),
+                                "terminal" => store.show_detail(crate::store::TERMINAL_TAB),
+                                "browser" => store.show_detail(crate::store::BROWSER_TAB),
                                 "new-project" => {
                                     store.reveal_sidebar();
                                     store.show_project_form(true);
@@ -558,10 +564,12 @@ fn steps_key() -> &'static str {
 }
 
 /// The live view of the agent's browser, read and driven through the store.
-fn live_screen(store: Store) -> crate::ui::LiveScreen {
+/// `docked`: the one drawn in the details' Browser tab, which shows while
+/// that tab does; the other is over the window the rest of the time.
+pub(crate) fn live_screen(store: Store, docked: bool) -> crate::ui::LiveScreen {
     use std::rc::Rc;
     crate::ui::LiveScreen {
-        open: Rc::new(move || store.live_open()),
+        open: Rc::new(move || store.live_open() && store.live_docked() == docked),
         title: Rc::new(move || {
             store.live_surface().map_or_else(
                 || "The agent's browser".to_owned(),
@@ -620,6 +628,7 @@ fn live_screen(store: Store) -> crate::ui::LiveScreen {
         not_now: Rc::new(move || store.live_finish(false)),
         close: Rc::new(move || store.hide_live()),
         room_changed: Rc::new(move |room| store.live_room_changed(room)),
+        docked,
     }
 }
 

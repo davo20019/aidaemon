@@ -149,6 +149,42 @@ pub fn output(
         )
 }
 
+/// A terminal the owner types into, filling its box: a conversation's
+/// shell. `term` takes what the program writes (`write`, `reset`);
+/// `on_event` gets the typing, the size in cells and the title.
+pub fn interactive_terminal(
+    term: nsh_core::element::ComponentRef<nsh_base::Terminal>,
+    on_event: impl Fn(&nsh_base::TerminalEvent) + Clone + 'static,
+    label: impl Into<SharedString>,
+) -> View {
+    use super::theme::colors;
+    use nsh_base::terminal;
+    let on_data = on_event.clone();
+    view()
+        .flex_1()
+        .w_full()
+        .min_h(px(0.0))
+        // Never a screen narrow enough to break the emulator.
+        .min_w(px(120.0))
+        .bg(colors::INSET)
+        .px_2()
+        .py_1()
+        .child(
+            terminal()
+                .font_family(SharedString::from(MONO))
+                .font_size(px(type_scale::SM))
+                .line_height(px(18.0))
+                .scrollback(10_000)
+                .accessibility_label(label.into())
+                .on_data(move |data: &SharedString| {
+                    on_data(&nsh_base::TerminalEvent::Data(data.clone()))
+                })
+                .on_resize(move |event: &nsh_base::TerminalEvent| on_event(event))
+                .component_ref(&term)
+                .size_full(),
+        )
+}
+
 /// Program output on an inset well: its last 8 lines in a terminal, or
 /// 24 with Show more (the terminal scrolls back through the rest), with
 /// Copy. `label` names it for screen readers.
