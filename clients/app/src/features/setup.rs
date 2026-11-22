@@ -226,13 +226,14 @@ fn pair_elsewhere(store: Store) -> View {
         });
     };
     // An `aidaemon-pair:` link opened on this device (a QR code, a tapped
-    // link) fills the field and pairs at once.
-    spawn(async move {
-        loop {
-            let opened = next_url_scheme_open().await;
-            if !link_text.try_set(opened) {
-                return;
-            }
+    // link; the shell listens for them) fills the field and pairs at once.
+    effect(move || {
+        if store.pairing_link().is_none() {
+            return;
+        }
+        if let Some(opened) = store.take_pairing_link()
+            && link_text.try_set(opened)
+        {
             pair();
         }
     });

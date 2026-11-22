@@ -22,6 +22,7 @@ pub fn shell(store: Store) -> View {
         store.set_sidebar(false);
     }
     effect(move || store.set_compact(!roomy.get()));
+    listen_for_pairing_links(store);
     crate::features::notify::approvals(store);
     crate::features::notify::replies(store);
     crate::features::links::surface_links(store);
@@ -233,6 +234,37 @@ pub fn shell(store: Store) -> View {
 }
 
 /// The app's notes, wherever they are shown.
+/// Pairing links opened on this device (a QR code, a tapped link), whatever
+/// screen is up: nsh hands each to one listener, so this is the only one.
+/// The pairing screen uses it; an app already paired asks first, since
+/// pairing again forgets the daemon it has (which may be unreachable at its
+/// old address, the reason to open a new link).
+fn listen_for_pairing_links(store: Store) {
+    spawn(async move {
+        loop {
+            let opened = next_url_scheme_open().await;
+            let signed_in_elsewhere = crate::link::signs_in_paired()
+                && !matches!(
+                    store.connection_untracked(),
+                    Connection::NoDaemon | Connection::NeedsPairing
+                );
+            if signed_in_elsewhere {
+                crate::ui::confirm(
+                    "Pair with this AIDaemon?",
+                    "This app is paired already. Pairing with this link replaces that pairing.",
+                    "Pair",
+                    move || {
+                        store.open_pairing_link(opened);
+                        crate::link::pair_again(store);
+                    },
+                );
+            } else {
+                store.open_pairing_link(opened);
+            }
+        }
+    });
+}
+
 fn toasts(store: Store) -> impl IntoElement {
     ui::toasts(
         move || store.toast(),

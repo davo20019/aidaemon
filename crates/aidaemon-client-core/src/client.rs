@@ -55,6 +55,9 @@ pub enum Connection {
 pub const QUIET_DROP_MS: u64 = 5_000;
 /// After this long, a drop is an outage worth alarm.
 pub const LONG_DROP_MS: u64 = 30_000;
+/// After this long unreachable, a paired app offers to pair again: the
+/// daemon may have moved where its saved address no longer finds it.
+pub const STRANDED_MS: u64 = 120_000;
 
 /// The connection as the owner should feel it at a moment: a short drop
 /// reads as still connected, a longer one as reconnecting, and only a
@@ -96,6 +99,25 @@ impl Connection {
                     Felt::Online
                 }
             }
+        }
+    }
+
+    /// Whether a paired app should offer to pair again: the daemon
+    /// refused this app's key, or has not been reached for
+    /// [`STRANDED_MS`] (or since the app started), so it may have moved
+    /// where the saved address no longer finds it (another relay, another
+    /// computer) and only a new pairing link from it brings the app back.
+    /// A daemon that needs a newer app is not helped by pairing.
+    pub fn may_pair_again(&self, now_ms: u64) -> bool {
+        match self {
+            Connection::Offline { kind, since_ms, .. } => match kind {
+                DropKind::Unauthorized => true,
+                DropKind::VersionUnsupported => false,
+                DropKind::DaemonNotRunning | DropKind::Dropped => {
+                    since_ms.map_or(u64::MAX, |since| now_ms.saturating_sub(since)) >= STRANDED_MS
+                }
+            },
+            _ => false,
         }
     }
 
@@ -4164,6 +4186,25 @@ mod tests {
             client.model_of(Some("app:a")),
             (ModelChoice::Auto, Effort::Auto)
         );
+    }
+
+    #[test]
+    fn an_app_offers_to_pair_again_when_refused_or_stranded() {
+        let down = |kind, since_ms| Connection::Offline {
+            kind,
+            reason: String::new(),
+            retry_at_ms: 0,
+            since_ms,
+        };
+        let now = 1_000_000;
+        assert!(down(DropKind::Unauthorized, Some(now)).may_pair_again(now));
+        assert!(!down(DropKind::VersionUnsupported, None).may_pair_again(now));
+        assert!(!down(DropKind::Dropped, Some(now - 60_000)).may_pair_again(now));
+        assert!(down(DropKind::Dropped, Some(now - STRANDED_MS)).may_pair_again(now));
+        // Never reached since the app started: its saved address may be stale.
+        assert!(down(DropKind::DaemonNotRunning, None).may_pair_again(now));
+        assert!(!Connection::Online.may_pair_again(now));
+        assert!(!Connection::Connecting.may_pair_again(now));
     }
 
     #[test]

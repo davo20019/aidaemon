@@ -1764,9 +1764,10 @@ fn connection(store: Store) -> View {
                     "Reconnecting…".to_string()
                 };
                 // A paired key the daemon refused (revoked, or the daemon
-                // was reset) never comes back on its own: offer to pair
-                // again.
-                let repair = kind == DropKind::Unauthorized && crate::link::signs_in_paired();
+                // was reset), or a daemon not reached for long (it may have
+                // moved where the saved address no longer finds it), does
+                // not come back on its own: offer to pair again.
+                let repair = crate::link::signs_in_paired() && store.may_pair_again();
                 view()
                     .flex_row()
                     .items_center()

@@ -434,6 +434,9 @@ pub struct Store {
     /// Starting the daemon on this computer or pairing with one elsewhere,
     /// before any link: what is happening, or why it stopped.
     starting_daemon: Signal<Option<(String, bool)>>,
+    /// A pairing link opened on this device (a QR code, a tapped link) that
+    /// the pairing screen has not used yet.
+    pairing_link: Signal<Option<String>>,
     /// The live view's newest picture (beside the client: frames never
     /// enter its state).
     live_frame: Signal<Option<crate::ui::LiveFrame>>,
@@ -521,6 +524,7 @@ impl Store {
             automations_seen_before: signal(0),
             posting: signal(BTreeSet::new()),
             starting_daemon: signal(None),
+            pairing_link: signal(None),
             live_frame: signal(None),
             live_focus: signal(None),
             live_focus_rect: signal(None),
@@ -1074,6 +1078,36 @@ impl Store {
     /// No daemon to sign in to: show where the agent should run.
     pub fn needs_daemon(&self) {
         self.act(Client::needs_daemon);
+    }
+
+    /// A pairing link opened on this device, for the pairing screen.
+    pub fn open_pairing_link(&self, link: String) {
+        self.pairing_link.set(Some(link));
+    }
+
+    /// The pairing link waiting for the pairing screen, if any (tracked).
+    pub fn pairing_link(&self) -> Option<String> {
+        self.pairing_link.get()
+    }
+
+    /// Takes the waiting pairing link, so it is used once.
+    pub fn take_pairing_link(&self) -> Option<String> {
+        let link = self.pairing_link.with_untracked(Clone::clone);
+        if link.is_some() {
+            self.pairing_link.set(None);
+        }
+        link
+    }
+
+    /// Whether this app should offer to pair again now: refused, or not
+    /// reached for long (`Connection::may_pair_again`). Reruns each second
+    /// while down, like [`Self::felt`].
+    pub fn may_pair_again(&self) -> bool {
+        let connection = self.connection();
+        if connection.is_offline() {
+            self.tick();
+        }
+        connection.may_pair_again(now_ms())
     }
 
     /// Starting a daemon here or pairing with one: `(what, failed)`.
