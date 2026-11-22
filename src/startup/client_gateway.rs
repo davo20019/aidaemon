@@ -1472,18 +1472,32 @@ impl aidaemon_channels::slash::SlashCommand for DeviceCommands {
         let pairing = gateway.pairing();
         match cmd {
             "/pair_device" => match pairing.offer(Some(call.session_id.to_string())).await {
-                Ok(offer) => format!(
-                    "To pair your phone, open this link on it (it opens the AIDaemon \
-                     app, or AIDaemon in the browser when the app is not installed): {}\n\n\
-                     To pair a browser instead, open {} in it.\n\n\
-                     The code is **{}**, valid 10 minutes. I'll ask you here before the \
-                     device can do anything.\n\n\
-                     Daemon fingerprint: `{}`",
-                    offer.phone_link(),
-                    web_link(&gateway, &offer),
-                    offer.code,
-                    offer.fingerprint
-                ),
+                Ok(offer) => {
+                    // The web app's link pairs any browser already; the
+                    // gateway's own page is offered only where another
+                    // device can open it (not on loopback).
+                    let browser = if offer.phone_link() == offer.page_link()
+                        && !aidaemon_client_protocol::is_loopback_url(&gateway.public_url())
+                    {
+                        format!(
+                            "To pair a browser instead, open {} in it.\n\n",
+                            web_link(&gateway, &offer)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "To pair your phone, open this link on it (it opens the AIDaemon \
+                         app, or AIDaemon in the browser when the app is not installed): \
+                         {}\n\n{browser}\
+                         The code is **{}**, valid 10 minutes. I'll ask you here before the \
+                         device can do anything.\n\n\
+                         Daemon fingerprint: `{}`",
+                        offer.phone_link(),
+                        offer.code,
+                        offer.fingerprint
+                    )
+                }
                 Err(error) => format!("Could not start pairing: {}", error.message),
             },
             "/devices" => match pairing.devices().await {

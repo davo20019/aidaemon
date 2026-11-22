@@ -3312,7 +3312,9 @@ impl PairingOffer {
 
 /// Whether `url`'s host is this machine only (`127.x`, `localhost`,
 /// `[::1]`): a URL, so its host is read from its own syntax.
-fn is_loopback_url(url: &str) -> bool {
+/// Whether `url` names this machine only (`localhost`, `127.0.0.1`, `::1`):
+/// no other device can open it.
+pub fn is_loopback_url(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority
