@@ -850,6 +850,58 @@ async fn http_mode_refuses_a_missing_or_wrong_token() {
     assert_eq!(response.status(), 401);
 }
 
+/// The same routes over iroh: a paired app far from home sends a command
+/// with its token, and the gateway's sign-in still refuses one without.
+#[tokio::test]
+async fn the_gateway_serves_its_routes_over_iroh() {
+    use aidaemon_remote::{Access, Relays, RemoteClient, RemoteListener, SecretKey};
+    let f = fixture(RiskLevel::Medium).await;
+    let listener = RemoteListener::bind(
+        SecretKey::generate(),
+        &Relays::Disabled,
+        Access::Any,
+        aidaemon_client_gateway::router(f.gateway.clone()),
+    )
+    .await
+    .unwrap();
+    let client = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
+        .await
+        .unwrap();
+    let conn = client.connect(listener.addr()).await.unwrap();
+    let post = |token: Option<&str>| {
+        let mut request =
+            http::Request::post("/client/v1/commands").header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        request
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                serde_json::to_vec(&command("r-iroh", Command::GetGlance)).unwrap(),
+            )))
+            .unwrap()
+    };
+
+    let refused = conn.send(post(None)).await.unwrap();
+    assert_eq!(refused.status(), 401);
+
+    let response = conn.send(post(Some(&f.token))).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let frame: ServerFrame = serde_json::from_slice(response.body()).unwrap();
+    assert!(
+        matches!(
+            frame,
+            ServerFrame::Ack {
+                result: CommandResult::Glance { .. },
+                ..
+            }
+        ),
+        "{frame:?}"
+    );
+
+    client.close().await;
+    listener.close().await;
+}
+
 /// A watch gets compact frames and may only deny above its risk ceiling;
 /// the first answer wins and a later one gets `conflict`.
 #[tokio::test]

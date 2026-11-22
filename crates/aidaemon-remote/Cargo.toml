@@ -1,0 +1,36 @@
+[package]
+name = "aidaemon-remote"
+description = "Remote access for aidaemon over iroh: the owner's apps reach the daemon's gateway from anywhere by its endpoint key (direct QUIC when the network allows, an encrypted relay otherwise), with no tunnel, account or domain; implementation crate of the aidaemon SDK, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-remote"
+readme = "README.md"
+keywords = ["agent", "p2p", "quic", "iroh", "remote-access"]
+categories = ["network-programming", "asynchronous"]
+# Integration tests need dev-dependencies that are not published with the crate.
+exclude = ["tests/"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# aws-lc-rs: the crypto provider the rest of the tree already builds (no ring).
+iroh = { version = "1.5", default-features = false, features = ["tls-aws-lc-rs", "portmapper", "fast-apple-datapath"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+futures = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

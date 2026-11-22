@@ -565,6 +565,13 @@ include_raw_tool_args = false
 # max_events = 100000
 # watch_risk_ceiling = "medium"
 # public_url = "https://aidaemon.example.ts.net"   # your HTTPS tunnel, for pairing links
+#
+# Remote access over iroh: the apps reach the gateway from anywhere by the
+# daemon's key (~/.aidaemon/remote-key), directly when the network allows and
+# through an encrypted relay otherwise. No tunnel, account or domain.
+# [client_gateway.remote]
+# enabled = false
+# relays = []    # your own iroh-relay URLs; empty: n0's public relays
 
 # Nodes are disabled by default. The Gateway binds only to loopback; publish
 # this narrow service through a separately managed HTTPS transport adapter.

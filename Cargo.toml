@@ -52,6 +52,7 @@ members = [
     "crates/aidaemon-secrets",
     "crates/aidaemon-nodes",
     "crates/aidaemon-exposure",
+    "crates/aidaemon-remote",
     "crates/aidaemon-surfaces",
     "crates/aidaemon-shells",
     "crates/aidaemon-terminal-bridge",
@@ -130,6 +131,7 @@ aidaemon-nodes = { version = "=0.21.0", path = "crates/aidaemon-nodes" }
 # The Client Gateway (`/client/v1`) and its wire types, for the owner's apps.
 aidaemon-client-gateway = { version = "=0.21.0", path = "crates/aidaemon-client-gateway" }
 aidaemon-exposure = { version = "=0.21.0", path = "crates/aidaemon-exposure" }
+aidaemon-remote = { version = "=0.21.0", path = "crates/aidaemon-remote" }
 aidaemon-client-protocol = { version = "=0.21.0", path = "crates/client-protocol" }
 # Sharing this computer's screen with a daemon elsewhere (`aidaemon share-screen`).
 aidaemon-client-core = { version = "=0.21.0", path = "crates/aidaemon-client-core", optional = true }

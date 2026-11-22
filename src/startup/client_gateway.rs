@@ -1281,12 +1281,67 @@ pub async fn start(
         gateway.attach_shells(crate::startup::shells::registry(config));
     }
     let _ = GATEWAY.set(gateway.clone());
+    if config.client_gateway.remote.enabled {
+        start_remote(&config.client_gateway, gateway.clone()).await;
+    }
     tokio::spawn(async move {
         if let Err(error) = aidaemon_client_gateway::serve(gateway).await {
             tracing::error!(%error, "Client Gateway stopped");
         }
     });
     Ok(())
+}
+
+static REMOTE: std::sync::OnceLock<aidaemon_remote::RemoteListener> = std::sync::OnceLock::new();
+
+/// The daemon's iroh endpoint, when remote access is on.
+#[allow(dead_code)] // read by pairing once links carry the endpoint
+pub(crate) fn remote() -> Option<&'static aidaemon_remote::RemoteListener> {
+    REMOTE.get()
+}
+
+/// The relays `[client_gateway.remote] relays` names; none: n0's public
+/// relays.
+fn remote_relays(config: &ClientGatewayConfig) -> anyhow::Result<aidaemon_remote::Relays> {
+    if config.remote.relays.is_empty() {
+        return Ok(aidaemon_remote::Relays::N0);
+    }
+    let urls = config
+        .remote
+        .relays
+        .iter()
+        .map(|url| {
+            url.trim()
+                .parse::<aidaemon_remote::RelayUrl>()
+                .map_err(|e| anyhow::anyhow!("client_gateway.remote.relays: {url}: {e}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(aidaemon_remote::Relays::Custom(urls))
+}
+
+/// `[client_gateway.remote]`: the same routes over iroh, for the owner's
+/// apps anywhere. The gateway's sign-in still decides every request; any
+/// key may connect. A failure leaves the loopback gateway serving.
+async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>) {
+    let key_path = aidaemon_client_gateway::token::token_file(config).with_file_name("remote-key");
+    let started = async {
+        let key = aidaemon_remote::load_or_create_key(&key_path)?;
+        let relays = remote_relays(config)?;
+        aidaemon_remote::RemoteListener::bind(
+            key,
+            &relays,
+            aidaemon_remote::Access::Any,
+            aidaemon_client_gateway::router(gateway),
+        )
+        .await
+    };
+    match started.await {
+        Ok(listener) => {
+            tracing::info!(endpoint = %listener.id(), "Remote access listening (iroh)");
+            let _ = REMOTE.set(listener);
+        }
+        Err(error) => tracing::warn!(error = %format!("{error:#}"), "Remote access is off"),
+    }
 }
 
 /// `/pair_device`, `/devices` and `/revoke_device <id>`: the owner's devices

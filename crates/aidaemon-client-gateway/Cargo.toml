@@ -46,6 +46,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 aidaemon-client-core = { path = "../aidaemon-client-core" }
+aidaemon-remote = { path = "../aidaemon-remote" }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
 aidaemon-surfaces = { path = "../aidaemon-surfaces", features = ["testing"] }
 aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
 rand = "0.10"

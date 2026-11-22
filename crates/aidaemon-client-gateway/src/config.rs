@@ -40,6 +40,22 @@ pub struct ClientGatewayConfig {
     /// the gateway's own origin. Empty: not served.
     #[serde(default)]
     pub app_dir: Option<String>,
+    /// Remote access over iroh (`[client_gateway.remote]`): the owner's
+    /// apps reach this gateway from anywhere by the daemon's key, with no
+    /// tunnel. Off by default.
+    #[serde(default)]
+    pub remote: RemoteAccessConfig,
+}
+
+/// `[client_gateway.remote]`: serve the gateway over iroh too.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccessConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Relay URLs (your own `iroh-relay`). Empty: n0's public relays.
+    #[serde(default)]
+    pub relays: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -70,6 +86,7 @@ impl Default for ClientGatewayConfig {
             watch_risk_ceiling: default_watch_risk_ceiling(),
             public_url: None,
             app_dir: None,
+            remote: RemoteAccessConfig::default(),
         }
     }
 }
