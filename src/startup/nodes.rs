@@ -39,6 +39,28 @@ pub async fn start(
             &config.nodes.speech,
         )?);
     }
+    let lan_authority = if config.nodes.gateway.lan.enabled {
+        let path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".aidaemon")
+            .join("node-lan-ca.key");
+        match crate::nodes::lan::LanAuthority::load_or_create(&path) {
+            Ok(authority) => Some(Arc::new(authority)),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "The Node Gateway's local listener is off");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(authority) = &lan_authority {
+        service_value = service_value.with_lan(crate::nodes::lan::LanEndpoint {
+            port: config.nodes.gateway.lan.port,
+            authority: authority.clone(),
+            address: None,
+        });
+    }
     let service = Arc::new(service_value);
     let ingress = Arc::new(AgentNodeConversationIngress::new(agent));
     hub.register_channel(Arc::new(NodeChannel::new(store)) as Arc<dyn HubChannel>)
@@ -50,6 +72,16 @@ pub async fn start(
         config: config.nodes.clone(),
         rate_limiter: Arc::new(NodeRateLimiter::default()),
     };
+    // The same routes on the local network, with the daemon's own CA.
+    if let Some(authority) = lan_authority {
+        let app = crate::nodes::gateway::router(state.clone());
+        let port = config.nodes.gateway.lan.port;
+        tokio::spawn(async move {
+            if let Err(error) = crate::nodes::lan::serve(app, authority, port).await {
+                tracing::error!(error = %format!("{error:#}"), "Node Gateway's local listener stopped");
+            }
+        });
+    }
     tokio::spawn(async move {
         if let Err(error) = crate::nodes::gateway::serve(state).await {
             tracing::error!(%error, "Node Gateway stopped");

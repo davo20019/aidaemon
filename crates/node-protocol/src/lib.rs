@@ -194,6 +194,23 @@ pub struct HeartbeatResponse {
     /// the Node holds an explicit device_restart grant. Older Devices ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_restart: Option<DeviceRestartCommand>,
+    /// Trust anchors for origins in `gateway_endpoints` that no public CA
+    /// vouches for: the Gateway's listener on the local network, whose
+    /// certificate is issued by the daemon's own CA. A Device verifies such an
+    /// origin's chain against `ca_pem` (and its name against the origin's
+    /// host) instead of its built-in roots. Sent only to Nodes that observe
+    /// the `gateway.trust` capability; older Devices ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gateway_trust: Vec<GatewayTrust>,
+}
+
+/// The CA a Device trusts for one Gateway origin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayTrust {
+    /// One of `gateway_endpoints`, exactly.
+    pub origin: String,
+    /// The CA certificate, PEM.
+    pub ca_pem: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

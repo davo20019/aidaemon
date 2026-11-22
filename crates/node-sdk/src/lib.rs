@@ -45,6 +45,24 @@ impl NodeIdentity {
     }
 }
 
+/// An HTTP client for a Gateway origin: trusting only `ca_pem` when given.
+fn gateway_client(ca_pem: Option<&str>) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(40));
+    if let Some(pem) = ca_pem {
+        builder = builder.tls_certs_only([reqwest::Certificate::from_pem(pem.as_bytes())?]);
+    }
+    Ok(builder.build()?)
+}
+
+/// The CA `response` names for `origin` (its `gateway_trust`), if any.
+pub fn gateway_trust<'a>(response: &'a HeartbeatResponse, origin: &str) -> Option<&'a str> {
+    response
+        .gateway_trust
+        .iter()
+        .find(|trust| trust.origin == origin)
+        .map(|trust| trust.ca_pem.as_str())
+}
+
 pub struct NodeClient {
     gateway: String,
     http: reqwest::Client,
@@ -62,13 +80,31 @@ impl NodeClient {
         );
         Ok(Self {
             gateway,
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(40))
-                .build()?,
+            http: gateway_client(None)?,
             identity,
             access_token: None,
             node_session_id: None,
         })
+    }
+
+    /// Talk to another origin of the same Gateway from now on, with
+    /// `ca_pem` (the heartbeat's `gateway_trust` for that origin) as its
+    /// only trust anchor, or the system's roots without one. The session
+    /// carries over.
+    pub fn switch_gateway(&mut self, origin: &str, ca_pem: Option<&str>) -> anyhow::Result<()> {
+        let origin = origin.trim_end_matches('/').to_string();
+        anyhow::ensure!(
+            origin.starts_with("https://") || origin.starts_with("http://127.0.0.1:"),
+            "Gateway must use HTTPS or loopback HTTP"
+        );
+        self.http = gateway_client(ca_pem)?;
+        self.gateway = origin;
+        Ok(())
+    }
+
+    /// The origin this client talks to.
+    pub fn gateway(&self) -> &str {
+        &self.gateway
     }
 
     pub async fn enroll(

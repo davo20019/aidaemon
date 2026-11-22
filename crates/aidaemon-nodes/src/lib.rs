@@ -16,6 +16,7 @@ pub mod channel;
 pub mod config;
 pub mod domain;
 pub mod gateway;
+pub mod lan;
 pub mod monitoring;
 pub mod ota;
 pub mod protocol;

@@ -4,8 +4,8 @@
 //! daemon's secret store (`auth`) and the `aidaemon node` CLI.
 
 pub use aidaemon_nodes::{
-    announcement, channel, domain, gateway, monitoring, ota, protocol, restart, simulator, speech,
-    store, tool,
+    announcement, channel, domain, gateway, lan, monitoring, ota, protocol, restart, simulator,
+    speech, store, tool,
 };
 
 pub mod cli;

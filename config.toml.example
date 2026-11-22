@@ -590,6 +590,15 @@ pairing_ttl_seconds = 600
 # split-DNS/LAN TLS adapter second. The listener itself remains loopback-only.
 # advertised_endpoints = ["https://nodes.example.com", "https://nodes-lan.example.com"]
 
+# The Node Gateway on this computer's local network too, so Nodes on the same
+# network reach it with no tunnel or cable. Its certificate comes from the
+# daemon's own CA (~/.aidaemon/node-lan-ca.key); Nodes that report the
+# gateway.trust capability learn the address and that CA from a heartbeat over
+# the channel they already use (USB, a tunnel) and verify it from then on.
+[nodes.gateway.lan]
+enabled = false
+port = 8443
+
 # Signed K10 application releases are offered only when all three gates pass:
 # this switch, the Device's observed firmware.ota capability, and the Node's
 # explicit receive_ota authorization. Keep the signing key offline; only its

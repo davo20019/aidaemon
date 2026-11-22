@@ -832,6 +832,109 @@ mod tests {
         assert!(limiter.windows.lock().await.len() <= NodeRateLimiter::MAX_WINDOWS);
     }
 
+    /// A Node that observes `gateway.trust` learns the local listener and
+    /// its CA from a heartbeat over the channel it already uses, then
+    /// carries on over the local network, verifying the listener against
+    /// that CA; a Node without the capability is never offered it.
+    #[tokio::test]
+    async fn a_node_moves_to_the_local_listener_it_learned_from_a_heartbeat() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::store::migrate(&pool).await.unwrap();
+        let store = Arc::new(NodeStore::new(pool, [7_u8; 32]));
+        let mut config = NodesConfig::default();
+        config.gateway.advertised_endpoints = vec!["https://node.example.test".to_string()];
+        let dir = tempfile::tempdir().unwrap();
+        let authority =
+            Arc::new(crate::lan::LanAuthority::load_or_create(&dir.path().join("ca.key")).unwrap());
+        let lan_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lan_port = lan_listener.local_addr().unwrap().port();
+        let service = Arc::new(NodeService::new(store.clone(), config.clone()).with_lan(
+            crate::lan::LanEndpoint {
+                port: lan_port,
+                authority: authority.clone(),
+                address: Some("127.0.0.1".parse().unwrap()),
+            },
+        ));
+        let offer = service
+            .create_pairing_offer(
+                "parent",
+                "simulator",
+                "Test Companion",
+                CHILD_COMPANION_POLICY,
+            )
+            .await
+            .unwrap();
+        let sessions: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let state = NodeGatewayState {
+            service,
+            ingress: Arc::new(EchoIngress),
+            hub: Arc::new(ChannelHub::new(Vec::new(), sessions)),
+            config,
+            rate_limiter: Arc::new(NodeRateLimiter::default()),
+        };
+        tokio::spawn(crate::lan::serve_on(
+            lan_listener,
+            router(state.clone()),
+            authority,
+            "127.0.0.1".parse().unwrap(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+
+        let mut simulator = NodeSimulator::new(format!("http://{address}")).unwrap();
+        simulator
+            .enroll(&offer.offer_id, &offer.offer_secret)
+            .await
+            .unwrap();
+        simulator.open_session().await.unwrap();
+        let trust = CapabilityObservation {
+            capability_id: crate::service::GATEWAY_TRUST_CAPABILITY.to_string(),
+            version: 1,
+            limits: serde_json::json!({}),
+        };
+
+        // Without the capability, nothing new is offered.
+        let plain = simulator.heartbeat(Vec::new()).await.unwrap();
+        assert_eq!(plain.gateway_endpoints, vec!["https://node.example.test"]);
+        assert!(plain.gateway_trust.is_empty());
+
+        // With it, the local listener comes first, with its CA.
+        let offered = simulator.heartbeat(vec![trust.clone()]).await.unwrap();
+        let lan = format!("https://127.0.0.1:{lan_port}");
+        assert_eq!(
+            offered.gateway_endpoints,
+            vec![lan.clone(), "https://node.example.test".to_string()]
+        );
+        let ca = aidaemon_node_sdk_trust(&offered, &lan).expect("a CA for the local origin");
+
+        // The Node carries on over the local network, its session intact.
+        simulator.switch_gateway(&lan, Some(ca)).unwrap();
+        let over_lan = simulator.heartbeat(vec![trust]).await.unwrap();
+        assert!(over_lan.accepted);
+
+        // Without the CA, the listener is not trusted.
+        simulator.switch_gateway(&lan, None).unwrap();
+        assert!(simulator.heartbeat(Vec::new()).await.is_err());
+    }
+
+    fn aidaemon_node_sdk_trust<'a>(
+        response: &'a crate::protocol::HeartbeatResponse,
+        origin: &str,
+    ) -> Option<&'a str> {
+        response
+            .gateway_trust
+            .iter()
+            .find(|trust| trust.origin == origin)
+            .map(|trust| trust.ca_pem.as_str())
+    }
+
     #[tokio::test]
     async fn enrolled_node_authenticates_and_completes_idempotent_turn() {
         let pool = SqlitePoolOptions::new()

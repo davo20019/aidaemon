@@ -112,7 +112,14 @@ pub struct NodeService {
     /// Where Nodes reach the Gateway: a live tunnel origin, then
     /// `gateway.advertised_endpoints`.
     endpoints: aidaemon_core::EndpointSource,
+    /// The Gateway's listener on the local network, when it runs
+    /// (`[nodes.gateway.lan]`): offered first to Nodes that can trust it.
+    lan: Option<Arc<super::lan::LanEndpoint>>,
 }
+
+/// The capability a Node observes when it verifies an origin against a CA
+/// from `gateway_trust` (a protocol identifier).
+pub const GATEWAY_TRUST_CAPABILITY: &str = "gateway.trust";
 
 impl NodeService {
     pub fn new(store: Arc<NodeStore>, config: NodesConfig) -> Self {
@@ -124,7 +131,14 @@ impl NodeService {
             speech: Arc::new(super::speech::DisabledSpeech),
             firmware_release: None,
             endpoints,
+            lan: None,
         }
+    }
+    /// Offer the Gateway's local-network listener to Nodes that can trust
+    /// it.
+    pub fn with_lan(mut self, lan: super::lan::LanEndpoint) -> Self {
+        self.lan = Some(Arc::new(lan));
+        self
     }
     /// Read the origins Nodes are told about from `endpoints` instead of
     /// the static config list.
@@ -146,6 +160,26 @@ impl NodeService {
         let mut endpoints = self.endpoints.current();
         endpoints.truncate(MAX_GATEWAY_ENDPOINTS);
         endpoints
+    }
+    /// The origins and trust anchors for a Node: the local-network origin
+    /// first when the Node can trust it (`trusts_lan`), then
+    /// [`Self::gateway_endpoints`], at most three in all.
+    pub fn gateway_endpoints_for(&self, trusts_lan: bool) -> (Vec<String>, Vec<GatewayTrust>) {
+        let mut endpoints = self.endpoints.current();
+        let mut trust = Vec::new();
+        if trusts_lan
+            && let Some(lan) = &self.lan
+            && let Some(origin) = lan.origin()
+        {
+            endpoints.retain(|endpoint| *endpoint != origin);
+            endpoints.insert(0, origin.clone());
+            trust.push(GatewayTrust {
+                origin,
+                ca_pem: lan.authority.ca_pem().to_string(),
+            });
+        }
+        endpoints.truncate(MAX_GATEWAY_ENDPOINTS);
+        (endpoints, trust)
     }
     pub fn store(&self) -> &Arc<NodeStore> {
         &self.store
@@ -363,6 +397,9 @@ impl NodeService {
         let audio_capable = heartbeat.capabilities.iter().any(|capability| {
             capability.capability_id == "output.audio" && capability.version >= 1
         });
+        let trusts_lan = heartbeat.capabilities.iter().any(|capability| {
+            capability.capability_id == GATEWAY_TRUST_CAPABILITY && capability.version >= 1
+        });
         let ota_capability = heartbeat.capabilities.iter().find(|capability| {
             capability.capability_id == "firmware.ota"
                 && capability.version >= 1
@@ -429,6 +466,7 @@ impl NodeService {
         } else {
             None
         };
+        let (gateway_endpoints, gateway_trust) = self.gateway_endpoints_for(trusts_lan);
         Ok(HeartbeatResponse {
             accepted: true,
             next_heartbeat_seconds: self.config.gateway.heartbeat_interval_seconds,
@@ -436,8 +474,9 @@ impl NodeService {
             authorization_revision: context.authorization_revision,
             outbox_poll_seconds,
             firmware_update,
-            gateway_endpoints: self.gateway_endpoints(),
+            gateway_endpoints,
             device_restart,
+            gateway_trust,
         })
     }
 
@@ -982,6 +1021,50 @@ mod sensor_tests {
         );
         publisher.set(None);
         assert_eq!(service.gateway_endpoints()[0], "https://a.example.com");
+    }
+
+    /// The local listener's origin goes first, with its CA, only to Nodes
+    /// that observe `gateway.trust`; others keep the list they had.
+    #[tokio::test]
+    async fn the_local_origin_and_its_ca_go_only_to_nodes_that_can_trust_them() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let store = Arc::new(NodeStore::new(pool, [7_u8; 32]));
+        let mut config = NodesConfig::default();
+        config.gateway.advertised_endpoints = vec![
+            "https://a.example.com".into(),
+            "https://b.example.com".into(),
+            "https://c.example.com".into(),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let authority = Arc::new(
+            super::super::lan::LanAuthority::load_or_create(&dir.path().join("ca.key")).unwrap(),
+        );
+        let service = NodeService::new(store, config).with_lan(super::super::lan::LanEndpoint {
+            port: 8443,
+            authority: authority.clone(),
+            address: Some("192.168.1.20".parse().unwrap()),
+        });
+
+        let (endpoints, trust) = service.gateway_endpoints_for(true);
+        assert_eq!(
+            endpoints,
+            vec![
+                "https://192.168.1.20:8443",
+                "https://a.example.com",
+                "https://b.example.com"
+            ]
+        );
+        assert_eq!(trust.len(), 1);
+        assert_eq!(trust[0].origin, "https://192.168.1.20:8443");
+        assert_eq!(trust[0].ca_pem, authority.ca_pem());
+
+        let (endpoints, trust) = service.gateway_endpoints_for(false);
+        assert_eq!(endpoints, service.gateway_endpoints());
+        assert!(trust.is_empty());
     }
 
     #[test]

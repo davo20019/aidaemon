@@ -172,6 +172,36 @@ pub struct NodeGatewayConfig {
     /// route to this same loopback Gateway. Empty means "do not update Devices".
     #[serde(default)]
     pub advertised_endpoints: Vec<String>,
+    /// The Gateway on the local network as well (`[nodes.gateway.lan]`), so
+    /// Nodes on the same network reach it with no tunnel or cable.
+    #[serde(default)]
+    pub lan: NodeLanConfig,
+}
+
+/// `[nodes.gateway.lan]`: an HTTPS listener on this computer's network
+/// address, with a certificate from the daemon's own CA, which Nodes learn
+/// over a channel they already trust (USB, a tunnel) and verify. Off by
+/// default.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct NodeLanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_node_lan_port")]
+    pub port: u16,
+}
+
+fn default_node_lan_port() -> u16 {
+    8443
+}
+
+impl Default for NodeLanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_node_lan_port(),
+        }
+    }
 }
 
 impl Default for NodeGatewayConfig {
@@ -185,6 +215,7 @@ impl Default for NodeGatewayConfig {
             heartbeat_interval_seconds: default_node_heartbeat_interval(),
             pairing_ttl_seconds: default_node_pairing_ttl(),
             advertised_endpoints: Vec::new(),
+            lan: NodeLanConfig::default(),
         }
     }
 }

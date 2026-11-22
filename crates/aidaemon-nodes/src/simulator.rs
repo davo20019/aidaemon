@@ -103,6 +103,18 @@ impl NodeSimulator {
         Ok(response)
     }
 
+    /// Talk to `origin` from now on, trusting only `ca_pem` when given
+    /// (the heartbeat's `gateway_trust`). The session carries over.
+    pub fn switch_gateway(&mut self, origin: &str, ca_pem: Option<&str>) -> anyhow::Result<()> {
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(40));
+        if let Some(pem) = ca_pem {
+            builder = builder.tls_certs_only([reqwest::Certificate::from_pem(pem.as_bytes())?]);
+        }
+        self.client = builder.build()?;
+        self.base_url = origin.trim_end_matches('/').to_string();
+        Ok(())
+    }
+
     pub async fn open_session(&mut self) -> anyhow::Result<OpenSessionResponse> {
         let credential_id = self
             .identity
