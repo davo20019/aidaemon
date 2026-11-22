@@ -1,0 +1,38 @@
+name: Relay health
+
+# The project's relay (relay.aidaemon.ai) and address lookup (dns.aidaemon.ai)
+# carry every app's remote access by default, so check them from outside every
+# 15 minutes: HTTPS answers, a certificate with more than 14 days left, and a
+# relay that still serves its AIDaemon page. A failed run notifies whoever last
+# changed this schedule (GitHub's rule for scheduled workflows), so an outage is
+# heard about before users report it. Runs only in the main repository.
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check relay and lookup
+    if: github.repository == 'davo20019/aidaemon'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Relay answers
+        run: |
+          curl -fsS --retry 2 --retry-delay 10 --max-time 10 https://relay.aidaemon.ai/healthz
+          curl -fsS --max-time 10 https://relay.aidaemon.ai/ | grep -q "AIDaemon Relay"
+      - name: Address lookup answers
+        run: curl -fsS --retry 2 --retry-delay 10 --max-time 10 https://dns.aidaemon.ai/healthz
+      - name: Certificates last more than 14 days
+        run: |
+          for host in relay.aidaemon.ai dns.aidaemon.ai; do
+            end=$(echo | openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
+              | openssl x509 -noout -enddate | cut -d= -f2)
+            left=$(( ($(date -d "$end" +%s) - $(date +%s)) / 86400 ))
+            echo "$host: certificate ends $end ($left days)"
+            [ "$left" -gt 14 ] || { echo "::error::$host certificate ends in $left days"; exit 1; }
+          done
