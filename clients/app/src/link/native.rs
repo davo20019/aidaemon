@@ -52,6 +52,7 @@ pub fn start(store: Store) {
         return;
     };
     store.set_gateway_base(aidaemon_client_core::machine::http_base(&url));
+    let bridged = (url.clone(), auth.clone());
     let kind = client_kind();
     let config = LinkConfig {
         url,
@@ -76,6 +77,15 @@ pub fn start(store: Store) {
     // "connecting" until the app was opened again (live 2026-11-19).
     Owner::detached().run(|| {
         spawn(async move {
+            // What the app loads by URL (pictures, files, live views,
+            // shells): a daemon reached over iroh is reached through the
+            // core's local bridge. Starting it opens no connection.
+            let (url, auth) = bridged;
+            match background(async move { local::reachable_base(&url, &auth).await }).await {
+                Ok(Ok(base)) => store.set_gateway_base(base),
+                Ok(Err(why)) => log::warn!("files and live views are unavailable: {why}"),
+                Err(_) => log::warn!("could not start the local bridge"),
+            }
             // The link's tasks run on the runtime behind `background`.
             let Ok((commands, waker)) =
                 background(async move { link::spawn_wakeable(config, updates_tx) }).await

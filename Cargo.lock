@@ -312,6 +312,8 @@ dependencies = [
  "getrandom 0.4.3",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "p256",
  "rand 0.10.3",
  "reqwest 0.13.5",
@@ -323,6 +325,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tracing",
  "uuid",
  "webpki-roots",
 ]

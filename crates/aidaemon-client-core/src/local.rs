@@ -120,6 +120,30 @@ pub fn sign_in() -> Option<(String, Auth)> {
     ))
 }
 
+/// The HTTP base that reaches the gateway at `url` (a socket or HTTP URL)
+/// for what the client loads by URL itself (pictures and files, live views,
+/// shells, screen sharing): the gateway's own, or for a daemon reached over
+/// iroh (`iroh://…`) the local bridge's
+/// ([`crate::bridge`]), started here. The error is for the owner.
+pub async fn reachable_base(url: &str, auth: &Auth) -> Result<String, String> {
+    #[cfg(feature = "remote")]
+    if crate::remote::is_remote(url) {
+        let Auth::Device(keys) = auth else {
+            return Err("the local token is for the daemon's own machine; pair this device".into());
+        };
+        let device = keys
+            .load()
+            .map_err(|e| e.to_string())?
+            .ok_or("This device is not paired: pair it first")?;
+        let dialer = crate::remote::Dialer::for_device(&device).map_err(|e| e.to_string())?;
+        return crate::bridge::base(url, &dialer)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    let _ = auth;
+    Ok(crate::machine::http_base(url))
+}
+
 /// Pair with a daemon elsewhere from its pairing `link` and keep the key;
 /// then [`sign_in`] finds it. The error is for the owner.
 pub async fn pair_from_link(link: &str, name: &str, kind: ClientKind) -> Result<(), String> {

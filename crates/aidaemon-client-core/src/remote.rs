@@ -53,7 +53,7 @@ impl Dialer {
         Ok(Self::Device(Box::new(aidaemon_remote::derive_key(&seed))))
     }
 
-    fn key(&self) -> SecretKey {
+    pub(crate) fn key(&self) -> SecretKey {
         match self {
             Self::Device(key) => (**key).clone(),
             Self::Pairing => {
@@ -79,13 +79,32 @@ fn connections() -> &'static Mutex<HashMap<(Key, EndpointId), RemoteConnection>>
     CONNECTIONS.get_or_init(Mutex::default)
 }
 
+/// Addresses learned outside a daemon's URL, by key: tried beside the
+/// URL's relays (a daemon on the same network, tests with no relay).
+fn learned() -> &'static std::sync::Mutex<HashMap<EndpointId, aidaemon_remote::EndpointAddr>> {
+    static LEARNED: OnceLock<std::sync::Mutex<HashMap<EndpointId, aidaemon_remote::EndpointAddr>>> =
+        OnceLock::new();
+    LEARNED.get_or_init(Default::default)
+}
+
+/// Also dial the daemon `addr.id` at `addr`'s addresses from now on.
+pub fn learn(addr: aidaemon_remote::EndpointAddr) {
+    learned()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(addr.id, addr);
+}
+
 fn parse(url: &str) -> Result<RemoteUrl, SignInError> {
     RemoteUrl::parse(url)
         .ok_or_else(|| SignInError::Refused(format!("not a daemon address: {url}")))
 }
 
 /// The open connection to `url`'s daemon, dialing it when there is none.
-async fn connection(url: &RemoteUrl, dialer: &Dialer) -> Result<RemoteConnection, SignInError> {
+pub(crate) async fn connection(
+    url: &RemoteUrl,
+    dialer: &Dialer,
+) -> Result<RemoteConnection, SignInError> {
     let key = dialer.key();
     let slot = (key.to_bytes(), url.id);
     let mut open = connections().lock().await;
@@ -109,7 +128,15 @@ async fn connection(url: &RemoteUrl, dialer: &Dialer) -> Result<RemoteConnection
             }
         }
     };
-    let conn = tokio::time::timeout(DIAL_TIMEOUT, client.connect_url(url))
+    let mut addr = url.addr(&Relays::N0);
+    if let Some(known) = learned()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&url.id)
+    {
+        addr.addrs.extend(known.addrs.iter().cloned());
+    }
+    let conn = tokio::time::timeout(DIAL_TIMEOUT, client.connect(addr))
         .await
         .map_err(|_| SignInError::Unreachable("reaching the daemon over iroh timed out".into()))?
         .map_err(|e| SignInError::Unreachable(format!("{e:#}")))?;
@@ -118,7 +145,7 @@ async fn connection(url: &RemoteUrl, dialer: &Dialer) -> Result<RemoteConnection
 }
 
 /// Forget the connection to `url`'s daemon, so the next call dials again.
-async fn forget(url: &RemoteUrl, dialer: &Dialer) {
+pub(crate) async fn forget(url: &RemoteUrl, dialer: &Dialer) {
     connections()
         .lock()
         .await

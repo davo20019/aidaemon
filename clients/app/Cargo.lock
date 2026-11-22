@@ -109,6 +109,8 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "p256",
  "rand 0.10.4",
  "reqwest",
@@ -119,6 +121,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tracing",
  "uuid",
  "webpki-roots 1.0.12",
 ]

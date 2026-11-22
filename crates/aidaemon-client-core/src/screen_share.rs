@@ -51,6 +51,17 @@ async fn token(base: &str, auth: &Auth) -> Result<String, String> {
                 .map_err(|e| e.to_string())?
                 .ok_or("This computer is not paired: pair it first")?;
             let _ = base;
+            #[cfg(feature = "remote")]
+            if crate::remote::is_remote(&device.gateway) {
+                let dialer =
+                    crate::remote::Dialer::for_device(&device).map_err(|e| e.to_string())?;
+                let http = crate::remote::RemoteHttp::new(&device.gateway, dialer)
+                    .map_err(|e| e.to_string())?;
+                return GrantCache::default()
+                    .token_with(&http, &device, crate::signin::now_ms())
+                    .await
+                    .map_err(|e| e.to_string());
+            }
             GrantCache::default()
                 .token(&crate::tls::http_client(), &device, crate::signin::now_ms())
                 .await
@@ -69,7 +80,11 @@ pub async fn share(
     source: Box<dyn ScreenSource>,
     on_state: impl Fn(&str),
 ) -> Result<(), String> {
-    let base = gateway.trim_end_matches('/').to_string();
+    // A daemon reached over iroh is reached through the local bridge.
+    let base = crate::local::reachable_base(gateway, auth)
+        .await?
+        .trim_end_matches('/')
+        .to_string();
     let token = token(&base, auth).await?;
     let (width, height) = source.size();
     let reply: ServerFrame = crate::tls::http_client()

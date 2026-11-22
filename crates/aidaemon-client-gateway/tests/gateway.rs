@@ -1029,6 +1029,159 @@ async fn over_iroh_a_device_pairs_signs_in_and_keeps_its_session_to_itself() {
     listener.close().await;
 }
 
+/// Pair a device over iroh (no relay) and return what it keeps.
+async fn pair_over_iroh(
+    f: &Fixture,
+    listener: &aidaemon_remote::RemoteListener,
+) -> aidaemon_client_core::StoredDevice {
+    use aidaemon_remote::{Relays, RemoteClient, SecretKey};
+    let phone = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
+        .await
+        .unwrap();
+    let conn = phone.connect(listener.addr()).await.unwrap();
+    let offer = f.gateway.pairing().offer(None).await.unwrap();
+    let request = aidaemon_client_core::signin::PairRequest {
+        gateway: listener.url().to_string(),
+        offer_id: offer.offer_id.clone(),
+        code: offer.code.clone(),
+        device_name: "Synthetic Phone".into(),
+        device_kind: ClientKind::Mobile,
+        fingerprint: None,
+    };
+    let http = IrohHttp(conn);
+    let pairing = tokio::spawn(async move {
+        aidaemon_client_core::signin::pair_with(&http, &request, Duration::from_millis(20)).await
+    });
+    for _ in 0..100 {
+        if f.gateway
+            .pairing()
+            .decide(&offer.offer_id, true)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    pairing.await.unwrap().unwrap()
+}
+
+/// What the app loads by URL goes through the core's local bridge: a
+/// command with the device's token, a signed file link (no token: the
+/// signed-in endpoint is enough) and the client socket's upgrade, while a
+/// device that never signed in, or a path without the bridge's secret, gets
+/// nothing.
+#[tokio::test]
+async fn the_local_bridge_carries_requests_files_and_sockets_over_iroh() {
+    use aidaemon_client_core::bridge;
+    use aidaemon_client_core::remote::{self, Dialer, RemoteHttp};
+    use aidaemon_remote::{Access, Relays, RemoteListener, RemotePeer, SecretKey};
+    let f = fixture(RiskLevel::Medium).await;
+    let listener = RemoteListener::bind(
+        SecretKey::generate(),
+        &Relays::Disabled,
+        Access::Any,
+        aidaemon_client_gateway::remote_router::<RemotePeer>(f.gateway.clone()),
+    )
+    .await
+    .unwrap();
+    remote::learn(listener.addr());
+    let device = pair_over_iroh(&f, &listener).await;
+    let dialer = Dialer::for_device(&device).unwrap();
+    let grant = aidaemon_client_core::signin::sign_in_with(
+        &RemoteHttp::new(&device.gateway, dialer.clone()).unwrap(),
+        &device,
+    )
+    .await
+    .unwrap();
+    let base = bridge::base(&device.gateway, &dialer).await.unwrap();
+    assert!(base.starts_with("http://127.0.0.1:"), "{base}");
+    assert_eq!(bridge::base(&device.gateway, &dialer).await.unwrap(), base);
+    let http = reqwest::Client::new();
+
+    let frame: ServerFrame = http
+        .post(format!("{base}/client/v1/commands"))
+        .bearer_auth(&grant.access_token)
+        .json(&command("b-1", Command::GetGlance))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(frame, ServerFrame::Ack { .. }), "{frame:?}");
+
+    // A file link with a wrong signature reaches the gateway (its own 404),
+    // past the guard.
+    let file = http
+        .get(format!("{base}/client/v1/files/f-1/not-signed/a.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(file.status(), 404);
+    assert_eq!(file.text().await.unwrap(), "");
+    // Without the secret, the bridge itself refuses.
+    let port = base
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap();
+    let guessed = http
+        .get(format!(
+            "http://{port}/client/v1/files/f-1/not-signed/a.png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(guessed.status(), 404);
+    assert_eq!(guessed.text().await.unwrap(), "not found");
+
+    // The client socket through the bridge: hello, then the gateway talks.
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(format!(
+            "{}/client/v1/ws",
+            base.replacen("http://", "ws://", 1)
+        ))
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", grant.access_token).parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let mut machine = aidaemon_client_core::machine::LinkMachine::new(
+        aidaemon_client_core::machine::ClientIdentity {
+            kind: ClientKind::Mobile,
+            name: "test".into(),
+            version: None,
+        },
+        None,
+        Vec::new(),
+    );
+    for frame in machine.opened(0) {
+        socket
+            .send(Message::text(serde_json::to_string(&frame).unwrap()))
+            .await
+            .unwrap();
+    }
+    let reply = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the gateway answered hello")
+        .unwrap()
+        .unwrap();
+    assert!(reply.is_text(), "{reply:?}");
+
+    // A device that never signed in gets no file through its own bridge.
+    let stranger = Dialer::Device(Box::new(SecretKey::generate()));
+    let other = bridge::base(&device.gateway, &stranger).await.unwrap();
+    assert_ne!(other, base);
+    let refused = http
+        .get(format!("{other}/client/v1/files/f-1/not-signed/a.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+}
+
 /// Live, through n0's relays: the app's own pairing and link (sign-in, the
 /// socket, hello and resume) against a daemon known only by its
 /// `iroh://` address. Needs the internet:
@@ -1122,6 +1275,26 @@ async fn the_app_link_runs_over_iroh_through_a_relay() {
     assert!(
         connected && framed,
         "connected {connected}, framed {framed}"
+    );
+
+    // What the app loads by URL, through the local bridge over the relay.
+    let base = aidaemon_client_core::local::reachable_base(
+        &device.gateway,
+        &Auth::Device(std::sync::Arc::new(
+            aidaemon_client_core::FileKeyStore::new(dir.path().join("device.json")),
+        )),
+    )
+    .await
+    .unwrap();
+    let file = reqwest::Client::new()
+        .get(format!("{base}/client/v1/files/f-1/not-signed/a.png"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        file.status(),
+        404,
+        "the gateway's own answer, past the guard"
     );
     listener.close().await;
 }

@@ -20,6 +20,8 @@
 //! device keys, and sign-in over any [`signin::Http`]. Feature `native`
 //! (on by default) adds the tokio link and reqwest.
 
+#[cfg(feature = "remote")]
+pub mod bridge;
 pub mod client;
 pub mod keystore;
 #[cfg(feature = "native")]
