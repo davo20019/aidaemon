@@ -1182,12 +1182,12 @@ async fn the_local_bridge_carries_requests_files_and_sockets_over_iroh() {
     assert_eq!(refused.status(), 401);
 }
 
-/// Live, through n0's relays: the app's own pairing and link (sign-in, the
-/// socket, hello and resume) against a daemon known only by its
-/// `iroh://` address. Needs the internet:
+/// Live, through the project's relay: the app's own pairing and link
+/// (sign-in, the socket, hello and resume) against a daemon known only by
+/// its `iroh://` address. Needs the internet:
 /// `cargo test -p aidaemon-client-gateway --test gateway the_app_link -- --ignored`.
 #[tokio::test]
-#[ignore = "needs the internet and n0's public relays"]
+#[ignore = "needs the internet and the project's relay"]
 async fn the_app_link_runs_over_iroh_through_a_relay() {
     use aidaemon_client_core::KeyStore as _;
     use aidaemon_client_core::link::{self, Auth, LinkConfig};
@@ -1197,7 +1197,7 @@ async fn the_app_link_runs_over_iroh_through_a_relay() {
     let f = fixture(RiskLevel::Medium).await;
     let listener = RemoteListener::bind(
         SecretKey::generate(),
-        &Relays::N0,
+        &Relays::Aidaemon,
         Access::Any,
         aidaemon_client_gateway::remote_router::<RemotePeer>(f.gateway.clone()),
     )
@@ -1205,6 +1205,7 @@ async fn the_app_link_runs_over_iroh_through_a_relay() {
     .unwrap();
     listener.online().await;
     let daemon = listener.url().to_string();
+    assert!(daemon.contains("@relay.aidaemon.ai"), "{daemon}");
     println!("daemon at {daemon}");
     f.gateway.pairing().set_remote_url(Some(daemon.clone()));
 
