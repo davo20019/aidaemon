@@ -29,6 +29,7 @@ pub mod local;
 pub mod machine;
 #[cfg(feature = "native")]
 pub mod screen_share;
+pub mod shells;
 pub mod signin;
 pub mod state;
 pub mod surfaces;

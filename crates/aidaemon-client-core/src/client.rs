@@ -304,6 +304,13 @@ pub enum Effect {
     /// The live view ended (closed here, or its surface went away): close
     /// its frame socket.
     CloseLive,
+    /// A conversation's shell opened (protocol 1.42): connect its terminal
+    /// to the shell's socket.
+    OpenShell {
+        session_id: String,
+        shell_id: String,
+        transport: aidaemon_client_protocol::ShellTransport,
+    },
 }
 
 /// The client, as [`crate::client`] describes it.
@@ -432,6 +439,10 @@ pub struct Client {
     /// This device asked for control and has not given it back: the
     /// surface's owner controller is this device.
     live_controller_is_mine: bool,
+    /// Shells asked for (protocol 1.42): request id to conversation.
+    shell_requests: BTreeMap<String, String>,
+    /// Why a conversation's shell could not open, by conversation.
+    pub shell_errors: BTreeMap<String, String>,
     /// The paired devices (protocol 1.31), and whether this client may
     /// change what they may do.
     pub devices: Read<(Vec<aidaemon_client_protocol::DeviceInfo>, bool)>,
@@ -2634,6 +2645,27 @@ impl Client {
         effects
     }
 
+    /// Open conversation `session_id`'s shell (started in its folder when
+    /// none runs) with a terminal of `cols` by `rows` cells; the answer
+    /// brings [`Effect::OpenShell`].
+    pub fn open_shell(&mut self, session_id: &str, cols: u16, rows: u16) {
+        self.shell_errors.remove(session_id);
+        let request = self.send(Command::OpenShell {
+            session_id: session_id.to_owned(),
+            cols,
+            rows,
+        });
+        self.shell_requests.insert(request, session_id.to_owned());
+    }
+
+    /// End conversation `session_id`'s shell, if it has one.
+    pub fn close_shell(&mut self, session_id: &str) {
+        if let Some(shell) = self.state.shells.get(session_id) {
+            let shell_id = shell.id.clone();
+            self.send(Command::CloseShell { shell_id });
+        }
+    }
+
     /// Close the live view, if one is open.
     pub fn close_surface(&mut self) -> Vec<Effect> {
         let Some(live) = self.live.take() else {
@@ -2751,6 +2783,30 @@ impl Client {
                 if !self.devices.is_ready() {
                     self.devices = Read::Failed(error.message.clone());
                 }
+                true
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::ShellOpened { shell, transport },
+            } if self.shell_requests.contains_key(request_id) => {
+                let session_id = self.shell_requests.remove(request_id).unwrap_or_default();
+                let shell_id = shell.id.clone();
+                self.state
+                    .shells
+                    .insert(shell.session_id.clone(), shell.clone());
+                out.push(Effect::OpenShell {
+                    session_id,
+                    shell_id,
+                    transport: transport.clone(),
+                });
+                true
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if self.shell_requests.contains_key(request_id) => {
+                let session_id = self.shell_requests.remove(request_id).unwrap_or_default();
+                self.shell_errors.insert(session_id, error.message.clone());
                 true
             }
             ServerFrame::Ack {
@@ -3185,6 +3241,45 @@ mod tests {
             &cx(None),
         );
         assert!(matches!(&client.files_file, Read::Failed(m) if m.contains("No such file")));
+    }
+
+    #[test]
+    fn a_conversation_shell_opens_with_its_socket_or_says_why_not() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.open_shell("app:s1", 100, 30);
+        let (request, command) = client.take_outgoing().pop().unwrap();
+        assert!(matches!(
+            command,
+            Command::OpenShell { ref session_id, cols: 100, rows: 30 } if session_id == "app:s1"
+        ));
+        let effects = client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"shell_opened","shell":{{"id":"sh_1","session_id":"app:s1","folder":"/home/synthetic/acme","cols":100,"rows":30,"started_at_ms":1}},"transport":{{"url":"/client/v1/shells/sh_1/ws","ticket":"tkt_1"}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::OpenShell { session_id, shell_id, transport }
+                if session_id == "app:s1" && shell_id == "sh_1" && transport.ticket == "tkt_1"
+        )));
+        assert_eq!(client.state.shells["app:s1"].id, "sh_1");
+        client.close_shell("app:s1");
+        assert!(matches!(
+            client.take_outgoing().pop().unwrap().1,
+            Command::CloseShell { ref shell_id } if shell_id == "sh_1"
+        ));
+
+        client.open_shell("app:s2", 80, 24);
+        let (request, _) = client.take_outgoing().pop().unwrap();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"error","request_id":"{request}","error":{{"code":"forbidden","message":"Only a device that may answer every approval may use a shell","retryable":false}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(client.shell_errors["app:s2"].contains("every approval"));
     }
 
     #[test]
