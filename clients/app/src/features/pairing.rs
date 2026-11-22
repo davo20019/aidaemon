@@ -111,10 +111,27 @@ enum Phone {
 /// pairing page link (the phone's camera opens it, and the page opens the
 /// app, which pairs at once), then the owner approves the phone here.
 pub fn pair_phone(store: Store) -> View {
+    phone_pairing(store, false, None)
+}
+
+/// [`pair_phone`] for first-run setup: the code shows at once, and
+/// `on_paired` runs once a phone is paired.
+pub fn pair_phone_now(store: Store, on_paired: std::rc::Rc<dyn Fn()>) -> View {
+    phone_pairing(store, true, Some(on_paired))
+}
+
+fn phone_pairing(store: Store, auto: bool, on_paired: Option<std::rc::Rc<dyn Fn()>>) -> View {
     use aidaemon_client_protocol::EnrollmentState;
     use link::owner_pairing;
 
     let phase = signal(Phone::Idle);
+    // Kept behind a copyable handle: the buttons copy `start` and `decide`.
+    let on_paired = stored(on_paired);
+    let paired = move || {
+        if let Some(paired) = on_paired.get() {
+            paired();
+        }
+    };
     // The tasks run under this view, not the pressed button: setting the
     // phase rebuilds the button, and a task under it ended before it sent
     // anything (the press did nothing).
@@ -126,13 +143,26 @@ pub fn pair_phone(store: Store) -> View {
         phase.set(Phone::Starting);
         owner.run(|| {
             spawn(async move {
-                let offer = match owner_pairing::offer().await {
+                let mut offer = match owner_pairing::offer().await {
                     Ok(offer) => offer,
                     Err(why) => {
                         let _ = phase.try_set(Phone::Ended(why, Tone::Danger));
                         return;
                     }
                 };
+                // Just started, the daemon may not be on its relay yet: its
+                // address (and with it the web app) comes in a few seconds.
+                // `remote=` is our own link's parameter (a machine format).
+                for _ in 0..8 {
+                    if offer.link.contains("&remote=") {
+                        break;
+                    }
+                    timer(std::time::Duration::from_secs(2)).await;
+                    match owner_pairing::offer().await {
+                        Ok(newer) => offer = newer,
+                        Err(_) => break,
+                    }
+                }
                 let id = offer.offer_id.clone();
                 if !phase.try_set(Phone::Showing(offer.clone())) {
                     return;
@@ -163,6 +193,7 @@ pub fn pair_phone(store: Store) -> View {
                         }
                         EnrollmentState::Approved => {
                             store.refresh_devices();
+                            paired();
                             Phone::Ended("Paired.".into(), Tone::Success)
                         }
                         EnrollmentState::Denied => {
@@ -191,6 +222,7 @@ pub fn pair_phone(store: Store) -> View {
                 let next = match owner_pairing::decide(id, approve).await {
                     Ok(e) if e.state == EnrollmentState::Approved => {
                         store.refresh_devices();
+                        paired();
                         Phone::Ended("Paired.".into(), Tone::Success)
                     }
                     Ok(_) => Phone::Ended("Not paired.".into(), Tone::Neutral),
@@ -201,6 +233,9 @@ pub fn pair_phone(store: Store) -> View {
         });
     };
 
+    if auto {
+        start();
+    }
     view().gap_2().child(dynamic(move || {
         let now = phase.get();
         Some(untracked(move || match now {
@@ -218,13 +253,14 @@ pub fn pair_phone(store: Store) -> View {
                         Tone::Warning,
                     ));
                 }
-                if let Some(qr) = ui::qr_code(&offer.page_link(), 200.0) {
+                if let Some(qr) = ui::qr_code(&offer.phone_link(), 200.0) {
                     card = card.child(qr);
                 }
                 card.child(hint(
                     "Point your phone's camera at this code and tap the link it \
-                     shows. It opens the AIDaemon app. No camera? Send the link to \
-                     your phone in a message or mail and tap it there.",
+                     shows. It opens AIDaemon: in the app when it is installed, \
+                     else in the browser. No camera? Send the link to your phone \
+                     in a message or mail and tap it there.",
                 ))
                 .child(hint(format!(
                     "Code {} · valid 10 minutes · daemon {}",
@@ -237,7 +273,7 @@ pub fn pair_phone(store: Store) -> View {
                         .flex_wrap()
                         .gap_2()
                         .child(when(!in_terminal(), {
-                            let link = offer.page_link();
+                            let link = offer.phone_link();
                             move || {
                                 let link = link.clone();
                                 btn(
@@ -249,7 +285,7 @@ pub fn pair_phone(store: Store) -> View {
                             }
                         }))
                         .child(btn("Copy link", Variant::Ghost, Size::Sm, {
-                            let link = offer.page_link();
+                            let link = offer.phone_link();
                             move || set_clipboard(link.clone())
                         }))
                         .child(btn("Cancel", Variant::Ghost, Size::Sm, move || {

@@ -580,6 +580,9 @@ include_raw_tool_args = false
 # enabled = true
 # relays = []    # your own iroh-relay URLs (see deploy/relay); empty: the
 #                # project's relay, relay.aidaemon.ai, and its address lookup
+# web_app = "https://app.aidaemon.ai"   # where a phone with no app pairs from
+#                # a QR code: the project's web app, or your own copy of the
+#                # web build (clients/app); "" for links that open the app only
 
 # Tunnels the daemon runs itself, so the gateways are reachable from elsewhere
 # (see "Reaching the gateways" in the README). Each table needs its gateway on

@@ -59,6 +59,19 @@ pub struct RemoteAccessConfig {
     /// relays (`relay.aidaemon.ai`).
     #[serde(default)]
     pub relays: Vec<String>,
+    /// The web app on a site of its own, where a phone with no app pairs
+    /// from a QR code and reaches this daemon by key: the project's
+    /// (`https://app.aidaemon.ai`) unless you host the web build yourself.
+    /// Empty: pairing links open the app only.
+    #[serde(default = "default_web_app")]
+    pub web_app: String,
+}
+
+/// The project's hosted web app.
+pub const AIDAEMON_WEB_APP: &str = "https://app.aidaemon.ai";
+
+fn default_web_app() -> String {
+    AIDAEMON_WEB_APP.to_string()
 }
 
 fn default_remote_enabled() -> bool {
@@ -70,6 +83,7 @@ impl Default for RemoteAccessConfig {
         Self {
             enabled: default_remote_enabled(),
             relays: Vec::new(),
+            web_app: default_web_app(),
         }
     }
 }
@@ -153,6 +167,7 @@ mod tests {
         let on: ClientGatewayConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
         assert!(on.remote.enabled);
         assert!(on.remote.relays.is_empty());
+        assert_eq!(on.remote.web_app, AIDAEMON_WEB_APP);
         assert!(ClientGatewayConfig::default().remote.enabled);
         let off: ClientGatewayConfig =
             serde_json::from_str(r#"{"enabled": true, "remote": {"enabled": false}}"#).unwrap();

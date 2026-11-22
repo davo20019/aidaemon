@@ -41,7 +41,25 @@ fn start() -> Headless {
     start_at(1280.0, 820.0)
 }
 
+/// The tests never reach a daemon on this machine: owner pairing (the
+/// phone step's QR code) signs in with the local token, so point it at a
+/// file that does not exist.
+fn no_local_daemon() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: set once, before any test starts an engine that reads it.
+        unsafe {
+            std::env::remove_var("AIDAEMON_CLIENT_TOKEN");
+            std::env::set_var(
+                "AIDAEMON_CLIENT_TOKEN_FILE",
+                std::env::temp_dir().join("aidaemon-app-tests-no-daemon/client-token"),
+            );
+        }
+    });
+}
+
 fn start_at(width: f32, height: f32) -> Headless {
+    no_local_daemon();
     let mut config = EngineConfig::new(Root::of::<Offline>());
     config.viewport = Size::new(Points(width), Points(height));
     Headless::start(config).unwrap()
@@ -49,6 +67,7 @@ fn start_at(width: f32, height: f32) -> Headless {
 
 /// A desktop window, with a mouse to hover with.
 fn start_desktop() -> Headless {
+    no_local_daemon();
     let mut config = EngineConfig::new(Root::of::<Offline>());
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.os = nsh_core::platform::Os::MacOs;
@@ -273,6 +292,7 @@ const SETTINGS: &str = r#"{"settings": {"bots": [{"allowed_user_ids": ["telegram
 #[test]
 fn the_terminal_settings_are_one_page_of_models_reached_by_keyboard() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    no_local_daemon();
     let mut config = EngineConfig::new(Root::of::<Offline>());
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;
@@ -1305,6 +1325,7 @@ impl nsh_core::speech::SpeechBackend for Hears {
 #[test]
 fn speaking_writes_into_the_composer() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    no_local_daemon();
     let mut config = EngineConfig::new(Root::of::<Offline>());
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.os = nsh_core::platform::Os::MacOs;
@@ -1480,6 +1501,7 @@ fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed
 #[test]
 fn the_terminal_build_shows_tool_output_as_text() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    no_local_daemon();
     let mut config = EngineConfig::new(Root::of::<Offline>());
     config.viewport = Size::new(Points(1280.0), Points(820.0));
     config.environment.idiom = nsh_core::platform::Idiom::Terminal;

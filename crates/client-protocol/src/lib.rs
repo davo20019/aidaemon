@@ -38,7 +38,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 44;
+pub const PROTOCOL_MINOR: u16 = 45;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3232,6 +3232,12 @@ pub struct PairingOffer {
     /// configured address, or loopback). Absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+    /// The web app on a site of its own (`https://app.aidaemon.ai` unless the
+    /// owner names another), when the daemon is reachable by key over iroh:
+    /// a phone with no app pairs there ([`PairingOffer::phone_link`])
+    /// (protocol 1.45).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_app: Option<String>,
 }
 
 /// The gateway's page that opens the phone app on a pairing: tapped in a
@@ -3261,6 +3267,20 @@ impl PairingOffer {
             .split_once('?')
             .map_or(self.link.as_str(), |(_, query)| query);
         format!("{base}{PAIRING_PAGE_PATH}#{query}")
+    }
+
+    /// The link a phone opens, for a QR code: the web app on its own site
+    /// ([`PairingOffer::web_app`]) with this offer and the daemon's iroh
+    /// address, which pairs the browser there, or opens the AIDaemon app
+    /// when the phone has it (the site names the app). Else, with no iroh
+    /// address or no web app, [`PairingOffer::page_link`].
+    pub fn phone_link(&self) -> String {
+        match self.web_app.as_deref().map(str::trim) {
+            Some(web_app) if !web_app.is_empty() && self.link.contains("&remote=") => {
+                self.web_link(web_app, "/")
+            }
+            _ => self.page_link(),
+        }
     }
 
     /// The web client at `base` + `app_path` with this offer in its
@@ -3494,6 +3514,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_phone_pairs_at_the_web_app_only_when_it_can_reach_the_daemon_by_key() {
+        let mut offer = PairingOffer {
+            offer_id: "of-1".into(),
+            code: "K7Q2-9FZD".into(),
+            expires_at_ms: 0,
+            link: "aidaemon-pair:?gateway=http%3A%2F%2F127.0.0.1%3A8788&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
+            fingerprint: "3b1f".into(),
+            public_url: Some("http://127.0.0.1:8788".into()),
+            web_app: Some("https://app.example.invalid".into()),
+        };
+        // No iroh address: the web app could not reach the daemon.
+        assert_eq!(offer.phone_link(), offer.page_link());
+        offer
+            .link
+            .push_str("&remote=iroh%3A%2F%2Fk%40relay.example.invalid");
+        assert_eq!(
+            offer.phone_link(),
+            "https://app.example.invalid/#offer=of-1&code=K7Q2-9FZD&fp=3b1f&remote=iroh%3A%2F%2Fk%40relay.example.invalid"
+        );
+        // The owner turned the web app off.
+        offer.web_app = Some(String::new());
+        assert_eq!(offer.phone_link(), offer.page_link());
+    }
+
+    #[test]
     fn a_pairing_page_link_is_on_the_gateway_with_the_offer_in_its_fragment() {
         let mut offer = PairingOffer {
             offer_id: "of-1".into(),
@@ -3502,6 +3547,7 @@ mod tests {
             link: "aidaemon-pair:?gateway=https%3A%2F%2Fd.example.invalid&offer=of-1&code=K7Q2-9FZD&fp=3b1f".into(),
             fingerprint: "3b1f".into(),
             public_url: Some("https://d.example.invalid/".into()),
+            web_app: None,
         };
         assert_eq!(
             offer.page_link(),

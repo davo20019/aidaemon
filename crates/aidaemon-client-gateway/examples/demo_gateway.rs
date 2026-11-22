@@ -1146,7 +1146,7 @@ async fn main() -> anyhow::Result<()> {
     // With AIDAEMON_DEMO_REMOTE=1 the demo is also reachable by key over
     // iroh through the project's relays, as a daemon with remote access is:
     // the web app on a site of its own pairs with it from the printed link
-    // (put the site's address before the `#`).
+    // (put the site's address before the `#`, or set AIDAEMON_DEMO_WEB_APP).
     let _remote = match std::env::var_os("AIDAEMON_DEMO_REMOTE") {
         Some(_) => Some(serve_remote(gateway.clone(), &offer).await?),
         None => None,
@@ -1164,6 +1164,11 @@ async fn serve_remote(
         .load_admission()
         .await
         .map_err(|e| anyhow::anyhow!(e.message))?;
+    // Offers name the web app at AIDAEMON_DEMO_WEB_APP (a local copy of the
+    // web build), so the desktop app's QR code opens it.
+    gateway
+        .pairing()
+        .set_web_app(std::env::var("AIDAEMON_DEMO_WEB_APP").ok());
     let pairing = gateway.pairing().clone();
     let access = aidaemon_remote::Access::Only(Arc::new(move |peer| {
         pairing.admits(&aidaemon_remote::endpoint_hex(peer))
@@ -1179,6 +1184,8 @@ async fn serve_remote(
     .await?;
     listener.online().await;
     let url = listener.url().to_string();
+    // New offers carry it, as the daemon's do once it is online.
+    gateway.pairing().set_remote_url(Some(url.clone()));
     println!(
         "web app over iroh: <site>/#offer={}&code={}&fp={}&remote={}",
         offer.offer_id,

@@ -312,8 +312,12 @@ pub fn page(store: Store) -> View {
             Some(SetupStep::Channel) if PHONE_ASKED.load(std::sync::atomic::Ordering::Relaxed) => {
                 channel_step(store).key("setup-channel")
             }
-            // First run: the first conversation before any bot token; the
-            // phone step waits in Settings.
+            // First run on the daemon's own computer: one question, the
+            // phone. Chat bots wait in Settings.
+            Some(SetupStep::Channel) if link::owner_pairing::available() => {
+                phone_step(store).key("setup-phone")
+            }
+            // Elsewhere: the first conversation before any bot token.
             Some(SetupStep::Channel) => {
                 spawn(async move {
                     if !store.setup_busy() {
@@ -842,6 +846,72 @@ fn choices(
                 list
             }))
         }))
+}
+
+/// Where a self-hoster reads about their own relay, web app or tunnel.
+const OWN_SETUP_URL: &str = "https://github.com/davo20019/aidaemon/blob/master/deploy/README.md";
+
+/// First run: use AIDaemon from a phone, by scanning one code. The phone
+/// opens the web app (or the AIDaemon app, when it has it), already paired;
+/// pairing it continues setup.
+fn phone_step(store: Store) -> View {
+    let done = move || store.setup_step_later(SetupAction::SkipChannel);
+    let advanced = signal(false);
+    frame(
+        view()
+            .gap_4()
+            .child(heading("Use AIDaemon from your phone?"))
+            .child(lead(
+                "Scan this code with your phone's camera. AIDaemon opens on your phone, \
+                 already paired: no install, no account.",
+            ))
+            .child(super::pairing::pair_phone_now(
+                store,
+                std::rc::Rc::new(done),
+            ))
+            .child(hint_text(
+                "It connects through AIDaemon's relay, encrypted end to end: the relay \
+                 cannot read your messages.",
+            ))
+            .child(
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        btn("Skip for now", Variant::Ghost, Size::Sm, done)
+                            .disabled(move || store.setup_busy()),
+                    )
+                    .child(btn("Advanced", Variant::Ghost, Size::Sm, move || {
+                        advanced.update(|open| *open = !*open)
+                    })),
+            )
+            .child(dynamic(move || {
+                advanced.get().then(|| {
+                    untracked(move || {
+                        view()
+                            .gap_2()
+                            .child(hint_text(
+                                "Your own relay, your own copy of the web app, or your own \
+                                 tunnel (Tailscale, Cloudflare): set them in config.toml.",
+                            ))
+                            .child(view().flex_row().child(btn(
+                                "How to set them up",
+                                Variant::Ghost,
+                                Size::Sm,
+                                move || drop(open_url(OWN_SETUP_URL.to_string())),
+                            )))
+                    })
+                })
+            })),
+    )
+}
+
+fn hint_text(words: &'static str) -> Text {
+    text(words)
+        .text_size(px(type_scale::SM))
+        .line_height(px(type_scale::LH_SM))
+        .text_color(colors::MUTED)
 }
 
 fn channel_step(store: Store) -> View {

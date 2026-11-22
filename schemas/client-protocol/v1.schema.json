@@ -4972,6 +4972,13 @@
             "string",
             "null"
           ]
+        },
+        "web_app": {
+          "description": "The web app on a site of its own (`https://app.aidaemon.ai` unless the\nowner names another), when the daemon is reachable by key over iroh:\na phone with no app pairs there ([`PairingOffer::phone_link`])\n(protocol 1.45).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

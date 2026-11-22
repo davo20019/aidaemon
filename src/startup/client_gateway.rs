@@ -1385,6 +1385,9 @@ async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>)
             .map_err(|error| anyhow::anyhow!("remote admission: {}", error.message))?;
         let key = aidaemon_remote::load_or_create_key(&key_path)?;
         let relays = remote_relays(config)?;
+        gateway
+            .pairing()
+            .set_web_app(Some(config.remote.web_app.clone()));
         let pairing = gateway.pairing().clone();
         let access = aidaemon_remote::Access::Only(Arc::new(move |peer| {
             pairing.admits(&aidaemon_remote::endpoint_hex(peer))
@@ -1471,12 +1474,12 @@ impl aidaemon_channels::slash::SlashCommand for DeviceCommands {
             "/pair_device" => match pairing.offer(Some(call.session_id.to_string())).await {
                 Ok(offer) => format!(
                     "To pair your phone, open this link on it (it opens the AIDaemon \
-                     app): {}\n\n\
+                     app, or AIDaemon in the browser when the app is not installed): {}\n\n\
                      To pair a browser instead, open {} in it.\n\n\
                      The code is **{}**, valid 10 minutes. I'll ask you here before the \
                      device can do anything.\n\n\
                      Daemon fingerprint: `{}`",
-                    offer.page_link(),
+                    offer.phone_link(),
                     web_link(&gateway, &offer),
                     offer.code,
                     offer.fingerprint

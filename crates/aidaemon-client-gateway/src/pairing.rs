@@ -141,6 +141,9 @@ pub struct Pairing {
     /// The daemon's peer-to-peer address (`iroh://…`), put in offer links
     /// beside `public_url` once remote access is up.
     remote_url: Mutex<Option<String>>,
+    /// The web app on a site of its own, named in offers while there is a
+    /// remote address.
+    web_app: Mutex<Option<String>>,
     /// Offers shown on the owner's own screen ([`Self::offer_shown_here`]):
     /// redeeming one pairs at once. Kept in memory only: after a restart
     /// such an offer asks like any other.
@@ -280,6 +283,7 @@ impl Pairing {
             approvals,
             public_url,
             remote_url: Mutex::default(),
+            web_app: Mutex::default(),
             shown_here: Mutex::default(),
             fingerprint,
             access: Mutex::default(),
@@ -373,6 +377,13 @@ impl Pairing {
         *self.remote_url.lock().unwrap_or_else(|p| p.into_inner()) = url;
     }
 
+    /// Offers name `url` as the web app a phone with no app pairs at
+    /// ([`PairingOffer::phone_link`]) while there is a remote address.
+    pub fn set_web_app(&self, url: Option<String>) {
+        *self.web_app.lock().unwrap_or_else(|p| p.into_inner()) =
+            url.filter(|u| !u.trim().is_empty());
+    }
+
     fn remote_url(&self) -> Option<String> {
         self.remote_url
             .lock()
@@ -418,9 +429,17 @@ impl Pairing {
             percent(&public_url),
             self.fingerprint
         );
-        if let Some(remote) = self.remote_url() {
-            link.push_str(&format!("&remote={}", percent(&remote)));
+        let remote = self.remote_url();
+        if let Some(remote) = &remote {
+            link.push_str(&format!("&remote={}", percent(remote)));
         }
+        // The web app can only reach the daemon by key.
+        let web_app = remote.and(
+            self.web_app
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        );
         Ok(PairingOffer {
             offer_id,
             code,
@@ -428,6 +447,7 @@ impl Pairing {
             link,
             fingerprint: self.fingerprint.clone(),
             public_url: Some(public_url),
+            web_app,
         })
     }
 
