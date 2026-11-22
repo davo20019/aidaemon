@@ -61,16 +61,20 @@ p{color:var(--muted);font-size:15px;margin-bottom:14px}
   var offer = params.get('offer') || '';
   var code = params.get('code') || '';
   var fp = params.get('fp') || '';
+  // The daemon's peer-to-peer address: iroh://<key>[@<relay host>[:port]].
+  var remote = params.get('remote') || '';
   var token = /^[A-Za-z0-9_-]{1,128}$/;
+  var peer = /^iroh:\/\/[0-9a-f]{64}(@[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?)?$/;
   var url = null;
   try { url = new URL(gateway); } catch (e) {}
   var valid = url && (url.protocol === 'https:' || url.protocol === 'http:') &&
-    token.test(offer) && token.test(code) && (fp === '' || token.test(fp));
+    token.test(offer) && token.test(code) && (fp === '' || token.test(fp)) &&
+    (remote === '' || peer.test(remote));
   if (!valid) { document.getElementById('broken').hidden = false; return; }
 
   // Rebuilt from the checked values only, so nothing else reaches the app.
   var query = 'gateway=' + encodeURIComponent(gateway) + '&offer=' + offer + '&code=' + code +
-    (fp ? '&fp=' + fp : '');
+    (fp ? '&fp=' + fp : '') + (remote ? '&remote=' + encodeURIComponent(remote) : '');
   var ua = navigator.userAgent;
   var android = /Android/i.test(ua);
   var ios = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
@@ -95,3 +99,17 @@ p{color:var(--muted);font-size:15px;margin-bottom:14px}
 </script>
 </body>
 </html>"##;
+
+#[cfg(test)]
+mod tests {
+    use super::PAIR_PAGE;
+
+    /// The page rebuilds the app's link from checked values: the daemon's
+    /// iroh address must be one of them, or the app pairs over the tunnel.
+    #[test]
+    fn the_app_link_keeps_the_checked_remote_address() {
+        assert!(PAIR_PAGE.contains("var peer = /^iroh:"));
+        assert!(PAIR_PAGE.contains("(remote === '' || peer.test(remote))"));
+        assert!(PAIR_PAGE.contains("'&remote=' + encodeURIComponent(remote)"));
+    }
+}
