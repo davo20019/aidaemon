@@ -20,6 +20,7 @@ use crate::startup::client_providers::{self, ProviderFlow};
 use crate::startup::settings_upkeep::{self, DbUpkeep, Trial};
 use crate::tools::ConfigManagerTool;
 use crate::traits::StateStore;
+use aidaemon_runtime::permissions::{AgentChoice, OwnerLevel, Permissions};
 
 /// What the example config documents about one setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +201,11 @@ fn kind_of_text(text: &str) -> SettingKind {
 /// When a change to `key` takes effect: providers and models reload in
 /// place; the rest is read at start.
 fn applies_of(key: &str) -> Applies {
+    // AIdaemon's level and the coding agents' choices are live
+    // (`aidaemon_runtime::permissions`): every write takes them again.
+    if key == "authority.owner_default" || key.starts_with("cli_agents.permissions") {
+        return Applies::Now;
+    }
     match key.split(['.', '[']).next().unwrap_or_default() {
         "provider" | "decisions" | "surfaces" => Applies::Reload,
         _ => Applies::Restart,
@@ -267,9 +273,25 @@ fn widens_authority(key: &str, value: Option<&str>, current: &toml::Table) -> Op
             .and_then(|t| t.get("v").cloned())
     });
     Some(match key {
-        // Unset, or back to `full`, is the default: never wider.
+        // Wider when the new level allows more than the current one (unset
+        // is Standard); a value this daemon cannot read is asked.
         "authority.owner_default" => {
-            parsed.as_ref().and_then(toml::Value::as_str) != Some("full") && value.is_some()
+            let level_of = |value: Option<&toml::Value>| -> Option<OwnerLevel> {
+                match value {
+                    None => Some(OwnerLevel::default()),
+                    Some(value) => value.clone().try_into().ok(),
+                }
+            };
+            let now = level_of(
+                current
+                    .get("authority")
+                    .and_then(|authority| authority.get("owner_default")),
+            )
+            .unwrap_or_default();
+            if value.is_some() && parsed.is_none() {
+                return Some(true);
+            }
+            level_of(parsed.as_ref()).is_none_or(|next| next > now)
         }
         "authority.trusted_roots" => {
             let now: HashSet<String> = current
@@ -323,6 +345,8 @@ pub(crate) struct SettingsHost {
     pub trial: Option<Arc<Trial>>,
     /// A ChatGPT sign-in or key check under way from the Providers tab.
     pub flow: ProviderFlow,
+    /// AIdaemon's permission level and the coding agents' choices, live.
+    pub permissions: Permissions,
 }
 
 impl SettingsHost {
@@ -333,11 +357,23 @@ impl SettingsHost {
         commands: Option<crate::channels::commands::CommandContext>,
     ) -> Self {
         let trial = settings_upkeep::arm_trial(&config_path);
+        // The daemon's live value; one of its own read from the file when
+        // there is no daemon (tests).
+        let permissions = match crate::startup::permissions::daemon() {
+            Some((permissions, _)) => permissions.clone(),
+            None => std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|text| text.parse::<toml::Table>().ok())
+                .map(|table| Permissions::from_config(&table))
+                .unwrap_or_default(),
+        };
         Self {
             tool: ConfigManagerTool::new(
                 crate::config::config_file(&config_path),
                 crate::config::secret_store().clone(),
-            ),
+            )
+            .with_permissions(permissions.clone()),
+            permissions,
             config_path,
             state,
             mcp,
@@ -518,7 +554,8 @@ impl SettingsHost {
             )
             .display()
             .to_string(),
-            coding_agents: coding_agents(&*self.state).await,
+            coding_agents: coding_agents(&self.permissions).await,
+            permission_level: Some(wire_level(self.permissions.level())),
             database_encrypted: cfg!(feature = "encryption")
                 && std::env::var("AIDAEMON_ALLOW_PLAINTEXT_DB").is_err(),
         })
@@ -699,6 +736,9 @@ impl SettingsHost {
             SettingsChange::SetAgentMode { agent, mode } => {
                 let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+                // Never looser than AIdaemon itself.
+                self.permissions
+                    .may_pick(&*coding_agent, agent_mode(*mode)?)?;
                 match agent_mode(*mode)? {
                     // Nothing it does is checked from then on.
                     aidaemon_runtime::tools::agent_mode::PermissionMode::FullAccess => ask(
@@ -710,6 +750,51 @@ impl SettingsHost {
                         false,
                     ),
                     _ => SettingsGate::Free,
+                }
+            }
+            SettingsChange::SetPermissionLevel { level } => {
+                let next = owner_level(*level)?;
+                let now = self.permissions.level();
+                if next <= now {
+                    SettingsGate::Free
+                } else if next >= OwnerLevel::FullAccess {
+                    // As raising `[authority]` from the Advanced tab.
+                    ask(
+                        "Give AIdaemon full access: every terminal command, including \
+                         dangerous ones (rm, sudo), runs without asking, and coding agents may \
+                         be given full access too."
+                            .to_string(),
+                        true,
+                    )
+                } else {
+                    ask(
+                        format!(
+                            "Raise AIdaemon's permission level from {} to {}",
+                            now.title(),
+                            next.title()
+                        ),
+                        true,
+                    )
+                }
+            }
+            SettingsChange::AgentSameAsAidaemon { agent } => {
+                let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
+                    .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+                let cap = aidaemon_runtime::permissions::agent_cap(self.permissions.level());
+                let runs = aidaemon_runtime::tools::agent_mode::modes_within(&*coding_agent, cap)
+                    .last()
+                    .copied();
+                if runs == Some(aidaemon_runtime::tools::agent_mode::PermissionMode::FullAccess) {
+                    ask(
+                        format!(
+                            "Give {} full access, as AIdaemon has: it runs on this machine with \
+                             nothing asked, and your rules don't see what it does.",
+                            coding_agent.name()
+                        ),
+                        false,
+                    )
+                } else {
+                    SettingsGate::Free
                 }
             }
             SettingsChange::ForgetSignIns => ask(
@@ -1141,6 +1226,36 @@ impl SettingsHost {
                     applies: Some(Applies::Restart),
                 })
             }
+            SettingsChange::SetPermissionLevel { level } => {
+                let level = owner_level(level)?;
+                aidaemon_runtime::permissions::save_level(
+                    &crate::config::config_file(&self.config_path),
+                    &self.permissions,
+                    level,
+                )
+                .await
+                .map_err(|error| format!("The level could not be saved: {error}"))?;
+                Ok(SettingsDone {
+                    message: format!("AIdaemon's permission level is now {}.", level.title()),
+                    applies: Some(Applies::Now),
+                })
+            }
+            SettingsChange::AgentSameAsAidaemon { agent } => {
+                let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(&agent)
+                    .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+                aidaemon_runtime::permissions::save_agent(
+                    &crate::config::config_file(&self.config_path),
+                    &self.permissions,
+                    &agent,
+                    Some(AgentChoice::Same),
+                )
+                .await
+                .map_err(|error| format!("The mode could not be saved: {error}"))?;
+                Ok(SettingsDone {
+                    message: format!("{} now follows AIdaemon's level.", coding_agent.name()),
+                    applies: Some(Applies::Now),
+                })
+            }
             SettingsChange::CheckAgents => {
                 aidaemon_runtime::tools::agent_mode::check_all().await;
                 Ok(SettingsDone {
@@ -1152,8 +1267,16 @@ impl SettingsHost {
                 use aidaemon_runtime::tools::agent_mode;
                 let coding_agent = agent_mode::agent_named(&agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
-                agent_mode::set_mode(&*self.state, &agent, &*coding_agent, agent_mode(mode)?)
-                    .await?;
+                let mode = agent_mode(mode)?;
+                self.permissions.may_pick(&*coding_agent, mode)?;
+                aidaemon_runtime::permissions::save_agent(
+                    &crate::config::config_file(&self.config_path),
+                    &self.permissions,
+                    &agent,
+                    Some(AgentChoice::Mode(mode)),
+                )
+                .await
+                .map_err(|error| format!("The mode could not be saved: {error}"))?;
                 Ok(SettingsDone {
                     message: format!("{} now runs as you chose.", coding_agent.name()),
                     applies: Some(Applies::Now),
@@ -1238,6 +1361,29 @@ fn group_of(key: &str) -> String {
     key.split(['.', '[']).next().unwrap_or_default().to_string()
 }
 
+/// The protocol's level as the runtime's; `Err` for one this daemon does
+/// not know.
+fn owner_level(level: aidaemon_client_protocol::PermissionLevel) -> Result<OwnerLevel, String> {
+    use aidaemon_client_protocol::PermissionLevel as Wire;
+    match level {
+        Wire::ReadOnly => Ok(OwnerLevel::ReadOnly),
+        Wire::Standard => Ok(OwnerLevel::Full),
+        Wire::FullAccess => Ok(OwnerLevel::FullAccess),
+        _ => Err("This permission level is not known to this daemon".to_string()),
+    }
+}
+
+/// The runtime's level as the protocol's. `unrestricted` (written by hand)
+/// runs every command unasked, so it shows as Full access.
+fn wire_level(level: OwnerLevel) -> aidaemon_client_protocol::PermissionLevel {
+    use aidaemon_client_protocol::PermissionLevel as Wire;
+    match level {
+        OwnerLevel::ReadOnly => Wire::ReadOnly,
+        OwnerLevel::Full => Wire::Standard,
+        OwnerLevel::FullAccess | OwnerLevel::Unrestricted => Wire::FullAccess,
+    }
+}
+
 /// The protocol's mode as the runtime's; `Err` for one this daemon does
 /// not know.
 fn agent_mode(
@@ -1254,9 +1400,7 @@ fn agent_mode(
 }
 
 /// The coding agents the daemon can hand work to, each with its mode.
-async fn coding_agents(
-    store: &(impl aidaemon_tools::services::SettingsStore + ?Sized),
-) -> Vec<aidaemon_client_protocol::CodingAgent> {
+async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protocol::CodingAgent> {
     use aidaemon_client_protocol::AgentMode as Wire;
     use aidaemon_runtime::tools::agent_mode::{self, PermissionMode};
     let wire = |mode: PermissionMode| match mode {
@@ -1267,6 +1411,7 @@ async fn coding_agents(
     use aidaemon_client_protocol::AgentReadiness;
     // An agent not asked yet is asked now (the page shows its answer).
     agent_mode::ensure_checked().await;
+    let cap = aidaemon_runtime::permissions::agent_cap(permissions.level());
     let mut out = Vec::new();
     for info in agent_mode::agents() {
         let agent = &info.agent;
@@ -1287,9 +1432,17 @@ async fn coding_agents(
             readiness_reason,
             readiness_fix,
             program: agent.name().to_string(),
-            mode: agent_mode::mode_of(store, &info.name, &**agent)
-                .await
-                .map(wire),
+            // What it runs at now: the owner's choice under AIdaemon's level.
+            mode: permissions.agent_mode(&info.name, &**agent).map(wire),
+            same_as_aidaemon: permissions.choice(&info.name) == Some(AgentChoice::Same),
+            within_level: agent_mode::modes_within(&**agent, cap)
+                .into_iter()
+                .map(wire)
+                .collect(),
+            capped: matches!(
+                permissions.choice(&info.name),
+                Some(AgentChoice::Mode(mode)) if mode > cap
+            ),
             modes: agent.modes().iter().copied().map(wire).collect(),
             note: agent.note().to_string(),
             name: info.name,
@@ -1431,7 +1584,7 @@ allowed_user_ids = [1]
             ]
         }));
         let (_dir, host) = host(CONFIG).await;
-        let agents = coding_agents(&*host.state).await;
+        let agents = coding_agents(&host.permissions).await;
         let codex: &CodingAgent = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
         assert_eq!(codex.program, "Codex");
         assert_eq!(codex.mode, Some(AgentMode::Checked));
@@ -1445,21 +1598,77 @@ allowed_user_ids = [1]
         assert_eq!(other.modes, vec![AgentMode::FullAccess]);
         assert!(!other.note.is_empty());
 
+        // Standard: full access is above AIdaemon's own level, refused with
+        // why, and not offered.
+        assert_eq!(
+            codex.within_level,
+            vec![AgentMode::EveryCommand, AgentMode::Checked]
+        );
+        assert!(other.within_level.is_empty());
         let full = SettingsChange::SetAgentMode {
             agent: "synthetic-codex".into(),
             mode: AgentMode::FullAccess,
         };
+        assert!(host.gate(&full).await.unwrap_err().contains("Standard"));
+        // Raising AIdaemon to full access asks (on another device), then
+        // offers it, and full access for the agent asks too.
+        let raise = SettingsChange::SetPermissionLevel {
+            level: aidaemon_client_protocol::PermissionLevel::FullAccess,
+        };
+        assert!(matches!(
+            host.gate(&raise).await.unwrap(),
+            SettingsGate::Ask {
+                other_device: true,
+                ..
+            }
+        ));
+        host.change(raise, true).await.unwrap();
+        assert_eq!(
+            host.settings().await.unwrap().permission_level,
+            Some(aidaemon_client_protocol::PermissionLevel::FullAccess)
+        );
         assert!(matches!(
             host.gate(&full).await.unwrap(),
             SettingsGate::Ask { .. }
         ));
+        host.change(full, true).await.unwrap();
+        let same = SettingsChange::AgentSameAsAidaemon {
+            agent: "synthetic-coder".into(),
+        };
+        assert!(matches!(
+            host.gate(&same).await.unwrap(),
+            SettingsGate::Ask { .. }
+        ));
+        host.change(same, true).await.unwrap();
+        let agents = coding_agents(&host.permissions).await;
+        let other = agents.iter().find(|a| a.name == "synthetic-coder").unwrap();
+        assert!(other.same_as_aidaemon);
+        assert_eq!(other.mode, Some(AgentMode::FullAccess));
+        // Back to Standard: free; the agent picked above it is capped and
+        // says so, the one following the level runs nothing.
+        let lower = SettingsChange::SetPermissionLevel {
+            level: aidaemon_client_protocol::PermissionLevel::Standard,
+        };
+        assert_eq!(host.gate(&lower).await.unwrap(), SettingsGate::Free);
+        host.change(lower, false).await.unwrap();
+        let agents = coding_agents(&host.permissions).await;
+        let codex = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
+        assert_eq!(codex.mode, Some(AgentMode::Checked));
+        assert!(codex.capped);
+        let other = agents.iter().find(|a| a.name == "synthetic-coder").unwrap();
+        assert_eq!(other.mode, None);
+        // All of it is in the file.
+        let text = std::fs::read_to_string(&host.config_path).unwrap();
+        assert!(text.contains("owner_default = \"full\""), "{text}");
+        assert!(text.contains("synthetic-codex = \"full_access\""), "{text}");
+        assert!(text.contains("synthetic-coder = \"same\""), "{text}");
         let every = SettingsChange::SetAgentMode {
             agent: "synthetic-codex".into(),
             mode: AgentMode::EveryCommand,
         };
         assert_eq!(host.gate(&every).await.unwrap(), SettingsGate::Free);
         host.change(every, false).await.unwrap();
-        let agents = coding_agents(&*host.state).await;
+        let agents = coding_agents(&host.permissions).await;
         let codex = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
         assert_eq!(codex.mode, Some(AgentMode::EveryCommand));
         // One whose run could not sign in shows why, until asked again.
@@ -1468,7 +1677,7 @@ allowed_user_ids = [1]
             "It couldn't sign in on its last run.",
             Some("Sign in again."),
         );
-        let agents = coding_agents(&*host.state).await;
+        let agents = coding_agents(&host.permissions).await;
         let codex = agents.iter().find(|a| a.name == "synthetic-codex").unwrap();
         assert_eq!(
             codex.readiness,

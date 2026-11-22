@@ -836,9 +836,11 @@ pub struct TerminalTool {
     /// `read:<path>`, `write:<path>`). Session grants live here only;
     /// Allow-Always grants are also persisted.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
-    /// Every command is allowed: the owner's `/trustall` (stored apart from
-    /// the prefixes, see `terminal_grants`) or YOLO mode.
-    trust_all: Arc<std::sync::atomic::AtomicBool>,
+    /// AIdaemon's permission level: at Full access every command is
+    /// allowed (the owner's `/trustall`). The daemon's shared value once
+    /// [`Self::set_permissions`] wires it; until then this terminal's own.
+    permissions: crate::permissions::Permissions,
+    daemon_permissions: OnceLock<crate::permissions::Permissions>,
     /// Permission persistence mode: picks the buttons on the owner's cards.
     permission_mode: PermissionMode,
     /// Host vs sandbox execution.
@@ -3732,7 +3734,9 @@ impl TerminalTool {
         }
 
         // Configured prefixes, then the ones the owner allowed for good. A
-        // configured `*` (and YOLO mode) is trust-all, never a prefix.
+        // configured `*` (and YOLO mode) is Full access, never a prefix; the
+        // daemon converts both into its level at start
+        // (`startup::permissions`), so this is for a terminal built alone.
         let mut trust_all = permission_mode == PermissionMode::Yolo;
         let mut merged: Vec<String> = Vec::new();
         for prefix in allowed_prefixes {
@@ -3758,12 +3762,10 @@ impl TerminalTool {
                     }
                 }
                 persisted_capabilities = grants.capabilities;
-                trust_all |= grants.trust_all;
                 // Counts, not the entries: some are whole command lines.
                 info!(
                     loaded,
                     capabilities = persisted_capabilities.len(),
-                    trust_all,
                     "Loaded the terminal's standing approvals"
                 );
             }
@@ -3775,7 +3777,12 @@ impl TerminalTool {
             allowed_prefixes: Arc::new(RwLock::new(merged)),
             session_approved: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
-            trust_all: Arc::new(std::sync::atomic::AtomicBool::new(trust_all)),
+            permissions: crate::permissions::Permissions::new(if trust_all {
+                crate::permissions::OwnerLevel::FullAccess
+            } else {
+                crate::permissions::OwnerLevel::Full
+            }),
+            daemon_permissions: OnceLock::new(),
             permission_mode,
             confinement: aidaemon_tools::TerminalConfinement::default(),
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -4934,22 +4941,18 @@ impl TerminalTool {
         Ok(cleaned)
     }
 
-    /// Whether trust-all mode (every command auto-approved) is on for this
-    /// backend.
+    /// Whether every command runs unasked: AIdaemon's level is Full access.
     pub async fn trust_all_enabled(&self) -> bool {
-        self.trust_all.load(std::sync::atomic::Ordering::SeqCst)
+        self.daemon_permissions
+            .get()
+            .unwrap_or(&self.permissions)
+            .trust_all()
     }
 
-    /// Turn trust-all mode on or off. Only the owner's `/trustall` command
-    /// calls this; the model has no way to.
-    pub async fn set_trust_all(&self, on: bool) -> anyhow::Result<()> {
-        if let Some(ref pool) = self.pool {
-            super::terminal_grants::set_trust_all(pool, self.backend.approval_scope(), on).await?;
-        }
-        self.trust_all
-            .store(on, std::sync::atomic::Ordering::SeqCst);
-        info!(on, "Trust-all mode changed by the owner");
-        Ok(())
+    /// Follow the daemon's permission level (shared with its engine and
+    /// Settings) instead of this terminal's own. Set once, at start.
+    pub fn set_permissions(&self, permissions: crate::permissions::Permissions) {
+        let _ = self.daemon_permissions.set(permissions);
     }
 
     /// The reply to a model still calling the retired `trust_all` action.

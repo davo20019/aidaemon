@@ -11,6 +11,7 @@ use aidaemon_runtime::engine::settings::{
 pub(crate) fn settings_from_config(
     config: &AppConfig,
     backend: &dyn crate::execution::ExecutionBackend,
+    permissions: aidaemon_runtime::permissions::Permissions,
 ) -> SdkEngineSettings {
     let engine = &config.agent.engine;
     if engine.kind.is_some() {
@@ -68,7 +69,7 @@ pub(crate) fn settings_from_config(
     let settings = SdkEngineSettings {
         model_override,
         max_turns: engine.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1),
-        owner_default: config.authority.owner_default,
+        permissions,
         trusted_roots: config.authority.trusted_roots.clone(),
         outbound_secrets: aidaemon_runtime::approvals::ConfiguredSecrets::new(
             config.outbound_secret_values(),
@@ -100,8 +101,11 @@ mod tests {
             "openai_chatgpt",
             "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
         );
-        let settings =
-            settings_from_config(&config, &*crate::execution::active_execution_backend());
+        let settings = settings_from_config(
+            &config,
+            &*crate::execution::active_execution_backend(),
+            Default::default(),
+        );
         assert_eq!(settings.model_override, None);
     }
 
@@ -111,16 +115,22 @@ mod tests {
             "anthropic",
             "model = \"claude-haiku-5-5\"\napi_key = \"sk-ant-test\"",
         );
-        let settings =
-            settings_from_config(&config, &*crate::execution::active_execution_backend());
+        let settings = settings_from_config(
+            &config,
+            &*crate::execution::active_execution_backend(),
+            Default::default(),
+        );
         assert_eq!(settings.model_override.as_deref(), Some("claude-haiku-5-5"));
     }
 
     #[test]
     fn engine_model_pin_without_api_key_is_honored() {
         let config = engine_config("openai_chatgpt", "model = \"gpt-6-luna\"");
-        let settings =
-            settings_from_config(&config, &*crate::execution::active_execution_backend());
+        let settings = settings_from_config(
+            &config,
+            &*crate::execution::active_execution_backend(),
+            Default::default(),
+        );
         assert_eq!(settings.model_override.as_deref(), Some("gpt-6-luna"));
     }
 }

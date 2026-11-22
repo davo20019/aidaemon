@@ -1,7 +1,8 @@
 //! The daemon's side of the coding agents it hands work to
-//! ([`aidaemon_coding_agents`]): where each agent's permission mode is kept,
-//! which agents the Settings page lists, and how a hosted agent's request
-//! is judged.
+//! ([`aidaemon_coding_agents`]): which agents the Settings page lists, and
+//! how a hosted agent's request is judged. Each agent's permission mode is
+//! the owner's choice in `config.toml`, capped by AIdaemon's level
+//! ([`crate::permissions`]).
 //!
 //! A request is judged as a call of the daemon's own tool for that action
 //! (a command is `terminal`, a write `write_file`, a network host a fetch
@@ -11,48 +12,13 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use aidaemon_coding_agents::{ActionJudge, AgentAction, ModeStore, Verdict};
-pub use aidaemon_coding_agents::{CodingAgent, CodingAgents, PermissionMode, Readiness};
+use aidaemon_coding_agents::{ActionJudge, AgentAction, Verdict};
+pub use aidaemon_coding_agents::{
+    CodingAgent, CodingAgents, PermissionMode, Readiness, modes_within,
+};
 use aidaemon_core::{NestedCalls, ToolCall};
-use aidaemon_tools::services::SettingsStore;
 use async_trait::async_trait;
 use serde_json::json;
-
-/// The daemon's settings store, as the place modes are kept.
-pub struct SettingsModes<'a, S: ?Sized>(pub &'a S);
-
-#[async_trait]
-impl<S: SettingsStore + ?Sized> ModeStore for SettingsModes<'_, S> {
-    async fn load(&self, key: &str) -> Option<String> {
-        self.0.get_setting(key).await.ok().flatten()
-    }
-
-    async fn save(&self, key: &str, value: &str) -> Result<(), String> {
-        self.0
-            .set_setting(key, value)
-            .await
-            .map_err(|error| format!("The mode could not be saved: {error}"))
-    }
-}
-
-/// The mode the agent named `name` runs in.
-pub async fn mode_of(
-    store: &(impl SettingsStore + ?Sized),
-    name: &str,
-    agent: &dyn CodingAgent,
-) -> Option<PermissionMode> {
-    aidaemon_coding_agents::mode_of(&SettingsModes(store), name, agent).await
-}
-
-/// Keep the owner's choice of `mode` for the agent named `name`.
-pub async fn set_mode(
-    store: &(impl SettingsStore + ?Sized),
-    name: &str,
-    agent: &dyn CodingAgent,
-    mode: PermissionMode,
-) -> Result<(), String> {
-    aidaemon_coding_agents::set_mode(&SettingsModes(store), name, agent, mode).await
-}
 
 /// One agent the daemon can hand work to, by its name among its tools.
 #[derive(Clone)]

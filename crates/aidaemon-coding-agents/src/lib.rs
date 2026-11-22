@@ -36,6 +36,6 @@ pub use agent::{
     AgentHost, CodingAgent, Discovery, HostAnswers, HostStarter, Launch, LaunchArguments, Plan,
     PromptPlacement, RunRequest, read_through,
 };
-pub use mode::{ModeStore, PermissionMode, mode_of, set_mode};
+pub use mode::{PermissionMode, mode_within, modes_within};
 pub use readiness::{Probe, Readiness, check};
 pub use registry::CodingAgents;

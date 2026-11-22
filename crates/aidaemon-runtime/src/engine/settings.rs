@@ -15,9 +15,10 @@ pub struct SdkEngineSettings {
     /// daemon's own selection.
     pub model_override: Option<String>,
     pub max_turns: u32,
-    /// `[authority] owner_default`: the owner's level when no session mode
-    /// sets one.
-    pub owner_default: crate::authority::OwnerLevel,
+    /// AIdaemon's permission level and the coding agents' choices, live
+    /// (`[authority] owner_default`: the owner's level when no session mode
+    /// sets one).
+    pub permissions: crate::permissions::Permissions,
     /// `[authority] trusted_roots`: directories whose files are the owner's
     /// own, so reading them is not untrusted content.
     pub trusted_roots: Vec<String>,
@@ -30,7 +31,7 @@ impl Default for SdkEngineSettings {
         Self {
             model_override: None,
             max_turns: DEFAULT_MAX_TURNS,
-            owner_default: crate::authority::OwnerLevel::default(),
+            permissions: crate::permissions::Permissions::default(),
             trusted_roots: Vec::new(),
             outbound_secrets: Default::default(),
         }

@@ -38,7 +38,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 42;
+pub const PROTOCOL_MINOR: u16 = 43;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1389,6 +1389,26 @@ pub struct Settings {
     /// it may do on its own (protocol 1.36).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coding_agents: Vec<CodingAgent>,
+    /// AIdaemon's own permission level: the most it, its sub-agents and
+    /// every coding agent may do (protocol 1.43). `None`: a daemon from
+    /// before levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_level: Option<PermissionLevel>,
+}
+
+/// AIdaemon's permission level (protocol 1.43).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionLevel {
+    /// Only tools that read; anything else is refused.
+    ReadOnly,
+    /// Every tool, with risky terminal commands asked first.
+    Standard,
+    /// Every terminal command runs unasked (the owner's `/trustall`).
+    FullAccess,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// A coding agent the daemon can hand work to (Claude Code, Codex, ...)
@@ -1418,6 +1438,18 @@ pub struct CodingAgent {
     pub readiness_reason: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub readiness_fix: String,
+    /// The owner chose "same as AIdaemon": it follows the level
+    /// (protocol 1.43).
+    #[serde(default)]
+    pub same_as_aidaemon: bool,
+    /// The modes the owner may pick for it under AIdaemon's level, safest
+    /// first: never more than AIdaemon itself (protocol 1.43).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub within_level: Vec<AgentMode>,
+    /// The owner's pick is above the level, so it runs as `mode`, the most
+    /// the level allows (protocol 1.43).
+    #[serde(default)]
+    pub capped: bool,
 }
 
 /// Whether a coding agent can do work now (protocol 1.38).
@@ -1748,6 +1780,15 @@ pub enum SettingsChange {
     /// Ask every coding agent again whether it can do work now (protocol
     /// 1.38).
     CheckAgents,
+    /// Set AIdaemon's permission level (protocol 1.43). A wider level asks
+    /// first.
+    SetPermissionLevel {
+        level: PermissionLevel,
+    },
+    /// Have coding agent `agent` follow AIdaemon's level (protocol 1.43).
+    AgentSameAsAidaemon {
+        agent: String,
+    },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,

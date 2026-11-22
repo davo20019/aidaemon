@@ -69,6 +69,7 @@ pub mod media;
 pub mod memory;
 pub mod message_content;
 pub mod mid_run;
+pub mod permissions;
 pub mod policy;
 pub mod prompt;
 pub mod run_state;

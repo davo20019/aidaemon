@@ -146,12 +146,39 @@ impl ResolvedProviderSelection {
 pub struct ConfigManagerTool {
     config: ConfigFile,
     secrets: Arc<dyn SecretStore>,
+    /// The daemon's live permission choices, taken again from the file
+    /// after each change (`[authority]`, `[cli_agents.permissions]`).
+    permissions: Option<crate::permissions::Permissions>,
 }
 
 impl ConfigManagerTool {
     /// `secrets` keeps the provider keys a change stores as `"keychain"`.
     pub fn new(config: ConfigFile, secrets: Arc<dyn SecretStore>) -> Self {
-        Self { config, secrets }
+        Self {
+            config,
+            secrets,
+            permissions: None,
+        }
+    }
+
+    /// Keep `permissions` the file's after every change this tool makes.
+    pub fn with_permissions(mut self, permissions: crate::permissions::Permissions) -> Self {
+        self.permissions = Some(permissions);
+        self
+    }
+
+    /// Take the permission choices the file now holds: a change to
+    /// `[authority]` or `[cli_agents.permissions]` (or a restored backup)
+    /// takes effect at once, with no second copy.
+    async fn refresh_permissions(&self) {
+        if let Some(permissions) = &self.permissions {
+            match self.config.load_table().await {
+                Ok(table) => permissions.reload(&table),
+                Err(error) => {
+                    warn!(%error, "Could not read config.toml back for the permission level")
+                }
+            }
+        }
     }
 
     /// Check if a key path requires user approval to modify.
@@ -2127,7 +2154,9 @@ impl ConfigManagerTool {
     ) -> anyhow::Result<ConfigReply> {
         let mut args: ConfigArgs = serde_json::from_str(arguments)?;
         args.kernel_approved = facts.kernel_approved.is_some();
-        self.run_args(args).await
+        let reply = self.run_args(args).await;
+        self.refresh_permissions().await;
+        reply
     }
 
     /// Run one call for the owner from outside the agent loop (the owner's
@@ -2143,7 +2172,9 @@ impl ConfigManagerTool {
         let mut args: ConfigArgs =
             serde_json::from_value(arguments.clone()).map_err(|e| e.to_string())?;
         args.kernel_approved = approved;
-        match self.run_args(args).await {
+        let reply = self.run_args(args).await;
+        self.refresh_permissions().await;
+        match reply {
             Ok(ConfigReply {
                 status: Some(aidaemon_tools::semantics::ToolOutcomeStatus::Succeeded) | None,
                 text,

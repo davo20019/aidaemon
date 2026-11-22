@@ -1229,6 +1229,9 @@ fn server_samples() -> Vec<ServerFrame> {
                         readiness: AgentReadiness::NotUsable,
                         readiness_reason: "Codex isn't signed in on this machine.".into(),
                         readiness_fix: "Run `codex login` on this machine.".into(),
+                        same_as_aidaemon: true,
+                        within_level: vec![AgentMode::EveryCommand, AgentMode::Checked],
+                        capped: false,
                     },
                     CodingAgent {
                         name: "aider".into(),
@@ -1239,8 +1242,12 @@ fn server_samples() -> Vec<ServerFrame> {
                         readiness: AgentReadiness::Unchecked,
                         readiness_reason: String::new(),
                         readiness_fix: String::new(),
+                        same_as_aidaemon: false,
+                        within_level: Vec::new(),
+                        capped: false,
                     },
                 ],
+                permission_level: Some(PermissionLevel::Standard),
             },
         }),
         ack(CommandResult::SettingsChanged {

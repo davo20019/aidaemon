@@ -216,8 +216,18 @@ working_memory_cap = 50
 # [state.context_window.model_budgets]
 # local-model-name = 16384
 
+# [authority]
+# AIdaemon's permission level (Settings: AIdaemon permissions; /trustall
+# switches Full access on and off). It is the most AIdaemon, its sub-agents
+# and every coding agent may do:
+#   read_only   - only tools that read; anything else is refused
+#   full        - Standard: every tool, risky terminal commands asked first
+#   full_access - every terminal command runs without asking
+# owner_default = "full"        # read_only, full (Standard) or full_access
+
 [terminal]
-# Set to ["*"] to allow all commands (only if you trust the LLM fully)
+# Commands that run without asking. For every command, use AIdaemon's Full
+# access level instead ([authority] owner_default = "full_access").
 allowed_prefixes = ["ls", "cat", "head", "tail", "echo", "date", "whoami", "pwd", "find", "wc", "grep", "tree", "file", "stat", "uname", "df", "du", "ps", "which", "env", "printenv"]
 # Telegram /terminal Mini App URL (must be HTTPS).
 # Runtime override: AIDAEMON_TERMINAL_WEB_APP_URL
@@ -441,6 +451,12 @@ health_port = 8080
 # [cli_agents.tools.codex]
 # command = "codex"
 # args = ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
+#
+# # How much each coding agent may do on its own (Settings: Coding agent
+# # permissions), never more than AIdaemon's level allows. An agent not
+# # listed runs checked when it can be.
+# [cli_agents.permissions]
+# claude = "same"              # same (as AIdaemon), checked, every_command or full_access
 
 # [mcp.filesystem]
 # command = "npx"

@@ -73,6 +73,11 @@ pub struct CliAgentsConfig {
     pub max_output_chars: usize,
     #[serde(default)]
     pub tools: HashMap<String, CliToolConfig>,
+    /// `[cli_agents.permissions]`: the owner's mode per agent, by name
+    /// (`same`, `checked`, `every_command`, `full_access`), read through
+    /// [`crate::permissions`]; never more than AIdaemon's level allows.
+    #[serde(default)]
+    pub permissions: HashMap<String, String>,
 }
 
 impl Default for CliAgentsConfig {
@@ -82,6 +87,7 @@ impl Default for CliAgentsConfig {
             timeout_secs: default_cli_agents_timeout_secs(),
             max_output_chars: default_cli_agents_max_output_chars(),
             tools: HashMap::new(),
+            permissions: HashMap::new(),
         }
     }
 }
@@ -555,6 +561,9 @@ pub struct CliAgentTool {
     reengagements: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     /// The coding agents it knows: how each is launched in each mode.
     coding_agents: aidaemon_coding_agents::CodingAgents,
+    /// The owner's choice per agent and AIdaemon's level, which caps it:
+    /// the daemon's shared value once [`Self::set_permissions`] wires it.
+    permissions: Arc<OnceLock<crate::permissions::Permissions>>,
 }
 
 async fn list_backend_files(
@@ -1183,8 +1192,8 @@ impl CliAgentTool {
         if !crate::tools::agent_mode::readiness_of(name).is_usable() {
             return false;
         }
-        crate::tools::agent_mode::mode_of(&*self.state, name, &*agent)
-            .await
+        self.permissions()
+            .agent_mode(name, &*agent)
             .is_some_and(|mode| agent.can_run(mode, read_only, can_host))
     }
 
@@ -1394,6 +1403,7 @@ impl CliAgentTool {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents,
+            permissions: Arc::new(OnceLock::new()),
         };
 
         // Load dynamic agents from DB
@@ -1440,6 +1450,16 @@ impl CliAgentTool {
     }
 
     /// Set channel hub reference for immediate background completion delivery.
+    /// Follow the daemon's permission choices (shared with Settings). Set
+    /// once, at start; until then the defaults (Standard, no choices).
+    pub fn set_permissions(&self, permissions: crate::permissions::Permissions) {
+        let _ = self.permissions.set(permissions);
+    }
+
+    fn permissions(&self) -> crate::permissions::Permissions {
+        self.permissions.get().cloned().unwrap_or_default()
+    }
+
     pub fn with_context_facts(mut self, facts: Arc<dyn crate::tools::traits::FactStore>) -> Self {
         self.context_facts = Some(facts);
         self
@@ -2231,15 +2251,33 @@ impl CliAgentTool {
         // The owner's mode for this agent decides how it runs
         // (`agent_mode`). Only the dispatcher's path enforces it.
         use aidaemon_coding_agents::PermissionMode;
-        let mode = crate::tools::agent_mode::mode_of(&*self.state, tool_name, &*coding_agent).await;
+        let mode = self.permissions().agent_mode(tool_name, &*coding_agent);
         let Some(mode) = mode.or((!enforce_native_access).then_some(PermissionMode::Checked))
         else {
-            return Ok(format!(
-                "Blocked: {program} (`{tool_name}`) may not run delegated work: AIDaemon can't \
-                 check its actions, and the owner has not given it full access (Settings, \
-                 Coding agent permissions).",
-                program = coding_agent.name()
-            ));
+            let level = self.permissions().level();
+            let program = coding_agent.name();
+            return Ok(
+                if aidaemon_coding_agents::modes_within(
+                    &*coding_agent,
+                    crate::permissions::agent_cap(level),
+                )
+                .is_empty()
+                {
+                    format!(
+                        "Blocked: {program} (`{tool_name}`) may not run delegated work: none of \
+                         its permission modes fits under AIdaemon's own level ({}), and no \
+                         coding agent may do more than AIdaemon. The owner can raise the level \
+                         in Settings (AIdaemon permissions).",
+                        level.title()
+                    )
+                } else {
+                    format!(
+                        "Blocked: {program} (`{tool_name}`) may not run delegated work: AIDaemon \
+                         can't check its actions, and the owner has not given it full access \
+                         (Settings, Coding agent permissions)."
+                    )
+                },
+            );
         };
         // One that last said it cannot work is asked again first (it may
         // have been signed in since); still not usable, it is not started.
@@ -5821,6 +5859,7 @@ mod tests {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
+            permissions: Arc::new(OnceLock::new()),
         };
 
         (tool, db_file)
@@ -5864,6 +5903,7 @@ mod tests {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
+            permissions: Arc::new(OnceLock::new()),
         };
 
         (tool, db_file)
@@ -7435,6 +7475,7 @@ mod tests {
             timeout_secs: 30,
             max_output_chars: 10000,
             tools,
+            permissions: HashMap::new(),
         };
 
         let tool = CliAgentTool::discover(
@@ -7471,6 +7512,7 @@ mod tests {
             timeout_secs: 30,
             max_output_chars: 10000,
             tools,
+            permissions: HashMap::new(),
         };
 
         let tool = CliAgentTool::discover(
@@ -7525,6 +7567,7 @@ mod tests {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
+            permissions: Arc::new(OnceLock::new()),
         };
 
         // Run a command
@@ -7589,6 +7632,7 @@ mod tests {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
+            permissions: Arc::new(OnceLock::new()),
         };
 
         // Run a command that will exceed the short timeout and be moved to background,
@@ -7746,6 +7790,7 @@ mod tests {
             agent: OnceLock::new(),
             reengagements: Arc::new(Mutex::new(HashMap::new())),
             coding_agents: aidaemon_coding_agents::CodingAgents::builtin(),
+            permissions: Arc::new(OnceLock::new()),
         };
 
         let resp = tool

@@ -13,11 +13,20 @@ use aidaemon_tools::semantics::{
 };
 use aidaemon_tools::services::SettingsStore;
 
-/// How much the owner may do by default. Both levels act the same at the
-/// tool gate; `unrestricted` records, instead of checking, outward actions
-/// taken after the turn read untrusted content.
-/// Ordered `Full < Unrestricted`: a child takes the lower of its parent's
-/// and its own.
+/// How much the owner's turns may do: AIdaemon's permission level
+/// (`[authority] owner_default`, kept live by [`crate::permissions`]), or a
+/// chat's `/mode`.
+///
+/// - `read_only`: tools that only read; anything else is refused.
+/// - `full` (shown as Standard; `standard` is accepted): every tool, with
+///   risky terminal commands asked first.
+/// - `full_access`: as `full`, with every terminal command run unasked.
+/// - `unrestricted` (a chat's `/mode` only): as `full`, and outward actions
+///   taken after the turn read untrusted content are recorded instead of
+///   checked.
+///
+/// Ordered by what it allows: a child takes the lower of its parent's and
+/// its own.
 #[derive(
     Debug,
     serde::Deserialize,
@@ -30,11 +39,36 @@ use aidaemon_tools::services::SettingsStore;
     Ord,
     Default,
 )]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OwnerLevel {
+    ReadOnly,
     #[default]
+    #[serde(alias = "standard")]
     Full,
+    FullAccess,
     Unrestricted,
+}
+
+impl OwnerLevel {
+    /// Its name in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Full => "full",
+            Self::FullAccess => "full_access",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+
+    /// Its name in Settings.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read only",
+            Self::Full => "Standard",
+            Self::FullAccess => "Full access",
+            Self::Unrestricted => "Unrestricted",
+        }
+    }
 }
 
 /// Plain sub-agents one request may run at the same time, by default.
@@ -181,13 +215,23 @@ pub const READ_ONLY_MODE_NOTE: &str = "The owner put this chat in read-only mode
      the owner to run commands or make the change by hand. Tell them in plain words what you \
      could not do and that sending /mode full lets you do it.";
 
+/// The note for a refusal while AIdaemon's permission level is Read only.
+pub const READ_ONLY_LEVEL_NOTE: &str = "AIdaemon's permission level is Read only, so it can \
+     only read. Do not ask the owner to run commands or make the change by hand. Tell them in \
+     plain words what you could not do and that they can raise the level in Settings (AIdaemon \
+     permissions), or send /mode full to lift it for this chat.";
+
 /// The note for a refusal by `resolved`'s own authority, when what limits it
-/// is something the owner can lift: an owner's turn is read-only only
-/// because of the chat's mode.
+/// is something the owner can lift: an owner's turn is read-only because of
+/// the chat's mode or AIdaemon's level.
 pub fn own_limit_note(resolved: &ResolvedAuthority) -> Option<&'static str> {
-    (resolved.owner_level.is_some()
-        && resolved.authority.level == aidaemon_core::AccessLevel::ReadOnly)
-        .then_some(READ_ONLY_MODE_NOTE)
+    if resolved.authority.level != aidaemon_core::AccessLevel::ReadOnly {
+        return None;
+    }
+    match resolved.owner_level? {
+        OwnerLevel::ReadOnly => Some(READ_ONLY_LEVEL_NOTE),
+        _ => Some(READ_ONLY_MODE_NOTE),
+    }
 }
 
 /// The explicit facts authority is resolved from.
@@ -623,7 +667,9 @@ pub fn resolve_authority(facts: &AuthorityFacts<'_>) -> ResolvedAuthority {
                 Some(SessionMode::Unrestricted) => OwnerLevel::Unrestricted,
                 Some(SessionMode::ReadOnly) | None => facts.owner_default,
             });
-            if facts.session_mode == Some(SessionMode::ReadOnly) {
+            if facts.session_mode == Some(SessionMode::ReadOnly)
+                || owner_level == Some(OwnerLevel::ReadOnly)
+            {
                 return ResolvedAuthority {
                     authority: Authority::read_only(),
                     owner_level,

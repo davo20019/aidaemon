@@ -75,6 +75,14 @@ pub async fn run(
     )
     .await?;
 
+    // AIdaemon's permission level and the coding agents' choices: older
+    // shapes moved into config.toml once, then one live value for all.
+    let permissions = crate::startup::permissions::upgrade(&config_path, &pool).await?;
+    crate::startup::permissions::publish(
+        permissions.clone(),
+        crate::config::config_file(&config_path),
+    );
+
     let crate::providers::factory::ProviderRouterBundle {
         provider,
         primary_model: model,
@@ -174,6 +182,7 @@ pub async fn run(
             health_store: health_store.clone(),
             approval_capacity: queue_policy.approval_capacity,
             media_capacity: queue_policy.media_capacity,
+            permissions: permissions.clone(),
         },
     )
     .await?;
@@ -240,7 +249,8 @@ pub async fn run(
         specialists_dir.as_deref(),
     ));
 
-    let sdk_engine = crate::startup::engine::settings_from_config(&config, &*execution_backend);
+    let sdk_engine =
+        crate::startup::engine::settings_from_config(&config, &*execution_backend, permissions);
 
     let parts = crate::agent::AgentParts {
         dependencies: crate::agent::AgentDependencies {

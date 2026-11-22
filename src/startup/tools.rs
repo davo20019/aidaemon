@@ -80,6 +80,9 @@ pub struct ToolSetupDependencies {
     pub health_store: Option<Arc<HealthProbeStore>>,
     pub approval_capacity: usize,
     pub media_capacity: usize,
+    /// AIdaemon's permission level and the coding agents' choices, shared
+    /// with the engine and Settings.
+    pub permissions: aidaemon_runtime::permissions::Permissions,
 }
 
 /// Assemble all tools and their startup-only dependencies.
@@ -103,6 +106,7 @@ pub async fn setup_tools(
         health_store,
         approval_capacity,
         media_capacity,
+        permissions,
     } = dependencies;
     let BaseToolsBundle {
         mut tools,
@@ -128,7 +132,7 @@ pub async fn setup_tools(
 
     if let Some(terminal) = &terminal_tool {
         terminal.set_side_calls(side_calls);
-        crate::startup::trust_all::publish(terminal.clone());
+        terminal.set_permissions(permissions.clone());
     }
 
     let OptionalToolsOutcome {
@@ -147,6 +151,9 @@ pub async fn setup_tools(
         execution_backend.clone(),
     )
     .await?;
+    if let Some(cli) = &cli_agent_tool {
+        cli.set_permissions(permissions);
+    }
 
     let mcp_registry = crate::startup::mcp::setup_mcp_registry(
         config,
@@ -1303,13 +1310,19 @@ async fn build_base_tool(
             },
             terminal_tool: None,
         },
-        BaseToolId::ConfigManager => BuiltBaseTool {
-            tool: Arc::new(ConfigManagerTool::new(
+        BaseToolId::ConfigManager => {
+            let tool = ConfigManagerTool::new(
                 crate::config::config_file(config_path),
                 crate::config::shared_secret_store(),
-            )),
-            terminal_tool: None,
-        },
+            );
+            BuiltBaseTool {
+                tool: Arc::new(match crate::startup::permissions::daemon() {
+                    Some((permissions, _)) => tool.with_permissions(permissions.clone()),
+                    None => tool,
+                }),
+                terminal_tool: None,
+            }
+        }
         BaseToolId::WebFetch => BuiltBaseTool {
             tool: Arc::new(WebFetchTool::new()),
             terminal_tool: None,

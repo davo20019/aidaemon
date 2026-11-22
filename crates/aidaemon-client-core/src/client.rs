@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use aidaemon_client_protocol::{
     AgentMode, Approval, ApprovalDecision, AttachmentRef, AutomationChange, AutomationNotify,
     AutomationSummary, Command, CommandResult, Effort, ErrorCode, Event, LiveTurnState, MemoryItem,
-    MidRun, ModelChoice, ModelOptions, ProjectDir, ProjectFile, ProjectSummary, QueuedMessage,
-    SearchHit, ServerFrame, SessionChanges, SessionModel, Settings, SettingsChange,
+    MidRun, ModelChoice, ModelOptions, PermissionLevel, ProjectDir, ProjectFile, ProjectSummary,
+    QueuedMessage, SearchHit, ServerFrame, SessionChanges, SessionModel, Settings, SettingsChange,
     SettingsOutcome, SetupAction, SetupStep, SlashCommand, StreamAccept, SurfaceController,
     SurfaceInfo, SurfaceMode, SurfaceTransport, SystemStatus, TaskSummary, TurnState, TurnStatus,
 };
@@ -1302,13 +1302,55 @@ impl Client {
     pub fn set_agent_mode(&mut self, agent: &str, mode: AgentMode) {
         if let Read::Ready(settings) = &self.settings
             && let Some(known) = settings.coding_agents.iter().find(|a| a.name == agent)
-            && (known.mode == Some(mode) || !known.modes.contains(&mode))
         {
-            return;
+            // A daemon with a permission level lists what may be picked
+            // under it; the daemon refuses the rest anyway.
+            let pickable = if settings.permission_level.is_some() {
+                &known.within_level
+            } else {
+                &known.modes
+            };
+            if (known.mode == Some(mode) && !known.same_as_aidaemon) || !pickable.contains(&mode) {
+                return;
+            }
         }
         self.change_settings(SettingsChange::SetAgentMode {
             agent: agent.to_owned(),
             mode,
+        });
+    }
+
+    /// Set AIdaemon's permission level. Nothing is sent when it is already
+    /// that level or the daemon predates levels (its settings carry none);
+    /// a wider level is asked first by the daemon.
+    pub fn set_permission_level(&mut self, level: PermissionLevel) {
+        match &self.settings {
+            Read::Ready(settings) if settings.permission_level.is_some() => {
+                if settings.permission_level == Some(level) {
+                    return;
+                }
+            }
+            _ => return,
+        }
+        self.change_settings(SettingsChange::SetPermissionLevel { level });
+    }
+
+    /// Have coding agent `agent` follow AIdaemon's level ("same as
+    /// AIdaemon"). Nothing is sent to a daemon that predates levels.
+    pub fn set_agent_same(&mut self, agent: &str) {
+        let Read::Ready(settings) = &self.settings else {
+            return;
+        };
+        if settings.permission_level.is_none()
+            || settings
+                .coding_agents
+                .iter()
+                .any(|a| a.name == agent && a.same_as_aidaemon)
+        {
+            return;
+        }
+        self.change_settings(SettingsChange::AgentSameAsAidaemon {
+            agent: agent.to_owned(),
         });
     }
 

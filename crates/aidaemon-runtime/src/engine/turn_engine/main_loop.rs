@@ -792,7 +792,7 @@ impl TurnEngine<'_> {
         let mut resolved_authority =
             crate::authority::resolve_authority(&crate::authority::AuthorityFacts {
                 user_role,
-                owner_default: self.engine_settings().owner_default,
+                owner_default: self.engine_settings().permissions.level(),
                 session_mode,
                 workspace_grant: channel_ctx.active_workspace_grant(user_role),
                 bound_workspace: turn_context.bound_workspace.as_deref(),

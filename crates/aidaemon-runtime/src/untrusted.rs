@@ -20,12 +20,15 @@ use crate::authority::OwnerLevel;
 use crate::llm::gateway::SideCallGateway;
 use crate::llm::side_calls::SideCall;
 
-/// `Unrestricted` records egress after untrusted reads; every other level
-/// (and a guest's `None`) enforces the rule.
+/// `Unrestricted` records egress after untrusted reads; every other level,
+/// Full access included (it runs commands unasked, not unchecked egress),
+/// and a guest's `None` enforce the rule.
 pub fn untrusted_mode(owner_level: Option<OwnerLevel>) -> sdk::UntrustedMode {
     match owner_level {
         Some(OwnerLevel::Unrestricted) => sdk::UntrustedMode::MarkOnly,
-        Some(OwnerLevel::Full) | None => sdk::UntrustedMode::Enforce,
+        Some(OwnerLevel::ReadOnly | OwnerLevel::Full | OwnerLevel::FullAccess) | None => {
+            sdk::UntrustedMode::Enforce
+        }
     }
 }
 

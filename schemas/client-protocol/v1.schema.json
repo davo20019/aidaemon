@@ -1126,6 +1126,11 @@
     "CodingAgent": {
       "description": "A coding agent the daemon can hand work to (Claude Code, Codex, ...)\nand its permission mode (protocol 1.36).",
       "properties": {
+        "capped": {
+          "default": false,
+          "description": "The owner's pick is above the level, so it runs as `mode`, the most\nthe level allows (protocol 1.43).",
+          "type": "boolean"
+        },
         "mode": {
           "anyOf": [
             {
@@ -1167,6 +1172,18 @@
         "readiness_reason": {
           "description": "For one that is not usable: why, in its own words when it gave them,\nand how the owner fixes it (protocol 1.38).",
           "type": "string"
+        },
+        "same_as_aidaemon": {
+          "default": false,
+          "description": "The owner chose \"same as AIdaemon\": it follows the level\n(protocol 1.43).",
+          "type": "boolean"
+        },
+        "within_level": {
+          "description": "The modes the owner may pick for it under AIdaemon's level, safest\nfirst: never more than AIdaemon itself (protocol 1.43).",
+          "items": {
+            "$ref": "#/$defs/AgentMode"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -4898,6 +4915,26 @@
       ],
       "type": "string"
     },
+    "PermissionLevel": {
+      "description": "AIdaemon's permission level (protocol 1.43).",
+      "oneOf": [
+        {
+          "const": "read_only",
+          "description": "Only tools that read; anything else is refused.",
+          "type": "string"
+        },
+        {
+          "const": "standard",
+          "description": "Every tool, with risky terminal commands asked first.",
+          "type": "string"
+        },
+        {
+          "const": "full_access",
+          "description": "Every terminal command runs unasked (the owner's `/trustall`).",
+          "type": "string"
+        }
+      ]
+    },
     "ProjectDir": {
       "description": "One folder of a project's files.",
       "properties": {
@@ -6093,6 +6130,17 @@
           },
           "type": "array"
         },
+        "permission_level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PermissionLevel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "AIdaemon's own permission level: the most it, its sub-agents and\nevery coding agent may do (protocol 1.43). `None`: a daemon from\nbefore levels."
+        },
         "providers": {
           "description": "The providers a failover entry can name (protocol 1.6), so the\nclient offers a list rather than a preset id typed by hand.",
           "items": {
@@ -6478,6 +6526,40 @@
           },
           "required": [
             "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Set AIdaemon's permission level (protocol 1.43). A wider level asks\nfirst.",
+          "properties": {
+            "kind": {
+              "const": "set_permission_level",
+              "type": "string"
+            },
+            "level": {
+              "$ref": "#/$defs/PermissionLevel"
+            }
+          },
+          "required": [
+            "kind",
+            "level"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Have coding agent `agent` follow AIdaemon's level (protocol 1.43).",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "agent_same_as_aidaemon",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "agent"
           ],
           "type": "object"
         }
