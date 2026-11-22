@@ -1780,6 +1780,11 @@ impl Store {
         self.keyboard_ask.get()
     }
 
+    /// Whether a new conversation's keyboard is still to raise.
+    pub fn keyboard_wanted(&self) -> bool {
+        self.keyboard_wanted.get()
+    }
+
     /// Whether a new conversation's keyboard is still to raise; answering
     /// it here clears it.
     pub fn take_keyboard(&self) -> bool {

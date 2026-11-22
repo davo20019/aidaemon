@@ -1659,21 +1659,23 @@ fn composer(store: Store, session: Option<String>) -> View {
         });
     }
     // A new conversation the owner started: they asked to write, so the
-    // keyboard comes up on a phone too. A composer built for it answers at
-    // once; one already on screen (a new conversation started from a new
-    // conversation) when asked. A composer going away with another
-    // conversation leaves the ask to the new one.
-    let raise_now = session.is_none() && untracked(|| store.take_keyboard());
+    // keyboard comes up on a phone too. A composer built for it takes the
+    // focus as it appears; one already on screen (a new conversation
+    // started from a new one) when asked. A composer going away with
+    // another conversation leaves the ask to the new one.
+    let raise_now = session.is_none() && untracked(|| store.keyboard_wanted());
     {
         let own = session.clone();
-        let first = std::cell::Cell::new(true);
+        // Asks from before this composer was built are not its own.
+        let seen = untracked(|| store.keyboard_ask());
         effect(move || {
-            store.keyboard_ask();
-            if first.replace(false) {
+            if store.keyboard_ask() == seen {
                 return;
             }
             untracked(|| {
                 if store.selected_untracked() == own && store.take_keyboard() {
+                    // Not there yet (built in this same change): its
+                    // auto-focus takes it.
                     field.focus();
                 }
             });
