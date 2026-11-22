@@ -9,6 +9,52 @@ use crate::nodes::service::{AgentNodeConversationIngress, NodeService};
 use crate::nodes::{NodeStore, auth};
 use crate::traits::HubChannel;
 
+/// The running Node service and how long a Node may be silent and still
+/// count as online, for the apps' System area.
+static RUNNING: std::sync::OnceLock<(Arc<NodeService>, u64)> = std::sync::OnceLock::new();
+
+/// The owner's devices for the apps: name, kind, whether online, version
+/// and how each last reached the Gateway. Empty when Nodes are off.
+pub(crate) async fn infos(pool: &sqlx::SqlitePool) -> Vec<aidaemon_client_protocol::NodeInfo> {
+    use aidaemon_client_protocol::{NodeConnection, NodeInfo};
+    let Some((service, offline_after)) = RUNNING.get() else {
+        return Vec::new();
+    };
+    let rows = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
+        "SELECT node_id, display_name, kind, last_seen_at, last_firmware_version FROM nodes \
+         WHERE revoked_at IS NULL ORDER BY display_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let now = chrono::Utc::now();
+    rows.into_iter()
+        .map(|(node_id, name, kind, last_seen, firmware)| {
+            let seen = last_seen
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.with_timezone(&chrono::Utc));
+            let online = seen.is_some_and(|at| {
+                (now - at).num_seconds() <= i64::try_from(*offline_after).unwrap_or(i64::MAX)
+            });
+            let connection = service.link(&node_id).map(|link| match link {
+                crate::nodes::domain::NodeLink::LocalNetwork => NodeConnection::LocalNetwork,
+                crate::nodes::domain::NodeLink::Tunnel => NodeConnection::Tunnel,
+                crate::nodes::domain::NodeLink::Local => NodeConnection::Local,
+            });
+            NodeInfo {
+                node_id,
+                name,
+                kind,
+                online,
+                last_seen_ms: seen.and_then(|at| u64::try_from(at.timestamp_millis()).ok()),
+                firmware_version: firmware.filter(|v| !v.is_empty()),
+                connection,
+            }
+        })
+        .collect()
+}
+
 pub async fn start(
     config: &AppConfig,
     pool: sqlx::SqlitePool,
@@ -62,6 +108,10 @@ pub async fn start(
         });
     }
     let service = Arc::new(service_value);
+    let _ = RUNNING.set((
+        service.clone(),
+        config.nodes.monitoring.default_offline_after_seconds,
+    ));
     let ingress = Arc::new(AgentNodeConversationIngress::new(agent));
     hub.register_channel(Arc::new(NodeChannel::new(store)) as Arc<dyn HubChannel>)
         .await;

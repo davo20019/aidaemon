@@ -4835,6 +4835,77 @@
       ],
       "type": "object"
     },
+    "NodeConnection": {
+      "description": "How a device reaches the daemon.",
+      "oneOf": [
+        {
+          "const": "local_network",
+          "description": "Straight to this computer over the local network.",
+          "type": "string"
+        },
+        {
+          "const": "tunnel",
+          "description": "Through a tunnel (Cloudflare).",
+          "type": "string"
+        },
+        {
+          "const": "local",
+          "description": "Through a USB relay or a program on this computer.",
+          "type": "string"
+        }
+      ]
+    },
+    "NodeInfo": {
+      "description": "One of the owner's devices (a Node), as the System area shows it.",
+      "properties": {
+        "connection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeConnection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How its latest heartbeat arrived; `None` before one since the\ndaemon started."
+        },
+        "firmware_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "What it is (`k10`, `simulator`, ...).",
+          "type": "string"
+        },
+        "last_seen_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "online": {
+          "description": "It sent a heartbeat recently.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "node_id",
+        "name",
+        "kind",
+        "online"
+      ],
+      "type": "object"
+    },
     "OfferRequest": {
       "description": "The owner's offer to pair a device (owner only:\n`POST /client/v1/pairing/offers`).",
       "properties": {
@@ -7636,6 +7707,13 @@
             }
           ],
           "description": "Model calls over the last 24 hours; `None` when not recorded."
+        },
+        "nodes": {
+          "description": "The owner's devices (Nodes: a K10 board, a sensor) and how each\nreaches the daemon (protocol 1.44).",
+          "items": {
+            "$ref": "#/$defs/NodeInfo"
+          },
+          "type": "array"
         },
         "queues": {
           "default": [],

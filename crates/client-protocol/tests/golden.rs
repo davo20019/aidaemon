@@ -1053,6 +1053,15 @@ fn server_samples() -> Vec<ServerFrame> {
                     finished_ms: Some(1_767_225_120_000),
                     session_id: Some("telegram:synthetic-user-1".into()),
                 }],
+                nodes: vec![NodeInfo {
+                    node_id: "node_synthetic_1".into(),
+                    name: "Synthetic Companion".into(),
+                    kind: "k10".into(),
+                    online: true,
+                    last_seen_ms: Some(1_767_225_300_000),
+                    firmware_version: Some("0.8.12".into()),
+                    connection: Some(NodeConnection::LocalNetwork),
+                }],
             },
         }),
         ack(CommandResult::SearchResults {

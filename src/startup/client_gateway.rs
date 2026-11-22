@@ -333,6 +333,7 @@ impl SystemSources {
             queues,
             checks,
             runs,
+            nodes: crate::startup::nodes::infos(&self.pool).await,
         }
     }
 }

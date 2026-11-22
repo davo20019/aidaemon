@@ -1713,3 +1713,26 @@ fn pair_a_phone_answers_the_press() -> Result<(), String> {
     answered?;
     Ok(())
 }
+
+/// The System page lists the owner's devices with how each reaches the
+/// daemon, from the protocol's own golden reply.
+#[test]
+fn the_system_page_lists_devices_and_how_they_connect() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_desktop();
+    app.wait_for("What can I help you with?")?;
+    feed([Update::Connected]);
+    let before = sent("get_system");
+    app.press("System")?;
+    let id = wait_sent_new("get_system", before)?;
+    let fixture =
+        include_str!("../../../crates/client-protocol/tests/fixtures/server_ack_system.golden");
+    let mut reply: serde_json::Value = serde_json::from_str(fixture).map_err(|e| e.to_string())?;
+    reply["request_id"] = serde_json::Value::String(id);
+    feed([frame(&reply.to_string())]);
+    app.wait_for("Devices")?;
+    app.wait_for("Synthetic Companion")?;
+    app.wait_for("text:/Local network · direct/")?;
+    app.wait_for("Online")?;
+    Ok(())
+}

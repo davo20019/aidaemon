@@ -686,6 +686,26 @@ impl ClientHost for Host {
                     session_id: None,
                 },
             ],
+            nodes: vec![
+                aidaemon_client_protocol::NodeInfo {
+                    node_id: "node_demo_1".into(),
+                    name: "Kitchen companion".into(),
+                    kind: "k10".into(),
+                    online: true,
+                    last_seen_ms: Some(now - 20_000),
+                    firmware_version: Some("0.8.12".into()),
+                    connection: Some(aidaemon_client_protocol::NodeConnection::LocalNetwork),
+                },
+                aidaemon_client_protocol::NodeInfo {
+                    node_id: "node_demo_2".into(),
+                    name: "Garage sensor".into(),
+                    kind: "sensor".into(),
+                    online: false,
+                    last_seen_ms: Some(now - 3 * 3_600_000),
+                    firmware_version: None,
+                    connection: Some(aidaemon_client_protocol::NodeConnection::Tunnel),
+                },
+            ],
         })
     }
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {

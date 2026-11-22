@@ -34,6 +34,17 @@
         "p95_ms": 4800,
         "total": 14
       },
+      "nodes": [
+        {
+          "connection": "local_network",
+          "firmware_version": "0.8.12",
+          "kind": "k10",
+          "last_seen_ms": 1767225300000,
+          "name": "Synthetic Companion",
+          "node_id": "node_synthetic_1",
+          "online": true
+        }
+      ],
       "queues": [
         {
           "capacity": 64,

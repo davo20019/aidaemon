@@ -314,6 +314,7 @@ fn bearer(headers: &HeaderMap) -> Result<&str, GatewayError> {
 
 async fn heartbeat(
     State(state): State<NodeGatewayState>,
+    local_network: Option<axum::Extension<crate::lan::ArrivedOnLocalNetwork>>,
     headers: HeaderMap,
     Json(request): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, GatewayError> {
@@ -322,6 +323,16 @@ async fn heartbeat(
         .authenticate(bearer(&headers)?)
         .await
         .map_err(GatewayError::unauthorized)?;
+    // For the owner to see only, never identity or policy: Cloudflare's edge
+    // adds `cf-ray` to every request it forwards (an HTTP header name).
+    let link = if local_network.is_some() {
+        crate::domain::NodeLink::LocalNetwork
+    } else if headers.contains_key("cf-ray") {
+        crate::domain::NodeLink::Tunnel
+    } else {
+        crate::domain::NodeLink::Local
+    };
+    state.service.note_link(&context.node_id, link);
     state
         .rate_limiter
         .consume(
@@ -869,6 +880,7 @@ mod tests {
             .await
             .unwrap();
         let sessions: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let state_service = service.clone();
         let state = NodeGatewayState {
             service,
             ingress: Arc::new(EchoIngress),
@@ -889,10 +901,11 @@ mod tests {
         });
 
         let mut simulator = NodeSimulator::new(format!("http://{address}")).unwrap();
-        simulator
+        let node_id = simulator
             .enroll(&offer.offer_id, &offer.offer_secret)
             .await
-            .unwrap();
+            .unwrap()
+            .node_id;
         simulator.open_session().await.unwrap();
         let trust = CapabilityObservation {
             capability_id: crate::service::GATEWAY_TRUST_CAPABILITY.to_string(),
@@ -915,9 +928,17 @@ mod tests {
         let ca = aidaemon_node_sdk_trust(&offered, &lan).expect("a CA for the local origin");
 
         // The Node carries on over the local network, its session intact.
+        assert_eq!(
+            state_service.link(&node_id),
+            Some(crate::domain::NodeLink::Local)
+        );
         simulator.switch_gateway(&lan, Some(ca)).unwrap();
         let over_lan = simulator.heartbeat(vec![trust]).await.unwrap();
         assert!(over_lan.accepted);
+        assert_eq!(
+            state_service.link(&node_id),
+            Some(crate::domain::NodeLink::LocalNetwork)
+        );
 
         // Without the CA, the listener is not trusted.
         simulator.switch_gateway(&lan, None).unwrap();

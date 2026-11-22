@@ -149,6 +149,11 @@ pub fn local_address() -> Option<IpAddr> {
     (!address.is_loopback() && !address.is_unspecified()).then_some(address)
 }
 
+/// Marks requests that came through the local-network listener (a request
+/// extension), so the Gateway can say how each Node is connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrivedOnLocalNetwork;
+
 /// Where the local-network listener is, for the Nodes: its origin now and
 /// the CA that vouches for it.
 pub struct LanEndpoint {
@@ -212,6 +217,7 @@ pub async fn serve_on(
     address: IpAddr,
 ) -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
+    let app = app.layer(axum::Extension(ArrivedOnLocalNetwork));
     let current = Arc::new(RwLock::new((address, server_config(&authority, address)?)));
     tracing::info!(origin = %origin(address, port), "Node Gateway listening on the local network");
     {

@@ -4,7 +4,7 @@
 //! on the owner's behalf is the Automations page); and the chat bots, each with the project its direct messages
 //! go to. Read on open, every 30 seconds while open, and on Refresh.
 
-use aidaemon_client_protocol::{CheckStatus, GoalRunInfo, SystemStatus};
+use aidaemon_client_protocol::{CheckStatus, GoalRunInfo, NodeConnection, SystemStatus};
 use nsh_core::prelude::*;
 
 use crate::store::{Store, SystemRead, now_ms};
@@ -91,6 +91,7 @@ fn body(store: Store, read: SystemRead) -> View {
             .child(attention(&status))
             .child(overview(&status))
             .child(bots(store))
+            .child(devices(&status))
             .child(runs(store, &status))
             .child(usage(&status))
             .child(jobs(&status))
@@ -745,6 +746,69 @@ fn jobs(s: &SystemStatus) -> View {
         ));
     }
     section("Background jobs").child(list(rows))
+}
+
+/// The owner's devices (Nodes): online or not, and how each reaches the
+/// daemon, which says who can see its traffic.
+fn devices(s: &SystemStatus) -> View {
+    if s.nodes.is_empty() {
+        return view();
+    }
+    let now = now_ms();
+    let mut rows = Vec::new();
+    for node in &s.nodes {
+        let (label, tone) = if node.online {
+            ("Online", Tone::Success)
+        } else {
+            ("Offline", Tone::Neutral)
+        };
+        let connection = node.connection.map(|connection| match connection {
+            NodeConnection::LocalNetwork => "Local network · direct",
+            NodeConnection::Tunnel => "Tunnel (HTTPS)",
+            NodeConnection::Local => "USB or this computer",
+            NodeConnection::Unknown => "Connected",
+        });
+        let detail = [
+            Some(node.kind.clone()),
+            connection.map(str::to_owned),
+            node.firmware_version
+                .as_ref()
+                .map(|v| format!("firmware {v}")),
+            node.last_seen_ms
+                .filter(|_| !node.online)
+                .map(|at| format!("seen {}", time::ago(at, now))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        rows.push(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(node.name.clone())
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::body())),
+                        )
+                        .child(
+                            text(detail)
+                                .number_of_lines(1)
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                        ),
+                )
+                .child(badge(label, tone)),
+        );
+    }
+    section("Devices").child(list(rows))
 }
 
 fn checks(s: &SystemStatus) -> View {

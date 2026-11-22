@@ -7,6 +7,19 @@ pub const NODE_PROTOCOL_MAJOR: u16 = aidaemon_node_protocol::NODE_PROTOCOL_MAJOR
 pub const CHILD_COMPANION_POLICY: &str = "child_companion_v1";
 pub const NODE_CHANNEL_NAME: &str = "node";
 
+/// How a Node's latest heartbeat reached the Gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeLink {
+    /// The Gateway's own listener on the local network.
+    LocalNetwork,
+    /// A Cloudflare tunnel (its edge marks each request).
+    Tunnel,
+    /// The loopback Gateway with no tunnel mark: a USB relay or a program on
+    /// this computer.
+    Local,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeRecord {
     pub node_id: String,

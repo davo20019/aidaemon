@@ -38,7 +38,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 43;
+pub const PROTOCOL_MINOR: u16 = 44;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2955,6 +2955,44 @@ pub struct SystemStatus {
     /// 1.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<GoalRunInfo>,
+    /// The owner's devices (Nodes: a K10 board, a sensor) and how each
+    /// reaches the daemon (protocol 1.44).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<NodeInfo>,
+}
+
+/// One of the owner's devices (a Node), as the System area shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub name: String,
+    /// What it is (`k10`, `simulator`, ...).
+    pub kind: String,
+    /// It sent a heartbeat recently.
+    pub online: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_version: Option<String>,
+    /// How its latest heartbeat arrived; `None` before one since the
+    /// daemon started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<NodeConnection>,
+}
+
+/// How a device reaches the daemon.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeConnection {
+    /// Straight to this computer over the local network.
+    LocalNetwork,
+    /// Through a tunnel (Cloudflare).
+    Tunnel,
+    /// Through a USB relay or a program on this computer.
+    Local,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// One run of a background goal, judged by what it left behind.

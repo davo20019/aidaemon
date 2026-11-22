@@ -115,6 +115,9 @@ pub struct NodeService {
     /// The Gateway's listener on the local network, when it runs
     /// (`[nodes.gateway.lan]`): offered first to Nodes that can trust it.
     lan: Option<Arc<super::lan::LanEndpoint>>,
+    /// How each Node's latest heartbeat arrived, by Node id (in memory: a
+    /// restart forgets it until the next heartbeat).
+    links: Arc<std::sync::Mutex<std::collections::HashMap<String, super::domain::NodeLink>>>,
 }
 
 /// The capability a Node observes when it verifies an origin against a CA
@@ -132,7 +135,18 @@ impl NodeService {
             firmware_release: None,
             endpoints,
             lan: None,
+            links: Arc::default(),
         }
+    }
+    /// Note how `node_id`'s heartbeat arrived.
+    pub fn note_link(&self, node_id: &str, link: super::domain::NodeLink) {
+        if let Ok(mut links) = self.links.lock() {
+            links.insert(node_id.to_string(), link);
+        }
+    }
+    /// How `node_id`'s latest heartbeat arrived, since this daemon started.
+    pub fn link(&self, node_id: &str) -> Option<super::domain::NodeLink> {
+        self.links.lock().ok()?.get(node_id).copied()
     }
     /// Offer the Gateway's local-network listener to Nodes that can trust
     /// it.
