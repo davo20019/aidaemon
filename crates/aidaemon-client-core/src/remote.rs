@@ -122,8 +122,8 @@ pub(crate) async fn connection(
     {
         return Ok(conn.clone());
     }
-    // The daemon's own relays when it runs them: n0 never learns which
-    // devices reach it.
+    // The daemon's own relays when it runs them: no other relay learns
+    // which devices reach it.
     let relays = url.dial_relays();
     let client = {
         let mut clients = clients().lock().await;

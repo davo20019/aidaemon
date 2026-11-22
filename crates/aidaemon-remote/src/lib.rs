@@ -48,11 +48,18 @@ const HOST: &str = "aidaemon.remote";
 /// One stream as a byte pipe (both halves).
 pub type RemoteStream = tokio::io::Join<RecvStream, SendStream>;
 
+/// The aidaemon project's relays: `iroh-relay` servers with QUIC address
+/// discovery on its default port.
+pub const AIDAEMON_RELAYS: &[&str] = &["https://relay.aidaemon.ai/"];
+
 /// Which relays an endpoint uses to be found and to fall back on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Relays {
-    /// n0's public relays.
+    /// The aidaemon project's relays ([`AIDAEMON_RELAYS`]).
     #[default]
+    Aidaemon,
+    /// n0's public relays, which daemons used before the project ran its
+    /// own; a device paired then still names one in its address.
     N0,
     /// Your own `iroh-relay` servers.
     Custom(Vec<RelayUrl>),
@@ -63,6 +70,7 @@ pub enum Relays {
 impl Relays {
     fn mode(&self) -> RelayMode {
         match self {
+            Self::Aidaemon => RelayMode::custom(aidaemon_relays()),
             Self::N0 => RelayMode::Default,
             Self::Custom(urls) => RelayMode::custom(urls.iter().cloned()),
             Self::Disabled => RelayMode::Disabled,
@@ -73,6 +81,12 @@ impl Relays {
     pub fn urls(&self) -> Vec<RelayUrl> {
         self.mode().relay_map().urls()
     }
+}
+
+fn aidaemon_relays() -> impl Iterator<Item = RelayUrl> {
+    AIDAEMON_RELAYS
+        .iter()
+        .map(|url| url.parse().expect("AIDAEMON_RELAYS are valid relay URLs"))
 }
 
 /// A daemon's address as clients keep it: `iroh://<endpoint-id>`, with its
@@ -111,20 +125,26 @@ impl RemoteUrl {
         Some(Self { id, relay })
     }
 
-    /// The relays a client reaching this daemon should use: n0's when the
-    /// daemon's home relay is one of them or unknown, else only the
-    /// daemon's own, so a daemon on self-hosted relays never puts the
-    /// devices that reach it on n0's.
+    /// The relays a client reaching this daemon should use: the project's
+    /// when the daemon's home relay is one of them or unknown; for an
+    /// address from before the project ran its own (an n0 relay), the
+    /// project's and n0's, since that daemon may have moved or not; else
+    /// only the daemon's own, so a daemon on self-hosted relays never puts
+    /// the devices that reach it on anyone else's.
     pub fn dial_relays(&self) -> Relays {
         fn host(url: &RelayUrl) -> Option<String> {
             url.host_str()
                 .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
         }
+        let among =
+            |set: &Relays, relay: &RelayUrl| set.urls().iter().any(|u| host(u) == host(relay));
         match &self.relay {
-            Some(relay) if !Relays::N0.urls().iter().any(|n0| host(n0) == host(relay)) => {
-                Relays::Custom(vec![relay.clone()])
+            None => Relays::Aidaemon,
+            Some(relay) if among(&Relays::Aidaemon, relay) => Relays::Aidaemon,
+            Some(relay) if among(&Relays::N0, relay) => {
+                Relays::Custom(aidaemon_relays().chain(Relays::N0.urls()).collect())
             }
-            _ => Relays::N0,
+            Some(relay) => Relays::Custom(vec![relay.clone()]),
         }
     }
 
@@ -355,14 +375,33 @@ mod tests {
             other => panic!("expected the daemon's own relay, got {other:?}"),
         }
         let bare = RemoteUrl::parse(&format!("iroh://{id}")).unwrap();
-        assert_eq!(bare.dial_relays(), Relays::N0);
+        assert_eq!(bare.dial_relays(), Relays::Aidaemon);
+        let ours = RemoteUrl::parse(&format!("iroh://{id}@relay.aidaemon.ai")).unwrap();
+        assert_eq!(ours.dial_relays(), Relays::Aidaemon);
+    }
+
+    #[test]
+    fn an_address_from_n0_days_dials_the_projects_relays_and_n0s() {
+        let id = SecretKey::generate().public();
         let n0 = Relays::N0.urls()[0].clone();
         let on_n0 = RemoteUrl::parse(&format!(
             "iroh://{id}@{}",
             n0.host_str().unwrap().trim_end_matches('.')
         ))
         .unwrap();
-        assert_eq!(on_n0.dial_relays(), Relays::N0);
+        let urls = on_n0.dial_relays().urls();
+        assert!(
+            urls.iter()
+                .any(|u| u.host_str() == Some("relay.aidaemon.ai"))
+        );
+        assert!(Relays::N0.urls().iter().all(|u| urls.contains(u)));
+    }
+
+    #[test]
+    fn the_default_relays_are_the_projects() {
+        let urls = Relays::default().urls();
+        assert_eq!(urls.len(), AIDAEMON_RELAYS.len());
+        assert_eq!(urls[0].host_str(), Some("relay.aidaemon.ai"));
     }
 
     #[test]

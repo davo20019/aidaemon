@@ -55,7 +55,8 @@ pub struct RemoteAccessConfig {
     /// (which sees its address, never its traffic). `false` turns it off.
     #[serde(default = "default_remote_enabled")]
     pub enabled: bool,
-    /// Relay URLs (your own `iroh-relay`). Empty: n0's public relays.
+    /// Relay URLs (your own `iroh-relay`). Empty: the aidaemon project's
+    /// relays (`relay.aidaemon.ai`).
     #[serde(default)]
     pub relays: Vec<String>,
 }

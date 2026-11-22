@@ -1343,12 +1343,12 @@ async fn start_exposed(gateway: Arc<ClientGateway>) {
 static REMOTE: std::sync::OnceLock<Arc<aidaemon_remote::RemoteListener>> =
     std::sync::OnceLock::new();
 
-/// The relays `[client_gateway.remote] relays` names; none: n0's public
-/// relays.
+/// The relays `[client_gateway.remote] relays` names; none: the aidaemon
+/// project's relays.
 #[cfg(feature = "remote")]
 fn remote_relays(config: &ClientGatewayConfig) -> anyhow::Result<aidaemon_remote::Relays> {
     if config.remote.relays.is_empty() {
-        return Ok(aidaemon_remote::Relays::N0);
+        return Ok(aidaemon_remote::Relays::Aidaemon);
     }
     let urls = config
         .remote

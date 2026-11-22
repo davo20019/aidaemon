@@ -15,7 +15,7 @@ or domain.
   `Access` only narrows which keys may open a connection, and handlers see
   the peer's key as a `RemotePeer` request extension.
 
-Relays default to n0's public relays; `Relays::Custom` points at your own
-`iroh-relay`.
+Relays default to the aidaemon project's (`relay.aidaemon.ai`); `Relays::Custom`
+points at your own `iroh-relay`.
 
 Implementation crate of the aidaemon SDK; no stability promise.
