@@ -330,30 +330,13 @@ impl GrantCache {
         signer: &impl Signer,
         now_ms: u64,
     ) -> Result<String, SignInError> {
-        self.token_signed_dialing(http, device, signer, None, now_ms)
-            .await
-    }
-
-    /// [`GrantCache::token_signed`] for a device that dials the daemon's
-    /// peer-to-peer address with endpoint key `endpoint` (hex), so that
-    /// address admits it from now on (a browser keeps that key apart from
-    /// its signing key, which it cannot read).
-    pub async fn token_signed_dialing(
-        &mut self,
-        http: &impl Http,
-        device: &StoredDevice,
-        signer: &impl Signer,
-        endpoint: Option<String>,
-        now_ms: u64,
-    ) -> Result<String, SignInError> {
         let margin = u64::try_from(RENEW_BEFORE.as_millis()).unwrap_or(60_000);
         if let Some(grant) = &self.grant
             && grant.expires_at_ms > now_ms.saturating_add(margin)
         {
             return Ok(grant.access_token.clone());
         }
-        let grant =
-            sign_in_from(http, &device.gateway, &device.device_id, signer, endpoint).await?;
+        let grant = sign_in_as(http, &device.gateway, &device.device_id, signer).await?;
         let token = grant.access_token.clone();
         self.grant = Some(grant);
         Ok(token)

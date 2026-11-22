@@ -1,0 +1,31 @@
+[package]
+name = "aidaemon-app-remote"
+description = "The web app's iroh connection: on a site of its own, the page reaches the daemon by key through a relay, with its own wasm module so a page the daemon serves loads none of it"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, like the app's: built only for the browser.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aidaemon-client-core = { path = "../../../crates/aidaemon-client-core", default-features = false, features = ["dial"] }
+bytes = "1"
+futures = "0.3"
+http = "1"
+http-body-util = "0.1"
+js-sys = "0.3"
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+
+# iroh asks for getrandom's Web Crypto backend, which build.sh selects with
+# `--cfg getrandom_backend="wasm_js"`. The app's own build forces a custom
+# one (nsh), which getrandom 0.4 cannot combine with iroh's: hence a module
+# of its own.
+# ring (TLS) draws on getrandom 0.2, whose browser backend is a feature.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }

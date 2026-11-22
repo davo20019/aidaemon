@@ -23,6 +23,8 @@ use futures::lock::Mutex;
 use http_body_util::Full;
 
 pub use aidaemon_remote::RemoteUrl;
+/// A message on a [`websocket`].
+pub use aidaemon_remote::tokio_tungstenite::tungstenite::Message;
 
 use crate::keystore::StoredDevice;
 use crate::signin::{Http, HttpReply, SignInError};
@@ -244,6 +246,24 @@ impl Http for RemoteHttp {
     }
 }
 
+/// Send `request` (its URI a path, e.g. `/client/v1/files/…`) to the
+/// daemon at `gateway` (`iroh://…`) as `dialer`, and read the whole reply.
+pub async fn send(
+    gateway: &str,
+    dialer: &Dialer,
+    request: http::Request<Full<Bytes>>,
+) -> Result<http::Response<Bytes>, SignInError> {
+    let daemon = parse(gateway)?;
+    let conn = connection(&daemon, dialer).await?;
+    match conn.send(request).await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            forget(&daemon, dialer).await;
+            Err(SignInError::Unreachable(format!("{error:#}")))
+        }
+    }
+}
+
 /// Open the client socket at `url` (`iroh://…/client/v1/ws`) with `token`.
 /// A refused token is [`SignInError::Refused`].
 pub async fn websocket(
@@ -251,8 +271,6 @@ pub async fn websocket(
     token: &str,
     dialer: &Dialer,
 ) -> Result<WebSocketStream<RemoteStream>, SignInError> {
-    let daemon = parse(url)?;
-    let conn = connection(&daemon, dialer).await?;
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::AUTHORIZATION,
@@ -260,7 +278,19 @@ pub async fn websocket(
             .parse()
             .map_err(|_| SignInError::Failed("the token is not a header value".into()))?,
     );
-    match conn.websocket(path_of(url), &headers).await {
+    websocket_with(url, &headers, dialer).await
+}
+
+/// Open a WebSocket at `url` (`iroh://…/client/v1/…`) with `headers`; a
+/// 401 is [`SignInError::Refused`].
+pub async fn websocket_with(
+    url: &str,
+    headers: &http::HeaderMap,
+    dialer: &Dialer,
+) -> Result<WebSocketStream<RemoteStream>, SignInError> {
+    let daemon = parse(url)?;
+    let conn = connection(&daemon, dialer).await?;
+    match conn.websocket(path_of(url), headers).await {
         Ok(socket) => Ok(socket),
         Err(WebSocketError::Handshake(tokio_tungstenite::tungstenite::Error::Http(response)))
             if response.status().as_u16() == 401 =>

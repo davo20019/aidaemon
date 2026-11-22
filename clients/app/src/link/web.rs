@@ -1,6 +1,11 @@
 //! The browser: the shared [`LinkMachine`] over the page's WebSocket, signed
-//! in with the device key the page keeps (WebCrypto, non-extractable). The
-//! app is served by the gateway itself, so every request is same-origin.
+//! in with the device key the page keeps (WebCrypto, non-extractable).
+//!
+//! Served by the gateway itself, every request is same-origin. On a site of
+//! its own (the project's web app), a pairing link names the daemon's
+//! `iroh://` address: the page then addresses the daemon at
+//! `<site>/_daemon` ([`base`]), and `js/browser.js` carries those requests
+//! and sockets over iroh through a relay.
 
 use std::time::Duration;
 
@@ -32,6 +37,14 @@ extern "C" {
     fn pairing_link() -> Vec<String>;
     #[wasm_bindgen(js_name = forgetPairingLink)]
     fn forget_pairing_link();
+    #[wasm_bindgen(js_name = remoteAddress)]
+    fn remote_address() -> String;
+    #[wasm_bindgen(js_name = keepRemoteGateway)]
+    fn keep_remote_gateway(url: &str);
+    #[wasm_bindgen(js_name = daemonBase)]
+    fn daemon_base() -> String;
+    #[wasm_bindgen(js_name = remoteReady)]
+    fn remote_ready() -> js_sys::Promise;
     #[wasm_bindgen(js_name = takePicture)]
     fn take_picture_js(max_dimension: u32) -> js_sys::Promise;
     #[wasm_bindgen(js_name = downloadUrl)]
@@ -102,7 +115,7 @@ extern "C" {
 
     type Socket;
     #[wasm_bindgen(constructor)]
-    fn new(url: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
+    fn new(url: &str, token: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
     #[wasm_bindgen(method)]
     fn send(this: &Socket, text: &str);
     #[wasm_bindgen(method)]
@@ -112,9 +125,39 @@ extern "C" {
 /// A picture taken with the device's camera: its JPEG bytes, scaled to fit
 /// `max_dimension`; `None` when nothing was taken.
 /// Save a same-origin file under `name` (the browser's download).
-/// How this browser reaches the daemon: its page's own origin.
+/// Whether this page reaches its daemon over iroh (it is on a site of its
+/// own and a pairing link, or a past pairing, named the daemon's address).
+fn over_iroh() -> bool {
+    aidaemon_client_core::machine::transport_of(&remote_address())
+        == aidaemon_client_core::machine::Transport::PeerToPeer
+}
+
+/// Where the app addresses its daemon: the page's own origin, or over iroh
+/// the base the page carries there.
+fn base() -> String {
+    if over_iroh() { daemon_base() } else { origin() }
+}
+
+/// Over iroh, wait for the page's service worker, which carries what the
+/// app addresses by URL; `Err` when this browser cannot.
+async fn ready() -> Result<(), String> {
+    if !over_iroh() {
+        return Ok(());
+    }
+    JsFuture::from(remote_ready())
+        .await
+        .map(|_| ())
+        .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
+}
+
+/// How this browser reaches the daemon: its page's own origin, or a relay
+/// (a browser cannot take iroh's direct path).
 pub fn transport() -> aidaemon_client_core::machine::Transport {
-    aidaemon_client_core::machine::transport_of(&origin())
+    if over_iroh() {
+        aidaemon_client_core::machine::Transport::Relay
+    } else {
+        aidaemon_client_core::machine::transport_of(&origin())
+    }
 }
 
 pub fn download(url: &str, name: &str) {
@@ -342,8 +385,9 @@ pub async fn pair(
     name: String,
     fingerprint: Option<String>,
 ) -> Result<(), String> {
+    ready().await?;
     let request = PairRequest {
-        gateway: origin(),
+        gateway: base(),
         offer_id: offer,
         code,
         device_name: name,
@@ -355,6 +399,9 @@ pub async fn pair(
         .await
         .map_err(|e| e.to_string())?;
     text_of(keep_key(&id)).await?;
+    if over_iroh() {
+        keep_remote_gateway(&remote_address());
+    }
     forget_pairing_link();
     // The link (owned by the root, waiting for a key) picks it up.
     store.update(Update::Connecting);
@@ -366,6 +413,8 @@ enum Heard {
     Open,
     Message(String),
     Close(String),
+    /// Over iroh: the daemon refused the token (in the upgrade).
+    Refused(String),
 }
 
 /// The paired device's id, once there is one: the pairing screen saves it.
@@ -391,7 +440,7 @@ pub async fn unpair() {
 pub fn start(store: Store) {
     // Files' links are on this page's own origin; opening one needs it
     // whole.
-    store.set_gateway_base(origin());
+    store.set_gateway_base(base());
     spawn(async move {
         let mut device = paired_device(store).await;
         let mut machine = LinkMachine::new(
@@ -419,12 +468,27 @@ pub fn start(store: Store) {
         });
         on_wake(&wake);
         wake.forget();
-        let base = origin();
-        let url = aidaemon_client_core::machine::socket_url(&base);
         let mut grant = GrantCache::default();
         loop {
+            // Paired over iroh now, if a pairing link said so.
+            let base = base();
+            store.set_gateway_base(base.clone());
+            let iroh = over_iroh();
+            // Over iroh the base has a path, which `socket_url` drops.
+            let url = if iroh {
+                format!("{}/client/v1/ws", base.replacen("http", "ws", 1))
+            } else {
+                aidaemon_client_core::machine::socket_url(&base)
+            };
             machine.set_seen(page_visible());
             store.update(Update::Connecting);
+            if let Err(why) = ready().await {
+                let d = machine.failed(DropKind::DaemonNotRunning, why);
+                let wait = d.retry_in;
+                store.update(Update::Disconnected(d));
+                wait_or_wake(&mut machine, wait, &mut wakes).await;
+                continue;
+            }
             let token = match grant_token(&mut grant, &base, &device).await {
                 Ok(token) => token,
                 Err((DropKind::Unauthorized, _)) if offered_pairing().is_some() => {
@@ -448,14 +512,19 @@ pub fn start(store: Store) {
             let (events_tx, mut events) = mpsc::unbounded::<Heard>();
             let on_event =
                 Closure::<dyn FnMut(String, String)>::new(move |kind: String, text: String| {
+                    // The kinds `Socket` in js/browser.js sends (a machine
+                    // format of our own).
                     let heard = match kind.as_str() {
                         "open" => Heard::Open,
                         "message" => Heard::Message(text),
+                        "refused" => Heard::Refused(text),
                         _ => Heard::Close(text),
                     };
                     let _ = events_tx.unbounded_send(heard);
                 });
-            let socket = Socket::new(&url, &on_event);
+            // Over iroh the token goes in the upgrade (the daemon takes it
+            // only there); the page's own socket sends it in its hello.
+            let socket = Socket::new(&url, if iroh { &token } else { "" }, &on_event);
             let send = |frame: &aidaemon_client_protocol::ClientFrame| {
                 if let Ok(text) = serde_json::to_string(frame) {
                     socket.send(&text);
@@ -491,7 +560,12 @@ pub fn start(store: Store) {
                 };
                 match event {
                     Some(Some(Heard::Open)) => {
-                        for frame in machine.opened_with_token(now(), Some(token.clone())) {
+                        let opening = if iroh {
+                            machine.opened(now())
+                        } else {
+                            machine.opened_with_token(now(), Some(token.clone()))
+                        };
+                        for frame in opening {
                             send(&frame);
                         }
                         store.update(Update::Connected);
@@ -509,6 +583,9 @@ pub fn start(store: Store) {
                             }
                             store.update(Update::Frame(frame));
                         }
+                    }
+                    Some(Some(Heard::Refused(why))) => {
+                        break machine.failed(DropKind::Unauthorized, why);
                     }
                     Some(heard @ (Some(Heard::Close(_)) | None)) => {
                         let why = match heard {

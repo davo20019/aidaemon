@@ -5,6 +5,12 @@
 
 const DB = "aidaemon-client";
 const DEVICE_KEY = "aidaemon.device";
+// The app on a site of its own (not served by the daemon) reaches the daemon
+// by key over iroh: its address (`iroh://…`), and the endpoint key this
+// browser dials with (32 random bytes, hex). iroh needs that key's bytes,
+// so it is kept apart from the device key, which cannot be read.
+const REMOTE_KEY = "aidaemon.remote";
+const ENDPOINT_KEY = "aidaemon.endpoint";
 let pending = null;
 
 function idb(mode, run) {
@@ -58,6 +64,7 @@ export async function keepKey(id) {
 export async function forget() {
   await idb("readwrite", (s) => s.delete("device"));
   localStorage.removeItem(DEVICE_KEY);
+  localStorage.removeItem(REMOTE_KEY);
 }
 
 /** The signature (r || s, base64url) of `message`. */
@@ -72,10 +79,51 @@ export async function sign(message) {
   return b64url(signature);
 }
 
-/** The pairing offer in the link that opened this page: offer, code, fp. */
+/**
+ * The pairing offer in the link that opened this page: offer, code, fp, and
+ * the daemon's iroh address when the link names one (`remote`).
+ */
 export function pairingLink() {
   const hash = new URLSearchParams(location.hash.slice(1));
-  return [hash.get("offer") ?? "", hash.get("code") ?? "", hash.get("fp") ?? ""];
+  return [hash.get("offer") ?? "", hash.get("code") ?? "", hash.get("fp") ?? "", hash.get("remote") ?? ""];
+}
+
+/**
+ * The daemon's iroh address for this page: a pairing link's, else the one
+ * this browser was paired over, else "" (the daemon served this page).
+ */
+export function remoteAddress() {
+  const offered = new URLSearchParams(location.hash.slice(1)).get("remote") ?? "";
+  return offered.startsWith("iroh://") ? offered : remoteGateway();
+}
+
+/** The daemon's iroh address this browser was paired over, or "". */
+export function remoteGateway() {
+  try {
+    return localStorage.getItem(REMOTE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function keepRemoteGateway(url) {
+  localStorage.setItem(REMOTE_KEY, url);
+}
+
+/** This browser's endpoint key (hex), made on first use. */
+export function endpointSecret() {
+  let hex = "";
+  try {
+    hex = localStorage.getItem(ENDPOINT_KEY) ?? "";
+  } catch {}
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    try {
+      localStorage.setItem(ENDPOINT_KEY, hex);
+    } catch {}
+  }
+  return hex;
 }
 
 // A pairing link opened in a tab that already shows the app changes only
@@ -89,7 +137,108 @@ export function forgetPairingLink() {
   history.replaceState(null, "", location.pathname + location.search);
 }
 
-/** A socket to `url`; `event(kind, text)` hears "open", "message", "close". */
+// The app on a site of its own reaches the daemon over iroh: the app
+// addresses it at daemonBase() as it would a daemon serving the page, the
+// service worker (sw.js) hands each request there to this page, and this
+// page sends it through the iroh module (remote/), loaded only then.
+let remoteDaemon = null;
+
+function daemon() {
+  remoteDaemon ??= (async () => {
+    const module = await import(new URL("remote/aidaemon_app_remote.js", document.baseURI).href);
+    await module.default();
+    return new module.Daemon(remoteAddress(), endpointSecret());
+  })();
+  remoteDaemon.catch(() => (remoteDaemon = null));
+  return remoteDaemon;
+}
+
+/** Where the app addresses the daemon over iroh (no trailing slash). */
+export function daemonBase() {
+  return new URL("_daemon", document.baseURI).href;
+}
+
+/** Resolves once the service worker carries requests to daemonBase(). */
+export async function remoteReady() {
+  if (!("serviceWorker" in navigator)) throw new Error("this browser has no service workers");
+  await navigator.serviceWorker.register(new URL("sw.js", document.baseURI).href);
+  await navigator.serviceWorker.ready;
+  if (!navigator.serviceWorker.controller) {
+    await new Promise((resolve) =>
+      navigator.serviceWorker.addEventListener("controllerchange", resolve, { once: true }),
+    );
+  }
+}
+
+// The service worker's requests: answered over iroh. Its message format is
+// sw.js's own.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", async (event) => {
+    if (event.data?.type !== "aidaemon-fetch") return;
+    const [port] = event.ports;
+    const { method, path, headers, body } = event.data;
+    try {
+      const reply = await (await daemon()).fetch(method, path, headers, body);
+      const bytes = reply.body;
+      port.postMessage({ status: reply.status, headers: reply.headers, body: bytes }, [bytes.buffer]);
+    } catch (error) {
+      port.postMessage({ error: String(error?.message ?? error) });
+    }
+  });
+  navigator.serviceWorker.startMessages();
+}
+
+/** A WebSocket's part the app's sockets use, over iroh. */
+class RemoteSocket {
+  constructor(path, token) {
+    this.readyState = 0;
+    this.binaryType = "arraybuffer";
+    const headers = token ? ["authorization", `Bearer ${token}`] : [];
+    daemon()
+      .then((d) => {
+        if (this.readyState === 3) return;
+        this.inner = d.socket(path, headers, (kind, data) => this.heard(kind, data));
+      })
+      .catch((error) => this.heard("close", String(error?.message ?? error)));
+  }
+  heard(kind, data) {
+    if (this.readyState === 3) return;
+    if (kind === "open") {
+      this.readyState = 1;
+      this.onopen?.();
+    } else if (kind === "text") {
+      this.onmessage?.({ data });
+    } else if (kind === "binary") {
+      this.onmessage?.({ data: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) });
+    } else {
+      this.readyState = 3;
+      // 4401: the daemon refused the token (the upgrade's 401).
+      this.onclose?.({ code: kind === "refused" ? 4401 : 1006, reason: data || "" });
+    }
+  }
+  send(data) {
+    if (this.readyState !== 1) return;
+    if (typeof data === "string") this.inner.send(data);
+    else this.inner.sendBytes(new Uint8Array(data));
+  }
+  close() {
+    this.readyState = 3;
+    this.inner?.close();
+  }
+}
+
+/** A WebSocket to `url`, over iroh when it is under daemonBase(). */
+function openSocket(url, token) {
+  const base = daemonBase().replace(/^http/, "ws");
+  if (remoteAddress() && url.startsWith(base)) return new RemoteSocket(url.slice(base.length), token);
+  return new WebSocket(url);
+}
+
+/**
+ * A socket to `url`; `event(kind, text)` hears "open", "message", "close"
+ * and "refused". `token` goes in the upgrade over iroh, where the daemon
+ * takes it there only (the page's own socket sends it in its hello).
+ */
 /**
  * Call `wake` when the page is shown again or the network comes back: a
  * phone freezes a background page, and its socket may have died meanwhile.
@@ -116,11 +265,11 @@ export function onWake(wake) {
 }
 
 export class Socket {
-  constructor(url, event) {
-    this.ws = new WebSocket(url);
+  constructor(url, token, event) {
+    this.ws = openSocket(url, token);
     this.ws.onopen = () => event("open", "");
     this.ws.onmessage = (m) => event("message", typeof m.data === "string" ? m.data : "");
-    this.ws.onclose = (c) => event("close", c.reason || `closed (${c.code})`);
+    this.ws.onclose = (c) => event(c.code === 4401 ? "refused" : "close", c.reason || `closed (${c.code})`);
     this.ws.onerror = () => {};
   }
   send(text) {
@@ -174,7 +323,7 @@ export class KeyCapture {
 
 export class MediaSocket {
   constructor(url, ticket, event) {
-    this.ws = new WebSocket(url);
+    this.ws = openSocket(url, "");
     this.ws.binaryType = "arraybuffer";
     this.ws.onopen = () => this.ws.send(JSON.stringify({ type: "auth", ticket }));
     this.ws.onmessage = (m) => {
@@ -215,7 +364,7 @@ export class MediaSocket {
  */
 export class ShellSocket {
   constructor(url, ticket, event) {
-    this.ws = new WebSocket(url);
+    this.ws = openSocket(url, "");
     this.ws.onopen = () => this.ws.send(JSON.stringify({ type: "auth", ticket }));
     this.ws.onmessage = (m) => {
       if (typeof m.data === "string") event(m.data);

@@ -44,6 +44,17 @@ A plain `cargo check --target wasm32-unknown-unknown` needs
 `RUSTFLAGS='--cfg getrandom_backend="custom"'` (nsh's web build sets it;
 `src/link/random.rs` supplies the backend).
 
+On a site of its own (the project's web app), the web build reaches the
+daemon by key over iroh instead: a pairing link carrying `remote=iroh://…`
+switches the page to it (`src/link/web.rs`, `js/browser.js`). The app then
+addresses the daemon at `<site>/_daemon`; `remote/sw.js` (a service worker)
+hands requests there to the page, and sockets there go straight to the iroh
+module (`remote/`, its own wasm module and workspace, loaded only then).
+`remote/build.sh [out]` builds it into the web package after
+`nsh package --target web`. The demo gateway with `AIDAEMON_DEMO_REMOTE=1`
+prints such a link (put the site's address before the `#`). The Claude app's
+built-in browser refuses service workers: test with Playwright's Chromium.
+
 The web build is served by the gateway from `[client_gateway] app_dir`
 at `/client/v1/next/` (same origin, so sign-in needs no CORS). The demo
 gateway serves it with
@@ -69,7 +80,10 @@ its pairing link approves itself (use `/client/v1/next/#offer=…`). With
   to the app.
 - The browser's device key is WebCrypto, non-extractable, in IndexedDB
   `aidaemon-client` (the name the retired TypeScript client used; keep it).
-  Never store a key a script can read.
+  Never store a key a script can read. One exception: over iroh, the
+  endpoint key the page dials with (localStorage `aidaemon.endpoint`), since
+  iroh needs its bytes. It names the connection only: signing in still
+  takes the device key, and the daemon ties each token to that endpoint.
 - Model output renders as Markdown with HTML off (`html: false`).
 - Nothing but drawing lives in the app. Connection state, the reducer,
   reads and their request ids, turns' activity, uploads, unread and

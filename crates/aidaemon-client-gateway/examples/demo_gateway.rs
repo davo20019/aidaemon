@@ -1143,8 +1143,52 @@ async fn main() -> anyhow::Result<()> {
         "tui:  aidaemon-tui --url ws://127.0.0.1:{port}/client/v1/ws --token-file {}",
         token_copy.display()
     );
+    // With AIDAEMON_DEMO_REMOTE=1 the demo is also reachable by key over
+    // iroh through the project's relays, as a daemon with remote access is:
+    // the web app on a site of its own pairs with it from the printed link
+    // (put the site's address before the `#`).
+    let _remote = match std::env::var_os("AIDAEMON_DEMO_REMOTE") {
+        Some(_) => Some(serve_remote(gateway.clone(), &offer).await?),
+        None => None,
+    };
     axum::serve(listener, aidaemon_client_gateway::router(gateway)).await?;
     Ok(())
+}
+
+async fn serve_remote(
+    gateway: Arc<ClientGateway>,
+    offer: &aidaemon_client_protocol::PairingOffer,
+) -> anyhow::Result<aidaemon_remote::RemoteListener> {
+    gateway
+        .pairing()
+        .load_admission()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.message))?;
+    let pairing = gateway.pairing().clone();
+    let access = aidaemon_remote::Access::Only(Arc::new(move |peer| {
+        pairing.admits(&aidaemon_remote::endpoint_hex(peer))
+    }));
+    let router =
+        aidaemon_client_gateway::remote_router::<aidaemon_remote::RemotePeer>(gateway.clone());
+    let listener = aidaemon_remote::RemoteListener::bind(
+        aidaemon_remote::SecretKey::generate(),
+        &aidaemon_remote::Relays::Aidaemon,
+        access,
+        router,
+    )
+    .await?;
+    listener.online().await;
+    let url = listener.url().to_string();
+    println!(
+        "web app over iroh: <site>/#offer={}&code={}&fp={}&remote={}",
+        offer.offer_id,
+        offer.code,
+        offer.fingerprint,
+        url.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('@', "%40")
+    );
+    Ok(listener)
 }
 
 fn now_ms() -> u64 {
