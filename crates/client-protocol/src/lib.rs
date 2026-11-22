@@ -3204,13 +3204,15 @@ impl PairingOffer {
     /// [`PairingOffer::link`] as a link to [`PAIRING_PAGE_PATH`] on the
     /// gateway's own address. The offer rides in the fragment, which
     /// browsers never send to the server. An older daemon that does not
-    /// say its address gets the app link itself.
+    /// say its address, or one only its own machine can reach (loopback),
+    /// gets the app link itself: the phone's camera opens the app, which
+    /// pairs over the link's `remote` address.
     pub fn page_link(&self) -> String {
         let Some(base) = self
             .public_url
             .as_deref()
             .map(|url| url.trim().trim_end_matches('/'))
-            .filter(|url| !url.is_empty())
+            .filter(|url| !url.is_empty() && !is_loopback_url(url))
         else {
             return self.link.clone();
         };
@@ -3220,6 +3222,24 @@ impl PairingOffer {
             .map_or(self.link.as_str(), |(_, query)| query);
         format!("{base}{PAIRING_PAGE_PATH}#{query}")
     }
+}
+
+/// Whether `url`'s host is this machine only (`127.x`, `localhost`,
+/// `[::1]`): a URL, so its host is read from its own syntax.
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// `POST /client/v1/enrollments/redeem`.
@@ -3418,6 +3438,21 @@ mod tests {
         );
         offer.public_url = None;
         assert_eq!(offer.page_link(), offer.link);
+        // A loopback address is no page for a phone.
+        for loopback in [
+            "http://127.0.0.1:8788",
+            "http://localhost:8788/",
+            "http://[::1]:8788",
+        ] {
+            offer.public_url = Some(loopback.into());
+            assert_eq!(offer.page_link(), offer.link, "{loopback}");
+        }
+        offer.public_url = Some("http://192.168.1.20:8788".into());
+        assert!(
+            offer
+                .page_link()
+                .starts_with("http://192.168.1.20:8788/client/v1/pair#")
+        );
     }
 
     #[test]

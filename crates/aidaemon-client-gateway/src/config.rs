@@ -42,20 +42,35 @@ pub struct ClientGatewayConfig {
     pub app_dir: Option<String>,
     /// Remote access over iroh (`[client_gateway.remote]`): the owner's
     /// apps reach this gateway from anywhere by the daemon's key, with no
-    /// tunnel. Off by default.
+    /// tunnel. On whenever the gateway is.
     #[serde(default)]
     pub remote: RemoteAccessConfig,
 }
 
 /// `[client_gateway.remote]`: serve the gateway over iroh too.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteAccessConfig {
-    #[serde(default)]
+    /// On by default: the daemon keeps a connection to its home relay
+    /// (which sees its address, never its traffic). `false` turns it off.
+    #[serde(default = "default_remote_enabled")]
     pub enabled: bool,
     /// Relay URLs (your own `iroh-relay`). Empty: n0's public relays.
     #[serde(default)]
     pub relays: Vec<String>,
+}
+
+fn default_remote_enabled() -> bool {
+    true
+}
+
+impl Default for RemoteAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_remote_enabled(),
+            relays: Vec::new(),
+        }
+    }
 }
 
 fn default_bind() -> String {
@@ -131,6 +146,17 @@ impl ClientGatewayConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_access_is_on_unless_turned_off() {
+        let on: ClientGatewayConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(on.remote.enabled);
+        assert!(on.remote.relays.is_empty());
+        assert!(ClientGatewayConfig::default().remote.enabled);
+        let off: ClientGatewayConfig =
+            serde_json::from_str(r#"{"enabled": true, "remote": {"enabled": false}}"#).unwrap();
+        assert!(!off.remote.enabled);
+    }
 
     #[test]
     fn off_and_loopback_by_default() {
