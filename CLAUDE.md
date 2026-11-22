@@ -101,6 +101,9 @@ background tasks`.
   `setup` router, no agent) until a model passes its test; the running
   daemon's client host then serves the chat step and the greeting.
 - Clients: `clients/app/` is the one nsh (Native Shell) Rust app for desktop, web and terminal (its own Cargo workspace; read `clients/app/AGENTS.md`). Shared client logic is `crates/aidaemon-client-core` (`machine::LinkMachine`, reducer, sign-in). The gateway serves its web build (installed to `~/.aidaemon/app-web`) at `/client/v1/next/`; releases ship `aidaemon-app` and `aidaemon-app-web.tar.gz`.
+- `deploy/`: setup for the project's public servers, `relay.aidaemon.ai`
+  (iroh-relay, the remote-access default) and `dns.aidaemon.ai` (address
+  lookup). They must run the workspace's iroh version; see `deploy/README.md`.
 - Specialists: prompts in `crates/aidaemon-runtime/specialists/<kind>.md`, user overrides in
   `~/.aidaemon/specialists/`, code in `src/agent/specialists/`, exposed via
   `spawn_agent`.

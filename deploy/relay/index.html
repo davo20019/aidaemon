@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AIDaemon Relay</title>
+<meta name="description" content="The AIDaemon relay helps AIDaemon apps reach your daemon from anywhere. Traffic is end-to-end encrypted.">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👁</text></svg>">
+<style>
+/* Layout: one terminal-style column; header bar, the address as the hero, then
+   what the relay does as a short session transcript, then self-hosting. */
+:root {
+  --bg: #0a0a0c;
+  --surface: #0f1012;
+  --raised: #161619;
+  --line: #2a2a32;
+  --text: #e8e8ed;
+  --muted: #8a8a96;
+  --dim: #5a5a66;
+  --green: #00ff9d;
+  --green-glow: rgba(0, 255, 157, 0.14);
+  --cyan: #00d4ff;
+  --amber: #ffb800;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.65 var(--mono);
+  padding-block: env(safe-area-inset-top, 0px) env(safe-area-inset-bottom, 0px);
+}
+a { color: var(--cyan); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; border-radius: 2px; }
+.wrap {
+  max-width: 760px;
+  margin: 0 auto;
+  padding-left: max(20px, env(safe-area-inset-left, 0px));
+  padding-right: max(20px, env(safe-area-inset-right, 0px));
+}
+header { border-bottom: 1px solid var(--line); }
+header .wrap {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 12px; padding-block: 18px;
+}
+.logo { display: flex; align-items: baseline; gap: 10px; font-weight: 600; font-size: 15px; color: var(--text); }
+.logo:hover { text-decoration: none; }
+.ai { color: var(--green); }
+.tag { color: var(--dim); font-weight: 400; font-size: 12px; }
+.status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--green); }
+.pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+  box-shadow: 0 0 0 0 var(--green-glow); animation: pulse 2.4s ease-out infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(0, 255, 157, 0.45); }
+  70% { box-shadow: 0 0 0 9px rgba(0, 255, 157, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 255, 157, 0); }
+}
+main .wrap { display: grid; gap: 56px; padding-block: 64px 72px; }
+.hero { display: grid; gap: 18px; }
+.prompt { color: var(--dim); font-size: 13px; }
+.prompt b { color: var(--green); font-weight: 400; }
+h1 {
+  margin: 0; font-size: clamp(30px, 7vw, 52px); line-height: 1.05; letter-spacing: -0.03em;
+  font-weight: 700; text-wrap: balance; overflow-wrap: anywhere;
+}
+h1 .host { color: var(--green); text-shadow: 0 0 36px var(--green-glow); }
+.lede { margin: 0; max-width: 60ch; color: var(--muted); font-size: 16px; }
+.lede strong { color: var(--text); font-weight: 500; }
+h2 {
+  margin: 0 0 18px; font-size: 12px; font-weight: 500; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--dim);
+}
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 22px; }
+.steps li { display: grid; grid-template-columns: 10ch 1fr; gap: 16px; align-items: baseline; }
+.steps .verb { color: var(--green); white-space: nowrap; }
+.steps .verb::before { content: "› "; color: var(--dim); }
+.steps p { margin: 0; color: var(--muted); min-width: 0; }
+.steps p strong { color: var(--text); font-weight: 500; }
+.facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  border: 1px solid var(--line); border-radius: 6px; background: var(--surface); overflow: hidden;
+}
+.fact { padding: 16px 18px; display: grid; gap: 4px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; }
+.fact dt { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+.fact dd { margin: 0; font-variant-numeric: tabular-nums; }
+.fact dd small { display: block; color: var(--muted); font-size: 12px; }
+.self p { margin: 0 0 14px; color: var(--muted); max-width: 62ch; }
+pre {
+  margin: 0; padding: 16px 18px; background: var(--raised); border: 1px solid var(--line);
+  border-radius: 6px; overflow-x: auto; font: 13.5px/1.7 var(--mono); color: var(--text);
+}
+pre .c { color: var(--dim); }
+pre .k { color: var(--cyan); }
+pre .s { color: var(--amber); }
+footer { border-top: 1px solid var(--line); }
+footer .wrap {
+  display: flex; flex-wrap: wrap; gap: 10px 22px; justify-content: space-between;
+  padding-block: 22px; font-size: 12px; color: var(--dim);
+}
+footer nav { display: flex; flex-wrap: wrap; gap: 18px; }
+footer a { color: var(--muted); }
+@media (max-width: 520px) {
+  main .wrap { gap: 44px; padding-block: 44px 56px; }
+  .steps li { grid-template-columns: 1fr; gap: 2px; }
+}
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <a class="logo" href="https://aidaemon.ai"><span><span class="ai">AID</span>aemon</span><span class="tag">relay</span></a>
+    <div class="status"><span class="pulse" aria-hidden="true"></span>relay active</div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+    <section class="hero">
+      <div class="prompt"><b>$</b> aidaemon remote status</div>
+      <h1><span class="host">relay.aidaemon.ai</span></h1>
+      <p class="lede">This server helps <strong>AIDaemon apps reach your daemon from anywhere</strong>: your phone on mobile data, your laptop at a café, your daemon at home. Everything that passes through it is end-to-end encrypted, so the relay can't read it.</p>
+    </section>
+
+    <section aria-labelledby="how">
+      <h2 id="how">What it does</h2>
+      <ol class="steps">
+        <li><span class="verb">listen</span><p>Your daemon keeps one connection open here, so your devices can <strong>find it by its key</strong>. No accounts, no sign-up.</p></li>
+        <li><span class="verb">connect</span><p>An app asks for that key. The relay passes the first messages along while the two sides learn each other's addresses.</p></li>
+        <li><span class="verb">direct</span><p>Then they <strong>connect directly</strong> when the network allows, and the relay steps out of the way.</p></li>
+        <li><span class="verb">carry</span><p>When a direct path isn't possible, the relay forwards the traffic. It sees only ciphertext: QUIC with TLS 1.3 and keys only your devices hold.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="facts">
+      <h2 id="facts">This relay</h2>
+      <dl class="facts">
+        <div class="fact"><dt>Relay</dt><dd>443/tcp<small>HTTPS and WebSocket</small></dd></div>
+        <div class="fact"><dt>Address discovery</dt><dd>7842/udp<small>tells devices their public address</small></dd></div>
+        <div class="fact"><dt>Networks</dt><dd>IPv4 + IPv6<small>reachable on either</small></dd></div>
+        <div class="fact"><dt>Address lookup</dt><dd>dns.aidaemon.ai<small>finds a daemon by its key if it moves</small></dd></div>
+        <div class="fact"><dt>Logs</dt><dd>warnings only<small>kept 7 days, no traffic content</small></dd></div>
+        <div class="fact"><dt>Health</dt><dd><a href="/healthz">/healthz</a><small>200 when the relay is up</small></dd></div>
+      </dl>
+    </section>
+
+    <section class="self" aria-labelledby="own">
+      <h2 id="own">Run your own</h2>
+      <p>This relay is the default, never a requirement. Point your daemon at a relay you run and your devices use only that one.</p>
+<pre><span class="c"># config.toml</span>
+<span class="k">[client_gateway.remote]</span>
+relays = [<span class="s">"https://relay.example.com"</span>]</pre>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>AIDaemon · self-hosted AI agent · MIT License</span>
+    <nav aria-label="AIDaemon">
+      <a href="https://aidaemon.ai">aidaemon.ai</a>
+      <a href="https://docs.aidaemon.ai">docs</a>
+      <a href="https://github.com/davo20019/aidaemon">github</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

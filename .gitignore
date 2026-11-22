@@ -13,6 +13,8 @@ config.toml.*backup*
 *.lastgood
 *.html
 !src/dashboard.html
+# The relay's landing page, baked into its build (deploy/relay).
+!deploy/**/*.html
 .DS_Store
 .fastembed_cache/
 
@@ -41,6 +43,9 @@ __pycache__/
 !tests/fixtures/**/*.json
 # The Client Protocol's generated JSON Schema, which clients generate from.
 !schemas/**/*.json
+# Server setup (deploy/): firewall rules. Resource ids stay local.
+!deploy/**/*.json
+deploy/**/ids.env
 # Stand-alone protocol reference docs, not generated from code.
 schemas/node-protocol-v1.schema.json
 *.png
