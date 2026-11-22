@@ -2127,8 +2127,15 @@ pub struct LiveScreen {
 
 /// The live view, over everything while it is open.
 pub fn live_screen(screen: LiveScreen) -> View {
+    let docked = screen.docked;
     let screen = std::rc::Rc::new(screen);
-    view().child(dynamic(move || {
+    // Docked, it fills the pane it is in (the picture takes what is left).
+    let frame = if docked {
+        view().flex_1().w_full().min_h(px(0.0))
+    } else {
+        view()
+    };
+    frame.child(dynamic(move || {
         if !(screen.open)() {
             return None;
         }
