@@ -1799,20 +1799,32 @@ impl Store {
         }
     }
 
-    /// A drawer (a narrow window's pane) has gone: a new conversation
-    /// started from it asks for the keyboard again, now that the page
-    /// under it takes the focus.
+    /// A drawer (a narrow window's pane) has gone: the choice made in it
+    /// ([`Self::leave_drawer`]) goes on, and a new conversation started
+    /// from it asks for the keyboard again, now that the page under it
+    /// takes the focus. Two frames on: the first shows the drawer gone,
+    /// so building the page never holds its last sliver on screen.
     pub fn drawer_gone(&self) {
-        if let Some(go) = self.after_drawer.replace(None) {
-            go();
+        let go = self.after_drawer.replace(None);
+        let keyboard = self.keyboard_after_drawer.replace(false);
+        if go.is_none() && !keyboard {
+            return;
         }
-        if self.keyboard_after_drawer.replace(false)
-            && self.selected.get_untracked().is_none()
-            && self.page.get_untracked() == Page::Conversation
-        {
-            self.keyboard_wanted.replace(true);
-            self.keyboard_ask.update(|n| *n += 1);
-        }
+        let store = *self;
+        request_animation_frame(move |_| {
+            request_animation_frame(move |_| {
+                if let Some(go) = go {
+                    go();
+                }
+                if keyboard
+                    && store.selected.get_untracked().is_none()
+                    && store.page.get_untracked() == Page::Conversation
+                {
+                    store.keyboard_wanted.replace(true);
+                    store.keyboard_ask.update(|n| *n += 1);
+                }
+            });
+        });
     }
 
     /// Changes when a new conversation asks for the keyboard.
