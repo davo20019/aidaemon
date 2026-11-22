@@ -119,3 +119,6 @@ crates/aidaemon-eval/RESULTS.md
 # Local scratch output
 .caffeinate_pid
 *.ps
+# The web app's build and wrangler's state (deploy/web).
+deploy/web/dist/
+deploy/web/.wrangler/

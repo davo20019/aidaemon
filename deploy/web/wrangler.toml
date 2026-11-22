@@ -1,0 +1,12 @@
+# The project's web app (https://app.aidaemon.ai): the app's web build on a
+# site of its own, static files only. Phones pair there from a QR code and
+# reach their daemon by key over iroh; nothing here sees their traffic.
+# Build with ./build.sh, then `npx wrangler deploy` from this directory.
+name = "aidaemon-web-app"
+compatibility_date = "2026-11-01"
+workers_dev = false
+routes = [{ pattern = "app.aidaemon.ai", custom_domain = true }]
+
+[assets]
+directory = "./dist"
+not_found_handling = "none"

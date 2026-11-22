@@ -7,6 +7,7 @@ machine with a public address.
 | Server | What it does | Ports |
 |---|---|---|
 | `relay.aidaemon.ai` (`relay/`) | Remote access's default relay: daemons keep a connection here so apps find them by key, and it forwards end-to-end encrypted traffic when two devices can't connect directly. | 443/tcp, 80/tcp (certificates), 7842/udp (address discovery) |
+| `app.aidaemon.ai` (`web/`) | The web app on a site of its own: static files on a Cloudflare Worker. A phone with no app pairs there from a QR code and reaches its daemon by key through the relay; this site never sees that traffic. | 443/tcp (Cloudflare) |
 | `dns.aidaemon.ai` (`lookup/`) | Address lookup: a daemon on the project's relays publishes which relay it is on (signed with its key, the relay URL only), so an app whose saved relay is stale still finds it. | 443/tcp, 80/tcp |
 
 Each `cloud-init.sh` installs the server, its firewall rules (IPv4 and IPv6),
@@ -27,6 +28,18 @@ as root on one.
 5. Relay only: `relay/build-relay.sh` builds `iroh-relay` with the AIDaemon
    landing page (`relay/index.html`), cross-compiled with `cargo zigbuild`,
    and deploys it (`HOST=`, `TARGET=aarch64-unknown-linux-musl` for ARM).
+
+## The web app
+
+`web/build.sh` builds the app's web package with its iroh module and service
+worker into `web/dist`; `cd web && npx wrangler deploy` publishes it. To host
+your own copy elsewhere, serve `web/dist` as static files (with the headers
+in `web/_headers`) and point your daemon at it:
+
+```toml
+[client_gateway.remote]
+web_app = "https://app.example.com"
+```
 
 ## Your own relay
 
