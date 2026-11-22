@@ -3477,7 +3477,9 @@ mod tests {
             offer.web_link("https://d.example.invalid/", "/client/v1/next/"),
             "https://d.example.invalid/client/v1/next/#offer=of-1&code=K7Q2-9FZD&fp=3b1f"
         );
-        offer.link.push_str("&remote=iroh%3A%2F%2Fk%40relay.example.invalid");
+        offer
+            .link
+            .push_str("&remote=iroh%3A%2F%2Fk%40relay.example.invalid");
         assert!(
             offer
                 .web_link("https://d.example.invalid", "/client/v1/next/")
