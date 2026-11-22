@@ -396,7 +396,11 @@ pub fn start(store: Store) {
                 version: Some(crate::link::app_version()),
             },
             None,
-            vec![Capability::ViewActions, Capability::Surfaces, Capability::Shells],
+            vec![
+                Capability::ViewActions,
+                Capability::Surfaces,
+                Capability::Shells,
+            ],
         );
         let (commands_tx, mut commands) = mpsc::unbounded::<(String, Command)>();
         store.attach(Box::new(move |id, command| {

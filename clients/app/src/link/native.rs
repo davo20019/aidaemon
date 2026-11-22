@@ -225,7 +225,10 @@ pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
         })
         .await;
         if started.is_err() {
-            store.shell_event(epoch, ShellEvent::Closed("could not start the shell".into()));
+            store.shell_event(
+                epoch,
+                ShellEvent::Closed("could not start the shell".into()),
+            );
             return;
         }
         let mut closed = false;

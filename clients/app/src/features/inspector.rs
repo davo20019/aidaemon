@@ -33,7 +33,9 @@ pub fn inspector(store: Store) -> View {
                     // every conversation has its terminal and browser.
                     view().flex_1().child(dynamic(move || {
                         let tabs = detail_tabs(coding.get(), store.is_compact());
-                        Some(untracked(move || ui::tab_bar_of(store.inspector_tab(), &tabs)))
+                        Some(untracked(move || {
+                            ui::tab_bar_of(store.inspector_tab(), &tabs)
+                        }))
                     })),
                 )
                 .child(when(

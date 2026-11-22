@@ -362,8 +362,7 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
             .group("View")
             .shortcut("mod+d"),
         CommandItem::new("terminal", "Open this conversation's terminal").group("View"),
-        CommandItem::new("browser", "Watch the agent's browser in this conversation")
-            .group("View"),
+        CommandItem::new("browser", "Watch the agent's browser in this conversation").group("View"),
     ];
     let system = CommandItem::new("system", "System: how the daemon is doing").group("View");
     items.push(match SYSTEM_KEY {

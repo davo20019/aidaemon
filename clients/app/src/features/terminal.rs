@@ -59,8 +59,12 @@ fn shell_view(store: Store, session: String) -> View {
     // Attach once laid out (the daemon starts it at this size); later
     // sizes resize it.
     let attach = {
-        let (session, sink, attached, size) =
-            (session.clone(), sink.clone(), attached.clone(), size.clone());
+        let (session, sink, attached, size) = (
+            session.clone(),
+            sink.clone(),
+            attached.clone(),
+            size.clone(),
+        );
         move || {
             let (cols, rows) = size.get();
             if cols < 2 || rows < 1 {

@@ -2836,49 +2836,49 @@ fn live_dialog(screen: std::rc::Rc<LiveScreen>) -> View {
     let sideways = live_sideways;
     let top_bar = bar.clone();
     let body = view()
-                    .flex_1()
-                    .w_full()
-                    .h_full()
-                    .flex_col()
-                    .style_when(sideways, |s| s.flex_row().px_safe_area())
-                    .gap_2()
-                    .bg(colors::LIVE_BACKDROP)
-                    .pt_safe_area()
-                    .pb_safe_area()
-                    .test_id("live-screen")
-                    .child(when(move || !sideways(), move || top_bar.clone()))
-                    .child(
-                        view()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .min_w(px(0.0))
-                            .w_full()
-                            .p_2()
-                            .items_center()
-                            .justify_center()
-                            .on_layout(move |b: &Bounds<Points>| {
-                                room.set((
-                                    (b.size.width.0 - 16.0).max(0.0),
-                                    (b.size.height.0 - 16.0).max(0.0),
-                                ))
-                            })
-                            .child(picture),
-                    )
-                    .child(
-                        view()
-                            .gap_2()
-                            .style_when(sideways, |s| s.w(px(LIVE_SIDE)).h_full().justify_center())
-                            .child(when(sideways, move || bar.clone()))
-                            .child(when(
-                                {
-                                    let c = controlling.clone();
-                                    move || c() && !mouse
-                                },
-                                move || typing.clone(),
-                            ))
-                            .child(answers)
-                            .child(view().h(px(8.0))),
-                    );
+        .flex_1()
+        .w_full()
+        .h_full()
+        .flex_col()
+        .style_when(sideways, |s| s.flex_row().px_safe_area())
+        .gap_2()
+        .bg(colors::LIVE_BACKDROP)
+        .pt_safe_area()
+        .pb_safe_area()
+        .test_id("live-screen")
+        .child(when(move || !sideways(), move || top_bar.clone()))
+        .child(
+            view()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .w_full()
+                .p_2()
+                .items_center()
+                .justify_center()
+                .on_layout(move |b: &Bounds<Points>| {
+                    room.set((
+                        (b.size.width.0 - 16.0).max(0.0),
+                        (b.size.height.0 - 16.0).max(0.0),
+                    ))
+                })
+                .child(picture),
+        )
+        .child(
+            view()
+                .gap_2()
+                .style_when(sideways, |s| s.w(px(LIVE_SIDE)).h_full().justify_center())
+                .child(when(sideways, move || bar.clone()))
+                .child(when(
+                    {
+                        let c = controlling.clone();
+                        move || c() && !mouse
+                    },
+                    move || typing.clone(),
+                ))
+                .child(answers)
+                .child(view().h(px(8.0))),
+        );
     if screen.docked {
         return view().flex_1().w_full().h_full().child(body);
     }
