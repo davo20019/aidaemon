@@ -1,0 +1,25 @@
+[package]
+name = "aidaemon-shells"
+description = "Conversation shells for aidaemon: one pseudo-terminal per conversation, started in its folder, that the owner's apps attach to and the agent can read; implementation crate of the aidaemon SDK, no stability promise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/aidaemon-shells"
+keywords = ["agent", "terminal", "pty", "shell"]
+categories = ["asynchronous", "command-line-interface"]
+
+[dependencies]
+portable-pty = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+vt100 = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

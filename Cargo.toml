@@ -53,6 +53,7 @@ members = [
     "crates/aidaemon-nodes",
     "crates/aidaemon-exposure",
     "crates/aidaemon-surfaces",
+    "crates/aidaemon-shells",
     "crates/aidaemon-terminal-bridge",
     "crates/aidaemon-channels",
     "crates/aidaemon-channel-telegram",
@@ -137,6 +138,8 @@ aidaemon-terminal-bridge = { version = "=0.21.0", path = "crates/aidaemon-termin
 aidaemon-tool-browser = { version = "=0.21.0", path = "crates/aidaemon-tool-browser" }
 # Live surfaces: the owner watches and controls the agent's browser from an app.
 aidaemon-surfaces = { version = "=0.21.0", path = "crates/aidaemon-surfaces", features = ["tool"] }
+# Conversation shells: one terminal per conversation, shared by the owner and the agent.
+aidaemon-shells = { version = "=0.21.0", path = "crates/aidaemon-shells" }
 aidaemon-providers = { version = "=0.21.0", path = "crates/aidaemon-providers", features = ["chatgpt-login"] }
 # The MCP transport; the daemon keeps its registry and result rendering.
 aidaemon-mcp = { version = "=0.21.0", path = "crates/aidaemon-mcp", features = ["registry"] }
