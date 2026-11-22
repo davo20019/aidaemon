@@ -300,7 +300,12 @@ async fn challenge(State(gateway): State<Arc<SetupGateway>>, bytes: axum::body::
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    reply(gateway.pairing.challenge(&request.device_id).await)
+    reply(
+        gateway
+            .pairing
+            .challenge(&request.device_id, request.endpoint.as_deref())
+            .await,
+    )
 }
 
 async fn open_session(

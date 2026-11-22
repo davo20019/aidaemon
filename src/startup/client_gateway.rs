@@ -1282,6 +1282,9 @@ pub async fn start(
     }
     let _ = GATEWAY.set(gateway.clone());
     if config.client_gateway.remote.enabled {
+    if config.exposure.client_gateway.is_some() {
+        start_exposed(gateway.clone()).await;
+    }
         start_remote(&config.client_gateway, gateway.clone()).await;
     }
     tokio::spawn(async move {
@@ -1293,6 +1296,40 @@ pub async fn start(
 }
 
 /// The daemon's iroh endpoint, while remote access is on.
+/// The loopback listener tunnels publish: the gateway as it is served off
+/// this computer ([`aidaemon_client_gateway::exposed_router`]).
+static EXPOSED: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
+
+/// Where a tunnel adapter should forward the Client Gateway to, once the
+/// gateway is up. Never the loopback listener, where the local token works.
+pub(crate) fn exposed_addr() -> Option<std::net::SocketAddr> {
+    EXPOSED.get().copied()
+}
+
+/// Serve the gateway for tunnels on a loopback port of its own. A failure
+/// leaves nothing to expose: tunnels stay down rather than publish the
+/// listener the local token works on.
+async fn start_exposed(gateway: Arc<ClientGateway>) {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(%error, "Client Gateway not exposable: no tunnel listener");
+            return;
+        }
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return;
+    };
+    let _ = EXPOSED.set(addr);
+    tracing::info!(%addr, "Client Gateway tunnel listener");
+    tokio::spawn(async move {
+        let app = aidaemon_client_gateway::exposed_router(gateway);
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(%error, "Client Gateway tunnel listener stopped");
+        }
+    });
+}
+
 static REMOTE: std::sync::OnceLock<Arc<aidaemon_remote::RemoteListener>> =
     std::sync::OnceLock::new();
 
@@ -1316,9 +1353,11 @@ fn remote_relays(config: &ClientGatewayConfig) -> anyhow::Result<aidaemon_remote
 }
 
 /// `[client_gateway.remote]`: the gateway over iroh, for the owner's apps
-/// anywhere, behind the peer guard (pairing and sign-in for any key, the
-/// rest only with a token issued to that key). Pairing links carry its
-/// address once it is online. A failure leaves the loopback gateway
+/// anywhere. The handshake admits only the endpoint keys of paired devices
+/// (any key while a pairing is open: [`aidaemon_client_gateway::Pairing::admits`]);
+/// behind it the peer guard opens pairing and sign-in to an admitted key
+/// and the rest only with a token issued to that key. Pairing links carry
+/// its address once it is online. A failure leaves the loopback gateway
 /// serving.
 async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>) {
     let key_path = aidaemon_client_gateway::token::token_file(config).with_file_name("remote-key");
@@ -1326,9 +1365,19 @@ async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>)
         aidaemon_client_gateway::remote_router::<aidaemon_remote::RemotePeer>(gateway.clone());
     let started = async {
         let key = aidaemon_remote::load_or_create_key(&key_path)?;
-        let relays = remote_relays(config)?;
-        aidaemon_remote::RemoteListener::bind(key, &relays, aidaemon_remote::Access::Any, router)
+        // Unread, nobody but an open pairing would be admitted: stay off
+        // rather than admit every key.
+        gateway
+            .pairing()
+            .load_admission()
             .await
+            .map_err(|error| anyhow::anyhow!("remote admission: {}", error.message))?;
+        let relays = remote_relays(config)?;
+        let pairing = gateway.pairing().clone();
+        let access = aidaemon_remote::Access::Only(Arc::new(move |peer| {
+            pairing.admits(&aidaemon_remote::endpoint_hex(peer))
+        }));
+        aidaemon_remote::RemoteListener::bind(key, &relays, access, router).await
     };
     let listener = match started.await {
         Ok(listener) => Arc::new(listener),

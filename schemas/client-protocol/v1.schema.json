@@ -858,6 +858,13 @@
       "properties": {
         "device_id": {
           "type": "string"
+        },
+        "endpoint": {
+          "description": "The endpoint key (64 hex digits) this device dials the daemon's\npeer-to-peer address with, recorded once the sign-in verifies so\nthat address admits it. Absent from clients that have none.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

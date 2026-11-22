@@ -9,7 +9,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{EndpointAddr, EndpointId, Relays, RemoteUrl, SecretKey, bind};
 
@@ -44,6 +44,12 @@ impl fmt::Debug for Access {
 /// The key of the peer a request came from, as a request extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RemotePeer(pub EndpointId);
+
+impl AsRef<[u8]> for RemotePeer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
 
 /// Serves a router to the peers [`Access`] lets in.
 pub struct RemoteListener {
@@ -144,6 +150,7 @@ pub fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<SecretKey> {
                 .trim()
                 .parse()
                 .with_context(|| format!("{} holds no endpoint key", path.display()))?;
+            keep_owner_only(path)?;
             Ok(key)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -156,6 +163,28 @@ pub fn load_or_create_key(path: &std::path::Path) -> anyhow::Result<SecretKey> {
         Err(error) => Err(error)
             .with_context(|| format!("could not read the endpoint key at {}", path.display())),
     }
+}
+
+/// Narrow a key file others can read (copied, restored from a backup) back
+/// to owner-only: whoever reads it can answer as this daemon.
+fn keep_owner_only(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            warn!(
+                path = %path.display(),
+                mode = format!("{:o}", mode & 0o777),
+                "The endpoint key was readable by others; narrowed to owner-only"
+            );
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("could not narrow {}", path.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -202,6 +231,20 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_others_can_read_is_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote-key");
+        let first = load_or_create_key(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let again = load_or_create_key(&path).unwrap();
+        assert_eq!(first.public(), again.public());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

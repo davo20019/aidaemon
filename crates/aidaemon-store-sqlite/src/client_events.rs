@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS client_devices (
     last_seen_ms  INTEGER,
     revoked_at_ms INTEGER
 );
+CREATE TABLE IF NOT EXISTS client_device_endpoints (
+    device_id TEXT NOT NULL,
+    endpoint  TEXT NOT NULL,
+    at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (device_id, endpoint)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS client_endpoint_admission (
+    one      INTEGER PRIMARY KEY CHECK (one = 1),
+    since_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS client_upgrades (
     name TEXT PRIMARY KEY NOT NULL
 );
@@ -532,6 +542,90 @@ impl SqliteClientEventLog {
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)
+    }
+
+    /// Record that `device_id` dials over a peer-to-peer transport with
+    /// endpoint key `endpoint` (hex).
+    pub async fn add_device_endpoint(
+        &self,
+        device_id: &str,
+        endpoint: &str,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO client_device_endpoints (device_id, endpoint, at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT (device_id, endpoint) DO UPDATE SET at_ms = excluded.at_ms",
+        )
+        .bind(device_id)
+        .bind(endpoint)
+        .bind(to_i64(now_ms))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The endpoint keys of active (unrevoked) devices.
+    pub async fn active_device_endpoints(&self) -> Result<Vec<String>, Error> {
+        let rows = sqlx::query(
+            "SELECT e.endpoint FROM client_device_endpoints e
+             JOIN client_devices d ON d.device_id = e.device_id
+             WHERE d.revoked_at_ms IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|row| row.get("endpoint")).collect())
+    }
+
+    /// When this database started recording endpoint keys (`now_ms` the
+    /// first time it is asked). Devices paired before then may have none.
+    pub async fn endpoint_admission_since(&self, now_ms: u64) -> Result<u64, Error> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO client_endpoint_admission (one, since_ms) VALUES (1, ?1)",
+        )
+        .bind(to_i64(now_ms))
+        .execute(&self.pool)
+        .await?;
+        let row = sqlx::query("SELECT since_ms FROM client_endpoint_admission WHERE one = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(to_u64(row.get("since_ms")))
+    }
+
+    /// Active devices paired before `before_ms`, of a kind other than
+    /// `except_kind`, with no endpoint key recorded yet: (id, name).
+    pub async fn unrecorded_devices(
+        &self,
+        before_ms: u64,
+        except_kind: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let rows = sqlx::query(
+            "SELECT d.device_id, d.name FROM client_devices d
+             WHERE d.revoked_at_ms IS NULL AND d.created_at_ms < ?1 AND d.kind <> ?2
+               AND NOT EXISTS (SELECT 1 FROM client_device_endpoints e
+                               WHERE e.device_id = d.device_id)
+             ORDER BY d.created_at_ms",
+        )
+        .bind(to_i64(before_ms))
+        .bind(except_kind)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get("device_id"), row.get("name")))
+            .collect())
+    }
+
+    /// The latest expiry among offers still open or waiting for the owner
+    /// at `now_ms`.
+    pub async fn open_offers_until(&self, now_ms: u64) -> Result<Option<u64>, Error> {
+        let row = sqlx::query(
+            "SELECT MAX(expires_at_ms) AS until FROM client_pairing
+             WHERE status IN ('open', 'pending') AND expires_at_ms > ?1",
+        )
+        .bind(to_i64(now_ms))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<Option<i64>, _>("until").map(to_u64))
     }
 
     pub async fn touch_device(&self, device_id: &str, now_ms: u64) -> Result<(), Error> {

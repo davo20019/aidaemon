@@ -1620,6 +1620,7 @@ fn http_samples() -> Vec<(&'static str, Value)> {
                 challenge_id: "ch-1".into(),
                 nonce: "n0nce".into(),
                 expires_at_ms: 1_767_225_660_000,
+                endpoint: None,
             })
             .unwrap(),
         ),

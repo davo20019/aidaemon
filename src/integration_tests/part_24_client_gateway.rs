@@ -578,6 +578,7 @@ mod client_gateway {
             http.post(format!("{base}/client/v1/sessions/challenge"))
                 .json(&ChallengeRequest {
                     device_id: device_id.clone(),
+                    endpoint: None,
                 })
                 .send()
                 .await

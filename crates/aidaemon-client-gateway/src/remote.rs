@@ -8,8 +8,11 @@
 //! - the owner's local token is refused: it is for this machine.
 //!
 //! The transport puts the peer's key on each request as an extension of
-//! type `P` (`aidaemon_remote::RemotePeer`); a request without one is
-//! refused. The gateway's own sign-in then decides as on loopback.
+//! type `P` (`aidaemon_remote::RemotePeer`, its bytes through `AsRef`); a
+//! request without one is refused. The gateway's own sign-in then decides
+//! as on loopback, and a sign-in that succeeds records the peer's key as
+//! the device's, so the transport admits it from then on
+//! ([`crate::pairing::Pairing::admits`]).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -87,12 +90,12 @@ fn before_sign_in(method: &Method, path: &str) -> bool {
 /// each request's peer key on it as a `P` extension.
 pub fn remote_router<P>(gateway: Arc<ClientGateway>) -> Router
 where
-    P: Clone + Eq + Hash + Send + Sync + 'static,
+    P: Clone + Eq + Hash + AsRef<[u8]> + Send + Sync + 'static,
 {
     let bindings = Arc::new(Bindings::<P> {
         tokens: Mutex::default(),
     });
-    crate::router(gateway.clone()).layer(axum::middleware::from_fn_with_state(
+    crate::exposed_router(gateway.clone()).layer(axum::middleware::from_fn_with_state(
         (gateway, bindings),
         guard::<P>,
     ))
@@ -106,7 +109,7 @@ async fn guard<P>(
     next: Next,
 ) -> Response
 where
-    P: Clone + Eq + Hash + Send + Sync + 'static,
+    P: Clone + Eq + Hash + AsRef<[u8]> + Send + Sync + 'static,
 {
     let Some(peer) = request.extensions().get::<P>().cloned() else {
         return error_response(
@@ -119,7 +122,7 @@ where
     if before_sign_in(&method, &path) {
         let response = next.run(request).await;
         if method == Method::POST && path == "/client/v1/sessions" {
-            return bind_grant(response, &bindings, peer).await;
+            return bind_grant(response, &gateway, &bindings, peer).await;
         }
         return response;
     }
@@ -143,8 +146,9 @@ where
 }
 
 /// Read a successful sign-in reply and tie its token to `peer`.
-async fn bind_grant<P: Clone + Eq>(
+async fn bind_grant<P: Clone + Eq + AsRef<[u8]>>(
     response: Response,
+    gateway: &ClientGateway,
     bindings: &Bindings<P>,
     peer: P,
 ) -> Response {
@@ -156,6 +160,12 @@ async fn bind_grant<P: Clone + Eq>(
         return error_response(ErrorCode::Internal, "The sign-in reply could not be read");
     };
     if let Ok(grant) = serde_json::from_slice::<AccessGrant>(&bytes) {
+        // A client too old to name its endpoint at sign-in is admitted by
+        // the one it signed in from.
+        gateway
+            .pairing
+            .record_endpoint(&grant.device_id, &hex::encode(peer.as_ref()))
+            .await;
         bindings.bind(&grant.access_token, peer, grant.expires_at_ms);
     }
     Response::from_parts(parts, Body::from(bytes))

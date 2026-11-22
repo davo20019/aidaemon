@@ -165,12 +165,25 @@ pub async fn sign_in_as(
     device_id: &str,
     signer: &impl Signer,
 ) -> Result<AccessGrant, SignInError> {
+    sign_in_from(http, gateway, device_id, signer, None).await
+}
+
+/// [`sign_in_as`], naming the endpoint key the device dials the daemon's
+/// peer-to-peer address with, so that address admits it from now on.
+async fn sign_in_from(
+    http: &impl Http,
+    gateway: &str,
+    device_id: &str,
+    signer: &impl Signer,
+    endpoint: Option<String>,
+) -> Result<AccessGrant, SignInError> {
     let challenge: Challenge = post(
         http,
         gateway,
         "/client/v1/sessions/challenge",
         &ChallengeRequest {
             device_id: device_id.to_owned(),
+            endpoint,
         },
     )
     .await?;
@@ -198,7 +211,11 @@ pub async fn sign_in_with(
     device: &StoredDevice,
 ) -> Result<AccessGrant, SignInError> {
     let key = DeviceKey::from_stored(device).map_err(|e| SignInError::Refused(e.to_string()))?;
-    sign_in_as(http, &device.gateway, &device.device_id, &key).await
+    #[cfg(feature = "remote")]
+    let endpoint = crate::remote::device_endpoint(device);
+    #[cfg(not(feature = "remote"))]
+    let endpoint = None;
+    sign_in_from(http, &device.gateway, &device.device_id, &key, endpoint).await
 }
 
 /// What a pairing needs: the offer from the owner's `/pair_device` or

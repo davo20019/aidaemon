@@ -102,6 +102,34 @@ struct PendingChallenge {
     device_id: String,
     nonce: String,
     expires_at_ms: u64,
+    /// The endpoint key the device says it dials with, recorded once the
+    /// signature verifies.
+    endpoint: Option<String>,
+}
+
+/// Who the peer-to-peer listener lets past its handshake.
+#[derive(Default)]
+struct Admission {
+    /// Endpoint keys (hex) of active devices.
+    known: HashSet<String>,
+    /// Any key until then: an offer is open, or a device just paired and
+    /// has not signed in yet.
+    open_until_ms: u64,
+    /// Devices paired before endpoint keys were recorded that have not
+    /// signed in since: any key, until each has (or is revoked).
+    unrecorded: usize,
+}
+
+impl Admission {
+    fn admits(&self, endpoint: &str, now_ms: u64) -> bool {
+        self.known.contains(endpoint) || now_ms < self.open_until_ms || self.unrecorded > 0
+    }
+}
+
+/// An endpoint key as sign-in names it: 64 lowercase hex digits.
+fn endpoint_of(text: &str) -> Option<String> {
+    let text = text.trim().to_ascii_lowercase();
+    (text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())).then_some(text)
 }
 
 pub struct Pairing {
@@ -124,6 +152,7 @@ pub struct Pairing {
     revocations: Mutex<HashMap<String, CancellationToken>>,
     /// The ceiling a watch gets unless the owner sets another.
     watch_ceiling: Risk,
+    admission: Mutex<Admission>,
 }
 
 fn scopes_text(scopes: &[Scope]) -> String {
@@ -257,6 +286,84 @@ impl Pairing {
             challenges: Mutex::default(),
             revocations: Mutex::default(),
             watch_ceiling,
+            admission: Mutex::default(),
+        }
+    }
+
+    /// Read who the peer-to-peer listener admits from the database: the
+    /// endpoint keys of active devices, offers still open, and devices
+    /// paired before keys were recorded.
+    pub async fn load_admission(&self) -> Result<(), ProtocolError> {
+        let now = now_ms();
+        let known = self.log.active_device_endpoints().await.map_err(internal)?;
+        let open_until = self.log.open_offers_until(now).await.map_err(internal)?;
+        let since = self
+            .log
+            .endpoint_admission_since(now)
+            .await
+            .map_err(internal)?;
+        // A browser never dials a peer-to-peer address, so it is never
+        // waited for.
+        let unrecorded = self
+            .log
+            .unrecorded_devices(since, &kind_text(ClientKind::Web))
+            .await
+            .map_err(internal)?;
+        if !unrecorded.is_empty() {
+            let names: Vec<&str> = unrecorded.iter().map(|(_, name)| name.as_str()).collect();
+            warn!(
+                devices = %names.join(", "),
+                "Remote access admits any key until these devices sign in once with an \
+                 updated app (or are revoked)"
+            );
+        }
+        let mut admission = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        admission.known = known.into_iter().collect();
+        admission.open_until_ms = admission.open_until_ms.max(open_until.unwrap_or(0));
+        admission.unrecorded = unrecorded.len();
+        Ok(())
+    }
+
+    /// Whether the peer-to-peer listener lets endpoint key `endpoint`
+    /// (hex) through its handshake. The gateway's sign-in still decides
+    /// every request of a key let in.
+    pub fn admits(&self, endpoint: &str) -> bool {
+        self.admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admits(endpoint, now_ms())
+    }
+
+    /// Any key until `until_ms`: a device is pairing.
+    fn open_admission_until(&self, until_ms: u64) {
+        let mut admission = self.admission.lock().unwrap_or_else(|p| p.into_inner());
+        admission.open_until_ms = admission.open_until_ms.max(until_ms);
+    }
+
+    /// Admit `endpoint` as `device_id`'s from now on.
+    pub(crate) async fn record_endpoint(&self, device_id: &str, endpoint: &str) {
+        let Some(endpoint) = endpoint_of(endpoint) else {
+            return;
+        };
+        let known = self
+            .admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .known
+            .contains(&endpoint);
+        if known {
+            return;
+        }
+        if let Err(error) = self
+            .log
+            .add_device_endpoint(device_id, &endpoint, now_ms())
+            .await
+        {
+            warn!(%error, "Could not record a device's endpoint key");
+            return;
+        }
+        if let Err(error) = self.load_admission().await {
+            warn!(error = %error.message, "Could not reload remote admission");
         }
     }
 
@@ -287,6 +394,7 @@ impl Pairing {
         let code = new_code();
         let now = now_ms();
         let expires_at_ms = now + ms(OFFER_TTL);
+        self.open_admission_until(expires_at_ms);
         self.log
             .create_offer(&PairingRow {
                 offer_id: offer_id.clone(),
@@ -507,6 +615,8 @@ impl Pairing {
                     .map_err(internal)?;
                 return Err(ProtocolError::new(ErrorCode::Conflict, "Already settled"));
             }
+            // The new device signs in next, from a key not known yet.
+            self.open_admission_until(now_ms() + ms(OFFER_TTL));
             info!(device_id, "Paired a client device");
         } else {
             self.log
@@ -541,7 +651,11 @@ impl Pairing {
         })
     }
 
-    pub async fn challenge(&self, device_id: &str) -> Result<Challenge, ProtocolError> {
+    pub async fn challenge(
+        &self,
+        device_id: &str,
+        endpoint: Option<&str>,
+    ) -> Result<Challenge, ProtocolError> {
         let device = self.active_device(device_id).await?;
         let challenge_id = format!("ch-{}", &random_hex()[..20]);
         let nonce = random_hex();
@@ -567,6 +681,7 @@ impl Pairing {
                 device_id: device.device_id,
                 nonce: nonce.clone(),
                 expires_at_ms,
+                endpoint: endpoint.and_then(endpoint_of),
             },
         );
         Ok(Challenge {
@@ -654,6 +769,9 @@ impl Pairing {
             );
         }
         let _ = self.log.touch_device(&device.device_id, now_ms()).await;
+        if let Some(endpoint) = &challenge.endpoint {
+            self.record_endpoint(&device.device_id, endpoint).await;
+        }
         Ok(AccessGrant {
             access_token: token,
             expires_at_ms,
@@ -800,6 +918,9 @@ impl Pairing {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|_, a| a.principal.device_id.as_deref() != Some(device_id));
+        if let Err(error) = self.load_admission().await {
+            warn!(error = %error.message, "Could not reload remote admission");
+        }
         Ok(revoked)
     }
 }
@@ -807,6 +928,120 @@ impl Pairing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn pairing() -> Pairing {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let log = SqliteClientEventLog::open(pool).await.unwrap();
+        Pairing::new(
+            log,
+            None,
+            crate::PublicUrl {
+                endpoints: aidaemon_core::EndpointSource::fixed(Vec::new()),
+                fallback: "http://127.0.0.1:8788".into(),
+            },
+            Risk::Low,
+        )
+    }
+
+    fn device(id: &str, kind: &str, created_at_ms: u64) -> DeviceRow {
+        DeviceRow {
+            device_id: id.into(),
+            name: format!("Synthetic {id}"),
+            kind: kind.into(),
+            public_key: "unused".into(),
+            scopes: "observe".into(),
+            risk_ceiling: None,
+            created_at_ms,
+            last_seen_ms: None,
+            revoked_at_ms: None,
+        }
+    }
+
+    fn close_window(pairing: &Pairing) {
+        pairing
+            .admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .open_until_ms = 0;
+    }
+
+    const PHONE: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
+    const STRANGER: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+
+    #[tokio::test]
+    async fn the_transport_admits_paired_endpoints_and_anyone_only_while_pairing() {
+        let pairing = pairing().await;
+        pairing.load_admission().await.unwrap();
+        assert!(!pairing.admits(STRANGER), "nothing paired, nothing open");
+
+        // An offer opens the door until it expires.
+        let offer = pairing.offer(None).await.unwrap();
+        assert!(pairing.admits(STRANGER));
+        let open_until = pairing.admission.lock().unwrap().open_until_ms;
+        assert_eq!(open_until, offer.expires_at_ms);
+        close_window(&pairing);
+        assert!(!pairing.admits(STRANGER));
+
+        // A device's recorded endpoint is admitted; others are not.
+        pairing
+            .log
+            .add_device(&device("dv-phone", "mobile", now_ms()))
+            .await
+            .unwrap();
+        pairing
+            .record_endpoint("dv-phone", &PHONE.to_uppercase())
+            .await;
+        // Reading the database again keeps the still-open offer open.
+        assert!(pairing.admits(STRANGER));
+        close_window(&pairing);
+        assert!(pairing.admits(PHONE));
+        assert!(!pairing.admits(STRANGER));
+        // Not hex, or the wrong length: never recorded.
+        pairing.record_endpoint("dv-phone", "not-an-endpoint").await;
+        assert_eq!(pairing.admission.lock().unwrap().known.len(), 1);
+
+        // Revoking the device closes its endpoint too.
+        pairing.revoke("dv-phone").await.unwrap();
+        close_window(&pairing);
+        assert!(!pairing.admits(PHONE));
+    }
+
+    #[tokio::test]
+    async fn devices_paired_before_endpoints_were_recorded_keep_the_door_open_until_seen() {
+        let pairing = pairing().await;
+        pairing
+            .log
+            .add_device(&device("dv-old-phone", "mobile", 1))
+            .await
+            .unwrap();
+        // A browser never dials peer to peer: it is not waited for.
+        pairing
+            .log
+            .add_device(&device("dv-old-browser", "web", 1))
+            .await
+            .unwrap();
+        pairing.load_admission().await.unwrap();
+        assert!(
+            pairing.admits(STRANGER),
+            "the old phone has not signed in yet"
+        );
+        pairing.record_endpoint("dv-old-phone", PHONE).await;
+        assert!(pairing.admits(PHONE));
+        assert!(!pairing.admits(STRANGER));
+
+        // A device paired after recording began is never waited for.
+        pairing
+            .log
+            .add_device(&device("dv-new", "mobile", now_ms() + 1))
+            .await
+            .unwrap();
+        pairing.load_admission().await.unwrap();
+        assert!(!pairing.admits(STRANGER));
+    }
 
     #[test]
     fn codes_read_back_whatever_their_case_or_dashes() {

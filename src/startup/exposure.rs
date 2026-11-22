@@ -71,13 +71,15 @@ pub fn start(
 ) -> Option<ExposureSupervisor> {
     let mut listeners = ServiceListeners::new();
     if config.client_gateway.enabled {
-        match config.client_gateway.bind_addr() {
-            Ok(addr) => {
+        // The tunnel listener, never the loopback one the local token works
+        // on.
+        match crate::startup::client_gateway::exposed_addr() {
+            Some(addr) => {
                 if let Err(error) = listeners.register(ExposedService::ClientGateway, addr) {
                     tracing::warn!(%error, "Client Gateway listener not exposable");
                 }
             }
-            Err(error) => tracing::warn!(%error, "Client Gateway listener not exposable"),
+            None => tracing::warn!("Client Gateway not exposable: its tunnel listener is down"),
         }
     }
     if config.nodes.gateway.enabled

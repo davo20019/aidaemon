@@ -89,7 +89,7 @@ pub use config::ClientGatewayConfig;
 pub use observer::{AppChannel, AppSurface, GatewayObserver, Ids};
 pub use pairing::{Pairing, Principal};
 pub use remote::remote_router;
-pub use server::{router, serve};
+pub use server::{exposed_router, local_router, router, serve};
 pub use views::{ViewError, ViewTargets};
 
 /// The hub channel and turn platform name of the app.

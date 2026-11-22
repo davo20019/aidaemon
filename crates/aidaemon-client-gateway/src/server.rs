@@ -147,13 +147,75 @@ async fn file(
     response
 }
 
-/// Listen on the configured loopback address until the process ends.
+/// Listen on the configured loopback address until the process ends. A
+/// request a reverse proxy forwarded is served as [`exposed_router`]
+/// serves it.
 pub async fn serve(gateway: Arc<ClientGateway>) -> anyhow::Result<()> {
     let addr = gateway.config.bind_addr()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "Client Gateway listening");
-    axum::serve(listener, router(gateway)).await?;
+    axum::serve(listener, local_router(gateway)).await?;
     Ok(())
+}
+
+/// The gateway's routes as its loopback listener serves them: the local
+/// token works, except on a request a reverse proxy forwarded.
+pub fn local_router(gateway: Arc<ClientGateway>) -> Router {
+    router(gateway.clone()).layer(axum::middleware::from_fn_with_state(
+        (gateway, false),
+        exposed_guard,
+    ))
+}
+
+/// Marks a request that came from off this computer (a tunnel, a reverse
+/// proxy, a peer-to-peer transport): the owner's local token is refused on
+/// it, in the header and in a socket's `hello` alike.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Exposed;
+
+/// The gateway's routes as a tunnel serves them: the local token, which is
+/// for this computer only, is refused; paired devices sign in as anywhere.
+/// Tunnel adapters publish a listener serving this, never the loopback one.
+pub fn exposed_router(gateway: Arc<ClientGateway>) -> Router {
+    router(gateway.clone()).layer(axum::middleware::from_fn_with_state(
+        (gateway, true),
+        exposed_guard,
+    ))
+}
+
+/// Whether a reverse proxy forwarded the request. Machine format: standard
+/// proxy headers, which a proxy adds and a client behind it cannot take
+/// away; a client on this computer sends none.
+fn forwarded(headers: &HeaderMap) -> bool {
+    const PROXY_HEADERS: [&str; 6] = [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "tailscale-user-login",
+    ];
+    PROXY_HEADERS.iter().any(|name| headers.contains_key(*name))
+}
+
+async fn exposed_guard(
+    State((gateway, always)): State<(Arc<ClientGateway>, bool)>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let exposed =
+        always || request.extensions().get::<Exposed>().is_some() || forwarded(request.headers());
+    if !exposed {
+        return next.run(request).await;
+    }
+    if principal(&gateway, bearer(request.headers())).is_some_and(|p| p.is_owner()) {
+        return error_response(
+            ErrorCode::Unauthorized,
+            "The local token works on this computer only; sign in as a paired device",
+        );
+    }
+    request.extensions_mut().insert(Exposed);
+    next.run(request).await
 }
 
 pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -399,7 +461,10 @@ async fn challenge(
         Ok(request) => request,
         Err(refused) => return refused,
     };
-    let result = gateway.pairing.challenge(&request.device_id).await;
+    let result = gateway
+        .pairing
+        .challenge(&request.device_id, request.endpoint.as_deref())
+        .await;
     match &result {
         Ok(_) => tracing::info!(device = %request.device_id, "Device sign-in: challenge sent"),
         Err(error) => tracing::warn!(
@@ -805,9 +870,11 @@ async fn http_events(
 
 async fn websocket(
     State(gateway): State<Arc<ClientGateway>>,
+    exposed: Option<axum::Extension<Exposed>>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let exposed = exposed.is_some();
     // A token in the header is checked now; without one, `hello` must
     // carry it.
     let by_header = match bearer(&headers) {
@@ -822,7 +889,7 @@ async fn websocket(
     upgrade
         .max_message_size(MAX_COMMAND)
         .on_upgrade(move |socket| async move {
-            if let Err(error) = run_socket(gateway, socket, by_header).await {
+            if let Err(error) = run_socket(gateway, socket, by_header, exposed).await {
                 debug!(%error, "Client socket closed");
             }
         })
@@ -851,6 +918,7 @@ async fn run_socket(
     gateway: Arc<ClientGateway>,
     mut socket: WebSocket,
     by_header: Option<Principal>,
+    exposed: bool,
 ) -> anyhow::Result<()> {
     let accepted = tokio::time::Instant::now();
     let hello = match tokio::time::timeout(HELLO_WITHIN, socket.recv()).await {
@@ -876,6 +944,14 @@ async fn run_socket(
         )
         .await;
     };
+    if exposed && principal.is_owner() {
+        return refuse(
+            &mut socket,
+            ErrorCode::Unauthorized,
+            "The local token works on this computer only; sign in as a paired device",
+        )
+        .await;
+    }
     if !principal.may(Scope::Observe) {
         return refuse(
             &mut socket,

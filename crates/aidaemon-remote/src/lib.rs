@@ -49,7 +49,7 @@ const HOST: &str = "aidaemon.remote";
 pub type RemoteStream = tokio::io::Join<RecvStream, SendStream>;
 
 /// Which relays an endpoint uses to be found and to fall back on.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Relays {
     /// n0's public relays.
     #[default]
@@ -111,6 +111,23 @@ impl RemoteUrl {
         Some(Self { id, relay })
     }
 
+    /// The relays a client reaching this daemon should use: n0's when the
+    /// daemon's home relay is one of them or unknown, else only the
+    /// daemon's own, so a daemon on self-hosted relays never puts the
+    /// devices that reach it on n0's.
+    pub fn dial_relays(&self) -> Relays {
+        fn host(url: &RelayUrl) -> Option<String> {
+            url.host_str()
+                .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        }
+        match &self.relay {
+            Some(relay) if !Relays::N0.urls().iter().any(|n0| host(n0) == host(relay)) => {
+                Relays::Custom(vec![relay.clone()])
+            }
+            _ => Relays::N0,
+        }
+    }
+
     /// Where to dial: the key, the relay hint, and every relay in `relays`.
     pub fn addr(&self, relays: &Relays) -> EndpointAddr {
         let mut addr = EndpointAddr::new(self.id);
@@ -132,6 +149,12 @@ impl fmt::Display for RemoteUrl {
         }
         Ok(())
     }
+}
+
+/// An endpoint key as 64 hex digits: how a gateway that does not link iroh
+/// records it.
+pub fn endpoint_hex(id: &EndpointId) -> String {
+    id.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// An endpoint key derived from `seed` (a device's own secret key): the
@@ -319,6 +342,28 @@ impl std::error::Error for WebSocketError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_self_hosted_relay_keeps_clients_off_n0() {
+        let id = SecretKey::generate().public();
+        let own = RemoteUrl::parse(&format!("iroh://{id}@relay.example.test")).unwrap();
+        match own.dial_relays() {
+            Relays::Custom(urls) => {
+                assert_eq!(urls.len(), 1);
+                assert_eq!(urls[0].host_str(), Some("relay.example.test"));
+            }
+            other => panic!("expected the daemon's own relay, got {other:?}"),
+        }
+        let bare = RemoteUrl::parse(&format!("iroh://{id}")).unwrap();
+        assert_eq!(bare.dial_relays(), Relays::N0);
+        let n0 = Relays::N0.urls()[0].clone();
+        let on_n0 = RemoteUrl::parse(&format!(
+            "iroh://{id}@{}",
+            n0.host_str().unwrap().trim_end_matches('.')
+        ))
+        .unwrap();
+        assert_eq!(on_n0.dial_relays(), Relays::N0);
+    }
 
     #[test]
     fn a_remote_url_reads_back_and_ignores_its_path() {

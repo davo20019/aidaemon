@@ -64,11 +64,20 @@ impl Dialer {
     }
 }
 
+/// The endpoint key (hex) a paired `device` dials with, as sign-in names
+/// it; `None` when its stored key is damaged.
+pub fn device_endpoint(device: &StoredDevice) -> Option<String> {
+    let key = Dialer::for_device(device).ok()?.key();
+    Some(aidaemon_remote::endpoint_hex(&key.public()))
+}
+
 type Key = [u8; 32];
 
-/// One endpoint per key.
-fn clients() -> &'static Mutex<HashMap<Key, Arc<RemoteClient>>> {
-    static CLIENTS: OnceLock<Mutex<HashMap<Key, Arc<RemoteClient>>>> = OnceLock::new();
+type Clients = Mutex<HashMap<(Key, Relays), Arc<RemoteClient>>>;
+
+/// One endpoint per key and relay set.
+fn clients() -> &'static Clients {
+    static CLIENTS: OnceLock<Clients> = OnceLock::new();
     CLIENTS.get_or_init(Mutex::default)
 }
 
@@ -113,22 +122,26 @@ pub(crate) async fn connection(
     {
         return Ok(conn.clone());
     }
+    // The daemon's own relays when it runs them: n0 never learns which
+    // devices reach it.
+    let relays = url.dial_relays();
     let client = {
         let mut clients = clients().lock().await;
-        match clients.get(&slot.0) {
+        let client_slot = (slot.0, relays.clone());
+        match clients.get(&client_slot) {
             Some(client) => client.clone(),
             None => {
                 let client = Arc::new(
-                    RemoteClient::bind(key, &Relays::N0)
+                    RemoteClient::bind(key, &relays)
                         .await
                         .map_err(|e| SignInError::Failed(format!("{e:#}")))?,
                 );
-                clients.insert(slot.0, client.clone());
+                clients.insert(client_slot, client.clone());
                 client
             }
         }
     };
-    let mut addr = url.addr(&Relays::N0);
+    let mut addr = url.addr(&relays);
     if let Some(known) = learned()
         .lock()
         .unwrap_or_else(|p| p.into_inner())

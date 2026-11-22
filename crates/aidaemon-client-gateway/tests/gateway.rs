@@ -366,7 +366,7 @@ async fn fixture_after(risk: RiskLevel, earlier: &[(&str, Event)]) -> Fixture {
     .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let app = aidaemon_client_gateway::router(gateway.clone());
+    let app = aidaemon_client_gateway::local_router(gateway.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Fixture {
         gateway,
@@ -1743,6 +1743,7 @@ impl Fixture {
             .post(format!("http://{}/client/v1/sessions/challenge", self.url))
             .json(&ChallengeRequest {
                 device_id: device.device_id.clone(),
+                endpoint: None,
             })
             .send()
             .await
@@ -1777,6 +1778,112 @@ impl Fixture {
             .await
             .unwrap()
     }
+}
+
+/// Through a tunnel the owner's local token, which is for this computer,
+/// is refused in the header and in a socket's `hello`; on the loopback
+/// listener it is refused too once a reverse proxy forwarded the request.
+/// A paired device signs in and works as anywhere.
+#[tokio::test]
+async fn a_tunnel_takes_paired_devices_never_the_local_token() {
+    let f = fixture(RiskLevel::Medium).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tunnel = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let app = aidaemon_client_gateway::exposed_router(f.gateway.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let glance = |url: &str, token: &str| {
+        reqwest::Client::new()
+            .post(format!("http://{url}/client/v1/commands"))
+            .bearer_auth(token)
+            .json(&command("r-tunnel", Command::GetGlance))
+    };
+
+    assert_eq!(glance(&f.url, &f.token).send().await.unwrap().status(), 200);
+    assert_eq!(
+        glance(&tunnel, &f.token).send().await.unwrap().status(),
+        401
+    );
+    let forwarded = glance(&f.url, &f.token)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forwarded.status(), 401);
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{tunnel}/client/v1/ws"))
+        .await
+        .unwrap();
+    let hello = ClientFrame::Hello {
+        version: ProtocolVersion::CURRENT,
+        client: ClientInfo {
+            kind: ClientKind::Web,
+            name: "test".into(),
+            version: None,
+            device: None,
+        },
+        capabilities: Vec::new(),
+        resume_from: None,
+        token: Some(f.token.clone()),
+    };
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::text(
+            serde_json::to_string(&hello).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap();
+    let frame: ServerFrame = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+    assert!(
+        matches!(
+            frame,
+            ServerFrame::Error { ref error, .. } if error.code == ErrorCode::Unauthorized
+        ),
+        "{frame:?}"
+    );
+
+    let phone = f.pair(vec![Scope::Observe, Scope::Chat]).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let works = glance(&tunnel, &grant.access_token).send().await.unwrap();
+    assert_eq!(works.status(), 200);
+}
+
+/// The daemon's iroh handshake admits only what pairing admits: a stranger
+/// is dropped while nothing is pairing, and let through to pair while an
+/// offer is open.
+#[tokio::test]
+async fn over_iroh_a_stranger_is_dropped_unless_a_pairing_is_open() {
+    use aidaemon_remote::{Access, Relays, RemoteClient, RemoteListener, RemotePeer, SecretKey};
+    let f = fixture(RiskLevel::Medium).await;
+    f.gateway.pairing().load_admission().await.unwrap();
+    let pairing = f.gateway.pairing().clone();
+    let listener = RemoteListener::bind(
+        SecretKey::generate(),
+        &Relays::Disabled,
+        Access::Only(Arc::new(move |peer| {
+            pairing.admits(&aidaemon_remote::endpoint_hex(peer))
+        })),
+        aidaemon_client_gateway::remote_router::<RemotePeer>(f.gateway.clone()),
+    )
+    .await
+    .unwrap();
+
+    let stranger = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
+        .await
+        .unwrap();
+    let dropped = match stranger.connect(listener.addr()).await {
+        Ok(conn) => conn.send(glance_request("acs_none")).await.is_err(),
+        Err(_) => true,
+    };
+    assert!(dropped, "a stranger got past the handshake");
+
+    f.gateway.pairing().offer(None).await.unwrap();
+    let pairer = RemoteClient::bind(SecretKey::generate(), &Relays::Disabled)
+        .await
+        .unwrap();
+    let conn = pairer.connect(listener.addr()).await.unwrap();
+    let response = conn.send(glance_request("acs_none")).await.unwrap();
+    // Through the handshake; the peer guard still wants a sign-in.
+    assert_eq!(response.status(), 401);
 }
 
 #[tokio::test]
