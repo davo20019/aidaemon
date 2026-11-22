@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The app and its CI and release builds use nsh 0.6.1 (fixes to reactive memos, keyed rows and animations).
 - **Android builds publish themselves.** Releases, and the new "Android beta" workflow (run by hand from any branch), build the signed app and upload it to Google Play's internal testing track once a service account key is set (`PLAY_SERVICE_ACCOUNT_JSON`); `scripts/ci-android-package.sh` holds the steps for both.
 
 - **The name is AIDaemon.** The app, messages, help text, README and crate descriptions say AIDaemon. Commands, crate names and the domain stay lowercase `aidaemon`; release file names (`AIdaemon-macos-*.dmg`, `AIdaemon.app`) and the Windows scheduled task keep their current names so downloads and existing installs keep working.
