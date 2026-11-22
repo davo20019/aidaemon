@@ -253,6 +253,9 @@ pub async fn serve_on(
                 continue;
             }
         };
+        // Small request and reply messages: send each at once rather than
+        // wait for the Node's (delayed) acknowledgement of the last one.
+        let _ = tcp.set_nodelay(true);
         let config = match current.read() {
             Ok(c) => c.1.clone(),
             Err(_) => continue,
