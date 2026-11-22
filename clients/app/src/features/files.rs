@@ -553,7 +553,7 @@ fn shown_file(store: Store, link: AttachmentRef, size_bytes: u64) -> View {
             format!("{what}, {}.", size_words(size_bytes)),
         ))
         .child(ui::btn("Open", Variant::Secondary, Size::Md, move || {
-            drop(open_url(url.clone()));
+            crate::link::open_outside(store, url.clone(), link.name.clone());
         }))
 }
 

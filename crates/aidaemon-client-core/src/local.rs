@@ -63,7 +63,6 @@ pub fn set_data_dir(dir: PathBuf) {
 
 /// Where this client keeps its files: [`set_data_dir`]'s, else
 /// `~/.aidaemon`. (iOS keeps the key in the keychain, not here.)
-#[cfg_attr(target_os = "ios", allow(dead_code))]
 fn data_dir() -> Option<PathBuf> {
     DATA_DIR
         .get()
@@ -142,6 +141,68 @@ pub async fn reachable_base(url: &str, auth: &Auth) -> Result<String, String> {
     }
     let _ = auth;
     Ok(crate::machine::http_base(url))
+}
+
+/// How long a copy kept for another app stays before it is cleared.
+const KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A local copy of the file at `url` (a message's file through the
+/// gateway, or the local bridge), named `name`, for another app to open (a
+/// phone's viewer or share sheet). It is read whole here, so it still opens
+/// once this app is in the background and no longer serves the bridge.
+/// Copies older than a day are cleared on each call. The error is for the
+/// owner.
+pub async fn keep_copy(url: &str, name: &str) -> Result<PathBuf, String> {
+    let dir = data_dir()
+        .ok_or("No folder to keep the file in")?
+        .join("opened");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not keep the file: {e}"))?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age > KEPT_FOR);
+            if old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let response = crate::tls::http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Could not get the file: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not get the file (HTTP {})",
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Could not get the file: {e}"))?;
+    let path = dir.join(file_name(name));
+    std::fs::write(&path, &bytes).map_err(|e| format!("Could not keep the file: {e}"))?;
+    Ok(path)
+}
+
+/// `name` as one file name: no folders, nothing hidden, never empty.
+fn file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_control() || c == ':' { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_start_matches('.').to_string();
+    if cleaned.is_empty() {
+        "file".into()
+    } else {
+        cleaned
+    }
 }
 
 /// Pair with a daemon elsewhere from its pairing `link` and keep the key;
@@ -367,5 +428,59 @@ mod tests {
         assert!(!reachable_elsewhere("http://[::1]:8788"));
         assert!(reachable_elsewhere("https://daemon.example.invalid"));
         assert!(reachable_elsewhere("http://100.64.0.7:8788"));
+    }
+}
+
+#[cfg(test)]
+mod file_name_tests {
+    use super::file_name;
+
+    #[test]
+    fn a_kept_copy_is_named_inside_its_folder() {
+        assert_eq!(file_name("report.pdf"), "report.pdf");
+        assert_eq!(file_name("../../etc/passwd"), "passwd");
+        assert_eq!(file_name("a\\b\\c.pdf"), "c.pdf");
+        assert_eq!(file_name(".hidden"), "hidden");
+        assert_eq!(file_name(""), "file");
+        assert_eq!(file_name(".."), "file");
+    }
+}
+
+#[cfg(test)]
+mod keep_copy_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server answering every request with `reply`, at the returned URL.
+    async fn serve(reply: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = tcp.read(&mut request).await;
+                let _ = tcp.write_all(reply.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_copy_is_kept_for_another_app_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        super::set_data_dir(dir.path().to_path_buf());
+        let ok =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").await;
+        let path = super::keep_copy(&format!("{ok}/client/v1/files/f/s/r.pdf"), "../report.pdf")
+            .await
+            .unwrap();
+        assert_eq!(path, dir.path().join("opened").join("report.pdf"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+
+        let missing =
+            serve("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let error = super::keep_copy(&format!("{missing}/x"), "x.pdf")
+            .await
+            .unwrap_err();
+        assert!(error.contains("404"), "{error}");
     }
 }

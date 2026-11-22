@@ -658,12 +658,19 @@ fn picture_actions(store: Store) -> crate::ui::ViewerActions {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = store;
         ViewerActions {
             save: ViewerAction {
-                label: "Open in browser",
+                // A phone hands over a copy (the browser would load the
+                // link from this app's bridge, gone once it is behind).
+                label: if crate::link::MOBILE {
+                    "Open in…"
+                } else {
+                    "Open in browser"
+                },
                 glyph: Glyph::External,
-                run: Rc::new(|shown: &Viewed| drop(nsh_core::prelude::open_url(shown.url.clone()))),
+                run: Rc::new(move |shown: &Viewed| {
+                    crate::link::open_outside(store, shown.url.clone(), shown.name.clone())
+                }),
             },
             share: None,
             can_mark_up: Rc::new(|| false),

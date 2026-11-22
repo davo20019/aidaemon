@@ -107,6 +107,36 @@ pub fn start(store: Store) {
     });
 }
 
+/// [`super::open_outside`] here: a desktop opens the link (the app, and
+/// so the bridge, stays up); a phone keeps a copy, then hands it over.
+pub fn open_outside(store: Store, url: String, name: String) {
+    if !super::MOBILE {
+        drop(open_url(url));
+        return;
+    }
+    spawn(async move {
+        let kept = background(async move { local::keep_copy(&url, &name).await }).await;
+        let path = match kept {
+            Ok(Ok(path)) => path,
+            Ok(Err(why)) => return store.say(why),
+            Err(_) => return store.say("Could not open the file"),
+        };
+        // iOS opens no local path for another app; its share sheet does
+        // (Open in, Save to Files, Books).
+        #[cfg(target_os = "ios")]
+        if share(nsh_core::share::ShareRequest::new().file(path))
+            .await
+            .is_err()
+        {
+            store.say("Could not open the file");
+        }
+        #[cfg(not(target_os = "ios"))]
+        if let Err(why) = open_path(path).await {
+            store.say(format!("Could not open the file: {why}"));
+        }
+    });
+}
+
 /// Forget this device's pairing (the daemon refused its key) and show the
 /// screen to pair again. Only a paired device: the owner's local token is
 /// renewed by the daemon, not here.

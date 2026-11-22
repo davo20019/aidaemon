@@ -174,6 +174,21 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
     web::open_live(store, epoch, url, ticket);
 }
 
+/// Open a message's file (`url`, named `name`) in another app: the link
+/// itself on a desktop or in a browser (called right in the press, since a
+/// browser opens a new tab only for the tap itself); on a phone a local copy
+/// first, which still opens once the app is in the background, in the
+/// system's viewer (Android) or share sheet (iOS: Open in, Save to Files).
+pub fn open_outside(store: Store, url: String, name: String) {
+    #[cfg(not(target_arch = "wasm32"))]
+    native::open_outside(store, url, name);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (store, name);
+        drop(nsh_core::prelude::open_url(url));
+    }
+}
+
 /// Open a conversation shell's socket for opening `epoch` (protocol 1.42).
 pub fn open_shell(store: Store, epoch: u64, url: String, ticket: String) {
     #[cfg(not(target_arch = "wasm32"))]

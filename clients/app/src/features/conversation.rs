@@ -1404,8 +1404,9 @@ fn files(store: Store, attached: impl Fn() -> Vec<AttachmentRef> + 'static, mine
                     list = list.child(
                         button()
                             .accessibility_label(format!("Open {}", file.name))
-                            .on_press(move || {
-                                open_file(open.clone());
+                            .on_press({
+                                let name = file.name.clone();
+                                move || crate::link::open_outside(store, open.clone(), name.clone())
                             })
                             .child(ui::file_chip(file.name.clone(), "")),
                     );
@@ -1454,13 +1455,6 @@ fn draft_files(store: Store) -> View {
             list
         }))
     }))
-}
-
-/// Open a message's file in the system's browser or viewer. Called right in
-/// the press: a browser opens a new tab only for the tap itself, so the
-/// request is not put off to a task (whether it opened is not awaited).
-fn open_file(url: String) {
-    drop(open_url(url));
 }
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
