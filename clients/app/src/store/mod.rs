@@ -1455,6 +1455,16 @@ impl Store {
         self.act(|c| c.set_agent_mode(&agent, mode));
     }
 
+    /// Set AIdaemon's permission level.
+    pub fn set_permission_level(&self, level: aidaemon_client_protocol::PermissionLevel) {
+        self.act(|c| c.set_permission_level(level));
+    }
+
+    /// Have coding agent `agent` follow AIdaemon's permission level.
+    pub fn set_agent_same(&self, agent: String) {
+        self.act(|c| c.set_agent_same(&agent));
+    }
+
     /// Ask every coding agent again whether it can do work now.
     pub fn check_agents(&self) {
         self.act(|c| c.check_agents());
@@ -2506,7 +2516,10 @@ impl Store {
             if self.compact.get_untracked() {
                 self.show_detail(TERMINAL_TAB);
             } else {
-                if !matches!(self.inspector_tab.get_untracked(), STEPS_TAB | TERMINAL_TAB | BROWSER_TAB) {
+                if !matches!(
+                    self.inspector_tab.get_untracked(),
+                    STEPS_TAB | TERMINAL_TAB | BROWSER_TAB
+                ) {
                     self.inspector_tab.set(STEPS_TAB);
                 }
                 self.toggle_inspector();

@@ -2,11 +2,13 @@
 //! settings most owners change, each with a real control) and the decision
 //! model on the Models tab. Every change is a `SettingsChange::Set` of the
 //! config key, so it takes the same path, approvals and refusals as the
-//! full list on the Advanced tab; a coding agent's permission mode is a
-//! `SettingsChange::SetAgentMode` on that same path.
+//! full list on the Advanced tab; AIdaemon's permission level and a coding
+//! agent's mode are `SettingsChange::SetPermissionLevel`,
+//! `SetAgentMode` and `AgentSameAsAidaemon` on that same path.
 
 use aidaemon_client_protocol::{
-    AgentMode, AgentReadiness, CodingAgent, SecretText, Setting, Settings, SettingsChange,
+    AgentMode, AgentReadiness, CodingAgent, PermissionLevel, SecretText, Setting, Settings,
+    SettingsChange,
 };
 use nsh_core::prelude::*;
 
@@ -219,10 +221,95 @@ pub fn general(store: Store, settings: &Settings) -> View {
         }
         page = page.child(view().gap_2().child(section_label(*title)).child(list));
     }
+    if let Some(level) = settings.permission_level {
+        page = page.child(permission_level(store, level));
+    }
     if !settings.coding_agents.is_empty() {
-        page = page.child(coding_agents(store, &settings.coding_agents));
+        page = page.child(coding_agents(
+            store,
+            &settings.coding_agents,
+            settings.permission_level,
+        ));
     }
     page.child(this_device(store))
+}
+
+/// AIdaemon's permission levels: id, title and what each means, safest
+/// first.
+const LEVELS: &[(PermissionLevel, &str, &str, &str)] = &[
+    (
+        PermissionLevel::ReadOnly,
+        "read_only",
+        "Read only",
+        "Reads and searches. Anything that changes something is refused.",
+    ),
+    (
+        PermissionLevel::Standard,
+        "standard",
+        "Standard",
+        "Works on its own; risky commands ask you first.",
+    ),
+    (
+        PermissionLevel::FullAccess,
+        "full_access",
+        "Full access",
+        "Every command runs without asking. Same as /trustall on.",
+    ),
+];
+
+fn level_title(level: PermissionLevel) -> &'static str {
+    LEVELS
+        .iter()
+        .find(|(l, ..)| *l == level)
+        .map(|(_, _, title, _)| *title)
+        .unwrap_or("Unknown")
+}
+
+/// AIdaemon's own permission level: the most it, its sub-agents and every
+/// coding agent may do. Full access asks first, like any guarded change.
+fn permission_level(store: Store, level: PermissionLevel) -> View {
+    let mut key = view().gap_1();
+    for (_, _, title, words) in LEVELS {
+        key = key.child(faint(format!("{title}: {words}")));
+    }
+    let items: Vec<(String, String)> = LEVELS
+        .iter()
+        .map(|(_, id, title, _)| (id.to_string(), title.to_string()))
+        .collect();
+    let current = LEVELS
+        .iter()
+        .find(|(l, ..)| *l == level)
+        .map(|(_, id, ..)| *id);
+    let control = ui::choice(
+        "AIdaemon permission level",
+        "Choose a level",
+        items,
+        move || current.map(str::to_owned),
+        move |next: Option<String>| {
+            if let Some((level, ..)) = next
+                .as_deref()
+                .and_then(|id| LEVELS.iter().find(|(_, l, ..)| *l == id))
+            {
+                store.set_permission_level(*level);
+            }
+        },
+    )
+    .flex_1()
+    .max_w(px(if ui::touch() { f32::MAX } else { 360.0 }));
+    view()
+        .gap_2()
+        .child(section_label("AIdaemon permissions"))
+        .child(key)
+        .child(
+            ui::surface()
+                .p_3()
+                .gap_2()
+                .child(view().flex_row().child(control))
+                .child(faint(
+                    "The most AIdaemon, its sub-agents and every coding agent may do. \
+                     A coding agent can be stricter, never looser.",
+                )),
+        )
 }
 
 /// Each mode a coding agent can run in: its id on the wire, its title and
@@ -257,7 +344,7 @@ fn agent_mode_id(mode: AgentMode) -> Option<&'static str> {
 
 /// The coding agents the daemon hands work to, each with a pick of the
 /// modes it supports. Full access asks first, like any guarded change.
-fn coding_agents(store: Store, agents: &[CodingAgent]) -> View {
+fn coding_agents(store: Store, agents: &[CodingAgent], level: Option<PermissionLevel>) -> View {
     let mut key = view().gap_1();
     for (_, _, title, words) in AGENT_MODES {
         key = key.child(faint(format!("{title}: {words}")));
@@ -267,7 +354,7 @@ fn coding_agents(store: Store, agents: &[CodingAgent]) -> View {
         if at > 0 {
             list = list.child(ui::separator());
         }
-        list = list.child(coding_agent(store, agent));
+        list = list.child(coding_agent(store, agent, level));
     }
     let head = view()
         .flex_row()
@@ -287,7 +374,10 @@ fn coding_agents(store: Store, agents: &[CodingAgent]) -> View {
     view().gap_2().child(head).child(key).child(list)
 }
 
-fn coding_agent(store: Store, agent: &CodingAgent) -> View {
+/// The choice that follows AIdaemon's level.
+const SAME: &str = "same";
+
+fn coding_agent(store: Store, agent: &CodingAgent, level: Option<PermissionLevel>) -> View {
     // One that is unavailable looks it: its name, mode and note dimmed and
     // its mode not to be changed; its reason stays clear.
     let available = agent.readiness != AgentReadiness::NotUsable;
@@ -307,17 +397,39 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
         title = title.child(faint(agent.name.clone()));
     }
     let title = view().gap_1().child(shown(title)).child(readiness(agent));
-    let items: Vec<(String, String)> = agent
-        .modes
-        .iter()
-        .filter_map(|mode| {
-            AGENT_MODES
-                .iter()
-                .find(|(m, ..)| m == mode)
-                .map(|(_, id, title, _)| (id.to_string(), title.to_string()))
-        })
-        .collect();
-    let current = agent.mode.and_then(agent_mode_id);
+    let mode_title = |mode: AgentMode| {
+        AGENT_MODES
+            .iter()
+            .find(|(m, ..)| *m == mode)
+            .map(|(_, _, title, _)| *title)
+    };
+    // A daemon that caps agents by its level lists what may be picked
+    // under it; an older one, every mode the agent has.
+    let pickable: &[AgentMode] = if level.is_some() {
+        &agent.within_level
+    } else {
+        &agent.modes
+    };
+    let mut items: Vec<(String, String)> = Vec::new();
+    if level.is_some() {
+        let runs = agent
+            .within_level
+            .last()
+            .and_then(|mode| mode_title(*mode))
+            .unwrap_or("not allowed");
+        items.push((SAME.to_owned(), format!("Same as AIdaemon ({runs})")));
+    }
+    items.extend(pickable.iter().filter_map(|mode| {
+        AGENT_MODES
+            .iter()
+            .find(|(m, ..)| m == mode)
+            .map(|(_, id, title, _)| (id.to_string(), title.to_string()))
+    }));
+    let current = if agent.same_as_aidaemon {
+        Some(SAME)
+    } else {
+        agent.mode.and_then(agent_mode_id)
+    };
     let name = agent.name.clone();
     let label = format!("{} permission mode", agent.program);
     let mut row = view().p_3().gap_2().child(title).child(shown(
@@ -328,6 +440,10 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
                 items,
                 move || current.map(str::to_owned),
                 move |next: Option<String>| {
+                    if next.as_deref() == Some(SAME) {
+                        store.set_agent_same(name.clone());
+                        return;
+                    }
                     let mode = next.as_deref().and_then(|id| {
                         AGENT_MODES
                             .iter()
@@ -346,6 +462,27 @@ fn coding_agent(store: Store, agent: &CodingAgent) -> View {
     ));
     if agent.mode.is_none() {
         row = row.child(muted("Not allowed to run delegated work yet."));
+    }
+    if let Some(level) = level {
+        if agent.capped {
+            row = row.child(muted(format!(
+                "Runs as {} while AIdaemon is on {}.",
+                agent.mode.and_then(mode_title).unwrap_or("nothing"),
+                level_title(level)
+            )));
+        }
+        let hidden: Vec<&str> = agent
+            .modes
+            .iter()
+            .filter(|mode| !agent.within_level.contains(mode))
+            .filter_map(|mode| mode_title(*mode))
+            .collect();
+        if !hidden.is_empty() {
+            row = row.child(shown(view().child(faint(format!(
+                "{} needs AIdaemon on a higher permission level.",
+                hidden.join(" and ")
+            )))));
+        }
     }
     if !agent.note.is_empty() {
         row = row.child(shown(
