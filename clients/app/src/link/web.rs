@@ -112,6 +112,11 @@ extern "C" {
 /// A picture taken with the device's camera: its JPEG bytes, scaled to fit
 /// `max_dimension`; `None` when nothing was taken.
 /// Save a same-origin file under `name` (the browser's download).
+/// How this browser reaches the daemon: its page's own origin.
+pub fn transport() -> aidaemon_client_core::machine::Transport {
+    aidaemon_client_core::machine::transport_of(&origin())
+}
+
 pub fn download(url: &str, name: &str) {
     download_url_js(url, name);
 }

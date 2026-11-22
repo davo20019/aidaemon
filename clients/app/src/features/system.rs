@@ -364,6 +364,7 @@ fn overview(s: &SystemStatus) -> View {
     let mut rows = vec![
         fact("Version", s.version.clone()),
         fact("This app", crate::link::app_version()),
+        connection(),
     ];
     if let Some(model) = &s.model {
         rows.push(fact("Model", model.clone()));
@@ -372,6 +373,53 @@ fn overview(s: &SystemStatus) -> View {
         rows.push(fact("Falls back to", s.fallback_models.join(", ")));
     }
     section("Daemon").child(view().gap_2().child(tiles).child(list(rows)))
+}
+
+/// How this app reaches the daemon, read again every few seconds: a
+/// peer-to-peer connection moves between direct and the relay as the
+/// network changes.
+fn connection() -> View {
+    use aidaemon_client_core::machine::Transport;
+    let now = signal(None::<Transport>);
+    spawn(async move {
+        loop {
+            let read = crate::link::transport().await;
+            if !now.try_set(read) {
+                return;
+            }
+            timer(std::time::Duration::from_secs(3)).await;
+        }
+    });
+    view().child(dynamic(move || {
+        let (value, detail) = match now.get()? {
+            Transport::ThisComputer => ("This computer", "The app runs where AIDaemon does."),
+            Transport::Direct => (
+                "Peer to peer · direct",
+                "Straight between your devices, encrypted end to end.",
+            ),
+            Transport::Relay => (
+                "Peer to peer · via relay",
+                "Encrypted end to end; the relay passes on data it cannot read.",
+            ),
+            Transport::PeerToPeer => (
+                "Peer to peer",
+                "Encrypted end to end, directly or through a relay.",
+            ),
+            Transport::Tunnel => (
+                "Tunnel (HTTPS)",
+                "Through your HTTPS address; its provider (Cloudflare, Tailscale) can \
+                 see the traffic.",
+            ),
+        };
+        Some(untracked(move || {
+            view().child(fact("Connection", value)).child(
+                text(detail)
+                    .px_3()
+                    .text_size(px(ui::fit::small()))
+                    .text_color(colors::MUTED),
+            )
+        }))
+    }))
 }
 
 fn seconds(ms: u64) -> String {

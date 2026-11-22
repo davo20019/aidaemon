@@ -152,6 +152,16 @@ pub(crate) async fn forget(url: &RemoteUrl, dialer: &Dialer) {
         .remove(&(dialer.key().to_bytes(), url.id));
 }
 
+/// The path the open connection to `url`'s daemon uses now (`None`: no
+/// open connection, or no path chosen yet). Dials nothing.
+pub async fn path(url: &str, dialer: &Dialer) -> Option<aidaemon_remote::PathKind> {
+    let daemon = RemoteUrl::parse(url)?;
+    let open = connections().lock().await;
+    open.get(&(dialer.key().to_bytes(), daemon.id))
+        .filter(|conn| !conn.is_closed())
+        .and_then(RemoteConnection::path)
+}
+
 /// The path and query of `url` (`iroh://key@relay/client/v1/…`).
 fn path_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);

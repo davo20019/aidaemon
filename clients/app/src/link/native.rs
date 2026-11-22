@@ -15,6 +15,17 @@ use crate::store::Store;
 /// task stops at its next update (dropping its receiver ends the link).
 static LINK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Where the current link goes and how it signs in, for [`transport`].
+static CURRENT: std::sync::Mutex<Option<(String, link::Auth)>> = std::sync::Mutex::new(None);
+
+/// How the current link reaches the daemon now (`None`: no link yet).
+pub async fn transport() -> Option<aidaemon_client_core::machine::Transport> {
+    let (url, auth) = CURRENT.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+    background(async move { local::transport(&url, &auth).await })
+        .await
+        .ok()
+}
+
 /// The current link's waker ([`woke`]).
 static WAKER: std::sync::Mutex<Option<link::Waker>> = std::sync::Mutex::new(None);
 
@@ -53,6 +64,7 @@ pub fn start(store: Store) {
     };
     store.set_gateway_base(aidaemon_client_core::machine::http_base(&url));
     let bridged = (url.clone(), auth.clone());
+    *CURRENT.lock().unwrap_or_else(|p| p.into_inner()) = Some((url.clone(), auth.clone()));
     let kind = client_kind();
     let config = LinkConfig {
         url,

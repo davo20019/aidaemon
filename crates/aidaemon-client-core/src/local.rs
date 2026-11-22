@@ -143,6 +143,28 @@ pub async fn reachable_base(url: &str, auth: &Auth) -> Result<String, String> {
     Ok(crate::machine::http_base(url))
 }
 
+/// How this client reaches the daemon at `url` now, for the owner to see:
+/// for a peer-to-peer address, whether its connection goes direct or
+/// through a relay at this moment.
+pub async fn transport(url: &str, auth: &Auth) -> crate::machine::Transport {
+    use crate::machine::Transport;
+    let kind = crate::machine::transport_of(url);
+    #[cfg(feature = "remote")]
+    if kind == Transport::PeerToPeer
+        && let Auth::Device(keys) = auth
+        && let Ok(Some(device)) = keys.load()
+        && let Ok(dialer) = crate::remote::Dialer::for_device(&device)
+    {
+        return match crate::remote::path(url, &dialer).await {
+            Some(aidaemon_remote::PathKind::Direct) => Transport::Direct,
+            Some(aidaemon_remote::PathKind::Relay) => Transport::Relay,
+            None => Transport::PeerToPeer,
+        };
+    }
+    let _ = auth;
+    kind
+}
+
 /// How long a copy kept for another app stays before it is cleared.
 const KEPT_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 

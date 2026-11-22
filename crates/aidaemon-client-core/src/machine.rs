@@ -337,6 +337,51 @@ pub fn http_base(url: &str) -> String {
     format!("{scheme}://{host}")
 }
 
+/// How this client reaches the daemon, for the owner to see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The daemon's own computer (loopback).
+    ThisComputer,
+    /// Peer to peer (iroh), straight between the devices.
+    Direct,
+    /// Peer to peer through a relay that passes it on encrypted.
+    Relay,
+    /// Peer to peer, before a path is chosen.
+    PeerToPeer,
+    /// An HTTPS address: a tunnel (Cloudflare, Tailscale) or the owner's
+    /// own; its operator can see the traffic.
+    Tunnel,
+}
+
+/// The [`Transport`] the gateway address `url` implies (a peer-to-peer
+/// address reads as [`Transport::PeerToPeer`]: its path is the link's to
+/// tell).
+pub fn transport_of(url: &str) -> Transport {
+    let url = url.trim();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Transport::Tunnel;
+    };
+    if scheme == "iroh" {
+        return Transport::PeerToPeer;
+    }
+    // The host of a URL (a machine format).
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if loopback {
+        Transport::ThisComputer
+    } else {
+        Transport::Tunnel
+    }
+}
+
 /// `http://host:port` (or a socket address) as the gateway's socket URL.
 pub fn socket_url(base: &str) -> String {
     let base = base.trim_end_matches('/');
@@ -358,6 +403,23 @@ pub fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gateway_address_says_how_the_daemon_is_reached() {
+        for (url, want) in [
+            ("ws://127.0.0.1:8788/client/v1/ws", Transport::ThisComputer),
+            ("http://localhost:8788", Transport::ThisComputer),
+            ("ws://[::1]:8788/client/v1/ws", Transport::ThisComputer),
+            ("wss://d.example.invalid/client/v1/ws", Transport::Tunnel),
+            ("http://192.168.1.20:8788", Transport::Tunnel),
+            (
+                "iroh://k@relay.example.invalid/client/v1/ws",
+                Transport::PeerToPeer,
+            ),
+        ] {
+            assert_eq!(transport_of(url), want, "{url}");
+        }
+    }
     use aidaemon_client_protocol::ProtocolError;
 
     fn machine() -> LinkMachine {

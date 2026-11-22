@@ -199,6 +199,15 @@ impl RemoteClient {
     }
 }
 
+/// Which way a connection's traffic goes now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Straight between the two devices.
+    Direct,
+    /// Through a relay, which passes it on encrypted.
+    Relay,
+}
+
 /// A connection to one daemon; each request or socket opens its own stream.
 #[derive(Clone)]
 pub struct RemoteConnection {
@@ -209,6 +218,18 @@ impl RemoteConnection {
     /// The daemon's key (verified in the handshake).
     pub fn daemon(&self) -> EndpointId {
         self.conn.remote_id()
+    }
+
+    /// The path the connection uses now, `None` before one is chosen. It
+    /// changes as hole punching succeeds or the network moves.
+    pub fn path(&self) -> Option<PathKind> {
+        let paths = self.conn.paths();
+        let selected = paths.iter().find(|path| path.is_selected())?;
+        Some(if selected.is_relay() {
+            PathKind::Relay
+        } else {
+            PathKind::Direct
+        })
     }
 
     /// Whether the connection has ended (closed, timed out, lost).

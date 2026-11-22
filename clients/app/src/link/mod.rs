@@ -177,6 +177,14 @@ pub fn open_live(store: Store, epoch: u64, url: String, ticket: String) {
     web::open_live(store, epoch, url, ticket);
 }
 
+/// How this app reaches the daemon now (`None`: not connected yet).
+pub async fn transport() -> Option<aidaemon_client_core::machine::Transport> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return native::transport().await;
+    #[cfg(target_arch = "wasm32")]
+    Some(web::transport())
+}
+
 /// Open a message's file (`url`, named `name`) in another app: the link
 /// itself on a desktop or in a browser (called right in the press, since a
 /// browser opens a new tab only for the tap itself); on a phone a local copy
