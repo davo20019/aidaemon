@@ -2766,3 +2766,6 @@ mod batch_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

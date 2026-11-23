@@ -128,3 +128,6 @@ mod tests {
         assert!(reminder_request(r#"{"when":"in 2h"}"#).is_err());
     }
 }
+
+#[cfg(test)]
+mod call_tests;

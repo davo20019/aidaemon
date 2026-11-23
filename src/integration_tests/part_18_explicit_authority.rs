@@ -894,11 +894,8 @@ async fn readonly_mid_run_blocks_a_terminal_redirect_write() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
         .await
         .unwrap();
-    let (approval_tx, _approval_rx) =
-        tokio::sync::mpsc::channel::<crate::tools::terminal::ApprovalRequest>(1);
     let terminal = crate::tools::TerminalTool::new(crate::execution::active_execution_backend(),
         vec!["*".to_string()],
-        crate::tools::ApprovalBroker::new(approval_tx),
         30,
         8000,
         crate::tools::command_risk::PermissionMode::Yolo,

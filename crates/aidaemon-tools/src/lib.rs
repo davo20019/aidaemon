@@ -74,6 +74,8 @@ pub mod result_spill;
 pub mod sanitize;
 mod search;
 mod search_files;
+#[cfg(test)]
+mod search_files_tests;
 pub mod semantics;
 pub mod services;
 mod shell;

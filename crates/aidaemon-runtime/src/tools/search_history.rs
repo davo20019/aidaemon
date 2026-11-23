@@ -687,3 +687,6 @@ impl crate::tools::traits::ToolSemantics for SearchHistoryTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

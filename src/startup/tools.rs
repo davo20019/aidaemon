@@ -689,7 +689,6 @@ pub async fn build_base_tools(
             memory.clone(),
             pool.clone(),
             event_store.clone(),
-            approval_tx.clone(),
             health_store.clone(),
         )
         .await?;
@@ -1234,7 +1233,6 @@ async fn build_base_tool(
     memory: ToolMemoryAccess,
     pool: SqlitePool,
     event_store: Arc<EventStore>,
-    approval_tx: ApprovalBroker,
     health_store: Option<Arc<HealthProbeStore>>,
 ) -> anyhow::Result<BuiltBaseTool> {
     let built = match tool_id {
@@ -1257,7 +1255,6 @@ async fn build_base_tool(
                 TerminalTool::new(
                     execution_backend,
                     config.terminal.allowed_prefixes.clone(),
-                    approval_tx,
                     config.terminal.initial_timeout_secs,
                     config.terminal.max_output_chars,
                     config.terminal.permission_mode,

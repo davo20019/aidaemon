@@ -3,6 +3,7 @@
 
 pub use aidaemon_runtime::tools::config_manager::ConfigManagerTool;
 
+// Stays here: these check edits against the daemon's own config schema (`AppConfig`).
 #[cfg(test)]
 mod tests {
     use crate::config::AppConfig;

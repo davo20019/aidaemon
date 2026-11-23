@@ -726,3 +726,6 @@ mod tests {
         assert!(message.contains("`/work unblock 60559600 <resolution>`"));
     }
 }
+
+#[cfg(test)]
+mod call_tests;

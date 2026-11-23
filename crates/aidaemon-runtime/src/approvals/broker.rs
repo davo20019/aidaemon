@@ -223,3 +223,6 @@ async fn persist_resolution(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
