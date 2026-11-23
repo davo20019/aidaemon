@@ -191,7 +191,19 @@ impl std::fmt::Display for CliAgentUnavailableError {
 
 impl std::error::Error for CliAgentUnavailableError {}
 
+/// What every launched agent's run id starts with: a marker the daemon
+/// writes itself ([`cli_run_id`]), read back by [`is_cli_agent_run`].
+const CLI_RUN_PREFIX: &str = "cli-agent-";
+
 /// The id of a launched agent's background run in the runtime's records.
 pub(super) fn cli_run_id(task_id: &str) -> String {
-    format!("cli-agent-{task_id}")
+    format!("{CLI_RUN_PREFIX}{task_id}")
+}
+
+/// Whether `id` is a launched agent's run id (`cli-agent-<task id>`): how a boot
+/// tells the coding agents a restart cut off from the other background
+/// jobs on record.
+pub fn is_cli_agent_run(id: &str) -> bool {
+    // A marker the daemon itself writes (`cli_run_id`).
+    id.starts_with(CLI_RUN_PREFIX)
 }
