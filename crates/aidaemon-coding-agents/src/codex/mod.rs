@@ -11,6 +11,14 @@
 //!   own read-only ones asked (`untrusted`); needs the host.
 //! - Full access: `--dangerously-bypass-approvals-and-sandbox`.
 //!
+//! A run continues an earlier session as `codex exec <options> resume
+//! <thread id> <task>`: the options stay before `resume`, which refuses
+//! `--sandbox` after it. Only an `exec` run keeps its session where a later
+//! one finds it (the owner's `CODEX_HOME`); a hosted run's thread is
+//! ephemeral, in a `CODEX_HOME` of its own, so a run that continues one
+//! stays on `exec`: checked, it just never asks, and every-command mode,
+//! which needs the host, cannot continue one.
+//!
 //! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18).
 
 pub mod events;
@@ -212,6 +220,10 @@ impl CodingAgent for Codex {
         true
     }
 
+    fn resumes(&self) -> bool {
+        true
+    }
+
     fn model_listing(&self) -> Option<crate::ModelListing> {
         Some(crate::ModelListing::Codex)
     }
@@ -236,50 +248,76 @@ impl CodingAgent for Codex {
         if let Some(model) = request.model {
             crate::agent::set_option(&mut launch.args, launch.start, "--model", &["-m"], model);
         }
-        if !request.enforce {
-            return Ok(Plan::plain());
+        let mut plan = shape(request, launch)?;
+        // A hosted run's thread is ephemeral, in a home of its own thrown
+        // away at its end; `exec` keeps it in the owner's, unless the
+        // launch says not to (`--ephemeral`, its own flag).
+        plan.keeps_session = plan.host.is_none()
+            && !launch.args[launch.start..]
+                .iter()
+                .any(|a| a == "--ephemeral");
+        if let Some(session) = request.resume {
+            // After every option, before the task (its last argument).
+            launch
+                .args
+                .extend(["resume".to_string(), session.to_string()]);
         }
-        match request.mode {
-            PermissionMode::FullAccess => {
-                drop_access_flags(&mut launch.args, launch.start);
-                launch
-                    .args
-                    .push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        Ok(plan)
+    }
+}
+
+/// `launch` in `request`'s mode, and how the run goes.
+fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
+    if !request.enforce {
+        return Ok(Plan::plain());
+    }
+    match request.mode {
+        PermissionMode::FullAccess => {
+            drop_access_flags(&mut launch.args, launch.start);
+            launch
+                .args
+                .push("--dangerously-bypass-approvals-and-sandbox".to_string());
+            Ok(Plan::plain())
+        }
+        PermissionMode::EveryCommand => {
+            if request.resume.is_some() {
+                return Err(
+                    "Codex can't continue an earlier session while it checks every command: \
+                         its prompts need a host, and a hosted run can't continue one"
+                        .to_string(),
+                );
+            }
+            if !request.can_host {
+                return Err(
+                    "Codex can check every command only where its requests can be answered"
+                        .to_string(),
+                );
+            }
+            read_only(&mut launch.args, launch.start);
+            hosted(launch, request, host::Asks::EveryCommand)
+        }
+        PermissionMode::Checked if request.read_only => {
+            read_only(&mut launch.args, launch.start);
+            Ok(Plan::plain())
+        }
+        PermissionMode::Checked => {
+            scoped(
+                &mut launch.args,
+                launch.start,
+                request.read_paths,
+                request.write_paths,
+            )?;
+            if !request.can_host || request.resume.is_some() {
+                return Ok(Plan::plain());
+            }
+            // A launch the app-server cannot take, or no sign-in to
+            // link, stays on `exec`: confined, it just never asks.
+            let exec = launch.clone();
+            hosted(launch, request, host::Asks::BeyondSandbox).or_else(|reason| {
+                tracing::info!(%reason, "A Codex run stays on exec");
+                *launch = exec;
                 Ok(Plan::plain())
-            }
-            PermissionMode::EveryCommand => {
-                if !request.can_host {
-                    return Err(
-                        "Codex can check every command only where its requests can be answered"
-                            .to_string(),
-                    );
-                }
-                read_only(&mut launch.args, launch.start);
-                hosted(launch, request, host::Asks::EveryCommand)
-            }
-            PermissionMode::Checked if request.read_only => {
-                read_only(&mut launch.args, launch.start);
-                Ok(Plan::plain())
-            }
-            PermissionMode::Checked => {
-                scoped(
-                    &mut launch.args,
-                    launch.start,
-                    request.read_paths,
-                    request.write_paths,
-                )?;
-                if !request.can_host {
-                    return Ok(Plan::plain());
-                }
-                // A launch the app-server cannot take, or no sign-in to
-                // link, stays on `exec`: confined, it just never asks.
-                let exec = launch.clone();
-                hosted(launch, request, host::Asks::BeyondSandbox).or_else(|reason| {
-                    tracing::info!(%reason, "A Codex run stays on exec");
-                    *launch = exec;
-                    Ok(Plan::plain())
-                })
-            }
+            })
         }
     }
 }
@@ -307,6 +345,7 @@ mod tests {
             can_host: false,
             stdin_open: true,
             model: None,
+            resume: None,
         }
     }
 
@@ -404,5 +443,98 @@ mod tests {
             .prepare(&request(PermissionMode::Checked, true, &[]), &mut launch)
             .unwrap();
         assert_eq!(&launch.args[..3], &strings(&["FOO=1", "codex", "exec"])[..]);
+    }
+
+    #[test]
+    fn a_run_continues_the_thread_it_names_with_its_options_before_resume() {
+        assert!(Codex.resumes());
+        let mut asked = request(PermissionMode::FullAccess, false, &[]);
+        asked.resume = Some("s-1");
+        asked.model = Some("m-2");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json", "-m", "m-1"]),
+            start: 0,
+        };
+        let plan = Codex.prepare(&asked, &mut launch).unwrap();
+        assert_eq!(
+            launch.args,
+            strings(&[
+                "exec",
+                "--json",
+                "--model",
+                "m-2",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "s-1",
+            ])
+        );
+        assert_eq!(plan.prompt, PromptPlacement::LastArgument);
+
+        // Read-only checked: its sandbox, then the thread.
+        let mut asked = request(PermissionMode::Checked, true, &[]);
+        asked.resume = Some("s-1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        Codex.prepare(&asked, &mut launch).unwrap();
+        assert!(
+            launch
+                .args
+                .join(" ")
+                .ends_with("--sandbox read-only resume s-1"),
+            "{:?}",
+            launch.args
+        );
+
+        // Outside the checks, too.
+        let mut asked = request(PermissionMode::Checked, false, &[]);
+        asked.enforce = false;
+        asked.resume = Some("s-1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        Codex.prepare(&asked, &mut launch).unwrap();
+        assert_eq!(launch.args, strings(&["exec", "--json", "resume", "s-1"]));
+    }
+
+    #[test]
+    fn a_continued_run_stays_on_exec_and_every_command_cannot_continue_one() {
+        let writes = ["/w/project/out.md".to_string()];
+        let mut asked = request(PermissionMode::Checked, false, &writes);
+        asked.can_host = true;
+        asked.resume = Some("s-1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = Codex.prepare(&asked, &mut launch).unwrap();
+        assert!(plan.host.is_none());
+        assert!(plan.keeps_session, "exec keeps its thread for the next follow-up");
+        assert_eq!(launch.args[0], "exec");
+        assert!(!launch.args.iter().any(|arg| arg == "app-server"));
+        assert_eq!(
+            &launch.args[launch.args.len() - 2..],
+            &strings(&["resume", "s-1"])[..]
+        );
+
+        let mut asked = request(PermissionMode::EveryCommand, false, &[]);
+        asked.can_host = true;
+        asked.resume = Some("s-1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        assert!(Codex.prepare(&asked, &mut launch).is_err());
+
+        // A launch told not to keep its thread keeps none.
+        let mut asked = request(PermissionMode::Checked, true, &[]);
+        asked.resume = None;
+        let mut launch = Launch {
+            args: strings(&["exec", "--json", "--ephemeral"]),
+            start: 0,
+        };
+        assert!(!Codex.prepare(&asked, &mut launch).unwrap().keeps_session);
     }
 }

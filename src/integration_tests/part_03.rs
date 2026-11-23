@@ -58,6 +58,7 @@ async fn test_same_channel_relevant_fact_is_rendered() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -126,6 +127,7 @@ async fn test_cross_channel_fact_blocked() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -227,6 +229,7 @@ async fn test_private_facts_never_in_channels() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -289,6 +292,7 @@ async fn test_cross_channel_hints() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -351,6 +355,7 @@ async fn test_legacy_facts_backward_compat() {
         user_id_map: std::collections::HashMap::new(),
         workspace_grant: None,
         trusted: false,
+        in_run: None,
     };
     for (session, channel) in [
         ("legacy_session_dm", ChannelContext::private("telegram")),

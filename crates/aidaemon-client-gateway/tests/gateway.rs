@@ -446,6 +446,7 @@ fn send(text: &str) -> Command {
         project_id: None,
         model: None,
         effort: None,
+        in_run: None,
     }
 }
 
@@ -820,6 +821,7 @@ async fn http_mode_runs_a_turn_and_long_polls_its_events() {
                     project_id: None,
                     model: None,
                     effort: None,
+                    in_run: None,
                 },
             ),
         )
@@ -2487,6 +2489,7 @@ async fn a_view_action_reaches_only_the_capable_sender() {
                     project_id: None,
                     model: None,
                     effort: None,
+                    in_run: None,
                 },
             ),
         )
@@ -2660,6 +2663,7 @@ async fn a_marked_up_picture_tells_the_agent_where_the_unmarked_one_is() {
                     project_id: None,
                     model: None,
                     effort: None,
+                    in_run: None,
                 },
             ),
         )
@@ -2767,6 +2771,7 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     project_id: None,
                     model: None,
                     effort: None,
+                    in_run: None,
                 },
             ),
         )
@@ -2827,6 +2832,7 @@ async fn an_uploaded_picture_goes_to_the_agent_and_back_to_clients() {
                     project_id: None,
                     model: None,
                     effort: None,
+                    in_run: None,
                 },
             ),
         )
@@ -2913,6 +2919,7 @@ async fn only_app_conversations_take_a_model() {
                     project_id: None,
                     model: None,
                     effort: Some(Effort::High),
+                    in_run: None,
                 },
             ),
         )

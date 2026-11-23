@@ -104,6 +104,10 @@ pub(super) struct PreparedRun {
     env_remove: Vec<String>,
     host: Option<Box<dyn aidaemon_coding_agents::HostStarter>>,
     keep_alive: Option<Box<dyn std::any::Any + Send>>,
+    /// The agent keeps its session where a follow-up can continue it.
+    keeps_session: bool,
+    /// The earlier run it continues.
+    continues: Option<String>,
     /// The prompt with its mission rules, before any enrichment.
     prompt: String,
     /// What it was asked, without the daemon's mission rules.
@@ -163,7 +167,7 @@ pub(super) struct RunHandles {
     state: Arc<dyn CliAgentStore>,
     tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
     tool_names: Arc<std::sync::RwLock<Vec<String>>>,
-    runs: Arc<crate::run_state::RunStates>,
+    pub(super) runs: Arc<crate::run_state::RunStates>,
     hub: Option<Arc<dyn OutboundRouter>>,
     agent: Option<Arc<dyn ConversationRuntime>>,
     reengagements: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
@@ -419,6 +423,9 @@ impl CliAgentTool {
         handles
             .runs
             .set_agent(&cli_run_id(&task_id), prep.coding_agent.name());
+        if let Some(earlier) = &prep.continues {
+            handles.runs.continues(&cli_run_id(&task_id), earlier);
+        }
 
         // Read its output, emit progress, judge and deliver its end, and
         // signal completion. `should_notify` starts as async_mode: a
@@ -917,6 +924,10 @@ impl CliAgentTool {
                 can_host,
                 stdin_open: self.backend.kind() == aidaemon_tools::backend::BackendKind::Local,
                 model: model.as_deref(),
+                resume: spec
+                    .continues
+                    .as_ref()
+                    .map(|earlier| earlier.agent_session.as_str()),
             },
             &mut launch,
         ) {
@@ -934,6 +945,7 @@ impl CliAgentTool {
             env_remove: plan_env_remove,
             host: host_starter,
             keep_alive,
+            keeps_session,
         } = plan;
         let writes = WriteScope::of(workspace_mode, &canonical_write_paths);
         let short_summary: String = prompt.chars().take(50).collect();
@@ -1032,6 +1044,8 @@ impl CliAgentTool {
             env_remove: plan_env_remove,
             host: host_starter,
             keep_alive,
+            keeps_session,
+            continues: spec.continues.as_ref().map(|earlier| earlier.run.clone()),
             prompt: prompt.to_string(),
             task,
             final_prompt,
@@ -1076,6 +1090,9 @@ impl CliAgentTool {
         record_background(&self.state, &call).await;
         let handles = self.run_handles();
         handles.runs.set_agent(&run_id, prep.coding_agent.name());
+        if let Some(earlier) = &prep.continues {
+            handles.runs.continues(&run_id, earlier);
+        }
         handles.runs.activity(&run_id, WAITING_FOR_SLOT.to_string());
         if let Some(ref tx) = call.status_tx {
             let _ = tx.try_send(StatusUpdate::ToolCancellable {
@@ -1310,6 +1327,12 @@ impl RunHandles {
                 .await
         {
             warn!(%error, "Could not keep a coding agent's task on its invocation");
+        }
+        if invocation_id != 0
+            && prep.keeps_session
+            && let Err(error) = self.state.note_cli_agent_keeps_session(invocation_id).await
+        {
+            warn!(%error, "Could not note that a coding agent kept its session");
         }
         // The agent's typed events: kept on its invocation, and its latest
         // step on its run record. Its host's judge keeps each decision too.

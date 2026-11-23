@@ -73,6 +73,7 @@ async fn test_public_external_no_memory() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -137,6 +138,7 @@ async fn test_tool_restriction_public_external() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -469,6 +471,7 @@ async fn test_private_group_fact_access() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )

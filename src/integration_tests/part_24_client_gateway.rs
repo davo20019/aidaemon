@@ -274,6 +274,7 @@ mod client_gateway {
                 project_id: None,
                 model: None,
                 effort: None,
+                in_run: None,
             },
         )
         .await;

@@ -280,6 +280,7 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -553,6 +554,7 @@ async fn test_public_channel_hides_personal_memory() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )

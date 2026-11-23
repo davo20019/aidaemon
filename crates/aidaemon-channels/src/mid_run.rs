@@ -252,6 +252,7 @@ mod tests {
             agent: None,
             group: None,
             edited: Vec::new(),
+            continues: None,
             this_request,
         }
     }

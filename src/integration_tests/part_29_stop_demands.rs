@@ -18,6 +18,7 @@ fn owner_channel() -> ChannelContext {
         user_id_map: std::collections::HashMap::new(),
         workspace_grant: None,
         trusted: false,
+        in_run: None,
     }
 }
 

@@ -1801,6 +1801,7 @@ impl SlackBot {
                 user_id_map,
                 workspace_grant,
                 trusted: false,
+                in_run: None,
             }
         };
 

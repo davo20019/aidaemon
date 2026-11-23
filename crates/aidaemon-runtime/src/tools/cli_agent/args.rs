@@ -30,6 +30,10 @@ pub(super) struct CliAgentArgs {
     /// creates it empty for the agent to work in.
     #[serde(default)]
     pub(super) new_folders: Vec<String>,
+    /// An earlier run of this conversation to go on from: its agent
+    /// continues its own session, in its folder.
+    #[serde(default)]
+    pub(super) continue_run: Option<String>,
     /// Files or directories the run will change.
     #[serde(default)]
     pub(super) scope: Vec<String>,

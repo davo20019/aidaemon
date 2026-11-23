@@ -15,8 +15,8 @@ use tracing::{info, warn};
 use crate::host::TurnHost;
 use crate::prompt::core as core_prompt;
 use crate::prompt::rules::{
-    infer_assistant_name_from_prompt, render_environment_section, render_workspace_section,
-    task_lead_rules,
+    infer_assistant_name_from_prompt, render_environment_section, render_run_thread_section,
+    render_workspace_section, task_lead_rules,
 };
 use crate::turn::resume::ResumeCheckpoint;
 
@@ -310,6 +310,15 @@ pub async fn build_system_prompt_for_message(
         for tail in [&mut fresh_tail, &mut continuation_tail] {
             tail.push_str("\n\n");
             tail.push_str(&environment);
+        }
+    }
+    // The owner wrote in a run's thread (typed, from the client that
+    // showed it): the message is for that run's coding agent.
+    if let Some(run) = channel_ctx.in_run.as_deref() {
+        let note = render_run_thread_section(run);
+        for tail in [&mut fresh_tail, &mut continuation_tail] {
+            tail.push_str("\n\n");
+            tail.push_str(&note);
         }
     }
     let tail = if preserve_conversation_context {

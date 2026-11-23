@@ -257,6 +257,12 @@ pub enum Command {
         /// absent: as it was.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<Effort>,
+        /// The run whose thread it was posted in (protocol 1.48): the owner
+        /// follows up with that run's coding agent, which goes on in its
+        /// own session ([`RunSummary::continues`]). Only the app's own
+        /// conversations take one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_run: Option<String>,
     },
     /// Stop everything the session has running (`/cancel all`).
     StopTurn { session_id: String },
@@ -2975,6 +2981,11 @@ pub struct RunSummary {
     /// the order first changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edited: Vec<String>,
+    /// The earlier run it continues (protocol 1.48): the same coding
+    /// agent's session, resumed with a follow-up. A client shows the runs
+    /// one continues as one thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
 }
 
 /// What one run did (protocol 1.46, `get_run`), from its record. Only a
@@ -2986,6 +2997,10 @@ pub struct RunDetail {
     /// thread id, an ACP session id): what resumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    /// A follow-up can go on from it (protocol 1.48): its agent kept its
+    /// session. `send_message` with `in_run` set to it continues it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_continue: bool,
     /// The model it worked with, as it reported it (protocol 1.47).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

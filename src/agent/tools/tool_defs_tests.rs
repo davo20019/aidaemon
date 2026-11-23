@@ -283,6 +283,7 @@ async fn session_static_roster_limits_scoped_guest_to_granted_file_tools() {
         user_id_map: HashMap::new(),
         workspace_grant: Some(grant),
         trusted: false,
+        in_run: None,
     };
 
     let roster = harness

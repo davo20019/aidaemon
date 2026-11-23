@@ -824,6 +824,47 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     Ok(())
 }
 
+/// A finished agent whose session was kept takes a follow-up from its
+/// view; the view moves to the run that takes it, the two listed as one
+/// thread, and the first run's row counts it.
+#[test]
+fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-thread","channel":"app","title":"Fix the synthetic slug","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-t1","session_id":"app:synthetic-thread","label":"Fix the slug","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-t"}]}}"#,
+        ),
+    ]);
+    settle(&mut app)?;
+    app.press("Fix the synthetic slug >> nth=0")?;
+    app.wait_for("text:Codex · Finished")?;
+    app.press("Codex · Finished, show its steps")?;
+    let id = wait_sent("get_run")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-t1","can_continue":true,"task":"Fix the slug","steps":[{{"words":"Editing slug.py","state":"done"}}]}}}}}}"#
+    ))]);
+    app.wait_for("text:Follow up with Codex")?;
+    app.type_text("label:Follow-up for the agent", "Also add a test")?;
+    let before = sent("send_message");
+    app.press("Send to the agent")?;
+    wait_sent_new("send_message", before)?;
+    app.wait_for("text:Sent. Passing it to Codex…")?;
+    // The run that takes it starts: the view moves to it.
+    let before = sent("get_run");
+    feed([frame(
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999995000,"group":"task-u","continues":"cli-agent-t1"}}}"#,
+    )]);
+    wait_sent_new("get_run", before)?;
+    app.wait_for("text:Thread")?;
+    app.wait_for("text:Codex · finished · Fix the slug")?;
+    app.press("Back")?;
+    app.wait_for("text:Codex · Finished · 1 follow-up")?;
+    Ok(())
+}
+
 /// On a phone: the drawer's row counts the agents under the conversation,
 /// the working line heads them, and a run's row opens its view in the
 /// details drawer, Back returning to the conversation.

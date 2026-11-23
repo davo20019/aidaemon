@@ -444,6 +444,7 @@ impl TurnObserver for GatewayObserver {
                 agent: change.agent.as_deref(),
                 group: change.group.as_deref(),
                 edited: &change.edited,
+                continues: change.continues.as_deref(),
                 started_at: change.started_at,
                 ended_at: change.ended_at,
             },
@@ -514,6 +515,7 @@ pub(crate) struct RunRecord<'a> {
     pub agent: Option<&'a str>,
     pub group: Option<&'a str>,
     pub edited: &'a [String],
+    pub continues: Option<&'a str>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -529,6 +531,7 @@ pub(crate) fn run_summary(
         agent,
         group,
         edited,
+        continues,
         started_at,
         ended_at,
     } = record;
@@ -555,6 +558,7 @@ pub(crate) fn run_summary(
         stopped_by_owner: view.stopped_by_owner,
         group: group.map(str::to_string),
         edited: edited.to_vec(),
+        continues: continues.map(str::to_string),
     }
 }
 

@@ -2,6 +2,11 @@
 //! asked, its steps as its coding agent reported them, its plan, the
 //! permissions it asked for, what it reported at its end and what it cost,
 //! read from the run's record (`get_run`) and read again as it moves.
+//!
+//! A run its agent can go on from takes a follow-up at its foot: the
+//! owner's message goes to the same agent, in its own session (`in_run`).
+//! The runs that continue one another are one thread: the view lists them,
+//! and moves to the follow-up's run once it starts.
 
 use aidaemon_client_protocol::{
     RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
@@ -52,27 +57,214 @@ pub fn run_view(store: Store, id: String) -> View {
                 ),
         )
         .child(
-            scroll()
-                .flex_1()
-                .child(view().px_3().pb_4().gap_3().child(dynamic(move || {
-                    let read = store.run_view();
-                    // The files it changed, as its record has them so far.
-                    let (edited, coding, running) = summary.with(|run| {
-                        run.as_ref().map_or((Vec::new(), false, false), |run| {
-                            (
-                                run.edited.clone(),
-                                store.is_coding(&run.session_id),
-                                run.phase == RunPhase::Running,
-                            )
-                        })
-                    });
-                    Some(untracked(move || match read {
-                        Read::Ready(detail) => body(store, detail, edited, coding, running),
-                        Read::Failed(why) => note(format!("Could not read this run: {why}")),
-                        _ => note("Reading what it did…".to_string()),
-                    }))
-                }))),
+            scroll().flex_1().child(
+                view()
+                    .px_3()
+                    .pb_4()
+                    .gap_3()
+                    .child(thread(store, id.clone()))
+                    .child(dynamic(move || {
+                        let read = store.run_view();
+                        // The files it changed, as its record has them so far.
+                        let (edited, coding, running) = summary.with(|run| {
+                            run.as_ref().map_or((Vec::new(), false, false), |run| {
+                                (
+                                    run.edited.clone(),
+                                    store.is_coding(&run.session_id),
+                                    run.phase == RunPhase::Running,
+                                )
+                            })
+                        });
+                        Some(untracked(move || match read {
+                            Read::Ready(detail) => body(store, detail, edited, coding, running),
+                            Read::Failed(why) => note(format!("Could not read this run: {why}")),
+                            _ => note("Reading what it did…".to_string()),
+                        }))
+                    })),
+            ),
         )
+        .child(follow_up(store, id, summary))
+}
+
+/// The runs that go on from one another (`continues`), oldest first, when
+/// there are several: each opens its own view; this one is marked.
+fn thread(store: Store, id: String) -> View {
+    let runs = {
+        let id = id.clone();
+        computed(move || thread_of(&store.all_runs(), &id))
+    };
+    view().child(dynamic(move || {
+        let runs = runs.get();
+        let id = id.clone();
+        (runs.len() > 1).then(|| {
+            untracked(move || {
+                let mut list = view().gap_1();
+                for run in runs {
+                    let this = run.id == id;
+                    let words = format!("{} · {}", title(&run), run.label);
+                    let (glyph, tone) = if this {
+                        (Glyph::Dot, Tone::Accent)
+                    } else {
+                        match run.phase {
+                            RunPhase::Succeeded => (Glyph::Check, Tone::Success),
+                            RunPhase::Failed => (Glyph::Warning, Tone::Danger),
+                            RunPhase::Stopped => (Glyph::Warning, Tone::Warning),
+                            _ => (Glyph::Work, Tone::Accent),
+                        }
+                    };
+                    let row = line(glyph, tone, words.clone(), false);
+                    list = if this {
+                        list.child(row)
+                    } else {
+                        list.child(
+                            button()
+                                .accessibility_label(format!("{words}, show it"))
+                                .on_press(move || store.open_run(&run.id))
+                                .child(row),
+                        )
+                    };
+                }
+                section("Thread", list)
+            })
+        })
+    }))
+}
+
+/// The runs of run `id`'s thread, oldest first: every run that goes on,
+/// step by step, from the first one it goes back to.
+fn thread_of(runs: &[RunSummary], id: &str) -> Vec<RunSummary> {
+    let root = first_of(runs, id);
+    let mut thread: Vec<RunSummary> = runs
+        .iter()
+        .filter(|run| first_of(runs, &run.id) == root)
+        .cloned()
+        .collect();
+    thread.sort_by_key(|run| run.started_at_ms);
+    thread
+}
+
+/// The first run run `id` goes back to, through what each continues.
+fn first_of<'a>(runs: &'a [RunSummary], id: &'a str) -> &'a str {
+    let mut at = id;
+    // Bounded: a record that loops can't hang the view.
+    for _ in 0..runs.len() {
+        match runs
+            .iter()
+            .find(|run| run.id == at)
+            .and_then(|run| run.continues.as_deref())
+        {
+            Some(earlier) if runs.iter().any(|run| run.id == earlier) => at = earlier,
+            _ => break,
+        }
+    }
+    at
+}
+
+/// A follow-up for the run's agent, at the view's foot: only when its agent
+/// kept its session, it ended, and nothing goes on from it yet. Once sent,
+/// the view moves to the run that takes it as soon as that starts.
+fn follow_up(store: Store, id: String, summary: Memo<Option<RunSummary>>) -> View {
+    let draft = signal(String::new());
+    let sent = signal(false);
+    let continued = {
+        let id = id.clone();
+        computed(move || {
+            store
+                .all_runs()
+                .into_iter()
+                .filter(|run| run.continues.as_deref() == Some(id.as_str()))
+                .max_by_key(|run| run.started_at_ms)
+                .map(|run| run.id)
+        })
+    };
+    effect(move || {
+        if sent.get()
+            && let Some(next) = continued.get()
+        {
+            sent.set(false);
+            untracked(|| store.open_run(&next));
+        }
+    });
+    let open = computed(move || {
+        let can = matches!(store.run_view(), Read::Ready(detail) if detail.can_continue);
+        let ended = summary.with(|run| {
+            run.as_ref()
+                .is_some_and(|run| run.phase != RunPhase::Running)
+        });
+        can && ended && continued.with(Option::is_none)
+    });
+    let agent = computed(move || {
+        summary.with(|run| {
+            run.as_ref()
+                .and_then(|run| run.agent.clone())
+                .unwrap_or_else(|| "its agent".to_string())
+        })
+    });
+    let send = {
+        let id = id.clone();
+        move || {
+            let text = draft.get_untracked();
+            if text.trim().is_empty() {
+                return;
+            }
+            let Some(session) =
+                summary.with_untracked(|run| run.as_ref().map(|run| run.session_id.clone()))
+            else {
+                return;
+            };
+            store.follow_up(&session, &id, &text);
+            draft.set(String::new());
+            sent.set(true);
+        }
+    };
+    view()
+        .child(when(
+            move || open.get() && !sent.get(),
+            move || {
+                let send = send.clone();
+                let submit = send.clone();
+                view()
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(colors::LINE)
+                    .child(
+                        text(move || format!("Follow up with {}", agent.get()))
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
+                    )
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                ui::field("Ask it to do more…", draft)
+                                    .label("Follow-up for the agent")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .on_submit(move |_: &str| submit()),
+                            )
+                            .child(ui::icon_btn_primary(Glyph::Send, "Send to the agent", send)),
+                    )
+            },
+        ))
+        .child(when(
+            move || sent.get(),
+            move || {
+                view()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(colors::LINE)
+                    .child(
+                        text(move || format!("Sent. Passing it to {}…", agent.get()))
+                            .text_size(px(type_scale::SM))
+                            .text_color(colors::FAINT),
+                    )
+            },
+        ))
 }
 
 /// The run's name: its agent, else its label.

@@ -148,6 +148,14 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn note_cli_agent_keeps_session(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cli_agent_invocations SET keeps_session = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn set_cli_agent_session(&self, id: i64, agent_session: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE cli_agent_invocations SET agent_session_id = ? WHERE id = ?")
             .bind(agent_session)
@@ -182,7 +190,8 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
     ) -> anyhow::Result<Option<aidaemon_tools::services::CliAgentRun>> {
         use sqlx::Row;
         let row = sqlx::query(
-            "SELECT id, agent_name, agent_session_id, working_dir, prompt_summary, task, output_summary, success
+            "SELECT id, session_id, agent_name, agent_session_id, working_dir, prompt_summary, task,
+                    output_summary, success, COALESCE(keeps_session, 0) AS keeps_session
              FROM cli_agent_invocations WHERE run_id = ? ORDER BY id DESC LIMIT 1",
         )
         .bind(run_id)
@@ -190,6 +199,9 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         .await?;
         Ok(row.map(|row| aidaemon_tools::services::CliAgentRun {
             invocation: row.get("id"),
+            session_id: row
+                .get::<Option<String>, _>("session_id")
+                .unwrap_or_default(),
             agent_name: row.get("agent_name"),
             agent_session: row.get("agent_session_id"),
             working_dir: row.get("working_dir"),
@@ -197,6 +209,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
             task: row.get("task"),
             output_summary: row.get("output_summary"),
             success: row.get("success"),
+            keeps_session: row.get::<i64, _>("keeps_session") != 0,
         }))
     }
 

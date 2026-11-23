@@ -11,6 +11,10 @@
 //! - Full access: `bypassPermissions`.
 //!
 //! In the first two every prompt goes to the host ([`host::ClaudeHost`]).
+//!
+//! A run continues an earlier session with `--resume <session id>`, in
+//! print mode as in its terminal. Claude Code keeps a session under the
+//! folder it ran in, so the run must work in the same folder.
 //! Verified against Claude Code 2.1.327 (live probes, 2026-11-17/18).
 
 pub mod events;
@@ -165,6 +169,47 @@ fn plan() -> Plan {
     }
 }
 
+/// `launch` in `request`'s mode, and how the run goes.
+fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
+    if let Some(model) = request.model {
+        crate::agent::set_option(&mut launch.args, launch.start, "--model", &[], model);
+    }
+    if let Some(session) = request.resume {
+        crate::agent::set_option(&mut launch.args, launch.start, "--resume", &["-r"], session);
+    }
+    let args = &mut launch.args;
+    basics(args);
+    if !request.enforce {
+        // Outside the embedding agent's checks: its prompts still go to
+        // the host when one can answer them.
+        return Ok(if request.can_host {
+            hosted(args, request)
+        } else {
+            plan()
+        });
+    }
+    match request.mode {
+        PermissionMode::FullAccess => {
+            drop_permission_flags(args, launch.start);
+            push(args, &["--permission-mode", "bypassPermissions"]);
+            Ok(plan())
+        }
+        _ if !request.can_host => Err(
+            "Claude Code's prompts can't be answered here (its run needs a local process \
+             inside a checked turn)"
+                .to_string(),
+        ),
+        PermissionMode::Checked => {
+            confine(args, launch.start, request)?;
+            Ok(hosted(args, request))
+        }
+        PermissionMode::EveryCommand => {
+            every_command(args, launch.start, request.read_only);
+            Ok(hosted(args, request))
+        }
+    }
+}
+
 impl CodingAgent for ClaudeCode {
     fn reports_steps(&self) -> bool {
         true
@@ -228,6 +273,10 @@ impl CodingAgent for ClaudeCode {
         true
     }
 
+    fn resumes(&self) -> bool {
+        true
+    }
+
     fn model_listing(&self) -> Option<crate::ModelListing> {
         Some(crate::ModelListing::Claude)
     }
@@ -251,40 +300,13 @@ impl CodingAgent for ClaudeCode {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
-        if let Some(model) = request.model {
-            crate::agent::set_option(&mut launch.args, launch.start, "--model", &[], model);
-        }
-        let args = &mut launch.args;
-        basics(args);
-        if !request.enforce {
-            // Outside the embedding agent's checks: its prompts still go to
-            // the host when one can answer them.
-            return Ok(if request.can_host {
-                hosted(args, request)
-            } else {
-                plan()
-            });
-        }
-        match request.mode {
-            PermissionMode::FullAccess => {
-                drop_permission_flags(args, launch.start);
-                push(args, &["--permission-mode", "bypassPermissions"]);
-                Ok(plan())
-            }
-            _ if !request.can_host => Err(
-                "Claude Code's prompts can't be answered here (its run needs a local process \
-                 inside a checked turn)"
-                    .to_string(),
-            ),
-            PermissionMode::Checked => {
-                confine(args, launch.start, request)?;
-                Ok(hosted(args, request))
-            }
-            PermissionMode::EveryCommand => {
-                every_command(args, launch.start, request.read_only);
-                Ok(hosted(args, request))
-            }
-        }
+        let mut plan = shape(request, launch)?;
+        // Its own flag: a session it was told not to keep can't be
+        // continued.
+        plan.keeps_session = !launch.args[launch.start..]
+            .iter()
+            .any(|arg| arg == "--no-session-persistence");
+        Ok(plan)
     }
 
     /// Its `result` event lists what its own permission check refused
@@ -356,6 +378,7 @@ mod tests {
             can_host,
             stdin_open: true,
             model: None,
+            resume: None,
         }
     }
 
@@ -458,5 +481,76 @@ mod tests {
             vec!["Bash: rm -rf /w/x".to_string(), "Write: /w/y".to_string()]
         );
         assert!(ClaudeCode.refused_actions("no json").is_empty());
+    }
+
+    #[test]
+    fn a_run_continues_the_session_it_names_in_every_mode() {
+        assert!(ClaudeCode.resumes());
+        for mode in [
+            PermissionMode::Checked,
+            PermissionMode::EveryCommand,
+            PermissionMode::FullAccess,
+        ] {
+            let mut asked = request(mode, false, true);
+            asked.resume = Some("s-1");
+            let mut launch = Launch {
+                args: strings(&["-p", "--output-format", "stream-json"]),
+                start: 0,
+            };
+            ClaudeCode.prepare(&asked, &mut launch).unwrap();
+            let at = launch
+                .args
+                .iter()
+                .position(|arg| arg == "--resume")
+                .unwrap();
+            assert_eq!(launch.args[at + 1], "s-1");
+            assert!(
+                launch
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--print" || arg == "-p")
+            );
+        }
+        // No session named: a new one.
+        let mut launch = Launch {
+            args: strings(&["-p"]),
+            start: 0,
+        };
+        ClaudeCode
+            .prepare(
+                &request(PermissionMode::FullAccess, false, true),
+                &mut launch,
+            )
+            .unwrap();
+        assert!(!launch.args.iter().any(|arg| arg == "--resume"));
+    }
+
+    #[test]
+    fn a_stored_launchs_own_session_is_replaced() {
+        for stored in [
+            &["-p", "--resume", "old"][..],
+            &["-p", "-r", "old"],
+            &["-p", "--resume=old"],
+        ] {
+            let mut asked = request(PermissionMode::FullAccess, false, true);
+            asked.resume = Some("s-1");
+            let mut launch = Launch {
+                args: strings(stored),
+                start: 0,
+            };
+            ClaudeCode.prepare(&asked, &mut launch).unwrap();
+            let joined = launch.args.join(" ");
+            assert!(!joined.contains("old"), "{joined}");
+            assert_eq!(
+                launch
+                    .args
+                    .iter()
+                    .filter(|arg| arg.starts_with("--resume") || *arg == "-r")
+                    .count(),
+                1,
+                "{joined}"
+            );
+            assert!(joined.contains("--resume s-1"), "{joined}");
+        }
     }
 }

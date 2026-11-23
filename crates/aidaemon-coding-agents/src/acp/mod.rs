@@ -154,6 +154,9 @@ impl CodingAgent for AcpAgent {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
+        // Its host opens a new session each run (`session/new`); ACP's
+        // `session/load` is not used yet.
+        crate::agent::refuse_resume(self, request)?;
         if !request.stdin_open {
             return Err(format!(
                 "{} runs only where its stdin can stay open (a local process)",
@@ -200,6 +203,7 @@ mod tests {
             can_host,
             stdin_open: true,
             model: None,
+            resume: None,
         }
     }
 
@@ -247,5 +251,23 @@ mod tests {
         assert!(!agent.can_run(PermissionMode::Checked, false, true));
         assert_eq!(agent.default_mode(), Some(PermissionMode::EveryCommand));
         assert!(!agent.modes().contains(&PermissionMode::Checked));
+    }
+
+    #[test]
+    fn it_cannot_continue_an_earlier_session() {
+        let agent = AcpAgent::custom("Synthetic Agent", "synthetic-agent", &["--acp"]);
+        assert!(!agent.resumes());
+        let mut asked = request(PermissionMode::FullAccess, true);
+        asked.resume = Some("s-1");
+        let mut launch = Launch {
+            args: Vec::new(),
+            start: 0,
+        };
+        let refusal = agent.prepare(&asked, &mut launch).err().unwrap();
+        assert!(
+            refusal.starts_with("Synthetic Agent can't continue"),
+            "{refusal}"
+        );
+        assert!(launch.args.is_empty());
     }
 }

@@ -616,6 +616,7 @@ pub fn build_child_channel_context(facts: &ToolCallContext) -> ChannelContext {
         user_id_map: std::collections::HashMap::new(),
         workspace_grant: None,
         trusted: facts.trusted_session,
+        in_run: None,
     }
 }
 
@@ -2533,6 +2534,7 @@ mod group_tests {
             activity: None,
             agent: None,
             edited: Vec::new(),
+            continues: None,
             steps: Vec::new(),
             evidence: Default::default(),
             failure: None,
@@ -2641,6 +2643,7 @@ mod group_tests {
                 activity: None,
                 agent: None,
                 edited: Vec::new(),
+                continues: None,
                 steps: Vec::new(),
                 evidence: crate::run_state::RunEvidence {
                     delivered,

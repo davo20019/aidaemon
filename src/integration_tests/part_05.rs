@@ -69,6 +69,7 @@ async fn test_full_stack_website_exploration_no_stall() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -143,6 +144,7 @@ async fn test_full_stack_duplicate_commands_no_stall() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -236,6 +238,7 @@ async fn test_full_stack_cli_agent_then_terminal_followup() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -1184,6 +1187,7 @@ async fn test_full_stack_deployed_site_url_lookup_no_stall() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -1279,6 +1283,7 @@ async fn test_full_stack_blocked_tool_triggers_stall() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -1496,6 +1501,7 @@ async fn test_full_stack_typed_recovery_reply_after_negative_contract_denial() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -1641,6 +1647,7 @@ async fn test_full_stack_executor_declared_checklist_is_demanded_until_receipts_
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )

@@ -754,6 +754,7 @@ async fn sdk_engine_demands_open_checklist_items_until_receipts_close_them() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )

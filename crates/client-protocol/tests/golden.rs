@@ -216,6 +216,7 @@ fn run() -> RunSummary {
         stopped_by_owner: false,
         group: Some("task-9b1d".into()),
         edited: vec!["/w/synthetic/release.md".into()],
+        continues: None,
     }
 }
 
@@ -378,6 +379,7 @@ fn client_samples() -> Vec<ClientFrame> {
                     model: "synthetic-model-large".into(),
                 }),
                 effort: Some(Effort::High),
+                in_run: None,
             },
         ),
         command(
@@ -1416,6 +1418,7 @@ fn server_samples() -> Vec<ServerFrame> {
             run: RunDetail {
                 run_id: "run-3f2a".into(),
                 agent_session_id: Some("synthetic-session-1".into()),
+                can_continue: true,
                 model: Some("synthetic-large".into()),
                 working_dir: Some("/w/synthetic".into()),
                 task: "Prepare the synthetic release notes".into(),

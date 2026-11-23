@@ -104,6 +104,12 @@ pub struct ChannelContext {
     /// Trusted sessions can bypass terminal command approval for allowed commands.
     /// This must be set explicitly by the scheduler — never derived from session ID strings.
     pub trusted: bool,
+    /// The run whose thread the owner posted this message in (a client that
+    /// shows each helper run as a thread): the owner is talking to that
+    /// run's coding agent, through this agent. Set only by the client that
+    /// showed the thread, from its typed field; `None` for a message in the
+    /// conversation itself.
+    pub in_run: Option<String>,
 }
 
 impl ChannelContext {
@@ -122,6 +128,7 @@ impl ChannelContext {
             user_id_map: HashMap::new(),
             workspace_grant: None,
             trusted: false,
+            in_run: None,
         }
     }
 
@@ -139,6 +146,7 @@ impl ChannelContext {
             user_id_map: HashMap::new(),
             workspace_grant: None,
             trusted: false,
+            in_run: None,
         }
     }
 
@@ -156,6 +164,7 @@ impl ChannelContext {
             user_id_map: HashMap::new(),
             workspace_grant: None,
             trusted: true,
+            in_run: None,
         }
     }
 
@@ -223,6 +232,7 @@ mod workspace_grant_tests {
             user_id_map: HashMap::new(),
             workspace_grant: Some(workspace_grant),
             trusted: false,
+            in_run: None,
         }
     }
 

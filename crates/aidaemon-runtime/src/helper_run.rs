@@ -31,6 +31,18 @@ pub struct HelperSpec {
     pub new_folders: Vec<String>,
     /// Files or directories the helper will change.
     pub scope: Vec<String>,
+    /// The earlier run it goes on from: its coding agent's own session,
+    /// resumed. `None` for new work.
+    pub continues: Option<Continues>,
+}
+
+/// An earlier coding agent run that a new one goes on from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Continues {
+    /// The earlier run's id.
+    pub run: String,
+    /// Its agent's own session id, which the new run resumes.
+    pub agent_session: String,
 }
 
 impl HelperSpec {
@@ -536,6 +548,7 @@ mod tests {
             mission: "Install Drupal".to_string(),
             new_folders: vec!["/Users/someone/projects/claude-drupal-7".to_string()],
             scope: Vec::new(),
+            continues: None,
         };
         let narrowed = helper_authority(&parent, spec.declaration("chat"), None);
         assert_eq!(

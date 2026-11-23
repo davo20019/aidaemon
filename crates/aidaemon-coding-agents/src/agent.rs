@@ -66,6 +66,13 @@ pub trait CodingAgent: Send + Sync {
         false
     }
 
+    /// Whether a run can continue a session it started earlier
+    /// ([`RunRequest::resume`]), keeping what it learned there. `false`:
+    /// every run starts a new one.
+    fn resumes(&self) -> bool {
+        false
+    }
+
     /// How to ask it which models it offers, when its readiness check does
     /// not say (an ACP session's does). `None`: it cannot be asked.
     fn model_listing(&self) -> Option<crate::ModelListing> {
@@ -125,6 +132,26 @@ pub struct RunRequest<'a> {
     /// The model the owner chose for it (an id it knows); `None`: its own
     /// default. Only an agent that [`CodingAgent::takes_model`] uses it.
     pub model: Option<&'a str>,
+    /// The agent's own id for a session an earlier run of it started (the
+    /// one its [`crate::AgentEvent::Session`] reported), to continue with
+    /// what it learned there; `None`: a new session. Only an agent that
+    /// [`CodingAgent::resumes`] takes it.
+    pub resume: Option<&'a str>,
+}
+
+/// `Err`, in words for the owner, when `request` asks `agent` to continue
+/// an earlier session and it cannot.
+pub(crate) fn refuse_resume(
+    agent: &(impl CodingAgent + ?Sized),
+    request: &RunRequest<'_>,
+) -> Result<(), String> {
+    if request.resume.is_some() && !agent.resumes() {
+        return Err(format!(
+            "{} can't continue an earlier session: each of its runs starts a new one",
+            agent.name()
+        ));
+    }
+    Ok(())
 }
 
 /// Set `flag` (or one of its `aliases`) to `value` among the agent's own
@@ -185,6 +212,10 @@ pub struct Plan {
     pub host: Option<Box<dyn HostStarter>>,
     /// Kept until the run is over (a folder made for it, ...).
     pub keep_alive: Option<Box<dyn Any + Send>>,
+    /// The agent keeps this run's session where a later run can continue
+    /// it ([`RunRequest::resume`]): `false` for a run whose session is
+    /// thrown away at its end, or an agent that can't continue one.
+    pub keeps_session: bool,
 }
 
 impl Plan {
@@ -196,6 +227,7 @@ impl Plan {
             env_remove: Vec::new(),
             host: None,
             keep_alive: None,
+            keeps_session: false,
         }
     }
 }

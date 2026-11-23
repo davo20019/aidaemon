@@ -450,6 +450,9 @@ pub struct RunState {
     /// The files the coding agent it launched changed, as its typed steps
     /// named them, in the order first changed.
     pub edited: Vec<String>,
+    /// The earlier run it continues: the same coding agent's session,
+    /// resumed with the owner's follow-up.
+    pub continues: Option<String>,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -746,6 +749,7 @@ impl RunStates {
             activity: None,
             agent: None,
             edited: Vec::new(),
+            continues: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -859,6 +863,7 @@ impl RunStates {
             agent: state.agent.clone(),
             group: state.request.clone(),
             edited: state.edited.clone(),
+            continues: state.continues.clone(),
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -1024,6 +1029,21 @@ impl RunStates {
             _ => false,
         };
         if added {
+            self.report(id, false);
+        }
+    }
+
+    /// Run `id` continues the earlier run `earlier` (the same coding
+    /// agent's session, resumed).
+    pub fn continues(&self, id: &str, earlier: &str) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry) => {
+                entry.state.continues = Some(earlier.to_string());
+                true
+            }
+            None => false,
+        };
+        if set {
             self.report(id, false);
         }
     }
@@ -1561,6 +1581,7 @@ mod tests {
             activity: None,
             agent: None,
             edited: Vec::new(),
+            continues: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,

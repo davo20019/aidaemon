@@ -2458,6 +2458,7 @@ impl Client {
                     project_id: session.is_none().then_some(project).flatten(),
                     model,
                     effort,
+                    in_run: None,
                 });
                 if queueing {
                     self.queue_sends.insert(id.clone());
@@ -2472,6 +2473,30 @@ impl Client {
         Ok(true)
     }
 
+    /// Follow up on run `run_id` of `session`: `text` goes to its coding
+    /// agent, which goes on in its own session (protocol 1.48, `in_run`).
+    /// While the conversation works it waits for a turn of its own.
+    pub fn follow_up(&mut self, session: &str, run_id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let queueing = self.is_running(session);
+        let id = self.send(Command::SendMessage {
+            session_id: Some(session.to_owned()),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+            mid_run: queueing.then_some(MidRun::Queue),
+            project_id: None,
+            model: None,
+            effort: None,
+            in_run: Some(run_id.to_owned()),
+        });
+        if queueing {
+            self.queue_sends.insert(id);
+        }
+    }
+
     /// Say `text` in `session`, as if typed (a suggested prompt, Retry).
     pub fn ask(&mut self, session: &str, text: String) {
         self.send(Command::SendMessage {
@@ -2482,6 +2507,7 @@ impl Client {
             project_id: None,
             model: None,
             effort: None,
+            in_run: None,
         });
     }
 
@@ -2546,6 +2572,7 @@ impl Client {
                     project_id: None,
                     model: None,
                     effort: None,
+                    in_run: None,
                 });
             }
         }
@@ -3347,6 +3374,27 @@ mod tests {
         client.close_run();
         client.update(frame(&step.replace(r#""seq":9"#, r#""seq":10"#)), &cx(None));
         assert!(client.take_outgoing().is_empty());
+    }
+
+    /// A follow-up names the run it is for; while the conversation works
+    /// it waits for a turn of its own.
+    #[test]
+    fn a_follow_up_names_its_run_and_waits_while_the_conversation_works() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.follow_up("app:s1", "cli-agent-1", "  also add tests ");
+        let sent = client.take_outgoing();
+        assert!(matches!(
+            &sent[..],
+            [(_, Command::SendMessage { in_run: Some(run), text, mid_run: None, .. })]
+                if run == "cli-agent-1" && text == "also add tests"
+        ));
+        client.follow_up("app:s1", "cli-agent-1", "   ");
+        assert!(
+            client.take_outgoing().is_empty(),
+            "nothing to say sends nothing"
+        );
     }
 
     /// "Send now" goes only to a daemon that knows it: an older one would

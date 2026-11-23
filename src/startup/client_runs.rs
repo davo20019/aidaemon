@@ -21,6 +21,7 @@ pub(crate) async fn run_detail(state: &dyn StateStore, run_id: &str) -> anyhow::
         return Ok(RunDetail {
             run_id: run_id.to_string(),
             agent_session_id: None,
+            can_continue: false,
             model: None,
             working_dir: None,
             task: String::new(),
@@ -39,6 +40,7 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
     let mut detail = RunDetail {
         run_id: run_id.to_string(),
         agent_session_id: run.agent_session,
+        can_continue: false,
         model: None,
         working_dir: run.working_dir,
         task: run.task.unwrap_or(run.prompt_summary),
@@ -145,6 +147,8 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
             }
         }
     }
+    // A follow-up goes on in the session its agent kept.
+    detail.can_continue = run.keeps_session && detail.agent_session_id.is_some();
     detail
 }
 
@@ -218,6 +222,7 @@ mod tests {
     fn a_runs_kept_events_read_back_as_its_steps_plan_permissions_and_usage() {
         let run = CliAgentRun {
             invocation: 7,
+            session_id: "app:synthetic".into(),
             agent_name: "codex".into(),
             agent_session: None,
             working_dir: Some("/w/synthetic".into()),
@@ -225,6 +230,7 @@ mod tests {
             task: Some("Review the slug module".into()),
             success: Some(true),
             output_summary: Some("Fixed one bug".into()),
+            keeps_session: true,
         };
         let events = [
             event(
@@ -262,6 +268,7 @@ mod tests {
         ];
         let detail = detail("cli-agent-1", run, &events);
         assert_eq!(detail.agent_session_id.as_deref(), Some("thread-1"));
+        assert!(detail.can_continue, "its agent kept the session it named");
         assert_eq!(detail.model.as_deref(), Some("synthetic-large"));
         assert_eq!(detail.task, "Review the slug module");
         assert_eq!(detail.steps.len(), 2);
@@ -282,6 +289,7 @@ mod tests {
     fn a_structured_agent_that_did_not_finish_has_no_report() {
         let run = |success| CliAgentRun {
             invocation: 8,
+            session_id: "app:synthetic".into(),
             agent_name: "codex".into(),
             agent_session: None,
             working_dir: None,
@@ -289,6 +297,7 @@ mod tests {
             task: None,
             output_summary: Some(r#"{"type":"thread.started","thread_id":"t-1"}"#.into()),
             success,
+            keeps_session: false,
         };
         let events = [event(1, "session", r#"{"id":"t-1","model":null}"#)];
         assert_eq!(

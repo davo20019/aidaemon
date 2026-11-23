@@ -3,6 +3,7 @@
   "result": {
     "run": {
       "agent_session_id": "synthetic-session-1",
+      "can_continue": true,
       "model": "synthetic-large",
       "permissions": [
         {

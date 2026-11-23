@@ -177,6 +177,8 @@ pub struct CliAgentEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliAgentRun {
     pub invocation: i64,
+    /// The conversation it reported to.
+    pub session_id: String,
     pub agent_name: String,
     /// The agent's own session id, once it gave one.
     pub agent_session: Option<String>,
@@ -188,6 +190,9 @@ pub struct CliAgentRun {
     pub output_summary: Option<String>,
     /// How it ended, once it did: whether it succeeded.
     pub success: Option<bool>,
+    /// Its agent kept its session where a follow-up can continue it
+    /// ([`DynamicCliAgentStore::note_cli_agent_keeps_session`]).
+    pub keeps_session: bool,
 }
 
 /// Runtime-managed CLI agents persistence + invocation logs.
@@ -250,6 +255,12 @@ pub trait DynamicCliAgentStore: Send + Sync {
 
     /// What invocation `id` was asked, whole: the task its run view shows.
     async fn note_cli_agent_task(&self, _id: i64, _task: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Invocation `id`'s agent keeps its session where a later run can
+    /// continue it.
+    async fn note_cli_agent_keeps_session(&self, _id: i64) -> anyhow::Result<()> {
         Ok(())
     }
 

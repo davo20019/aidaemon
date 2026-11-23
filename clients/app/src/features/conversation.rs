@@ -537,7 +537,37 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
                 .is_some_and(|r| r.phase.is_running() && r.background)
         })
     });
-    let line = computed(move || run.with(|r| r.as_ref().map(run_line).unwrap_or_default()));
+    // The runs that go on from it: the owner's follow-ups to its agent.
+    let follow_ups = {
+        let id = id.clone();
+        computed(move || {
+            store
+                .all_runs()
+                .iter()
+                .filter(|later| later.continues.as_deref() == Some(id.as_str()))
+                .count()
+        })
+    };
+    let line = computed(move || {
+        let mut words = run.with(|r| {
+            r.as_ref()
+                .map(|r| {
+                    let line = run_line(r);
+                    if r.continues.is_some() {
+                        format!("{line} · follow-up")
+                    } else {
+                        line
+                    }
+                })
+                .unwrap_or_default()
+        });
+        match follow_ups.get() {
+            0 => {}
+            1 => words.push_str(" · 1 follow-up"),
+            n => words.push_str(&format!(" · {n} follow-ups")),
+        }
+        words
+    });
     // How it ended by its mark as well as its colour: a check, a warning,
     // or the work mark while it runs.
     let mark = computed(move || {

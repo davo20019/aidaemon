@@ -362,6 +362,9 @@ pub struct RunChange {
     pub group: Option<String>,
     /// The files the coding agent it launched changed.
     pub edited: Vec<String>,
+    /// The earlier run it continues: the same coding agent's session,
+    /// resumed with the owner's follow-up.
+    pub continues: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
@@ -1641,6 +1644,7 @@ mod tests {
                         agent: None,
                         group: None,
                         edited: Vec::new(),
+                        continues: None,
                         this_request: false,
                     })
                 })

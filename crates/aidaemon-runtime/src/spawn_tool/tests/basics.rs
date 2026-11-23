@@ -87,6 +87,7 @@ pub(super) fn ended_run(
         activity: None,
         agent: None,
         edited: Vec::new(),
+        continues: None,
         steps: Vec::new(),
         evidence: crate::run_state::RunEvidence {
             unconfirmed: unconfirmed

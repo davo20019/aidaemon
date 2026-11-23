@@ -47,6 +47,10 @@ impl Tool for CliAgentTool {
                         "type": "string",
                         "description": "Task prompt"
                     },
+                    "continue_run": {
+                        "type": "string",
+                        "description": "For run: an earlier run's id in this conversation to follow up on. Its agent goes on in its own session, in its folder, knowing what it did; give it the access the follow-up needs as for any run."
+                    },
                     "new_folders": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -111,6 +115,54 @@ impl Tool for CliAgentTool {
 
         self.outcome_with_facts(arguments, status_tx, true, &exec_ctx)
             .await
+    }
+}
+
+/// An earlier run a follow-up goes on from ([`CliAgentArgs::continue_run`]).
+struct EarlierRun {
+    /// Its agent's configured name.
+    agent: String,
+    working_dir: Option<String>,
+    continues: crate::helper_run::Continues,
+}
+
+impl CliAgentTool {
+    /// Run `run` of conversation `session_id`, when a follow-up can go on
+    /// from it: it ended, and its agent kept its session. `Err`: why not,
+    /// in plain words.
+    async fn earlier_run(&self, run: &str, session_id: &str) -> Result<EarlierRun, String> {
+        let found = self
+            .state
+            .cli_agent_run(run)
+            .await
+            .map_err(|error| format!("run `{run}` could not be read: {error}"))?
+            .filter(|found| found.session_id == session_id)
+            .ok_or_else(|| format!("this conversation has no coding agent run `{run}`"))?;
+        if self
+            .run_handles()
+            .runs
+            .get(run)
+            .is_some_and(|state| state.ended_at.is_none())
+        {
+            return Err(format!(
+                "run `{run}` is still working: wait for it to end, or stop it, before following up"
+            ));
+        }
+        let Some(agent_session) = found.agent_session.filter(|_| found.keeps_session) else {
+            return Err(format!(
+                "{} didn't keep run `{run}`'s session, so nothing can go on from it; start a new \
+                 run instead",
+                found.agent_name
+            ));
+        };
+        Ok(EarlierRun {
+            agent: found.agent_name,
+            working_dir: found.working_dir,
+            continues: crate::helper_run::Continues {
+                run: run.to_string(),
+                agent_session,
+            },
+        })
     }
 }
 
@@ -574,6 +626,26 @@ impl CliAgentTool {
 
         match action {
             "run" => {
+                // A follow-up to an earlier run: the same agent, in its
+                // folder, going on in its own session.
+                let continues = match args
+                    .continue_run
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|run| !run.is_empty())
+                {
+                    None => None,
+                    Some(run) => match self.earlier_run(run, &session_id).await {
+                        Ok(earlier) => {
+                            args.tool = Some(earlier.agent);
+                            if args.working_dir.is_none() {
+                                args.working_dir = earlier.working_dir;
+                            }
+                            Some(earlier.continues)
+                        }
+                        Err(why) => return Ok(format!("Blocked: {why}")),
+                    },
+                };
                 // An agent asked for by name runs when its owner-set mode
                 // lets it run this run here (`agent_mode`).
                 let can_host = self.can_host(facts);
@@ -614,6 +686,20 @@ impl CliAgentTool {
                         anyhow::anyhow!("No CLI agents available")
                     }
                 })?;
+                // Only the agent that kept the session can go on in it.
+                if continues.is_some()
+                    && args
+                        .tool
+                        .as_deref()
+                        .and_then(|name| self.configured_tool(name))
+                        != Some(tool.clone())
+                {
+                    return Ok(format!(
+                        "Blocked: {} can't take this follow-up here (its mode doesn't let it \
+                         run this run), and no other agent can go on in its session.",
+                        args.tool.as_deref().unwrap_or("its agent")
+                    ));
+                }
                 let prompt = if let Some(prompt) = args.run_prompt() {
                     prompt
                 } else if let Some(prompt) = args.contextual_run_prompt(&self.state).await {
@@ -695,6 +781,7 @@ impl CliAgentTool {
                     mission: String::new(),
                     new_folders: made_folders.clone(),
                     scope: args.scope.clone(),
+                    continues,
                 };
                 let write_paths = helper_write_paths(&args, &spec, &session_id, facts);
                 let working_dir = args
@@ -746,8 +833,15 @@ impl CliAgentTool {
                             };
                             unavailable.push((failure.tool_name.clone(), failure.message.clone()));
 
-                            let Some(next_tool) =
-                                self.fallback_tool_name(enforce_native_access, read_only_run)
+                            // A follow-up goes on in its own agent's
+                            // session; another agent can't take it.
+                            let Some(next_tool) = spec
+                                .continues
+                                .is_none()
+                                .then(|| {
+                                    self.fallback_tool_name(enforce_native_access, read_only_run)
+                                })
+                                .flatten()
                             else {
                                 let mut message = String::from(
                                     "ERROR: CLI agent recovery exhausted before task execution. \

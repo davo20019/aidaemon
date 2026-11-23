@@ -881,6 +881,7 @@ mod tests {
             stopped_by_owner: false,
             group: None,
             edited: Vec::new(),
+            continues: None,
         }
     }
 

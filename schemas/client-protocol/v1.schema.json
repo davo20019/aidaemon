@@ -1272,6 +1272,13 @@
               ],
               "description": "How hard it thinks from this message on (protocol 1.16);\nabsent: as it was."
             },
+            "in_run": {
+              "description": "The run whose thread it was posted in (protocol 1.48): the owner\nfollows up with that run's coding agent, which goes on in its\nown session ([`RunSummary::continues`]). Only the app's own\nconversations take one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "mid_run": {
               "anyOf": [
                 {
@@ -5763,6 +5770,10 @@
             "null"
           ]
         },
+        "can_continue": {
+          "description": "A follow-up can go on from it (protocol 1.48): its agent kept its\nsession. `send_message` with `in_run` set to it continues it.",
+          "type": "boolean"
+        },
         "model": {
           "description": "The model it worked with, as it reported it (protocol 1.47).",
           "type": [
@@ -5998,6 +6009,13 @@
         "background": {
           "description": "It goes on after the turn that started it ended.",
           "type": "boolean"
+        },
+        "continues": {
+          "description": "The earlier run it continues (protocol 1.48): the same coding\nagent's session, resumed with a follow-up. A client shows the runs\none continues as one thread.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "edited": {
           "description": "The files the coding agent it launched changed, as full paths, in\nthe order first changed.",

@@ -524,6 +524,7 @@ impl DiscordBot {
             user_id_map: HashMap::new(),
             workspace_grant: None,
             trusted: false,
+            in_run: None,
         };
         self.runner
             .register_chat(&session_id, &self.channel_name(), &channel_ctx)

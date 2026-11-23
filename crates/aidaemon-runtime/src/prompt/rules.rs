@@ -695,6 +695,22 @@ pub fn render_workspace_section(workspace: &str) -> String {
     )
 }
 
+/// The owner wrote this message in the thread of helper run `run` (a
+/// client's typed field, [`aidaemon_channels::context::ChannelContext::in_run`]):
+/// it is a follow-up for that run's coding agent, which goes on in its own
+/// session.
+pub fn render_run_thread_section(run: &str) -> String {
+    format!(
+        "[Run Thread]\nThe owner wrote this message in the thread of helper run `{run}`: it is a \
+         follow-up for that run's coding agent. Pass it on with cli_agent (action \"run\", \
+         continue_run \"{run}\", the owner's message as the prompt, async_mode true): the same \
+         agent goes on in its own session, with what it already knows. Add only what it needs \
+         from this conversation that it can't know. Answer the owner yourself only when the \
+         message is plainly for you rather than the agent, or when continuing the run is \
+         refused; then say why."
+    )
+}
+
 /// What the host's command-line tools are, when they differ from the GNU
 /// tools models tend to assume.
 fn userland_note(os: &str) -> &'static str {

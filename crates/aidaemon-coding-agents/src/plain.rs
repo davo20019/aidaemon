@@ -112,6 +112,7 @@ impl CodingAgent for PlainAgent {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, _launch: &mut Launch) -> Result<Plan, String> {
+        crate::agent::refuse_resume(self, request)?;
         if request.enforce && request.mode != PermissionMode::FullAccess {
             return Err(format!(
                 "{} can only run with full access: {}",

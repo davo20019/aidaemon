@@ -300,6 +300,7 @@ pub trait ClientHost: Send + Sync {
         Ok(aidaemon_client_protocol::RunDetail {
             run_id: run_id.to_string(),
             agent_session_id: None,
+            can_continue: false,
             model: None,
             working_dir: None,
             task: String::new(),
@@ -969,6 +970,7 @@ impl ClientGateway {
                 project_id,
                 model,
                 effort,
+                in_run,
             } => {
                 let placement = match mid_run {
                     Some(MidRun::Steer) => Some(MidRunPlacement::Steer),
@@ -984,6 +986,7 @@ impl ClientGateway {
                     placement,
                     project_id,
                     (model, effort),
+                    in_run,
                 )
                 .await
             }
@@ -1538,6 +1541,7 @@ impl ClientGateway {
                     None,
                     None,
                     (None, None),
+                    None,
                 )
                 .await
             }
@@ -2158,6 +2162,7 @@ impl ClientGateway {
             Option<aidaemon_client_protocol::ModelChoice>,
             Option<aidaemon_client_protocol::Effort>,
         ),
+        in_run: Option<String>,
     ) -> Result<CommandResult, ProtocolError> {
         let files = self.message_files(&attachments)?;
         if text.trim().is_empty() && files.is_empty() {
@@ -2172,10 +2177,10 @@ impl ClientGateway {
                 true,
             ),
             Some(session_id) if session_id.starts_with(APP_SESSION_PREFIX) => (session_id, false),
-            Some(_) if model.is_some() || effort.is_some() => {
+            Some(_) if model.is_some() || effort.is_some() || in_run.is_some() => {
                 return Err(ProtocolError::new(
                     ErrorCode::Invalid,
-                    "Only the app's own conversations can be set to a model",
+                    "Only the app's own conversations take a model or a run's thread",
                 ));
             }
             Some(session_id) => {
@@ -2244,6 +2249,9 @@ impl ClientGateway {
         }
         let mut channel_ctx = aidaemon_channels::context::ChannelContext::private(APP_CHANNEL);
         channel_ctx.channel_id = Some(session_id.clone());
+        // Typed: the thread the app showed it in. Which run it is, and
+        // whether it is this conversation's, the agent's tool checks.
+        channel_ctx.in_run = in_run.filter(|_| !new_session);
         let text = if files.is_empty() {
             text
         } else {
@@ -2495,6 +2503,7 @@ impl ClientGateway {
                         agent: run.agent.as_deref(),
                         group: run.group.as_deref(),
                         edited: &run.edited,
+                        continues: run.continues.as_deref(),
                         started_at: run.started_at,
                         ended_at: run.ended_at,
                     },

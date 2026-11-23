@@ -50,6 +50,7 @@ pub fn node_channel_context(
         user_id_map: std::collections::HashMap::new(),
         workspace_grant: None,
         trusted: false,
+        in_run: None,
     }
 }
 

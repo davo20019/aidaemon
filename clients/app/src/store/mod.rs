@@ -2305,6 +2305,12 @@ impl Store {
         self.act(|c| c.ask(session, text));
     }
 
+    /// Follow up on run `run` of `session`: `text` goes to its coding
+    /// agent, which goes on in its own session.
+    pub fn follow_up(&self, session: &str, run: &str, text: &str) {
+        self.act(|c| c.follow_up(session, run, text));
+    }
+
     pub fn needs_you(&self, id: &str) -> bool {
         self.row(id, |r| r.needs_you)
     }

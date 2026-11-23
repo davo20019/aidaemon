@@ -905,6 +905,7 @@ async fn test_owner_receives_tools_for_command_request() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -952,6 +953,7 @@ async fn test_public_user_gets_no_tools() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -1000,6 +1002,7 @@ async fn test_command_request_with_tool_use() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )
@@ -1051,6 +1054,7 @@ async fn test_slack_command_request_llm_payload() {
                 user_id_map: std::collections::HashMap::new(),
                 workspace_grant: None,
                 trusted: false,
+                in_run: None,
             },
             None,
         )

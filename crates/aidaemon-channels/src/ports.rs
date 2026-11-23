@@ -156,6 +156,9 @@ pub struct ChatRun {
     pub group: Option<String>,
     /// The files the coding agent it launched changed.
     pub edited: Vec<String>,
+    /// The earlier run it continues: the same coding agent's session,
+    /// resumed with the owner's follow-up.
+    pub continues: Option<String>,
     /// The chat's running turn started it (an earlier turn's helper runs on
     /// in the background).
     pub this_request: bool,
