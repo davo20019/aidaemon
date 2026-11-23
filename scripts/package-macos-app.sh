@@ -116,6 +116,17 @@ for path_dir in "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.npm-global/bin" "$
   case ":$DAEMON_PATH:" in *":$path_dir:"*) ;; *) DAEMON_PATH="${DAEMON_PATH:+$DAEMON_PATH:}$path_dir" ;; esac
 done
 
+# Where the daemon runs from (its config.toml, .env and database): the
+# folder the installed daemon already runs from, so a build from another
+# checkout (a git worktree) replaces the binary without moving the daemon to
+# a folder with no config, where it would start in first-run setup.
+# AIDAEMON_WORK_DIR moves it on purpose; a first install uses this checkout.
+WORK_DIR="${AIDAEMON_WORK_DIR:-}"
+if [[ -z "$WORK_DIR" && -f "$PLIST" ]]; then
+  WORK_DIR="$(plutil -extract WorkingDirectory raw -o - "$PLIST" 2>/dev/null || true)"
+fi
+WORK_DIR="${WORK_DIR:-$PROJECT_DIR}"
+
 cat > "$PLIST" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -124,7 +135,7 @@ cat > "$PLIST" <<PLISTEOF
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key>
     <array><string>$APP/Contents/MacOS/aidaemon</string></array>
-    <key>WorkingDirectory</key><string>$PROJECT_DIR</string>
+    <key>WorkingDirectory</key><string>$WORK_DIR</string>
     <key>EnvironmentVariables</key>
     <dict><key>PATH</key><string>$DAEMON_PATH</string></dict>
     <key>RunAtLoad</key><true/>
