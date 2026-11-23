@@ -226,8 +226,15 @@ pub fn program_of(command: &str) -> Option<String> {
     {
         return Some(program);
     }
+    // Shell grammar words (a machine format): a compound command's header
+    // (`for f in a b`, `while cond`, `if cond`) runs no work of its own up
+    // to its separator; a body or branch word (`do`, `then`, `{`) comes
+    // before the command that does.
+    const HEADERS: &[&str] = &["for", "while", "until", "if", "elif", "case", "select"];
+    const LEADS: &[&str] = &["do", "then", "else", "{", "(", "!", "time"];
     let mut first: Option<String> = None;
     let mut at_start = true;
+    let mut in_header = false;
     for word in words {
         // A separator glued to a word (`cd x;`) ends its command too.
         let (word, ends) = match word.strip_suffix(';') {
@@ -236,6 +243,21 @@ pub fn program_of(command: &str) -> Option<String> {
         };
         if matches!(word.as_str(), "&&" | "||" | ";" | "|" | "&") {
             at_start = true;
+            in_header = false;
+            continue;
+        }
+        if in_header {
+            if ends {
+                in_header = false;
+                at_start = true;
+            }
+            continue;
+        }
+        if at_start && HEADERS.contains(&word.as_str()) {
+            in_header = !ends;
+            continue;
+        }
+        if at_start && LEADS.contains(&word.as_str()) {
             continue;
         }
         if at_start && !word.is_empty() {
@@ -301,6 +323,18 @@ mod tests {
             Some("pytest")
         );
         assert_eq!(program_of("bash script.sh").as_deref(), Some("bash"));
+        assert_eq!(
+            program_of("for f in a.py b.py; do python3 \"$f\"; done").as_deref(),
+            Some("python3")
+        );
+        assert_eq!(
+            program_of("if [ -f x ]; then pytest -q; fi").as_deref(),
+            Some("pytest")
+        );
+        assert_eq!(
+            program_of("while true; do sleep 1; done").as_deref(),
+            Some("sleep")
+        );
         assert_eq!(
             StepTool::Run {
                 program: program_of("git push origin HEAD")
