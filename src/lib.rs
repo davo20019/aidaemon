@@ -434,9 +434,17 @@ pub fn run() -> anyhow::Result<()> {
     // these per worker thread; the 2 MB default overflowed and crash-looped the
     // daemon. Sub-agents are also now run on their own tasks (see
     // `runtime/spawn.rs`), but the larger stack gives durable headroom.
+    // A debug build's futures are several times larger (no inlining, every
+    // local kept): 8 MiB overflowed on a turn's first step in a debug
+    // daemon (2026-11-23), so a debug build gets 32 MiB.
+    let worker_stack = if cfg!(debug_assertions) {
+        32 * 1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(8 * 1024 * 1024)
+        .thread_stack_size(worker_stack)
         .build()?
         .block_on(crate::core::run(config, config_path, daemon_paths))
 }
