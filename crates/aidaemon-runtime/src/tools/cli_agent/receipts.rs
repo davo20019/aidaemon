@@ -54,42 +54,90 @@ pub(super) struct TreeReceipt {
     pub(super) newest: Option<std::time::SystemTime>,
 }
 
-/// A file root's size and change time; `None` while it does not exist.
+/// A file's size and change time; `None` while it does not exist.
 pub(super) type FileMark = (String, Option<(u64, Option<std::time::SystemTime>)>);
 
-/// Each write root that is a file (or not there yet): its size and change
-/// time, `None` while it does not exist. Compared after the run
-/// ([`changed_files`]), it names the files the run wrote however it wrote
-/// them (an edit tool, a shell redirect, a script).
+/// Most files under a run's write roots marked one by one; past it the
+/// tree receipt alone says whether something changed.
+const FILE_MARK_CAP: usize = 20_000;
+
+/// Folders never marked file by file: a repository's own records, and
+/// dependency and build trees a tool rewrites wholesale (folder names, a
+/// machine format).
+const UNMARKED: [&str; 5] = [".git", "node_modules", "target", ".venv", "__pycache__"];
+
+/// Every file under the run's write roots, each with its size and change
+/// time: a root that is a file (or not there yet: `None`), and each file
+/// under a root that is a folder. Compared after the run
+/// ([`changed_files`]), they name the files the run wrote, created or
+/// removed however it did (an edit tool, a shell redirect, a script).
 pub(super) async fn file_marks(
     backend: &SharedExecutionBackend,
     roots: &[String],
 ) -> Vec<FileMark> {
     let mut marks = Vec::new();
+    let mut queue: VecDeque<BackendPath> = VecDeque::new();
     for root in roots {
         match backend.metadata(&BackendPath::new(root)).await {
-            Ok(meta) if meta.file_type == BackendFileType::Directory => {}
+            Ok(meta) if meta.file_type == BackendFileType::Directory => {
+                queue.push_back(BackendPath::new(root))
+            }
             Ok(meta) => marks.push((root.clone(), Some((meta.len, meta.modified)))),
             Err(_) => marks.push((root.clone(), None)),
+        }
+    }
+    while let Some(directory) = queue.pop_front() {
+        let Ok(entries) = backend.read_dir(&directory).await else {
+            continue;
+        };
+        for entry in entries {
+            if marks.len() >= FILE_MARK_CAP {
+                return marks;
+            }
+            match entry.metadata.file_type {
+                BackendFileType::Directory => {
+                    if !UNMARKED.contains(&entry.path.file_name().unwrap_or_default()) {
+                        queue.push_back(entry.path);
+                    }
+                }
+                BackendFileType::File => marks.push((
+                    entry.path.to_string(),
+                    Some((entry.metadata.len, entry.metadata.modified)),
+                )),
+                _ => {}
+            }
         }
     }
     marks
 }
 
-/// The file roots of `before` that exist now and differ from then.
+/// The files under `roots` the run changed, created or removed: their
+/// marks now ([`file_marks`]) against `before`.
 pub(super) async fn changed_files(
     backend: &SharedExecutionBackend,
     before: &[FileMark],
+    roots: &[String],
 ) -> Vec<String> {
-    let mut changed = Vec::new();
-    for (path, mark) in before {
-        if let Ok(meta) = backend.metadata(&BackendPath::new(path)).await
-            && meta.file_type != BackendFileType::Directory
-            && *mark != Some((meta.len, meta.modified))
-        {
-            changed.push(path.clone());
-        }
-    }
+    let after = file_marks(backend, roots).await;
+    let was: std::collections::HashMap<&str, &Option<(u64, Option<std::time::SystemTime>)>> =
+        before
+            .iter()
+            .map(|(path, mark)| (path.as_str(), mark))
+            .collect();
+    let now: std::collections::HashSet<&str> =
+        after.iter().map(|(path, _)| path.as_str()).collect();
+    let mut changed: Vec<String> = after
+        .iter()
+        .filter(|(path, mark)| mark.is_some() && was.get(path.as_str()) != Some(&mark))
+        .map(|(path, _)| path.clone())
+        .collect();
+    // Removed: there before, gone now.
+    changed.extend(
+        before
+            .iter()
+            .filter(|(path, mark)| mark.is_some() && !now.contains(path.as_str()))
+            .map(|(path, _)| path.clone()),
+    );
     changed
 }
 

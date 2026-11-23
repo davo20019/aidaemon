@@ -2611,6 +2611,22 @@ impl ClientGateway {
             .filter(|approval| approval.session_id == session_id)
             .filter_map(|approval| approval.card.and_then(|card| card.run))
             .collect();
+        // How many of an agent's runs its turn is told the results of.
+        const RECENT_RESULTS: usize = 3;
+        let recent = |thread: &str| -> Vec<String> {
+            let mut ended: Vec<&aidaemon_client_protocol::RunSummary> = runs
+                .iter()
+                .filter(|run| run.thread.as_deref().unwrap_or(run.id.as_str()) == thread)
+                .filter(|run| run.result.is_some())
+                .collect();
+            ended.sort_by_key(|run| run.started_at_ms);
+            let skip = ended.len().saturating_sub(RECENT_RESULTS);
+            ended
+                .into_iter()
+                .skip(skip)
+                .filter_map(|run| run.result.as_ref().map(result_line))
+                .collect()
+        };
         aidaemon_client_protocol::participants::participants(&runs, &names, &asking)
             .into_iter()
             // The most recent few: a long conversation's oldest agents are
@@ -2626,7 +2642,7 @@ impl ClientGateway {
                 } else {
                     AgentState::Ended
                 },
-                latest_result: p.latest.result.as_ref().map(result_line),
+                recent_results: recent(&p.thread),
                 name: p.name,
                 agent: p.agent,
                 latest_run: p.latest.id,

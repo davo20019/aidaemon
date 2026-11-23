@@ -464,5 +464,35 @@ async fn the_files_a_run_wrote_are_found_by_their_marks() {
     let roots = vec![written.clone(), kept.clone()];
     let before = file_marks(&tool.backend, &roots).await;
     std::fs::write(&written, "a synthetic review").unwrap();
-    assert_eq!(changed_files(&tool.backend, &before).await, vec![written]);
+    assert_eq!(
+        changed_files(&tool.backend, &before, &roots).await,
+        vec![written]
+    );
+}
+
+/// A write path that is a folder names each file the run changed, created
+/// or removed in it, however it did (live 2026-11-23: Codex appended a line
+/// with a shell redirect and the run read as changing nothing); its
+/// repository's own records are not read file by file.
+#[tokio::test]
+async fn the_files_a_run_changed_in_its_folder_are_found() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = |name: &str| dir.path().join(name).to_string_lossy().to_string();
+    std::fs::write(path("note.md"), "hello\n").unwrap();
+    std::fs::write(path("gone.md"), "x").unwrap();
+    std::fs::write(path("kept.md"), "kept").unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(path(".git/index"), "a").unwrap();
+    let roots = vec![dir.path().to_string_lossy().to_string()];
+    let before = file_marks(&tool.backend, &roots).await;
+    std::fs::write(path("note.md"), "hello\nworld\n").unwrap();
+    std::fs::write(path("new.md"), "new").unwrap();
+    std::fs::remove_file(path("gone.md")).unwrap();
+    std::fs::write(path(".git/index"), "changed").unwrap();
+    let mut changed = changed_files(&tool.backend, &before, &roots).await;
+    changed.sort();
+    let mut expected = vec![path("gone.md"), path("new.md"), path("note.md")];
+    expected.sort();
+    assert_eq!(changed, expected);
 }

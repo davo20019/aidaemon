@@ -1808,7 +1808,13 @@ async fn watch_run(
         tree_receipt(&backend_for_receipt, &watched_for_task).await != receipt_before_for_task;
     // The files it wrote among its write paths, however it wrote
     // them: what its run says it changed.
-    for path in changed_files(&backend_for_receipt, &files_before_for_task).await {
+    for path in changed_files(
+        &backend_for_receipt,
+        &files_before_for_task,
+        &watched_for_task,
+    )
+    .await
+    {
         handles.runs.edited(&cli_run_id(&call.task_id), &path);
     }
     // What its agent ended with, each claim checked against that record.
