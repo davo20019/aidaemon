@@ -87,8 +87,10 @@ pub fn approvals(store: Store) {
 
 const REPLY: &str = "reply:";
 
-/// A finished turn while the app is in the background: "Reply in …".
-/// Pressing it opens that conversation.
+/// Long or background work that finished while the app is in the
+/// background: "Done: …". Pressing it opens that conversation. While the
+/// app is in front nothing is said: the conversation's unread dot and its
+/// run row already show it.
 pub fn replies(store: Store) {
     effect(move || {
         let Some((session, _)) = store.finished() else {
@@ -96,10 +98,6 @@ pub fn replies(store: Store) {
         };
         untracked(|| {
             if lifecycle() == Lifecycle::Active {
-                // In front, but looking at something else: say so here.
-                if !on_screen(store, &session) {
-                    store.say_done(&session);
-                }
                 return;
             }
             let title = store.title(&session);

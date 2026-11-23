@@ -753,10 +753,11 @@ fn a_background_run_shows_its_step_and_its_end() -> Result<(), String> {
     app.press("text:Stop")?;
     wait_sent_new("cancel_task", before)?;
     feed([frame(
-        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-runs","event":{"type":"run_updated","run":{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Claude Code: prepare the release","phase":"stopped","background":true,"started_at_ms":1,"ended_at_ms":9999999999999,"took":"Took 4m 2s","stopped_by_owner":true}}}"#,
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-runs","event":{"type":"run_updated","run":{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Claude Code: prepare the release","phase":"stopped","background":true,"started_at_ms":9999999757999,"ended_at_ms":9999999999999,"took":"Took 4m 2s (synthetic)","stopped_by_owner":true}}}"#,
     )]);
     app.wait_for("text:Claude Code: prepare the release · Stopped by you")?;
-    app.wait_for("text:Took 4m 2s")?;
+    // How long it took, short, from its start and end times.
+    app.wait_for("text:4m")?;
     Ok(())
 }
 
@@ -1400,7 +1401,7 @@ fn speaking_writes_into_the_composer() -> Result<(), String> {
 }
 
 #[test]
-fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
+fn a_reply_finishing_elsewhere_raises_no_toast_in_the_app() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let mut app = start();
     app.wait_for("What can I help you with?")?;
@@ -1421,11 +1422,12 @@ fn a_reply_finishing_elsewhere_says_so_in_the_app() -> Result<(), String> {
     feed([frame(
         r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:synthetic-7","event":{"type":"turn_completed","turn_id":"t7","text":"The invoice is drafted.","state":"completed"}}"#,
     )]);
-    // "Done", what finished under it, and a press opens it.
-    app.wait_for("Done: Draft the invoice")?;
-    // It can be closed without opening anything.
-    app.wait_for("label:Dismiss")?;
-    app.press("label:Open Draft the invoice")?;
+    // While the app is in front, a finished reply says nothing over the
+    // page: its row's unread dot is the news, and opening it shows the reply.
+    settle(&mut app)?;
+    let texts = app.screen().texts().join("\n");
+    assert!(!texts.contains("Done: Draft the invoice"), "{texts}");
+    app.press("Draft the invoice >> nth=0")?;
     app.wait_for("The invoice is drafted.")?;
     Ok(())
 }

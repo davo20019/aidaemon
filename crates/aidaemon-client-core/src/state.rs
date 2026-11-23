@@ -83,7 +83,15 @@ pub struct LiveTurn {
     /// When the turn started (ms since the epoch); 0 when unknown.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub started_ms: u64,
+    /// It started while the conversation waited on work handed to the
+    /// background: it is that work's report.
+    #[serde(skip)]
+    pub after_background: bool,
 }
+
+/// How long a turn runs before its end is worth a notification to an owner
+/// who left the app.
+pub const NOTABLE_TURN_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SessionView {
@@ -279,6 +287,9 @@ impl State {
                 tools: turn.tools,
                 calls: turn.calls,
                 started_ms: turn.started_at_ms,
+                // A turn joined from a snapshot: whether it reports
+                // background work is not known here.
+                after_background: false,
             });
         }
         self.last_seq = Some(seq);
@@ -482,10 +493,12 @@ impl State {
                 ..
             } => {
                 let view = self.session(&session_id);
+                let after_background = view.background;
                 view.background = false;
                 view.live = Some(LiveTurn {
                     turn_id,
                     started_ms: at_ms,
+                    after_background,
                     ..LiveTurn::default()
                 });
             }

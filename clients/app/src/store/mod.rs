@@ -2514,16 +2514,6 @@ impl Store {
 
     /// A conversation not on screen finished its turn: "Done", its title,
     /// and a press opens it.
-    pub fn say_done(&self, session: &str) {
-        self.toast.set(Some(crate::ui::Note {
-            title: "Done".to_owned(),
-            detail: Some(untracked(|| self.title(session))),
-            done: true,
-            opens: Some(session.to_owned()),
-            undo: None,
-        }));
-    }
-
     pub fn dismiss_toast(&self) {
         self.toast.set(None);
     }

@@ -257,17 +257,14 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
                         .text_size(px(ui::fit::small()))
                         .text_color(colors::MUTED),
                 )
-                // While it runs, how long so far (a clock tick a second);
-                // once it ended, how long it took, as the daemon worded it.
+                // How long it has run (a clock tick a second), or took once
+                // it ended: a short span, from its start and end times.
                 .child(
                     text(move || {
                         store.tick();
-                        run.with(|r| match (&r.took, r.phase.is_running()) {
-                            (_, true) => ui::time::span(
-                                crate::store::now_ms().saturating_sub(r.started_at_ms) / 1000,
-                            ),
-                            (Some(took), false) => took.clone(),
-                            (None, false) => String::new(),
+                        run.with(|r| {
+                            let end = r.ended_at_ms.unwrap_or_else(crate::store::now_ms);
+                            ui::time::span(end.saturating_sub(r.started_at_ms) / 1000)
                         })
                     })
                     .number_of_lines(1)

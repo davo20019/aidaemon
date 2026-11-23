@@ -428,7 +428,8 @@ pub struct Client {
     pub unread: BTreeSet<String>,
     /// Conversations asked to stop, until their turn ends.
     stopping: BTreeSet<String>,
-    /// The latest turn that finished: its session and when.
+    /// The latest turn whose end is worth a notification (a long turn, or
+    /// one that reported background work): its session and when.
     pub finished: Option<(String, u64)>,
     /// Conversations that wrote files or showed code changes.
     coded: BTreeSet<String>,
@@ -1108,7 +1109,10 @@ impl Client {
                 self.settings_waiting.remove(approval_id);
             }
             ServerFrame::Event {
-                event, session_id, ..
+                event,
+                session_id,
+                at_ms,
+                ..
             } => {
                 // A turn starting or ending takes waiting messages in, and so
                 // does a running turn that reads one (it arrives as the
@@ -1125,7 +1129,7 @@ impl Client {
                 }
                 self.note_activity(event, cx.now_ms);
                 self.note_code(event, cx, out);
-                self.note_reply(session_id.as_deref(), event, cx);
+                self.note_reply(session_id.as_deref(), event, *at_ms, cx);
             }
             // After a reload or a dropped connection: what running turns
             // have got to, so the turn's activity is not empty.
@@ -1141,7 +1145,7 @@ impl Client {
 
     /// A reply landed: unread unless the owner is looking at it; a stop
     /// asked for is over once its turn ends.
-    fn note_reply(&mut self, session: Option<&str>, event: &Event, cx: &Context) {
+    fn note_reply(&mut self, session: Option<&str>, event: &Event, at_ms: u64, cx: &Context) {
         let (session, done) = match event {
             Event::AssistantMessage { session_id, .. } => (session_id.as_str(), false),
             Event::TurnCompleted { .. } => match session {
@@ -1156,7 +1160,23 @@ impl Client {
         }
         if done {
             self.stopping.remove(session);
-            self.finished = Some((session.to_owned(), cx.now_ms));
+            // Only an end worth a notification: a long turn, or one that
+            // reported background work. A quick reply is read in the app.
+            // Read before the reducer takes the turn off the conversation.
+            let notable = self
+                .state
+                .sessions
+                .get(session)
+                .and_then(|view| view.live.as_ref())
+                .is_some_and(|live| {
+                    live.after_background
+                        || (live.started_ms > 0
+                            && at_ms.saturating_sub(live.started_ms)
+                                >= crate::state::NOTABLE_TURN_MS)
+                });
+            if notable {
+                self.finished = Some((session.to_owned(), cx.now_ms));
+            }
         }
     }
 
@@ -3154,6 +3174,46 @@ mod tests {
                 )
             })
             .expect("a surface command")
+    }
+
+    /// Only an end worth telling an owner who left the app is a "finished":
+    /// a quick reply is not, a turn that ran a minute is, and so is the
+    /// turn that reports work handed to the background, however short.
+    #[test]
+    fn only_long_or_background_work_counts_as_finished() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        let turn = |client: &mut Client, seq: u64, id: &str, start: u64, end: u64, state: &str| {
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"event","seq":{seq},"at_ms":{start},"session_id":"app:s1","event":{{"type":"turn_started","turn_id":"{id}","session_id":"app:s1","origin":"app"}}}}"#
+                )),
+                &cx(None),
+            );
+            client.update(
+                frame(&format!(
+                    r#"{{"type":"event","seq":{},"at_ms":{end},"session_id":"app:s1","event":{{"type":"turn_completed","turn_id":"{id}","text":"ok","state":"{state}"}}}}"#,
+                    seq + 1
+                )),
+                &cx(None),
+            );
+        };
+        turn(&mut client, 1, "quick", 1_000, 5_000, "completed");
+        assert_eq!(client.finished, None);
+        turn(&mut client, 3, "long", 10_000, 75_000, "completed");
+        assert_eq!(
+            client.finished.as_ref().map(|(s, _)| s.as_str()),
+            Some("app:s1")
+        );
+        client.finished = None;
+        // A short turn hands its work off; its report comes in a short turn.
+        turn(&mut client, 5, "handoff", 80_000, 82_000, "handed_off");
+        assert_eq!(client.finished, None);
+        turn(&mut client, 7, "report", 200_000, 203_000, "completed");
+        assert_eq!(
+            client.finished.as_ref().map(|(s, _)| s.as_str()),
+            Some("app:s1")
+        );
     }
 
     /// "Send now" goes only to a daemon that knows it: an older one would
