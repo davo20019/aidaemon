@@ -32,4 +32,10 @@ assert page.count("</head>") == 1, "index.html has no single </head>"
 open(path, "w").write(page.replace("</head>", tag + "</head>"))
 PY
 cp "$here/_headers" "$here/dist/_headers"
+# nsh builds the app's describe program from a workspace of its own in the
+# app's target dir, so Cargo keeps a second copy of most dependencies, and an
+# older copy stays whenever that workspace changes. Units no build has read
+# for a day go (scripts/prune-target.py; Cargo never removes them itself).
+python3 "$here/../../scripts/prune-target.py" --target "${CARGO_TARGET_DIR:-$app/target}" --days 1 \
+    || echo "build.sh: could not prune the app's target dir" >&2
 echo "built $here/dist"
