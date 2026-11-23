@@ -448,6 +448,16 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// Name one of a conversation's agents (protocol 1.48): the agent
+    /// session whose thread is `thread` (`RunSummary::thread`, or its first
+    /// run's id), "Designer". `None` or blank: back to what it was started
+    /// for. Answers with `reply`; `agent_renamed` follows.
+    RenameAgent {
+        session_id: String,
+        thread: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// Archive a conversation, or bring it back (protocol 1.17). Answers
     /// with `reply`; `session_updated` follows.
     ArchiveSession { session_id: String, archived: bool },
@@ -877,6 +887,10 @@ pub enum CommandResult {
         /// and events instead, which win.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         runs: Vec<RunSummary>,
+        /// The names the owner gave its agents (protocol 1.48), by thread
+        /// (`rename_agent`).
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        agent_names: std::collections::BTreeMap<String, String>,
     },
     /// `clear_session` and `run_slash`: the command's reply.
     Reply {
@@ -2248,6 +2262,14 @@ pub enum Event {
         step: String,
         at_ms: u64,
     },
+    /// The owner named one of a conversation's agents (protocol 1.48,
+    /// `rename_agent`); `None`: the name was taken away.
+    AgentRenamed {
+        session_id: String,
+        thread: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// A project was created or changed (protocol 1.10).
     ProjectUpdated {
         project: ProjectSummary,
@@ -2352,6 +2374,7 @@ impl Event {
             Event::TaskUpdated { .. } => "task_updated",
             Event::RunUpdated { .. } => "run_updated",
             Event::RunStep { .. } => "run_step",
+            Event::AgentRenamed { .. } => "agent_renamed",
             Event::ProjectUpdated { .. } => "project_updated",
             Event::ProjectDeleted { .. } => "project_deleted",
             Event::GoalUpdated { .. } => "goal_updated",
@@ -2986,6 +3009,16 @@ pub struct RunSummary {
     /// one continues as one thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<String>,
+    /// The first run of its thread (protocol 1.48): the agent session it is
+    /// part of, one participant of the conversation. Absent: it starts its
+    /// own (its id is the thread's). Every client groups runs by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// Its agent kept its session and it ended: a follow-up can go on from
+    /// it (protocol 1.48; [`RunDetail::can_continue`] once its record says
+    /// the session id too).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_continue: bool,
 }
 
 /// What one run did (protocol 1.46, `get_run`), from its record. Only a

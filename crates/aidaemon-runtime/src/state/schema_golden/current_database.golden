@@ -750,7 +750,7 @@ CREATE TABLE cli_agent_invocations (
             output_summary TEXT,
             success INTEGER,
             duration_secs REAL
-        , run_id TEXT, mode TEXT, agent_session_id TEXT, task TEXT, keeps_session INTEGER)
+        , run_id TEXT, mode TEXT, agent_session_id TEXT, task TEXT, keeps_session INTEGER, thread_id TEXT)
 
 index idx_cli_agent_invocations_task_id on cli_agent_invocations
 CREATE INDEX idx_cli_agent_invocations_task_id
@@ -766,6 +766,13 @@ CREATE TABLE client_runs (
 
 index idx_client_runs_session on client_runs
 CREATE INDEX idx_client_runs_session ON client_runs(session_id, ended_at_ms)
+
+table agent_names on agent_names
+CREATE TABLE agent_names (
+            thread_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL
+        )
 
 table cli_agent_events on cli_agent_events
 CREATE TABLE cli_agent_events (
@@ -1597,6 +1604,7 @@ rows dynamic_mcp_servers = 0
 rows dynamic_cli_agents = 0
 rows cli_agent_invocations = 0
 rows client_runs = 0
+rows agent_names = 0
 rows cli_agent_events = 0
 rows oauth_connections = 0
 rows pending_oauth_flows = 0

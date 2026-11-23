@@ -217,6 +217,8 @@ fn run() -> RunSummary {
         group: Some("task-9b1d".into()),
         edited: vec!["/w/synthetic/release.md".into()],
         continues: None,
+        thread: None,
+        can_continue: false,
     }
 }
 

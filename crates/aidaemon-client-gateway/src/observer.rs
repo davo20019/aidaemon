@@ -445,6 +445,8 @@ impl TurnObserver for GatewayObserver {
                 group: change.group.as_deref(),
                 edited: &change.edited,
                 continues: change.continues.as_deref(),
+                thread: change.thread.as_deref(),
+                keeps_session: change.keeps_session,
                 started_at: change.started_at,
                 ended_at: change.ended_at,
             },
@@ -516,6 +518,8 @@ pub(crate) struct RunRecord<'a> {
     pub group: Option<&'a str>,
     pub edited: &'a [String],
     pub continues: Option<&'a str>,
+    pub thread: Option<&'a str>,
+    pub keeps_session: bool,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -532,6 +536,8 @@ pub(crate) fn run_summary(
         group,
         edited,
         continues,
+        thread,
+        keeps_session,
         started_at,
         ended_at,
     } = record;
@@ -559,6 +565,9 @@ pub(crate) fn run_summary(
         group: group.map(str::to_string),
         edited: edited.to_vec(),
         continues: continues.map(str::to_string),
+        thread: thread.map(str::to_string),
+        // A follow-up goes on from an ended run whose agent kept its session.
+        can_continue: keeps_session && ended_at.is_some(),
     }
 }
 

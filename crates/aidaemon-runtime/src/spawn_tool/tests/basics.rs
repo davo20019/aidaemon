@@ -88,6 +88,8 @@ pub(super) fn ended_run(
         agent: None,
         edited: Vec::new(),
         continues: None,
+        thread: None,
+        keeps_session: false,
         steps: Vec::new(),
         evidence: crate::run_state::RunEvidence {
             unconfirmed: unconfirmed

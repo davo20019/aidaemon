@@ -453,6 +453,11 @@ pub struct RunState {
     /// The earlier run it continues: the same coding agent's session,
     /// resumed with the owner's follow-up.
     pub continues: Option<String>,
+    /// The first run of its thread: the agent session it is part of (one
+    /// participant of the conversation). `None`: it starts its own.
+    pub thread: Option<String>,
+    /// Its coding agent keeps its session where a follow-up can continue it.
+    pub keeps_session: bool,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -750,6 +755,8 @@ impl RunStates {
             agent: None,
             edited: Vec::new(),
             continues: None,
+            thread: None,
+            keeps_session: false,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -864,6 +871,8 @@ impl RunStates {
             group: state.request.clone(),
             edited: state.edited.clone(),
             continues: state.continues.clone(),
+            thread: state.thread.clone(),
+            keeps_session: state.keeps_session,
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -1035,13 +1044,29 @@ impl RunStates {
 
     /// Run `id` continues the earlier run `earlier` (the same coding
     /// agent's session, resumed).
-    pub fn continues(&self, id: &str, earlier: &str) {
+    pub fn continues(&self, id: &str, earlier: &str, thread: &str) {
         let set = match self.lock().get_mut(id) {
             Some(entry) => {
                 entry.state.continues = Some(earlier.to_string());
+                entry.state.thread = Some(thread.to_string());
                 true
             }
             None => false,
+        };
+        if set {
+            self.report(id, false);
+        }
+    }
+
+    /// Whether run `id`'s coding agent keeps its session where a follow-up
+    /// can continue it (its launch said, or the agent as it ran).
+    pub fn keeps_session(&self, id: &str, kept: bool) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry) if entry.state.keeps_session != kept => {
+                entry.state.keeps_session = kept;
+                true
+            }
+            _ => false,
         };
         if set {
             self.report(id, false);
@@ -1582,6 +1607,8 @@ mod tests {
             agent: None,
             edited: Vec::new(),
             continues: None,
+            thread: None,
+            keeps_session: false,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,

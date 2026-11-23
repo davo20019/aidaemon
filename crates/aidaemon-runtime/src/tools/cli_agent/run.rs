@@ -107,7 +107,7 @@ pub(super) struct PreparedRun {
     /// The agent keeps its session where a follow-up can continue it.
     keeps_session: bool,
     /// The earlier run it continues.
-    continues: Option<String>,
+    continues: Option<crate::helper_run::Continues>,
     /// The prompt with its mission rules, before any enrichment.
     prompt: String,
     /// What it was asked, without the daemon's mission rules.
@@ -424,8 +424,13 @@ impl CliAgentTool {
             .runs
             .set_agent(&cli_run_id(&task_id), prep.coding_agent.name());
         if let Some(earlier) = &prep.continues {
-            handles.runs.continues(&cli_run_id(&task_id), earlier);
+            handles
+                .runs
+                .continues(&cli_run_id(&task_id), &earlier.run, &earlier.thread);
         }
+        handles
+            .runs
+            .keeps_session(&cli_run_id(&task_id), prep.keeps_session);
 
         // Read its output, emit progress, judge and deliver its end, and
         // signal completion. `should_notify` starts as async_mode: a
@@ -1045,7 +1050,7 @@ impl CliAgentTool {
             host: host_starter,
             keep_alive,
             keeps_session,
-            continues: spec.continues.as_ref().map(|earlier| earlier.run.clone()),
+            continues: spec.continues.clone(),
             prompt: prompt.to_string(),
             task,
             final_prompt,
@@ -1091,8 +1096,11 @@ impl CliAgentTool {
         let handles = self.run_handles();
         handles.runs.set_agent(&run_id, prep.coding_agent.name());
         if let Some(earlier) = &prep.continues {
-            handles.runs.continues(&run_id, earlier);
+            handles
+                .runs
+                .continues(&run_id, &earlier.run, &earlier.thread);
         }
+        handles.runs.keeps_session(&run_id, prep.keeps_session);
         handles.runs.activity(&run_id, WAITING_FOR_SLOT.to_string());
         if let Some(ref tx) = call.status_tx {
             let _ = tx.try_send(StatusUpdate::ToolCancellable {
@@ -1336,6 +1344,15 @@ impl RunHandles {
                 .await
         {
             warn!(%error, "Could not note that a coding agent kept its session");
+        }
+        if invocation_id != 0
+            && let Some(earlier) = &prep.continues
+            && let Err(error) = self
+                .state
+                .set_cli_agent_thread(invocation_id, &earlier.thread)
+                .await
+        {
+            warn!(%error, "Could not note which thread a coding agent's run continues");
         }
         // The agent's typed events: kept on its invocation, and its latest
         // step on its run record. Its host's judge keeps each decision too.

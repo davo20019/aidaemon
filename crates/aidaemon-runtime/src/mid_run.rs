@@ -231,6 +231,8 @@ mod tests {
                 group: None,
                 edited: Vec::new(),
                 continues: None,
+                thread: None,
+                keeps_session: false,
                 this_request: true,
             }],
             running: vec![RunningItem {

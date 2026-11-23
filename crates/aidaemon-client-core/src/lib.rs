@@ -30,6 +30,7 @@ pub mod link;
 #[cfg(feature = "native")]
 pub mod local;
 pub mod machine;
+pub mod participants;
 #[cfg(feature = "dial")]
 pub mod remote;
 #[cfg(feature = "native")]

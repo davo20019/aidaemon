@@ -855,13 +855,36 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     // The run that takes it starts: the view moves to it.
     let before = sent("get_run");
     feed([frame(
-        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999995000,"group":"task-u","continues":"cli-agent-t1"}}}"#,
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999995000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1"}}}"#,
     )]);
     wait_sent_new("get_run", before)?;
     app.wait_for("text:Thread")?;
     app.wait_for("text:Codex · finished · Fix the slug")?;
     app.press("Back")?;
     app.wait_for("text:Codex · Finished · 1 follow-up")?;
+    // Its participants: one agent session, working, its two runs.
+    app.wait_for("text:1 agent · 1 working")?;
+    app.press("1 agent · 1 working")?;
+    app.wait_for("text:Codex · Fix the slug")?;
+    app.wait_for("text:working · 2 runs")?;
+    feed([frame(
+        r#"{"type":"event","seq":9,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true}}}"#,
+    )]);
+    app.wait_for("text:can continue · 2 runs · now")?;
+    // The owner names it; the daemon keeps the name and every client shows it.
+    app.press("Rename this agent")?;
+    app.type_text("label:Agent name", "Designer")?;
+    let before = sent("rename_agent");
+    app.press("Save")?;
+    wait_sent_new("rename_agent", before)?;
+    feed([frame(
+        r#"{"type":"event","seq":10,"at_ms":5,"session_id":"app:synthetic-thread","event":{"type":"agent_renamed","session_id":"app:synthetic-thread","thread":"cli-agent-t1","name":"Designer"}}"#,
+    )]);
+    app.wait_for("text:Codex · Designer")?;
+    // Its row opens its latest run, where a follow-up goes to it.
+    let before = sent("get_run");
+    app.press("Codex · Designer, can continue · 2 runs · now, open its thread")?;
+    wait_sent_new("get_run", before)?;
     Ok(())
 }
 

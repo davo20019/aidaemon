@@ -43,6 +43,8 @@ pub struct Continues {
     pub run: String,
     /// Its agent's own session id, which the new run resumes.
     pub agent_session: String,
+    /// The first run of its thread, which the new run joins.
+    pub thread: String,
 }
 
 impl HelperSpec {

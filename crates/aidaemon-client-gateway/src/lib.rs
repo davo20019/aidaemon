@@ -283,6 +283,27 @@ pub trait ClientHost: Send + Sync {
     /// off rather than wait on it.
     fn keep_run(&self, _run: &aidaemon_client_protocol::RunSummary) {}
 
+    /// Name the agent session whose thread is `thread` in conversation
+    /// `session_id` (`None`: take its name away). `Err`: why not, in plain
+    /// words.
+    async fn rename_agent(
+        &self,
+        _session_id: &str,
+        _thread: &str,
+        _name: Option<&str>,
+    ) -> Result<(), String> {
+        Err("This daemon can't name agents".to_string())
+    }
+
+    /// The names the owner gave conversation `session_id`'s agents, by
+    /// thread.
+    async fn agent_names(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        Ok(Default::default())
+    }
+
     /// Conversation `session_id`'s ended runs as [`Self::keep_run`] kept
     /// them, oldest first.
     async fn past_runs(
@@ -897,6 +918,7 @@ impl ClientGateway {
             Command::SetSessionModel { .. } => Some(Scope::Chat),
             Command::ListQueued { .. } => Some(Scope::Observe),
             Command::RenameSession { .. }
+            | Command::RenameAgent { .. }
             | Command::ArchiveSession { .. }
             | Command::RevertFile { .. }
             | Command::EditQueued { .. } => Some(Scope::Chat),
@@ -996,6 +1018,36 @@ impl ClientGateway {
                     .await
                     .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
                 self.publish_session(&session_id).await;
+                Ok(CommandResult::Reply {
+                    text: "Renamed".to_string(),
+                })
+            }
+            Command::RenameAgent {
+                session_id,
+                thread,
+                name,
+            } => {
+                let name = name
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty());
+                if name.as_ref().is_some_and(|name| name.chars().count() > 40) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Invalid,
+                        "An agent's name is at most 40 characters",
+                    ));
+                }
+                self.host
+                    .rename_agent(&session_id, &thread, name.as_deref())
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                self.publisher.publish(
+                    Some(session_id.clone()),
+                    Event::AgentRenamed {
+                        session_id,
+                        thread,
+                        name,
+                    },
+                );
                 Ok(CommandResult::Reply {
                     text: "Renamed".to_string(),
                 })
@@ -2345,11 +2397,19 @@ impl ClientGateway {
                 Vec::new()
             }
         };
+        let agent_names = match self.host.agent_names(&session_id).await {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::warn!(%error, "Could not read a conversation's agent names");
+                Default::default()
+            }
+        };
         Ok(CommandResult::History {
             session_id,
             messages,
             more,
             runs,
+            agent_names,
         })
     }
 
@@ -2504,6 +2564,8 @@ impl ClientGateway {
                         group: run.group.as_deref(),
                         edited: &run.edited,
                         continues: run.continues.as_deref(),
+                        thread: run.thread.as_deref(),
+                        keeps_session: run.keeps_session,
                         started_at: run.started_at,
                         ended_at: run.ended_at,
                     },

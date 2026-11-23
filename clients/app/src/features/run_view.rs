@@ -130,34 +130,21 @@ fn thread(store: Store, id: String) -> View {
     }))
 }
 
-/// The runs of run `id`'s thread, oldest first: every run that goes on,
-/// step by step, from the first one it goes back to.
+/// The runs of run `id`'s thread, oldest first: its first run and every
+/// follow-up in the same agent session (`RunSummary::thread`, the
+/// daemon's own record).
 fn thread_of(runs: &[RunSummary], id: &str) -> Vec<RunSummary> {
-    let root = first_of(runs, id);
+    let key = |run: &RunSummary| run.thread.clone().unwrap_or_else(|| run.id.clone());
+    let Some(thread) = runs.iter().find(|run| run.id == id).map(key) else {
+        return Vec::new();
+    };
     let mut thread: Vec<RunSummary> = runs
         .iter()
-        .filter(|run| first_of(runs, &run.id) == root)
+        .filter(|run| key(run) == thread)
         .cloned()
         .collect();
     thread.sort_by_key(|run| run.started_at_ms);
     thread
-}
-
-/// The first run run `id` goes back to, through what each continues.
-fn first_of<'a>(runs: &'a [RunSummary], id: &'a str) -> &'a str {
-    let mut at = id;
-    // Bounded: a record that loops can't hang the view.
-    for _ in 0..runs.len() {
-        match runs
-            .iter()
-            .find(|run| run.id == at)
-            .and_then(|run| run.continues.as_deref())
-        {
-            Some(earlier) if runs.iter().any(|run| run.id == earlier) => at = earlier,
-            _ => break,
-        }
-    }
-    at
 }
 
 /// A follow-up for the run's agent, at the view's foot: only when its agent

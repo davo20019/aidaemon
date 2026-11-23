@@ -2018,6 +2018,33 @@
           "type": "object"
         },
         {
+          "description": "Name one of a conversation's agents (protocol 1.48): the agent\nsession whose thread is `thread` (`RunSummary::thread`, or its first\nrun's id), \"Designer\". `None` or blank: back to what it was started\nfor. Answers with `reply`; `agent_renamed` follows.",
+          "properties": {
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "thread": {
+              "type": "string"
+            },
+            "type": {
+              "const": "rename_agent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "thread"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Archive a conversation, or bring it back (protocol 1.17). Answers\nwith `reply`; `session_updated` follows.",
           "properties": {
             "archived": {
@@ -2488,6 +2515,13 @@
         },
         {
           "properties": {
+            "agent_names": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "The names the owner gave its agents (protocol 1.48), by thread\n(`rename_agent`).",
+              "type": "object"
+            },
             "messages": {
               "items": {
                 "$ref": "#/$defs/HistoryMessage"
@@ -3746,6 +3780,33 @@
             "run_id",
             "session_id",
             "at_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner named one of a conversation's agents (protocol 1.48,\n`rename_agent`); `None`: the name was taken away.",
+          "properties": {
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "thread": {
+              "type": "string"
+            },
+            "type": {
+              "const": "agent_renamed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "thread"
           ],
           "type": "object"
         },
@@ -6010,6 +6071,10 @@
           "description": "It goes on after the turn that started it ended.",
           "type": "boolean"
         },
+        "can_continue": {
+          "description": "Its agent kept its session and it ended: a follow-up can go on from\nit (protocol 1.48; [`RunDetail::can_continue`] once its record says\nthe session id too).",
+          "type": "boolean"
+        },
         "continues": {
           "description": "The earlier run it continues (protocol 1.48): the same coding\nagent's session, resumed with a follow-up. A client shows the runs\none continues as one thread.",
           "type": [
@@ -6073,6 +6138,13 @@
         "stopped_by_owner": {
           "description": "It ended because the owner stopped it.",
           "type": "boolean"
+        },
+        "thread": {
+          "description": "The first run of its thread (protocol 1.48): the agent session it is\npart of, one participant of the conversation. Absent: it starts its\nown (its id is the thread's). Every client groups runs by it.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "took": {
           "description": "Once it ended, how long it took, already worded by the daemon.",

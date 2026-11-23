@@ -465,6 +465,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         "ALTER TABLE cli_agent_invocations ADD COLUMN agent_session_id TEXT",
         "ALTER TABLE cli_agent_invocations ADD COLUMN task TEXT",
         "ALTER TABLE cli_agent_invocations ADD COLUMN keeps_session INTEGER",
+        "ALTER TABLE cli_agent_invocations ADD COLUMN thread_id TEXT",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }
@@ -483,6 +484,17 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_client_runs_session ON client_runs(session_id, ended_at_ms)",
+    )
+    .execute(pool)
+    .await?;
+    // The names the owner gave a conversation's agents, by thread (the
+    // agent session's first run).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS agent_names (
+            thread_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL
+        )",
     )
     .execute(pool)
     .await?;

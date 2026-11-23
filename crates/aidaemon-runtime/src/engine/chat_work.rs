@@ -110,6 +110,8 @@ pub trait ChatWorkControl: TurnHost {
                 group: run.request.clone(),
                 edited: run.edited.clone(),
                 continues: run.continues.clone(),
+                thread: run.thread.clone(),
+                keeps_session: run.keeps_session,
                 this_request: request.is_some() && run.request == request,
             })
             .collect();

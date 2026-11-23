@@ -726,6 +726,25 @@ impl ClientHost for DaemonClientHost {
         super::client_runs::past(&self.system.pool, session_id).await
     }
 
+    async fn rename_agent(
+        &self,
+        session_id: &str,
+        thread: &str,
+        name: Option<&str>,
+    ) -> Result<(), String> {
+        if !super::client_runs::is_agent_of(self.state.as_ref(), session_id, thread).await? {
+            return Err("This conversation has no such agent".to_string());
+        }
+        super::client_runs::rename_agent(&self.system.pool, session_id, thread, name).await
+    }
+
+    async fn agent_names(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        super::client_runs::agent_names(&self.system.pool, session_id).await
+    }
+
     async fn automations(
         &self,
     ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {

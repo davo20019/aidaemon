@@ -167,7 +167,7 @@ impl ActivityMode {
 
 /// The details pane's tabs, by index: [`detail_tabs`] says which a
 /// conversation shows.
-pub const DETAIL_TABS: [&str; 5] = ["Changes", "Files", "Steps", "Terminal", "Browser"];
+pub const DETAIL_TABS: [&str; 6] = ["Changes", "Files", "Steps", "Terminal", "Browser", "Agents"];
 /// The Changes tab's index in [`DETAIL_TABS`].
 pub const CHANGES_TAB: usize = 0;
 /// The Files tab's index: the project's files, read-only.
@@ -178,11 +178,14 @@ pub const STEPS_TAB: usize = 2;
 pub const TERMINAL_TAB: usize = 3;
 /// The agent's browser in this conversation, watched in the pane.
 pub const BROWSER_TAB: usize = 4;
+/// The conversation's participants: each coding agent session in it.
+pub const AGENTS_TAB: usize = 5;
 
 /// The details tabs a conversation shows, as `(index, label)`: Changes and
 /// Files only for code, Steps only on a wide window (a phone has them
-/// under each reply), Terminal and Browser always.
-pub fn detail_tabs(coding: bool, compact: bool) -> Vec<(usize, &'static str)> {
+/// under each reply), Agents once a coding agent worked in it, Terminal and
+/// Browser always.
+pub fn detail_tabs(coding: bool, compact: bool, agents: bool) -> Vec<(usize, &'static str)> {
     DETAIL_TABS
         .iter()
         .copied()
@@ -190,6 +193,7 @@ pub fn detail_tabs(coding: bool, compact: bool) -> Vec<(usize, &'static str)> {
         .filter(|(index, _)| match *index {
             CHANGES_TAB | FILES_TAB => coding,
             STEPS_TAB => !compact,
+            AGENTS_TAB => agents,
             _ => true,
         })
         .collect()
@@ -2727,8 +2731,11 @@ impl Store {
     pub fn show_detail(&self, tab: usize) {
         let coding = untracked(|| self.coding_on_screen());
         let compact = self.compact.get_untracked();
+        let agents = untracked(|| self.has_participants());
         if untracked(|| self.selected.get()).is_none()
-            || !detail_tabs(coding, compact).iter().any(|(i, _)| *i == tab)
+            || !detail_tabs(coding, compact, agents)
+                .iter()
+                .any(|(i, _)| *i == tab)
         {
             self.say(NO_DETAILS);
             return;
@@ -3244,6 +3251,37 @@ impl Store {
     /// Every run the app knows, oldest first.
     pub fn all_runs(&self) -> Vec<RunSummary> {
         self.reads.runs.get()
+    }
+
+    /// The conversation on screen's participants: each coding agent
+    /// session that worked in it, working ones first.
+    pub fn participants(&self) -> Vec<aidaemon_client_core::participants::Participant> {
+        let Some(session) = self.selected.get() else {
+            return Vec::new();
+        };
+        let runs: Vec<RunSummary> = self
+            .all_runs()
+            .into_iter()
+            .filter(|run| run.session_id == session)
+            .collect();
+        self.client
+            .with(|c| aidaemon_client_core::participants::participants(&runs, c.agent_names()))
+    }
+
+    /// Name the agent of conversation `session` whose thread is `thread`
+    /// ("Designer"; blank: back to what it was started for).
+    pub fn rename_agent(&self, session: &str, thread: &str, name: String) {
+        self.act(|c| c.rename_agent(session, thread, Some(name)));
+    }
+
+    /// A coding agent worked in the conversation on screen.
+    pub fn has_participants(&self) -> bool {
+        self.selected.get().is_some_and(|session| {
+            self.reads.runs.with(|runs| {
+                runs.iter()
+                    .any(|run| run.session_id == session && run.agent.is_some())
+            })
+        })
     }
 
     /// Every run running now, in any conversation, oldest first.

@@ -2259,6 +2259,28 @@ impl Client {
         self.state.running().into_iter().cloned().collect()
     }
 
+    /// Conversation `session`'s participants: each coding agent session
+    /// that worked in it, working ones first ([`crate::participants`]).
+    pub fn participants(&self, session: &str) -> Vec<crate::participants::Participant> {
+        let runs: Vec<_> = self.state.runs_for(session).into_iter().cloned().collect();
+        crate::participants::participants(&runs, &self.state.agent_names)
+    }
+
+    /// Name the agent of conversation `session` whose thread is `thread`
+    /// ("Designer"; `None` or blank: back to what it was started for).
+    pub fn rename_agent(&mut self, session: &str, thread: &str, name: Option<String>) {
+        self.send(Command::RenameAgent {
+            session_id: session.to_owned(),
+            thread: thread.to_owned(),
+            name: name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()),
+        });
+    }
+
+    /// The names the owner gave agents, by thread.
+    pub fn agent_names(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.state.agent_names
+    }
+
     /// Every helper run on record (protocol 1.46), oldest first.
     pub fn runs(&self) -> Vec<aidaemon_client_protocol::RunSummary> {
         let mut runs: Vec<_> = self.state.all_runs().cloned().collect();

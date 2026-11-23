@@ -161,6 +161,7 @@ impl CliAgentTool {
             continues: crate::helper_run::Continues {
                 run: run.to_string(),
                 agent_session,
+                thread: found.thread.unwrap_or_else(|| run.to_string()),
             },
         })
     }

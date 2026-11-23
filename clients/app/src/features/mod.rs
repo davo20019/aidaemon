@@ -12,6 +12,7 @@ pub mod memory;
 pub mod model_picker;
 pub mod notify;
 pub mod pairing;
+pub mod participants;
 pub mod run_view;
 pub mod settings;
 pub mod settings_general;

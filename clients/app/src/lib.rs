@@ -130,6 +130,7 @@ pub fn Offline() -> impl IntoElement {
             "cancel_task",
             "get_run",
             "resolve_approval",
+            "rename_agent",
         ] {
             if let Some(id) = store.queued_id(kind)
                 && let Ok(mut sent) = SENT.lock()

@@ -96,6 +96,9 @@ impl AgentEventRecorder {
                 }
                 // The agent said, as it ran, whether its session can be
                 // continued (its launch could not tell).
+                if let Some(kept) = *resumable {
+                    self.runs.keeps_session(&self.run_id, kept);
+                }
                 if let Some(kept) = *resumable
                     && let Err(error) = self
                         .store

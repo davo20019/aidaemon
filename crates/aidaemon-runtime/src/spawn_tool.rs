@@ -2535,6 +2535,8 @@ mod group_tests {
             agent: None,
             edited: Vec::new(),
             continues: None,
+            thread: None,
+            keeps_session: false,
             steps: Vec::new(),
             evidence: Default::default(),
             failure: None,
@@ -2644,6 +2646,8 @@ mod group_tests {
                 agent: None,
                 edited: Vec::new(),
                 continues: None,
+                thread: None,
+                keeps_session: false,
                 steps: Vec::new(),
                 evidence: crate::run_state::RunEvidence {
                     delivered,

@@ -157,6 +157,9 @@ pub struct State {
     /// not clear them; a run in [`Self::runs`] wins over its kept record.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub past_runs: BTreeMap<String, RunSummary>,
+    /// The names the owner gave agents, by thread (protocol 1.48).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_names: BTreeMap<String, String>,
 }
 
 /// How many ended runs a conversation keeps on show from the daemon's
@@ -362,11 +365,13 @@ impl State {
                 session_id,
                 messages,
                 runs,
+                agent_names,
                 ..
             } => {
                 for run in runs {
                     self.past_runs.insert(run.id.clone(), run);
                 }
+                self.agent_names.extend(agent_names);
                 self.set_history(&session_id, messages)
             }
             CommandResult::Stopped { report } | CommandResult::Reply { text: report } => {
@@ -645,6 +650,14 @@ impl State {
                 }
             }
             Event::RunUpdated { run } => self.put_run(run),
+            Event::AgentRenamed { thread, name, .. } => match name {
+                Some(name) => {
+                    self.agent_names.insert(thread, name);
+                }
+                None => {
+                    self.agent_names.remove(&thread);
+                }
+            },
             // A step for a run this client never heard start (it joined
             // late) waits for the run's own record.
             Event::RunStep { run_id, step, .. } => {
@@ -882,6 +895,8 @@ mod tests {
             group: None,
             edited: Vec::new(),
             continues: None,
+            thread: None,
+            can_continue: false,
         }
     }
 
@@ -1003,6 +1018,7 @@ mod tests {
             messages: Vec::new(),
             more: false,
             runs: vec![run("kept", RunPhase::Succeeded, 5)],
+            agent_names: Default::default(),
         });
         assert_eq!(state.runs_for("app:s1")[0].id, "kept");
         state.apply(event(

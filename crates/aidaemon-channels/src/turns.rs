@@ -365,6 +365,11 @@ pub struct RunChange {
     /// The earlier run it continues: the same coding agent's session,
     /// resumed with the owner's follow-up.
     pub continues: Option<String>,
+    /// The first run of its thread: the agent session it is part of (one
+    /// participant of the conversation). `None`: it starts its own.
+    pub thread: Option<String>,
+    /// Its coding agent keeps its session where a follow-up can continue it.
+    pub keeps_session: bool,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
@@ -1645,6 +1650,8 @@ mod tests {
                         group: None,
                         edited: Vec::new(),
                         continues: None,
+                        thread: None,
+                        keeps_session: false,
                         this_request: false,
                     })
                 })

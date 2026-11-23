@@ -2,14 +2,16 @@
 //! Changes (`features::code`) and its project's Files (`features::files`);
 //! for any, its Steps (the work running for it and what its current turn
 //! did, step by step), its Terminal (`features::terminal`, the shell it
-//! shares with the agent) and its Browser (`features::browser_tab`).
+//! shares with the agent), its Browser (`features::browser_tab`) and its
+//! Agents (`features::participants`: each coding agent session in it).
 //! What waits on the owner across conversations is the sidebar's Needs
 //! you, not here.
 
 use nsh_core::prelude::*;
 
 use crate::store::{
-    ActivityKind, BROWSER_TAB, CHANGES_TAB, FILES_TAB, STEPS_TAB, Store, TERMINAL_TAB, detail_tabs,
+    AGENTS_TAB, ActivityKind, BROWSER_TAB, CHANGES_TAB, FILES_TAB, STEPS_TAB, Store, TERMINAL_TAB,
+    detail_tabs,
 };
 use crate::ui::{self, Glyph, Size, Tone, Variant, btn, colors, section_label, type_scale};
 
@@ -26,6 +28,7 @@ pub fn inspector(store: Store) -> View {
 
 fn tabs(store: Store) -> View {
     let coding = computed(move || store.coding_on_screen());
+    let agents = computed(move || store.has_participants());
     view()
         .w_full()
         .flex_1()
@@ -43,7 +46,7 @@ fn tabs(store: Store) -> View {
                     // beside the chat (a phone has them under each reply);
                     // every conversation has its terminal and browser.
                     view().flex_1().child(dynamic(move || {
-                        let tabs = detail_tabs(coding.get(), store.is_compact());
+                        let tabs = detail_tabs(coding.get(), store.is_compact(), agents.get());
                         Some(untracked(move || {
                             ui::tab_bar_of(store.inspector_tab(), &tabs)
                         }))
@@ -60,7 +63,7 @@ fn tabs(store: Store) -> View {
         )
         .child(dynamic(move || {
             // A tab this conversation does not show falls back to its first.
-            let tabs = detail_tabs(coding.get(), store.is_compact());
+            let tabs = detail_tabs(coding.get(), store.is_compact(), agents.get());
             let picked = store.inspector_tab().get();
             let tab = if tabs.iter().any(|(i, _)| *i == picked) {
                 picked
@@ -72,6 +75,7 @@ fn tabs(store: Store) -> View {
                 FILES_TAB => super::files::files(store),
                 TERMINAL_TAB => super::terminal::terminal_tab(store),
                 BROWSER_TAB => super::browser_tab::browser_tab(store),
+                AGENTS_TAB => super::participants::participants(store),
                 _ => steps(store),
             }))
         }))

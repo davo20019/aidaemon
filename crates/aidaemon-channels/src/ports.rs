@@ -159,6 +159,11 @@ pub struct ChatRun {
     /// The earlier run it continues: the same coding agent's session,
     /// resumed with the owner's follow-up.
     pub continues: Option<String>,
+    /// The first run of its thread: the agent session it is part of (one
+    /// participant of the conversation). `None`: it starts its own.
+    pub thread: Option<String>,
+    /// Its coding agent keeps its session where a follow-up can continue it.
+    pub keeps_session: bool,
     /// The chat's running turn started it (an earlier turn's helper runs on
     /// in the background).
     pub this_request: bool,

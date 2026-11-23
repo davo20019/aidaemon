@@ -537,14 +537,14 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
                 .is_some_and(|r| r.phase.is_running() && r.background)
         })
     });
-    // The runs that go on from it: the owner's follow-ups to its agent.
+    // The runs of its thread after it: the follow-ups to its agent.
     let follow_ups = {
         let id = id.clone();
         computed(move || {
             store
                 .all_runs()
                 .iter()
-                .filter(|later| later.continues.as_deref() == Some(id.as_str()))
+                .filter(|later| later.thread.as_deref() == Some(id.as_str()))
                 .count()
         })
     };
@@ -1106,6 +1106,30 @@ fn header(store: Store, session: Option<String>) -> View {
                 ui::icon_btn(Glyph::Compose, "New conversation", Size::Md, move || {
                     store.new_in_project(store.current_project())
                 })
+            },
+        ))
+        // Its participants: one press to the Agents tab, the count of agent
+        // sessions that worked here, how many work now.
+        .child(when(
+            move || store.has_participants(),
+            move || {
+                view().child(dynamic(move || {
+                    let list = store.participants();
+                    let working = list.iter().filter(|p| p.working()).count();
+                    let mut label = match list.len() {
+                        1 => "1 agent".to_string(),
+                        n => format!("{n} agents"),
+                    };
+                    if working > 0 {
+                        label.push_str(&format!(" · {working} working"));
+                    }
+                    Some(untracked(move || {
+                        ui::btn(label, Variant::Ghost, Size::Sm, move || {
+                            store.show_detail(crate::store::AGENTS_TAB)
+                        })
+                        .into_element()
+                    }))
+                }))
             },
         ))
         .child(when(

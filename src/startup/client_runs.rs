@@ -199,6 +199,61 @@ pub(crate) async fn past(
     Ok(runs)
 }
 
+/// Whether `thread` is one of conversation `session_id`'s coding agent
+/// runs: only those can be named there.
+pub(crate) async fn is_agent_of(
+    state: &dyn StateStore,
+    session_id: &str,
+    thread: &str,
+) -> Result<bool, String> {
+    Ok(state
+        .cli_agent_run(thread)
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some_and(|run| run.session_id == session_id))
+}
+
+/// Name the agent session whose thread is `thread` in conversation
+/// `session_id` ([`is_agent_of`] first); `None` takes the name away.
+pub(crate) async fn rename_agent(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    thread: &str,
+    name: Option<&str>,
+) -> Result<(), String> {
+    match name {
+        Some(name) => sqlx::query(
+            "INSERT INTO agent_names (thread_id, session_id, name) VALUES (?, ?, ?)
+             ON CONFLICT(thread_id) DO UPDATE SET name = excluded.name",
+        )
+        .bind(thread)
+        .bind(session_id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .map(|_| ()),
+        None => sqlx::query("DELETE FROM agent_names WHERE thread_id = ?")
+            .bind(thread)
+            .execute(pool)
+            .await
+            .map(|_| ()),
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// The names the owner gave conversation `session_id`'s agents, by thread.
+pub(crate) async fn agent_names(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT thread_id, name FROM agent_names WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// A stored event time (SQLite's `datetime('now')`, UTC) in ms.
 fn at_ms(at: &str) -> Option<u64> {
     let at = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S").ok()?;
@@ -231,6 +286,7 @@ mod tests {
             success: Some(true),
             output_summary: Some("Fixed one bug".into()),
             keeps_session: true,
+            thread: None,
         };
         let events = [
             event(
@@ -298,6 +354,7 @@ mod tests {
             output_summary: Some(r#"{"type":"thread.started","thread_id":"t-1"}"#.into()),
             success,
             keeps_session: false,
+            thread: None,
         };
         let events = [event(1, "session", r#"{"id":"t-1","model":null}"#)];
         assert_eq!(
@@ -345,5 +402,40 @@ mod tests {
         let kept = past(&pool, "app:synthetic").await.unwrap();
         assert_eq!(kept, vec![run]);
         assert!(past(&pool, "app:other").await.unwrap().is_empty());
+    }
+
+    /// A name the owner gives an agent is its conversation's, by thread,
+    /// until taken away.
+    #[tokio::test]
+    async fn an_agent_keeps_the_name_it_was_given() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE agent_names (thread_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+             name TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        rename_agent(&pool, "app:synthetic", "cli-agent-1", Some("Designer"))
+            .await
+            .unwrap();
+        rename_agent(&pool, "app:synthetic", "cli-agent-1", Some("Developer"))
+            .await
+            .unwrap();
+        let names = agent_names(&pool, "app:synthetic").await.unwrap();
+        assert_eq!(
+            names.get("cli-agent-1").map(String::as_str),
+            Some("Developer")
+        );
+        assert!(agent_names(&pool, "app:other").await.unwrap().is_empty());
+        rename_agent(&pool, "app:synthetic", "cli-agent-1", None)
+            .await
+            .unwrap();
+        assert!(
+            agent_names(&pool, "app:synthetic")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

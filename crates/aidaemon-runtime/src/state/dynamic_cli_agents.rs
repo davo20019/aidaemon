@@ -148,6 +148,15 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn set_cli_agent_thread(&self, id: i64, thread: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cli_agent_invocations SET thread_id = ? WHERE id = ?")
+            .bind(thread)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn set_cli_agent_keeps_session(&self, id: i64, kept: bool) -> anyhow::Result<()> {
         sqlx::query("UPDATE cli_agent_invocations SET keeps_session = ? WHERE id = ?")
             .bind(i64::from(kept))
@@ -192,7 +201,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         use sqlx::Row;
         let row = sqlx::query(
             "SELECT id, session_id, agent_name, agent_session_id, working_dir, prompt_summary, task,
-                    output_summary, success, COALESCE(keeps_session, 0) AS keeps_session
+                    output_summary, success, COALESCE(keeps_session, 0) AS keeps_session, thread_id
              FROM cli_agent_invocations WHERE run_id = ? ORDER BY id DESC LIMIT 1",
         )
         .bind(run_id)
@@ -211,6 +220,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
             output_summary: row.get("output_summary"),
             success: row.get("success"),
             keeps_session: row.get::<i64, _>("keeps_session") != 0,
+            thread: row.get("thread_id"),
         }))
     }
 

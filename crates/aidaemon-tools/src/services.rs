@@ -193,6 +193,9 @@ pub struct CliAgentRun {
     /// Its agent kept its session where a follow-up can continue it
     /// ([`DynamicCliAgentStore::set_cli_agent_keeps_session`]).
     pub keeps_session: bool,
+    /// The first run of its thread, when it continues one
+    /// ([`DynamicCliAgentStore::set_cli_agent_thread`]).
+    pub thread: Option<String>,
 }
 
 /// Runtime-managed CLI agents persistence + invocation logs.
@@ -255,6 +258,11 @@ pub trait DynamicCliAgentStore: Send + Sync {
 
     /// What invocation `id` was asked, whole: the task its run view shows.
     async fn note_cli_agent_task(&self, _id: i64, _task: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Invocation `id` continues the thread whose first run is `thread`.
+    async fn set_cli_agent_thread(&self, _id: i64, _thread: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
