@@ -1731,6 +1731,16 @@ fn http_samples() -> Vec<(&'static str, Value)> {
             .unwrap(),
         ),
         (
+            "http_socket_sign_in",
+            serde_json::to_value(SocketSignIn {
+                device_id: "dv-1".into(),
+                issued_at_ms: 1_767_225_600_000,
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+                signature: "c2ln...".into(),
+            })
+            .unwrap(),
+        ),
+        (
             "http_access_grant",
             serde_json::to_value(AccessGrant {
                 access_token: "acs_synthetic".into(),
@@ -1771,6 +1781,7 @@ fn roundtrip_http(name: &str, text: &str) -> Value {
         "http_challenge_request" => again::<ChallengeRequest>(text),
         "http_challenge" => again::<Challenge>(text),
         "http_session_request" => again::<SessionRequest>(text),
+        "http_socket_sign_in" => again::<SocketSignIn>(text),
         "http_access_grant" => again::<AccessGrant>(text),
         "http_devices" => again::<Vec<DeviceInfo>>(text),
         other => panic!("no type for {other}"),

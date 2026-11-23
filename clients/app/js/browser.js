@@ -209,12 +209,24 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.startMessages();
 }
 
+/** The endpoint key (hex) this browser dials its daemon with over iroh. */
+export async function remoteEndpoint() {
+  return (await daemon()).endpoint();
+}
+
 /** A WebSocket's part the app's sockets use, over iroh. */
 class RemoteSocket {
-  constructor(path, token) {
+  constructor(path, token, signIn) {
     this.readyState = 0;
     this.binaryType = "arraybuffer";
-    const headers = token ? ["authorization", `Bearer ${token}`] : [];
+    // A token, or a sign-in the daemon takes in the upgrade instead
+    // (protocol 1.48; the header name is the protocol crate's
+    // SOCKET_SIGN_IN_HEADER).
+    const headers = token
+      ? ["authorization", `Bearer ${token}`]
+      : signIn
+        ? ["x-aidaemon-sign-in", signIn]
+        : [];
     daemon()
       .then((d) => {
         if (this.readyState === 3) return;
@@ -249,16 +261,17 @@ class RemoteSocket {
 }
 
 /** A WebSocket to `url`, over iroh when it is under daemonBase(). */
-function openSocket(url, token) {
+function openSocket(url, token, signIn = "") {
   const base = daemonBase().replace(/^http/, "ws");
-  if (remoteAddress() && url.startsWith(base)) return new RemoteSocket(url.slice(base.length), token);
+  if (remoteAddress() && url.startsWith(base)) return new RemoteSocket(url.slice(base.length), token, signIn);
   return new WebSocket(url);
 }
 
 /**
  * A socket to `url`; `event(kind, text)` hears "open", "message", "close"
- * and "refused". `token` goes in the upgrade over iroh, where the daemon
- * takes it there only (the page's own socket sends it in its hello).
+ * and "refused". Over iroh the upgrade carries `token`, or else `signIn`
+ * (the daemon signs the device in from it); the page's own socket sends
+ * its token in its hello.
  */
 /**
  * Call `wake` when the page is shown again or the network comes back: a
@@ -286,8 +299,8 @@ export function onWake(wake) {
 }
 
 export class Socket {
-  constructor(url, token, event) {
-    this.ws = openSocket(url, token);
+  constructor(url, token, signIn, event) {
+    this.ws = openSocket(url, token, signIn);
     this.ws.onopen = () => event("open", "");
     this.ws.onmessage = (m) => event("message", typeof m.data === "string" ? m.data : "");
     this.ws.onclose = (c) => event(c.code === 4401 ? "refused" : "close", c.reason || `closed (${c.code})`);

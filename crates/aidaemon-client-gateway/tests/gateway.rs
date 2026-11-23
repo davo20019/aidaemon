@@ -1910,6 +1910,116 @@ async fn any_transport_with_a_peer_key_gets_the_remote_guard() {
     );
 }
 
+/// Over a peer-to-peer transport the client socket signs itself in: its
+/// upgrade carries a proof for this daemon and the peer's key, and opens
+/// with no token at all. The same proof again, a proof sent from another
+/// peer, and one before the device ever signed in from that peer are
+/// refused (the client then signs in with a challenge).
+#[tokio::test]
+async fn a_socket_signs_itself_in_once_from_its_own_peer() {
+    #[derive(Clone)]
+    struct Key([u8; 32]);
+    async fn tag(
+        axum::extract::State(key): axum::extract::State<Key>,
+        mut request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        request.extensions_mut().insert(key.0);
+        next.run(request).await
+    }
+    let f = fixture(RiskLevel::Medium).await;
+    let daemon = "5a".repeat(32);
+    f.gateway
+        .pairing()
+        .set_remote_url(Some(format!("iroh://{daemon}@relay.example.test")));
+    let serve = |key: [u8; 32]| {
+        let app = aidaemon_client_gateway::remote_router::<[u8; 32]>(f.gateway.clone())
+            .layer(axum::middleware::from_fn_with_state(Key(key), tag));
+        async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        }
+    };
+    let (mine_key, other_key) = ([7u8; 32], [8u8; 32]);
+    let mine = serve(mine_key).await;
+    let other = serve(other_key).await;
+    let phone = f.pair(vec![Scope::Observe, Scope::Chat]).await;
+    let proof = |endpoint: [u8; 32]| {
+        let nonce = format!("{:032x}", rand::random::<u128>());
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let message = socket_sign_in_message(
+            &daemon,
+            &hex::encode(endpoint),
+            &phone.device_id,
+            at,
+            &nonce,
+        );
+        let signature: Signature = phone.key.sign(message.as_bytes());
+        serde_json::to_string(&SocketSignIn {
+            device_id: phone.device_id.clone(),
+            issued_at_ms: at,
+            nonce,
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        })
+        .unwrap()
+    };
+    let open = |url: String, proof: String| async move {
+        let mut request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                format!("ws://{url}/client/v1/ws"),
+            )
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(SOCKET_SIGN_IN_HEADER, proof.parse().unwrap());
+        tokio_tungstenite::connect_async(request).await
+    };
+    let refused = |result: Result<_, tokio_tungstenite::tungstenite::Error>| match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("opened"),
+    };
+
+    // Never signed in from this peer: a challenge first.
+    assert_eq!(refused(open(mine.clone(), proof(mine_key)).await), 401);
+    let first: AccessGrant = f.sign_in_at(&mine, &phone).await.json().await.unwrap();
+    assert!(!first.access_token.is_empty());
+
+    // Now one round trip: no token in the upgrade or the hello.
+    let signed = proof(mine_key);
+    let (mut socket, _) = open(mine.clone(), signed.clone()).await.unwrap();
+    let hello = ClientFrame::Hello {
+        version: ProtocolVersion::CURRENT,
+        client: ClientInfo {
+            kind: ClientKind::Web,
+            name: "test".into(),
+            version: None,
+            device: None,
+        },
+        capabilities: Vec::new(),
+        resume_from: None,
+        token: None,
+    };
+    socket
+        .send(Message::text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .unwrap();
+    let frame = next(&mut socket).await;
+    assert!(matches!(frame, ServerFrame::Welcome { .. }), "{frame:?}");
+
+    // The same proof again: refused.
+    assert_eq!(refused(open(mine.clone(), signed).await), 401);
+    // A proof made for this peer, sent from another: refused.
+    assert_eq!(refused(open(other.clone(), proof(mine_key)).await), 401);
+    // Malformed: refused.
+    assert_eq!(refused(open(mine.clone(), "{}".into()).await), 401);
+}
+
 /// The daemon's iroh handshake admits only what pairing admits: a stranger
 /// is dropped while nothing is pairing, and let through to pair while an
 /// offer is open.

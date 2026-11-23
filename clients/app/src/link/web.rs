@@ -45,6 +45,8 @@ extern "C" {
     fn daemon_base() -> String;
     #[wasm_bindgen(js_name = remoteReady)]
     fn remote_ready() -> js_sys::Promise;
+    #[wasm_bindgen(js_name = remoteEndpoint)]
+    fn remote_endpoint() -> js_sys::Promise;
     #[wasm_bindgen(js_name = takePicture)]
     fn take_picture_js(max_dimension: u32) -> js_sys::Promise;
     #[wasm_bindgen(js_name = downloadUrl)]
@@ -115,7 +117,12 @@ extern "C" {
 
     type Socket;
     #[wasm_bindgen(constructor)]
-    fn new(url: &str, token: &str, event: &Closure<dyn FnMut(String, String)>) -> Socket;
+    fn new(
+        url: &str,
+        token: &str,
+        sign_in: &str,
+        event: &Closure<dyn FnMut(String, String)>,
+    ) -> Socket;
     #[wasm_bindgen(method)]
     fn send(this: &Socket, text: &str);
     #[wasm_bindgen(method)]
@@ -469,6 +476,10 @@ pub fn start(store: Store) {
         on_wake(&wake);
         wake.forget();
         let mut grant = GrantCache::default();
+        // Over iroh the socket signs in by itself (one round trip) until
+        // the daemon refuses that once; then this page signs in with a
+        // challenge, as before.
+        let mut by_challenge = false;
         loop {
             // Paired over iroh now, if a pairing link said so.
             let base = base();
@@ -489,7 +500,17 @@ pub fn start(store: Store) {
                 wait_or_wake(&mut machine, wait, &mut wakes).await;
                 continue;
             }
-            let token = match grant_token(&mut grant, &base, &device).await {
+            let sign_in = if iroh && !by_challenge {
+                socket_sign_in(&device).await
+            } else {
+                None
+            };
+            let token = if sign_in.is_some() {
+                Ok(String::new())
+            } else {
+                grant_token(&mut grant, &base, &device).await
+            };
+            let token = match token {
                 Ok(token) => token,
                 Err((DropKind::Unauthorized, _)) if offered_pairing().is_some() => {
                     // Refused, with a new pairing offer in hand: pair again.
@@ -522,9 +543,16 @@ pub fn start(store: Store) {
                     };
                     let _ = events_tx.unbounded_send(heard);
                 });
-            // Over iroh the token goes in the upgrade (the daemon takes it
-            // only there); the page's own socket sends it in its hello.
-            let socket = Socket::new(&url, if iroh { &token } else { "" }, &on_event);
+            // Over iroh the token (or the sign-in) goes in the upgrade (the
+            // daemon takes it only there); the page's own socket sends it
+            // in its hello.
+            let socket = Socket::new(
+                &url,
+                if iroh { &token } else { "" },
+                sign_in.as_deref().unwrap_or_default(),
+                &on_event,
+            );
+            let mut opened = false;
             let send = |frame: &aidaemon_client_protocol::ClientFrame| {
                 if let Ok(text) = serde_json::to_string(frame) {
                     socket.send(&text);
@@ -560,6 +588,7 @@ pub fn start(store: Store) {
                 };
                 match event {
                     Some(Some(Heard::Open)) => {
+                        opened = true;
                         let opening = if iroh {
                             machine.opened(now())
                         } else {
@@ -610,6 +639,15 @@ pub fn start(store: Store) {
             };
             socket.close();
             drop(on_event);
+            // The daemon refused the socket's own sign-in (an older daemon,
+            // a clock too far off, an endpoint not yet this device's): sign
+            // in with a challenge now, which says what is wrong if anything
+            // is. A socket that only failed to connect waits and tries the
+            // same way again.
+            if sign_in.is_some() && !opened && disconnect.kind == DropKind::Unauthorized {
+                by_challenge = true;
+                continue;
+            }
             if disconnect.kind == DropKind::Unauthorized {
                 grant.drop_grant();
                 if offered_pairing().is_some() {
@@ -638,6 +676,16 @@ async fn wait_or_wake(
             machine.woke(now());
         }
     }
+}
+
+/// The sign-in a socket's upgrade carries over iroh (protocol 1.48), signed
+/// with the page's key; `None` when it cannot be made (the iroh module or
+/// the key not there), so the page signs in with a challenge.
+async fn socket_sign_in(device: &str) -> Option<String> {
+    let endpoint = text_of(remote_endpoint()).await.ok()?;
+    signin::socket_sign_in(&remote_address(), &endpoint, device, now(), &PageKey)
+        .await
+        .ok()
 }
 
 async fn grant_token(

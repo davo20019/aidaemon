@@ -10,6 +10,10 @@
 //! - a peer with no session may reach only pairing and sign-in;
 //! - an access token works only from the peer key that signed in for it,
 //!   so a token lifted from one device is useless from another;
+//! - the client socket may sign in by itself instead of bringing a token:
+//!   its upgrade carries a proof ([`SOCKET_SIGN_IN_HEADER`]) bound to this
+//!   daemon and the peer's key, taken once ([`Pairing::sign_in_socket`]),
+//!   and the token it earns is bound to the peer as a sign-in's is;
 //! - the owner's local token is refused: it is for this machine.
 //!
 //! The transport puts the peer's key on each request as an extension of
@@ -23,11 +27,11 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use aidaemon_client_protocol::{AccessGrant, ErrorCode};
+use aidaemon_client_protocol::{AccessGrant, ErrorCode, SOCKET_SIGN_IN_HEADER, SocketSignIn};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::Method;
+use axum::http::{HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use sha2::{Digest, Sha256};
@@ -35,6 +39,9 @@ use sha2::{Digest, Sha256};
 use crate::ClientGateway;
 use crate::bus::now_ms;
 use crate::server::{bearer, error_response};
+
+#[cfg(doc)]
+use crate::pairing::Pairing;
 
 /// The largest sign-in reply read back to bind its token.
 const MAX_GRANT_BYTES: usize = 64 * 1024;
@@ -131,6 +138,22 @@ where
         }
         return response;
     }
+    if method == Method::GET
+        && path == "/client/v1/ws"
+        && bearer(request.headers()).is_none()
+        && let Some(proof) = request.headers().get(SOCKET_SIGN_IN_HEADER)
+    {
+        return match sign_in_socket(&gateway, &bindings, peer, proof).await {
+            Ok(token) => {
+                // The socket goes on as one that brought this token: the
+                // route checks it as it checks any.
+                let mut request = request;
+                request.headers_mut().insert(header::AUTHORIZATION, token);
+                next.run(request).await
+            }
+            Err(error) => error_response(error.code, &error.message),
+        };
+    }
     let allowed = match bearer(request.headers()) {
         // A token works from the peer it was issued to, and only while the
         // gateway still honours it (revoking a device ends it).
@@ -148,6 +171,33 @@ where
         );
     }
     next.run(request).await
+}
+
+/// Sign a socket's device in from the proof its upgrade carried, tie the
+/// token to `peer` and give it back as the upgrade's `Authorization`.
+async fn sign_in_socket<P: Clone + Eq + AsRef<[u8]>>(
+    gateway: &ClientGateway,
+    bindings: &Bindings<P>,
+    peer: P,
+    proof: &HeaderValue,
+) -> Result<HeaderValue, aidaemon_client_protocol::ProtocolError> {
+    let malformed = || {
+        aidaemon_client_protocol::ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "The socket's sign-in is malformed",
+        )
+    };
+    let proof: SocketSignIn = proof
+        .to_str()
+        .ok()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .ok_or_else(malformed)?;
+    let grant = gateway
+        .pairing
+        .sign_in_socket(&proof, &hex::encode(peer.as_ref()))
+        .await?;
+    bindings.bind(&grant.access_token, peer, grant.expires_at_ms);
+    HeaderValue::from_str(&format!("Bearer {}", grant.access_token)).map_err(|_| malformed())
 }
 
 /// Read a successful sign-in reply and tie its token to `peer`.

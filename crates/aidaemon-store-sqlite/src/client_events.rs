@@ -564,6 +564,22 @@ impl SqliteClientEventLog {
         Ok(())
     }
 
+    /// Whether endpoint key `endpoint` (hex) is recorded as `device_id`'s.
+    pub async fn device_has_endpoint(
+        &self,
+        device_id: &str,
+        endpoint: &str,
+    ) -> Result<bool, Error> {
+        let row = sqlx::query(
+            "SELECT 1 FROM client_device_endpoints WHERE device_id = ?1 AND endpoint = ?2",
+        )
+        .bind(device_id)
+        .bind(endpoint)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     /// The endpoint keys of active (unrevoked) devices.
     pub async fn active_device_endpoints(&self) -> Result<Vec<String>, Error> {
         let rows = sqlx::query(

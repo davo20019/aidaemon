@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use aidaemon_client_protocol::{
     AccessGrant, Challenge, ChallengeRequest, ClientKind, Enrollment, EnrollmentState,
-    RedeemRequest, ServerFrame, SessionRequest, challenge_message,
+    RedeemRequest, ServerFrame, SessionRequest, SocketSignIn, challenge_message,
+    socket_sign_in_message,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -156,6 +157,57 @@ impl Signer for DeviceKey {
         let signature: Signature = self.0.sign(message.as_bytes());
         Ok(URL_SAFE_NO_PAD.encode(signature.to_bytes()))
     }
+}
+
+/// The sign-in a socket's upgrade carries to the daemon at peer-to-peer
+/// address `daemon_url` (`iroh://<key>@…`), from endpoint key `endpoint`
+/// (hex), for `device_id` at `now_ms` (protocol 1.48): the JSON for
+/// [`aidaemon_client_protocol::SOCKET_SIGN_IN_HEADER`]. It signs in and
+/// opens the socket in one round trip; a daemon that refuses it answers
+/// 401, and the device signs in with a challenge instead.
+pub async fn socket_sign_in(
+    daemon_url: &str,
+    endpoint: &str,
+    device_id: &str,
+    now_ms: u64,
+    signer: &impl Signer,
+) -> Result<String, SignInError> {
+    let daemon = daemon_key(daemon_url)
+        .ok_or_else(|| SignInError::Failed(format!("not a daemon address: {daemon_url}")))?;
+    let endpoint = endpoint.trim().to_ascii_lowercase();
+    if !is_key_hex(&endpoint) {
+        return Err(SignInError::Failed("the endpoint key is malformed".into()));
+    }
+    // 122 random bits, never used again.
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let signature = signer
+        .sign(&socket_sign_in_message(
+            &daemon, &endpoint, device_id, now_ms, &nonce,
+        ))
+        .await?;
+    serde_json::to_string(&SocketSignIn {
+        device_id: device_id.to_owned(),
+        issued_at_ms: now_ms,
+        nonce,
+        signature,
+    })
+    .map_err(|e| SignInError::Failed(e.to_string()))
+}
+
+/// The daemon's endpoint key (64 lowercase hex digits) in its peer-to-peer
+/// address `iroh://<key>@<relay>` (a machine format of our own).
+fn daemon_key(url: &str) -> Option<String> {
+    let key = url
+        .split_once("://")?
+        .1
+        .split(['@', '/'])
+        .next()?
+        .to_ascii_lowercase();
+    is_key_hex(&key).then_some(key)
+}
+
+fn is_key_hex(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Sign device `device_id` in at `gateway` over `http`, with `signer`.
@@ -451,6 +503,68 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_socket_sign_in_signs_the_message_the_daemon_checks() {
+        use p256::ecdsa::signature::Verifier as _;
+        let key = DeviceKey::generate();
+        let daemon = "AB".repeat(32);
+        let endpoint = "cd".repeat(32);
+        let text = socket_sign_in(
+            &format!("iroh://{daemon}@relay.example.test"),
+            &endpoint,
+            "dev-synthetic-1",
+            1_767_225_600_000,
+            &key,
+        )
+        .await
+        .unwrap();
+        let proof: SocketSignIn = serde_json::from_str(&text).unwrap();
+        assert_eq!(proof.device_id, "dev-synthetic-1");
+        assert_eq!(proof.issued_at_ms, 1_767_225_600_000);
+        assert_eq!(proof.nonce.len(), 32);
+        let signature =
+            Signature::from_slice(&URL_SAFE_NO_PAD.decode(&proof.signature).unwrap()).unwrap();
+        let message = socket_sign_in_message(
+            &daemon.to_lowercase(),
+            &endpoint,
+            "dev-synthetic-1",
+            proof.issued_at_ms,
+            &proof.nonce,
+        );
+        assert!(
+            key.0
+                .verifying_key()
+                .verify(message.as_bytes(), &signature)
+                .is_ok()
+        );
+        // Each is new.
+        let again: SocketSignIn = serde_json::from_str(
+            &socket_sign_in(
+                &format!("iroh://{daemon}@relay.example.test"),
+                &endpoint,
+                "dev-synthetic-1",
+                1_767_225_600_000,
+                &key,
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(again.nonce, proof.nonce);
+        // Not a daemon address, or a damaged endpoint key: nothing to sign.
+        for (url, endpoint) in [
+            ("http://127.0.0.1:8788", endpoint.as_str()),
+            ("iroh://short@relay.example.test", endpoint.as_str()),
+        ] {
+            assert!(socket_sign_in(url, endpoint, "d", 1, &key).await.is_err());
+        }
+        assert!(
+            socket_sign_in(&format!("iroh://{daemon}@r"), "zz", "d", 1, &key)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn a_key_survives_the_store_and_signs_what_the_gateway_checks() {

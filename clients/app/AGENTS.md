@@ -86,6 +86,10 @@ its pairing link approves itself (use `/client/v1/next/#offer=…`). With
   endpoint key the page dials with (localStorage `aidaemon.endpoint`), since
   iroh needs its bytes. It names the connection only: signing in still
   takes the device key, and the daemon ties each token to that endpoint.
+  Over iroh the page holds no token: its socket's upgrade carries a
+  sign-in signed with the device key for this daemon and that endpoint,
+  taken once (protocol 1.48, `signin::socket_sign_in`); a refused one
+  falls back to the challenge sign-in for the rest of the page's life.
 - Model output renders as Markdown with HTML off (`html: false`).
 - Nothing but drawing lives in the app. Connection state, the reducer,
   reads and their request ids, turns' activity, uploads, unread and

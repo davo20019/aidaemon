@@ -1,0 +1,6 @@
+{
+  "device_id": "dv-1",
+  "issued_at_ms": 1767225600000,
+  "nonce": "0123456789abcdef0123456789abcdef",
+  "signature": "c2ln..."
+}

@@ -38,7 +38,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 47;
+pub const PROTOCOL_MINOR: u16 = 48;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -3651,6 +3651,52 @@ pub fn challenge_message(challenge_id: &str, nonce: &str) -> String {
     format!("aidaemon-client-v1:{challenge_id}:{nonce}")
 }
 
+/// The header a socket upgrade over a peer-to-peer transport may carry
+/// instead of a token: a [`SocketSignIn`] as JSON, which signs the device
+/// in and opens the socket in one round trip (protocol 1.48). A daemon that
+/// refuses it (an older one, a clock too far off, a proof seen before)
+/// answers 401, and the client signs in with a challenge instead.
+pub const SOCKET_SIGN_IN_HEADER: &str = "x-aidaemon-sign-in";
+
+/// How far a [`SocketSignIn`]'s time may lie behind the daemon's clock.
+pub const SOCKET_SIGN_IN_MAX_AGE_MS: u64 = 60_000;
+
+/// How far it may lie ahead (the device's clock runs fast).
+pub const SOCKET_SIGN_IN_MAX_AHEAD_MS: u64 = 30_000;
+
+/// A device's sign-in carried by its socket upgrade
+/// ([`SOCKET_SIGN_IN_HEADER`], protocol 1.48). In place of a challenge the
+/// daemon picked, it signs its own time and a random value, so the daemon
+/// takes each proof once, only while it is fresh, and only for itself and
+/// the endpoint key the transport says the upgrade came from
+/// ([`socket_sign_in_message`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct SocketSignIn {
+    pub device_id: String,
+    /// The device's clock, milliseconds since the Unix epoch.
+    pub issued_at_ms: u64,
+    /// 32 to 64 random hex digits, never used twice.
+    pub nonce: String,
+    /// The signature of [`socket_sign_in_message`] as `r || s` (64 bytes),
+    /// base64url.
+    pub signature: String,
+}
+
+/// The exact bytes a device signs (ECDSA P-256, SHA-256) for a
+/// [`SocketSignIn`]: its own prefix, so no challenge signature passes for
+/// one nor one for a challenge's; the daemon's endpoint key and the
+/// device's (both 64 hex digits), so it is good at one daemon and from one
+/// endpoint only; the device, its time and the random value.
+pub fn socket_sign_in_message(
+    daemon: &str,
+    endpoint: &str,
+    device_id: &str,
+    issued_at_ms: u64,
+    nonce: &str,
+) -> String {
+    format!("aidaemon-socket-sign-in-v1:{daemon}:{endpoint}:{device_id}:{issued_at_ms}:{nonce}")
+}
+
 /// `POST /client/v1/sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct SessionRequest {
@@ -3707,6 +3753,7 @@ pub fn schema() -> serde_json::Value {
     let _ = generator.subschema_for::<ChallengeRequest>();
     let _ = generator.subschema_for::<Challenge>();
     let _ = generator.subschema_for::<SessionRequest>();
+    let _ = generator.subschema_for::<SocketSignIn>();
     let _ = generator.subschema_for::<AccessGrant>();
     let _ = generator.subschema_for::<Vec<DeviceInfo>>();
     let _ = generator.subschema_for::<media::MediaHeader>();
@@ -3758,6 +3805,20 @@ pub fn schema_file() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_socket_sign_in_signs_its_own_message_never_a_challenges() {
+        let daemon = "a".repeat(64);
+        let endpoint = "b".repeat(64);
+        let message = socket_sign_in_message(&daemon, &endpoint, "dv-1", 1_767_225_600_000, "0f0f");
+        assert_eq!(
+            message,
+            format!("aidaemon-socket-sign-in-v1:{daemon}:{endpoint}:dv-1:1767225600000:0f0f")
+        );
+        // No challenge message can be the same bytes: their prefixes differ.
+        assert!(!message.starts_with("aidaemon-client-v1:"));
+        assert!(!challenge_message("ch-1", "n").starts_with("aidaemon-socket-sign-in-v1:"));
+    }
 
     #[test]
     fn a_phone_pairs_at_the_web_app_only_when_it_can_reach_the_daemon_by_key() {

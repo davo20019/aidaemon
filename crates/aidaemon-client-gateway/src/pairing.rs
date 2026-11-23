@@ -5,7 +5,10 @@
 //! confirms on a chat they already use (an approval card through the hub)
 //! or, for an offer made at the terminal, there. Each connection proves the
 //! key by signing a challenge and gets a 15-minute access token carrying
-//! the device's scopes and risk ceiling. Revoking a device ends its tokens
+//! the device's scopes and risk ceiling. Over a peer-to-peer transport a
+//! socket's upgrade may carry the proof instead ([`Pairing::sign_in_socket`]):
+//! the device signs its own time and a random value, bound to this daemon
+//! and its endpoint key, and the daemon takes each such proof once. Revoking a device ends its tokens
 //! and its open sockets at once.
 
 use std::collections::{HashMap, HashSet};
@@ -15,7 +18,8 @@ use std::time::Duration;
 use aidaemon_channels::hub::ApprovalRequest;
 use aidaemon_client_protocol::{
     ALL_SCOPES, AccessGrant, Challenge, ClientKind, DeviceInfo, Enrollment, EnrollmentState,
-    ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk, Scope, challenge_message,
+    ErrorCode, PairingOffer, ProtocolError, RedeemRequest, Risk, SOCKET_SIGN_IN_MAX_AGE_MS,
+    SOCKET_SIGN_IN_MAX_AHEAD_MS, Scope, SocketSignIn, challenge_message, socket_sign_in_message,
 };
 use aidaemon_store_sqlite::{DeviceRow, PairingRow, SqliteClientEventLog};
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
@@ -43,6 +47,12 @@ const ACCESS_PREFIX: &str = "acs_";
 const MAX_OPEN_CHALLENGES: usize = 1024;
 /// One device signs in a few sockets at once at most.
 const MAX_OPEN_CHALLENGES_PER_DEVICE: usize = 8;
+/// Socket sign-ins remembered at once (each until it could no longer be
+/// fresh), so none is taken twice.
+const MAX_SOCKET_SIGN_INS: usize = 4096;
+/// One device's socket sign-ins within that time: a page reconnecting now
+/// and then, never this many.
+const MAX_SOCKET_SIGN_INS_PER_DEVICE: usize = 32;
 
 fn ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -126,6 +136,34 @@ impl Admission {
     }
 }
 
+/// Whether `signature` (base64url, `r || s` or DER) is `device`'s key's
+/// signature of `message`.
+fn verify(device: &DeviceRow, message: &str, signature: &str) -> Result<(), ProtocolError> {
+    let refused = || ProtocolError::new(ErrorCode::Unauthorized, "The signature does not verify");
+    let key = URL_SAFE_NO_PAD
+        .decode(&device.public_key)
+        .ok()
+        .and_then(|bytes| VerifyingKey::from_sec1_bytes(&bytes).ok())
+        .ok_or_else(refused)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(signature.trim())
+        .map_err(|_| refused())?;
+    let signature = if bytes.len() == 64 {
+        Signature::from_slice(&bytes).map_err(|_| refused())?
+    } else {
+        Signature::from_der(&bytes).map_err(|_| refused())?
+    };
+    key.verify(message.as_bytes(), &signature)
+        .map_err(|_| refused())
+}
+
+/// The daemon's own endpoint key in its peer-to-peer address
+/// (`iroh://<key>@<relay>`; a machine format of our own).
+fn own_key(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    endpoint_of(rest.split(['@', '/']).next()?)
+}
+
 /// An endpoint key as sign-in names it: 64 lowercase hex digits.
 fn endpoint_of(text: &str) -> Option<String> {
     let text = text.trim().to_ascii_lowercase();
@@ -151,6 +189,13 @@ pub struct Pairing {
     fingerprint: String,
     access: Mutex<HashMap<String, Access>>,
     challenges: Mutex<HashMap<String, PendingChallenge>>,
+    /// Socket sign-ins taken, by device and random value, each until it is
+    /// too old to be taken anyway (its time plus the window). Kept in
+    /// memory: after a restart [`Self::started_ms`] stands in for it.
+    socket_sign_ins: Mutex<HashMap<(String, String), u64>>,
+    /// When this gateway started: a socket sign-in made before it may have
+    /// been taken by the run before, whose memory is gone.
+    started_ms: u64,
     /// Per device, what revoking it cancels.
     revocations: Mutex<HashMap<String, CancellationToken>>,
     /// The ceiling a watch gets unless the owner sets another.
@@ -288,6 +333,8 @@ impl Pairing {
             fingerprint,
             access: Mutex::default(),
             challenges: Mutex::default(),
+            socket_sign_ins: Mutex::default(),
+            started_ms: now_ms(),
             revocations: Mutex::default(),
             watch_ceiling,
             admission: Mutex::default(),
@@ -737,27 +784,107 @@ impl Pairing {
                 ProtocolError::new(ErrorCode::Unauthorized, "Unknown or expired challenge")
             })?;
         let device = self.active_device(&challenge.device_id).await?;
-        let refused =
-            || ProtocolError::new(ErrorCode::Unauthorized, "The signature does not verify");
-        let key = URL_SAFE_NO_PAD
-            .decode(&device.public_key)
-            .ok()
-            .and_then(|bytes| VerifyingKey::from_sec1_bytes(&bytes).ok())
-            .ok_or_else(refused)?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(signature.trim())
-            .map_err(|_| refused())?;
-        let signature = if bytes.len() == 64 {
-            Signature::from_slice(&bytes).map_err(|_| refused())?
-        } else {
-            Signature::from_der(&bytes).map_err(|_| refused())?
-        };
-        key.verify(
-            challenge_message(challenge_id, &challenge.nonce).as_bytes(),
-            &signature,
-        )
-        .map_err(|_| refused())?;
+        verify(
+            &device,
+            &challenge_message(challenge_id, &challenge.nonce),
+            signature,
+        )?;
+        let grant = self.grant(&device).await;
+        if let Some(endpoint) = &challenge.endpoint {
+            self.record_endpoint(&device.device_id, endpoint).await;
+        }
+        Ok(grant)
+    }
 
+    /// Sign a device in from the proof its socket upgrade carried, over a
+    /// peer-to-peer transport whose handshake proved `endpoint` (hex): the
+    /// same token a signed challenge gets, in one round trip. Refused
+    /// unless the device is active and `endpoint` is one it signed in from
+    /// before (so a first sign-in takes a challenge); the proof's time is
+    /// within the window and not before this gateway started; it signs
+    /// [`socket_sign_in_message`] for this daemon's own key and `endpoint`;
+    /// and its random value was not taken before.
+    pub async fn sign_in_socket(
+        &self,
+        proof: &SocketSignIn,
+        endpoint: &str,
+    ) -> Result<AccessGrant, ProtocolError> {
+        let refused = |why: &str| ProtocolError::new(ErrorCode::Unauthorized, why);
+        let endpoint =
+            endpoint_of(endpoint).ok_or_else(|| refused("This transport names no endpoint key"))?;
+        // Its own key, as its peer-to-peer address names it: without one
+        // (remote access not up yet) there is nothing to bind the proof to.
+        let daemon = self
+            .remote_url()
+            .and_then(|url| own_key(&url))
+            .ok_or_else(|| refused("This daemon has no peer-to-peer address"))?;
+        let nonce = proof.nonce.trim();
+        if !(32..=64).contains(&nonce.len()) || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(refused("The sign-in's random value is malformed"));
+        }
+        let now = now_ms();
+        if proof.issued_at_ms.saturating_add(SOCKET_SIGN_IN_MAX_AGE_MS) < now
+            || proof.issued_at_ms > now.saturating_add(SOCKET_SIGN_IN_MAX_AHEAD_MS)
+            || proof.issued_at_ms < self.started_ms
+        {
+            return Err(refused(
+                "The sign-in is not fresh; sign in with a challenge",
+            ));
+        }
+        let device = self.active_device(&proof.device_id).await?;
+        if !self
+            .log
+            .device_has_endpoint(&device.device_id, &endpoint)
+            .await
+            .map_err(internal)?
+        {
+            return Err(refused(
+                "This endpoint key is not this device's yet; sign in with a challenge",
+            ));
+        }
+        verify(
+            &device,
+            &socket_sign_in_message(
+                &daemon,
+                &endpoint,
+                &device.device_id,
+                proof.issued_at_ms,
+                nonce,
+            ),
+            &proof.signature,
+        )?;
+        // Taken once: checked and recorded under one lock, after the
+        // signature, so nobody without the device's key fills this memory.
+        {
+            let mut taken = self
+                .socket_sign_ins
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            taken.retain(|_, until| *until > now);
+            let slot = (device.device_id.clone(), nonce.to_ascii_lowercase());
+            if taken.contains_key(&slot) {
+                return Err(refused("This sign-in was used already"));
+            }
+            let own = taken.keys().filter(|(d, _)| *d == device.device_id).count();
+            if own >= MAX_SOCKET_SIGN_INS_PER_DEVICE || taken.len() >= MAX_SOCKET_SIGN_INS {
+                return Err(ProtocolError::new(
+                    ErrorCode::RateLimited,
+                    "Too many sign-ins at once; try again in a minute",
+                ));
+            }
+            // Past this it is refused as stale anyway.
+            let until = proof
+                .issued_at_ms
+                .saturating_add(SOCKET_SIGN_IN_MAX_AGE_MS)
+                .max(now)
+                .saturating_add(1);
+            taken.insert(slot, until);
+        }
+        Ok(self.grant(&device).await)
+    }
+
+    /// A new access token for `device`, with its scopes and ceiling.
+    async fn grant(&self, device: &DeviceRow) -> AccessGrant {
         let scopes = scopes_of(&device.scopes);
         let ceiling = device.risk_ceiling.as_deref().and_then(risk_of);
         let revoked = self
@@ -789,16 +916,13 @@ impl Pairing {
             );
         }
         let _ = self.log.touch_device(&device.device_id, now_ms()).await;
-        if let Some(endpoint) = &challenge.endpoint {
-            self.record_endpoint(&device.device_id, endpoint).await;
-        }
-        Ok(AccessGrant {
+        AccessGrant {
             access_token: token,
             expires_at_ms,
-            device_id: device.device_id,
+            device_id: device.device_id.clone(),
             scopes,
             risk_ceiling: ceiling,
-        })
+        }
     }
 
     /// The device behind an access token, while it is valid.
@@ -991,6 +1115,225 @@ mod tests {
 
     const PHONE: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
     const STRANGER: &str = "22222222222222222222222222222222222222222222222222222222222222bb";
+
+    mod socket_sign_in {
+        use super::*;
+        use p256::ecdsa::SigningKey;
+        use p256::ecdsa::signature::Signer as _;
+        use p256::elliptic_curve::Generate as _;
+
+        const DAEMON: &str = "33333333333333333333333333333333333333333333333333333333333333cc";
+        const OTHER_DAEMON: &str =
+            "44444444444444444444444444444444444444444444444444444444444444dd";
+
+        struct Setup {
+            pairing: Pairing,
+            key: SigningKey,
+        }
+
+        /// A paired phone that signed in from PHONE once, at a daemon whose
+        /// peer-to-peer address names DAEMON.
+        async fn setup() -> Setup {
+            let pairing = pairing().await;
+            pairing.set_remote_url(Some(format!("iroh://{DAEMON}@relay.example.test")));
+            let key = SigningKey::generate_from_rng(&mut rand::rng());
+            let mut row = device("dv-phone", "web", now_ms());
+            row.public_key =
+                URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_point(false).as_bytes());
+            pairing.log.add_device(&row).await.unwrap();
+            pairing.record_endpoint("dv-phone", PHONE).await;
+            Setup { pairing, key }
+        }
+
+        fn nonce() -> String {
+            random_hex()[..32].to_string()
+        }
+
+        fn signed(key: &SigningKey, message: &str) -> String {
+            let signature: Signature = key.sign(message.as_bytes());
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        }
+
+        /// A proof as the phone makes it: for `daemon`, from `endpoint`.
+        fn proof(
+            key: &SigningKey,
+            daemon: &str,
+            endpoint: &str,
+            at: u64,
+            nonce: &str,
+        ) -> SocketSignIn {
+            SocketSignIn {
+                device_id: "dv-phone".into(),
+                issued_at_ms: at,
+                nonce: nonce.into(),
+                signature: signed(
+                    key,
+                    &socket_sign_in_message(daemon, endpoint, "dv-phone", at, nonce),
+                ),
+            }
+        }
+
+        fn refused(result: Result<AccessGrant, ProtocolError>) -> ErrorCode {
+            result.expect_err("refused").code
+        }
+
+        #[tokio::test]
+        async fn a_fresh_proof_signs_in_once_and_its_token_works() {
+            let s = setup().await;
+            let good = proof(&s.key, DAEMON, PHONE, now_ms(), &nonce());
+            let grant = s.pairing.sign_in_socket(&good, PHONE).await.unwrap();
+            assert_eq!(grant.device_id, "dv-phone");
+            assert!(s.pairing.principal(&grant.access_token).is_some());
+            // The same proof again (a replay): refused.
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&good, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            // The same random value in upper case is the same value.
+            let mut shouted = good.clone();
+            shouted.nonce = good.nonce.to_uppercase();
+            shouted.signature = signed(
+                &s.key,
+                &socket_sign_in_message(
+                    DAEMON,
+                    PHONE,
+                    "dv-phone",
+                    good.issued_at_ms,
+                    &shouted.nonce,
+                ),
+            );
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&shouted, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            // A new one is fine.
+            let next = proof(&s.key, DAEMON, PHONE, now_ms(), &nonce());
+            assert!(s.pairing.sign_in_socket(&next, PHONE).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn a_proof_is_good_only_at_this_daemon_and_from_its_own_endpoint() {
+            let s = setup().await;
+            // Made for another daemon.
+            let elsewhere = proof(&s.key, OTHER_DAEMON, PHONE, now_ms(), &nonce());
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&elsewhere, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            // Made for PHONE, sent from another endpoint (even a known one).
+            s.pairing.record_endpoint("dv-phone", STRANGER).await;
+            let lifted = proof(&s.key, DAEMON, PHONE, now_ms(), &nonce());
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&lifted, STRANGER).await),
+                ErrorCode::Unauthorized
+            );
+            // And it was not used up by those refusals.
+            assert!(s.pairing.sign_in_socket(&lifted, PHONE).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn an_endpoint_the_device_never_signed_in_from_takes_a_challenge() {
+            let s = setup().await;
+            let new_endpoint = STRANGER;
+            let first = proof(&s.key, DAEMON, new_endpoint, now_ms(), &nonce());
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&first, new_endpoint).await),
+                ErrorCode::Unauthorized
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stale_early_or_pre_start_proof_is_refused() {
+            let s = setup().await;
+            let now = now_ms();
+            for at in [
+                now - SOCKET_SIGN_IN_MAX_AGE_MS - 1_000,
+                now + SOCKET_SIGN_IN_MAX_AHEAD_MS + 1_000,
+                // Within the window, but before this gateway started: the
+                // run before may have taken it.
+                s.pairing.started_ms - 1,
+            ] {
+                let old = proof(&s.key, DAEMON, PHONE, at, &nonce());
+                assert_eq!(
+                    refused(s.pairing.sign_in_socket(&old, PHONE).await),
+                    ErrorCode::Unauthorized,
+                    "issued at {at} (now {now})"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_devices_key_signing_this_message_passes() {
+            let s = setup().await;
+            let now = now_ms();
+            let n = nonce();
+            // Another key.
+            let stranger = SigningKey::generate_from_rng(&mut rand::rng());
+            let forged = proof(&stranger, DAEMON, PHONE, now, &n);
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&forged, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            // The device's key over a challenge message, not this one.
+            let mut crossed = proof(&s.key, DAEMON, PHONE, now, &n);
+            crossed.signature = signed(&s.key, &challenge_message("ch-1", &n));
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&crossed, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            // A good signature with a field changed after signing.
+            let mut moved = proof(&s.key, DAEMON, PHONE, now, &n);
+            moved.issued_at_ms += 1;
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&moved, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            // A malformed random value.
+            for bad in ["short", &"z".repeat(32), &"a".repeat(65)] {
+                let odd = proof(&s.key, DAEMON, PHONE, now, bad);
+                assert_eq!(
+                    refused(s.pairing.sign_in_socket(&odd, PHONE).await),
+                    ErrorCode::Unauthorized
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_revoked_device_or_a_daemon_without_an_address_refuses() {
+            let s = setup().await;
+            let good = proof(&s.key, DAEMON, PHONE, now_ms(), &nonce());
+            s.pairing.set_remote_url(None);
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&good, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+            s.pairing
+                .set_remote_url(Some(format!("iroh://{DAEMON}@relay.example.test")));
+            s.pairing
+                .log
+                .revoke_device("dv-phone", now_ms())
+                .await
+                .unwrap();
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&good, PHONE).await),
+                ErrorCode::Unauthorized
+            );
+        }
+
+        #[tokio::test]
+        async fn one_device_cannot_fill_the_memory_of_taken_proofs() {
+            let s = setup().await;
+            for _ in 0..MAX_SOCKET_SIGN_INS_PER_DEVICE {
+                let p = proof(&s.key, DAEMON, PHONE, now_ms(), &nonce());
+                s.pairing.sign_in_socket(&p, PHONE).await.unwrap();
+            }
+            let more = proof(&s.key, DAEMON, PHONE, now_ms(), &nonce());
+            assert_eq!(
+                refused(s.pairing.sign_in_socket(&more, PHONE).await),
+                ErrorCode::RateLimited
+            );
+        }
+    }
 
     #[tokio::test]
     async fn the_transport_admits_paired_endpoints_and_anyone_only_while_pairing() {

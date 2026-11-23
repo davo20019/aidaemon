@@ -7790,6 +7790,35 @@
       ],
       "type": "object"
     },
+    "SocketSignIn": {
+      "description": "A device's sign-in carried by its socket upgrade\n([`SOCKET_SIGN_IN_HEADER`], protocol 1.48). In place of a challenge the\ndaemon picked, it signs its own time and a random value, so the daemon\ntakes each proof once, only while it is fresh, and only for itself and\nthe endpoint key the transport says the upgrade came from\n([`socket_sign_in_message`]).",
+      "properties": {
+        "device_id": {
+          "type": "string"
+        },
+        "issued_at_ms": {
+          "description": "The device's clock, milliseconds since the Unix epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nonce": {
+          "description": "32 to 64 random hex digits, never used twice.",
+          "type": "string"
+        },
+        "signature": {
+          "description": "The signature of [`socket_sign_in_message`] as `r || s` (64 bytes),\nbase64url.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id",
+        "issued_at_ms",
+        "nonce",
+        "signature"
+      ],
+      "type": "object"
+    },
     "StepState": {
       "enum": [
         "started",
