@@ -14,6 +14,17 @@ use crate::store::{
 use crate::ui::{self, Glyph, Size, Tone, Variant, btn, colors, section_label, type_scale};
 
 pub fn inspector(store: Store) -> View {
+    view().w_full().flex_1().child(dynamic(move || {
+        // A run's view, opened from its row, takes the pane until closed.
+        let run = store.open_run_id();
+        Some(untracked(move || match run {
+            Some(id) => super::run_view::run_view(store, id),
+            None => tabs(store),
+        }))
+    }))
+}
+
+fn tabs(store: Store) -> View {
     let coding = computed(move || store.coding_on_screen());
     view()
         .w_full()

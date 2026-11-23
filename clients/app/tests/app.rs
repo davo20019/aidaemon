@@ -761,6 +761,42 @@ fn a_background_run_shows_its_step_and_its_end() -> Result<(), String> {
     Ok(())
 }
 
+/// Agents one request started together sit under one heading; the drawer
+/// lists what runs now and counts a conversation's agents; a run's row
+/// opens what it did, step by step.
+#[test]
+fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-pair","channel":"app","title":"Truncate the synthetic slugs","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-a","session_id":"app:synthetic-pair","label":"Truncate on branch a","agent":"Claude Code","phase":"running","background":true,"step":"Editing slug.py","started_at_ms":9999999950000,"group":"task-1"},{"id":"cli-agent-b","session_id":"app:synthetic-pair","label":"Truncate on branch b","agent":"Codex","phase":"running","background":true,"step":"Running pytest","started_at_ms":9999999950000,"group":"task-1"}]}}"#,
+        ),
+    ]);
+    settle(&mut app)?;
+    app.wait_for("text:Running now")?;
+    app.wait_for("text:2 agents")?;
+    app.press("Truncate the synthetic slugs >> nth=0")?;
+    app.wait_for("text:2 agents working together")?;
+    feed([frame(
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-a","session_id":"app:synthetic-pair","label":"Truncate on branch a","agent":"Claude Code","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-1","edited":["/w/synthetic/slug.py","/w/synthetic/test_slug.py"]}}}"#,
+    )]);
+    app.wait_for("text:2 agents working together · 1 done")?;
+    app.wait_for("text:Claude Code · Finished · changed 2 files")?;
+    app.press("Claude Code · Finished · changed 2 files, show its steps")?;
+    let id = wait_sent("get_run")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-a","task":"Add truncate_slug on branch a","steps":[{{"words":"Editing slug.py","state":"done"}},{{"words":"Running pytest","state":"failed"}}],"permissions":[{{"label":"write: /w/synthetic/slug.py","outcome":"allowed"}}]}}}}}}"#
+    ))]);
+    app.wait_for("text:Add truncate_slug on branch a")?;
+    app.wait_for("text:write: /w/synthetic/slug.py · allowed")?;
+    app.press("Back")?;
+    app.wait_for("text:2 agents working together · 1 done")?;
+    Ok(())
+}
+
 #[test]
 fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());

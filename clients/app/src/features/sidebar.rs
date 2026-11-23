@@ -465,6 +465,7 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
     view()
         .gap(px(1.0))
         .child(group(store, "Needs you", needs))
+        .child(running_now(store))
         .child(group(store, "Pinned", pinned))
         .child(section_label("Projects"))
         .child(when(
@@ -1340,7 +1341,31 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         let at = date_id.clone();
         Some(untracked(move || match state {
             RowState::NeedsYou => ui::badge_dot("Needs you", Tone::Warning),
-            RowState::Working => ui::spinner("Working"),
+            RowState::Working => {
+                // Its coding agents, counted, beside the ring.
+                let id = at.clone();
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(when(
+                        {
+                            let id = id.clone();
+                            move || store.agents_running(&id) > 0
+                        },
+                        move || {
+                            let id = id.clone();
+                            text(move || match store.agents_running(&id) {
+                                1 => "1 agent".to_string(),
+                                n => format!("{n} agents"),
+                            })
+                            .number_of_lines(1)
+                            .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                            .text_color(colors::FAINT)
+                        },
+                    ))
+                    .child(ui::spinner("Working"))
+            }
             RowState::WasWorking => ui::spinner_stale("Was working when the connection dropped"),
             RowState::Quiet => view().child(when(dated, move || {
                 let at = at.clone();
@@ -1647,6 +1672,74 @@ fn pages(store: Store) -> View {
 }
 
 /// A titled group of conversations, shown only when it has any.
+/// What runs now, anywhere, while anything does: a line per run (its
+/// agent or name, its conversation, how long), opening its conversation.
+/// What each is doing step by step is in the conversation, not here.
+fn running_now(store: Store) -> View {
+    let runs = computed(move || store.running_runs());
+    view()
+        .gap(px(1.0))
+        .child(when(
+            move || !runs.with(Vec::is_empty),
+            || section_label("Running now"),
+        ))
+        .child(each(
+            runs,
+            |run| run.id.clone(),
+            move |run, _| {
+                let session = run.with_untracked(|r| r.session_id.clone());
+                let lit = session.clone();
+                let name = computed(move || {
+                    run.with(|r| r.agent.clone().unwrap_or_else(|| r.label.clone()))
+                });
+                let place = computed(move || run.with(|r| store.title(&r.session_id)));
+                row(
+                    move || {
+                        store.page() == Page::Conversation
+                            && store.selected().as_deref() == Some(lit.as_str())
+                    },
+                    move || {
+                        let session = session.clone();
+                        store.leave_drawer(move || store.select(Some(session)))
+                    },
+                )
+                .accessibility_label(move || {
+                    Some(SharedString::from(format!(
+                        "{}, running in {}",
+                        name.get(),
+                        place.get()
+                    )))
+                })
+                .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
+                .child(
+                    text(move || name.get())
+                        .number_of_lines(1)
+                        .text_size(px(ui::fit::body()))
+                        .text_color(colors::TEXT),
+                )
+                .child(
+                    text(move || place.get())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                        .text_color(colors::FAINT),
+                )
+                .child(
+                    text(move || {
+                        store.tick();
+                        run.with(|r| {
+                            ui::time::span(now_ms().saturating_sub(r.started_at_ms) / 1000)
+                        })
+                    })
+                    .tabular_nums()
+                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                    .text_color(colors::FAINT),
+                )
+            },
+        ))
+}
+
 fn group(store: Store, title: &'static str, ids: Memo<Vec<String>>) -> View {
     view()
         .gap(px(1.0))

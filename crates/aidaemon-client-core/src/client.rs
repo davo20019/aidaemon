@@ -386,6 +386,11 @@ pub struct Client {
     memories_request: Option<String>,
     pub automations: Read<Vec<AutomationSummary>>,
     automations_request: Option<String>,
+    /// The run the owner opened, and what its record says
+    /// ([`Self::open_run`]).
+    pub run_view: Read<aidaemon_client_protocol::RunDetail>,
+    run_view_of: Option<String>,
+    run_view_request: Option<String>,
     /// The automation a change was sent for and not answered yet.
     pub automation_busy: Option<String>,
     pub search: SearchRead,
@@ -628,6 +633,18 @@ impl Client {
             self.live_request = None;
             effects.push(Effect::CloseLive);
         }
+        // An open run's record is read again as it moves.
+        if let ServerFrame::Event {
+            event: Event::RunUpdated { run: aidaemon_client_protocol::RunSummary { id, .. } }
+                | Event::RunStep { run_id: id, .. },
+            ..
+        } = &frame
+            && self.run_view_of.as_deref() == Some(id.as_str())
+            && self.run_view_request.is_none()
+        {
+            let run_id = id.clone();
+            self.run_view_request = Some(self.send(Command::GetRun { run_id }));
+        }
         self.state.apply(frame);
         if let Some(request) = self.state.take_view_request() {
             effects.push(Effect::View(request));
@@ -842,6 +859,26 @@ impl Client {
                     out.push(Effect::Say(error.message.clone()));
                 } else {
                     self.automations = Read::Failed(error.message.clone());
+                }
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Run { run },
+            } if mine(&self.run_view_request, request_id) => {
+                self.run_view_request = None;
+                if self.run_view_of.as_deref() == Some(run.run_id.as_str()) {
+                    self.run_view = Read::Ready(run.clone());
+                }
+                return true;
+            }
+            ServerFrame::Error {
+                request_id: Some(request_id),
+                error,
+            } if mine(&self.run_view_request, request_id) => {
+                self.run_view_request = None;
+                if !self.run_view.is_ready() {
+                    self.run_view = Read::Failed(error.message.clone());
                 }
                 return true;
             }
@@ -1245,6 +1282,29 @@ impl Client {
                 .map(|d| d.input_tokens + d.output_tokens)
                 .sum(),
         )
+    }
+
+    /// Open run `run_id`'s view: its record is read now and again each time
+    /// the run moves, until [`Self::close_run`].
+    pub fn open_run(&mut self, run_id: &str) {
+        if self.run_view_of.as_deref() != Some(run_id) {
+            self.run_view = Read::Loading;
+            self.run_view_of = Some(run_id.to_string());
+        }
+        self.run_view_request = Some(self.send(Command::GetRun {
+            run_id: run_id.to_string(),
+        }));
+    }
+
+    pub fn close_run(&mut self) {
+        self.run_view_of = None;
+        self.run_view_request = None;
+        self.run_view = Read::NotYet;
+    }
+
+    /// The run whose view is open.
+    pub fn open_run_id(&self) -> Option<&str> {
+        self.run_view_of.as_deref()
     }
 
     pub fn refresh_automations(&mut self) {
@@ -3232,6 +3292,33 @@ mod tests {
             client.finished.as_ref().map(|(s, _)| s.as_str()),
             Some("app:s1")
         );
+    }
+
+    /// An opened run's record is read, then read again as the run moves;
+    /// once closed, its moves read nothing.
+    #[test]
+    fn an_open_run_is_read_and_read_again_as_it_moves() {
+        let mut client = Client::new();
+        client.update(Update::Connected, &cx(None));
+        client.take_outgoing();
+        client.open_run("cli-agent-1");
+        let sent = client.take_outgoing();
+        assert!(matches!(&sent[..], [(_, Command::GetRun { run_id })] if run_id == "cli-agent-1"));
+        assert!(matches!(client.run_view, Read::Loading));
+        let request = sent[0].0.clone();
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{request}","result":{{"type":"run","run":{{"run_id":"cli-agent-1","task":"Review it","steps":[{{"words":"Running pytest","state":"done"}}]}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert!(matches!(&client.run_view, Read::Ready(run) if run.steps.len() == 1));
+        let step = r#"{"type":"event","seq":9,"at_ms":5,"session_id":"app:s1","event":{"type":"run_step","run_id":"cli-agent-1","session_id":"app:s1","step":"Editing a.py","at_ms":5}}"#;
+        client.update(frame(step), &cx(None));
+        assert!(matches!(&client.take_outgoing()[..], [(_, Command::GetRun { .. })]));
+        client.close_run();
+        client.update(frame(&step.replace(r#""seq":9"#, r#""seq":10"#)), &cx(None));
+        assert!(client.take_outgoing().is_empty());
     }
 
     /// "Send now" goes only to a daemon that knows it: an older one would

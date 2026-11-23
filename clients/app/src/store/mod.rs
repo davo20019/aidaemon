@@ -29,6 +29,8 @@ pub use aidaemon_client_core::client::{
 
 /// The Automations page's list, as last read.
 pub type AutomationsRead = Read<Vec<aidaemon_client_protocol::AutomationSummary>>;
+/// The record of the run whose view is open.
+pub type RunRead = Read<aidaemon_client_protocol::RunDetail>;
 /// The details pane's Changes: a session's uncommitted changes.
 pub type ChangesRead = Read<SessionChanges>;
 /// The details pane's Files: a folder of the project, as last read.
@@ -198,6 +200,8 @@ struct Reads {
     setup_error: Memo<Option<String>>,
     system: Memo<SystemRead>,
     automations: Memo<AutomationsRead>,
+    run_view: Memo<RunRead>,
+    run_view_of: Memo<Option<String>>,
     automation_busy: Memo<Option<String>>,
     memories: Memo<MemoryRead>,
     settings: Memo<SettingsRead>,
@@ -278,6 +282,8 @@ impl Reads {
             setup_error: computed(move || client.with(|c| c.setup_error.clone())),
             system: computed(move || client.with(|c| c.system.clone())),
             automations: computed(move || client.with(|c| c.automations.clone())),
+            run_view: computed(move || client.with(|c| c.run_view.clone())),
+            run_view_of: computed(move || client.with(|c| c.open_run_id().map(str::to_string))),
             automation_busy: computed(move || client.with(|c| c.automation_busy.clone())),
             memories: computed(move || client.with(|c| c.memories.clone())),
             settings: computed(move || client.with(|c| c.settings.clone())),
@@ -2754,8 +2760,13 @@ impl Store {
     }
 
     /// A turn runs, or work it handed to the background does.
+    /// Its turn runs, work it handed off runs, or a run of its runs.
     pub fn is_working(&self, id: &str) -> bool {
         self.row(id, |r| r.running || r.background)
+            || self.reads.runs.with(|runs| {
+                runs.iter()
+                    .any(|run| run.session_id == id && run.phase.is_running())
+            })
     }
 
     pub fn in_background(&self, id: &str) -> bool {
@@ -2829,6 +2840,8 @@ impl Store {
         self.page.set(Page::Conversation);
         if let Some(id) = &id {
             self.act(|c| {
+                // A run view belongs to its conversation.
+                c.close_run();
                 c.seen(id);
                 c.load_history(id);
             });
@@ -3104,6 +3117,56 @@ impl Store {
     /// Stop helper run `run` from its row.
     pub fn stop_run(&self, run: &str) {
         self.act(|c| c.stop_run(run));
+    }
+
+    /// Open run `run`'s view in the details pane: what it did, step by
+    /// step, from its record (a phone opens the pane over the chat).
+    pub fn open_run(&self, run: &str) {
+        self.act(|c| c.open_run(run));
+        if self.compact.get_untracked() {
+            self.sidebar.set(false);
+        }
+        self.inspector.set(true);
+    }
+
+    /// Close the run view: the details pane shows its tabs again.
+    pub fn close_run(&self) {
+        self.act(Client::close_run);
+    }
+
+    /// The run whose view is open.
+    pub fn open_run_id(&self) -> Option<String> {
+        self.reads.run_view_of.get()
+    }
+
+    pub fn run_view(&self) -> RunRead {
+        self.reads.run_view.get()
+    }
+
+    /// Every run the app knows, oldest first.
+    pub fn all_runs(&self) -> Vec<RunSummary> {
+        self.reads.runs.get()
+    }
+
+    /// Every run running now, in any conversation, oldest first.
+    pub fn running_runs(&self) -> Vec<RunSummary> {
+        self.reads
+            .runs
+            .get()
+            .into_iter()
+            .filter(|run| run.phase.is_running())
+            .collect()
+    }
+
+    /// How many coding agents are running for conversation `session`.
+    pub fn agents_running(&self, session: &str) -> usize {
+        self.reads.runs.with(|runs| {
+            runs.iter()
+                .filter(|run| {
+                    run.session_id == session && run.phase.is_running() && run.agent.is_some()
+                })
+                .count()
+        })
     }
 
     // ----- Naming, archiving, undoing, waiting messages ------------------

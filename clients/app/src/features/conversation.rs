@@ -198,97 +198,231 @@ fn running_work(store: Store, session: Option<String>) -> View {
         ))
 }
 
-/// One row per run: its state, name and step, its time, and Stop while it
-/// runs. Every word comes from the run's record.
-fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
-    view().items_center().px_4().gap_1().child(each(
-        runs,
-        |run| run.id.clone(),
-        move |run, _| {
-            let id = run.with_untracked(|r| r.id.clone());
-            // A run its turn waits on is stopped by the turn's own Stop (the
-            // composer's); only work that outlives its turn has its own.
-            let stoppable = computed(move || run.with(|r| r.phase.is_running() && r.background));
-            let line = computed(move || {
-                run.with(|r| {
-                    let state = match r.phase {
-                        RunPhase::Running if r.step.is_empty() => String::new(),
-                        RunPhase::Running => r.step.clone(),
-                        RunPhase::Succeeded => "Finished".into(),
-                        RunPhase::Failed => match &r.reason {
-                            Some(why) => format!("Failed: {why}"),
-                            None => "Failed".into(),
-                        },
-                        RunPhase::Stopped if r.stopped_by_owner => "Stopped by you".into(),
-                        RunPhase::Stopped => match &r.reason {
-                            Some(why) => format!("Stopped: {why}"),
-                            None => "Stopped".into(),
-                        },
-                        RunPhase::Unknown => String::new(),
-                    };
-                    // A coding agent's run names the agent, then what it is
-                    // doing (its task's title until its first step).
-                    let name = r.agent.clone().unwrap_or_else(|| r.label.clone());
-                    let state = if state.is_empty() && r.agent.is_some() {
-                        r.label.clone()
-                    } else {
-                        state
-                    };
-                    if state.is_empty() {
-                        name
-                    } else {
-                        format!("{name} · {state}")
-                    }
-                })
+/// A row of the running work: a group's heading, or one run.
+#[derive(Clone, PartialEq)]
+enum WorkRow {
+    /// Runs one request started together (`RunSummary.group`), when there
+    /// are two or more: how many, and how many ended.
+    Group {
+        key: String,
+        total: usize,
+        ended: usize,
+    },
+    /// A run; `grouped`: it sits under its group's heading.
+    Run { run: Box<RunSummary>, grouped: bool },
+}
+
+impl WorkRow {
+    fn key(&self) -> String {
+        match self {
+            Self::Group { key, .. } => format!("group:{key}"),
+            Self::Run { run, .. } => run.id.clone(),
+        }
+    }
+}
+
+/// The runs in order, each group of two or more under its heading.
+fn work_rows(runs: &[RunSummary]) -> Vec<WorkRow> {
+    let mut rows = Vec::new();
+    let mut headed = std::collections::HashSet::new();
+    for run in runs {
+        if let Some(group) = run.group.as_deref()
+            && headed.insert(group.to_string())
+        {
+            let members: Vec<_> = runs
+                .iter()
+                .filter(|other| other.group.as_deref() == Some(group))
+                .collect();
+            if members.len() > 1 {
+                rows.push(WorkRow::Group {
+                    key: group.to_string(),
+                    total: members.len(),
+                    ended: members.iter().filter(|m| !m.phase.is_running()).count(),
+                });
+                rows.extend(members.into_iter().map(|run| WorkRow::Run {
+                    run: Box::new(run.clone()),
+                    grouped: true,
+                }));
+                continue;
+            }
+        }
+        if !rows
+            .iter()
+            .any(|row| matches!(row, WorkRow::Run { run: r, .. } if r.id == run.id))
+        {
+            rows.push(WorkRow::Run {
+                run: Box::new(run.clone()),
+                grouped: false,
             });
-            let color = move || {
-                run.with(|r| match r.phase {
-                    RunPhase::Running | RunPhase::Unknown => colors::MUTED,
-                    RunPhase::Succeeded => colors::SUCCESS,
-                    RunPhase::Failed => colors::DANGER,
-                    RunPhase::Stopped => colors::WARNING,
+        }
+    }
+    rows
+}
+
+/// A group's heading: "2 agents working together · 1 done".
+fn group_line(total: usize, ended: usize) -> String {
+    if ended == total {
+        format!("{total} agents · all done")
+    } else if ended == 0 {
+        format!("{total} agents working together")
+    } else {
+        format!("{total} agents working together · {ended} done")
+    }
+}
+
+/// A run's line: the agent (or its name), then what it is doing or how it
+/// ended. Every word comes from the run's record.
+fn run_line(r: &RunSummary) -> String {
+    let state = match r.phase {
+        RunPhase::Running if r.step.is_empty() => String::new(),
+        RunPhase::Running => r.step.clone(),
+        RunPhase::Succeeded => match r.edited.len() {
+            0 => "Finished".into(),
+            1 => format!("Finished · changed {}", file_name(&r.edited[0])),
+            n => format!("Finished · changed {n} files"),
+        },
+        RunPhase::Failed => match &r.reason {
+            Some(why) => format!("Failed: {why}"),
+            None => "Failed".into(),
+        },
+        RunPhase::Stopped if r.stopped_by_owner => "Stopped by you".into(),
+        RunPhase::Stopped => match &r.reason {
+            Some(why) => format!("Stopped: {why}"),
+            None => "Stopped".into(),
+        },
+        RunPhase::Unknown => String::new(),
+    };
+    // A coding agent's run names the agent, then what it is doing (its
+    // task's title until its first step).
+    let name = r.agent.clone().unwrap_or_else(|| r.label.clone());
+    let state = if state.is_empty() && r.agent.is_some() {
+        r.label.clone()
+    } else {
+        state
+    };
+    if state.is_empty() {
+        name
+    } else {
+        format!("{name} · {state}")
+    }
+}
+
+/// A path's last part.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// The running work, a row per run (runs one request started together
+/// under one heading): its state, name and step, its time, and Stop while
+/// it runs. A run's row opens its view: what it did, step by step.
+fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
+    let rows = computed(move || runs.with(|runs| work_rows(runs)));
+    view()
+        .items_center()
+        .px_4()
+        .gap_1()
+        .child(each(rows, WorkRow::key, move |row, _| {
+            match row.get_untracked() {
+                WorkRow::Group { .. } => view().w_full().max_w(px(size::COLUMN)).pl_1().child(
+                    text(move || match row.get() {
+                        WorkRow::Group { total, ended, .. } => group_line(total, ended),
+                        WorkRow::Run { .. } => String::new(),
+                    })
+                    .number_of_lines(1)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                ),
+                WorkRow::Run { run, grouped } => run_row(store, run.id, row, grouped),
+            }
+        }))
+}
+
+fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) -> View {
+    let run = computed(move || match row.get() {
+        WorkRow::Run { run, .. } => Some(*run),
+        WorkRow::Group { .. } => None,
+    });
+    // A run its turn waits on is stopped by the turn's own Stop (the
+    // composer's); only work that outlives its turn has its own.
+    let stoppable = computed(move || {
+        run.with(|r| {
+            r.as_ref()
+                .is_some_and(|r| r.phase.is_running() && r.background)
+        })
+    });
+    let line = computed(move || run.with(|r| r.as_ref().map(run_line).unwrap_or_default()));
+    let color = move || {
+        run.with(|r| match r.as_ref().map(|r| r.phase) {
+            Some(RunPhase::Succeeded) => colors::SUCCESS,
+            Some(RunPhase::Failed) => colors::DANGER,
+            Some(RunPhase::Stopped) => colors::WARNING,
+            _ => colors::MUTED,
+        })
+    };
+    let open = id.clone();
+    view()
+        .w_full()
+        .max_w(px(size::COLUMN))
+        .flex_row()
+        .items_center()
+        .gap_2()
+        // A run of a group sits under its heading.
+        .pl(px(if grouped { 12.0 } else { 4.0 }))
+        .child(
+            button()
+                .flex_1()
+                .min_w(px(0.0))
+                .accessibility_label(move || {
+                    Some(SharedString::from(format!(
+                        "{}, show its steps",
+                        line.get()
+                    )))
                 })
-            };
-            view()
-                .w_full()
-                .max_w(px(size::COLUMN))
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .pl_1()
-                .child(ui::icon(Glyph::Work).text_color(color))
+                .on_press(move || store.open_run(&open))
                 .child(
-                    text(move || line.get())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .number_of_lines(1)
-                        .text_size(px(ui::fit::small()))
-                        .text_color(colors::MUTED),
-                )
-                // How long it has run (a clock tick a second), or took once
-                // it ended: a short span, from its start and end times.
-                .child(
-                    text(move || {
-                        store.tick();
-                        run.with(|r| {
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::icon(Glyph::Work).text_color(color))
+                        .child(
+                            text(move || line.get())
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::small()))
+                                .text_color(colors::MUTED),
+                        ),
+                ),
+        )
+        // How long it has run (a clock tick a second), or took once it
+        // ended: a short span, from its start and end times.
+        .child(
+            text(move || {
+                store.tick();
+                run.with(|r| {
+                    r.as_ref()
+                        .map(|r| {
                             let end = r.ended_at_ms.unwrap_or_else(crate::store::now_ms);
                             ui::time::span(end.saturating_sub(r.started_at_ms) / 1000)
                         })
-                    })
-                    .number_of_lines(1)
-                    .tabular_nums()
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                )
-                .child(when(
-                    move || stoppable.get(),
-                    move || {
-                        let id = id.clone();
-                        ui::btn("Stop", Variant::Ghost, Size::Sm, move || store.stop_run(&id))
-                    },
-                ))
-        },
-    ))
+                        .unwrap_or_default()
+                })
+            })
+            .number_of_lines(1)
+            .tabular_nums()
+            .text_size(px(type_scale::XS))
+            .text_color(colors::FAINT),
+        )
+        .child(when(
+            move || stoppable.get(),
+            move || {
+                let id = id.clone();
+                ui::btn("Stop", Variant::Ghost, Size::Sm, move || {
+                    store.stop_run(&id)
+                })
+            },
+        ))
 }
 
 /// An older daemon's background work: its task list.

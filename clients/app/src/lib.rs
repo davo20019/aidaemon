@@ -128,6 +128,7 @@ pub fn Offline() -> impl IntoElement {
             "list_devices",
             "get_system",
             "cancel_task",
+            "get_run",
         ] {
             if let Some(id) = store.queued_id(kind)
                 && let Ok(mut sent) = SENT.lock()
