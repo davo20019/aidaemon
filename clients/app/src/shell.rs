@@ -80,6 +80,11 @@ pub fn shell(store: Store) -> View {
                 palette.set(false);
                 return;
             }
+            // A narrow window's drawer is what is open over the page.
+            if store.is_compact_untracked() && store.pane_open_untracked() {
+                store.close_panes();
+                return;
+            }
             if let Some(id) = store.selected()
                 && store.is_running(&id)
             {

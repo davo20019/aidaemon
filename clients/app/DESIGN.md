@@ -53,7 +53,7 @@ Tokens: `FAST` 120 ms (hover and colour), `BASE` 180 ms (press, toggle), `ENTER`
 | Inspector, sidebar | Panes fold at narrow widths | Hidden by style, state kept |
 | Inspector, sidebar | Owner drags the line between panes | `split` (resizable panels; sidebar 200–420, inspector 260–1100, room for a terminal or the agent's browser) |
 | All | A page replaces another (conversation, Settings, Memory, System) | `motion::next_layout`: fade, `BASE` |
-| Phone | Sidebar or inspector opens or closes | `ui::drawer` (nsh-base Sheet): slides in from its own edge (sidebar left, inspector right) over a dimmed page (`SCRIM`), back out on close; a tap on the dimmed page, Escape or back closes it; in place with reduced motion |
+| Phone | Sidebar or inspector opens or closes | `ui::drawer`: slides in from its own edge (sidebar left, inspector right) over a dimmed page (`SCRIM`), ease-out in `ENTER` (260 ms), and back out ease-out in `DRAWER_OUT` (220 ms), settling at the edge; a tap on the dimmed page, Escape or back closes it; in place with reduced motion. Its content is made once and stays mounted out of sight (`invisible`), so neither opening nor the end of closing builds or tears down the conversation list. A choice in it that leaves it (`Store::leave_drawer`) changes the page two frames after it has gone |
 | Desktop | Sidebar or inspector toggles | At once: the resizable group keeps measured widths, so it is not animated |
 | Conversation, Settings | A reply's tool line, a tool's details, more options, sections unfold | `ui::unfold` / accordion `reveal`: a clipped height springs open and shut, what is below moves with it; nothing fades or overlaps |
 | Sidebar | Row menu opens and closes | Grows from where it was asked for (`opacity-0 scale-95`), `BASE` |

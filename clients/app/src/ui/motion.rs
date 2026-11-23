@@ -10,6 +10,10 @@ pub const BASE: f32 = 180.0;
 /// Arriving rows, panels opening.
 pub const ENTER: f32 = 260.0;
 
+/// A narrow window's drawer sliding out: settling, so it eases to the
+/// edge rather than leaving at full speed.
+pub const DRAWER_OUT: f32 = 220.0;
+
 /// The scale a pressed button settles to.
 pub const PRESS_SCALE: f32 = 0.97;
 /// The scale a pressed icon button settles to.

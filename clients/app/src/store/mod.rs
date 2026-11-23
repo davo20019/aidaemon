@@ -2596,6 +2596,15 @@ impl Store {
         self.compact.get()
     }
 
+    pub fn is_compact_untracked(&self) -> bool {
+        self.compact.get_untracked()
+    }
+
+    /// Whether a pane (the sidebar or the details) is open.
+    pub fn pane_open_untracked(&self) -> bool {
+        untracked(|| self.sidebar_open() || self.details_open())
+    }
+
     /// The window became narrow (or wide again). Narrow starts on the
     /// conversation, with both panes closed.
     pub fn set_compact(&self, compact: bool) {

@@ -997,36 +997,133 @@ fn note_body(
 
 /// A pane at an edge of a narrow window: it slides in from `side` over the
 /// page, which dims behind it, and back out (in place when the owner asked
-/// for less motion). A press on the dimmed page, Escape or the back button
-/// close it (`close`); `gone` hears it once it has slid out. Its content's
-/// own heading names it.
+/// for less motion). A press on the dimmed page or the back button close
+/// it (`close`); `gone` hears it once it has slid out. Its content's own
+/// heading names it.
+///
+/// Its content is made once and stays: closed, the drawer is only out of
+/// sight (laid out, taking no presses). Making a long list of
+/// conversations on each opening, and taking it down as the slide ended,
+/// held the slide's first and last frames on a phone.
 pub fn drawer(
     side: Placement,
     open: impl Fn() -> bool + 'static,
     close: impl Fn() + 'static,
     gone: impl Fn() + 'static,
     content: impl IntoElement,
-) -> nsh_base::SheetElement {
-    sheet()
-        .side(side)
-        .open(move || Some(open()))
-        .on_open_change(move |event: &nsh_base::SheetEvent| {
-            if let nsh_base::SheetEvent::OpenChange(false, _) = event {
+) -> Overlay {
+    let open = computed(open);
+    let close = std::rc::Rc::new(close);
+    let left = side != Placement::Right;
+    // The panel's width as last laid out, and how far it goes to be out
+    // of sight (its shadow too).
+    let width = stored(window().width.0);
+    let away = move || {
+        let w = width.get() + 32.0;
+        if left { -w } else { w }
+    };
+    let x = animated_value(away());
+    let fade = animated_value(0.0);
+    // In sight: from the opening until the slide out is over.
+    let shown = signal(false);
+    let motion_id = stored(0_u64);
+    effect(move || {
+        let open = open.get();
+        untracked(|| {
+            let id = motion_id.with(|n| {
+                *n += 1;
+                *n
+            });
+            if open {
+                shown.set(true);
+                if reduce_motion() {
+                    x.set(0.0);
+                    fade.set(1.0);
+                } else {
+                    x.timing(0.0, motion::ENTER, Easing::EaseOut);
+                    fade.timing(1.0, motion::ENTER, Easing::EaseOut);
+                }
+                return;
+            }
+            if !shown.get_untracked() {
+                return;
+            }
+            if reduce_motion() {
+                x.set(away());
+                fade.set(0.0);
+                shown.set(false);
+                return;
+            }
+            let end = x.timing(away(), motion::DRAWER_OUT, Easing::EaseOut);
+            fade.timing(0.0, motion::DRAWER_OUT, Easing::EaseOut);
+            let out = move || {
+                if motion_id.get() == id && shown.get_untracked() {
+                    shown.set(false);
+                }
+            };
+            spawn(async move {
+                if end.await {
+                    out();
+                }
+            });
+            // Or after its time, whether or not its end is reported.
+            set_timeout(Duration::from_millis(motion::DRAWER_OUT as u64 + 50), out);
+        });
+    });
+    // Gone once out of sight (not on the first run: it starts closed).
+    let was_shown = stored(false);
+    effect(move || {
+        let now_shown = shown.get();
+        if was_shown.replace(now_shown) && !now_shown {
+            untracked(&gone);
+        }
+    });
+    {
+        let close = close.clone();
+        on_back_press(move || {
+            if open.get_untracked() {
                 close();
+                true
+            } else {
+                false
+            }
+        });
+    }
+    let panel = view()
+        .test_id("drawer")
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .style_when(left, |s| s.left_0())
+        .style_when(!left, |s| s.right_0())
+        .py_safe_area()
+        .w(percentage(0.86))
+        .max_w(px(380.0))
+        .bg(colors::SIDEBAR)
+        .shadow_lg()
+        .bind_translate_x(&x)
+        .on_layout(move |frame: &Bounds<Points>| {
+            width.replace(frame.size.width.0);
+            // Out of sight, it stays as far as its new width.
+            if !shown.get_untracked() {
+                x.set(away());
             }
         })
-        // All gone, its slide out done: the page takes the focus again.
-        .on_close(gone)
-        .popup_style(|s| {
-            s.h_full()
-                .py_safe_area()
-                .w(percentage(0.86))
-                .max_w(px(380.0))
-                .bg(colors::SIDEBAR)
-                .shadow_lg()
-        })
-        .backdrop_style(|s| s.bg(colors::SCRIM))
-        .child(content)
+        .child(content);
+    overlay()
+        .absolute()
+        .inset_0()
+        .style_when(move || !shown.get(), |s| s.invisible())
+        .child(
+            view()
+                .absolute()
+                .inset_0()
+                .bg(colors::SCRIM)
+                .bind_opacity(&fade)
+                .focusable(false)
+                .on_press(move || close()),
+        )
+        .child(panel)
 }
 
 /// Side-by-side panes the owner resizes by dragging the line between them.
