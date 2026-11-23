@@ -246,6 +246,8 @@ mod tests {
             id: id.into(),
             view,
             running_for: Duration::from_secs(10),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
             this_request,
         }
     }

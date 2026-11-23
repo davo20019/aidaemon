@@ -1,0 +1,12 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "at_ms": 1767225660000,
+    "run_id": "run-3f2a",
+    "session_id": "app:6c1f",
+    "step": "Running a command",
+    "type": "run_step"
+  },
+  "session_id": "app:6c1f",
+  "type": "event"
+}

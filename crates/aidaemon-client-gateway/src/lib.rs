@@ -2374,8 +2374,33 @@ impl ClientGateway {
                     .shell_desk()
                     .map(|desk| desk.list())
                     .unwrap_or_default(),
+                runs: self.runs().await,
             },
         )
+    }
+
+    /// The helper runs of every session that ran a turn this boot, running
+    /// or ended and still on record, oldest first.
+    async fn runs(&self) -> Vec<aidaemon_client_protocol::RunSummary> {
+        let sessions: Vec<String> = self
+            .active
+            .lock()
+            .map(|active| active.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut runs = Vec::new();
+        for session_id in sessions {
+            for run in self.turns.agent.chat_runs(&session_id).await.runs {
+                runs.push(observer::run_summary(
+                    &session_id,
+                    &run.id,
+                    &run.view,
+                    run.started_at,
+                    run.ended_at,
+                ));
+            }
+        }
+        runs.sort_by_key(|run| run.started_at_ms);
+        runs
     }
 
     /// Turns running now, oldest first, as far as each has got.

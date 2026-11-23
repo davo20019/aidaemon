@@ -337,6 +337,25 @@ pub trait TurnObserver: Send + Sync {
     /// One of the turn's status updates, as the surface gets it.
     fn turn_status(&self, session_id: &str, turn: u64, update: &StatusUpdate);
     fn turn_finished(&self, turn: &TurnFinish<'_>);
+    /// A helper run (sub-agent, launched coding agent, background command)
+    /// started, took a step or ended, from the runtime's record of it. Its
+    /// updates go on after the turn that started it is over.
+    fn run_changed(&self, _change: &RunChange) {}
+}
+
+/// A helper run as its record stands after a change, for a
+/// [`TurnObserver`].
+#[derive(Debug, Clone)]
+pub struct RunChange {
+    /// The conversation it reports to.
+    pub session_id: String,
+    /// The run's id: the key every surface finds it by.
+    pub id: String,
+    pub view: aidaemon_core::card::HelperView,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Only its current step changed: it started or ended earlier.
+    pub step_only: bool,
 }
 
 /// Where a runner reports its turns: empty until an observer is set, which
@@ -1606,6 +1625,8 @@ mod tests {
                             )),
                         ),
                         running_for: Duration::from_secs(60),
+                        started_at: chrono::Utc::now(),
+                        ended_at: None,
                         this_request: false,
                     })
                 })

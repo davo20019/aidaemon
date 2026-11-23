@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use aidaemon_client_protocol::{
     Approval, AttachmentRef, CommandResult, ErrorCode, Event, Feature, HistoryMessage,
-    ProjectSummary, ServedBy, ServerFrame, SessionSummary, SetupState, ShellInfo, Snapshot,
-    SurfaceInfo, TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
+    ProjectSummary, RunSummary, ServedBy, ServerFrame, SessionSummary, SetupState, ShellInfo,
+    Snapshot, SurfaceInfo, TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus, ViewAction,
 };
 
 /// One line of a transcript.
@@ -139,7 +139,15 @@ pub struct State {
     /// `shells`): one per conversation at most.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub shells: BTreeMap<String, ShellInfo>,
+    /// Helper runs, by id (protocol 1.46): sub-agents, launched coding
+    /// agents and background commands, running or recently ended
+    /// ([`MAX_ENDED_RUNS`] ended ones per conversation).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub runs: BTreeMap<String, RunSummary>,
 }
+
+/// How many ended runs a conversation keeps on show.
+pub const MAX_ENDED_RUNS: usize = 5;
 
 /// The agent needs a feature that is off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -242,6 +250,10 @@ impl State {
         }
         for task in state.running_tasks {
             self.tasks.insert(task.id.clone(), task);
+        }
+        self.runs.clear();
+        for run in state.runs {
+            self.put_run(run);
         }
         // What running turns have got to: the working line comes back after
         // a reload or a dropped connection, and later status events find
@@ -607,6 +619,16 @@ impl State {
                     self.tasks.remove(&task.id);
                 }
             }
+            Event::RunUpdated { run } => self.put_run(run),
+            // A step for a run this client never heard start (it joined
+            // late) waits for the run's own record.
+            Event::RunStep { run_id, step, .. } => {
+                if let Some(run) = self.runs.get_mut(&run_id)
+                    && run.phase.is_running()
+                {
+                    run.step = step;
+                }
+            }
             // Kinds this client does not know are ignored.
             Event::ViewAction {
                 action: ViewAction::Unknown,
@@ -628,6 +650,35 @@ impl State {
     /// The oldest approval waiting, which the card shows.
     pub fn next_approval(&self) -> Option<&Approval> {
         self.approvals.values().min_by_key(|a| a.requested_at_ms)
+    }
+
+    /// Keep `run`'s record, and only the newest [`MAX_ENDED_RUNS`] ended
+    /// runs of its conversation.
+    fn put_run(&mut self, run: RunSummary) {
+        let session = run.session_id.clone();
+        self.runs.insert(run.id.clone(), run);
+        let mut ended: Vec<(u64, String)> = self
+            .runs
+            .values()
+            .filter(|run| run.session_id == session && !run.phase.is_running())
+            .map(|run| (run.ended_at_ms.unwrap_or(run.started_at_ms), run.id.clone()))
+            .collect();
+        ended.sort();
+        let excess = ended.len().saturating_sub(MAX_ENDED_RUNS);
+        for (_, id) in ended.into_iter().take(excess) {
+            self.runs.remove(&id);
+        }
+    }
+
+    /// A conversation's runs, oldest first.
+    pub fn runs_for(&self, session_id: &str) -> Vec<&RunSummary> {
+        let mut runs: Vec<&RunSummary> = self
+            .runs
+            .values()
+            .filter(|run| run.session_id == session_id)
+            .collect();
+        runs.sort_by_key(|run| run.started_at_ms);
+        runs
     }
 
     /// Running tasks, oldest first.
@@ -764,6 +815,105 @@ mod tests {
             session_id: Some("app:s1".into()),
             event,
         }
+    }
+
+    fn run(id: &str, phase: aidaemon_client_protocol::RunPhase, at: u64) -> RunSummary {
+        RunSummary {
+            id: id.into(),
+            session_id: "app:s1".into(),
+            label: "Claude Code: synthetic release".into(),
+            phase,
+            background: true,
+            step: String::new(),
+            started_at_ms: at,
+            ended_at_ms: (!phase.is_running()).then_some(at + 1),
+            took: None,
+            reason: None,
+            stopped_by_owner: false,
+        }
+    }
+
+    /// A run is shown from its start, its step follows it while it runs,
+    /// and it stays on show once it ended: the work after a turn is over is
+    /// never silent.
+    #[test]
+    fn a_run_is_followed_from_start_to_end() {
+        use aidaemon_client_protocol::RunPhase;
+        let mut state = State::default();
+        state.apply(event(
+            Some(1),
+            Event::RunUpdated {
+                run: run("r1", RunPhase::Running, 10),
+            },
+        ));
+        state.apply(event(
+            None,
+            Event::RunStep {
+                run_id: "r1".into(),
+                session_id: "app:s1".into(),
+                step: "Running a command".into(),
+                at_ms: 11,
+            },
+        ));
+        assert_eq!(state.runs_for("app:s1")[0].step, "Running a command");
+        // A step for a run never heard of is not invented into one.
+        state.apply(event(
+            None,
+            Event::RunStep {
+                run_id: "unknown".into(),
+                session_id: "app:s1".into(),
+                step: "Running a command".into(),
+                at_ms: 12,
+            },
+        ));
+        assert_eq!(state.runs.len(), 1);
+        state.apply(event(
+            Some(2),
+            Event::RunUpdated {
+                run: run("r1", RunPhase::Succeeded, 10),
+            },
+        ));
+        let runs = state.runs_for("app:s1");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].phase, RunPhase::Succeeded);
+        assert!(runs[0].step.is_empty());
+        // A late step does not bring an ended run back to life.
+        state.apply(event(
+            None,
+            Event::RunStep {
+                run_id: "r1".into(),
+                session_id: "app:s1".into(),
+                step: "Running a command".into(),
+                at_ms: 13,
+            },
+        ));
+        assert!(state.runs_for("app:s1")[0].step.is_empty());
+    }
+
+    /// A conversation keeps only its newest ended runs; running ones always
+    /// stay.
+    #[test]
+    fn only_the_newest_ended_runs_stay() {
+        use aidaemon_client_protocol::RunPhase;
+        let mut state = State::default();
+        state.apply(event(
+            Some(1),
+            Event::RunUpdated {
+                run: run("live", RunPhase::Running, 1),
+            },
+        ));
+        for n in 0..(MAX_ENDED_RUNS as u64 + 3) {
+            state.apply(event(
+                Some(n + 2),
+                Event::RunUpdated {
+                    run: run(&format!("done-{n}"), RunPhase::Failed, 100 + n),
+                },
+            ));
+        }
+        let runs = state.runs_for("app:s1");
+        assert_eq!(runs.len(), MAX_ENDED_RUNS + 1);
+        assert!(runs.iter().any(|run| run.id == "live"));
+        assert!(!runs.iter().any(|run| run.id == "done-0"));
     }
 
     /// A turn that hands its work to the background leaves the

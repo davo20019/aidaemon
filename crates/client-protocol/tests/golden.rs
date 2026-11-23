@@ -196,6 +196,23 @@ fn snapshot() -> Snapshot {
         }],
         surfaces: vec![surface()],
         shells: vec![shell()],
+        runs: vec![run()],
+    }
+}
+
+fn run() -> RunSummary {
+    RunSummary {
+        id: "run-3f2a".into(),
+        session_id: "app:6c1f".into(),
+        label: "Claude Code: prepare the synthetic release".into(),
+        phase: RunPhase::Running,
+        background: true,
+        step: "Running a command".into(),
+        started_at_ms: 1_767_225_600_000,
+        ended_at_ms: None,
+        took: None,
+        reason: None,
+        stopped_by_owner: false,
     }
 }
 
@@ -822,6 +839,16 @@ fn server_samples() -> Vec<ServerFrame> {
             },
         ),
         event(Some(10), Event::TaskUpdated { task: task() }),
+        event(Some(10), Event::RunUpdated { run: run() }),
+        event(
+            None,
+            Event::RunStep {
+                run_id: "run-3f2a".into(),
+                session_id: "app:6c1f".into(),
+                step: "Running a command".into(),
+                at_ms: 1_767_225_660_000,
+            },
+        ),
         event(Some(10), Event::ProjectUpdated { project: project() }),
         event(
             Some(10),

@@ -103,6 +103,8 @@ pub trait ChatWorkControl: TurnHost {
                 running_for: (run.ended_at.unwrap_or(now) - run.started_at)
                     .to_std()
                     .unwrap_or_default(),
+                started_at: run.started_at,
+                ended_at: run.ended_at,
                 this_request: request.is_some() && run.request == request,
             })
             .collect();

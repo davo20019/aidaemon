@@ -3606,6 +3606,54 @@
           "type": "object"
         },
         {
+          "description": "A helper run started or ended (protocol 1.46): a sub-agent, a coding\nagent the daemon launched or a background command, from the daemon's\nown record of the run, so a client shows work that goes on after the\nturn that started it is over.",
+          "properties": {
+            "run": {
+              "$ref": "#/$defs/RunSummary"
+            },
+            "type": {
+              "const": "run_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "run"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ephemeral (protocol 1.46): what a running run is doing now. Sent at\nmost every few seconds per run; its start and end are `run_updated`.",
+          "properties": {
+            "at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "step": {
+              "description": "The step in plain words; empty when it says nothing worth showing.",
+              "type": "string"
+            },
+            "type": {
+              "const": "run_step",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "run_id",
+            "session_id",
+            "at_ms"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A project was created or changed (protocol 1.10).",
           "properties": {
             "project": {
@@ -5644,6 +5692,100 @@
         }
       ]
     },
+    "RunPhase": {
+      "description": "Where a run is (protocol 1.46).",
+      "oneOf": [
+        {
+          "enum": [
+            "running"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "succeeded",
+          "description": "Its own end record says it did the work.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "It ended without doing the work.",
+          "type": "string"
+        },
+        {
+          "const": "stopped",
+          "description": "It ended before the work was done (stopped, cancelled, stalled).",
+          "type": "string"
+        }
+      ]
+    },
+    "RunSummary": {
+      "description": "One helper run as the daemon records it (protocol 1.46): a sub-agent, a\ncoding agent it launched (Claude Code, Codex, ...) or a background\ncommand. Every field comes from the run's typed record, never from what\na model wrote.",
+      "properties": {
+        "background": {
+          "description": "It goes on after the turn that started it ended.",
+          "type": "boolean"
+        },
+        "ended_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable while the daemon runs; the key every update finds it by.",
+          "type": "string"
+        },
+        "label": {
+          "description": "The name the owner reads for it.",
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/RunPhase"
+        },
+        "reason": {
+          "description": "Once it failed or stopped, why, in plain words from its record.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "description": "The conversation it reports to.",
+          "type": "string"
+        },
+        "started_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "step": {
+          "description": "What it is doing now, in plain words; empty when nothing worth\nshowing (or once it ended).",
+          "type": "string"
+        },
+        "stopped_by_owner": {
+          "description": "It ended because the owner stopped it.",
+          "type": "boolean"
+        },
+        "took": {
+          "description": "Once it ended, how long it took, already worded by the daemon.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "session_id",
+        "label",
+        "phase",
+        "background",
+        "started_at_ms"
+      ],
+      "type": "object"
+    },
     "ScheduleInfo": {
       "properties": {
         "description": {
@@ -7272,6 +7414,13 @@
         "running_tasks": {
           "items": {
             "$ref": "#/$defs/TaskSummary"
+          },
+          "type": "array"
+        },
+        "runs": {
+          "description": "Helper runs the daemon still holds a record of, running or recently\nended (protocol 1.46).",
+          "items": {
+            "$ref": "#/$defs/RunSummary"
           },
           "type": "array"
         },

@@ -38,7 +38,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 45;
+pub const PROTOCOL_MINOR: u16 = 46;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2176,6 +2176,23 @@ pub enum Event {
     TaskUpdated {
         task: TaskSummary,
     },
+    /// A helper run started or ended (protocol 1.46): a sub-agent, a coding
+    /// agent the daemon launched or a background command, from the daemon's
+    /// own record of the run, so a client shows work that goes on after the
+    /// turn that started it is over.
+    RunUpdated {
+        run: RunSummary,
+    },
+    /// Ephemeral (protocol 1.46): what a running run is doing now. Sent at
+    /// most every few seconds per run; its start and end are `run_updated`.
+    RunStep {
+        run_id: String,
+        session_id: String,
+        /// The step in plain words; empty when it says nothing worth showing.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        step: String,
+        at_ms: u64,
+    },
     /// A project was created or changed (protocol 1.10).
     ProjectUpdated {
         project: ProjectSummary,
@@ -2259,6 +2276,7 @@ impl Event {
                 | Event::SurfaceClosed { .. }
                 | Event::ShellUpdated { .. }
                 | Event::ShellClosed { .. }
+                | Event::RunStep { .. }
         )
     }
 
@@ -2277,6 +2295,8 @@ impl Event {
             Event::ApprovalRequested { .. } => "approval_requested",
             Event::ApprovalResolved { .. } => "approval_resolved",
             Event::TaskUpdated { .. } => "task_updated",
+            Event::RunUpdated { .. } => "run_updated",
+            Event::RunStep { .. } => "run_step",
             Event::ProjectUpdated { .. } => "project_updated",
             Event::ProjectDeleted { .. } => "project_deleted",
             Event::GoalUpdated { .. } => "goal_updated",
@@ -2863,6 +2883,61 @@ pub struct TaskSummary {
     pub error: Option<String>,
 }
 
+/// One helper run as the daemon records it (protocol 1.46): a sub-agent, a
+/// coding agent it launched (Claude Code, Codex, ...) or a background
+/// command. Every field comes from the run's typed record, never from what
+/// a model wrote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunSummary {
+    /// Stable while the daemon runs; the key every update finds it by.
+    pub id: String,
+    /// The conversation it reports to.
+    pub session_id: String,
+    /// The name the owner reads for it.
+    pub label: String,
+    pub phase: RunPhase,
+    /// It goes on after the turn that started it ended.
+    pub background: bool,
+    /// What it is doing now, in plain words; empty when nothing worth
+    /// showing (or once it ended).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub step: String,
+    pub started_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
+    /// Once it ended, how long it took, already worded by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub took: Option<String>,
+    /// Once it failed or stopped, why, in plain words from its record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// It ended because the owner stopped it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_by_owner: bool,
+}
+
+/// Where a run is (protocol 1.46).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+    Running,
+    /// Its own end record says it did the work.
+    Succeeded,
+    /// It ended without doing the work.
+    Failed,
+    /// It ended before the work was done (stopped, cancelled, stalled).
+    Stopped,
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+impl RunPhase {
+    pub fn is_running(self) -> bool {
+        self == Self::Running
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -2902,6 +2977,10 @@ pub struct Snapshot {
     /// Conversation shells (protocol 1.42, capability `shells`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shells: Vec<ShellInfo>,
+    /// Helper runs the daemon still holds a record of, running or recently
+    /// ended (protocol 1.46).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<RunSummary>,
 }
 
 /// A running turn as far as it has got: the text streamed so far, what it

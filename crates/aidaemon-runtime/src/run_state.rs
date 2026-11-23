@@ -595,7 +595,16 @@ pub struct RunStates {
     runs: Mutex<HashMap<String, Entry>>,
     order: std::sync::atomic::AtomicU64,
     groups: Mutex<HashMap<String, RunGroup>>,
+    /// Where each change to a run is reported (the Client Gateway), once
+    /// one is watching.
+    watch: std::sync::OnceLock<aidaemon_channels::turns::TurnWatch>,
+    /// The step last reported per running run and when, so a run that
+    /// prints a line at a time is reported at most every [`STEP_EVERY`].
+    stepped: Mutex<HashMap<String, (std::time::Instant, String)>>,
 }
+
+/// The least time between two step reports of one run.
+const STEP_EVERY: Duration = Duration::from_secs(2);
 
 /// The runs one turn started, in the order they started, and the ends of
 /// those whose results are ready.
@@ -696,6 +705,20 @@ impl RunStates {
         label: &str,
         on_end: Option<mpsc::UnboundedSender<RunEnded>>,
     ) -> RunState {
+        let state = self.begin_quiet(id, chat, label, on_end);
+        self.report(id, false);
+        state
+    }
+
+    /// [`Self::begin`] without reporting it: its caller reports the record
+    /// once it is complete.
+    fn begin_quiet(
+        &self,
+        id: &str,
+        chat: &str,
+        label: &str,
+        on_end: Option<mpsc::UnboundedSender<RunEnded>>,
+    ) -> RunState {
         let state = RunState {
             id: id.to_string(),
             chat: chat.to_string(),
@@ -743,7 +766,7 @@ impl RunStates {
         started_at: DateTime<Utc>,
         request: Option<&str>,
     ) -> RunState {
-        let mut state = self.begin(id, chat, label, None);
+        let mut state = self.begin_quiet(id, chat, label, None);
         state.background = false;
         state.started_at = started_at;
         state.request = request.map(str::to_string);
@@ -765,7 +788,61 @@ impl RunStates {
         for (_, old) in ended.into_iter().take(excess) {
             runs.remove(&old);
         }
+        drop(runs);
+        self.report(id, false);
         state
+    }
+
+    /// Report everything to `watch` from now on. Set once.
+    pub fn report_to(&self, watch: aidaemon_channels::turns::TurnWatch) {
+        let _ = self.watch.set(watch);
+    }
+
+    /// Tell the watcher, if any, how run `id` stands now. A step alone is
+    /// reported only when it says something new and at most every
+    /// [`STEP_EVERY`]; a start or an end always is. Never called with a
+    /// lock held: the watcher runs inline.
+    fn report(&self, id: &str, step_only: bool) {
+        let Some(observer) = self.watch.get().and_then(|watch| watch.observer()) else {
+            return;
+        };
+        let Some(state) = self.get(id) else {
+            return;
+        };
+        let view = state.view();
+        {
+            let mut stepped = self
+                .stepped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.phase.is_terminal() {
+                stepped.remove(id);
+            } else if step_only {
+                let words = view
+                    .step
+                    .as_ref()
+                    .filter(|step| step.is_shown())
+                    .map(Step::words)
+                    .unwrap_or_default();
+                let now = std::time::Instant::now();
+                match stepped.get(id) {
+                    Some((at, last)) if *last == words || now.duration_since(*at) < STEP_EVERY => {
+                        return;
+                    }
+                    _ => {
+                        stepped.insert(id.to_string(), (now, words));
+                    }
+                }
+            }
+        }
+        observer.run_changed(&aidaemon_channels::turns::RunChange {
+            session_id: state.chat.clone(),
+            id: state.id.clone(),
+            view,
+            started_at: state.started_at,
+            ended_at: state.ended_at,
+            step_only,
+        });
     }
 
     /// Run `id` was started by the chat turn `request` (its task id).
@@ -868,14 +945,20 @@ impl RunStates {
 
     /// The running run's latest step. Ignored once it ended.
     pub fn step(&self, id: &str, step: Step) -> bool {
-        let mut runs = self.lock();
-        match runs.get_mut(id) {
-            Some(entry) if entry.state.phase == RunPhase::Running => {
-                entry.state.step = Some(step);
-                true
+        let stepped = {
+            let mut runs = self.lock();
+            match runs.get_mut(id) {
+                Some(entry) if entry.state.phase == RunPhase::Running => {
+                    entry.state.step = Some(step);
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        };
+        if stepped {
+            self.report(id, true);
         }
+        stepped
     }
 
     /// The chat's kept card when run `id` began: its own card is the first
@@ -923,6 +1006,7 @@ impl RunStates {
             entry.state.failure = end.failure().cloned();
             (entry.state.clone(), entry.on_end.take())
         };
+        self.report(id, false);
         if let Some(on_end) = on_end {
             let _ = on_end.send(RunEnded {
                 state: state.clone(),
@@ -1178,6 +1262,83 @@ mod tests {
             text: "Done.".to_string(),
             untrusted: false,
         }
+    }
+
+    /// Records what it is told about runs.
+    #[derive(Default)]
+    struct Watcher(std::sync::Mutex<Vec<aidaemon_channels::turns::RunChange>>);
+
+    impl aidaemon_channels::turns::TurnObserver for Watcher {
+        fn turn_started(&self, _turn: &aidaemon_channels::turns::TurnStart<'_>) {}
+        fn turn_status(
+            &self,
+            _session_id: &str,
+            _turn: u64,
+            _update: &aidaemon_tools::status::StatusUpdate,
+        ) {
+        }
+        fn turn_finished(&self, _turn: &aidaemon_channels::turns::TurnFinish<'_>) {}
+        fn run_changed(&self, change: &aidaemon_channels::turns::RunChange) {
+            self.0.lock().unwrap().push(change.clone());
+        }
+    }
+
+    /// A watcher hears a run start, its steps (a repeat or a burst of
+    /// output lines only once) and its end, each from the run's record.
+    #[test]
+    fn a_watcher_hears_a_runs_start_steps_and_end() {
+        let runs = RunStates::default();
+        let watch = aidaemon_channels::turns::TurnWatch::default();
+        let watcher = std::sync::Arc::new(Watcher::default());
+        watch.set(watcher.clone());
+        runs.report_to(watch);
+
+        runs.begin("job-1", "chat-a", "Claude Code: release", None);
+        runs.step("job-1", Step::Doing(aidaemon_core::card::ActivityKind::Run));
+        // The same words again, then output lines within the throttle: none
+        // is reported.
+        runs.step("job-1", Step::Doing(aidaemon_core::card::ActivityKind::Run));
+        runs.step("job-1", Step::Output { lines: 1 });
+        runs.step("job-1", Step::Output { lines: 2 });
+        runs.finish(
+            "job-1",
+            RunEnd::Failed(RunFailure::NoCause),
+            measure(),
+            RunEvidence::default(),
+            report(),
+        );
+
+        let heard = watcher.0.lock().unwrap().clone();
+        let seen: Vec<(bool, RunPhase)> = heard
+            .iter()
+            .map(|change| (change.step_only, change.view.phase))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (false, RunPhase::Running),
+                (true, RunPhase::Running),
+                (false, RunPhase::Failed),
+            ]
+        );
+        assert!(heard.iter().all(|change| change.session_id == "chat-a"));
+        assert_eq!(heard[0].view.label, "Claude Code: release");
+        assert!(heard[2].ended_at.is_some());
+    }
+
+    /// A waited-on helper is reported once its record is complete: not as
+    /// a background run first.
+    #[test]
+    fn a_waited_on_helper_is_reported_as_waited_on() {
+        let runs = RunStates::default();
+        let watch = aidaemon_channels::turns::TurnWatch::default();
+        let watcher = std::sync::Arc::new(Watcher::default());
+        watch.set(watcher.clone());
+        runs.report_to(watch);
+        runs.begin_waited("helper:a", "chat", "Research", Utc::now(), Some("task-1"));
+        let heard = watcher.0.lock().unwrap().clone();
+        assert_eq!(heard.len(), 1);
+        assert!(!heard[0].view.background);
     }
 
     fn measure() -> RunMeasure {

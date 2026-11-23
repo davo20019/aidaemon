@@ -9,10 +9,11 @@ use std::sync::{Arc, Mutex};
 use aidaemon_channels::hub::{ChannelCapabilities, HubChannel, MediaKind, MediaMessage};
 use aidaemon_channels::ports::AgentResponseEnvelope;
 use aidaemon_channels::turns::{
-    Delivered, TurnEnd, TurnFinish, TurnObserver, TurnStart, TurnSurface,
+    Delivered, RunChange, TurnEnd, TurnFinish, TurnObserver, TurnStart, TurnSurface,
 };
 use aidaemon_client_protocol::{
-    Event, LiveTurnState, StepState, TaskState, TaskSummary, ToolCallInfo, TurnState, TurnStatus,
+    Event, LiveTurnState, RunPhase, RunSummary, StepState, TaskState, TaskSummary, ToolCallInfo,
+    TurnState, TurnStatus,
 };
 use aidaemon_tools::command_risk::{PermissionMode, RiskLevel};
 use aidaemon_tools::semantics::ApprovalResponse;
@@ -420,6 +421,34 @@ impl TurnObserver for GatewayObserver {
         }
     }
 
+    fn run_changed(&self, change: &RunChange) {
+        let session = Some(change.session_id.clone());
+        if change.step_only {
+            self.publisher.publish(
+                session,
+                Event::RunStep {
+                    run_id: change.id.clone(),
+                    session_id: change.session_id.clone(),
+                    step: step_words(&change.view),
+                    at_ms: now_ms(),
+                },
+            );
+            return;
+        }
+        self.publisher.publish(
+            session,
+            Event::RunUpdated {
+                run: run_summary(
+                    &change.session_id,
+                    &change.id,
+                    &change.view,
+                    change.started_at,
+                    change.ended_at,
+                ),
+            },
+        );
+    }
+
     fn turn_finished(&self, turn: &TurnFinish<'_>) {
         let (description, started) = self
             .running
@@ -468,6 +497,52 @@ impl TurnObserver for GatewayObserver {
             },
         );
     }
+}
+
+/// A run's record as the owner's app reads it. Every field is the
+/// runtime's: phase, step, reason and time taken come from the run's typed
+/// record ([`aidaemon_core::card::HelperView`]), never from its reply.
+pub(crate) fn run_summary(
+    session_id: &str,
+    id: &str,
+    view: &aidaemon_core::card::HelperView,
+    started_at: chrono::DateTime<chrono::Utc>,
+    ended_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> RunSummary {
+    use aidaemon_core::card::RunPhase as Phase;
+    let phase = match view.phase {
+        Phase::Running => RunPhase::Running,
+        Phase::Succeeded => RunPhase::Succeeded,
+        Phase::Failed => RunPhase::Failed,
+        Phase::Stopped => RunPhase::Stopped,
+    };
+    let ms = |at: chrono::DateTime<chrono::Utc>| u64::try_from(at.timestamp_millis()).unwrap_or(0);
+    RunSummary {
+        id: id.to_string(),
+        session_id: session_id.to_string(),
+        label: view.label.clone(),
+        phase,
+        background: view.background,
+        step: step_words(view),
+        started_at_ms: ms(started_at),
+        ended_at_ms: ended_at.map(ms),
+        took: view.took.clone(),
+        reason: view.reason.clone(),
+        stopped_by_owner: view.stopped_by_owner,
+    }
+}
+
+/// A running run's step in plain words; empty once it ended or when the
+/// step says nothing ([`aidaemon_core::card::Step::is_shown`]).
+fn step_words(view: &aidaemon_core::card::HelperView) -> String {
+    if view.phase.is_terminal() {
+        return String::new();
+    }
+    view.step
+        .as_ref()
+        .filter(|step| step.is_shown())
+        .map(aidaemon_core::card::Step::words)
+        .unwrap_or_default()
 }
 
 /// Where an app session's turns are shown: their events. The reply itself

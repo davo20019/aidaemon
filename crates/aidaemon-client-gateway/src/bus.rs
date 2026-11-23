@@ -32,6 +32,7 @@ fn ref_id(event: &Event) -> Option<&str> {
         | Event::TurnCompleted { turn_id, .. }
         | Event::UserActionRequired { turn_id, .. } => Some(turn_id),
         Event::TaskUpdated { task } => Some(&task.id),
+        Event::RunUpdated { run } => Some(&run.id),
         _ => None,
     }
 }

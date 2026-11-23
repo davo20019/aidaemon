@@ -512,6 +512,7 @@ impl Agent {
     /// Report this agent's background follow-up turns where channel turns
     /// are reported.
     pub fn set_turn_watch(&self, watch: aidaemon_channels::turns::TurnWatch) {
+        self.running_children.runs().report_to(watch.clone());
         let _ = self.turn_watch.set(watch);
     }
 

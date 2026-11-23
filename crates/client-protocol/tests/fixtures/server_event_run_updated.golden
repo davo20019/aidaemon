@@ -1,0 +1,18 @@
+{
+  "at_ms": 1767225600000,
+  "event": {
+    "run": {
+      "background": true,
+      "id": "run-3f2a",
+      "label": "Claude Code: prepare the synthetic release",
+      "phase": "running",
+      "session_id": "app:6c1f",
+      "started_at_ms": 1767225600000,
+      "step": "Running a command"
+    },
+    "type": "run_updated"
+  },
+  "seq": 10,
+  "session_id": "app:6c1f",
+  "type": "event"
+}
