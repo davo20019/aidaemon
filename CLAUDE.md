@@ -86,18 +86,27 @@ background tasks`.
 
 - `src/startup/`: subsystem setup (stores, provider/router, tools, skills, MCP,
   memory, channels, DB security, wiring).
-- `src/agent/`: runtime. `turn/` (bootstrap, tool offering, closeout) hands
-  each turn to the SDK engine in `runtime/sdk_engine/`.
-- `src/tools/`: LLM-callable and deterministic local tools.
+- `src/agent/`: the daemon's `Agent` (construction, host ports) and the
+  runtime's tests on it. The runtime is `crates/aidaemon-runtime/src/`:
+  `turn/` (bootstrap, closeout, completion, memory), `engine/` (tool roster,
+  gate, dispatch) and `engine/turn_engine/`, one turn on the SDK kernel.
+- Tools: `crates/aidaemon-tools` and `crates/aidaemon-runtime/src/tools/`
+  (terminal, cli_agent, ...); `src/tools/` holds the app-assembled ones and
+  re-exports.
 - `src/traits.rs` and `src/types.rs` re-export the contract types and store
   traits, which live in the crates that own them; `src/traits/state_store.rs`
   keeps only what the app assembles itself (`StateStore`, `MandateToolStore`,
   `SkillsStore`, `HealthCheckStore`).
-- `src/state/sqlite/`: SQLite persistence by domain. Goals, mandates, tasks,
-  work coordination and notifications: `crates/aidaemon-work`. Memory:
-  `aidaemon_memory::sqlite`. Events and run aggregate:
-  `crates/aidaemon-events` (host adapter in `src/events/`).
-- `src/memory/`, `src/plans/`, `src/channels/` (Telegram, Slack, Discord, hub).
+- State: `crates/aidaemon-runtime/src/state/` (the SQLite `StateStore` and
+  its schema; `src/state/` re-exports). Goals, mandates, tasks, work
+  coordination and notifications: `crates/aidaemon-work/src/sqlite/`; task
+  plans: `crates/aidaemon-work/src/plans/`. Memory: `crates/aidaemon-memory`
+  (`aidaemon_memory::sqlite`; host adapters in `aidaemon_runtime::memory`).
+  Events and run aggregate: `crates/aidaemon-events` (host adapter in
+  `src/events/`).
+- Channels: bots in `crates/aidaemon-channel-{telegram,slack,discord}`, hub,
+  turns and prompts in `crates/aidaemon-channels`; `src/channels/` is the
+  daemon's side (config, commands).
 - `src/setup/`: first run. No config runs setup mode (the gateway crate's
   `setup` router, no agent) until a model passes its test; the running
   daemon's client host then serves the chat step and the greeting.
@@ -106,10 +115,10 @@ background tasks`.
   (iroh-relay, the remote-access default) and `dns.aidaemon.ai` (address
   lookup). They must run the workspace's iroh version; see `deploy/README.md`.
 - Specialists: prompts in `crates/aidaemon-runtime/specialists/<kind>.md`, user overrides in
-  `~/.aidaemon/specialists/`, code in `src/agent/specialists/`, exposed via
+  `~/.aidaemon/specialists/`, code in `crates/aidaemon-runtime/src/specialists/`, exposed via
   `spawn_agent`.
-- MCP: `src/startup/mcp.rs`, `src/tools/manage_mcp.rs`,
-  `src/state/sqlite/dynamic_mcp.rs`.
+- MCP: `src/startup/mcp.rs`, `crates/aidaemon-mcp` (`manage_mcp` is
+  `registry/manage.rs`), `crates/aidaemon-runtime/src/state/dynamic_mcp.rs`.
 - Project memory: notes per project id in `aidaemon_memory::project`
   (files, never the database); a turn's project is resolved from typed state
   in `aidaemon-runtime/src/turn/turn_project.rs` and gated by
