@@ -443,6 +443,7 @@ pub fn group_followup(
         let state = &end.state;
         let ended = match state.phase {
             RunPhase::Succeeded => "finished",
+            RunPhase::Stopped if state.stopped_by_owner() => "stopped by the owner",
             RunPhase::Stopped => "didn't finish",
             RunPhase::Failed => "failed",
             RunPhase::Running => "still running",
@@ -513,6 +514,14 @@ pub fn group_followup(
          never say it wasn't measured, and don't state one of your own. A record's \
          \"Next step\" is the daemon's offer: make it in your answer, as given.",
     );
+    // The owner's stop is the owner's decision: what a stopped helper was
+    // doing stays undone unless they ask again.
+    if ends.iter().any(|end| end.state.stopped_by_owner()) {
+        out.push_str(
+            " The owner stopped every helper marked \"stopped by the owner\": don't redo its \
+             work, start it again or do it yourself; say plainly that it was stopped.",
+        );
+    }
     out.push_str(match work {
         GroupWork::Helpers => " Don't call tools to re-check this work.",
         GroupWork::Checks => {

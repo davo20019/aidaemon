@@ -117,6 +117,8 @@ pub fn ago(at_ms: u64, now_ms: u64) -> String {
 pub fn span(secs: u64) -> String {
     match secs {
         0..60 => format!("{secs}s"),
+        // Under ten minutes a running clock still moves each second.
+        60..600 if !secs.is_multiple_of(60) => format!("{}m {}s", secs / 60, secs % 60),
         60..3_600 => format!("{}m", secs / 60),
         3_600..86_400 => {
             let m = (secs % 3_600) / 60;

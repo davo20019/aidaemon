@@ -1295,6 +1295,16 @@ impl RunHandles {
         {
             warn!(%error, "Could not note a coding agent's run on its invocation");
         }
+        // What it was asked, whole, for its run view (the summary above is
+        // the log's).
+        if invocation_id != 0
+            && let Err(error) = self
+                .state
+                .note_cli_agent_task(invocation_id, &prep.prompt)
+                .await
+        {
+            warn!(%error, "Could not keep a coding agent's task on its invocation");
+        }
         // The agent's typed events: kept on its invocation, and its latest
         // step on its run record. Its host's judge keeps each decision too.
         let events = crate::tools::cli_agent_events::AgentEventRecorder::new(
@@ -1652,8 +1662,14 @@ async fn watch_run(
 
             // A background run's step is how much the agent printed,
             // never a heartbeat or a timer, and never what it printed:
-            // its output is its own data and can carry a credential.
-            if let Some(run) = run_for_task.get().cloned().filter(|_| printed_lines > 0) {
+            // its output is its own data and can carry a credential. An
+            // agent whose output reads as typed events has its steps from
+            // them instead (until its first, its row shows its task).
+            if let Some(run) = run_for_task
+                .get()
+                .cloned()
+                .filter(|_| printed_lines > 0 && !agent_events.structured())
+            {
                 let lines = printed_lines;
                 tokio::spawn(async move { run.step(Step::Output { lines }).await });
             }
@@ -2028,8 +2044,15 @@ async fn deliver_end(
             );
             return;
         }
+        // The owner stopped it (or every run of its turn): its card says
+        // so, and nothing picks the work up again.
+        crate::background_run::RunsTurn::Stopped => return,
         crate::background_run::RunsTurn::Answer(answer) => Some(answer),
-        crate::background_run::RunsTurn::Alone if !end.answer_alone => return,
+        crate::background_run::RunsTurn::Alone
+            if !end.answer_alone || end.phase.stopped_by_owner() =>
+        {
+            return;
+        }
         crate::background_run::RunsTurn::Alone => None,
     };
 

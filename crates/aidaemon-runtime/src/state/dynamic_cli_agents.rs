@@ -139,6 +139,15 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn note_cli_agent_task(&self, id: i64, task: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cli_agent_invocations SET task = ? WHERE id = ?")
+            .bind(task)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn set_cli_agent_session(&self, id: i64, agent_session: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE cli_agent_invocations SET agent_session_id = ? WHERE id = ?")
             .bind(agent_session)
@@ -173,7 +182,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
     ) -> anyhow::Result<Option<aidaemon_tools::services::CliAgentRun>> {
         use sqlx::Row;
         let row = sqlx::query(
-            "SELECT id, agent_name, agent_session_id, working_dir, prompt_summary, output_summary
+            "SELECT id, agent_name, agent_session_id, working_dir, prompt_summary, task, output_summary
              FROM cli_agent_invocations WHERE run_id = ? ORDER BY id DESC LIMIT 1",
         )
         .bind(run_id)
@@ -185,6 +194,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
             agent_session: row.get("agent_session_id"),
             working_dir: row.get("working_dir"),
             prompt_summary: row.get("prompt_summary"),
+            task: row.get("task"),
             output_summary: row.get("output_summary"),
         }))
     }

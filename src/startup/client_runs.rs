@@ -41,7 +41,7 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
         agent_session_id: run.agent_session,
         model: None,
         working_dir: run.working_dir,
-        task: run.prompt_summary,
+        task: run.task.unwrap_or(run.prompt_summary),
         result: run.output_summary.filter(|text| !text.trim().is_empty()),
         steps: Vec::new(),
         plan: Vec::new(),
@@ -167,7 +167,8 @@ mod tests {
             agent_name: "codex".into(),
             agent_session: None,
             working_dir: Some("/w/synthetic".into()),
-            prompt_summary: "Review the slug module".into(),
+            prompt_summary: "Review the slug".into(),
+            task: Some("Review the slug module".into()),
             output_summary: Some("Fixed one bug".into()),
         };
         let events = [

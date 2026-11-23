@@ -182,6 +182,9 @@ pub struct CliAgentRun {
     pub agent_session: Option<String>,
     pub working_dir: Option<String>,
     pub prompt_summary: String,
+    /// What it was asked, whole ([`DynamicCliAgentStore::note_cli_agent_task`]);
+    /// an invocation from before it was kept has its summary alone.
+    pub task: Option<String>,
     pub output_summary: Option<String>,
 }
 
@@ -240,6 +243,11 @@ pub trait DynamicCliAgentStore: Send + Sync {
         _run_id: &str,
         _mode: Option<&str>,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// What invocation `id` was asked, whole: the task its run view shows.
+    async fn note_cli_agent_task(&self, _id: i64, _task: &str) -> anyhow::Result<()> {
         Ok(())
     }
 

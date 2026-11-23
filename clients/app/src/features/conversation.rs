@@ -45,6 +45,13 @@ enum Row {
     Retry,
     /// Work handed to the background runs; its report comes here.
     Background,
+    /// The runs one request started (`RunSummary.group`, or a run alone:
+    /// its id), under the reply that started them; `headed`: with their
+    /// own heading (the running turn's line heads them while it runs).
+    Runs {
+        key: String,
+        headed: bool,
+    },
 }
 
 impl Row {
@@ -54,6 +61,7 @@ impl Row {
             Self::Retry => "retry".into(),
             Self::Background => "background".into(),
             Self::Approval(id) => format!("approval-{id}"),
+            Self::Runs { key, headed } => format!("runs-{key}-{headed}"),
             Self::Day(label) => format!("day-{label}-{index}"),
             _ => format!("line-{index}"),
         }
@@ -109,16 +117,27 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             _ => {}
         }
     }
-    if store.live(session).is_some() {
+    // Each request's runs sit under the reply that started them, and stay
+    // there once they end: which agents ran and how each ended. A request
+    // still being answered has its runs under its live line.
+    let tail = place_runs(&mut rows, &store.runs_for(session));
+    let live = store.live(session).is_some();
+    let tail = tail.into_iter().map(|key| Row::Runs { key, headed: !live });
+    if live {
         rows.push(Row::Live);
+        rows.extend(tail);
     } else if store.in_background(session)
         && !matches!(rows.last(), Some(Row::Assistant(_, _, _, true, ..)))
     {
-        // A launch line already says it; the work's own strip over the
-        // composer shows it running, with Cancel.
+        // A launch line already says it; the work's own rows show it
+        // running, with Stop.
+        rows.extend(tail);
         rows.push(Row::Background);
-    } else if store.can_retry(session) {
-        rows.push(Row::Retry);
+    } else {
+        rows.extend(tail);
+        if store.can_retry(session) {
+            rows.push(Row::Retry);
+        }
     }
     rows.extend(
         store
@@ -127,6 +146,40 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             .map(|a| Row::Approval(a.id)),
     );
     rows
+}
+
+/// A run's group: the request that started it, or the run alone.
+fn run_key(run: &RunSummary) -> String {
+    run.group.clone().unwrap_or_else(|| run.id.clone())
+}
+
+/// Places each request's runs under the first reply written at or after
+/// the first of them started (the reply that started them); returns, in
+/// order, the groups no reply follows yet (their request is still being
+/// answered, or its reply has not come).
+fn place_runs(rows: &mut Vec<Row>, runs: &[RunSummary]) -> Vec<String> {
+    let mut groups: Vec<(String, u64)> = Vec::new();
+    for run in runs {
+        let key = run_key(run);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, at)) => *at = (*at).min(run.started_at_ms),
+            None => groups.push((key, run.started_at_ms)),
+        }
+    }
+    groups.sort_by_key(|(_, at)| *at);
+    let mut tail = Vec::new();
+    // From the last group back, so each insert leaves earlier places as
+    // they were.
+    for (key, at) in groups.into_iter().rev() {
+        let reply = rows
+            .iter()
+            .position(|row| matches!(row, Row::Assistant(_, reply_at, ..) if *reply_at >= at));
+        match reply {
+            Some(index) => rows.insert(index + 1, Row::Runs { key, headed: true }),
+            None => tail.insert(0, key),
+        }
+    }
+    tail
 }
 
 /// The page for `session` (`None`: a new conversation).
@@ -159,52 +212,122 @@ pub fn page(store: Store, session: Option<String>) -> View {
         })
 }
 
-/// How long an ended run stays on show over the composer.
-const ENDED_RUN_SHOWN_MS: u64 = 10 * 60 * 1000;
-
-/// This conversation's work running in the background, over the composer
-/// where the eye already is: what it is, what it is doing, how long it has
-/// run, Stop; for a while after it ended, how it ended. From the daemon's
-/// run records (protocol 1.46); an older daemon's task list otherwise.
+/// An older daemon's background work, over the composer: its task list.
+/// A daemon with run records (protocol 1.46) has its runs in the
+/// transcript, under the reply that started them.
 fn running_work(store: Store, session: Option<String>) -> View {
     let Some(session) = session else {
         return view();
-    };
-    let runs = {
-        let session = session.clone();
-        computed(move || {
-            let now = crate::store::now_ms();
-            store
-                .runs_for(&session)
-                .into_iter()
-                .filter(|run| {
-                    run.phase.is_running()
-                        || run
-                            .ended_at_ms
-                            .is_some_and(|ended| now.saturating_sub(ended) < ENDED_RUN_SHOWN_MS)
-                })
-                .collect::<Vec<_>>()
-        })
     };
     let has_runs = {
         let session = session.clone();
         computed(move || !store.runs_for(&session).is_empty())
     };
-    view()
-        .child(when(move || has_runs.get(), {
-            let session = session.clone();
-            move || {
-                let session = session.clone();
-                // The running turn's line heads its agents; with none, a
-                // group of runs gets a heading of its own.
-                let headed = computed(move || store.live(&session).is_some());
-                run_rows(store, runs, headed)
+    view().child(when(
+        move || !has_runs.get(),
+        move || task_rows(store, session.clone()),
+    ))
+}
+
+/// One request's runs in the transcript: several under a line that says
+/// how they are doing ("3 agents working together · 1 done") and, once
+/// every one ended, how they ended, folded when all of them finished; a
+/// run alone is its row. Each row says what its run is doing or how it
+/// ended, with Stop while it runs, and opens its steps.
+fn run_group(store: Store, session: String, key: String, headed: bool) -> View {
+    let runs = computed(move || {
+        store
+            .runs_for(&session)
+            .into_iter()
+            .filter(|run| run_key(run) == key)
+            .collect::<Vec<_>>()
+    });
+    let several = computed(move || runs.with(Vec::len) > 1);
+    // Folded once every one finished; open while any runs, or when one
+    // did not finish. The owner's own unfolding stands until that changes.
+    let settled =
+        computed(move || runs.with(|runs| runs.iter().all(|run| run.phase == RunPhase::Succeeded)));
+    let open = signal(!untracked(|| settled.get()));
+    effect(move || {
+        let settled = settled.get();
+        untracked(|| open.set(!settled));
+    });
+    view().w_full().gap_1().child(dynamic(move || {
+        let several = several.get();
+        // The running turn's line heads its agents while it runs.
+        let heading = several && (headed || runs.with(|r| r.iter().all(|r| !r.phase.is_running())));
+        Some(untracked(move || {
+            if !heading {
+                return run_rows(store, runs).into_element();
             }
+            view()
+                .gap_1()
+                .child(ui::quiet_disclosure(
+                    move || {
+                        store.tick();
+                        SharedString::from(runs.with(|runs| group_summary(runs)))
+                    },
+                    open,
+                ))
+                .child(ui::unfold(open, move || run_rows(store, runs)))
+                .into_element()
         }))
-        .child(when(
-            move || !has_runs.get(),
-            move || task_rows(store, session.clone()),
-        ))
+    }))
+}
+
+/// A group's line: how many are working and done while any runs; once
+/// all ended, how they ended, what they changed and how long it took
+/// ("3 agents finished · changed 3 files · 1m 12s").
+fn group_summary(runs: &[RunSummary]) -> String {
+    let total = runs.len();
+    let ended = runs.iter().filter(|r| !r.phase.is_running()).count();
+    if ended < total {
+        return group_line(total, ended);
+    }
+    let count = |phase: RunPhase, by_owner: bool| {
+        runs.iter()
+            .filter(|r| r.phase == phase && r.stopped_by_owner == by_owner)
+            .count()
+    };
+    let finished = count(RunPhase::Succeeded, false);
+    let mut line = if finished == total {
+        format!("{total} agents finished")
+    } else {
+        let mut how = Vec::new();
+        for (n, words) in [
+            (finished, "finished"),
+            (count(RunPhase::Failed, false), "failed"),
+            (count(RunPhase::Stopped, true), "stopped by you"),
+            (count(RunPhase::Stopped, false), "stopped"),
+        ] {
+            if n > 0 {
+                how.push(format!("{n} {words}"));
+            }
+        }
+        format!("{total} agents · {}", how.join(", "))
+    };
+    let mut files: Vec<&str> = runs
+        .iter()
+        .flat_map(|r| r.edited.iter().map(String::as_str))
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    match files.as_slice() {
+        [] => {}
+        [one] => line.push_str(&format!(" · changed {}", file_name(one))),
+        many => line.push_str(&format!(" · changed {} files", many.len())),
+    }
+    let start = runs.iter().map(|r| r.started_at_ms).min().unwrap_or(0);
+    let end = runs
+        .iter()
+        .filter_map(|r| r.ended_at_ms)
+        .max()
+        .unwrap_or(start);
+    line.push_str(&format!(
+        " · {}",
+        ui::time::span(end.saturating_sub(start) / 1000)
+    ));
+    line
 }
 
 /// A row of the running work: a group's heading, or one run.
@@ -337,35 +460,25 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// The running work, a row per run (runs one request started together
-/// under one heading): its state, name and step, its time, and Stop while
-/// it runs. A run's row opens its view: what it did, step by step.
-fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>, headed: Memo<bool>) -> View {
+/// A request's runs, a row each (under its group's line when there are
+/// several): its state, name and step, its time, and Stop while it runs.
+/// A run's row opens its view: what it did, step by step.
+fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
     let rows = computed(move || {
-        let headed = headed.get();
         runs.with(|runs| {
             work_rows(runs)
                 .into_iter()
-                .filter(|row| !(headed && matches!(row, WorkRow::Group { .. })))
+                .filter(|row| matches!(row, WorkRow::Run { .. }))
                 .collect::<Vec<_>>()
         })
     });
     view()
-        .items_center()
-        .px_4()
+        .w_full()
         .gap_1()
         .child(each(rows, WorkRow::key, move |row, _| {
             match row.get_untracked() {
-                WorkRow::Group { .. } => view().w_full().max_w(px(size::COLUMN)).pl_1().child(
-                    text(move || match row.get() {
-                        WorkRow::Group { total, ended, .. } => group_line(total, ended),
-                        WorkRow::Run { .. } => String::new(),
-                    })
-                    .number_of_lines(1)
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-                ),
                 WorkRow::Run { run, grouped } => run_row(store, run.id, row, grouped),
+                WorkRow::Group { .. } => view(),
             }
         }))
 }
@@ -395,7 +508,6 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
     let open = id.clone();
     view()
         .w_full()
-        .max_w(px(size::COLUMN))
         .flex_row()
         .items_center()
         .gap_2()
@@ -1160,6 +1272,26 @@ fn transcript(store: Store, session: String) -> View {
     let id = session.clone();
     let all = computed(move || rows(store, &id));
     let last_seen = signal(usize::MAX);
+    let first_seen = signal(0usize);
+    // The first request with agents still running, and how many run: when
+    // its rows are out of view, a line over the composer says so and
+    // brings them back.
+    let running = {
+        let session = session.clone();
+        computed(move || {
+            let runs: Vec<RunSummary> = store
+                .runs_for(&session)
+                .into_iter()
+                .filter(|run| run.phase.is_running() && run.background)
+                .collect();
+            let at = all.with(|rows| {
+                rows.iter().position(|row| {
+                    matches!(row, Row::Runs { key, .. } if runs.iter().any(|run| run_key(run) == *key))
+                })
+            })?;
+            Some((at, runs.len()))
+        })
+    };
     let list = element_ref();
     let unfolding = ui::Unfolding::provide();
     let loading_id = session.clone();
@@ -1207,42 +1339,77 @@ fn transcript(store: Store, session: String) -> View {
             },
         ))
         .child(ui::refreshable(
-            transcript_list(store, session, all, last_seen, unfolding)
+            transcript_list(store, session, all, first_seen, last_seen, unfolding)
                 .element_ref(&list)
                 .flex_1(),
             move || store.pull_refreshing(),
             move || store.pull_refresh(),
         ))
-        .child(when(
-            move || {
-                let len = all.with(Vec::len);
-                let seen = last_seen.get();
-                seen != usize::MAX && len > 0 && seen + 2 < len
-            },
-            move || {
-                view()
-                    .absolute()
-                    .bottom(px(12.0))
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .items_center()
-                    .child(
+        .child(
+            view()
+                .absolute()
+                .bottom(px(12.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .items_center()
+                .gap_2()
+                .child(when(
+                    move || {
+                        let Some((at, _)) = running.get() else {
+                            return false;
+                        };
+                        let last = last_seen.get();
+                        last != usize::MAX && (at < first_seen.get() || at > last)
+                    },
+                    move || {
+                        let count = computed(move || running.get().map(|(_, n)| n));
+                        view().child(dynamic(move || {
+                            let n = count.get()?;
+                            let label = if n == 1 {
+                                "1 agent running ↑".to_string()
+                            } else {
+                                format!("{n} agents running ↑")
+                            };
+                            Some(untracked(move || {
+                                ui::btn(label, Variant::Secondary, Size::Sm, move || {
+                                    if let Some((at, _)) = untracked(|| running.get()) {
+                                        list.scroll_to_index(
+                                            u32::try_from(at).unwrap_or(0),
+                                            Percentage(0.3),
+                                            px(0.0),
+                                            true,
+                                        );
+                                    }
+                                })
+                                .shadow_md()
+                            }))
+                        }))
+                    },
+                ))
+                .child(when(
+                    move || {
+                        let len = all.with(Vec::len);
+                        let seen = last_seen.get();
+                        seen != usize::MAX && len > 0 && seen + 2 < len
+                    },
+                    move || {
                         ui::btn(
                             "Jump to latest ↓",
                             Variant::Secondary,
                             Size::Sm,
                             move || list.scroll_to_end(true),
                         )
-                        .shadow_md(),
-                    )
-            },
-        ))
+                        .shadow_md()
+                    },
+                )),
+        )
 }
 
 fn transcript_list(
     store: Store,
     session: String,
     all: Memo<Vec<Row>>,
+    first_seen: Signal<usize>,
     last_seen: Signal<usize>,
     unfolding: ui::Unfolding,
 ) -> VirtualList {
@@ -1264,6 +1431,7 @@ fn transcript_list(
                         Row::Activity(..) => 6,
                         Row::Retry => 7,
                         Row::Background => 8,
+                        Row::Runs { .. } => 10,
                     })
                 })
             });
@@ -1351,6 +1519,14 @@ fn transcript_list(
                         8 => column.child(ui::working(
                             "Working in the background · the result comes here",
                         )),
+                        10 => column.py_1().child(dynamic(move || {
+                            let (key, headed) = row.with(|r| match r {
+                                Some(Row::Runs { key, headed }) => Some((key.clone(), *headed)),
+                                _ => None,
+                            })?;
+                            let session = session.clone();
+                            Some(untracked(move || run_group(store, session, key, headed)))
+                        })),
                         _ => column.child(dynamic(move || {
                             let id = row.with(|r| match r {
                                 Some(Row::Approval(id)) => Some(id.clone()),
@@ -1373,7 +1549,8 @@ fn transcript_list(
         })
     })
     .on_viewable_items_change(move |items: &nsh_core::element::ViewableItems| {
-        if let Some((_, last)) = items.viewable {
+        if let Some((first, last)) = items.viewable {
+            first_seen.set(first);
             last_seen.set(last);
         }
     })
@@ -2870,5 +3047,56 @@ mod drop_tests {
             "C:/Users/synthetic/né.txt"
         );
         assert_eq!(file_path("file:///tmp/100%"), "/tmp/100%");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(id: &str, group: Option<&str>, started_at_ms: u64) -> RunSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "session_id": "app:synthetic",
+            "label": id,
+            "phase": "succeeded",
+            "background": true,
+            "started_at_ms": started_at_ms,
+            "group": group,
+        }))
+        .expect("a run")
+    }
+
+    fn reply(at: u64) -> Row {
+        Row::Assistant(format!("reply {at}"), at, Vec::new(), false, false, None)
+    }
+
+    #[test]
+    fn a_requests_runs_sit_under_the_reply_that_started_them() {
+        let mut rows = vec![
+            Row::User("first".into(), 100, Vec::new()),
+            reply(200),
+            Row::User("second".into(), 300, Vec::new()),
+            reply(400),
+            Row::User("third".into(), 500, Vec::new()),
+        ];
+        let tail = place_runs(
+            &mut rows,
+            &[
+                run("a", Some("task-1"), 150),
+                run("b", Some("task-1"), 160),
+                run("c", None, 350),
+                run("d", Some("task-3"), 550),
+            ],
+        );
+        let runs = |key: &str| Row::Runs {
+            key: key.into(),
+            headed: true,
+        };
+        assert_eq!(rows[2], runs("task-1"));
+        assert_eq!(rows[5], runs("c"));
+        // The third request has no reply yet: its runs come at the end.
+        assert_eq!(tail, vec!["task-3".to_string()]);
+        assert_eq!(rows.len(), 7);
     }
 }

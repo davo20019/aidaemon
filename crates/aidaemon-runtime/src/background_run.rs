@@ -90,6 +90,9 @@ pub enum RunsTurn {
     /// It was the last run of its turn's group: the chat gets one answer
     /// from every run's result.
     Answer(GroupAnswer),
+    /// It was the last run of its turn's group and the owner stopped every
+    /// one of them: their cards say so, and nothing answers the chat.
+    Stopped,
 }
 
 /// The one answer a turn's group of runs gets.
@@ -369,6 +372,9 @@ impl BackgroundRun {
         match self.home.runs.group_end(&self.id, end) {
             GroupTurn::Alone => RunsTurn::Alone,
             GroupTurn::Waiting => RunsTurn::Waiting,
+            GroupTurn::Complete(ends) if ends.iter().all(|end| end.state.stopped_by_owner()) => {
+                RunsTurn::Stopped
+            }
             GroupTurn::Complete(ends) => RunsTurn::Answer(GroupAnswer {
                 followup: group_followup(
                     &ends,
@@ -526,6 +532,38 @@ mod tests {
             }
             other => panic!("expected the group's answer, got {other:?}"),
         }
+
+        // The owner stopped one of three: the rest answer, and the answer
+        // leaves the stopped one's work undone.
+        let owner_stop = || {
+            RunEnd::Stopped(Some(crate::run_state::RunFailure::Cancelled {
+                by: crate::run_state::CancelledBy::Owner,
+            }))
+        };
+        let group = |id| RunStart {
+            task_id: Some("task-3"),
+            ..start(id, "review")
+        };
+        let x = BackgroundRun::start(home.clone(), group("review-1")).await;
+        let y = BackgroundRun::start(home.clone(), group("review-2")).await;
+        let (state, _) = x.finish(owner_stop(), RunEvidence::default()).await;
+        assert!(matches!(end(&x, state, "read it"), RunsTurn::Waiting));
+        let (state, _) = y.finish(RunEnd::Succeeded, RunEvidence::default()).await;
+        match end(&y, state, "reviewed") {
+            RunsTurn::Answer(answer) => {
+                assert!(answer.followup.contains("(stopped by the owner)"));
+                assert!(answer.followup.contains("don't redo its work"));
+            }
+            other => panic!("expected the group's answer, got {other:?}"),
+        }
+
+        // The owner stopped all of them: nothing answers the chat.
+        let x = BackgroundRun::start(home.clone(), group("review-3")).await;
+        let y = BackgroundRun::start(home.clone(), group("review-4")).await;
+        let (state, _) = x.finish(owner_stop(), RunEvidence::default()).await;
+        assert!(matches!(end(&x, state, ""), RunsTurn::Waiting));
+        let (state, _) = y.finish(owner_stop(), RunEvidence::default()).await;
+        assert!(matches!(end(&y, state, ""), RunsTurn::Stopped));
 
         // A run alone in its turn answers alone.
         let solo = BackgroundRun::start(

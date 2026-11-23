@@ -757,7 +757,7 @@ fn a_background_run_shows_its_step_and_its_end() -> Result<(), String> {
     )]);
     app.wait_for("text:Claude Code · Stopped by you")?;
     // How long it took, short, from its start and end times.
-    app.wait_for("text:4m")?;
+    app.wait_for("text:4m 2s")?;
     Ok(())
 }
 
@@ -807,6 +807,14 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.wait_for("text:write: /w/synthetic/slug.py · allowed")?;
     app.press("Back")?;
     app.wait_for("text:2 agents working together · 1 done")?;
+    // Both ended: their line says how, what they changed and how long,
+    // and stays in the conversation, folded, its rows a press away.
+    feed([frame(
+        r#"{"type":"event","seq":11,"at_ms":4,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-b","session_id":"app:synthetic-pair","label":"Truncate on branch b","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999995000,"group":"task-1"}}}"#,
+    )]);
+    app.wait_for("text:2 agents finished · changed 2 files · 45s")?;
+    app.press("2 agents finished · changed 2 files · 45s")?;
+    app.wait_for("text:Codex · Finished")?;
     Ok(())
 }
 

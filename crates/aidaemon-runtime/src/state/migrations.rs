@@ -463,6 +463,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         "ALTER TABLE cli_agent_invocations ADD COLUMN run_id TEXT",
         "ALTER TABLE cli_agent_invocations ADD COLUMN mode TEXT",
         "ALTER TABLE cli_agent_invocations ADD COLUMN agent_session_id TEXT",
+        "ALTER TABLE cli_agent_invocations ADD COLUMN task TEXT",
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }

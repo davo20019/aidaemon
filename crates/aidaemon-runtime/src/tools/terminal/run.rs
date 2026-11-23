@@ -950,8 +950,20 @@ impl TerminalTool {
                                 ),
                                 _ => crate::background_run::RunsTurn::Alone,
                             };
-                            let group_waiting =
-                                matches!(group, crate::background_run::RunsTurn::Waiting);
+                            // Waiting for the rest of its turn's runs, or
+                            // stopped by the owner (alone, or with every run of
+                            // its turn): its card says so, and nothing answers
+                            // the chat or picks the work up again.
+                            let owner_stopped = ended
+                                .as_ref()
+                                .and_then(|(state, _)| state.as_ref())
+                                .is_some_and(crate::run_state::RunState::stopped_by_owner);
+                            let group_waiting = match &group {
+                                crate::background_run::RunsTurn::Waiting
+                                | crate::background_run::RunsTurn::Stopped => true,
+                                crate::background_run::RunsTurn::Alone => owner_stopped,
+                                crate::background_run::RunsTurn::Answer(_) => false,
+                            };
                             let group_answer = match group {
                                 crate::background_run::RunsTurn::Answer(answer) => Some(answer),
                                 _ => None,

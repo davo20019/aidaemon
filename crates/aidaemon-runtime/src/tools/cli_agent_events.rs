@@ -29,6 +29,9 @@ pub(super) struct AgentEventRecorder {
     /// Steps already recorded, by the agent's own id: an item reported
     /// started and again completed is one step.
     steps: HashSet<String>,
+    /// Its output read as typed events at least once: its steps come from
+    /// them, not from how much it printed.
+    structured: bool,
 }
 
 impl AgentEventRecorder {
@@ -47,6 +50,7 @@ impl AgentEventRecorder {
             run_id,
             seq: Arc::default(),
             steps: HashSet::new(),
+            structured: false,
         }
     }
 
@@ -63,8 +67,14 @@ impl AgentEventRecorder {
     /// Read one output line (as the run reads it, after its host).
     pub(super) async fn read(&mut self, line: &str) {
         for event in self.agent.read_events(line) {
+            self.structured = true;
             self.record(event).await;
         }
+    }
+
+    /// Whether its output reads as typed events ([`Self::read`] found one).
+    pub(super) fn structured(&self) -> bool {
+        self.structured
     }
 
     async fn record(&mut self, event: AgentEvent) {
