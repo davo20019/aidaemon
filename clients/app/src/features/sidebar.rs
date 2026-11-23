@@ -361,7 +361,8 @@ fn menu_row(store: Store, id: String, dated: bool) -> View {
             move || store.archive_session(&session, !archived),
         ));
     }
-    let (preview, title) = (id.clone(), id.clone());
+    let (preview, title, open) = (id.clone(), id.clone(), id.clone());
+    let is_open = computed(move || store.selected().as_deref() == Some(open.as_str()));
     // While the menu is up its row is the marked one, whichever
     // conversation is open behind it.
     let about = signal(false);
@@ -371,6 +372,8 @@ fn menu_row(store: Store, id: String, dated: bool) -> View {
         ui::with_preview(
             session_button(store, id, dated).style_when(move || about.get(), ui::menu_target),
             move || session_preview(store, preview),
+            // The open conversation is on the page already.
+            move || is_open.get(),
         ),
         actions,
     )

@@ -647,10 +647,15 @@ pub fn suggest_field(
 }
 
 /// `trigger` with a card of more about it shown while the pointer rests on
-/// it (or it has the keyboard focus). Touch screens and terminals have no
-/// hover: there, a press keeps meaning what it meant, and only `trigger`
-/// shows.
-pub fn with_preview(trigger: impl IntoElement + 'static, card: impl FnOnce() -> View) -> View {
+/// it (or it has the keyboard focus), except while `quiet` holds (what it
+/// previews is already on the page: a card would only cover it). Touch
+/// screens and terminals have no hover: there, a press keeps meaning what
+/// it meant, and only `trigger` shows.
+pub fn with_preview(
+    trigger: impl IntoElement + 'static,
+    card: impl FnOnce() -> View,
+    quiet: impl Fn() -> bool + Copy + 'static,
+) -> View {
     use nsh_base::hover_card;
 
     use super::theme::{colors, radius};
@@ -658,8 +663,17 @@ pub fn with_preview(trigger: impl IntoElement + 'static, card: impl FnOnce() -> 
     if super::touch() || idiom() == nsh_core::platform::Idiom::Terminal {
         return view().child(trigger);
     }
+    // Asked for by the pointer, shown unless quiet: pressing the row opens
+    // what it previews, and the card goes at once.
+    let open = signal(false);
     view().child(
         hover_card()
+            .open(move || Some(open.get() && !quiet()))
+            .on_open_change(move |event: &nsh_base::HoverCardEvent| {
+                if let nsh_base::HoverCardEvent::OpenChange(now_open, _) = event {
+                    open.set(*now_open && !untracked(quiet));
+                }
+            })
             .open_delay(600.0)
             .close_delay(150.0)
             .offset(px(6.0))
