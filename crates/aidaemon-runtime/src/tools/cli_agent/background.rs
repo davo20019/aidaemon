@@ -101,7 +101,7 @@ impl CliAgentTool {
         let result = extract_meaningful_output(&stdout_output, 10000);
 
         // Capture git diff for finished background tasks.
-        let diff_section = if let Some(ref dir) = agent.working_dir {
+        let diff_section = if let Some(dir) = agent.diff_dir.get() {
             Self::capture_git_diff(backend, dir)
                 .await
                 .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
@@ -161,7 +161,7 @@ impl CliAgentTool {
             let mut removed: Vec<(String, RunningCliAgent)> = Vec::new();
             for task_id in finished_ids {
                 if let Some(agent) = running.remove(&task_id) {
-                    if let Some(ref dir) = agent.working_dir {
+                    if let Some(ref dir) = agent.claim_dir {
                         release_claim(&mut claims, dir, &task_id);
                     }
                     removed.push((task_id, agent));
@@ -217,7 +217,7 @@ impl CliAgentTool {
     }
 
     pub(super) async fn persist_delegated_cli_handoff(
-        &self,
+        state: &Arc<dyn CliAgentStore>,
         delegated_task_id: &str,
         tool_name: &str,
         prompt: &str,
@@ -238,7 +238,7 @@ impl CliAgentTool {
             allowed_tools: Some(vec![format!("cli_agent:{tool_name}")]),
         };
 
-        if let Ok(Some(mut task)) = self.state.get_task(delegated_task_id).await {
+        if let Ok(Some(mut task)) = state.get_task(delegated_task_id).await {
             task.status = "running".to_string();
             if task.started_at.is_none() {
                 task.started_at = Some(chrono::Utc::now().to_rfc3339());
@@ -247,7 +247,7 @@ impl CliAgentTool {
             {
                 task.context = Some(context);
             }
-            let _ = self.state.update_task(&task).await;
+            let _ = state.update_task(&task).await;
         }
     }
 
@@ -377,6 +377,15 @@ impl CliAgentTool {
         };
 
         let elapsed = agent.started_at.elapsed().as_secs();
+        if agent.process.is_queued() {
+            mark_left_in_background();
+            return Ok(format!(
+                "CLI agent '{}' is queued (task_id={task_id}): it has waited {elapsed}s for a \
+                 free slot and starts by itself when one frees. Do not start it again.\n\
+                 Task: {}...",
+                agent.tool_name, agent.prompt_summary
+            ));
+        }
         let display_output = agent.display_buf.lock().await.clone();
 
         let is_running = !agent.finished.load(Ordering::Acquire);
@@ -392,7 +401,11 @@ impl CliAgentTool {
                  Partial output ({} chars):\n{}",
                 agent.tool_name,
                 elapsed,
-                agent.process_handle.display_id(),
+                agent
+                    .process
+                    .handle()
+                    .map(|handle| handle.display_id())
+                    .unwrap_or_default(),
                 agent.prompt_summary,
                 display_output.len(),
                 crate::tools::terminal::keep_head_and_tail(&display_output, 5000)
@@ -429,12 +442,13 @@ impl CliAgentTool {
         let elapsed = agent.started_at.elapsed().as_secs();
 
         // Release working-dir claim owned by this task.
-        if let Some(ref dir) = agent.working_dir {
+        if let Some(ref dir) = agent.claim_dir {
             self.release_working_dir_claim(dir, task_id);
         }
 
-        // Try to kill the process
-        kill_process(&self.backend, &agent.process_handle).await;
+        // Kill its process; a queued run never starts.
+        let queued = agent.process.is_queued();
+        agent.process.stop(&self.backend).await;
         mark_background_settled();
 
         if let Some(ref delegated_task_id) = agent.delegated_task_id {
@@ -447,6 +461,13 @@ impl CliAgentTool {
             .await;
         }
 
+        if queued {
+            return Ok(format!(
+                "Cancelled CLI agent '{}' before it started: it waited {elapsed}s for a free \
+                 slot and never ran.",
+                agent.tool_name
+            ));
+        }
         Ok(format!(
             "Cancelled CLI agent '{}' (was running for {}s).\n\nOutput before cancellation:\n{}",
             agent.tool_name,
@@ -482,10 +503,10 @@ impl CliAgentTool {
         let mut cancelled = Vec::new();
         for (task_id, agent) in to_cancel {
             self.completed.lock().await.remove(&task_id);
-            if let Some(ref dir) = agent.working_dir {
+            if let Some(ref dir) = agent.claim_dir {
                 self.release_working_dir_claim(dir, &task_id);
             }
-            kill_process(&self.backend, &agent.process_handle).await;
+            agent.process.stop(&self.backend).await;
             mark_background_settled();
             if let Some(ref delegated_task_id) = agent.delegated_task_id {
                 Self::persist_delegated_cli_result_with_state(
@@ -517,7 +538,9 @@ impl CliAgentTool {
         let mut lines = vec!["Running CLI agents:".to_string()];
         for (task_id, agent) in running.iter() {
             let elapsed = agent.started_at.elapsed().as_secs();
-            let status = if !agent.finished.load(Ordering::Acquire) {
+            let status = if agent.process.is_queued() {
+                "queued, waiting for a free slot"
+            } else if !agent.finished.load(Ordering::Acquire) {
                 "running"
             } else {
                 "finished"

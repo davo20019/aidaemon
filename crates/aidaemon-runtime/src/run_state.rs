@@ -1000,6 +1000,19 @@ impl RunStates {
         set
     }
 
+    /// Run `id`'s activity no longer holds (a queued run got its slot):
+    /// its row reads its steps again. Always reported, so a change soon
+    /// after the last step report is never dropped.
+    pub fn clear_activity(&self, id: &str) {
+        let cleared = match self.lock().get_mut(id) {
+            Some(entry) => entry.state.activity.take().is_some(),
+            None => false,
+        };
+        if cleared {
+            self.report(id, false);
+        }
+    }
+
     /// The coding agent run `id` launched changed file `path` (once per
     /// file).
     pub fn edited(&self, id: &str, path: &str) {

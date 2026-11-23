@@ -19,6 +19,7 @@ mod claims;
 mod launch;
 mod output;
 mod prompt;
+mod queue;
 
 /// The work stores on a fresh database, an empty chat history and an
 /// in-memory invocation log: what the tool reads and writes.
