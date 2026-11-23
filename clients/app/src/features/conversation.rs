@@ -191,7 +191,16 @@ fn running_work(store: Store, session: Option<String>) -> View {
         computed(move || !store.runs_for(&session).is_empty())
     };
     view()
-        .child(when(move || has_runs.get(), move || run_rows(store, runs)))
+        .child(when(move || has_runs.get(), {
+            let session = session.clone();
+            move || {
+                let session = session.clone();
+                // The running turn's line heads its agents; with none, a
+                // group of runs gets a heading of its own.
+                let headed = computed(move || store.live(&session).is_some());
+                run_rows(store, runs, headed)
+            }
+        }))
         .child(when(
             move || !has_runs.get(),
             move || task_rows(store, session.clone()),
@@ -259,6 +268,22 @@ fn work_rows(runs: &[RunSummary]) -> Vec<WorkRow> {
     rows
 }
 
+/// The running turn's line while agents it started run: "Working with
+/// Codex", "Working with 3 agents · 1 done".
+fn working_with(work: &crate::store::AgentWork) -> String {
+    match (work.total, work.done) {
+        (1, _) => format!(
+            "Working with {}",
+            work.kinds
+                .first()
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("an agent")
+        ),
+        (total, 0) => format!("Working with {total} agents"),
+        (total, done) => format!("Working with {total} agents · {done} done"),
+    }
+}
+
 /// A group's heading: "2 agents working together · 1 done".
 fn group_line(total: usize, ended: usize) -> String {
     if ended == total {
@@ -315,8 +340,16 @@ fn file_name(path: &str) -> &str {
 /// The running work, a row per run (runs one request started together
 /// under one heading): its state, name and step, its time, and Stop while
 /// it runs. A run's row opens its view: what it did, step by step.
-fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
-    let rows = computed(move || runs.with(|runs| work_rows(runs)));
+fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>, headed: Memo<bool>) -> View {
+    let rows = computed(move || {
+        let headed = headed.get();
+        runs.with(|runs| {
+            work_rows(runs)
+                .into_iter()
+                .filter(|row| !(headed && matches!(row, WorkRow::Group { .. })))
+                .collect::<Vec<_>>()
+        })
+    });
     view()
         .items_center()
         .px_4()
@@ -1792,6 +1825,12 @@ fn live(store: Store, session: String) -> View {
                 } else {
                     format!("Waiting for {waiting} approvals")
                 };
+            }
+            // While agents it started run, this line heads them (their
+            // rows sit under it): it says how many and how far along, not
+            // the last thing one of them reported.
+            if let Some(work) = store.agent_work(&session) {
+                return working_with(&work);
             }
             store
                 .live(&session)
