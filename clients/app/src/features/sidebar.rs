@@ -415,13 +415,14 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
 }
 
 /// New conversation from the sidebar: inside a project's page it starts
-/// there.
+/// there. At once, not after a drawer's slide (`Store::leave_drawer`):
+/// its composer must take the focus inside the tap, the only place iOS
+/// Safari raises the keyboard for it; the page is a light one.
 fn new_here(store: Store) {
-    let view = untracked(|| store.sidebar_view());
-    store.leave_drawer(move || match view {
+    match untracked(|| store.sidebar_view()) {
         SidebarView::Project(id) => store.new_in_project(Some(id)),
         _ => store.with_keyboard(|| store.select(None)),
-    });
+    }
 }
 
 /// Home lists every project up to this many; past it, the pinned and the
@@ -612,9 +613,9 @@ fn project_row(store: Store, id: String, reorder: Option<Reorder>) -> View {
         "Pin to the top"
     };
     let actions = vec![
+        // At once, as `new_here`: the keyboard comes up inside the tap.
         ui::MenuAction::new("New conversation here", move || {
-            let start = start.clone();
-            store.leave_drawer(move || store.new_in_project(Some(start)))
+            store.new_in_project(Some(start.clone()))
         }),
         ui::MenuAction::new(pin_label, move || store.toggle_project_pin(&pin)),
         ui::MenuAction::new("Move up", move || store.move_project_by(&up, -1))
@@ -960,21 +961,16 @@ fn project_page(store: Store, id: String, ids: Memo<Vec<String>>) -> View {
         // a new Code conversation in this project's folder.
         .child(when(ui::touch(), move || {
             let start = empty.clone();
-            row(
-                || false,
-                move || {
-                    let start = start.clone();
-                    store.leave_drawer(move || store.new_in_project(Some(start)))
-                },
-            )
-            .accessibility_label("New conversation in this project")
-            .child(icon(Glyph::Compose).text_color(colors::MUTED))
-            .child(
-                text("New conversation")
-                    .flex_1()
-                    .number_of_lines(1)
-                    .text_size(px(type_scale::BASE)),
-            )
+            // At once, as `new_here`: the keyboard comes up inside the tap.
+            row(|| false, move || store.new_in_project(Some(start.clone())))
+                .accessibility_label("New conversation in this project")
+                .child(icon(Glyph::Compose).text_color(colors::MUTED))
+                .child(
+                    text("New conversation")
+                        .flex_1()
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::BASE)),
+                )
         }))
         .child(when(
             move || mine.with(Vec::is_empty),

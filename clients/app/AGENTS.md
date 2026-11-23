@@ -1,7 +1,9 @@
 # clients/app: agent guide
 
-The AIDaemon app: one Rust crate on Native Shell (nsh 0.6.1 from
-crates.io; CI and releases pin the same nsh CLI version) for desktop, web,
+The AIDaemon app: one Rust crate on Native Shell (nsh 0.6.1 from the
+fork `davo20019/nsh`, branch `v0.6.1-web-autofocus`, pinned by `rev` in
+`Cargo.toml` until a release has longbridge/nsh#2889; CI and releases pin
+the 0.6.1 nsh CLI and check the web build took the fork) for desktop, web,
 terminal, iOS and Android. `CLAUDE.md` is a symlink to this file.
 It is its own Cargo workspace; the root workspace excludes it, so the
 root's `cargo test`/clippy never build it. Run its checks here.
