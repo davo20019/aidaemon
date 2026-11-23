@@ -2261,7 +2261,7 @@ impl Client {
 
     /// Every helper run on record (protocol 1.46), oldest first.
     pub fn runs(&self) -> Vec<aidaemon_client_protocol::RunSummary> {
-        let mut runs: Vec<_> = self.state.runs.values().cloned().collect();
+        let mut runs: Vec<_> = self.state.all_runs().cloned().collect();
         runs.sort_by_key(|run| run.started_at_ms);
         runs
     }

@@ -673,6 +673,75 @@ async fn a_background_cli_run_is_listed_for_its_chat_and_stops() {
     assert!(tool.background_jobs("session-cli-jobs").await.is_empty());
 }
 
+/// A continuation runtime that counts how often a run's end wakes it.
+#[derive(Default)]
+struct CountingRuntime(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl ConversationRuntime for CountingRuntime {
+    async fn continue_conversation(
+        &self,
+        _request: ConversationRequest,
+    ) -> anyhow::Result<aidaemon_channels::ports::AgentResponseEnvelope> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::bail!("not answered in this test")
+    }
+
+    async fn record_continuation_delivery(
+        &self,
+        _session_id: &str,
+        _delivery: aidaemon_events::ResponseDeliveryData,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Live 2026-11-23: the owner pressed Stop on a background Codex run in
+/// the app; its card said "Stopped by you", then its chat woke up and
+/// started the work again. A run the owner stopped ends on its card and
+/// wakes nothing.
+#[tokio::test]
+async fn a_run_the_owner_stops_does_not_wake_its_chat() {
+    let (tool, _db) = setup_bash_tool().await;
+    let runs = Arc::new(crate::run_state::RunStates::default());
+    tool.set_runs(runs.clone());
+    let counting = Arc::new(CountingRuntime::default());
+    let runtime: Arc<dyn ConversationRuntime> = counting.clone();
+    tool.set_agent(Arc::downgrade(&runtime));
+    let facts = aidaemon_tools::testing::call_facts("app:synthetic-stop");
+    tool.outcome_with_facts(
+        r#"{"action":"run","tool":"bash-agent","prompt":"sleep 30","async_mode":true}"#,
+        None,
+        false,
+        &facts,
+    )
+    .await
+    .unwrap();
+    let jobs = tool.background_jobs("app:synthetic-stop").await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let run_id = runs
+        .for_chat("app:synthetic-stop")
+        .into_iter()
+        .next()
+        .expect("its run")
+        .id;
+    // The app's Stop: the run is marked as the owner's stop, then ended.
+    runs.owner_stopping(&run_id);
+    assert!(tool.stop_background_job(&jobs[0].key).await);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline
+        && !runs
+            .for_chat("app:synthetic-stop")
+            .iter()
+            .any(crate::run_state::RunState::stopped_by_owner)
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Long enough for a continuation to have started.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// A CLI agent left running in the background is a run on its turn's
 /// one card: the reply names it in plain words (never the prompt), its
 /// latest output line is its step (never "(N min)"), it settles to its

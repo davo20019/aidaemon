@@ -709,6 +709,23 @@ impl ClientHost for DaemonClientHost {
         super::client_runs::run_detail(self.state.as_ref(), run_id).await
     }
 
+    fn keep_run(&self, run: &aidaemon_client_protocol::RunSummary) {
+        let pool = self.system.pool.clone();
+        let run = run.clone();
+        tokio::spawn(async move {
+            if let Err(error) = super::client_runs::keep(&pool, &run).await {
+                tracing::warn!(%error, run = %run.id, "Could not keep an ended run");
+            }
+        });
+    }
+
+    async fn past_runs(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<aidaemon_client_protocol::RunSummary>> {
+        super::client_runs::past(&self.system.pool, session_id).await
+    }
+
     async fn automations(
         &self,
     ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {

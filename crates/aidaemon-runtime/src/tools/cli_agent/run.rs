@@ -2048,8 +2048,15 @@ async fn deliver_end(
         // so, and nothing picks the work up again.
         crate::background_run::RunsTurn::Stopped => return,
         crate::background_run::RunsTurn::Answer(answer) => Some(answer),
+        // Its record says who stopped it: the owner's Stop marks it there,
+        // and the agent's own exit does not know.
         crate::background_run::RunsTurn::Alone
-            if !end.answer_alone || end.phase.stopped_by_owner() =>
+            if !end.answer_alone
+                || end.phase.stopped_by_owner()
+                || ended
+                    .as_ref()
+                    .and_then(|(state, _)| state.as_ref())
+                    .is_some_and(crate::run_state::RunState::stopped_by_owner) =>
         {
             return;
         }

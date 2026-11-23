@@ -2492,6 +2492,13 @@
               "description": "More, older messages exist.",
               "type": "boolean"
             },
+            "runs": {
+              "description": "The conversation's ended runs as the daemon kept them when each\nended (protocol 1.46): which agents ran and how each ended, past\na restart. A run the daemon still holds comes in its snapshot\nand events instead, which win.",
+              "items": {
+                "$ref": "#/$defs/RunSummary"
+              },
+              "type": "array"
+            },
             "session_id": {
               "type": "string"
             },

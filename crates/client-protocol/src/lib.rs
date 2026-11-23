@@ -865,6 +865,12 @@ pub enum CommandResult {
         /// More, older messages exist.
         #[serde(default)]
         more: bool,
+        /// The conversation's ended runs as the daemon kept them when each
+        /// ended (protocol 1.46): which agents ran and how each ended, past
+        /// a restart. A run the daemon still holds comes in its snapshot
+        /// and events instead, which win.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        runs: Vec<RunSummary>,
     },
     /// `clear_session` and `run_slash`: the command's reply.
     Reply {

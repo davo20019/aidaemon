@@ -435,24 +435,24 @@ impl TurnObserver for GatewayObserver {
             );
             return;
         }
-        self.publisher.publish(
-            session,
-            Event::RunUpdated {
-                run: run_summary(
-                    &change.session_id,
-                    &change.id,
-                    &change.view,
-                    RunRecord {
-                        activity: change.activity.as_deref(),
-                        agent: change.agent.as_deref(),
-                        group: change.group.as_deref(),
-                        edited: &change.edited,
-                        started_at: change.started_at,
-                        ended_at: change.ended_at,
-                    },
-                ),
+        let run = run_summary(
+            &change.session_id,
+            &change.id,
+            &change.view,
+            RunRecord {
+                activity: change.activity.as_deref(),
+                agent: change.agent.as_deref(),
+                group: change.group.as_deref(),
+                edited: &change.edited,
+                started_at: change.started_at,
+                ended_at: change.ended_at,
             },
         );
+        // An ended run stays in its conversation past a restart.
+        if run.ended_at_ms.is_some() {
+            self.host.keep_run(&run);
+        }
+        self.publisher.publish(session, Event::RunUpdated { run });
     }
 
     fn turn_finished(&self, turn: &TurnFinish<'_>) {

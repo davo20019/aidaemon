@@ -467,6 +467,24 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     ] {
         let _ = sqlx::query(statement).execute(pool).await;
     }
+    // Each ended run as the owner's apps were last told of it (a protocol
+    // `RunSummary`, as JSON): what a conversation shows of its runs past a
+    // restart.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS client_runs (
+            run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            ended_at_ms INTEGER NOT NULL,
+            data TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_client_runs_session ON client_runs(session_id, ended_at_ms)",
+    )
+    .execute(pool)
+    .await?;
     // What each launched agent did, in order: its typed events.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS cli_agent_events (

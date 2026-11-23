@@ -141,6 +141,53 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
     detail
 }
 
+/// How many ended runs a conversation's history brings back.
+const PAST_RUNS: i64 = 200;
+
+/// Keep `run` as it ended (`client_runs`): its last word replaces any
+/// earlier one.
+pub(crate) async fn keep(
+    pool: &sqlx::SqlitePool,
+    run: &aidaemon_client_protocol::RunSummary,
+) -> anyhow::Result<()> {
+    let Some(ended) = run.ended_at_ms else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO client_runs (run_id, session_id, ended_at_ms, data) VALUES (?, ?, ?, ?)
+         ON CONFLICT(run_id) DO UPDATE SET session_id = excluded.session_id,
+             ended_at_ms = excluded.ended_at_ms, data = excluded.data",
+    )
+    .bind(&run.id)
+    .bind(&run.session_id)
+    .bind(i64::try_from(ended).unwrap_or(i64::MAX))
+    .bind(serde_json::to_string(run)?)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Conversation `session_id`'s newest kept runs, oldest first. A record
+/// this build cannot read is left out.
+pub(crate) async fn past(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> anyhow::Result<Vec<aidaemon_client_protocol::RunSummary>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT data FROM client_runs WHERE session_id = ? ORDER BY ended_at_ms DESC LIMIT ?",
+    )
+    .bind(session_id)
+    .bind(PAST_RUNS)
+    .fetch_all(pool)
+    .await?;
+    let mut runs: Vec<aidaemon_client_protocol::RunSummary> = rows
+        .into_iter()
+        .filter_map(|(data,)| serde_json::from_str(&data).ok())
+        .collect();
+    runs.sort_by_key(|run| run.started_at_ms);
+    Ok(runs)
+}
+
 /// A stored event time (SQLite's `datetime('now')`, UTC) in ms.
 fn at_ms(at: &str) -> Option<u64> {
     let at = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M:%S").ok()?;
@@ -219,5 +266,35 @@ mod tests {
         assert_eq!(detail.plan[1].status, RunPlanStatus::InProgress);
         assert_eq!(detail.permissions[0].outcome, RunPermissionOutcome::Allowed);
         assert_eq!(detail.usage.as_ref().map(|u| u.output_tokens), Some(30));
+    }
+
+    #[tokio::test]
+    async fn an_ended_run_is_kept_for_its_conversation() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE client_runs (run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+             ended_at_ms INTEGER NOT NULL, data TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut run: aidaemon_client_protocol::RunSummary =
+            serde_json::from_value(serde_json::json!({
+                "id": "cli-agent-1", "session_id": "app:synthetic", "label": "Review",
+                "agent": "Codex", "phase": "running", "background": true,
+                "started_at_ms": 1000, "group": "task-1"
+            }))
+            .unwrap();
+        // Running: nothing kept yet.
+        keep(&pool, &run).await.unwrap();
+        assert!(past(&pool, "app:synthetic").await.unwrap().is_empty());
+        run.phase = aidaemon_client_protocol::RunPhase::Succeeded;
+        run.ended_at_ms = Some(5000);
+        run.edited = vec!["/w/synthetic/review.md".into()];
+        keep(&pool, &run).await.unwrap();
+        keep(&pool, &run).await.unwrap();
+        let kept = past(&pool, "app:synthetic").await.unwrap();
+        assert_eq!(kept, vec![run]);
+        assert!(past(&pool, "app:other").await.unwrap().is_empty());
     }
 }

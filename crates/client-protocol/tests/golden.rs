@@ -1005,6 +1005,7 @@ fn server_samples() -> Vec<ServerFrame> {
                 },
             ],
             more: true,
+            runs: Vec::new(),
         }),
         ack(CommandResult::Reply {
             text: "Nothing is running in this chat right now.".into(),

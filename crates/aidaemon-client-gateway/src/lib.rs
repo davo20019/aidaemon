@@ -278,6 +278,20 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no projects".to_string())
     }
 
+    /// Keep `run` as it ended, for its conversation's history
+    /// ([`Self::past_runs`]). Called inline as the run ends: hand the write
+    /// off rather than wait on it.
+    fn keep_run(&self, _run: &aidaemon_client_protocol::RunSummary) {}
+
+    /// Conversation `session_id`'s ended runs as [`Self::keep_run`] kept
+    /// them, oldest first.
+    async fn past_runs(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<Vec<aidaemon_client_protocol::RunSummary>> {
+        Ok(Vec::new())
+    }
+
     /// What run `run_id` did, as its record keeps it (`get_run`).
     async fn run_detail(
         &self,
@@ -2301,10 +2315,24 @@ impl ClientGateway {
         }
         let more = messages.len() > limit;
         let messages = messages.split_off(messages.len().saturating_sub(limit));
+        // Its ended runs, from the first message shown on: older ones
+        // belong to older pages.
+        let from = messages.first().map_or(0, |m| m.at_ms);
+        let runs = match self.host.past_runs(&session_id).await {
+            Ok(runs) => runs
+                .into_iter()
+                .filter(|run| run.ended_at_ms.unwrap_or(run.started_at_ms) >= from)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "Could not read a conversation's past runs");
+                Vec::new()
+            }
+        };
         Ok(CommandResult::History {
             session_id,
             messages,
             more,
+            runs,
         })
     }
 

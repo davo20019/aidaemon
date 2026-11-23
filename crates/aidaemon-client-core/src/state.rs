@@ -152,10 +152,16 @@ pub struct State {
     /// ([`MAX_ENDED_RUNS`] ended ones per conversation).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub runs: BTreeMap<String, RunSummary>,
+    /// Ended runs a conversation's history brought back, by id: as the
+    /// daemon kept them when each ended, past a restart. A snapshot does
+    /// not clear them; a run in [`Self::runs`] wins over its kept record.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub past_runs: BTreeMap<String, RunSummary>,
 }
 
-/// How many ended runs a conversation keeps on show.
-pub const MAX_ENDED_RUNS: usize = 5;
+/// How many ended runs a conversation keeps on show from the daemon's
+/// live records (its history brings back the rest).
+pub const MAX_ENDED_RUNS: usize = 50;
 
 /// The agent needs a feature that is off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -355,8 +361,14 @@ impl State {
             CommandResult::History {
                 session_id,
                 messages,
+                runs,
                 ..
-            } => self.set_history(&session_id, messages),
+            } => {
+                for run in runs {
+                    self.past_runs.insert(run.id.clone(), run);
+                }
+                self.set_history(&session_id, messages)
+            }
             CommandResult::Stopped { report } | CommandResult::Reply { text: report } => {
                 self.notice = Some(report)
             }
@@ -697,11 +709,20 @@ impl State {
         }
     }
 
+    /// Every run on record: the daemon's live ones, then those a history
+    /// brought back that it no longer holds.
+    pub fn all_runs(&self) -> impl Iterator<Item = &RunSummary> {
+        self.runs.values().chain(
+            self.past_runs
+                .values()
+                .filter(|run| !self.runs.contains_key(&run.id)),
+        )
+    }
+
     /// A conversation's runs, oldest first.
     pub fn runs_for(&self, session_id: &str) -> Vec<&RunSummary> {
         let mut runs: Vec<&RunSummary> = self
-            .runs
-            .values()
+            .all_runs()
             .filter(|run| run.session_id == session_id)
             .collect();
         runs.sort_by_key(|run| run.started_at_ms);
@@ -968,6 +989,32 @@ mod tests {
         assert_eq!(runs.len(), MAX_ENDED_RUNS + 1);
         assert!(runs.iter().any(|run| run.id == "live"));
         assert!(!runs.iter().any(|run| run.id == "done-0"));
+    }
+
+    /// A conversation's history brings back its ended runs; a snapshot
+    /// keeps them, and a live record of the same run wins.
+    #[test]
+    fn a_history_brings_back_its_ended_runs() {
+        use aidaemon_client_protocol::RunPhase;
+        let mut state = State::default();
+        state.apply_result(CommandResult::History {
+            session_id: "app:s1".into(),
+            messages: Vec::new(),
+            more: false,
+            runs: vec![run("kept", RunPhase::Succeeded, 5)],
+        });
+        assert_eq!(state.runs_for("app:s1")[0].id, "kept");
+        state.apply(event(
+            Some(1),
+            Event::RunUpdated {
+                run: run("kept", RunPhase::Failed, 5),
+            },
+        ));
+        let runs = state.runs_for("app:s1");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].phase, RunPhase::Failed);
+        state.runs.clear();
+        assert_eq!(state.runs_for("app:s1")[0].phase, RunPhase::Succeeded);
     }
 
     /// A turn that hands its work to the background leaves the
