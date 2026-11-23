@@ -124,7 +124,7 @@ mod tests {
                 id: Some("i1".into()),
                 parent: None,
                 tool: StepTool::Run {
-                    program: Some("bash".into())
+                    program: Some("npm".into())
                 }
             })]
         );

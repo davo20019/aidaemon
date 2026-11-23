@@ -209,12 +209,23 @@ pub fn program_of(command: &str) -> Option<String> {
     const SETUP: &[&str] = &[
         "cd", "pushd", "popd", "export", "unset", "set", "source", ".", "alias", "umask",
     ];
+    // Shells that only run the command line they are given (`zsh -lc
+    // '...'`, as Codex wraps every command): machine format, command words.
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
     let words = shell_words::split(command).unwrap_or_else(|_| {
         command
             .split_whitespace()
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
+    if let [shell, flags, inner, ..] = words.as_slice()
+        && SHELLS.contains(&file_name(shell).as_str())
+        && flags.starts_with('-')
+        && flags.contains('c')
+        && let Some(program) = program_of(inner)
+    {
+        return Some(program);
+    }
     let mut first: Option<String> = None;
     let mut at_start = true;
     for word in words {
@@ -285,6 +296,11 @@ mod tests {
             Some("cargo")
         );
         assert_eq!(program_of("cd /w/x").as_deref(), Some("cd"));
+        assert_eq!(
+            program_of("/bin/zsh -lc 'cd /w/x && pytest -q'").as_deref(),
+            Some("pytest")
+        );
+        assert_eq!(program_of("bash script.sh").as_deref(), Some("bash"));
         assert_eq!(
             StepTool::Run {
                 program: program_of("git push origin HEAD")

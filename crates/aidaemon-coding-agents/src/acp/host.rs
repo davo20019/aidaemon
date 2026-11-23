@@ -83,6 +83,27 @@ pub fn initialize_line() -> String {
 
 /// The first string among `keys` in `value` (an agent's own field names
 /// for the same thing differ: a machine format, read field by field).
+/// The `rawInput` keys agents put a command and a URL under (ACP leaves
+/// `rawInput` to each agent; Gemini's agents use `CommandLine`).
+const COMMAND_KEYS: &[&str] = &["command", "CommandLine", "cmd"];
+const URL_KEYS: &[&str] = &["url", "Url", "URL"];
+
+/// The run's line for a `tool_call` update: its typed fields only.
+fn tool_call_line(update: &Value) -> String {
+    let input = update.get("rawInput");
+    json!({
+        "type": "tool_call",
+        "id": update.get("toolCallId"),
+        "title": update.get("title").and_then(Value::as_str).unwrap_or_default(),
+        "kind": update.get("kind"),
+        "status": update.get("status"),
+        "paths": locations(update),
+        "command": text_of(input, COMMAND_KEYS),
+        "url": text_of(input, URL_KEYS),
+    })
+    .to_string()
+}
+
 fn text_of(value: Option<&Value>, keys: &[&str]) -> Option<String> {
     let value = value?;
     keys.iter().find_map(|key| match value.get(*key)? {
@@ -142,7 +163,7 @@ pub fn actions(tool_call: &Value, working_dir: Option<&str>) -> Result<Vec<Agent
     let none = |what: &str| format!("its `{kind}` request names no {what}");
     Ok(match kind {
         "execute" => vec![AgentAction::RunCommand {
-            command: text_of(input, &["command", "CommandLine", "cmd"])
+            command: text_of(input, COMMAND_KEYS)
                 .or_else(|| (!title.is_empty()).then(|| title.to_string()))
                 .ok_or_else(|| none("command"))?,
             working_dir: text_of(input, &["cwd", "Cwd", "directory", "workdir"])
@@ -176,7 +197,7 @@ pub fn actions(tool_call: &Value, working_dir: Option<&str>) -> Result<Vec<Agent
             path: paths.into_iter().next(),
         }],
         "fetch" => vec![AgentAction::Fetch {
-            url: text_of(input, &["url", "Url", "URL"]).ok_or_else(|| none("URL"))?,
+            url: text_of(input, URL_KEYS).ok_or_else(|| none("URL"))?,
         }],
         other => {
             return Err(format!(
@@ -357,19 +378,7 @@ impl AcpHost {
             // run's reader records the step without reading its title.
             "tool_call" => {
                 state.message.clear();
-                vec![
-                    json!({
-                        "type": "tool_call",
-                        "id": update.get("toolCallId"),
-                        "title": update.get("title").and_then(Value::as_str).unwrap_or_default(),
-                        "kind": update.get("kind"),
-                        "status": update.get("status"),
-                        "paths": locations(update),
-                        "command": update.pointer("/rawInput/command"),
-                        "url": update.pointer("/rawInput/url"),
-                    })
-                    .to_string(),
-                ]
+                vec![tool_call_line(update)]
             }
             "tool_call_update" => match update.get("status").and_then(Value::as_str) {
                 Some(status @ ("completed" | "failed")) => vec![
@@ -564,6 +573,17 @@ mod tests {
         // Unknown kinds and changes naming no file are refused.
         assert!(actions(&json!({"kind": "other", "title": "send mail"}), None).is_err());
         assert!(actions(&json!({"kind": "edit"}), None).is_err());
+    }
+
+    #[test]
+    fn a_tool_calls_line_carries_its_command_under_any_agents_key() {
+        let line = tool_call_line(&json!({
+            "sessionUpdate": "tool_call", "toolCallId": "call_9", "kind": "execute",
+            "rawInput": {"CommandLine": "python3 -m pytest -q", "WaitMsBeforeAsync": 5000}
+        }));
+        let events = super::super::events::read_events(&line);
+        assert!(matches!(&events[0], crate::AgentEvent::Step(step)
+            if step.tool == crate::StepTool::Run { program: Some("python3".into()) }));
     }
 
     #[test]
