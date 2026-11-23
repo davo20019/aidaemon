@@ -401,6 +401,11 @@ pub trait OutboundRouter: Send + Sync {
     async fn delete_message(&self, _session_id: &str, _message_id: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
+    /// The session's chat shows each background run as its own row
+    /// ([`crate::hub::HubChannel::shows_runs`]).
+    async fn shows_runs(&self, _session_id: &str) -> bool {
+        false
+    }
     /// The plan card a turn left in the session's chat, if the channel keeps
     /// one; the default suits routers without plan cards.
     async fn checklist_surface(&self, _session_id: &str) -> Option<String> {

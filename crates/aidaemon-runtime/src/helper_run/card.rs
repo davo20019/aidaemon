@@ -266,6 +266,16 @@ pub fn show_helper_steps_on_card(
     Some(tx)
 }
 
+/// Whether `chat` shows its background runs as their own rows, kept with
+/// how each ended and its time (the app's clients): there a run's result
+/// says only what it found, as under a card.
+pub async fn chat_shows_runs(hub: Option<&Weak<dyn OutboundRouter>>, chat: &str) -> bool {
+    match hub.and_then(Weak::upgrade) {
+        Some(hub) => hub.shows_runs(chat).await,
+        None => false,
+    }
+}
+
 /// A background run ended: settle the checklist steps it was given, then
 /// redraw its own card (the one its starting turn kept) from the records:
 /// the plan and every run drawn on that card. Once nothing on the card is

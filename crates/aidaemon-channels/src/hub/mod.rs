@@ -143,6 +143,13 @@ pub trait HubChannel: Send + Sync {
     /// Channel capabilities — used to adapt output format.
     fn capabilities(&self) -> ChannelCapabilities;
 
+    /// Its chats show each background run as its own row, kept with how it
+    /// ended and its time (the app's run rows, from the run records): a
+    /// run's result there need not say how it ended.
+    fn shows_runs(&self) -> bool {
+        false
+    }
+
     /// Send a text message to a session.
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
 

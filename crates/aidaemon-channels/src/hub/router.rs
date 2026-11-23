@@ -1074,6 +1074,12 @@ impl OutboundRouter for ChannelHub {
         ChannelHub::send_text(self, session_id, text).await
     }
 
+    async fn shows_runs(&self, session_id: &str) -> bool {
+        self.routed_channel(session_id)
+            .await
+            .is_some_and(|(channel, _)| channel.shows_runs())
+    }
+
     async fn send_text_tracked(
         &self,
         session_id: &str,

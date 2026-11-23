@@ -350,7 +350,8 @@ impl BackgroundRun {
             job_end(phase, None),
             false,
         )
-        .await;
+        .await
+            || crate::helper_run::card::chat_shows_runs(self.home.hub.as_ref(), &self.chat).await;
         (Some(ended), on_card)
     }
 
@@ -460,6 +461,94 @@ mod tests {
             "{}\nThen I checked the logs.",
             started_in_background("x")
         )));
+    }
+
+    /// A chat that shows each run as its own row (the app's clients).
+    struct RowsHub;
+
+    #[async_trait::async_trait]
+    impl OutboundRouter for RowsHub {
+        async fn send_text(&self, _session_id: &str, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_text_tracked(
+            &self,
+            _session_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn edit_text(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn send_media(
+            &self,
+            _session_id: &str,
+            _media: &aidaemon_channels::hub::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_media_strict(
+            &self,
+            _session_id: &str,
+            _media: &aidaemon_channels::hub::MediaMessage,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn shows_runs(&self, _session_id: &str) -> bool {
+            true
+        }
+        async fn request_inline_approval(
+            &self,
+            _session_id: &str,
+            _description: &str,
+            _risk_level: aidaemon_tools::semantics::RiskLevel,
+            _warnings: &[String],
+            _permission_mode: aidaemon_tools::semantics::PermissionMode,
+        ) -> anyhow::Result<aidaemon_tools::semantics::ApprovalResponse> {
+            anyhow::bail!("no approvals in this test")
+        }
+        async fn register_session_route(&self, _child: &str, _parent: &str) -> bool {
+            true
+        }
+        async fn unregister_session_route(&self, _child: &str, _parent: &str) {}
+    }
+
+    /// Live 2026-11-23: the app's reply began "✅ Finished in the
+    /// background: …" right under the run's own row that said so. Where the
+    /// chat shows its runs as rows, a run's result is what it found alone;
+    /// elsewhere it still says how the run ended.
+    #[tokio::test]
+    async fn a_chat_with_run_rows_gets_the_result_without_its_end_line() {
+        let hub: Arc<dyn OutboundRouter> = Arc::new(RowsHub);
+        for (rows, header) in [(true, false), (false, true)] {
+            let home = RunHome {
+                runs: Arc::new(RunStates::default()),
+                hub: rows.then(|| Arc::downgrade(&hub)),
+                plans: None,
+            };
+            let run = BackgroundRun::start(
+                home,
+                RunStart {
+                    id: "cli-agent-rows",
+                    chat: "app:synthetic-rows",
+                    label: "One-line note",
+                    task_id: None,
+                    status_tx: None,
+                    work_began: Utc::now(),
+                },
+            )
+            .await;
+            let (state, on_card) = run.finish(RunEnd::Succeeded, RunEvidence::default()).await;
+            let result = run.result(state.as_ref(), "Wrote the note.", on_card);
+            assert_eq!(result.contains("One-line note"), header, "{result}");
+            assert!(result.contains("Wrote the note."), "{result}");
+        }
     }
 
     /// A command and a CLI agent one turn left running are one group: the

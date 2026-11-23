@@ -289,7 +289,8 @@ pub async fn deliver_when_run_ends(
         job_end(state.phase, state.failure.as_ref()),
         answer_follows,
     )
-    .await;
+    .await
+        || super::card::chat_shows_runs(route.hub.as_ref(), &state.chat).await;
     let message = render_run_result(
         &state,
         &route.name,

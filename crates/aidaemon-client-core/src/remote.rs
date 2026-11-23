@@ -170,6 +170,14 @@ pub(crate) async fn connection(
     Ok(conn)
 }
 
+/// Dial `url`'s daemon ahead of the first request, so the relay and the
+/// connection are up by then: a page that loads knowing the daemon's address
+/// starts this before its app has started. A connection already open is
+/// kept; a request made meanwhile waits for this dial and takes it.
+pub async fn dial(url: &str, dialer: &Dialer) -> Result<(), SignInError> {
+    connection(&parse(url)?, dialer).await.map(drop)
+}
+
 /// Forget the connection to `url`'s daemon, so the next call dials again.
 pub(crate) async fn forget(url: &RemoteUrl, dialer: &Dialer) {
     connections()

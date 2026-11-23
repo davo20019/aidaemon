@@ -720,6 +720,11 @@ impl HubChannel for AppChannel {
         }
     }
 
+    /// The app shows each run as its own row (protocol 1.46 run records).
+    fn shows_runs(&self) -> bool {
+        true
+    }
+
     async fn send_text(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         self.say(session_id, text.to_string());
         Ok(())
