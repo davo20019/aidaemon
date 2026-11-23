@@ -13,7 +13,7 @@ use aidaemon_client_core::machine::Update;
 use aidaemon_client_core::state::{Line, LiveTurn, SessionView, ViewRequest};
 use aidaemon_client_protocol::{
     AgentMode, Approval, ApprovalDecision, AttachmentRef, Command, Feature, MemoryItem, MidRun,
-    ProjectSummary, SessionChanges, Settings, SettingsChange, SetupAction, SetupState,
+    ProjectSummary, RunSummary, SessionChanges, Settings, SettingsChange, SetupAction, SetupState,
     SlashCommand, TaskSummary,
 };
 use aidaemon_client_protocol::{Pane, ViewAction};
@@ -220,6 +220,7 @@ struct Reads {
     bots: Memo<Vec<Bot>>,
     approvals: Memo<Vec<Approval>>,
     running: Memo<Vec<TaskSummary>>,
+    runs: Memo<Vec<RunSummary>>,
     notice: Memo<Option<String>>,
     session_ids: Memo<Vec<String>>,
     unread: Memo<BTreeSet<String>>,
@@ -308,6 +309,7 @@ impl Reads {
             bots: computed(move || client.with(Client::bots)),
             approvals: computed(move || client.with(Client::approvals)),
             running: computed(move || client.with(Client::running)),
+            runs: computed(move || client.with(Client::runs)),
             notice: computed(move || client.with(|c| c.state.notice.clone())),
             session_ids: computed(move || {
                 list_rev.get();
@@ -2496,10 +2498,11 @@ impl Store {
 
     /// The shell's second hand.
     pub fn advance_tick(&self) {
-        if self
-            .client
-            .with_untracked(|c| !c.state.tasks.is_empty() || c.connection.is_offline())
-        {
+        if self.client.with_untracked(|c| {
+            !c.state.tasks.is_empty()
+                || c.state.runs.values().any(|run| run.phase.is_running())
+                || c.connection.is_offline()
+        }) {
             self.tick.update(|t| *t += 1);
         }
     }
@@ -2786,6 +2789,16 @@ impl Store {
 
     pub fn running(&self) -> Vec<TaskSummary> {
         self.reads.running.get()
+    }
+
+    /// Conversation `session`'s helper runs, oldest first.
+    pub fn runs_for(&self, session: &str) -> Vec<RunSummary> {
+        self.reads
+            .runs
+            .get()
+            .into_iter()
+            .filter(|run| run.session_id == session)
+            .collect()
     }
 
     pub fn notice(&self) -> Option<String> {

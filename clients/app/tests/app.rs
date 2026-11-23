@@ -3,7 +3,7 @@
 
 use aidaemon_client_core::Update;
 use aidaemon_client_protocol::ServerFrame;
-use nsh_app_aidaemon::{Offline, feed, fed, sent};
+use nsh_app_aidaemon::{Offline, fed, feed, sent};
 use nsh_engine::{EngineConfig, Points, Root, Size};
 use nsh_testing::Headless;
 
@@ -725,6 +725,38 @@ fn a_snapshot_mid_turn_shows_what_the_turn_is_doing() -> Result<(), String> {
     // Stop is the composer's round button while it is empty.
     app.wait_for("label:Stop")?;
     assert!(app.press("Cancel").is_err());
+    Ok(())
+}
+
+/// Work handed to the background is never silent: a launched agent's run
+/// shows over the composer with what it is doing and how long it has run,
+/// Stop stops it, and once it ends the row says how it ended.
+#[test]
+fn a_background_run_shows_its_step_and_its_end() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-runs","channel":"app","title":"Prepare the synthetic release","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Claude Code: prepare the release","phase":"running","background":true,"started_at_ms":1}]}}"#,
+        ),
+    ]);
+    settle(&mut app)?;
+    app.press("Prepare the synthetic release >> nth=0")?;
+    app.wait_for("text:Claude Code: prepare the release")?;
+    feed([frame(
+        r#"{"type":"event","seq":null,"at_ms":2,"session_id":"app:synthetic-runs","event":{"type":"run_step","run_id":"cli-agent-r1","session_id":"app:synthetic-runs","step":"Running a command","at_ms":2}}"#,
+    )]);
+    app.wait_for("text:Claude Code: prepare the release · Running a command")?;
+    let before = sent("cancel_task");
+    app.press("text:Stop")?;
+    wait_sent_new("cancel_task", before)?;
+    feed([frame(
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-runs","event":{"type":"run_updated","run":{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Claude Code: prepare the release","phase":"stopped","background":true,"started_at_ms":1,"ended_at_ms":9999999999999,"took":"Took 4m 2s","stopped_by_owner":true}}}"#,
+    )]);
+    app.wait_for("text:Claude Code: prepare the release · Stopped by you")?;
+    app.wait_for("text:Took 4m 2s")?;
     Ok(())
 }
 

@@ -3,7 +3,9 @@
 //! conversation is the same page with no session yet.
 
 use aidaemon_client_core::state::Line;
-use aidaemon_client_protocol::{AttachmentRef, MidRun, ServedBy, ToolCallInfo};
+use aidaemon_client_protocol::{
+    AttachmentRef, MidRun, RunPhase, RunSummary, ServedBy, ToolCallInfo,
+};
 use nsh_base::{
     MarkdownOptions, TextViewLinks, TextViewPart, TextViewParts, button, input, text_view,
 };
@@ -157,12 +159,133 @@ pub fn page(store: Store, session: Option<String>) -> View {
         })
 }
 
+/// How long an ended run stays on show over the composer.
+const ENDED_RUN_SHOWN_MS: u64 = 10 * 60 * 1000;
+
 /// This conversation's work running in the background, over the composer
-/// where the eye already is: what it is, how long it has run, Cancel.
+/// where the eye already is: what it is, what it is doing, how long it has
+/// run, Stop; for a while after it ended, how it ended. From the daemon's
+/// run records (protocol 1.46); an older daemon's task list otherwise.
 fn running_work(store: Store, session: Option<String>) -> View {
     let Some(session) = session else {
         return view();
     };
+    let runs = {
+        let session = session.clone();
+        computed(move || {
+            let now = crate::store::now_ms();
+            store
+                .runs_for(&session)
+                .into_iter()
+                .filter(|run| {
+                    run.phase.is_running()
+                        || run
+                            .ended_at_ms
+                            .is_some_and(|ended| now.saturating_sub(ended) < ENDED_RUN_SHOWN_MS)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let has_runs = {
+        let session = session.clone();
+        computed(move || !store.runs_for(&session).is_empty())
+    };
+    view()
+        .child(when(move || has_runs.get(), move || run_rows(store, runs)))
+        .child(when(
+            move || !has_runs.get(),
+            move || task_rows(store, session.clone()),
+        ))
+}
+
+/// One row per run: its state, name and step, its time, and Stop while it
+/// runs. Every word comes from the run's record.
+fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
+    view().items_center().px_4().gap_1().child(each(
+        runs,
+        |run| run.id.clone(),
+        move |run, _| {
+            let id = run.with_untracked(|r| r.id.clone());
+            let running = computed(move || run.with(|r| r.phase.is_running()));
+            let line = computed(move || {
+                run.with(|r| {
+                    let state = match r.phase {
+                        RunPhase::Running if r.step.is_empty() => String::new(),
+                        RunPhase::Running => r.step.clone(),
+                        RunPhase::Succeeded => "Finished".into(),
+                        RunPhase::Failed => match &r.reason {
+                            Some(why) => format!("Failed: {why}"),
+                            None => "Failed".into(),
+                        },
+                        RunPhase::Stopped if r.stopped_by_owner => "Stopped by you".into(),
+                        RunPhase::Stopped => match &r.reason {
+                            Some(why) => format!("Stopped: {why}"),
+                            None => "Stopped".into(),
+                        },
+                        RunPhase::Unknown => String::new(),
+                    };
+                    if state.is_empty() {
+                        r.label.clone()
+                    } else {
+                        format!("{} · {state}", r.label)
+                    }
+                })
+            });
+            let color = move || {
+                run.with(|r| match r.phase {
+                    RunPhase::Running | RunPhase::Unknown => colors::MUTED,
+                    RunPhase::Succeeded => colors::SUCCESS,
+                    RunPhase::Failed => colors::DANGER,
+                    RunPhase::Stopped => colors::WARNING,
+                })
+            };
+            view()
+                .w_full()
+                .max_w(px(size::COLUMN))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .pl_1()
+                .child(ui::icon(Glyph::Work).text_color(color))
+                .child(
+                    text(move || line.get())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .text_size(px(ui::fit::small()))
+                        .text_color(colors::MUTED),
+                )
+                // While it runs, how long so far (a clock tick a second);
+                // once it ended, how long it took, as the daemon worded it.
+                .child(
+                    text(move || {
+                        store.tick();
+                        run.with(|r| match (&r.took, r.phase.is_running()) {
+                            (_, true) => ui::time::span(
+                                crate::store::now_ms().saturating_sub(r.started_at_ms) / 1000,
+                            ),
+                            (Some(took), false) => took.clone(),
+                            (None, false) => String::new(),
+                        })
+                    })
+                    .number_of_lines(1)
+                    .tabular_nums()
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+                )
+                .child(when(
+                    move || running.get(),
+                    move || {
+                        let id = id.clone();
+                        ui::btn("Stop", Variant::Ghost, Size::Sm, move || store.cancel(&id))
+                    },
+                ))
+        },
+    ))
+}
+
+/// An older daemon's background work: its task list.
+fn task_rows(store: Store, session: String) -> View {
     // While a turn runs, its own Stop stops everything it started (the
     // daemon lists the turn itself as a task too): one control at a time.
     // This is the work that outlives a turn.

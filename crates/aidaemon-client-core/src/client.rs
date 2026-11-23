@@ -2145,6 +2145,13 @@ impl Client {
         self.state.running().into_iter().cloned().collect()
     }
 
+    /// Every helper run on record (protocol 1.46), oldest first.
+    pub fn runs(&self) -> Vec<aidaemon_client_protocol::RunSummary> {
+        let mut runs: Vec<_> = self.state.runs.values().cloned().collect();
+        runs.sort_by_key(|run| run.started_at_ms);
+        runs
+    }
+
     /// Slash commands completing `draft`: it starts with `/` and has no
     /// space yet. At most eight, in the daemon's order.
     pub fn slash_matches(&self, draft: &str) -> Vec<SlashCommand> {
