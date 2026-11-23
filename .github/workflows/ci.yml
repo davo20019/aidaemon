@@ -26,6 +26,36 @@ permissions:
   contents: read
 
 jobs:
+  # Whether a pull request changes what the app is built from
+  # (scripts/ci-app-inputs.py): the app's jobs skip when it does not. The
+  # whole pull request against its base counts, not the last push, so a
+  # cancelled run never leaves an app change untested. Master runs them all.
+  changes:
+    name: What changed
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.app.outputs.app }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: app
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            echo "app=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t changed < <(git diff --name-only "$BASE...$HEAD")
+          if python3 scripts/ci-app-inputs.py --changed "${changed[@]}"; then
+            echo "app=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No change to what the app is built from: its jobs skip."
+            echo "app=false" >> "$GITHUB_OUTPUT"
+          fi
+
   release-tag-guard:
     name: Release tag guard
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -380,6 +410,8 @@ jobs:
 
   windows-app:
     name: Windows app build
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     # Its own workspace and build folder: alongside the daemon's build, not
@@ -662,6 +694,8 @@ jobs:
   # backend the binary links.
   app:
     name: App (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -719,6 +753,8 @@ jobs:
   # release.yml's env.
   web-app:
     name: App (web)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-24.04
     env:
       NSH_VERSION: "0.6.1"
@@ -783,6 +819,8 @@ jobs:
   # wasm-only API in a shared path fails here first.
   android-app:
     name: App (Android)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-24.04
     env:
       NSH_VERSION: "0.6.1"
@@ -832,6 +870,8 @@ jobs:
 
   ios-app:
     name: App (iOS simulator)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: macos-15
     env:
       NSH_VERSION: "0.6.1"
