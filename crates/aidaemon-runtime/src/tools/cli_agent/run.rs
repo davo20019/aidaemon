@@ -1550,7 +1550,10 @@ async fn watch_run(
     let run_for_task = shared.run_slot.clone();
     let task_id_for_notify = call.task_id.clone();
     let left_running_for_task = shared.left_running.clone();
-    let expects_change = !watched_for_task.is_empty();
+    // A run given paths to write was sent to change them, so ending with
+    // nothing changed is ending short. The owner's own follow-up is given
+    // its folder as leave to write, not as work: it may only answer.
+    let expects_change = !watched_for_task.is_empty() && !call.owner_follow_up;
     let auth_failed_for_task = shared.auth_failed.clone();
     let task_context = call.label.clone();
     let coding_agent_for_task = coding_agent;

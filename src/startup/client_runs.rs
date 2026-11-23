@@ -33,10 +33,20 @@ pub(crate) async fn run_detail(state: &dyn StateStore, run_id: &str) -> anyhow::
         });
     };
     let events = state.get_cli_agent_events(run.invocation).await?;
-    Ok(detail(run_id, run, &events))
+    let speaks = speaks_a_protocol(&run.agent_name);
+    Ok(detail(run_id, run, &events, speaks))
 }
 
-fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail {
+/// Whether agent `name`'s output is its protocol's stream (typed events),
+/// never a report in words: what it left when it did not finish is raw
+/// protocol data, even when it failed before reporting a step.
+fn speaks_a_protocol(name: &str) -> bool {
+    aidaemon_runtime::tools::agent_mode::agent_named(name)
+        .is_some_and(|agent| agent.reports_steps())
+}
+
+/// `speaks`: its agent's output is a protocol stream ([`speaks_a_protocol`]).
+fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool) -> RunDetail {
     let mut detail = RunDetail {
         run_id: run_id.to_string(),
         agent_session_id: run.agent_session,
@@ -51,7 +61,7 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
         result: run
             .output_summary
             .filter(|text| !text.trim().is_empty())
-            .filter(|_| run.success == Some(true) || events.is_empty()),
+            .filter(|_| run.success == Some(true) || !(speaks || !events.is_empty())),
         steps: Vec::new(),
         plan: Vec::new(),
         permissions: Vec::new(),
@@ -322,7 +332,7 @@ mod tests {
             ),
             event(8, "turn_ended", r#"{"failed":false}"#),
         ];
-        let detail = detail("cli-agent-1", run, &events);
+        let detail = detail("cli-agent-1", run, &events, false);
         assert_eq!(detail.agent_session_id.as_deref(), Some("thread-1"));
         assert!(detail.can_continue, "its agent kept the session it named");
         assert_eq!(detail.model.as_deref(), Some("synthetic-large"));
@@ -357,18 +367,24 @@ mod tests {
             thread: None,
         };
         let events = [event(1, "session", r#"{"id":"t-1","model":null}"#)];
+        // One that failed before reporting anything left its protocol's
+        // error line, not a report.
+        let mut early = run(Some(false));
+        early.agent_name = "agy".into();
+        early.output_summary = Some(r#"{"message":"Failed to start","type":"error"}"#.into());
+        assert_eq!(detail("cli-agent-9", early, &[], true).result, None);
         assert_eq!(
-            detail("cli-agent-8", run(Some(false)), &events).result,
+            detail("cli-agent-8", run(Some(false)), &events, false).result,
             None
         );
         assert!(
-            detail("cli-agent-8", run(Some(true)), &events)
+            detail("cli-agent-8", run(Some(true)), &events, false)
                 .result
                 .is_some()
         );
         // An agent read as plain text keeps what it printed.
         assert!(
-            detail("cli-agent-8", run(Some(false)), &[])
+            detail("cli-agent-8", run(Some(false)), &[], false)
                 .result
                 .is_some()
         );
