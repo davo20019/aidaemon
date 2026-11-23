@@ -106,6 +106,8 @@ pub(super) struct PreparedRun {
     keep_alive: Option<Box<dyn std::any::Any + Send>>,
     /// The prompt with its mission rules, before any enrichment.
     prompt: String,
+    /// What it was asked, without the daemon's mission rules.
+    task: String,
     final_prompt: String,
     /// Released on drop until the run is tracked in the task table, whose
     /// reaper and cancel paths then own it.
@@ -988,6 +990,9 @@ impl CliAgentTool {
         // daemon's to state.
         // Only a coding agent reads a mission: any other program is given
         // its prompt as is.
+        // What it was asked, as the parent wrote it: what its run view
+        // shows (the rules below are the daemon's, not the task).
+        let task = prompt.trim().to_string();
         let prompt_with_rules = if coding_agent.launch_arguments().is_some() {
             format!(
                 "{}\n\n{}",
@@ -1028,6 +1033,7 @@ impl CliAgentTool {
             host: host_starter,
             keep_alive,
             prompt: prompt.to_string(),
+            task,
             final_prompt,
             claim: claim_guard,
         }))
@@ -1300,7 +1306,7 @@ impl RunHandles {
         if invocation_id != 0
             && let Err(error) = self
                 .state
-                .note_cli_agent_task(invocation_id, &prep.prompt)
+                .note_cli_agent_task(invocation_id, &prep.task)
                 .await
         {
             warn!(%error, "Could not keep a coding agent's task on its invocation");
