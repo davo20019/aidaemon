@@ -57,13 +57,17 @@ pub fn run_view(store: Store, id: String) -> View {
                 .child(view().px_3().pb_4().gap_3().child(dynamic(move || {
                     let read = store.run_view();
                     // The files it changed, as its record has them so far.
-                    let (edited, coding) = summary.with(|run| {
-                        run.as_ref().map_or((Vec::new(), false), |run| {
-                            (run.edited.clone(), store.is_coding(&run.session_id))
+                    let (edited, coding, running) = summary.with(|run| {
+                        run.as_ref().map_or((Vec::new(), false, false), |run| {
+                            (
+                                run.edited.clone(),
+                                store.is_coding(&run.session_id),
+                                run.phase == RunPhase::Running,
+                            )
                         })
                     });
                     Some(untracked(move || match read {
-                        Read::Ready(detail) => body(store, detail, edited, coding),
+                        Read::Ready(detail) => body(store, detail, edited, coding, running),
                         Read::Failed(why) => note(format!("Could not read this run: {why}")),
                         _ => note("Reading what it did…".to_string()),
                     }))
@@ -104,7 +108,7 @@ fn note(words: String) -> View {
 
 /// `coding`: its conversation has a Changes tab, where each changed file
 /// opens its diff.
-fn body(store: Store, detail: RunDetail, edited: Vec<String>, coding: bool) -> View {
+fn body(store: Store, detail: RunDetail, edited: Vec<String>, coding: bool, running: bool) -> View {
     let mut page = view().gap_3().pt_2();
     if !detail.task.is_empty() {
         page = page.child(section(
@@ -130,7 +134,11 @@ fn body(store: Store, detail: RunDetail, edited: Vec<String>, coding: bool) -> V
         page = page.child(section("Plan", plan));
     }
     let steps = if detail.steps.is_empty() {
-        note("No steps were kept for this run.".to_string())
+        note(if running {
+            "No steps yet.".to_string()
+        } else {
+            "No steps were kept for this run.".to_string()
+        })
     } else {
         let mut steps = view().gap_1();
         for step in &detail.steps {
