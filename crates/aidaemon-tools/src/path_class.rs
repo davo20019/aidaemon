@@ -258,4 +258,34 @@ mod tests {
         assert!(classifier.is_sensitive(&own));
         assert!(!PathClassifier::default().is_sensitive(&own));
     }
+
+    // `DaemonPaths` as the daemon's file tools use it (moved from the
+    // daemon's `tools::file_policy`).
+    #[test]
+    fn sensitive_paths_are_classified() {
+        let paths = DaemonPaths::default();
+        for sensitive in [
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.env",
+            "/repo/.env.production/value",
+            "/repo/.dev.vars.local",
+            "/repo/.git/config",
+            "/repo/certificates/app.PEM",
+            "/repo/terraform.tfstate.backup",
+            "/home/user/.gnupg/key",
+        ] {
+            assert!(paths.is_sensitive(Path::new(sensitive)), "{sensitive}");
+        }
+        assert!(!paths.is_sensitive(Path::new("/home/user/code/main.rs")));
+        assert!(!paths.is_sensitive(Path::new("/repo/src/environment.rs")));
+    }
+
+    #[test]
+    fn the_daemons_own_files_are_protected_only_when_given() {
+        let own = Path::new("/synthetic/daemon/config.toml");
+        assert!(!DaemonPaths::default().is_sensitive(own));
+        let paths = DaemonPaths::new(vec![own.to_path_buf()]);
+        assert!(paths.is_sensitive(own));
+        assert!(paths.is_secret(own));
+    }
 }

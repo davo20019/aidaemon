@@ -21,6 +21,15 @@ mod read;
 mod workspace_backend;
 mod write;
 
+#[cfg(test)]
+mod edit_tests;
+#[cfg(test)]
+mod read_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod write_tests;
+
 pub use edit::EditFile;
 pub use guard::ProtectedPathGuard;
 pub use read::{MAX_READ_CHARS, ReadFile, render_read_file_output, render_read_file_output_within};
