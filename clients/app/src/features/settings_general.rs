@@ -3,8 +3,9 @@
 //! model on the Models tab. Every change is a `SettingsChange::Set` of the
 //! config key, so it takes the same path, approvals and refusals as the
 //! full list on the Advanced tab; AIdaemon's permission level and a coding
-//! agent's mode are `SettingsChange::SetPermissionLevel`,
-//! `SetAgentMode` and `AgentSameAsAidaemon` on that same path.
+//! agent's mode and model are `SettingsChange::SetPermissionLevel`,
+//! `SetAgentMode`, `AgentSameAsAidaemon` and `SetAgentModel` on that same
+//! path.
 
 use aidaemon_client_protocol::{
     AgentMode, AgentReadiness, CodingAgent, PermissionLevel, SecretText, Setting, Settings,
@@ -362,7 +363,7 @@ fn coding_agents(store: Store, agents: &[CodingAgent], level: Option<PermissionL
         .items_center()
         .justify_between()
         .gap_2()
-        .child(section_label("Coding agent permissions"))
+        .child(section_label("Coding agents"))
         .child(ui::btn(
             "Check again",
             Variant::Ghost,
@@ -463,6 +464,9 @@ fn coding_agent(store: Store, agent: &CodingAgent, level: Option<PermissionLevel
     if agent.mode.is_none() {
         row = row.child(muted("Not allowed to run delegated work yet."));
     }
+    if agent.takes_model {
+        row = row.child(shown(agent_model(store, agent, available)));
+    }
     if let Some(level) = level {
         if agent.capped {
             row = row.child(muted(format!(
@@ -490,6 +494,87 @@ fn coding_agent(store: Store, agent: &CodingAgent, level: Option<PermissionLevel
         ));
     }
     row
+}
+
+/// The pick that leaves an agent on its own default model (no model id
+/// has parentheses).
+const OWN_MODEL: &str = "(default)";
+
+/// The model an agent works with: one of those it listed, or any id typed
+/// for one that lists none. Its own default is always a choice, named
+/// when it said which it is.
+fn agent_model(store: Store, agent: &CodingAgent, available: bool) -> View {
+    let name_of = |id: &str| {
+        agent
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .map_or_else(|| id.to_owned(), |model| model.name.clone())
+    };
+    let own = match &agent.default_model {
+        Some(id) => format!("Its default ({})", name_of(id)),
+        None => "Its default".to_owned(),
+    };
+    let label = format!("{} model", agent.program);
+    let name = agent.name.clone();
+    let picker = if agent.models.is_empty() {
+        // It lists none: any id it knows, typed; empty is its own.
+        let typed = signal(agent.model.clone().unwrap_or_default());
+        let save = {
+            let name = name.clone();
+            move || store.set_agent_model(name.clone(), Some(typed.get_untracked()))
+        };
+        view()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(
+                ui::field("Its default", typed)
+                    .label(label)
+                    .flex_1()
+                    .max_w(px(if ui::touch() { f32::MAX } else { 360.0 })),
+            )
+            .child(ui::btn("Save", Variant::Outline, Size::Sm, save).disabled(!available))
+    } else {
+        let mut items = vec![(OWN_MODEL.to_owned(), own.clone())];
+        items.extend(
+            agent
+                .models
+                .iter()
+                .map(|model| (model.id.clone(), model.name.clone())),
+        );
+        // A choice it no longer lists still shows as chosen.
+        if let Some(chosen) = &agent.model
+            && !agent.models.iter().any(|model| &model.id == chosen)
+        {
+            items.push((chosen.clone(), chosen.clone()));
+        }
+        // The choice closure must be `Copy`: the chosen id in a signal.
+        let current = signal(agent.model.clone().unwrap_or_else(|| OWN_MODEL.to_owned()));
+        view().flex_row().child(
+            ui::choice(
+                label,
+                "Choose a model",
+                items,
+                move || Some(current.get()),
+                move |next: Option<String>| {
+                    let model = next.filter(|id| id != OWN_MODEL);
+                    store.set_agent_model(name.clone(), model);
+                },
+            )
+            .disabled(!available)
+            .flex_1()
+            .max_w(px(if ui::touch() { f32::MAX } else { 360.0 })),
+        )
+    };
+    let mut part = view().gap_1().child(faint("Model")).child(picker);
+    if agent.models.is_empty() {
+        part = part.child(faint(
+            "It doesn't list its models: type an id it knows, or leave it empty for its own.",
+        ));
+    }
+    part
 }
 
 /// Whether an agent can do work now, as it last answered; one that cannot

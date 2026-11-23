@@ -115,6 +115,11 @@ impl CliAgentTool {
         // (`agent_mode`). Only the dispatcher's path enforces it.
         use aidaemon_coding_agents::PermissionMode;
         let mode = self.permissions().agent_mode(tool_name, &*coding_agent);
+        // The model the owner chose for it, if any (Settings, Coding agents).
+        let model = coding_agent
+            .takes_model()
+            .then(|| self.permissions().model_of(tool_name))
+            .flatten();
         let Some(mode) = mode.or((!enforce_native_access).then_some(PermissionMode::Checked))
         else {
             let level = self.permissions().level();
@@ -154,7 +159,12 @@ impl CliAgentTool {
                 fix.map(|fix| format!(" {fix}")).unwrap_or_default()
             ));
         }
-        info!(agent = %tool_name, mode = mode.as_str(), "A coding agent runs in its mode");
+        info!(
+            agent = %tool_name,
+            mode = mode.as_str(),
+            model = model.as_deref().unwrap_or("its own"),
+            "A coding agent runs in its mode"
+        );
         // Full access: nothing is asked; the owner chose it.
         let nested = nested.filter(|_| mode != PermissionMode::FullAccess);
         let can_host =
@@ -268,6 +278,7 @@ impl CliAgentTool {
                 write_paths: &canonical_write_paths,
                 can_host,
                 stdin_open: self.backend.kind() == aidaemon_tools::backend::BackendKind::Local,
+                model: model.as_deref(),
             },
             &mut launch,
         ) {

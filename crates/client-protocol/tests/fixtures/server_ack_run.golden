@@ -3,6 +3,7 @@
   "result": {
     "run": {
       "agent_session_id": "synthetic-session-1",
+      "model": "synthetic-large",
       "permissions": [
         {
           "label": "write: /w/synthetic/release.md",

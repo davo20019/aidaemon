@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use aidaemon_coding_agents::{ActionJudge, AgentAction, Verdict};
 pub use aidaemon_coding_agents::{
-    CodingAgent, CodingAgents, PermissionMode, Readiness, modes_within,
+    AgentModel, AgentModels, Checked, CodingAgent, CodingAgents, PermissionMode, Readiness,
+    modes_within,
 };
 use aidaemon_core::{NestedCalls, ToolCall};
 use async_trait::async_trait;
@@ -98,14 +99,40 @@ fn remember(name: &str, readiness: Readiness) {
     }
 }
 
+fn models_cache() -> &'static Mutex<std::collections::HashMap<String, AgentModels>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, AgentModels>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+/// The models the agent named `name` listed when it was last asked, and
+/// the one it uses unless told otherwise (`None`: it lists none, or was
+/// not asked yet).
+pub fn models_of(name: &str) -> Option<AgentModels> {
+    models_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(name).cloned())
+}
+
+/// Keep an agent's answer: its readiness, and its models when it listed
+/// them (an answer that lists none keeps the ones it listed before).
+fn remember_checked(name: &str, checked: Checked) {
+    if let Some(models) = checked.models
+        && let Ok(mut cache) = models_cache().lock()
+    {
+        cache.insert(name.to_string(), models);
+    }
+    remember(name, checked.readiness);
+}
+
 /// Ask one agent now (its own probe; one that cannot be asked, or does not
 /// run here, is unchecked).
-async fn ask(info: &AgentInfo) -> Readiness {
+async fn ask(info: &AgentInfo) -> Checked {
     match info.agent.readiness_probe() {
         Some(probe) if info.local => {
-            aidaemon_coding_agents::check(&probe, &info.command, &info.prefix, None).await
+            aidaemon_coding_agents::check_models(&probe, &info.command, &info.prefix, None).await
         }
-        _ => Readiness::Unchecked,
+        _ => Readiness::Unchecked.into(),
     }
 }
 
@@ -114,16 +141,17 @@ pub async fn recheck(name: &str) -> Readiness {
     let Some(info) = agents().into_iter().find(|info| info.name == name) else {
         return Readiness::Unchecked;
     };
-    let readiness = ask(&info).await;
-    remember(name, readiness.clone());
+    let checked = ask(&info).await;
+    let readiness = checked.readiness.clone();
+    remember_checked(name, checked);
     readiness
 }
 
 /// Ask every agent again, all at once, and keep their answers.
 pub async fn check_all() {
     let checks = agents().into_iter().map(|info| async move {
-        let readiness = ask(&info).await;
-        remember(&info.name, readiness);
+        let checked = ask(&info).await;
+        remember_checked(&info.name, checked);
     });
     futures::future::join_all(checks).await;
 }
@@ -139,8 +167,8 @@ pub async fn ensure_checked() {
         })
         .collect();
     let checks = unasked.into_iter().map(|info| async move {
-        let readiness = ask(&info).await;
-        remember(&info.name, readiness);
+        let checked = ask(&info).await;
+        remember_checked(&info.name, checked);
     });
     futures::future::join_all(checks).await;
 }

@@ -24,7 +24,19 @@
       "coding_agents": [
         {
           "capped": false,
+          "default_model": "synthetic-small",
           "mode": "checked",
+          "model": "synthetic-large",
+          "models": [
+            {
+              "id": "synthetic-large",
+              "name": "Synthetic Large"
+            },
+            {
+              "id": "synthetic-small",
+              "name": "Synthetic Small"
+            }
+          ],
           "modes": [
             "checked",
             "every_command",
@@ -36,6 +48,7 @@
           "readiness_fix": "Run `codex login` on this machine.",
           "readiness_reason": "Codex isn't signed in on this machine.",
           "same_as_aidaemon": true,
+          "takes_model": true,
           "within_level": [
             "every_command",
             "checked"
@@ -50,7 +63,8 @@
           "note": "AIDaemon cannot check this agent's actions.",
           "program": "Aider",
           "readiness": "unchecked",
-          "same_as_aidaemon": false
+          "same_as_aidaemon": false,
+          "takes_model": false
         }
       ],
       "config_path": "/home/synthetic/.aidaemon/config.toml",

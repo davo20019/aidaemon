@@ -286,6 +286,7 @@ pub trait ClientHost: Send + Sync {
         Ok(aidaemon_client_protocol::RunDetail {
             run_id: run_id.to_string(),
             agent_session_id: None,
+            model: None,
             working_dir: None,
             task: String::new(),
             result: None,

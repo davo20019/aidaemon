@@ -1,6 +1,6 @@
 //! An Agent Client Protocol agent's run read into [`AgentEvent`]s, from the
 //! lines its host gives the run's reader ([`super::host`]): `acp.session`
-//! (its session id), `tool_call` (the call's id, its ACP `kind`, the paths
+//! (its session id and model), `tool_call` (the call's id, its ACP `kind`, the paths
 //! it names, its command or URL), `tool_call_update` (a call completed or
 //! failed), `acp.plan` (its plan entries) and `result` (its turn's end).
 //! A step's kind is the protocol's `kind` value, never its title.
@@ -18,7 +18,10 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
     };
     match event.get("type").and_then(Value::as_str) {
         Some("acp.session") => text(&event, "/session_id")
-            .map(|id| AgentEvent::Session { id, model: None })
+            .map(|id| AgentEvent::Session {
+                id,
+                model: text(&event, "/model"),
+            })
             .into_iter()
             .collect(),
         Some("tool_call") => {

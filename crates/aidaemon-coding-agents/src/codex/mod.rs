@@ -202,6 +202,10 @@ impl CodingAgent for Codex {
 
     /// `codex login status` exits 0 when signed in, 1 when not (verified
     /// with an empty `CODEX_HOME`, 0.170.0).
+    fn takes_model(&self) -> bool {
+        true
+    }
+
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::Status {
             args: vec!["login".into(), "status".into()],
@@ -217,6 +221,9 @@ impl CodingAgent for Codex {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
+        if let Some(model) = request.model {
+            crate::agent::set_option(&mut launch.args, launch.start, "--model", &["-m"], model);
+        }
         if !request.enforce {
             return Ok(Plan::plain());
         }
@@ -287,6 +294,7 @@ mod tests {
             write_paths,
             can_host: false,
             stdin_open: true,
+            model: None,
         }
     }
 

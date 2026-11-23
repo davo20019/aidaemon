@@ -21,6 +21,7 @@ pub(crate) async fn run_detail(state: &dyn StateStore, run_id: &str) -> anyhow::
         return Ok(RunDetail {
             run_id: run_id.to_string(),
             agent_session_id: None,
+            model: None,
             working_dir: None,
             task: String::new(),
             result: None,
@@ -38,6 +39,7 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
     let mut detail = RunDetail {
         run_id: run_id.to_string(),
         agent_session_id: run.agent_session,
+        model: None,
         working_dir: run.working_dir,
         task: run.prompt_summary,
         result: run.output_summary.filter(|text| !text.trim().is_empty()),
@@ -58,6 +60,10 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
             "session" => {
                 if detail.agent_session_id.is_none() {
                     detail.agent_session_id = text("id");
+                }
+                // The model it reported working with (its latest word).
+                if let Some(model) = text("model").filter(|model| !model.trim().is_empty()) {
+                    detail.model = Some(model);
                 }
             }
             "step" => {
@@ -165,7 +171,11 @@ mod tests {
             output_summary: Some("Fixed one bug".into()),
         };
         let events = [
-            event(1, "session", r#"{"id":"thread-1","model":null}"#),
+            event(
+                1,
+                "session",
+                r#"{"id":"thread-1","model":"synthetic-large"}"#,
+            ),
             event(
                 2,
                 "step",
@@ -196,6 +206,7 @@ mod tests {
         ];
         let detail = detail("cli-agent-1", run, &events);
         assert_eq!(detail.agent_session_id.as_deref(), Some("thread-1"));
+        assert_eq!(detail.model.as_deref(), Some("synthetic-large"));
         assert_eq!(detail.task, "Review the slug module");
         assert_eq!(detail.steps.len(), 2);
         assert_eq!(detail.steps[0].words, "Running pytest");

@@ -203,7 +203,10 @@ fn kind_of_text(text: &str) -> SettingKind {
 fn applies_of(key: &str) -> Applies {
     // AIdaemon's level and the coding agents' choices are live
     // (`aidaemon_runtime::permissions`): every write takes them again.
-    if key == "authority.owner_default" || key.starts_with("cli_agents.permissions") {
+    if key == "authority.owner_default"
+        || key.starts_with("cli_agents.permissions")
+        || key.starts_with("cli_agents.models")
+    {
         return Applies::Now;
     }
     match key.split(['.', '[']).next().unwrap_or_default() {
@@ -733,6 +736,11 @@ impl SettingsHost {
                 DatabaseAction::Unknown => return Err("Unknown database action".to_string()),
             },
             SettingsChange::CheckAgents => SettingsGate::Free,
+            // Which model an agent works with widens nothing it may do.
+            SettingsChange::SetAgentModel { agent, model } => {
+                agent_model_choice(agent, model.as_deref())?;
+                SettingsGate::Free
+            }
             SettingsChange::SetAgentMode { agent, mode } => {
                 let coding_agent = aidaemon_runtime::tools::agent_mode::agent_named(agent)
                     .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
@@ -1256,6 +1264,27 @@ impl SettingsHost {
                     applies: Some(Applies::Now),
                 })
             }
+            SettingsChange::SetAgentModel { agent, model } => {
+                let (coding_agent, model) = agent_model_choice(&agent, model.as_deref())?;
+                aidaemon_runtime::permissions::save_agent_model(
+                    &crate::config::config_file(&self.config_path),
+                    &self.permissions,
+                    &agent,
+                    model.as_deref(),
+                )
+                .await
+                .map_err(|error| format!("The model could not be saved: {error}"))?;
+                Ok(SettingsDone {
+                    message: match model {
+                        Some(model) => format!("{} now works with {model}.", coding_agent.name()),
+                        None => format!(
+                            "{} now works with its own default model.",
+                            coding_agent.name()
+                        ),
+                    },
+                    applies: Some(Applies::Now),
+                })
+            }
             SettingsChange::CheckAgents => {
                 aidaemon_runtime::tools::agent_mode::check_all().await;
                 Ok(SettingsDone {
@@ -1400,6 +1429,45 @@ fn agent_mode(
 }
 
 /// The coding agents the daemon can hand work to, each with its mode.
+/// The agent named `agent` and the model chosen for it (trimmed; `None`:
+/// its own default), when it can take one and, if it listed its models
+/// when asked, the model is one of them. `Err`: why not, in plain words.
+fn agent_model_choice(
+    agent: &str,
+    model: Option<&str>,
+) -> Result<
+    (
+        std::sync::Arc<dyn aidaemon_runtime::tools::agent_mode::CodingAgent>,
+        Option<String>,
+    ),
+    String,
+> {
+    use aidaemon_runtime::tools::agent_mode;
+    let coding_agent = agent_mode::agent_named(agent)
+        .ok_or_else(|| format!("There is no coding agent named `{agent}`"))?;
+    if !coding_agent.takes_model() {
+        return Err(format!(
+            "{} can't be given a model: it works with its own.",
+            coding_agent.name()
+        ));
+    }
+    let model = model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    if let Some(model) = model.as_deref()
+        && let Some(listed) = agent_mode::models_of(agent)
+        && !listed.available.is_empty()
+        && !listed.available.iter().any(|offered| offered.id == model)
+    {
+        return Err(format!(
+            "{} doesn't list a model `{model}`. Pick one of the models it offers.",
+            coding_agent.name()
+        ));
+    }
+    Ok((coding_agent, model))
+}
+
 async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protocol::CodingAgent> {
     use aidaemon_client_protocol::AgentMode as Wire;
     use aidaemon_runtime::tools::agent_mode::{self, PermissionMode};
@@ -1415,6 +1483,11 @@ async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protoco
     let mut out = Vec::new();
     for info in agent_mode::agents() {
         let agent = &info.agent;
+        // The models it listed when asked (only one that takes a model).
+        let listed = agent
+            .takes_model()
+            .then(|| agent_mode::models_of(&info.name))
+            .flatten();
         let (readiness, readiness_reason, readiness_fix) =
             match agent_mode::readiness_of(&info.name) {
                 agent_mode::Readiness::Ready => {
@@ -1445,6 +1518,24 @@ async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protoco
             ),
             modes: agent.modes().iter().copied().map(wire).collect(),
             note: agent.note().to_string(),
+            takes_model: agent.takes_model(),
+            model: agent
+                .takes_model()
+                .then(|| permissions.model_of(&info.name))
+                .flatten(),
+            default_model: listed.as_ref().and_then(|models| models.current.clone()),
+            models: listed
+                .map(|models| {
+                    models
+                        .available
+                        .into_iter()
+                        .map(|model| aidaemon_client_protocol::AgentModelOption {
+                            id: model.id,
+                            name: model.name,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             name: info.name,
         });
     }

@@ -60,6 +60,24 @@
         }
       ]
     },
+    "AgentModelOption": {
+      "description": "A model a coding agent offers (protocol 1.47).",
+      "properties": {
+        "id": {
+          "description": "What selects it.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Its name, as the agent gives it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
     "AgentReadiness": {
       "description": "Whether a coding agent can do work now (protocol 1.38).",
       "oneOf": [
@@ -1138,6 +1156,13 @@
           "description": "The owner's pick is above the level, so it runs as `mode`, the most\nthe level allows (protocol 1.43).",
           "type": "boolean"
         },
+        "default_model": {
+          "description": "The model it uses when it is given none, as it said when last\nasked; `None`: it did not say (protocol 1.47).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "anyOf": [
             {
@@ -1148,6 +1173,20 @@
             }
           ],
           "description": "Its mode; `None`: it may not run delegated work until the owner\npicks one of `modes`."
+        },
+        "model": {
+          "description": "The model the owner chose for it; `None`: its own default\n(protocol 1.47).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "description": "The models it said it offers, in its order; empty when it lists\nnone (any id it knows may still be typed) (protocol 1.47).",
+          "items": {
+            "$ref": "#/$defs/AgentModelOption"
+          },
+          "type": "array"
         },
         "modes": {
           "description": "The modes it can run in, safest first: checking needs an agent\nwhose approval requests the daemon can answer.",
@@ -1183,6 +1222,11 @@
         "same_as_aidaemon": {
           "default": false,
           "description": "The owner chose \"same as AIdaemon\": it follows the level\n(protocol 1.43).",
+          "type": "boolean"
+        },
+        "takes_model": {
+          "default": false,
+          "description": "It can be given a model to work with (protocol 1.47).",
           "type": "boolean"
         },
         "within_level": {
@@ -5708,6 +5752,13 @@
             "null"
           ]
         },
+        "model": {
+          "description": "The model it worked with, as it reported it (protocol 1.47).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "permissions": {
           "description": "What it asked permission for and the answer, in order.",
           "items": {
@@ -7035,6 +7086,29 @@
             "kind": {
               "const": "agent_same_as_aidaemon",
               "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "agent"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Set the model coding agent `agent` works with; `None`: its own\ndefault (protocol 1.47).",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "set_agent_model",
+              "type": "string"
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

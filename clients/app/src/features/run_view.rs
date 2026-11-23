@@ -165,6 +165,9 @@ fn body(detail: RunDetail) -> View {
         ));
     }
     let mut facts = Vec::new();
+    if let Some(model) = &detail.model {
+        facts.push(format!("Model: {model}"));
+    }
     if let Some(usage) = &detail.usage {
         let mut tokens = format!(
             "{} tokens in, {} out",

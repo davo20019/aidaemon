@@ -38,7 +38,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 46;
+pub const PROTOCOL_MINOR: u16 = 47;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -1458,6 +1458,30 @@ pub struct CodingAgent {
     /// the level allows (protocol 1.43).
     #[serde(default)]
     pub capped: bool,
+    /// It can be given a model to work with (protocol 1.47).
+    #[serde(default)]
+    pub takes_model: bool,
+    /// The model the owner chose for it; `None`: its own default
+    /// (protocol 1.47).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The model it uses when it is given none, as it said when last
+    /// asked; `None`: it did not say (protocol 1.47).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// The models it said it offers, in its order; empty when it lists
+    /// none (any id it knows may still be typed) (protocol 1.47).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<AgentModelOption>,
+}
+
+/// A model a coding agent offers (protocol 1.47).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AgentModelOption {
+    /// What selects it.
+    pub id: String,
+    /// Its name, as the agent gives it.
+    pub name: String,
 }
 
 /// Whether a coding agent can do work now (protocol 1.38).
@@ -1796,6 +1820,13 @@ pub enum SettingsChange {
     /// Have coding agent `agent` follow AIdaemon's level (protocol 1.43).
     AgentSameAsAidaemon {
         agent: String,
+    },
+    /// Set the model coding agent `agent` works with; `None`: its own
+    /// default (protocol 1.47).
+    SetAgentModel {
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     #[serde(other)]
     #[schemars(skip)]
@@ -2945,6 +2976,9 @@ pub struct RunDetail {
     /// thread id, an ACP session id): what resumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    /// The model it worked with, as it reported it (protocol 1.47).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The folder it worked in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,

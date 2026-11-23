@@ -635,7 +635,10 @@ impl Client {
         }
         // An open run's record is read again as it moves.
         if let ServerFrame::Event {
-            event: Event::RunUpdated { run: aidaemon_client_protocol::RunSummary { id, .. } }
+            event:
+                Event::RunUpdated {
+                    run: aidaemon_client_protocol::RunSummary { id, .. },
+                }
                 | Event::RunStep { run_id: id, .. },
             ..
         } = &frame
@@ -1462,6 +1465,28 @@ impl Client {
         }
         self.change_settings(SettingsChange::AgentSameAsAidaemon {
             agent: agent.to_owned(),
+        });
+    }
+
+    /// Set the model coding agent `agent` works with (`None`: its own
+    /// default). Nothing is sent for one that takes no model or already
+    /// has it, or to a daemon that predates agent models.
+    pub fn set_agent_model(&mut self, agent: &str, model: Option<String>) {
+        let Read::Ready(settings) = &self.settings else {
+            return;
+        };
+        let model = model
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        let Some(current) = settings.coding_agents.iter().find(|a| a.name == agent) else {
+            return;
+        };
+        if !current.takes_model || current.model == model {
+            return;
+        }
+        self.change_settings(SettingsChange::SetAgentModel {
+            agent: agent.to_owned(),
+            model,
         });
     }
 
@@ -3315,7 +3340,10 @@ mod tests {
         assert!(matches!(&client.run_view, Read::Ready(run) if run.steps.len() == 1));
         let step = r#"{"type":"event","seq":9,"at_ms":5,"session_id":"app:s1","event":{"type":"run_step","run_id":"cli-agent-1","session_id":"app:s1","step":"Editing a.py","at_ms":5}}"#;
         client.update(frame(step), &cx(None));
-        assert!(matches!(&client.take_outgoing()[..], [(_, Command::GetRun { .. })]));
+        assert!(matches!(
+            &client.take_outgoing()[..],
+            [(_, Command::GetRun { .. })]
+        ));
         client.close_run();
         client.update(frame(&step.replace(r#""seq":9"#, r#""seq":10"#)), &cx(None));
         assert!(client.take_outgoing().is_empty());

@@ -217,6 +217,10 @@ impl CodingAgent for ClaudeCode {
     }
 
     /// `claude auth status` answers with typed JSON (`loggedIn`).
+    fn takes_model(&self) -> bool {
+        true
+    }
+
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::Status {
             args: vec!["auth".into(), "status".into()],
@@ -235,6 +239,9 @@ impl CodingAgent for ClaudeCode {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
+        if let Some(model) = request.model {
+            crate::agent::set_option(&mut launch.args, launch.start, "--model", &[], model);
+        }
         let args = &mut launch.args;
         basics(args);
         if !request.enforce {
@@ -336,6 +343,7 @@ mod tests {
             write_paths: &[],
             can_host,
             stdin_open: true,
+            model: None,
         }
     }
 

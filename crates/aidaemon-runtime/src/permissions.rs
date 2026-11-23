@@ -1,6 +1,7 @@
 //! AIdaemon's permission level and each coding agent's: the owner's choices,
 //! kept in `config.toml` as `[authority] owner_default` and
-//! `[cli_agents.permissions]`.
+//! `[cli_agents.permissions]`. The model the owner chose for a coding agent
+//! (`[cli_agents.models]`) is kept and refreshed the same way.
 //!
 //! The file is their only store. A [`Permissions`] handle is their live
 //! value: read from the file at start and refreshed from it whenever the
@@ -66,6 +67,8 @@ pub fn agent_cap(level: OwnerLevel) -> PermissionMode {
 struct State {
     level: OwnerLevel,
     agents: HashMap<String, AgentChoice>,
+    /// The model chosen per agent, by name (absent: its own default).
+    models: HashMap<String, String>,
 }
 
 /// The live permission choices. Clones share one value.
@@ -78,6 +81,7 @@ impl std::fmt::Debug for Permissions {
         f.debug_struct("Permissions")
             .field("level", &state.level)
             .field("agents", &state.agents)
+            .field("models", &state.models)
             .finish()
     }
 }
@@ -140,7 +144,28 @@ impl Permissions {
                 }
             }
         }
-        *self.write() = State { level, agents };
+        let models = config
+            .get("cli_agents")
+            .and_then(|table| table.get("models"))
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, value)| {
+                let model = value.as_str()?.trim();
+                (!model.is_empty()).then(|| (name.clone(), model.to_string()))
+            })
+            .collect();
+        *self.write() = State {
+            level,
+            agents,
+            models,
+        };
+    }
+
+    /// The model the owner chose for the agent named `name` (`None`: the
+    /// agent's own default).
+    pub fn model_of(&self, name: &str) -> Option<String> {
+        self.read().models.get(name).cloned()
     }
 
     /// AIdaemon's level.
@@ -274,6 +299,29 @@ pub async fn save_agent(
         match choice {
             Some(choice) => {
                 table.insert(name, toml_edit::value(choice.as_str()));
+            }
+            None => {
+                table.remove(name);
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Save the model chosen for the agent named `name` (`None`: back to its
+/// own default) and take it.
+pub async fn save_agent_model(
+    config: &ConfigFile,
+    permissions: &Permissions,
+    name: &str,
+    model: Option<&str>,
+) -> anyhow::Result<()> {
+    edit_config(config, permissions, |doc| {
+        let table = table_at(doc, &["cli_agents", "models"])?;
+        match model {
+            Some(model) => {
+                table.insert(name, toml_edit::value(model));
             }
             None => {
                 table.remove(name);
@@ -419,5 +467,25 @@ mod tests {
             .unwrap();
         assert!(!permissions.trust_all());
         assert_eq!(permissions.choice("claude"), None);
+
+        // A model chosen for an agent, then its own default again.
+        save_agent_model(&file, &permissions, "agy", Some("synthetic-large-high"))
+            .await
+            .unwrap();
+        assert_eq!(
+            permissions.model_of("agy").as_deref(),
+            Some("synthetic-large-high")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("agy = \"synthetic-large-high\""), "{text}");
+        let again = Permissions::from_config(&file.load_table().await.unwrap());
+        assert_eq!(
+            again.model_of("agy").as_deref(),
+            Some("synthetic-large-high")
+        );
+        save_agent_model(&file, &permissions, "agy", None)
+            .await
+            .unwrap();
+        assert_eq!(permissions.model_of("agy"), None);
     }
 }

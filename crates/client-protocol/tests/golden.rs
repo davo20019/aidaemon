@@ -1279,6 +1279,19 @@ fn server_samples() -> Vec<ServerFrame> {
                         same_as_aidaemon: true,
                         within_level: vec![AgentMode::EveryCommand, AgentMode::Checked],
                         capped: false,
+                        takes_model: true,
+                        model: Some("synthetic-large".into()),
+                        default_model: Some("synthetic-small".into()),
+                        models: vec![
+                            AgentModelOption {
+                                id: "synthetic-large".into(),
+                                name: "Synthetic Large".into(),
+                            },
+                            AgentModelOption {
+                                id: "synthetic-small".into(),
+                                name: "Synthetic Small".into(),
+                            },
+                        ],
                     },
                     CodingAgent {
                         name: "aider".into(),
@@ -1292,6 +1305,10 @@ fn server_samples() -> Vec<ServerFrame> {
                         same_as_aidaemon: false,
                         within_level: Vec::new(),
                         capped: false,
+                        takes_model: false,
+                        model: None,
+                        default_model: None,
+                        models: Vec::new(),
                     },
                 ],
                 permission_level: Some(PermissionLevel::Standard),
@@ -1396,6 +1413,7 @@ fn server_samples() -> Vec<ServerFrame> {
             run: RunDetail {
                 run_id: "run-3f2a".into(),
                 agent_session_id: Some("synthetic-session-1".into()),
+                model: Some("synthetic-large".into()),
                 working_dir: Some("/w/synthetic".into()),
                 task: "Prepare the synthetic release notes".into(),
                 result: Some("Wrote release.md".into()),

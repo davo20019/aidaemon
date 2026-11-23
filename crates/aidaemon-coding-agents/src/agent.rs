@@ -53,6 +53,12 @@ pub trait CodingAgent: Send + Sync {
     /// cannot run as asked, in words for the owner).
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String>;
 
+    /// Whether a run can be given a model ([`RunRequest::model`]): its
+    /// launch or its protocol sets one. `false`: it runs on its own.
+    fn takes_model(&self) -> bool {
+        false
+    }
+
     /// How to ask whether it can do work now (signed in, served by its
     /// provider), without a task. `None`: it cannot be asked.
     fn readiness_probe(&self) -> Option<crate::Probe> {
@@ -96,6 +102,40 @@ pub struct RunRequest<'a> {
     pub can_host: bool,
     /// Its stdin can stay open for a host (a local process), judge or not.
     pub stdin_open: bool,
+    /// The model the owner chose for it (an id it knows); `None`: its own
+    /// default. Only an agent that [`CodingAgent::takes_model`] uses it.
+    pub model: Option<&'a str>,
+}
+
+/// Set `flag` (or one of its `aliases`) to `value` among the agent's own
+/// arguments (`args[start..]`): any value the launch already gives it, as
+/// `--flag value` or `--flag=value`, is replaced.
+pub(crate) fn set_option(
+    args: &mut Vec<String>,
+    start: usize,
+    flag: &str,
+    aliases: &[&str],
+    value: &str,
+) {
+    let named = |arg: &str| arg == flag || aliases.contains(&arg);
+    let mut index = start.min(args.len());
+    while index < args.len() {
+        let arg = args[index].as_str();
+        // `--flag=value` (a machine format: the argument's own syntax).
+        let joined = arg
+            .split_once('=')
+            .is_some_and(|(name, _)| name.starts_with("--") && named(name));
+        if named(arg) {
+            let end = (index + 2).min(args.len());
+            args.drain(index..end);
+        } else if joined {
+            args.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+    args.push(flag.to_string());
+    args.push(value.to_string());
 }
 
 /// A launch's arguments: `args[start..]` are the agent's own; what precedes
@@ -284,6 +324,34 @@ mod tests {
         assert_eq!(
             list.unlisted(&args(&["review"])),
             Some("review".to_string())
+        );
+    }
+
+    #[test]
+    fn a_chosen_option_replaces_any_the_launch_gives() {
+        use super::set_option;
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let mut launch = args(&[
+            "env",
+            "A=1",
+            "codex",
+            "exec",
+            "-m",
+            "old",
+            "--model=older",
+            "--json",
+        ]);
+        set_option(&mut launch, 3, "--model", &["-m"], "new");
+        assert_eq!(
+            launch,
+            args(&["env", "A=1", "codex", "exec", "--json", "--model", "new"])
+        );
+        // A launcher's own arguments before `start` are left alone.
+        let mut launch = args(&["--model", "launcher", "claude"]);
+        set_option(&mut launch, 3, "--model", &[], "x");
+        assert_eq!(
+            launch,
+            args(&["--model", "launcher", "claude", "--model", "x"])
         );
     }
 }

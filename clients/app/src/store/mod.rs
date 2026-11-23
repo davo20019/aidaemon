@@ -1603,6 +1603,11 @@ impl Store {
         self.act(|c| c.set_agent_same(&agent));
     }
 
+    /// Set the model coding agent `agent` works with (`None`: its own).
+    pub fn set_agent_model(&self, agent: String, model: Option<String>) {
+        self.act(|c| c.set_agent_model(&agent, model));
+    }
+
     /// Ask every coding agent again whether it can do work now.
     pub fn check_agents(&self) {
         self.act(|c| c.check_agents());

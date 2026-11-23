@@ -2,7 +2,8 @@
 //! permission request answered by the judge.
 //!
 //! JSON-RPC over the agent's stdin and stdout: `initialize`, then
-//! `session/new` in the run's folder, then `session/prompt` with the task.
+//! `session/new` in the run's folder, then (when the owner chose its model)
+//! `session/set_model`, then `session/prompt` with the task.
 //! While it works the agent sends `session/update` notifications (its
 //! message, its tool calls) and, before an action that needs one,
 //! `session/request_permission` with the tool call (its `kind`, raw input
@@ -29,6 +30,7 @@ use crate::{ActionJudge, AgentAction, AgentHost, HostAnswers, HostStarter, Verdi
 const INITIALIZE_ID: u64 = 1;
 const SESSION_NEW_ID: u64 = 2;
 const PROMPT_ID: u64 = 3;
+const SET_MODEL_ID: u64 = 4;
 
 fn request_line(id: u64, method: &str, params: Value) -> String {
     let mut line =
@@ -207,6 +209,50 @@ pub fn actions(tool_call: &Value, working_dir: Option<&str>) -> Result<Vec<Agent
     })
 }
 
+/// The model a session works with, as `session/new` reports it: ACP's
+/// `models.currentModelId`, else its `model` config option's value.
+pub(crate) fn current_model(session: &Value) -> Option<String> {
+    let id = session
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            session
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|option| option.get("category").and_then(Value::as_str) == Some("model"))
+                .and_then(|option| option.get("currentValue").and_then(Value::as_str))
+        })?;
+    (!id.trim().is_empty()).then(|| id.to_string())
+}
+
+/// The models a session offers, as `session/new` lists them
+/// (`models.availableModels`: each one's id and name).
+pub(crate) fn available_models(session: &Value) -> Vec<crate::AgentModel> {
+    session
+        .pointer("/models/availableModels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("modelId").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(id);
+            Some(crate::AgentModel {
+                id: id.to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// The answer to a permission request: the option of the kind wanted, the
 /// once-only one (an "always" option would keep a rule in the agent).
 pub fn outcome(options: &[Value], allowed: bool) -> Value {
@@ -235,6 +281,8 @@ struct HostState {
 /// Starts an [`AcpHost`].
 pub struct AcpHostStarter {
     pub working_dir: Option<String>,
+    /// The model the owner chose (`None`: the agent's own).
+    pub model: Option<String>,
 }
 
 #[async_trait]
@@ -245,7 +293,8 @@ impl HostStarter for AcpHostStarter {
         judge: Arc<dyn ActionJudge>,
         prompt: &str,
     ) -> Arc<dyn AgentHost> {
-        let host = AcpHost::new(stdin, judge, self.working_dir, prompt);
+        let mut host = AcpHost::new(stdin, judge, self.working_dir, prompt);
+        host.model = self.model.map(Arc::from);
         host.stdin.write(&initialize_line()).await;
         Arc::new(host)
     }
@@ -258,6 +307,8 @@ pub struct AcpHost {
     judge: Arc<dyn ActionJudge>,
     working_dir: Option<String>,
     prompt: Arc<str>,
+    /// The model the owner chose, set before the task is sent.
+    model: Option<Arc<str>>,
     state: Arc<Mutex<HostState>>,
 }
 
@@ -273,8 +324,19 @@ impl AcpHost {
             judge,
             working_dir,
             prompt: Arc::from(prompt),
+            model: None,
             state: Arc::default(),
         }
+    }
+
+    async fn send_prompt(&self, session: &str) {
+        let params = json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": &*self.prompt}],
+        });
+        self.stdin
+            .write(&request_line(PROMPT_ID, "session/prompt", params))
+            .await;
     }
 
     fn end(&self, completed: bool) -> String {
@@ -287,11 +349,17 @@ impl AcpHost {
 
     async fn on_response(&self, id: &Value, message: &Value) -> Vec<String> {
         if let Some(error) = message.get("error") {
-            let text = error
+            let mut text = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("the agent refused the request")
                 .to_string();
+            if id.as_u64() == Some(SET_MODEL_ID) {
+                text = format!(
+                    "It could not switch to the model chosen for it ({}): {text}",
+                    self.model.as_deref().unwrap_or_default()
+                );
+            }
             self.end(false);
             self.stdin.close().await;
             return vec![json!({"type": "error", "message": text}).to_string()];
@@ -317,15 +385,35 @@ impl AcpHost {
                 if let Ok(mut state) = self.state.lock() {
                     state.session_id = Some(session.clone());
                 }
-                let params = json!({
-                    "sessionId": session,
-                    "prompt": [{"type": "text", "text": &*self.prompt}],
-                });
-                self.stdin
-                    .write(&request_line(PROMPT_ID, "session/prompt", params))
-                    .await;
-                // Its session, for the run's record (what resumes it).
-                vec![json!({"type": "acp.session", "session_id": session}).to_string()]
+                let model = match self.model.as_deref() {
+                    Some(model) => {
+                        let params = json!({"sessionId": session, "modelId": model});
+                        self.stdin
+                            .write(&request_line(SET_MODEL_ID, "session/set_model", params))
+                            .await;
+                        Some(model.to_string())
+                    }
+                    None => {
+                        self.send_prompt(&session).await;
+                        current_model(result)
+                    }
+                };
+                // Its session, for the run's record (what resumes it), and
+                // the model it works with.
+                vec![
+                    json!({"type": "acp.session", "session_id": session, "model": model})
+                        .to_string(),
+                ]
+            }
+            Some(SET_MODEL_ID) => {
+                let session = self
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.session_id.clone())
+                    .unwrap_or_default();
+                self.send_prompt(&session).await;
+                Vec::new()
             }
             Some(PROMPT_ID) => {
                 let stop = result
@@ -695,5 +783,81 @@ mod tests {
             vec!["command: curl -sS https://example.com".to_string()]
         );
         assert_eq!(judge.1.lock().unwrap().len(), 2);
+    }
+
+    /// With a model chosen, the host switches to it before sending the
+    /// task; without one, the session's own model is what the run reports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_chosen_model_is_set_before_the_task_and_reported() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let start = |model: Option<&str>| {
+            let mut child = tokio::process::Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("cat");
+            let mut host = AcpHost::new(
+                child.stdin.take().unwrap(),
+                Arc::new(crate::AllowAll),
+                None,
+                "fix the test",
+            );
+            host.model = model.map(Arc::from);
+            let sent = BufReader::new(child.stdout.take().unwrap()).lines();
+            (child, host, sent)
+        };
+        let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1","models":{"currentModelId":"synthetic-large","availableModels":[{"modelId":"synthetic-large","name":"Synthetic Large"}]}}}"#;
+
+        let (_child, host, mut sent) = start(Some("synthetic-small"));
+        let line = host.on_line(session).await;
+        let reported: Value = serde_json::from_str(&line[0]).unwrap();
+        assert_eq!(reported["model"], "synthetic-small");
+        let set: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(set["method"], "session/set_model");
+        assert_eq!(set["params"]["modelId"], "synthetic-small");
+        assert!(
+            host.on_line(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#)
+                .await
+                .is_empty()
+        );
+        let prompt: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(prompt["params"]["sessionId"], "s1");
+
+        // A model it does not know ends the run with its own reason.
+        let (_child, host, _sent) = start(Some("synthetic-missing"));
+        host.on_line(session).await;
+        let refused = host
+            .on_line(r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"Unknown model ID: synthetic-missing"}}"#)
+            .await;
+        let refused: Value = serde_json::from_str(&refused[0]).unwrap();
+        assert_eq!(refused["type"], "error");
+        assert!(
+            refused["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown model ID: synthetic-missing"),
+            "{refused}"
+        );
+
+        let (_child, host, mut sent) = start(None);
+        let line = host.on_line(session).await;
+        let reported: Value = serde_json::from_str(&line[0]).unwrap();
+        assert_eq!(reported["model"], "synthetic-large");
+        let events = super::super::events::read_events(&line[0]);
+        assert_eq!(
+            events,
+            vec![crate::AgentEvent::Session {
+                id: "s1".into(),
+                model: Some("synthetic-large".into()),
+            }]
+        );
+        let prompt: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(prompt["method"], "session/prompt");
     }
 }

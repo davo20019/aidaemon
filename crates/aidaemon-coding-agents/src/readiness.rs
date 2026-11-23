@@ -1,6 +1,8 @@
 //! Whether an installed coding agent can do work now: signed in, served by
 //! its provider. Each agent says how to ask it ([`Probe`]), without a task
-//! and without a model call; [`check`] asks.
+//! and without a model call; [`check`] asks. An agent whose answer lists
+//! its models (an ACP session) says which ones, and which it uses unless
+//! told otherwise ([`check_models`]).
 
 use std::path::Path;
 use std::process::Stdio;
@@ -24,6 +26,39 @@ pub enum Readiness {
 impl Readiness {
     pub fn is_usable(&self) -> bool {
         !matches!(self, Self::NotUsable { .. })
+    }
+}
+
+/// One model an agent offers: its id (what selects it) and its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentModel {
+    pub id: String,
+    pub name: String,
+}
+
+/// The models an agent said it offers, as it answered a check.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentModels {
+    /// The one it uses when it is given none (its own default).
+    pub current: Option<String>,
+    /// Every one it offers, in its order.
+    pub available: Vec<AgentModel>,
+}
+
+/// An agent's answer to a check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub readiness: Readiness,
+    /// Its models, when its answer listed them.
+    pub models: Option<AgentModels>,
+}
+
+impl From<Readiness> for Checked {
+    fn from(readiness: Readiness) -> Self {
+        Self {
+            readiness,
+            models: None,
+        }
     }
 }
 
@@ -54,13 +89,23 @@ pub async fn check(
     prefix: &[String],
     cwd: Option<&Path>,
 ) -> Readiness {
+    check_models(probe, command, prefix, cwd).await.readiness
+}
+
+/// [`check`], with the models the agent listed in its answer.
+pub async fn check_models(
+    probe: &Probe,
+    command: &str,
+    prefix: &[String],
+    cwd: Option<&Path>,
+) -> Checked {
     match tokio::time::timeout(ANSWER_WITHIN, ask(probe, command, prefix, cwd)).await {
-        Ok(readiness) => readiness,
-        Err(_) => Readiness::Unchecked,
+        Ok(checked) => checked,
+        Err(_) => Readiness::Unchecked.into(),
     }
 }
 
-async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>) -> Readiness {
+async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>) -> Checked {
     let mut process = tokio::process::Command::new(command);
     process
         .args(prefix)
@@ -75,19 +120,20 @@ async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>
     match probe {
         Probe::Status { args, read } => {
             let Ok(output) = process.args(args).stdin(Stdio::null()).output().await else {
-                return Readiness::Unchecked;
+                return Readiness::Unchecked.into();
             };
             read(
                 output.status.code(),
                 &String::from_utf8_lossy(&output.stdout),
             )
+            .into()
         }
         Probe::AcpSession { serve } => {
             let Ok(mut child) = process.args(serve).stdin(Stdio::piped()).spawn() else {
-                return Readiness::Unchecked;
+                return Readiness::Unchecked.into();
             };
             let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-                return Readiness::Unchecked;
+                return Readiness::Unchecked.into();
             };
             let request = |id: u64, method: &str, params: Value| {
                 let mut line =
@@ -103,7 +149,7 @@ async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>
                 json!({"protocolVersion": 1, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}}),
             );
             if stdin.write_all(first.as_bytes()).await.is_err() {
-                return Readiness::Unchecked;
+                return Readiness::Unchecked.into();
             }
             // A session needs a folder; with none given, the temp folder.
             let cwd = cwd
@@ -122,7 +168,7 @@ async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>
                 ) {
                     (Some(1), None) => {
                         if let Some(error) = message.get("error") {
-                            return not_usable(error);
+                            return not_usable(error).into();
                         }
                         let params = json!({"mcpServers": [], "cwd": cwd});
                         if stdin
@@ -130,19 +176,28 @@ async fn ask(probe: &Probe, command: &str, prefix: &[String], cwd: Option<&Path>
                             .await
                             .is_err()
                         {
-                            return Readiness::Unchecked;
+                            return Readiness::Unchecked.into();
                         }
                     }
                     (Some(2), None) => {
                         return match message.get("error") {
-                            Some(error) => not_usable(error),
-                            None => Readiness::Ready,
+                            Some(error) => not_usable(error).into(),
+                            None => {
+                                let session = message.get("result").unwrap_or(&Value::Null);
+                                let available = crate::acp::host::available_models(session);
+                                let current = crate::acp::host::current_model(session);
+                                Checked {
+                                    readiness: Readiness::Ready,
+                                    models: (current.is_some() || !available.is_empty())
+                                        .then_some(AgentModels { current, available }),
+                                }
+                            }
                         };
                     }
                     _ => {}
                 }
             }
-            Readiness::Unchecked
+            Readiness::Unchecked.into()
         }
     }
 }
@@ -207,6 +262,29 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}"#,
         ));
         assert_eq!(check(&ready, "sh", &[], None).await, Readiness::Ready);
+        let listed = probe(agent(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s","models":{"currentModelId":"synthetic-large","availableModels":[{"modelId":"synthetic-large","name":"Synthetic Large"},{"modelId":"synthetic-small","name":"Synthetic Small"}]}}}"#,
+        ));
+        assert_eq!(
+            check_models(&listed, "sh", &[], None).await,
+            Checked {
+                readiness: Readiness::Ready,
+                models: Some(AgentModels {
+                    current: Some("synthetic-large".into()),
+                    available: vec![
+                        AgentModel {
+                            id: "synthetic-large".into(),
+                            name: "Synthetic Large".into(),
+                        },
+                        AgentModel {
+                            id: "synthetic-small".into(),
+                            name: "Synthetic Small".into(),
+                        },
+                    ],
+                }),
+            }
+        );
+        assert_eq!(check_models(&ready, "sh", &[], None).await.models, None);
         let refused = probe(agent(
             r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"This client is no longer supported for this account."}}"#,
         ));

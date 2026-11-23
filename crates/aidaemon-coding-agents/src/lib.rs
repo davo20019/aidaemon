@@ -39,5 +39,5 @@ pub use agent::{
 };
 pub use events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, program_of};
 pub use mode::{PermissionMode, mode_within, modes_within};
-pub use readiness::{Probe, Readiness, check};
+pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, check_models};
 pub use registry::CodingAgents;

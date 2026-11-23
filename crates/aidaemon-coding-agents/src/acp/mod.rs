@@ -128,6 +128,11 @@ impl CodingAgent for AcpAgent {
         }
     }
 
+    /// Set over the protocol once its session opens (`session/set_model`).
+    fn takes_model(&self) -> bool {
+        true
+    }
+
     /// A session it opens (no prompt sent), or its own reason not to.
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::AcpSession {
@@ -160,6 +165,7 @@ impl CodingAgent for AcpAgent {
             prompt: PromptPlacement::Host,
             host: Some(Box::new(host::AcpHostStarter {
                 working_dir: request.working_dir.map(str::to_string),
+                model: request.model.map(str::to_string),
             })),
             ..Plan::plain()
         })
@@ -180,6 +186,7 @@ mod tests {
             write_paths: &[],
             can_host,
             stdin_open: true,
+            model: None,
         }
     }
 
