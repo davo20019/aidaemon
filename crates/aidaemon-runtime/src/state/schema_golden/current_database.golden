@@ -750,11 +750,25 @@ CREATE TABLE cli_agent_invocations (
             output_summary TEXT,
             success INTEGER,
             duration_secs REAL
-        )
+        , run_id TEXT, mode TEXT, agent_session_id TEXT)
 
 index idx_cli_agent_invocations_task_id on cli_agent_invocations
 CREATE INDEX idx_cli_agent_invocations_task_id
          ON cli_agent_invocations(task_id)
+
+table cli_agent_events on cli_agent_events
+CREATE TABLE cli_agent_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            at TEXT NOT NULL DEFAULT (datetime('now')),
+            kind TEXT NOT NULL,
+            data TEXT NOT NULL
+        )
+
+index idx_cli_agent_events_invocation on cli_agent_events
+CREATE INDEX idx_cli_agent_events_invocation
+         ON cli_agent_events(invocation_id, seq)
 
 table oauth_connections on oauth_connections
 CREATE TABLE oauth_connections (
@@ -1571,6 +1585,7 @@ rows skill_drafts = 0
 rows dynamic_mcp_servers = 0
 rows dynamic_cli_agents = 0
 rows cli_agent_invocations = 0
+rows cli_agent_events = 0
 rows oauth_connections = 0
 rows pending_oauth_flows = 0
 rows settings = 0

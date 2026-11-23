@@ -352,6 +352,9 @@ pub struct RunChange {
     /// The run's id: the key every surface finds it by.
     pub id: String,
     pub view: aidaemon_core::card::HelperView,
+    /// What a coding agent it launched last said it was doing, in plain
+    /// words ("Editing state.rs"); `None` for any other run.
+    pub activity: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
@@ -1627,6 +1630,7 @@ mod tests {
                         running_for: Duration::from_secs(60),
                         started_at: chrono::Utc::now(),
                         ended_at: None,
+                        activity: None,
                         this_request: false,
                     })
                 })

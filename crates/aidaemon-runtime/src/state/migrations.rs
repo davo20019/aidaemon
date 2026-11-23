@@ -457,6 +457,34 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    // A run's link to the runtime's run record, the mode it was launched
+    // in and the agent's own session id (what resumes it).
+    for statement in [
+        "ALTER TABLE cli_agent_invocations ADD COLUMN run_id TEXT",
+        "ALTER TABLE cli_agent_invocations ADD COLUMN mode TEXT",
+        "ALTER TABLE cli_agent_invocations ADD COLUMN agent_session_id TEXT",
+    ] {
+        let _ = sqlx::query(statement).execute(pool).await;
+    }
+    // What each launched agent did, in order: its typed events.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cli_agent_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            at TEXT NOT NULL DEFAULT (datetime('now')),
+            kind TEXT NOT NULL,
+            data TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_cli_agent_events_invocation
+         ON cli_agent_events(invocation_id, seq)",
+    )
+    .execute(pool)
+    .await?;
 
     // --- OAuth connections table ---
     sqlx::query(

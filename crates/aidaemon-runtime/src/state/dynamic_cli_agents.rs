@@ -124,6 +124,71 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn note_cli_agent_run(
+        &self,
+        id: i64,
+        run_id: &str,
+        mode: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cli_agent_invocations SET run_id = ?, mode = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(mode)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_cli_agent_session(&self, id: i64, agent_session: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cli_agent_invocations SET agent_session_id = ? WHERE id = ?")
+            .bind(agent_session)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_cli_agent_event(
+        &self,
+        id: i64,
+        seq: i64,
+        kind: &str,
+        data: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO cli_agent_events (invocation_id, seq, kind, data) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(seq)
+        .bind(kind)
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_cli_agent_events(
+        &self,
+        id: i64,
+    ) -> anyhow::Result<Vec<aidaemon_tools::services::CliAgentEvent>> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT seq, at, kind, data FROM cli_agent_events WHERE invocation_id = ? ORDER BY seq",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| aidaemon_tools::services::CliAgentEvent {
+                seq: row.get("seq"),
+                at: row.get("at"),
+                kind: row.get("kind"),
+                data: row.get("data"),
+            })
+            .collect())
+    }
+
     async fn get_cli_agent_invocations(
         &self,
         limit: usize,

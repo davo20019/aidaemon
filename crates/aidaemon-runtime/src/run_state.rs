@@ -441,6 +441,10 @@ pub struct RunState {
     pub waited: Duration,
     /// Its latest step while it runs.
     pub step: Option<Step>,
+    /// What a coding agent it launched last said it was doing, in plain
+    /// words from the agent's typed events ("Editing state.rs"); `None` for
+    /// any other run.
+    pub activity: Option<String>,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -731,6 +735,7 @@ impl RunStates {
             work_began: None,
             waited: Duration::ZERO,
             step: None,
+            activity: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -818,12 +823,13 @@ impl RunStates {
             if state.phase.is_terminal() {
                 stepped.remove(id);
             } else if step_only {
-                let words = view
-                    .step
-                    .as_ref()
-                    .filter(|step| step.is_shown())
-                    .map(Step::words)
-                    .unwrap_or_default();
+                let words = state.activity.clone().unwrap_or_else(|| {
+                    view.step
+                        .as_ref()
+                        .filter(|step| step.is_shown())
+                        .map(Step::words)
+                        .unwrap_or_default()
+                });
                 let now = std::time::Instant::now();
                 match stepped.get(id) {
                     Some((at, last)) if *last == words || now.duration_since(*at) < STEP_EVERY => {
@@ -839,6 +845,7 @@ impl RunStates {
             session_id: state.chat.clone(),
             id: state.id.clone(),
             view,
+            activity: state.activity.clone(),
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -959,6 +966,25 @@ impl RunStates {
             self.report(id, true);
         }
         stepped
+    }
+
+    /// What the coding agent run `id` launched is doing now, in plain words
+    /// from its typed events. Ignored once it ended.
+    pub fn activity(&self, id: &str, words: String) -> bool {
+        let set = {
+            let mut runs = self.lock();
+            match runs.get_mut(id) {
+                Some(entry) if entry.state.phase == RunPhase::Running => {
+                    entry.state.activity = Some(words);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if set {
+            self.report(id, true);
+        }
+        set
     }
 
     /// The chat's kept card when run `id` began: its own card is the first
@@ -1406,6 +1432,7 @@ mod tests {
             work_began: Some(requested + chrono::Duration::milliseconds(12_400)),
             waited: Duration::ZERO,
             step: None,
+            activity: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,

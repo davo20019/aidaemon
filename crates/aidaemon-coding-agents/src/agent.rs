@@ -65,6 +65,14 @@ pub trait CodingAgent: Send + Sync {
     fn refused_actions(&self, _stdout: &str) -> Vec<String> {
         Vec::new()
     }
+
+    /// What one output line (as the embedding agent reads it: after its
+    /// host, if it has one) says the agent did ([`crate::AgentEvent`]),
+    /// read from its protocol's typed fields. Empty when it says nothing,
+    /// or this agent's output has no structure to read.
+    fn read_events(&self, _line: &str) -> Vec<crate::AgentEvent> {
+        Vec::new()
+    }
 }
 
 /// One run, as the embedding agent asks for it.

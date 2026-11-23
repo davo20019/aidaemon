@@ -2604,6 +2604,24 @@ impl CliAgentTool {
             )
             .await
             .unwrap_or(0);
+        if invocation_id != 0
+            && let Err(error) = self
+                .state
+                .note_cli_agent_run(invocation_id, &cli_run_id(&task_id), Some(mode.as_str()))
+                .await
+        {
+            warn!(%error, "Could not note a coding agent's run on its invocation");
+        }
+        // The agent's typed events: kept on its invocation, and its latest
+        // step on its run record. Its host's judge keeps each decision too.
+        let waited_runs = self.runs.get_or_init(Default::default).clone();
+        let mut agent_events = super::cli_agent_events::AgentEventRecorder::new(
+            coding_agent.clone(),
+            self.state.clone(),
+            invocation_id,
+            waited_runs.clone(),
+            cli_run_id(&task_id),
+        );
 
         let state_for_completion = self.state.clone();
         let tools_for_completion = self.tools.clone();
@@ -2686,6 +2704,7 @@ impl CliAgentTool {
                         }
                         None => Arc::new(aidaemon_coding_agents::AllowAll),
                     };
+                    let judge = agent_events.judging(judge);
                     Some(starter.start(stdin, judge, &final_prompt).await)
                 }
                 _ => None,
@@ -2801,7 +2820,6 @@ impl CliAgentTool {
         // rows, a question about running work) reads it the same way. If it
         // is moved to the background later, its background run takes the
         // record over under the same id.
-        let waited_runs = self.runs.get_or_init(Default::default).clone();
         if async_mode {
             self.start_background_run(
                 &run_slot,
@@ -2905,6 +2923,7 @@ impl CliAgentTool {
                                     loop_pattern_count = loop_detector.get_loop_pattern();
                                 }
 
+                                agent_events.read(&text).await;
                                 // Write to stdout buffer (for JSON extraction)
                                 {
                                     let mut buf = stdout_buf_writer.lock().await;
@@ -5564,6 +5583,9 @@ mod tests {
     struct TestStore {
         work: aidaemon_work::sqlite::SqliteWorkStore,
         invocations: std::sync::Mutex<Vec<aidaemon_tools::services::CliAgentInvocation>>,
+        /// Kept events: (invocation, seq, kind, data).
+        events: std::sync::Mutex<Vec<(i64, i64, String, String)>>,
+        sessions: std::sync::Mutex<Vec<(i64, String)>>,
     }
 
     impl TestStore {
@@ -5571,6 +5593,8 @@ mod tests {
             Self {
                 work: aidaemon_work::sqlite::open_for_tests(path).await,
                 invocations: Default::default(),
+                events: Default::default(),
+                sessions: Default::default(),
             }
         }
     }
@@ -5610,6 +5634,28 @@ mod tests {
 
     #[async_trait]
     impl crate::tools::traits::DynamicCliAgentStore for TestStore {
+        async fn set_cli_agent_session(&self, id: i64, agent_session: &str) -> anyhow::Result<()> {
+            self.sessions
+                .lock()
+                .unwrap()
+                .push((id, agent_session.to_string()));
+            Ok(())
+        }
+
+        async fn record_cli_agent_event(
+            &self,
+            id: i64,
+            seq: i64,
+            kind: &str,
+            data: &str,
+        ) -> anyhow::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((id, seq, kind.to_string(), data.to_string()));
+            Ok(())
+        }
+
         async fn log_cli_agent_start(
             &self,
             task_id: Option<&str>,
@@ -8234,6 +8280,75 @@ mod tests {
     /// header and total come from the runs' phases; each is named from its
     /// task; and the card settles the moment the programs end, though the
     /// parent's continuation turn never gets its slot.
+
+    /// A launched agent's output is read into typed events: its session id
+    /// is kept, each event is kept in order with each permission decision,
+    /// and its latest step is its run's activity, in words that never carry
+    /// a command line.
+    #[tokio::test]
+    async fn a_coding_agents_events_are_kept_and_its_step_is_its_runs_activity() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(TestStore::open(db.path().to_str().unwrap()).await);
+        let runs = Arc::new(crate::run_state::RunStates::default());
+        runs.begin("cli-agent-r1", "app:synthetic-events", "Claude Code", None);
+        let agent = aidaemon_coding_agents::CodingAgents::builtin().for_program("claude");
+        let mut recorder = super::super::cli_agent_events::AgentEventRecorder::new(
+            agent,
+            store.clone() as Arc<dyn CliAgentStore>,
+            7,
+            runs.clone(),
+            "cli-agent-r1".to_string(),
+        );
+        recorder
+            .read(r#"{"type":"system","subtype":"init","session_id":"sess-synthetic","model":"m"}"#)
+            .await;
+        recorder
+            .read(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"SECRET=abc cargo test -q"}}]}}"#)
+            .await;
+        assert_eq!(
+            runs.get("cli-agent-r1").unwrap().activity.as_deref(),
+            Some("Running cargo")
+        );
+        let judge = recorder.judging(Arc::new(aidaemon_coding_agents::AllowAll));
+        judge
+            .judge(aidaemon_coding_agents::AgentAction::ReachHost {
+                host: "github.com".into(),
+            })
+            .await;
+        recorder
+            .read(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#)
+            .await;
+        recorder
+            .read(r#"{"type":"result","is_error":false,"total_cost_usd":0.1,"usage":{"input_tokens":1,"output_tokens":2}}"#)
+            .await;
+        assert_eq!(
+            *store.sessions.lock().unwrap(),
+            vec![(7, "sess-synthetic".to_string())]
+        );
+        let events = store.events.lock().unwrap().clone();
+        let kinds: Vec<(i64, &str)> = events
+            .iter()
+            .map(|(_, seq, kind, _)| (*seq, kind.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (1, "session"),
+                (2, "step"),
+                (3, "permission"),
+                (4, "step_ended"),
+                (5, "usage"),
+                (6, "turn_ended"),
+            ]
+        );
+        assert!(events.iter().all(|(invocation, ..)| *invocation == 7));
+        assert!(!events[1].3.contains("SECRET"), "{}", events[1].3);
+        assert!(
+            events[2].3.contains("\"outcome\":\"allowed\""),
+            "{}",
+            events[2].3
+        );
+    }
 
     /// A run its turn waits on has a record like a background one: it is
     /// listed in its chat while it runs and ends there with how it ended.

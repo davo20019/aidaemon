@@ -146,6 +146,9 @@ pub struct ChatRun {
     pub running_for: std::time::Duration,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What a coding agent it launched last said it was doing, in plain
+    /// words; `None` for any other run.
+    pub activity: Option<String>,
     /// The chat's running turn started it (an earlier turn's helper runs on
     /// in the background).
     pub this_request: bool,

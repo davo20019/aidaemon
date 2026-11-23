@@ -429,7 +429,7 @@ impl TurnObserver for GatewayObserver {
                 Event::RunStep {
                     run_id: change.id.clone(),
                     session_id: change.session_id.clone(),
-                    step: step_words(&change.view),
+                    step: step_words(&change.view, change.activity.as_deref()),
                     at_ms: now_ms(),
                 },
             );
@@ -442,6 +442,7 @@ impl TurnObserver for GatewayObserver {
                     &change.session_id,
                     &change.id,
                     &change.view,
+                    change.activity.as_deref(),
                     change.started_at,
                     change.ended_at,
                 ),
@@ -506,6 +507,7 @@ pub(crate) fn run_summary(
     session_id: &str,
     id: &str,
     view: &aidaemon_core::card::HelperView,
+    activity: Option<&str>,
     started_at: chrono::DateTime<chrono::Utc>,
     ended_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> RunSummary {
@@ -523,7 +525,7 @@ pub(crate) fn run_summary(
         label: view.label.clone(),
         phase,
         background: view.background,
-        step: step_words(view),
+        step: step_words(view, activity),
         started_at_ms: ms(started_at),
         ended_at_ms: ended_at.map(ms),
         took: view.took.clone(),
@@ -534,9 +536,12 @@ pub(crate) fn run_summary(
 
 /// A running run's step in plain words; empty once it ended or when the
 /// step says nothing ([`aidaemon_core::card::Step::is_shown`]).
-fn step_words(view: &aidaemon_core::card::HelperView) -> String {
+fn step_words(view: &aidaemon_core::card::HelperView, activity: Option<&str>) -> String {
     if view.phase.is_terminal() {
         return String::new();
+    }
+    if let Some(activity) = activity.filter(|words| !words.is_empty()) {
+        return activity.to_string();
     }
     view.step
         .as_ref()

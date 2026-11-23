@@ -226,6 +226,7 @@ mod tests {
                 running_for: Duration::from_secs(90),
                 started_at: chrono::Utc::now(),
                 ended_at: None,
+                activity: None,
                 this_request: true,
             }],
             running: vec![RunningItem {

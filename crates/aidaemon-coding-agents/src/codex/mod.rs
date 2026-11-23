@@ -13,6 +13,7 @@
 //!
 //! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18).
 
+pub mod events;
 pub mod host;
 
 use crate::{
@@ -155,6 +156,10 @@ fn hosted(launch: &mut Launch, request: &RunRequest<'_>, asks: host::Asks) -> Re
 }
 
 impl CodingAgent for Codex {
+    fn read_events(&self, line: &str) -> Vec<crate::AgentEvent> {
+        events::read_events(line)
+    }
+
     fn name(&self) -> &str {
         "Codex"
     }

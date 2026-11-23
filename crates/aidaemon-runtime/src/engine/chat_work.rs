@@ -105,6 +105,7 @@ pub trait ChatWorkControl: TurnHost {
                     .unwrap_or_default(),
                 started_at: run.started_at,
                 ended_at: run.ended_at,
+                activity: run.activity.clone(),
                 this_request: request.is_some() && run.request == request,
             })
             .collect();

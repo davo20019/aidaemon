@@ -160,6 +160,18 @@ pub struct CliAgentInvocation {
     pub duration_secs: Option<f64>,
 }
 
+/// One thing a launched coding agent did, as its run's record keeps it:
+/// `kind` and `data` are a typed agent event's stored form (`session`, `step`, `step_ended`, `plan`, `usage`,
+/// `turn_ended`, `permission`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliAgentEvent {
+    pub seq: i64,
+    pub at: String,
+    pub kind: String,
+    /// Its fields, as JSON.
+    pub data: String,
+}
+
 /// Runtime-managed CLI agents persistence + invocation logs.
 #[async_trait]
 pub trait DynamicCliAgentStore: Send + Sync {
@@ -205,6 +217,39 @@ pub trait DynamicCliAgentStore: Send + Sync {
         _duration_secs: f64,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Invocation `id` is run `run_id` in the runtime's records, launched in
+    /// `mode` (its permission mode's stored name, when one applies).
+    async fn note_cli_agent_run(
+        &self,
+        _id: i64,
+        _run_id: &str,
+        _mode: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The agent's own session (Claude Code's session id, Codex's thread id,
+    /// an ACP session id): what resumes it or finds its own transcript.
+    async fn set_cli_agent_session(&self, _id: i64, _agent_session: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Keep one event of invocation `id`, in order (`seq`).
+    async fn record_cli_agent_event(
+        &self,
+        _id: i64,
+        _seq: i64,
+        _kind: &str,
+        _data: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Invocation `id`'s events, in order.
+    async fn get_cli_agent_events(&self, _id: i64) -> anyhow::Result<Vec<CliAgentEvent>> {
+        Ok(vec![])
     }
 
     /// Get recent CLI agent invocations (most recent first).

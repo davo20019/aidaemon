@@ -2530,6 +2530,7 @@ mod group_tests {
             work_began: Some(at(began)),
             waited: Duration::ZERO,
             step: None,
+            activity: None,
             steps: Vec::new(),
             evidence: Default::default(),
             failure: None,
@@ -2635,6 +2636,7 @@ mod group_tests {
                 work_began: None,
                 waited: Duration::ZERO,
                 step: None,
+                activity: None,
                 steps: Vec::new(),
                 evidence: crate::run_state::RunEvidence {
                     delivered,

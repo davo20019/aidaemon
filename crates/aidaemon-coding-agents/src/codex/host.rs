@@ -693,6 +693,14 @@ fn exec_item(item: &Value) -> Option<Value> {
                 .collect();
             Some(json!({"id": id, "type": "file_change", "changes": changes, "status": status}))
         }
+        "webSearch" => Some(json!({"id": id, "type": "web_search", "status": status})),
+        "mcpToolCall" => Some(json!({
+            "id": id,
+            "type": "mcp_tool_call",
+            "server": item.get("server").cloned().unwrap_or(Value::Null),
+            "tool": item.get("tool").cloned().unwrap_or(Value::Null),
+            "status": status,
+        })),
         _ => None,
     }
 }

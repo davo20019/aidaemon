@@ -54,6 +54,17 @@ fn error_line(id: &Value, message: &str) -> String {
     line
 }
 
+/// The paths a tool call names (`locations[].path`).
+fn locations(update: &Value) -> Vec<Value> {
+    update
+        .get("locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|location| location.get("path").cloned())
+        .collect()
+}
+
 /// The handshake: protocol 1, and no file system or terminal offered.
 pub fn initialize_line() -> String {
     request_line(
@@ -292,7 +303,8 @@ impl AcpHost {
                 self.stdin
                     .write(&request_line(PROMPT_ID, "session/prompt", params))
                     .await;
-                Vec::new()
+                // Its session, for the run's record (what resumes it).
+                vec![json!({"type": "acp.session", "session_id": session}).to_string()]
             }
             Some(PROMPT_ID) => {
                 let stop = result
@@ -340,13 +352,38 @@ impl AcpHost {
                 Vec::new()
             }
             // What it says before a tool call is not its final message.
+            // Each tool call goes on with its typed fields (its id, `kind`,
+            // status, the paths it touches and the command it runs), so the
+            // run's reader records the step without reading its title.
             "tool_call" => {
                 state.message.clear();
-                let title = update
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                vec![json!({"type": "tool_call", "title": title}).to_string()]
+                vec![
+                    json!({
+                        "type": "tool_call",
+                        "id": update.get("toolCallId"),
+                        "title": update.get("title").and_then(Value::as_str).unwrap_or_default(),
+                        "kind": update.get("kind"),
+                        "status": update.get("status"),
+                        "paths": locations(update),
+                        "command": update.pointer("/rawInput/command"),
+                        "url": update.pointer("/rawInput/url"),
+                    })
+                    .to_string(),
+                ]
+            }
+            "tool_call_update" => match update.get("status").and_then(Value::as_str) {
+                Some(status @ ("completed" | "failed")) => vec![
+                    json!({
+                        "type": "tool_call_update",
+                        "id": update.get("toolCallId"),
+                        "status": status,
+                    })
+                    .to_string(),
+                ],
+                _ => Vec::new(),
+            },
+            "plan" => {
+                vec![json!({"type": "acp.plan", "entries": update.get("entries")}).to_string()]
             }
             _ => Vec::new(),
         }

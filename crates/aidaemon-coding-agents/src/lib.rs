@@ -25,6 +25,7 @@ mod action;
 mod agent;
 pub mod claude;
 pub mod codex;
+mod events;
 mod mode;
 pub mod plain;
 mod readiness;
@@ -36,6 +37,7 @@ pub use agent::{
     AgentHost, CodingAgent, Discovery, HostAnswers, HostStarter, Launch, LaunchArguments, Plan,
     PromptPlacement, RunRequest, read_through,
 };
+pub use events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, program_of};
 pub use mode::{PermissionMode, mode_within, modes_within};
 pub use readiness::{Probe, Readiness, check};
 pub use registry::CodingAgents;

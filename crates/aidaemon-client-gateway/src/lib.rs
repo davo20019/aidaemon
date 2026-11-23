@@ -2426,6 +2426,7 @@ impl ClientGateway {
                     &session_id,
                     &run.id,
                     &run.view,
+                    run.activity.as_deref(),
                     run.started_at,
                     run.ended_at,
                 ));

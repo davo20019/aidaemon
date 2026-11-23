@@ -248,6 +248,7 @@ mod tests {
             running_for: Duration::from_secs(10),
             started_at: chrono::Utc::now(),
             ended_at: None,
+            activity: None,
             this_request,
         }
     }

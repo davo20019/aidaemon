@@ -12,6 +12,7 @@
 //! [`AcpAgent::antigravity`] and [`AcpAgent::gemini`] are the ones known;
 //! [`AcpAgent::custom`] is any other the owner names.
 
+pub mod events;
 pub mod host;
 
 use crate::{
@@ -83,6 +84,10 @@ impl AcpAgent {
 }
 
 impl CodingAgent for AcpAgent {
+    fn read_events(&self, line: &str) -> Vec<crate::AgentEvent> {
+        events::read_events(line)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

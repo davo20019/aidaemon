@@ -13,6 +13,7 @@
 //! In the first two every prompt goes to the host ([`host::ClaudeHost`]).
 //! Verified against Claude Code 2.1.327 (live probes, 2026-11-17/18).
 
+pub mod events;
 pub mod host;
 
 use serde_json::{Value, json};
@@ -165,6 +166,10 @@ fn plan() -> Plan {
 }
 
 impl CodingAgent for ClaudeCode {
+    fn read_events(&self, line: &str) -> Vec<crate::AgentEvent> {
+        events::read_events(line)
+    }
+
     fn name(&self) -> &str {
         "Claude Code"
     }
