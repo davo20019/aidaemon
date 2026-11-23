@@ -12,8 +12,6 @@ mod diagnose;
 mod file_policy;
 pub use file_policy::DaemonPaths;
 pub(crate) use file_policy::daemon_file_policy;
-#[cfg(test)]
-pub(crate) use file_policy::{guarded_call, guarded_call_protecting};
 mod goal_trace;
 pub mod image_generation;
 pub(crate) mod manage_automations;
