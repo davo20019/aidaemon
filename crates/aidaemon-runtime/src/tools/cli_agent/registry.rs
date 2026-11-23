@@ -178,14 +178,7 @@ impl CliAgentTool {
 
     /// Release a working-directory claim if it belongs to the given task.
     pub(super) fn release_working_dir_claim(&self, dir: &str, task_id: &str) {
-        let mut claims = lock_claims(&self.working_dir_claims);
-        let should_remove = claims
-            .get(dir)
-            .map(|claim| claim.task_id == task_id)
-            .unwrap_or(false);
-        if should_remove {
-            claims.remove(dir);
-        }
+        release_claim(&mut lock_claims(&self.working_dir_claims), dir, task_id);
     }
 
     pub async fn discover(

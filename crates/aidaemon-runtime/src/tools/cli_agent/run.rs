@@ -299,7 +299,7 @@ impl CliAgentTool {
         } else {
             None
         };
-        let dedup_prompt = make_dedup_prompt(prompt);
+        let writes = WriteScope::of(workspace_mode, &canonical_write_paths);
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         let short_summary: String = prompt.chars().take(50).collect();
 
@@ -313,37 +313,16 @@ impl CliAgentTool {
                 let _running_guard = self.running.lock().await;
                 let mut claims = lock_claims(&self.working_dir_claims);
 
-                if let Some(claim) = claims.get(dir) {
-                    let sim = prompt_similarity(&dedup_prompt, &claim.dedup_prompt);
-                    if sim > 0.5 {
-                        Some(format!(
-                            "BLOCKED: A very similar task is already running in {} \
-                             (task_id={}, agent={}, similarity={:.0}%). \
-                             You MUST wait for it to finish or cancel it.",
-                            dir,
-                            claim.task_id,
-                            claim.tool_name,
-                            sim * 100.0
-                        ))
-                    } else {
-                        Some(format!(
-                            "BLOCKED: Another CLI agent is already working in {} \
-                             (task_id={}, agent={}, prompt=\"{}\"). \
-                             You MUST wait for it to finish or cancel it before dispatching \
-                             another task to the same directory.",
-                            dir, claim.task_id, claim.tool_name, claim.prompt_summary
-                        ))
-                    }
+                let held = claims.entry(dir.clone()).or_default();
+                if let Some(claim) = conflicting(held, &writes) {
+                    Some(conflict_message(dir, claim))
                 } else {
-                    claims.insert(
-                        dir.clone(),
-                        WorkingDirClaim {
-                            task_id: task_id.clone(),
-                            tool_name: tool_name.to_string(),
-                            prompt_summary: short_summary.clone(),
-                            dedup_prompt: dedup_prompt.clone(),
-                        },
-                    );
+                    held.push(WorkingDirClaim {
+                        task_id: task_id.clone(),
+                        tool_name: tool_name.to_string(),
+                        prompt_summary: short_summary.clone(),
+                        writes: writes.clone(),
+                    });
                     None
                 }
             };

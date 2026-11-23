@@ -40,12 +40,12 @@ async fn test_working_dir_conflict_detection() {
     // Seed a claim as if another task already owns this directory.
     lock_claims(&tool.working_dir_claims).insert(
         "/tmp/project".to_string(),
-        WorkingDirClaim {
+        vec![WorkingDirClaim {
             task_id: "abc12345".to_string(),
             tool_name: "bash-agent".to_string(),
             prompt_summary: "sleep 60".to_string(),
-            dedup_prompt: make_dedup_prompt("sleep 60"),
-        },
+            writes: WriteScope::Whole,
+        }],
     );
 
     let result = tool
@@ -232,8 +232,8 @@ async fn test_sync_inflight_duplicate_prompt_blocked() {
     );
     let second = tool.call(&second_args).await.unwrap();
     assert!(
-        second.contains("BLOCKED") && second.contains("similar task"),
-        "Expected duplicate-task block for sync in-flight run, got: {}",
+        second.contains("BLOCKED") && second.contains("Another CLI agent"),
+        "Expected a run changing the same folder to be blocked, got: {}",
         second
     );
 
@@ -325,12 +325,12 @@ async fn test_claim_guard_disarm_keeps_claim() {
     let claims: Arc<WorkingDirClaims> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     lock_claims(&claims).insert(
         "/tmp/project".to_string(),
-        WorkingDirClaim {
+        vec![WorkingDirClaim {
             task_id: "abc12345".to_string(),
             tool_name: "bash-agent".to_string(),
             prompt_summary: "sleep 60".to_string(),
-            dedup_prompt: make_dedup_prompt("sleep 60"),
-        },
+            writes: WriteScope::Whole,
+        }],
     );
 
     let mut guard = WorkingDirClaimGuard::new(
@@ -375,39 +375,15 @@ async fn test_claim_guard_disarm_keeps_claim() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_prompt_similarity_scores() {
-    // Identical prompts → 1.0
-    assert!(
-        (prompt_similarity("refactor the auth module", "refactor the auth module") - 1.0).abs()
-            < f64::EPSILON
-    );
-
-    // Very similar prompts → high similarity
-    let sim = prompt_similarity(
-        "refactor the auth module to use JWT",
-        "refactor the auth module to use OAuth",
-    );
-    assert!(
-        sim > 0.5,
-        "Similar prompts should score > 0.5, got: {:.3}",
-        sim
-    );
-
-    // Completely different prompts → low similarity
-    let sim = prompt_similarity("refactor the auth module", "deploy to production server");
-    assert!(
-        sim < 0.3,
-        "Different prompts should score < 0.3, got: {:.3}",
-        sim
-    );
-
-    // Empty prompts
-    assert!((prompt_similarity("", "") - 1.0).abs() < f64::EPSILON);
-    assert!((prompt_similarity("hello", "") - 0.0).abs() < f64::EPSILON);
-
-    // Single-word prompts (unigram fallback)
-    assert!((prompt_similarity("deploy", "deploy") - 1.0).abs() < f64::EPSILON);
-    assert!((prompt_similarity("deploy", "refactor") - 0.0).abs() < f64::EPSILON);
+fn write_scopes_overlap_only_where_both_may_change_the_same_files() {
+    let paths = |p: &[&str]| WriteScope::Paths(p.iter().map(|p| p.to_string()).collect());
+    let reviews = paths(&["/w/synthetic/reviews/claude.md"]);
+    assert!(!reviews.overlaps(&paths(&["/w/synthetic/reviews/codex.md"])));
+    assert!(reviews.overlaps(&paths(&["/w/synthetic/reviews"])));
+    assert!(reviews.overlaps(&WriteScope::Whole));
+    assert!(!WriteScope::ReadOnly.overlaps(&WriteScope::Whole));
+    // A sibling whose name starts the same is not inside it.
+    assert!(!paths(&["/w/synthetic/src"]).overlaps(&paths(&["/w/synthetic/src2/a.rs"])));
 }
 
 // -----------------------------------------------------------------------
@@ -432,17 +408,43 @@ async fn test_duplicate_task_detection() {
         first
     );
 
-    // Try a very similar prompt to the same dir → should be blocked
+    // The same task again, changing the same folder: blocked.
     let second_args = format!(
-        r#"{{"action":"run","tool":"bash-agent","prompt":"refactor the auth module to use OAuth tokens","working_dir":"{}"}}"#,
+        r#"{{"action":"run","tool":"bash-agent","prompt":"refactor the auth module to use JWT tokens","working_dir":"{}"}}"#,
         dir
     );
     let second = tool.call(&second_args).await.unwrap();
     assert!(
-        second.contains("BLOCKED") && second.contains("similar task"),
-        "Expected duplicate task BLOCKED message, got: {}",
+        second.contains("BLOCKED") && second.contains("Another CLI agent"),
+        "Expected the same folder's writer to be blocked, got: {}",
         second
     );
+
+    tool.handle_cancel_all("").await.unwrap();
+}
+
+/// Agents given the same task side by side, each writing its own file,
+/// all start: what they may change does not overlap.
+#[tokio::test]
+async fn runs_that_change_different_files_in_one_folder_start_side_by_side() {
+    let (tool, _db) = setup_bash_tool().await;
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let dir = tmp_dir.path().to_string_lossy().to_string();
+    for name in ["a", "b"] {
+        let args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 5; review the module","working_dir":"{dir}","write_paths":["{dir}/reviews/{name}.md"],"async_mode":true}}"#
+        );
+        let started = tool.call(&args).await.unwrap();
+        assert!(
+            started.contains("started in background"),
+            "Expected run {name} to start, got: {started}"
+        );
+    }
+    // A third that may change anything in the folder waits for them.
+    let whole = format!(
+        r#"{{"action":"run","tool":"bash-agent","prompt":"review the module","working_dir":"{dir}"}}"#
+    );
+    assert!(tool.call(&whole).await.unwrap().contains("BLOCKED"));
 
     tool.handle_cancel_all("").await.unwrap();
 }

@@ -162,13 +162,7 @@ impl CliAgentTool {
             for task_id in finished_ids {
                 if let Some(agent) = running.remove(&task_id) {
                     if let Some(ref dir) = agent.working_dir {
-                        let should_remove = claims
-                            .get(dir)
-                            .map(|claim| claim.task_id == task_id)
-                            .unwrap_or(false);
-                        if should_remove {
-                            claims.remove(dir);
-                        }
+                        release_claim(&mut claims, dir, &task_id);
                     }
                     removed.push((task_id, agent));
                 }
