@@ -54,8 +54,9 @@ pub(super) struct RunningCliAgent {
     pub(super) display_buf: Arc<Mutex<String>>,
     /// Pure stdout for JSON extraction
     pub(super) stdout_buf: Arc<Mutex<String>>,
-    /// Backend-scoped handle for status display and cancellation.
-    pub(super) process_handle: ProcessHandle,
+    /// Its process, for status display and cancellation: none while it
+    /// waits in line for a free slot.
+    pub(super) process: Arc<RunProcess>,
     /// Set by the stream/wait task after the backend process exits.
     pub(super) finished: Arc<AtomicBool>,
     /// Set by the stream/wait task when the run failed to authenticate
@@ -65,10 +66,93 @@ pub(super) struct RunningCliAgent {
     pub(super) session_id: String,
     /// Delegated task ID when this cli_agent run is acting as an executor.
     pub(super) delegated_task_id: Option<String>,
-    /// Working directory for git diff capture
-    pub(super) working_dir: Option<String>,
+    /// The working directory whose diff its result shows: set when it
+    /// starts from a clean read-write checkout.
+    pub(super) diff_dir: Arc<OnceLock<String>>,
+    /// The working directory it claimed ([`WorkingDirClaim`]), released
+    /// when it ends or is cancelled.
+    pub(super) claim_dir: Option<String>,
     /// What the agent left running, set once it has exited.
     pub(super) left_running: Arc<OnceLock<left_running::LeftRunning>>,
+}
+
+/// Where a run's process stands: a background launch that found every slot
+/// taken waits in line ([`ProcessState::Queued`]) until one frees.
+#[derive(Default)]
+pub(super) struct RunProcess {
+    state: std::sync::Mutex<ProcessState>,
+    /// Wakes a queued run that was stopped before it started.
+    stop: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+enum ProcessState {
+    /// Waiting for a free slot: no process yet.
+    #[default]
+    Queued,
+    Started(ProcessHandle),
+    /// Stopped while it waited: it never starts.
+    Stopped,
+}
+
+impl RunProcess {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ProcessState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Its process, once started.
+    pub(super) fn handle(&self) -> Option<ProcessHandle> {
+        match &*self.lock() {
+            ProcessState::Started(handle) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether it still waits for a free slot.
+    pub(super) fn is_queued(&self) -> bool {
+        matches!(*self.lock(), ProcessState::Queued)
+    }
+
+    /// Whether it was stopped while it waited.
+    pub(super) fn was_stopped(&self) -> bool {
+        matches!(*self.lock(), ProcessState::Stopped)
+    }
+
+    /// Record its started process. False when it was stopped while it
+    /// waited: its caller stops the process it just started.
+    pub(super) fn start(&self, handle: ProcessHandle) -> bool {
+        let mut state = self.lock();
+        if matches!(*state, ProcessState::Stopped) {
+            return false;
+        }
+        *state = ProcessState::Started(handle);
+        true
+    }
+
+    /// Stop it: a started process is killed, a queued run never starts.
+    pub(super) async fn stop(&self, backend: &SharedExecutionBackend) {
+        let handle = {
+            let mut state = self.lock();
+            match &*state {
+                ProcessState::Started(handle) => Some(handle.clone()),
+                ProcessState::Queued | ProcessState::Stopped => {
+                    *state = ProcessState::Stopped;
+                    None
+                }
+            }
+        };
+        match handle {
+            Some(handle) => kill_process(backend, &handle).await,
+            None => self.stop.notify_one(),
+        }
+    }
+
+    /// Resolves once it is stopped while it waits.
+    pub(super) async fn stopped(&self) {
+        self.stop.notified().await;
+    }
 }
 
 /// Finalized background CLI task output retained briefly so `action="check"`
