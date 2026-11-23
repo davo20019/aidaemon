@@ -1,6 +1,7 @@
 //! An Agent Client Protocol agent's run read into [`AgentEvent`]s, from the
 //! lines its host gives the run's reader ([`super::host`]): `acp.session`
-//! (its session id and model), `tool_call` (the call's id, its ACP `kind`, the paths
+//! (its session id, its model, and whether a later run can continue it:
+//! the agent's own `loadSession`), `tool_call` (the call's id, its ACP `kind`, the paths
 //! it names, its command or URL), `tool_call_update` (a call completed or
 //! failed), `acp.plan` (its plan entries) and `result` (its turn's end).
 //! A step's kind is the protocol's `kind` value, never its title.
@@ -21,7 +22,9 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
             .map(|id| AgentEvent::Session {
                 id,
                 model: text(&event, "/model"),
-                resumable: None,
+                // The agent's word, given only once it runs (its
+                // `loadSession` capability); absent: the launch decided.
+                resumable: event.get("resumable").and_then(Value::as_bool),
             })
             .into_iter()
             .collect(),
@@ -99,6 +102,23 @@ mod tests {
                 resumable: None,
             }]
         );
+        assert_eq!(
+            read_events(
+                r#"{"type":"acp.session","session_id":"sess-2","model":"synthetic-large","resumable":true}"#
+            ),
+            vec![AgentEvent::Session {
+                id: "sess-2".into(),
+                model: Some("synthetic-large".into()),
+                resumable: Some(true),
+            }]
+        );
+        assert!(matches!(
+            &read_events(r#"{"type":"acp.session","session_id":"sess-3","resumable":false}"#)[0],
+            AgentEvent::Session {
+                resumable: Some(false),
+                ..
+            }
+        ));
         assert_eq!(
             read_events(
                 r#"{"type":"tool_call","id":"c1","title":"Delete everything","kind":"edit","paths":["/w/synthetic/notes.md"]}"#

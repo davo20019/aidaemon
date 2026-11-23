@@ -12,8 +12,20 @@
 //! never sent back.
 //!
 //! The process runs with its own `CODEX_HOME` ([`CodexHome`]), holding only
-//! a link to the owner's sign-in: the owner's `config.toml`, command rules,
-//! MCP servers, plugins and trusted projects never reach a delegated run.
+//! two links into the owner's: the sign-in (`auth.json`) and the folder of
+//! thread records (`sessions`). The owner's `config.toml`, command rules,
+//! MCP servers, plugins, skills and trusted projects never reach a
+//! delegated run, and neither do Codex's own databases.
+//!
+//! Its thread is stored (not `ephemeral`) in the owner's `sessions`, where
+//! `codex exec ... resume <id>` finds it too, so a later run continues it
+//! whichever way either run was launched. A run that continues a thread
+//! sends `thread/resume` instead of `thread/start`. Codex finds a thread by
+//! its id from its record file alone (`sessions/YYYY/MM/DD/rollout-...-<id>.jsonl`):
+//! a home with no database, or one whose database has never seen that
+//! thread, continues it all the same. A resumed thread takes back the model,
+//! sandbox and approval policy it last ran with unless the request names
+//! them, so the request names this run's own ([`thread_settings`]).
 //!
 //! Its notifications are translated into the `codex exec --json` events an
 //! `exec` run writes, so the embedding agent reads both launches the same
@@ -52,8 +64,15 @@ const DISABLED_FEATURES: [&str; 11] = [
 ];
 
 const INITIALIZE_ID: u64 = 1;
-const THREAD_START_ID: u64 = 2;
+/// `thread/start`, or `thread/resume` for a run that continues a thread.
+const THREAD_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
+
+/// The launch settings a resumed thread would otherwise take back from its
+/// last run (live probe, 0.170.0: a thread last run with full access came
+/// back with full access under a read-only launch, and with its old model
+/// and approval policy).
+const THREAD_SETTINGS: [&str; 3] = ["model", "sandbox_mode", "default_permissions"];
 
 /// What the agent is told about its approvals. Codex's own model decides
 /// when to ask to leave its sandbox, and without this it reads a sandbox
@@ -175,30 +194,67 @@ pub fn app_server_args(args: &[String], start: usize, asks: Asks) -> Result<Vec<
     Ok(out)
 }
 
+/// The settings of an app-server launch ([`app_server_args`]) that a
+/// resumed thread must be told again, as `thread/resume`'s `config`: its
+/// model, sandbox mode and permission profile, each a string. A value that
+/// is not a quoted string is passed as written (Codex reads a `-c` value it
+/// cannot parse the same way).
+pub fn thread_settings(args: &[String]) -> Value {
+    let mut settings = serde_json::Map::new();
+    for pair in args.windows(2).filter(|pair| pair[0] == "-c") {
+        // Its own entries, by their config keys (machine format).
+        let Some((key, value)) = pair[1].split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if THREAD_SETTINGS.contains(&key) {
+            let value = value.trim();
+            let value = serde_json::from_str::<String>(value).unwrap_or_else(|_| value.to_string());
+            settings.insert(key.to_string(), Value::String(value));
+        }
+    }
+    Value::Object(settings)
+}
+
 /// A run's own `CODEX_HOME`: a fresh folder holding only a link to the
-/// owner's `auth.json`, removed when the run is over. The link (not a copy)
-/// keeps a token Codex refreshes during the run the owner's.
+/// owner's `auth.json` and one to the owner's `sessions` folder, removed
+/// when the run is over. The sign-in link (not a copy) keeps a token Codex
+/// refreshes during the run the owner's; the sessions link keeps the run's
+/// thread where a later run, hosted or `codex exec`, finds it by its id.
+/// Nothing else is linked: the owner's settings, rules, MCP servers,
+/// plugins and skills stay out, and so do Codex's databases (each run makes
+/// its own, and Codex finds a thread without them).
 #[derive(Debug)]
 pub struct CodexHome {
     path: PathBuf,
 }
 
 impl CodexHome {
-    /// `Err` when the owner's sign-in is not a file this can link (no
-    /// `auth.json`, or links unsupported here).
+    /// A home linked to the owner's (`$CODEX_HOME`, else `~/.codex`, the
+    /// home a `codex exec` run uses). `Err` when the owner's sign-in is not
+    /// a file this can link (no `auth.json`, or links unsupported here).
     pub fn prepare() -> Result<Self, String> {
         let source = std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
             .ok_or("no home directory")?;
+        Self::linked_to(&source)
+    }
+
+    /// A home linked to the Codex home at `source`.
+    pub fn linked_to(source: &std::path::Path) -> Result<Self, String> {
         let auth = source.join("auth.json");
         if !auth.is_file() {
             return Err(format!("no Codex sign-in at {}", auth.display()));
         }
+        // Codex makes it on its first stored thread; a link needs it now.
+        let sessions = source.join("sessions");
+        std::fs::create_dir_all(&sessions).map_err(|error| error.to_string())?;
         let path = std::env::temp_dir().join(format!("aidaemon-codex-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
         let home = Self { path };
-        link(&auth, &home.path.join("auth.json")).map_err(|error| error.to_string())?;
+        link_file(&auth, &home.path.join("auth.json")).map_err(|error| error.to_string())?;
+        link_dir(&sessions, &home.path.join("sessions")).map_err(|error| error.to_string())?;
         Ok(home)
     }
 
@@ -208,18 +264,29 @@ impl CodexHome {
 }
 
 #[cfg(unix)]
-fn link(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+fn link_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(unix)]
+fn link_dir(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(source, target)
 }
 
 #[cfg(windows)]
-fn link(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+fn link_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_file(source, target)
+}
+
+#[cfg(windows)]
+fn link_dir(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(source, target)
 }
 
 impl Drop for CodexHome {
     fn drop(&mut self) {
-        // Removes the link, never the file it points to.
+        // Removes the links, never what they point to: `remove_dir_all`
+        // does not follow a link (the owner's threads stay).
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -327,6 +394,24 @@ struct HostState {
 pub struct CodexHostStarter {
     pub working_dir: Option<String>,
     pub asks: Asks,
+    /// Which thread its run starts or continues.
+    pub thread: ThreadRequest,
+}
+
+/// The thread a hosted run works on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThreadRequest {
+    /// A new thread; `ephemeral` (the launch said `--ephemeral`) is never
+    /// stored, so no later run can continue it.
+    Start { ephemeral: bool },
+    /// The stored thread `id`, with this run's own [`thread_settings`].
+    Resume { id: String, settings: Value },
+}
+
+impl Default for ThreadRequest {
+    fn default() -> Self {
+        Self::Start { ephemeral: false }
+    }
 }
 
 #[async_trait]
@@ -339,7 +424,8 @@ impl HostStarter for CodexHostStarter {
         judge: Arc<dyn ActionJudge>,
         prompt: &str,
     ) -> Arc<dyn AgentHost> {
-        let host = CodexHost::new(stdin, judge, self.working_dir, prompt, self.asks);
+        let host = CodexHost::new(stdin, judge, self.working_dir, prompt, self.asks)
+            .on_thread(self.thread);
         host.stdin.write(&initialize_line()).await;
         Arc::new(host)
     }
@@ -354,6 +440,7 @@ pub struct CodexHost {
     working_dir: Option<String>,
     prompt: Arc<str>,
     asks: Asks,
+    thread: Arc<ThreadRequest>,
     state: Arc<Mutex<HostState>>,
 }
 
@@ -371,7 +458,41 @@ impl CodexHost {
             working_dir,
             prompt: Arc::from(prompt),
             asks,
+            thread: Arc::default(),
             state: Arc::default(),
+        }
+    }
+
+    /// Works on `thread` (a new stored thread by default).
+    pub fn on_thread(mut self, thread: ThreadRequest) -> Self {
+        self.thread = Arc::new(thread);
+        self
+    }
+
+    /// `thread/start`, or `thread/resume` for a thread to continue.
+    fn thread_line(&self) -> String {
+        let mut params = json!({
+            "approvalPolicy": self.asks.policy(),
+            "approvalsReviewer": "user",
+            "developerInstructions": HOST_INSTRUCTIONS,
+        });
+        if let Some(dir) = self.working_dir.as_deref() {
+            params["cwd"] = json!(dir);
+        }
+        match &*self.thread {
+            ThreadRequest::Start { ephemeral } => {
+                if *ephemeral {
+                    params["ephemeral"] = json!(true);
+                }
+                request_line(THREAD_ID, "thread/start", params)
+            }
+            ThreadRequest::Resume { id, settings } => {
+                params["threadId"] = json!(id);
+                params["config"] = settings.clone();
+                // Its earlier turns are not needed here, and can be long.
+                params["excludeTurns"] = json!(true);
+                request_line(THREAD_ID, "thread/resume", params)
+            }
         }
     }
 
@@ -391,19 +512,10 @@ impl CodexHost {
             Some(INITIALIZE_ID) => {
                 let mut lines = json!({"jsonrpc": "2.0", "method": "initialized"}).to_string();
                 lines.push('\n');
-                let mut params = json!({
-                    "approvalPolicy": self.asks.policy(),
-                    "approvalsReviewer": "user",
-                    "ephemeral": true,
-                    "developerInstructions": HOST_INSTRUCTIONS,
-                });
-                if let Some(dir) = self.working_dir.as_deref() {
-                    params["cwd"] = json!(dir);
-                }
-                lines.push_str(&request_line(THREAD_START_ID, "thread/start", params));
+                lines.push_str(&self.thread_line());
                 self.stdin.write(&lines).await;
             }
-            Some(THREAD_START_ID) => {
+            Some(THREAD_ID) => {
                 let thread_id = message
                     .pointer("/result/thread/id")
                     .and_then(Value::as_str)
@@ -415,6 +527,14 @@ impl CodexHost {
                 self.stdin
                     .write(&request_line(TURN_START_ID, "turn/start", params))
                     .await;
+                // A resumed thread is not announced (no `thread/started`),
+                // while `codex exec ... resume` announces it: its id is
+                // reported from the reply, the same way.
+                if matches!(&*self.thread, ThreadRequest::Resume { .. }) {
+                    return vec![
+                        json!({"type": "thread.started", "thread_id": thread_id}).to_string(),
+                    ];
+                }
             }
             _ => {}
         }
@@ -899,9 +1019,15 @@ mod tests {
             thread_start["params"]["developerInstructions"],
             HOST_INSTRUCTIONS
         );
+        // Stored, so a later run can continue it.
+        assert!(thread_start["params"].get("ephemeral").is_none());
 
-        host.on_line(r#"{"id":2,"result":{"thread":{"id":"t1"}}}"#)
-            .await;
+        // A new thread is announced by Codex (`thread/started`), not here.
+        assert!(
+            host.on_line(r#"{"id":2,"result":{"thread":{"id":"t1"}}}"#)
+                .await
+                .is_empty()
+        );
         let turn_start: Value =
             serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(turn_start["params"]["threadId"], "t1");
@@ -949,6 +1075,178 @@ mod tests {
             vec!["command: rm -rf /w/other".to_string()]
         );
         assert!(answers.refused.is_empty());
+    }
+
+    /// A run that continues a thread resumes it, under this run's own
+    /// settings, and starts its turn on it; its id is reported the way
+    /// `codex exec ... resume` reports it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_continued_thread_is_resumed_instead_of_started() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let settings = json!({"sandbox_mode": "read-only", "model": "m-1"});
+        let host = CodexHost::new(
+            child.stdin.take().unwrap(),
+            Judge::new(|_| Verdict::Allow),
+            Some("/w".to_string()),
+            "go on",
+            Asks::EveryCommand,
+        )
+        .on_thread(ThreadRequest::Resume {
+            id: "thread-a1".to_string(),
+            settings: settings.clone(),
+        });
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        host.on_line(r#"{"id":1,"result":{}}"#).await;
+        assert!(
+            sent.next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("initialized")
+        );
+        let resume: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["id"], THREAD_ID);
+        let params = &resume["params"];
+        assert_eq!(params["threadId"], "thread-a1");
+        assert_eq!(params["config"], settings);
+        assert_eq!(params["approvalPolicy"], "untrusted");
+        assert_eq!(params["approvalsReviewer"], "user");
+        assert_eq!(params["cwd"], "/w");
+        assert_eq!(params["developerInstructions"], HOST_INSTRUCTIONS);
+        assert_eq!(params["excludeTurns"], true);
+        assert!(params.get("ephemeral").is_none());
+
+        let announced = host
+            .on_line(r#"{"id":2,"result":{"thread":{"id":"thread-a1"}}}"#)
+            .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&announced[0]).unwrap(),
+            json!({"type": "thread.started", "thread_id": "thread-a1"})
+        );
+        let turn_start: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(turn_start["method"], "turn/start");
+        assert_eq!(turn_start["params"]["threadId"], "thread-a1");
+        assert_eq!(turn_start["params"]["input"][0]["text"], "go on");
+        host.close().await;
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launch_told_not_to_keep_its_thread_starts_an_ephemeral_one() {
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("cat");
+        let host = CodexHost::new(
+            child.stdin.take().unwrap(),
+            Judge::new(|_| Verdict::Allow),
+            None,
+            "p",
+            Asks::BeyondSandbox,
+        );
+        let line = |thread| {
+            serde_json::from_str::<Value>(&host.clone().on_thread(thread).thread_line()).unwrap()
+        };
+        let ephemeral = line(ThreadRequest::Start { ephemeral: true });
+        assert_eq!(ephemeral["method"], "thread/start");
+        assert_eq!(ephemeral["params"]["ephemeral"], true);
+        let stored = line(ThreadRequest::default());
+        assert!(stored["params"].get("ephemeral").is_none());
+        host.close().await;
+        let _ = child.wait().await;
+    }
+
+    #[test]
+    fn the_settings_a_resumed_thread_is_told_are_the_launchs_own() {
+        let args = strings(&[
+            "app-server",
+            "-c",
+            "model=\"m-2\"",
+            "-c",
+            "default_permissions=\"aidaemon-task\"",
+            "-c",
+            "permissions.aidaemon-task.network.enabled=true",
+            "-c",
+            "approval_policy=\"on-request\"",
+            "-c",
+            "sandbox_mode=read-only",
+        ]);
+        assert_eq!(
+            thread_settings(&args),
+            json!({
+                "model": "m-2",
+                "default_permissions": "aidaemon-task",
+                "sandbox_mode": "read-only",
+            })
+        );
+        assert_eq!(thread_settings(&strings(&["app-server"])), json!({}));
+    }
+
+    /// A folder of its own under the temp dir, removed by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("aidaemon-test-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_links_only_the_sign_in_and_the_threads_and_its_removal_keeps_them() {
+        let owner = scratch("owner");
+        std::fs::write(owner.join("auth.json"), "{}").unwrap();
+        std::fs::write(owner.join("config.toml"), "model = \"m-1\"").unwrap();
+        std::fs::create_dir_all(owner.join("rules")).unwrap();
+        std::fs::write(owner.join("state_5.sqlite"), "").unwrap();
+
+        let home = CodexHome::linked_to(&owner).unwrap();
+        let path = home.path().to_path_buf();
+        let mut entries: Vec<String> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, strings(&["auth.json", "sessions"]));
+        assert_eq!(
+            std::fs::read_link(path.join("auth.json")).unwrap(),
+            owner.join("auth.json")
+        );
+        // Made in the owner's home when missing, so the link has a target.
+        assert!(owner.join("sessions").is_dir());
+        assert_eq!(
+            std::fs::read_link(path.join("sessions")).unwrap(),
+            owner.join("sessions")
+        );
+
+        // A thread the run writes lands in the owner's sessions, and stays
+        // there once the run's home is gone.
+        std::fs::write(
+            path.join("sessions").join("rollout-x-thread-a1.jsonl"),
+            "{}",
+        )
+        .unwrap();
+        drop(home);
+        assert!(!path.exists());
+        assert!(owner.join("sessions/rollout-x-thread-a1.jsonl").is_file());
+        assert!(owner.join("auth.json").is_file());
+        std::fs::remove_dir_all(&owner).unwrap();
+
+        // No sign-in, no home.
+        let empty = scratch("empty");
+        assert!(CodexHome::linked_to(&empty).is_err());
+        std::fs::remove_dir_all(&empty).unwrap();
     }
 
     /// Every command is asked on the thread, where Codex accepts it.

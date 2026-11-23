@@ -12,6 +12,17 @@
 //! option, never one that would keep a rule in the agent's settings. The
 //! prompt's response ends the turn (its `stopReason`).
 //!
+//! A run that continues an earlier session sends `session/load` with that
+//! session's id in place of `session/new`, which only an agent whose
+//! `initialize` reply says `agentCapabilities.loadSession` offers; any
+//! other agent's run ends there, before a prompt, with that said in plain
+//! words. While it loads, the agent replays the session's history as
+//! `session/update` notifications: they are what it did before, not what
+//! it does now, so none of them reaches the run. Its reply to the load
+//! means the session is ready, and the task follows as in a new one.
+//! The run's reader is told the session's id, its model, and whether a
+//! later run can continue it (`resumable`: the agent's `loadSession`).
+//!
 //! The run's reader is given a `{"type": "result"}` line with the agent's
 //! final message, as a stream-json agent writes it.
 //!
@@ -31,6 +42,7 @@ const INITIALIZE_ID: u64 = 1;
 const SESSION_NEW_ID: u64 = 2;
 const PROMPT_ID: u64 = 3;
 const SET_MODEL_ID: u64 = 4;
+const SESSION_LOAD_ID: u64 = 5;
 
 fn request_line(id: u64, method: &str, params: Value) -> String {
     let mut line =
@@ -271,6 +283,12 @@ pub fn outcome(options: &[Value], allowed: bool) -> Value {
 #[derive(Default)]
 struct HostState {
     session_id: Option<String>,
+    /// Its `initialize` reply said it can load an earlier session
+    /// (`agentCapabilities.loadSession`).
+    loads_sessions: bool,
+    /// Between `session/load` and its reply: the updates are the session's
+    /// history, replayed.
+    loading: bool,
     /// Its message since its last tool call: the turn's final message.
     message: String,
     answers: HostAnswers,
@@ -280,9 +298,13 @@ struct HostState {
 
 /// Starts an [`AcpHost`].
 pub struct AcpHostStarter {
+    /// The agent's name, for the owner's words.
+    pub agent: String,
     pub working_dir: Option<String>,
     /// The model the owner chose (`None`: the agent's own).
     pub model: Option<String>,
+    /// The earlier session to continue (`None`: a new one).
+    pub resume: Option<String>,
 }
 
 #[async_trait]
@@ -294,7 +316,9 @@ impl HostStarter for AcpHostStarter {
         prompt: &str,
     ) -> Arc<dyn AgentHost> {
         let mut host = AcpHost::new(stdin, judge, self.working_dir, prompt);
+        host.agent = Arc::from(self.agent);
         host.model = self.model.map(Arc::from);
+        host.resume = self.resume.map(Arc::from);
         host.stdin.write(&initialize_line()).await;
         Arc::new(host)
     }
@@ -305,10 +329,14 @@ impl HostStarter for AcpHostStarter {
 pub struct AcpHost {
     stdin: Stdin,
     judge: Arc<dyn ActionJudge>,
+    /// The agent's name, for the owner's words.
+    agent: Arc<str>,
     working_dir: Option<String>,
     prompt: Arc<str>,
     /// The model the owner chose, set before the task is sent.
     model: Option<Arc<str>>,
+    /// The earlier session the run continues (`session/load`).
+    resume: Option<Arc<str>>,
     state: Arc<Mutex<HostState>>,
 }
 
@@ -322,9 +350,11 @@ impl AcpHost {
         Self {
             stdin: Stdin::new(stdin),
             judge,
+            agent: Arc::from("The coding agent"),
             working_dir,
             prompt: Arc::from(prompt),
             model: None,
+            resume: None,
             state: Arc::default(),
         }
     }
@@ -337,6 +367,49 @@ impl AcpHost {
         self.stdin
             .write(&request_line(PROMPT_ID, "session/prompt", params))
             .await;
+    }
+
+    /// The run ends on a protocol error, in `text`: stdin closes, so the
+    /// agent exits.
+    async fn fail(&self, text: String) -> Vec<String> {
+        self.end(false);
+        self.stdin.close().await;
+        vec![json!({"type": "error", "message": text}).to_string()]
+    }
+
+    /// Its session is open (new or loaded): the chosen model is set, else
+    /// the task sent, and the run's reader told the session's id (what a
+    /// later run continues), its model, and whether it can be continued.
+    async fn opened(&self, session: String, result: &Value) -> Vec<String> {
+        let resumable = match self.state.lock() {
+            Ok(mut state) => {
+                state.session_id = Some(session.clone());
+                state.loads_sessions
+            }
+            Err(_) => false,
+        };
+        let model = match self.model.as_deref() {
+            Some(model) => {
+                let params = json!({"sessionId": session, "modelId": model});
+                self.stdin
+                    .write(&request_line(SET_MODEL_ID, "session/set_model", params))
+                    .await;
+                Some(model.to_string())
+            }
+            None => {
+                self.send_prompt(&session).await;
+                current_model(result)
+            }
+        };
+        vec![
+            json!({
+                "type": "acp.session",
+                "session_id": session,
+                "model": model,
+                "resumable": resumable,
+            })
+            .to_string(),
+        ]
     }
 
     fn end(&self, completed: bool) -> String {
@@ -354,25 +427,61 @@ impl AcpHost {
                 .and_then(Value::as_str)
                 .unwrap_or("the agent refused the request")
                 .to_string();
-            if id.as_u64() == Some(SET_MODEL_ID) {
-                text = format!(
-                    "It could not switch to the model chosen for it ({}): {text}",
-                    self.model.as_deref().unwrap_or_default()
-                );
+            match id.as_u64() {
+                Some(SET_MODEL_ID) => {
+                    text = format!(
+                        "It could not switch to the model chosen for it ({}): {text}",
+                        self.model.as_deref().unwrap_or_default()
+                    );
+                }
+                Some(SESSION_LOAD_ID) => {
+                    text = format!(
+                        "{} could not load its earlier session ({}): {text}",
+                        self.agent,
+                        self.resume.as_deref().unwrap_or_default()
+                    );
+                }
+                _ => {}
             }
-            self.end(false);
-            self.stdin.close().await;
-            return vec![json!({"type": "error", "message": text}).to_string()];
+            return self.fail(text).await;
         }
         let result = message.get("result").unwrap_or(&Value::Null);
         match id.as_u64() {
             Some(INITIALIZE_ID) => {
+                let loads_sessions = result
+                    .pointer("/agentCapabilities/loadSession")
+                    .and_then(Value::as_bool)
+                    == Some(true);
                 let mut params = json!({"mcpServers": []});
                 if let Some(dir) = self.working_dir.as_deref() {
                     params["cwd"] = json!(dir);
                 }
+                let Some(resume) = self.resume.as_deref() else {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.loads_sessions = loads_sessions;
+                    }
+                    self.stdin
+                        .write(&request_line(SESSION_NEW_ID, "session/new", params))
+                        .await;
+                    return Vec::new();
+                };
+                if !loads_sessions {
+                    // Asked to continue a session it has no way to load: no
+                    // prompt is sent, so nothing starts over in its place.
+                    return self
+                        .fail(format!(
+                            "{} can't continue an earlier session: it doesn't offer to load one",
+                            self.agent
+                        ))
+                        .await;
+                }
+                params["sessionId"] = json!(resume);
+                if let Ok(mut state) = self.state.lock() {
+                    state.loads_sessions = true;
+                    state.loading = true;
+                }
                 self.stdin
-                    .write(&request_line(SESSION_NEW_ID, "session/new", params))
+                    .write(&request_line(SESSION_LOAD_ID, "session/load", params))
                     .await;
                 Vec::new()
             }
@@ -382,28 +491,16 @@ impl AcpHost {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                self.opened(session, result).await
+            }
+            // The load's reply names no session of its own (the protocol's
+            // has none): it is the one asked for, its history replayed by now.
+            Some(SESSION_LOAD_ID) => {
                 if let Ok(mut state) = self.state.lock() {
-                    state.session_id = Some(session.clone());
+                    state.loading = false;
                 }
-                let model = match self.model.as_deref() {
-                    Some(model) => {
-                        let params = json!({"sessionId": session, "modelId": model});
-                        self.stdin
-                            .write(&request_line(SET_MODEL_ID, "session/set_model", params))
-                            .await;
-                        Some(model.to_string())
-                    }
-                    None => {
-                        self.send_prompt(&session).await;
-                        current_model(result)
-                    }
-                };
-                // Its session, for the run's record (what resumes it), and
-                // the model it works with.
-                vec![
-                    json!({"type": "acp.session", "session_id": session, "model": model})
-                        .to_string(),
-                ]
+                let session = self.resume.as_deref().unwrap_or_default().to_string();
+                self.opened(session, result).await
             }
             Some(SET_MODEL_ID) => {
                 let session = self
@@ -453,6 +550,11 @@ impl AcpHost {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
+        // A loading session's history, replayed: done before this run, so
+        // neither a step nor its message.
+        if state.loading {
+            return Vec::new();
+        }
         match kind {
             "agent_message_chunk" => {
                 if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
@@ -854,11 +956,163 @@ mod tests {
             vec![crate::AgentEvent::Session {
                 id: "s1".into(),
                 model: Some("synthetic-large".into()),
-                resumable: None,
+                // Its `initialize` reply (not sent here) offered no load.
+                resumable: Some(false),
             }]
         );
         let prompt: Value =
             serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(prompt["method"], "session/prompt");
+    }
+
+    /// A host over `cat`, as the named agent, continuing `resume` when set.
+    #[cfg(unix)]
+    fn hosted(
+        resume: Option<&str>,
+    ) -> (
+        tokio::process::Child,
+        AcpHost,
+        tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    ) {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let mut host = AcpHost::new(
+            child.stdin.take().unwrap(),
+            Arc::new(crate::AllowAll),
+            Some("/w/project".into()),
+            "go on with the note",
+        );
+        host.agent = Arc::from("Synthetic Agent");
+        host.resume = resume.map(Arc::from);
+        let sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        (child, host, sent)
+    }
+
+    const LOADS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}"#;
+    const NO_LOAD: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}"#;
+
+    /// Continuing an earlier session: it is loaded, its replayed history
+    /// reaches the run as nothing (no step, plan or message), and the task
+    /// goes to the same session once the load's reply comes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_earlier_session_is_loaded_its_history_dropped_then_prompted() {
+        let (_child, host, mut sent) = hosted(Some("synthetic-session-1"));
+        macro_rules! next {
+            () => {
+                serde_json::from_str::<Value>(&sent.next_line().await.unwrap().unwrap()).unwrap()
+            };
+        }
+        assert!(host.on_line(LOADS).await.is_empty());
+        let load = next!();
+        assert_eq!(load["method"], "session/load");
+        assert_eq!(
+            load["params"],
+            json!({"sessionId": "synthetic-session-1", "cwd": "/w/project", "mcpServers": []})
+        );
+
+        let update = |update: Value| {
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "synthetic-session-1", "update": update,
+            }})
+            .to_string()
+        };
+        for replayed in [
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "make the note"}}),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Made it earlier."}}),
+            write_request(),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "call_1", "status": "completed"}),
+            json!({"sessionUpdate": "plan", "entries": [{"content": "Write the note", "status": "completed"}]}),
+        ] {
+            assert!(host.on_line(&update(replayed)).await.is_empty());
+        }
+
+        let opened = host
+            .on_line(r#"{"jsonrpc":"2.0","id":5,"result":{"models":{"currentModelId":"synthetic-large"}}}"#)
+            .await;
+        assert_eq!(
+            super::super::events::read_events(&opened[0]),
+            vec![crate::AgentEvent::Session {
+                id: "synthetic-session-1".into(),
+                model: Some("synthetic-large".into()),
+                resumable: Some(true),
+            }]
+        );
+        let prompt = next!();
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(prompt["params"]["sessionId"], "synthetic-session-1");
+        assert_eq!(prompt["params"]["prompt"][0]["text"], "go on with the note");
+
+        // What it does now is the run's again.
+        assert_eq!(host.on_line(&update(command_request())).await.len(), 1);
+        host.on_line(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Added a line."}})))
+            .await;
+        let end = host
+            .on_line(r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}"#)
+            .await;
+        let end: Value = serde_json::from_str(&end[0]).unwrap();
+        assert_eq!(end["result"], "Added a line.");
+        assert!(!host.unfinished());
+    }
+
+    /// An agent that offers no load: asked to continue, its run ends with
+    /// that said before any prompt; a new session it opens can't be
+    /// continued later.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_load_a_run_cannot_continue_and_a_new_session_is_not_resumable() {
+        let (_child, host, mut sent) = hosted(Some("synthetic-session-1"));
+        let refused = host.on_line(NO_LOAD).await;
+        let refused: Value = serde_json::from_str(&refused[0]).unwrap();
+        assert_eq!(refused["type"], "error");
+        assert_eq!(
+            refused["message"],
+            "Synthetic Agent can't continue an earlier session: it doesn't offer to load one"
+        );
+        assert!(host.unfinished());
+        // Nothing was sent, and stdin is closed.
+        assert!(sent.next_line().await.unwrap().is_none());
+
+        for (initialized, resumable) in [(NO_LOAD, false), (LOADS, true)] {
+            let (_child, host, mut sent) = hosted(None);
+            host.on_line(initialized).await;
+            let new: Value =
+                serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(new["method"], "session/new");
+            let opened = host
+                .on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"synthetic-session-2"}}"#)
+                .await;
+            assert!(matches!(
+                &super::super::events::read_events(&opened[0])[0],
+                crate::AgentEvent::Session { id, resumable: Some(kept), .. }
+                    if id == "synthetic-session-2" && *kept == resumable
+            ));
+        }
+    }
+
+    /// A session the agent can't find ends the run with its own reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_load_ends_the_run_with_its_reason() {
+        let (_child, host, mut sent) = hosted(Some("synthetic-missing"));
+        host.on_line(LOADS).await;
+        assert!(sent.next_line().await.unwrap().is_some());
+        let failed = host
+            .on_line(r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32002,"message":"Session not found: synthetic-missing"}}"#)
+            .await;
+        let failed: Value = serde_json::from_str(&failed[0]).unwrap();
+        assert_eq!(failed["type"], "error");
+        assert_eq!(
+            failed["message"],
+            "Synthetic Agent could not load its earlier session (synthetic-missing): Session not found: synthetic-missing"
+        );
+        assert!(sent.next_line().await.unwrap().is_none());
     }
 }

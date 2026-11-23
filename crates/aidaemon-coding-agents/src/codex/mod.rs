@@ -11,15 +11,20 @@
 //!   own read-only ones asked (`untrusted`); needs the host.
 //! - Full access: `--dangerously-bypass-approvals-and-sandbox`.
 //!
-//! A run continues an earlier session as `codex exec <options> resume
-//! <thread id> <task>`: the options stay before `resume`, which refuses
-//! `--sandbox` after it. Only an `exec` run keeps its session where a later
-//! one finds it (the owner's `CODEX_HOME`); a hosted run's thread is
-//! ephemeral, in a `CODEX_HOME` of its own, so a run that continues one
-//! stays on `exec`: checked, it just never asks, and every-command mode,
-//! which needs the host, cannot continue one.
+//! Every run keeps its thread where a later run can continue it, unless the
+//! launch says `--ephemeral`: the owner's `CODEX_HOME` (`~/.codex` by
+//! default) holds the threads of both launches. An `exec` run writes there
+//! directly; a hosted run's own `CODEX_HOME` links its `sessions` folder
+//! there and nothing else of the owner's (see [`host`]). So a thread either
+//! launch started can be continued by either. An `exec` run continues one
+//! as `codex exec <options> resume <thread id> <task>`: the options stay
+//! before `resume`, which refuses `--sandbox` after it. A hosted run stays
+//! hosted, and still asks: it continues the thread with `thread/resume`
+//! under its own sandbox, model and approval policy, whatever the thread
+//! last ran with.
 //!
-//! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18).
+//! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18; continuing
+//! threads across launches, 2026-11-23).
 
 pub mod events;
 pub mod host;
@@ -141,11 +146,37 @@ fn scoped(
     Ok(())
 }
 
+/// The launch says not to keep its thread (`--ephemeral`, Codex's own flag).
+fn ephemeral(launch: &Launch) -> bool {
+    launch.args[launch.start.min(launch.args.len())..]
+        .iter()
+        .any(|arg| arg == "--ephemeral")
+}
+
+/// Makes a hosted run's `CODEX_HOME` ([`host::CodexHome::prepare`]; a
+/// test's own in tests).
+type MakeHome<'a> = &'a dyn Fn() -> Result<host::CodexHome, String>;
+
 /// The same run behind `codex app-server`, its requests answered by the
-/// host, with its own `CODEX_HOME`.
-fn hosted(launch: &mut Launch, request: &RunRequest<'_>, asks: host::Asks) -> Result<Plan, String> {
+/// host, with its own `CODEX_HOME`: a new thread, or the one `request`
+/// continues.
+fn hosted(
+    launch: &mut Launch,
+    request: &RunRequest<'_>,
+    asks: host::Asks,
+    home: MakeHome<'_>,
+) -> Result<Plan, String> {
     let args = host::app_server_args(&launch.args, launch.start, asks)?;
-    let home = host::CodexHome::prepare()?;
+    let home = home()?;
+    let thread = match request.resume {
+        Some(id) => host::ThreadRequest::Resume {
+            id: id.to_string(),
+            settings: host::thread_settings(&args[launch.start.min(args.len())..]),
+        },
+        None => host::ThreadRequest::Start {
+            ephemeral: ephemeral(launch),
+        },
+    };
     launch.args = args;
     tracing::info!("A Codex run is hosted through its app-server");
     Ok(Plan {
@@ -157,6 +188,7 @@ fn hosted(launch: &mut Launch, request: &RunRequest<'_>, asks: host::Asks) -> Re
         host: Some(Box::new(host::CodexHostStarter {
             working_dir: request.working_dir.map(str::to_string),
             asks,
+            thread,
         })),
         keep_alive: Some(Box::new(home)),
         ..Plan::plain()
@@ -245,29 +277,43 @@ impl CodingAgent for Codex {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
-        if let Some(model) = request.model {
-            crate::agent::set_option(&mut launch.args, launch.start, "--model", &["-m"], model);
-        }
-        let mut plan = shape(request, launch)?;
-        // A hosted run's thread is ephemeral, in a home of its own thrown
-        // away at its end; `exec` keeps it in the owner's, unless the
-        // launch says not to (`--ephemeral`, its own flag).
-        plan.keeps_session = plan.host.is_none()
-            && !launch.args[launch.start..]
-                .iter()
-                .any(|a| a == "--ephemeral");
-        if let Some(session) = request.resume {
-            // After every option, before the task (its last argument).
-            launch
-                .args
-                .extend(["resume".to_string(), session.to_string()]);
-        }
-        Ok(plan)
+        prepare(request, launch, &host::CodexHome::prepare)
     }
 }
 
+/// [`Codex::prepare`], its hosted runs' homes made by `home`.
+fn prepare(
+    request: &RunRequest<'_>,
+    launch: &mut Launch,
+    home: MakeHome<'_>,
+) -> Result<Plan, String> {
+    if let Some(model) = request.model {
+        crate::agent::set_option(&mut launch.args, launch.start, "--model", &["-m"], model);
+    }
+    // Read before shaping: a hosted launch no longer carries the flag.
+    let ephemeral = ephemeral(launch);
+    let mut plan = shape(request, launch, home)?;
+    // Both launches keep the thread in the owner's sessions, unless the
+    // launch says not to.
+    plan.keeps_session = !ephemeral;
+    if plan.host.is_none()
+        && let Some(session) = request.resume
+    {
+        // After every option, before the task (its last argument). A
+        // hosted run names it in its `thread/resume` instead.
+        launch
+            .args
+            .extend(["resume".to_string(), session.to_string()]);
+    }
+    Ok(plan)
+}
+
 /// `launch` in `request`'s mode, and how the run goes.
-fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
+fn shape(
+    request: &RunRequest<'_>,
+    launch: &mut Launch,
+    home: MakeHome<'_>,
+) -> Result<Plan, String> {
     if !request.enforce {
         return Ok(Plan::plain());
     }
@@ -280,13 +326,6 @@ fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> 
             Ok(Plan::plain())
         }
         PermissionMode::EveryCommand => {
-            if request.resume.is_some() {
-                return Err(
-                    "Codex can't continue an earlier session while it checks every command: \
-                         its prompts need a host, and a hosted run can't continue one"
-                        .to_string(),
-                );
-            }
             if !request.can_host {
                 return Err(
                     "Codex can check every command only where its requests can be answered"
@@ -294,7 +333,7 @@ fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> 
                 );
             }
             read_only(&mut launch.args, launch.start);
-            hosted(launch, request, host::Asks::EveryCommand)
+            hosted(launch, request, host::Asks::EveryCommand, home)
         }
         PermissionMode::Checked if request.read_only => {
             read_only(&mut launch.args, launch.start);
@@ -307,13 +346,14 @@ fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> 
                 request.read_paths,
                 request.write_paths,
             )?;
-            if !request.can_host || request.resume.is_some() {
+            if !request.can_host {
                 return Ok(Plan::plain());
             }
             // A launch the app-server cannot take, or no sign-in to
-            // link, stays on `exec`: confined, it just never asks.
+            // link, stays on `exec`: confined, it just never asks. It
+            // continues a thread all the same, as `exec ... resume`.
             let exec = launch.clone();
-            hosted(launch, request, host::Asks::BeyondSandbox).or_else(|reason| {
+            hosted(launch, request, host::Asks::BeyondSandbox, home).or_else(|reason| {
                 tracing::info!(%reason, "A Codex run stays on exec");
                 *launch = exec;
                 Ok(Plan::plain())
@@ -499,45 +539,188 @@ mod tests {
         assert_eq!(launch.args, strings(&["exec", "--json", "resume", "s-1"]));
     }
 
-    #[test]
-    fn a_continued_run_stays_on_exec_and_every_command_cannot_continue_one() {
+    /// A signed-in owner's Codex home in a folder of its own, removed by
+    /// the caller.
+    fn owner_home() -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("aidaemon-test-owner-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("auth.json"), "{}").unwrap();
+        path
+    }
+
+    struct AllowAll;
+
+    #[async_trait::async_trait]
+    impl crate::ActionJudge for AllowAll {
+        async fn judge(&self, _action: crate::AgentAction) -> crate::Verdict {
+            crate::Verdict::Allow
+        }
+    }
+
+    /// The thread request a hosted plan's host sends once Codex answers
+    /// its handshake.
+    #[cfg(unix)]
+    async fn thread_request(plan: Plan) -> serde_json::Value {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = plan
+            .host
+            .expect("a hosted plan")
+            .start(
+                child.stdin.take().unwrap(),
+                std::sync::Arc::new(AllowAll),
+                "go on",
+            )
+            .await;
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        // Its handshake, then the thread once Codex answers it.
+        assert!(
+            sent.next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("initialize")
+        );
+        host.on_line(r#"{"id":1,"result":{}}"#).await;
+        assert!(
+            sent.next_line()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("initialized")
+        );
+        let line = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        host.close().await;
+        let _ = child.wait().await;
+        line
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hosted_run_keeps_its_thread_and_continues_one_through_its_host() {
+        let owner = owner_home();
+        let home = || host::CodexHome::linked_to(&owner);
         let writes = ["/w/project/out.md".to_string()];
+
+        // Checked: a new stored thread.
         let mut asked = request(PermissionMode::Checked, false, &writes);
         asked.can_host = true;
-        asked.resume = Some("s-1");
         let mut launch = Launch {
             args: strings(&["exec", "--json"]),
             start: 0,
         };
-        let plan = Codex.prepare(&asked, &mut launch).unwrap();
-        assert!(plan.host.is_none());
+        let plan = prepare(&asked, &mut launch, &home).unwrap();
+        assert_eq!(launch.args[0], "app-server");
+        assert!(plan.keeps_session, "its thread is in the owner's sessions");
+        let start = thread_request(plan).await;
+        assert_eq!(start["method"], "thread/start");
+        assert!(start["params"].get("ephemeral").is_none());
+
+        // Checked, continuing a thread: still hosted, under its profile and
+        // model whatever the thread last ran with.
+        asked.resume = Some("thread-a1");
+        asked.model = Some("m-2");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = prepare(&asked, &mut launch, &home).unwrap();
+        assert_eq!(launch.args[0], "app-server");
         assert!(
-            plan.keeps_session,
-            "exec keeps its thread for the next follow-up"
+            !launch
+                .args
+                .iter()
+                .any(|arg| arg == "resume" || arg == "thread-a1")
         );
-        assert_eq!(launch.args[0], "exec");
-        assert!(!launch.args.iter().any(|arg| arg == "app-server"));
+        assert_eq!(plan.prompt, PromptPlacement::Host);
+        assert!(plan.keeps_session);
+        let resume = thread_request(plan).await;
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["threadId"], "thread-a1");
+        assert_eq!(resume["params"]["approvalPolicy"], "on-request");
         assert_eq!(
-            &launch.args[launch.args.len() - 2..],
-            &strings(&["resume", "s-1"])[..]
+            resume["params"]["config"],
+            serde_json::json!({"model": "m-2", "default_permissions": "aidaemon-task"})
         );
 
+        // Every command, continuing a thread: hosted, read-only, every
+        // command asked.
         let mut asked = request(PermissionMode::EveryCommand, false, &[]);
         asked.can_host = true;
-        asked.resume = Some("s-1");
+        asked.resume = Some("thread-a1");
         let mut launch = Launch {
             args: strings(&["exec", "--json"]),
             start: 0,
         };
-        assert!(Codex.prepare(&asked, &mut launch).is_err());
+        let plan = prepare(&asked, &mut launch, &home).unwrap();
+        assert!(plan.keeps_session);
+        let resume = thread_request(plan).await;
+        assert_eq!(resume["method"], "thread/resume");
+        assert_eq!(resume["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(
+            resume["params"]["config"],
+            serde_json::json!({"sandbox_mode": "read-only"})
+        );
 
-        // A launch told not to keep its thread keeps none.
-        let mut asked = request(PermissionMode::Checked, true, &[]);
-        asked.resume = None;
+        // A launch told not to keep its thread keeps none, hosted too.
+        let mut asked = request(PermissionMode::EveryCommand, false, &[]);
+        asked.can_host = true;
         let mut launch = Launch {
             args: strings(&["exec", "--json", "--ephemeral"]),
             start: 0,
         };
-        assert!(!Codex.prepare(&asked, &mut launch).unwrap().keeps_session);
+        let plan = prepare(&asked, &mut launch, &home).unwrap();
+        assert!(!plan.keeps_session);
+        let start = thread_request(plan).await;
+        assert_eq!(start["params"]["ephemeral"], true);
+        std::fs::remove_dir_all(&owner).unwrap();
+    }
+
+    #[test]
+    fn without_a_sign_in_to_link_a_checked_run_continues_on_exec() {
+        let no_home = || Err::<host::CodexHome, _>("no Codex sign-in".to_string());
+        let writes = ["/w/project/out.md".to_string()];
+        let mut asked = request(PermissionMode::Checked, false, &writes);
+        asked.can_host = true;
+        asked.resume = Some("thread-a1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = prepare(&asked, &mut launch, &no_home).unwrap();
+        assert!(plan.host.is_none());
+        assert!(plan.keeps_session);
+        assert_eq!(launch.args[0], "exec");
+        assert_eq!(
+            &launch.args[launch.args.len() - 2..],
+            &strings(&["resume", "thread-a1"])[..]
+        );
+
+        // Every command needs its host.
+        let mut asked = request(PermissionMode::EveryCommand, false, &[]);
+        asked.can_host = true;
+        asked.resume = Some("thread-a1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        assert!(prepare(&asked, &mut launch, &no_home).is_err());
+
+        // An exec run told not to keep its thread keeps none.
+        let asked = request(PermissionMode::Checked, true, &[]);
+        let mut launch = Launch {
+            args: strings(&["exec", "--json", "--ephemeral"]),
+            start: 0,
+        };
+        assert!(
+            !prepare(&asked, &mut launch, &no_home)
+                .unwrap()
+                .keeps_session
+        );
     }
 }

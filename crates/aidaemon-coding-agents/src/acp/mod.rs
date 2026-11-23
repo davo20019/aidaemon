@@ -9,6 +9,13 @@
 //! wrote outside its folder once a command was allowed; live probe,
 //! 2026-11-18).
 //!
+//! A run can continue a session an earlier run started: its host loads it
+//! (`session/load`) in place of opening a new one. Only an agent whose
+//! `initialize` reply says it can load sessions (`loadSession`) does, so
+//! that is known once it runs: its session event says whether a later run
+//! can continue it, and a run asked to continue one with an agent that
+//! can't ends before its task is sent.
+//!
 //! [`AcpAgent::antigravity`] and [`AcpAgent::gemini`] are the ones known;
 //! [`AcpAgent::custom`] is any other the owner names.
 
@@ -146,6 +153,14 @@ impl CodingAgent for AcpAgent {
         true
     }
 
+    /// Over the protocol (`session/load`), when the agent offers it: that
+    /// is known only once it runs, so its session event says whether a
+    /// run's session can be continued, and its host ends a run asked to
+    /// continue one with an agent that can't.
+    fn resumes(&self) -> bool {
+        true
+    }
+
     /// A session it opens (no prompt sent), or its own reason not to.
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::AcpSession {
@@ -154,9 +169,6 @@ impl CodingAgent for AcpAgent {
     }
 
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> {
-        // Its host opens a new session each run (`session/new`); ACP's
-        // `session/load` is not used yet.
-        crate::agent::refuse_resume(self, request)?;
         if !request.stdin_open {
             return Err(format!(
                 "{} runs only where its stdin can stay open (a local process)",
@@ -180,9 +192,13 @@ impl CodingAgent for AcpAgent {
         Ok(Plan {
             prompt: PromptPlacement::Host,
             host: Some(Box::new(host::AcpHostStarter {
+                agent: self.name.clone(),
                 working_dir: request.working_dir.map(str::to_string),
                 model: request.model.map(str::to_string),
+                resume: request.resume.map(str::to_string),
             })),
+            // Whether its session can be continued is the agent's word once
+            // it runs (its session event's `resumable`).
             ..Plan::plain()
         })
     }
@@ -254,20 +270,19 @@ mod tests {
     }
 
     #[test]
-    fn it_cannot_continue_an_earlier_session() {
+    fn a_run_may_ask_to_continue_an_earlier_session() {
         let agent = AcpAgent::custom("Synthetic Agent", "synthetic-agent", &["--acp"]);
-        assert!(!agent.resumes());
+        assert!(agent.resumes());
         let mut asked = request(PermissionMode::FullAccess, true);
-        asked.resume = Some("s-1");
+        asked.resume = Some("synthetic-session-1");
         let mut launch = Launch {
             args: Vec::new(),
             start: 0,
         };
-        let refusal = agent.prepare(&asked, &mut launch).err().unwrap();
-        assert!(
-            refusal.starts_with("Synthetic Agent can't continue"),
-            "{refusal}"
-        );
-        assert!(launch.args.is_empty());
+        let plan = agent.prepare(&asked, &mut launch).unwrap();
+        assert_eq!(launch.args, ["--acp"]);
+        assert!(plan.host.is_some());
+        // Whether it can is the agent's own word, once it runs.
+        assert!(!plan.keeps_session);
     }
 }
