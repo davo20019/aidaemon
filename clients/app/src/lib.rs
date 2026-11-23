@@ -48,6 +48,11 @@ pub fn set_working_folder(folder: String) {
 static FEED: std::sync::Mutex<Vec<aidaemon_client_core::Update>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Whether the [`Offline`] root has taken everything [`feed`] handed it.
+pub fn fed() -> bool {
+    FEED.lock().is_ok_and(|f| f.is_empty())
+}
+
 /// Hand `updates` to the [`Offline`] root, as the link would.
 pub fn feed(updates: impl IntoIterator<Item = aidaemon_client_core::Update>) {
     if let Ok(mut feed) = FEED.lock() {

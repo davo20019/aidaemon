@@ -3,7 +3,7 @@
 
 use aidaemon_client_core::Update;
 use aidaemon_client_protocol::ServerFrame;
-use nsh_app_aidaemon::{Offline, feed, sent};
+use nsh_app_aidaemon::{Offline, feed, fed, sent};
 use nsh_engine::{EngineConfig, Points, Root, Size};
 use nsh_testing::Headless;
 
@@ -32,6 +32,31 @@ fn wait_sent_new(kind: &str, before: Option<String>) -> Result<String, String> {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     Err(format!("no new {kind} was sent"))
+}
+
+/// Waits until the app has taken what was fed and drawn what it changed:
+/// a press steps to a view by its id, and one the update is about to
+/// rebuild takes the press and goes (on a loaded machine the update can
+/// land between the look and the press).
+fn settle(app: &mut Headless) -> Result<(), String> {
+    for _ in 0..250 {
+        if fed() {
+            break;
+        }
+        app.next_change(std::time::Duration::from_millis(20))?;
+    }
+    if !fed() {
+        return Err("the app never took what was fed".into());
+    }
+    // Then what it changed, until nothing more comes for a while.
+    for _ in 0..50 {
+        let before = app.screen().texts().join("\u{1}");
+        app.next_change(std::time::Duration::from_millis(60))?;
+        if app.screen().texts().join("\u{1}") == before {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// The feed is one per process: tests take turns.
@@ -1779,11 +1804,14 @@ fn a_new_conversation_on_a_phone_raises_the_keyboard() -> Result<(), String> {
             r#"{"type":"ack","request_id":"r0","result":{"type":"sessions","sessions":[{"id":"app:synthetic-1","channel":"app","title":"Plan the trip","writable":true}]}}"#,
         ),
     ]);
+    settle(&mut app)?;
     let open = |app: &mut Headless| -> Result<(), String> {
         app.press("label:Conversations")?;
         app.wait_for("Plan the trip")?;
         app.press("Plan the trip >> nth=0")?;
-        app.wait_for_gone("Search conversations", std::time::Duration::from_secs(2))
+        app.wait_for_gone("Search conversations", std::time::Duration::from_secs(2))?;
+        // Opening it reads its history: let that redraw the page first.
+        settle(app)
     };
     // Opening a conversation reads it: no keyboard either.
     open(&mut app)?;
