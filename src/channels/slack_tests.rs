@@ -285,6 +285,7 @@ async fn a_typed_approval_card_puts_the_command_under_the_summary() {
     let (channel, _harness) = channel(&api, MockProvider::new()).await;
     let card = aidaemon_core::ApprovalCard {
         asked_by: Some("Drupal install".to_string()),
+        run: None,
         action: aidaemon_core::CardAction::Command {
             line: "ls -la claude-drupal && ddev describe <site>".to_string(),
             title: None,

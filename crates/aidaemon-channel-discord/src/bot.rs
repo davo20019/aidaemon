@@ -525,6 +525,7 @@ impl DiscordBot {
             workspace_grant: None,
             trusted: false,
             in_run: None,
+            agents: Vec::new(),
         };
         self.runner
             .register_chat(&session_id, &self.channel_name(), &channel_ctx)

@@ -298,6 +298,7 @@ fn card_of(card: &aidaemon_core::ApprovalCard) -> wire::ApprovalCard {
     use aidaemon_core::{AskReason, CardAction, HighImpact};
     wire::ApprovalCard {
         asked_by: card.asked_by.clone(),
+        run: card.run.clone(),
         action: match &card.action {
             CardAction::Command {
                 line,

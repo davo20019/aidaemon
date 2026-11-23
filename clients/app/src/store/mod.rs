@@ -3285,8 +3285,13 @@ impl Store {
             .into_iter()
             .filter(|run| run.session_id == session)
             .collect();
-        self.client
-            .with(|c| aidaemon_client_core::participants::participants(&runs, c.agent_names()))
+        self.client.with(|c| {
+            aidaemon_client_core::participants::participants(
+                &runs,
+                c.agent_names(),
+                &c.asking_runs(),
+            )
+        })
     }
 
     /// Name the agent of conversation `session` whose thread is `thread`

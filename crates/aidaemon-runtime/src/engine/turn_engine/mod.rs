@@ -80,6 +80,63 @@ pub struct TurnEngine<'h> {
     host: &'h dyn TurnHost,
 }
 
+/// The owner's follow-up to a run, written in its thread (the typed
+/// `in_run`, with the folder its record names): its first step is known
+/// without a model, the `cli_agent` call that continues that run's agent in
+/// its own session, in its folder, writing only there. When a run that
+/// continues it has started, the turn ends there too, with no model asked;
+/// a refused call goes to the model, which says why. Only the owner's own
+/// message is followed up this way.
+fn follow_up_script(
+    channel_ctx: &ChannelContext,
+    user_role: UserRole,
+    user_text: &str,
+    session_id: &str,
+    runs: Arc<crate::run_state::RunStates>,
+) -> Option<Arc<crate::engine::provider::ScriptedSteps>> {
+    let thread = channel_ctx.in_run.as_ref()?;
+    let working_dir = thread.working_dir.clone()?;
+    if user_role != UserRole::Owner || user_text.trim().is_empty() {
+        return None;
+    }
+    let call = sdk::ToolCall {
+        id: format!("follow-up-{}", uuid::Uuid::new_v4().simple()),
+        name: "cli_agent".to_string(),
+        arguments: serde_json::json!({
+            "action": "run",
+            "continue_run": thread.run,
+            "prompt": user_text.trim(),
+            "title": aidaemon_channels::presentation::word_preview(user_text.trim(), 50),
+            "working_dir": working_dir,
+            "workspace_mode": "read_write",
+            "write_paths": [working_dir],
+            "async_mode": true,
+        }),
+        provider_data: None,
+    };
+    let (earlier, chat, since) = (
+        thread.run.clone(),
+        session_id.to_string(),
+        chrono::Utc::now(),
+    );
+    Some(Arc::new(crate::engine::provider::ScriptedSteps::new(
+        call,
+        move || {
+            // A run that continues it started in this turn: the agent has
+            // it. Typed state, never the call's words.
+            runs.for_chat(&chat)
+                .into_iter()
+                .find(|run| run.continues.as_deref() == Some(earlier.as_str()) && run.started_at >= since)
+                .map(|run| {
+                    let agent = run.agent.unwrap_or_else(|| "The agent".to_string());
+                    format!(
+                        "Passed on to {agent}: it goes on in its own session, and its work shows in its thread."
+                    )
+                })
+        },
+    )))
+}
+
 impl<'h> TurnEngine<'h> {
     pub fn new(host: &'h dyn TurnHost) -> Self {
         Self { host }
@@ -618,6 +675,13 @@ impl TurnEngine<'_> {
             .model(model.clone())
             .provider(HostProvider {
                 calls: calls_tx.clone(),
+                script: follow_up_script(
+                    &channel_ctx,
+                    user_role,
+                    user_text,
+                    session_id,
+                    self.running_children().runs(),
+                ),
             })
             .limits(sdk::Limits {
                 max_turns: engine.max_turns,

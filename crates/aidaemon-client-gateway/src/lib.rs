@@ -2303,7 +2303,25 @@ impl ClientGateway {
         channel_ctx.channel_id = Some(session_id.clone());
         // Typed: the thread the app showed it in. Which run it is, and
         // whether it is this conversation's, the agent's tool checks.
-        channel_ctx.in_run = in_run.filter(|_| !new_session);
+        // Who works in it: its agents as the owner sees and names them.
+        if !new_session {
+            channel_ctx.agents = self.conversation_agents(&session_id).await;
+        }
+        channel_ctx.in_run = match in_run.filter(|_| !new_session) {
+            Some(run) => {
+                // Where its agent worked, from the run's record: the
+                // follow-up goes on there.
+                let working_dir = match self.host.run_detail(&run).await {
+                    Ok(detail) => detail.working_dir,
+                    Err(error) => {
+                        warn!(%error, %run, "Could not read a followed-up run's record");
+                        None
+                    }
+                };
+                Some(aidaemon_channels::context::RunThread { run, working_dir })
+            }
+            None => None,
+        };
         let text = if files.is_empty() {
             text
         } else {
@@ -2541,6 +2559,77 @@ impl ClientGateway {
             }
         }
         None
+    }
+
+    /// Conversation `session_id`'s coding agent sessions as the owner sees
+    /// them (its participants, named as the owner named them): what its
+    /// turn is told about who works in it.
+    async fn conversation_agents(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_channels::context::ConversationAgent> {
+        use aidaemon_channels::context::{AgentState, ConversationAgent};
+        // Its runs: those the runtime holds win over the kept records.
+        let mut runs: Vec<aidaemon_client_protocol::RunSummary> = Vec::new();
+        for run in self.turns.agent.chat_runs(session_id).await.runs {
+            runs.push(observer::run_summary(
+                session_id,
+                &run.id,
+                &run.view,
+                observer::RunRecord {
+                    activity: run.activity.as_deref(),
+                    agent: run.agent.as_deref(),
+                    group: run.group.as_deref(),
+                    edited: &run.edited,
+                    continues: run.continues.as_deref(),
+                    thread: run.thread.as_deref(),
+                    keeps_session: run.keeps_session,
+                    started_at: run.started_at,
+                    ended_at: run.ended_at,
+                },
+            ));
+        }
+        match self.host.past_runs(session_id).await {
+            Ok(past) => {
+                for run in past {
+                    if !runs.iter().any(|held| held.id == run.id) {
+                        runs.push(run);
+                    }
+                }
+            }
+            Err(error) => warn!(%error, "Could not read a conversation's past runs"),
+        }
+        if !runs.iter().any(|run| run.agent.is_some()) {
+            return Vec::new();
+        }
+        let names = self.host.agent_names(session_id).await.unwrap_or_default();
+        let asking: std::collections::BTreeSet<String> = self
+            .approvals
+            .pending()
+            .into_iter()
+            .filter(|approval| approval.session_id == session_id)
+            .filter_map(|approval| approval.card.and_then(|card| card.run))
+            .collect();
+        aidaemon_client_protocol::participants::participants(&runs, &names, &asking)
+            .into_iter()
+            // The most recent few: a long conversation's oldest agents are
+            // in its history.
+            .take(12)
+            .map(|p| ConversationAgent {
+                state: if p.waiting {
+                    AgentState::WaitingOnOwner
+                } else if p.working() {
+                    AgentState::Working
+                } else if p.can_continue() {
+                    AgentState::CanContinue
+                } else {
+                    AgentState::Ended
+                },
+                name: p.name,
+                agent: p.agent,
+                latest_run: p.latest.id,
+            })
+            .collect()
     }
 
     /// The helper runs of every session that ran a turn this boot, running

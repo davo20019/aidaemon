@@ -7,7 +7,7 @@
 //! Every field comes from the runs' typed records; nothing is read from
 //! what an agent wrote.
 
-use aidaemon_client_protocol::{RunPhase, RunSummary};
+use crate::{RunPhase, RunSummary};
 
 /// One agent session of a conversation.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,8 @@ pub struct Participant {
     pub name: String,
     /// The owner named it.
     pub named: bool,
+    /// One of its runs waits on the owner's answer to an approval.
+    pub waiting: bool,
     /// Its latest run: what its row opens, and what a follow-up continues.
     pub latest: RunSummary,
     /// How many runs it took: its first and each follow-up.
@@ -42,12 +44,15 @@ impl Participant {
     }
 }
 
-/// The participants among `runs` (one conversation's), working ones first,
-/// then the most recently active, named as `names` (by thread) says. Runs
-/// with no coding agent are left out.
+/// The participants among `runs` (one conversation's): those waiting on the
+/// owner first, then working ones, then the most recently active; named as
+/// `names` (by thread) says, waiting when one of their runs is among
+/// `asking` (the runs an open approval card names). Runs with no coding
+/// agent are left out.
 pub fn participants(
     runs: &[RunSummary],
     names: &std::collections::BTreeMap<String, String>,
+    asking: &std::collections::BTreeSet<String>,
 ) -> Vec<Participant> {
     let mut threads: Vec<(String, Vec<&RunSummary>)> = Vec::new();
     for run in runs.iter().filter(|run| run.agent.is_some()) {
@@ -71,10 +76,12 @@ pub fn participants(
                 .max()
                 .unwrap_or(0);
             let given = names.get(&thread);
+            let waiting = list.iter().any(|run| asking.contains(&run.id));
             Some(Participant {
                 agent: first.agent.clone().unwrap_or_default(),
                 name: given.cloned().unwrap_or_else(|| first.label.clone()),
                 named: given.is_some(),
+                waiting,
                 runs: list.len(),
                 thread,
                 latest,
@@ -83,8 +90,9 @@ pub fn participants(
         })
         .collect();
     out.sort_by(|a, b| {
-        b.working()
-            .cmp(&a.working())
+        b.waiting
+            .cmp(&a.waiting)
+            .then(b.working().cmp(&a.working()))
             .then(b.last_activity_ms.cmp(&a.last_activity_ms))
             .then(a.thread.cmp(&b.thread))
     });
@@ -129,9 +137,16 @@ mod tests {
             run("h", None, None, 120, "succeeded"),
         ];
         let names = [("b".to_string(), "Designer".to_string())].into();
-        let list = participants(&runs, &names);
+        let asking = ["b".to_string()].into();
+        let list = participants(&runs, &names, &asking);
         assert_eq!(list.len(), 2, "a helper with no coding agent is not one");
-        assert_eq!(list[0].thread, "a", "the working one comes first");
+        assert_eq!(
+            list[0].thread, "b",
+            "the one waiting on the owner comes first"
+        );
+        assert!(list[0].waiting && !list[1].waiting);
+        let list = participants(&runs, &names, &Default::default());
+        assert_eq!(list[0].thread, "a", "then the working one");
         assert_eq!(list[0].name, "label a", "named by its first run");
         assert_eq!(list[0].latest.id, "a2");
         assert_eq!(list[0].runs, 2);

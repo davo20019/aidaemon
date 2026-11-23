@@ -906,6 +906,7 @@ async fn test_owner_receives_tools_for_command_request() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -954,6 +955,7 @@ async fn test_public_user_gets_no_tools() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -1003,6 +1005,7 @@ async fn test_command_request_with_tool_use() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -1055,6 +1058,7 @@ async fn test_slack_command_request_llm_payload() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )

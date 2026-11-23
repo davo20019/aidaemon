@@ -22,6 +22,55 @@ use aidaemon_events::traits::{ChatOptions, ProviderResponse};
 /// happen there, so this must not be wrapped in [`sdk::Retry`].
 pub struct HostProvider {
     pub calls: mpsc::Sender<HostCall>,
+    /// Steps of the turn known without a model ([`ScriptedSteps`]).
+    pub script: Option<std::sync::Arc<ScriptedSteps>>,
+}
+
+/// A turn whose first step is known without asking a model: the owner's
+/// follow-up to a run (a typed `in_run`), passed to that run's agent as one
+/// tool call. The kernel runs the call as it runs any (its hooks, approvals
+/// and receipts), only no model wrote it. The step after it is known too
+/// when the call did its work (`then` says so, from typed state, with the
+/// answer); otherwise, and for every later step, the model is asked, and it
+/// sees the call and its result.
+pub struct ScriptedSteps {
+    first: sdk::ModelResponse,
+    then: Box<dyn Fn() -> Option<String> + Send + Sync>,
+    step: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedSteps {
+    pub fn new(
+        call: sdk::ToolCall,
+        then: impl Fn() -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            first: scripted(String::new(), vec![call]),
+            then: Box::new(then),
+            step: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The next step's response when it is known; `None`: ask the model.
+    fn next(&self) -> Option<sdk::ModelResponse> {
+        match self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Some(self.first.clone()),
+            1 => (self.then)().map(|text| scripted(text, Vec::new())),
+            _ => None,
+        }
+    }
+}
+
+/// A response no model wrote: nothing spent.
+fn scripted(text: String, tool_calls: Vec<sdk::ToolCall>) -> sdk::ModelResponse {
+    sdk::ModelResponse {
+        text,
+        tool_calls,
+        usage: sdk::Usage::default(),
+        reasoning: None,
+        note: None,
+        cut_off: false,
+    }
 }
 
 #[async_trait]
@@ -34,6 +83,9 @@ impl sdk::Provider for HostProvider {
         &self,
         request: &sdk::ModelRequest,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
+        if let Some(known) = self.script.as_ref().and_then(|script| script.next()) {
+            return Ok(known);
+        }
         let (reply, answer) = oneshot::channel();
         self.calls
             .send(HostCall::Model(ModelCall {
@@ -55,6 +107,14 @@ impl sdk::Provider for HostProvider {
         &'a self,
         request: &'a sdk::ModelRequest,
     ) -> BoxStream<'a, Result<sdk::StreamEvent, sdk::ProviderError>> {
+        if let Some(known) = self.script.as_ref().and_then(|script| script.next()) {
+            let mut events = Vec::new();
+            if !known.text.is_empty() {
+                events.push(Ok(sdk::StreamEvent::TextDelta(known.text.clone())));
+            }
+            events.push(Ok(sdk::StreamEvent::Done(known)));
+            return Box::pin(stream::iter(events));
+        }
         let (text_tx, text_rx) = mpsc::unbounded_channel::<String>();
         let calls = self.calls.clone();
         let request = request.clone();
@@ -413,6 +473,68 @@ mod tests {
         })
     }
 
+    /// A known first step is answered without the model; the second only
+    /// once its typed check says the call did its work, else the model is
+    /// asked; every later step goes to the model.
+    #[tokio::test]
+    async fn known_steps_are_answered_without_the_model() {
+        let (calls_tx, mut calls_rx) = mpsc::channel(4);
+        let call = sdk::ToolCall {
+            id: "follow-up-1".into(),
+            name: "cli_agent".into(),
+            arguments: json!({"action": "run", "continue_run": "cli-agent-1"}),
+            provider_data: None,
+        };
+        let did = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = did.clone();
+        let script = std::sync::Arc::new(ScriptedSteps::new(call.clone(), move || {
+            seen.load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| "Passed on.".to_string())
+        }));
+        let provider = HostProvider {
+            calls: calls_tx.clone(),
+            script: Some(script.clone()),
+        };
+        let request = sdk::ModelRequest {
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        let first = sdk::Provider::complete(&provider, &request).await.unwrap();
+        assert_eq!(first.tool_calls, vec![call.clone()]);
+        assert_eq!(first.usage, sdk::Usage::default(), "no model was asked");
+        did.store(true, std::sync::atomic::Ordering::SeqCst);
+        let second = sdk::Provider::complete(&provider, &request).await.unwrap();
+        assert_eq!(second.text, "Passed on.");
+        assert!(second.tool_calls.is_empty());
+        // Every later step is the model's.
+        let server = tokio::spawn(async move {
+            let Some(HostCall::Model(call)) = calls_rx.recv().await else {
+                panic!("expected a model call");
+            };
+            let _ = call.reply.send(Ok(sdk::testing::text("from the model")));
+        });
+        let third = sdk::Provider::complete(&provider, &request).await.unwrap();
+        assert_eq!(third.text, "from the model");
+        server.await.unwrap();
+
+        // A call that did not do its work: the model says why.
+        let (calls_tx, mut calls_rx) = mpsc::channel(4);
+        let provider = HostProvider {
+            calls: calls_tx,
+            script: Some(std::sync::Arc::new(ScriptedSteps::new(call, || None))),
+        };
+        sdk::Provider::complete(&provider, &request).await.unwrap();
+        let server = tokio::spawn(async move {
+            let Some(HostCall::Model(call)) = calls_rx.recv().await else {
+                panic!("expected a model call");
+            };
+            let _ = call.reply.send(Ok(sdk::testing::text("it was refused")));
+        });
+        let second = sdk::Provider::complete(&provider, &request).await.unwrap();
+        assert_eq!(second.text, "it was refused");
+        server.await.unwrap();
+    }
+
     /// The reply's text reaches the run while the call is still open, and
     /// all of it before the final response.
     #[tokio::test]
@@ -421,7 +543,10 @@ mod tests {
         let (calls_tx, calls_rx) = mpsc::channel(4);
         let (go_tx, go_rx) = oneshot::channel();
         let server = serve_one(calls_rx, vec!["Hel", "lo"], "Hello", go_rx);
-        let provider = HostProvider { calls: calls_tx };
+        let provider = HostProvider {
+            calls: calls_tx,
+            script: None,
+        };
         let request = sdk::ModelRequest {
             model: "mock-model".into(),
             ..Default::default()
@@ -462,7 +587,10 @@ mod tests {
         let (go_tx, go_rx) = oneshot::channel();
         go_tx.send(()).unwrap();
         let server = serve_one(calls_rx, vec!["a", "b", "c"], "abc", go_rx);
-        let provider = HostProvider { calls: calls_tx };
+        let provider = HostProvider {
+            calls: calls_tx,
+            script: None,
+        };
         let request = sdk::ModelRequest {
             model: "mock-model".into(),
             ..Default::default()

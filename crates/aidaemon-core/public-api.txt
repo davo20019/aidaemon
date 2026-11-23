@@ -722,6 +722,7 @@ pub aidaemon_core::ApprovalCard::action: aidaemon_core::CardAction
 pub aidaemon_core::ApprovalCard::asked_by: core::option::Option<alloc::string::String>
 pub aidaemon_core::ApprovalCard::impact: core::option::Option<aidaemon_core::HighImpact>
 pub aidaemon_core::ApprovalCard::reason: core::option::Option<aidaemon_core::AskReason>
+pub aidaemon_core::ApprovalCard::run: core::option::Option<alloc::string::String>
 impl aidaemon_core::ApprovalCard
 pub fn aidaemon_core::ApprovalCard::new(aidaemon_core::CardAction) -> Self
 pub struct aidaemon_core::Audio

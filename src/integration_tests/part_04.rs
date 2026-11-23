@@ -74,6 +74,7 @@ async fn test_public_external_no_memory() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -139,6 +140,7 @@ async fn test_tool_restriction_public_external() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -472,6 +474,7 @@ async fn test_private_group_fact_access() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )

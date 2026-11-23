@@ -33,6 +33,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub mod media;
+pub mod participants;
 pub mod shell;
 
 /// The major version this crate speaks.
@@ -2704,6 +2705,10 @@ pub struct ApprovalCard {
     /// The helper asking; `None` for the assistant itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked_by: Option<String>,
+    /// The run asking (protocol 1.48), when a coding agent a run launched
+    /// asks: the agent a client shows as waiting on the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     pub action: CardAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<AskReason>,

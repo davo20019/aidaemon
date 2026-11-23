@@ -59,6 +59,7 @@ async fn test_same_channel_relevant_fact_is_rendered() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -128,6 +129,7 @@ async fn test_cross_channel_fact_blocked() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -230,6 +232,7 @@ async fn test_private_facts_never_in_channels() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -293,6 +296,7 @@ async fn test_cross_channel_hints() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -356,6 +360,7 @@ async fn test_legacy_facts_backward_compat() {
         workspace_grant: None,
         trusted: false,
         in_run: None,
+        agents: Vec::new(),
     };
     for (session, channel) in [
         ("legacy_session_dm", ChannelContext::private("telegram")),

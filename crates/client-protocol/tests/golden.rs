@@ -25,6 +25,7 @@ fn approval() -> Approval {
         detail: Some("POST https://h.example.invalid/report".into()),
         card: Some(ApprovalCard {
             asked_by: Some("Report helper".into()),
+            run: None,
             action: CardAction::Use {
                 what: "send a request to h.example.invalid".into(),
                 detail: Some("{\"method\":\"POST\"}".into()),
@@ -91,6 +92,7 @@ fn handoff() -> Approval {
         detail: None,
         card: Some(ApprovalCard {
             asked_by: None,
+            run: None,
             action: CardAction::TakeOver {
                 surface_id: "srf_7d1c".into(),
                 what: "Sign in to your Acme account".into(),
@@ -120,6 +122,7 @@ fn click_on_site() -> Approval {
         detail: Some("button#checkout".into()),
         card: Some(ApprovalCard {
             asked_by: None,
+            run: None,
             action: CardAction::ClickOnSite {
                 site: "https://shop.acme.example".into(),
                 target: Some("button#checkout".into()),
@@ -267,6 +270,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::GetSessionModel { .. } => "get_session_model",
         Command::SetSessionModel { .. } => "set_session_model",
         Command::RenameSession { .. } => "rename_session",
+        Command::RenameAgent { .. } => "rename_agent",
         Command::ArchiveSession { .. } => "archive_session",
         Command::RevertFile { .. } => "revert_file",
         Command::ListProjectFiles { .. } => "list_project_files",
@@ -586,6 +590,14 @@ fn client_samples() -> Vec<ClientFrame> {
             Command::RenameSession {
                 session_id: "app:6c1f".into(),
                 title: Some("Acme invoice".into()),
+            },
+        ),
+        command(
+            "5d0c2b1e-0021a",
+            Command::RenameAgent {
+                session_id: "app:6c1f".into(),
+                thread: "run-3f2a".into(),
+                name: Some("Designer".into()),
             },
         ),
         command(
@@ -1010,6 +1022,7 @@ fn server_samples() -> Vec<ServerFrame> {
             ],
             more: true,
             runs: Vec::new(),
+            agent_names: [("run-3f2a".to_string(), "Designer".to_string())].into(),
         }),
         ack(CommandResult::Reply {
             text: "Nothing is running in this chat right now.".into(),

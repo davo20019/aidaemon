@@ -1115,11 +1115,15 @@ fn header(store: Store, session: Option<String>) -> View {
             move || {
                 view().child(dynamic(move || {
                     let list = store.participants();
-                    let working = list.iter().filter(|p| p.working()).count();
+                    let working = list.iter().filter(|p| p.working() && !p.waiting).count();
+                    let waiting = list.iter().filter(|p| p.waiting).count();
                     let mut label = match list.len() {
                         1 => "1 agent".to_string(),
                         n => format!("{n} agents"),
                     };
+                    if waiting > 0 {
+                        label.push_str(&format!(" · {waiting} waiting on you"));
+                    }
                     if working > 0 {
                         label.push_str(&format!(" · {working} working"));
                     }

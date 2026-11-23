@@ -109,7 +109,47 @@ pub struct ChannelContext {
     /// run's coding agent, through this agent. Set only by the client that
     /// showed the thread, from its typed field; `None` for a message in the
     /// conversation itself.
-    pub in_run: Option<String>,
+    pub in_run: Option<RunThread>,
+    /// The coding agent sessions working in this conversation, as the
+    /// owner sees them (a client that shows them names them); empty where
+    /// none are known.
+    pub agents: Vec<ConversationAgent>,
+}
+
+/// One coding agent session of a conversation: one of its participants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationAgent {
+    /// The name the owner gave it ("Designer"), else what it was first
+    /// started for.
+    pub name: String,
+    /// Its coding agent ("Codex").
+    pub agent: String,
+    /// Its latest run: what a follow-up continues.
+    pub latest_run: String,
+    pub state: AgentState,
+}
+
+/// Where a conversation's agent stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    /// One of its runs waits on the owner's answer.
+    WaitingOnOwner,
+    Working,
+    /// Its latest run ended and its session can be continued.
+    CanContinue,
+    /// Its latest run ended and nothing can go on from it.
+    Ended,
+}
+
+/// The run whose thread a message was posted in, as the client that showed
+/// it named it, with what its record says about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunThread {
+    /// The run's id.
+    pub run: String,
+    /// The folder its agent worked in, from the run's record: where a
+    /// follow-up goes on, and the only place it may write.
+    pub working_dir: Option<String>,
 }
 
 impl ChannelContext {
@@ -129,6 +169,7 @@ impl ChannelContext {
             workspace_grant: None,
             trusted: false,
             in_run: None,
+            agents: Vec::new(),
         }
     }
 
@@ -147,6 +188,7 @@ impl ChannelContext {
             workspace_grant: None,
             trusted: false,
             in_run: None,
+            agents: Vec::new(),
         }
     }
 
@@ -165,6 +207,7 @@ impl ChannelContext {
             workspace_grant: None,
             trusted: true,
             in_run: None,
+            agents: Vec::new(),
         }
     }
 
@@ -233,6 +276,7 @@ mod workspace_grant_tests {
             workspace_grant: Some(workspace_grant),
             trusted: false,
             in_run: None,
+            agents: Vec::new(),
         }
     }
 

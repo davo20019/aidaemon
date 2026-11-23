@@ -1435,13 +1435,19 @@ impl RunHandles {
                 (Some(starter), Some(stdin)) => {
                     // Full access: an agent whose protocol still asks is
                     // allowed as it asks, unjudged.
-                    let judge: Arc<dyn aidaemon_coding_agents::ActionJudge> =
-                        match prep.nested.take() {
-                            Some(nested) => {
-                                Arc::new(crate::tools::agent_mode::DaemonJudge::new(nested))
-                            }
-                            None => Arc::new(aidaemon_coding_agents::AllowAll),
-                        };
+                    let judge: Arc<dyn aidaemon_coding_agents::ActionJudge> = match prep
+                        .nested
+                        .take()
+                    {
+                        Some(nested) => Arc::new(crate::tools::agent_mode::DaemonJudge::for_run(
+                            nested,
+                            crate::tools::agent_mode::Asker {
+                                run: cli_run_id(task_id),
+                                agent: prep.coding_agent.name().to_string(),
+                            },
+                        )),
+                        None => Arc::new(aidaemon_coding_agents::AllowAll),
+                    };
                     let judge = events.judging(judge);
                     Some(starter.start(stdin, judge, &prep.final_prompt).await)
                 }

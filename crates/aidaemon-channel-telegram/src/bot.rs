@@ -1521,6 +1521,7 @@ impl TelegramBot {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             }
         };
 

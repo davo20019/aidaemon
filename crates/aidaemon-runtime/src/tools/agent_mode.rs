@@ -199,12 +199,49 @@ pub fn mark_not_usable(name: &str, reason: &str, fix: Option<&str>) {
 /// Judges a hosted agent's requests through the run's nested-call seam.
 pub struct DaemonJudge {
     nested: NestedCalls,
+    /// The run whose agent asks, named on any card its asks raise.
+    asker: Option<Asker>,
 }
 
 impl DaemonJudge {
     pub fn new(nested: NestedCalls) -> Self {
-        Self { nested }
+        Self {
+            nested,
+            asker: None,
+        }
     }
+
+    /// Its asks name run `asker` on the cards they raise.
+    pub fn for_run(nested: NestedCalls, asker: Asker) -> Self {
+        Self {
+            nested,
+            asker: Some(asker),
+        }
+    }
+}
+
+/// A coding agent's run, as a card it raises names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asker {
+    /// The run's id.
+    pub run: String,
+    /// Its agent ("Codex").
+    pub agent: String,
+}
+
+/// The asks being judged now, by the id of the daemon call each is judged
+/// as ([`daemon_call`] makes it unique): the card an ask raises reads its
+/// run here ([`asker_of`]).
+static ASKING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Asker>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The run whose agent's ask is daemon call `call_id`, while it is judged.
+pub fn asker_of(call_id: &str) -> Option<Asker> {
+    ASKING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(call_id)
+        .cloned()
 }
 
 /// The daemon call an action is judged as: the daemon tool whose judgment
@@ -280,7 +317,18 @@ pub fn daemon_call(action: &AgentAction) -> ToolCall {
 #[async_trait]
 impl ActionJudge for DaemonJudge {
     async fn judge(&self, action: AgentAction) -> Verdict {
-        self.nested.authorize(daemon_call(&action)).await
+        let call = daemon_call(&action);
+        let Some(asker) = &self.asker else {
+            return self.nested.authorize(call).await;
+        };
+        let id = call.id.clone();
+        ASKING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.clone(), asker.clone());
+        let verdict = self.nested.authorize(call).await;
+        ASKING.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        verdict
     }
 }
 
@@ -345,6 +393,38 @@ mod tests {
         assert!(!readiness_of("synthetic-signed-out").is_usable());
         remember("synthetic-signed-out", Readiness::Ready);
         assert!(readiness_of("synthetic-signed-out").is_usable());
+    }
+
+    /// A run's judge names that run while its ask is judged (the card it
+    /// raises reads it), and only then.
+    #[tokio::test]
+    async fn an_ask_names_its_run_while_it_is_judged() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let during = seen.clone();
+        let (nested, _asked) = aidaemon_core::testing::nested_calls(move |call| {
+            *during.lock().unwrap() = Some((call.id.clone(), asker_of(&call.id)));
+            Verdict::Allow
+        });
+        let judge = DaemonJudge::for_run(
+            nested,
+            Asker {
+                run: "cli-agent-synthetic".into(),
+                agent: "Codex".into(),
+            },
+        );
+        let verdict = judge
+            .judge(AgentAction::RunCommand {
+                command: "pytest".into(),
+                working_dir: None,
+            })
+            .await;
+        assert!(verdict.is_allowed());
+        let (id, asker) = seen.lock().unwrap().clone().expect("the ask was judged");
+        assert_eq!(
+            asker.map(|asker| asker.run),
+            Some("cli-agent-synthetic".to_string())
+        );
+        assert_eq!(asker_of(&id), None, "gone once judged");
     }
 
     #[tokio::test]

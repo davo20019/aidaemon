@@ -33,6 +33,9 @@ pub fn participants(store: Store) -> View {
 
 /// What it is doing, or how it ended and whether it takes a follow-up.
 pub fn state_words(p: &Participant) -> &'static str {
+    if p.waiting {
+        return "waiting on you";
+    }
     match p.latest.phase {
         RunPhase::Running => "working",
         _ if p.can_continue() => "can continue",
@@ -102,6 +105,7 @@ fn rename_field(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>)
 fn shown(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>) -> View {
     let mark = computed(move || {
         p.with(|p| match p.latest.phase {
+            _ if p.waiting => (Glyph::Approval, colors::WARNING),
             RunPhase::Running => (Glyph::Work, colors::ACCENT),
             RunPhase::Failed => (Glyph::Warning, colors::DANGER),
             RunPhase::Stopped => (Glyph::Warning, colors::WARNING),
@@ -114,7 +118,7 @@ fn shown(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>) -> Vie
         store.tick();
         p.with(|p| {
             let mut words = state_words(p).to_string();
-            if p.working() && !p.latest.step.is_empty() {
+            if p.working() && !p.waiting && !p.latest.step.is_empty() {
                 words = format!("{words} · {}", p.latest.step);
             }
             if p.runs > 1 {

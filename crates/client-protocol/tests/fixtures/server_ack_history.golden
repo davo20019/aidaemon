@@ -1,6 +1,9 @@
 {
   "request_id": "5d0c2b1e-0001",
   "result": {
+    "agent_names": {
+      "run-3f2a": "Designer"
+    },
     "messages": [
       {
         "at_ms": 1767225600000,

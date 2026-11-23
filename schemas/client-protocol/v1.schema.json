@@ -247,6 +247,13 @@
               "type": "null"
             }
           ]
+        },
+        "run": {
+          "description": "The run asking (protocol 1.48), when a coding agent a run launched\nasks: the agent a client shows as waiting on the owner.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

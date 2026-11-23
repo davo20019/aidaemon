@@ -654,6 +654,7 @@ mod tests {
     fn a_low_risk_read_only_card_says_what_happens_without_alarm() {
         let card = ApprovalCard {
             asked_by: Some("Drupal install".to_string()),
+            run: None,
             action: CardAction::Command {
                 line: INSPECT.to_string(),
                 title: Some("check claude site dirs and docker".to_string()),
@@ -698,6 +699,7 @@ mod tests {
     fn a_high_risk_delete_card_names_the_effect() {
         let card = ApprovalCard {
             asked_by: None,
+            run: None,
             action: CardAction::Command {
                 line: "rm -rf build dist".to_string(),
                 title: Some("clean old builds".to_string()),

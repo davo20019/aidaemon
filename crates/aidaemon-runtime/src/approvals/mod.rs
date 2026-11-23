@@ -1025,6 +1025,20 @@ impl OwnerApprovalResolver<'_> {
             .await;
         // Several sub-agents can ask at once: the card says which one asks.
         let card = asked_by(self.mission, request);
+        // A coding agent a run launched asks: its card names that run
+        // (typed, by the ask's own call id), so a client shows which agent
+        // waits on the owner.
+        let card = match crate::tools::agent_mode::asker_of(&interruption.call.id) {
+            Some(asker) => {
+                let mut shown = card.into_owned();
+                if let Some(card) = &mut shown.card {
+                    card.asked_by.get_or_insert(asker.agent);
+                    card.run = Some(asker.run);
+                }
+                std::borrow::Cow::Owned(shown)
+            }
+            None => card,
+        };
         match self
             .approvals
             .ask(

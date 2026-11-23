@@ -867,8 +867,19 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.press("1 agent · 1 working")?;
     app.wait_for("text:Codex · Fix the slug")?;
     app.wait_for("text:working · 2 runs")?;
+    // Its agent asks for an approval: the card names its run, and its row
+    // says it waits on the owner until answered.
     feed([frame(
-        r#"{"type":"event","seq":9,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true}}}"#,
+        r#"{"type":"event","seq":9,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"approval_requested","approval":{"id":"ap-thread","session_id":"app:synthetic-thread","kind":"command","risk":"medium","summary":"Run pytest","options":["approve_once","deny"],"requested_at_ms":4,"card":{"asked_by":"Codex","run":"cli-agent-t2","action":{"kind":"command","line":"pytest"}}}}}"#,
+    )]);
+    app.wait_for("text:waiting on you · 2 runs")?;
+    app.wait_for("text:1 agent · 1 waiting on you")?;
+    feed([frame(
+        r#"{"type":"event","seq":10,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"approval_resolved","approval_id":"ap-thread","outcome":"approved"}}"#,
+    )]);
+    app.wait_for("text:working · 2 runs")?;
+    feed([frame(
+        r#"{"type":"event","seq":11,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true}}}"#,
     )]);
     app.wait_for("text:can continue · 2 runs · now")?;
     // The owner names it; the daemon keeps the name and every client shows it.
@@ -878,7 +889,7 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.press("Save")?;
     wait_sent_new("rename_agent", before)?;
     feed([frame(
-        r#"{"type":"event","seq":10,"at_ms":5,"session_id":"app:synthetic-thread","event":{"type":"agent_renamed","session_id":"app:synthetic-thread","thread":"cli-agent-t1","name":"Designer"}}"#,
+        r#"{"type":"event","seq":12,"at_ms":5,"session_id":"app:synthetic-thread","event":{"type":"agent_renamed","session_id":"app:synthetic-thread","thread":"cli-agent-t1","name":"Designer"}}"#,
     )]);
     app.wait_for("text:Codex · Designer")?;
     // Its row opens its latest run, where a follow-up goes to it.

@@ -711,6 +711,36 @@ pub fn render_run_thread_section(run: &str) -> String {
     )
 }
 
+/// The coding agent sessions working in the conversation, as the owner
+/// sees and names them ([`aidaemon_channels::context::ChannelContext::agents`]):
+/// who "the designer" is, and how to give one more work. Empty: none.
+pub fn render_conversation_agents(
+    agents: &[aidaemon_channels::context::ConversationAgent],
+) -> String {
+    use aidaemon_channels::context::AgentState;
+    if agents.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "[Agents in this conversation]\nEach is one coding agent session; the owner sees them \
+         and may call one by its name. To give one more work, use cli_agent with continue_run \
+         set to its latest run: it goes on with what it already knows.",
+    );
+    for agent in agents {
+        let state = match agent.state {
+            AgentState::WaitingOnOwner => "waiting on the owner's approval",
+            AgentState::Working => "working",
+            AgentState::CanContinue => "can continue",
+            AgentState::Ended => "ended; it can't be continued",
+        };
+        section.push_str(&format!(
+            "\n- \"{}\" ({}), latest run `{}`: {state}",
+            agent.name, agent.agent, agent.latest_run
+        ));
+    }
+    section
+}
+
 /// What the host's command-line tools are, when they differ from the GNU
 /// tools models tend to assume.
 fn userland_note(os: &str) -> &'static str {
@@ -778,5 +808,24 @@ mod environment_tests {
         let section = render_environment_section(BackendKind::Ssh, "/home/synthetic-user");
         assert!(!section.contains("BSD"));
         assert!(section.contains("may have failed"));
+    }
+
+    /// The conversation's agents reach the model by the owner's names, each
+    /// with its latest run and where it stands; none, nothing.
+    #[test]
+    fn the_conversation_agents_are_named_with_their_latest_run() {
+        use aidaemon_channels::context::{AgentState, ConversationAgent};
+        assert!(render_conversation_agents(&[]).is_empty());
+        let section = render_conversation_agents(&[ConversationAgent {
+            name: "Designer".into(),
+            agent: "Codex".into(),
+            latest_run: "cli-agent-synthetic".into(),
+            state: AgentState::CanContinue,
+        }]);
+        assert!(
+            section
+                .contains("\"Designer\" (Codex), latest run `cli-agent-synthetic`: can continue")
+        );
+        assert!(section.contains("continue_run"));
     }
 }

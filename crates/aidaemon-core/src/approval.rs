@@ -446,6 +446,10 @@ pub struct ApprovalCard {
     /// itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked_by: Option<String>,
+    /// The helper run asking, when a coding agent a run launched asks: the
+    /// key a client finds that agent by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     pub action: CardAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<AskReason>,
@@ -459,6 +463,7 @@ impl ApprovalCard {
     pub fn new(action: CardAction) -> Self {
         Self {
             asked_by: None,
+            run: None,
             action,
             reason: None,
             impact: None,

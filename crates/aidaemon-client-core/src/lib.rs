@@ -30,7 +30,8 @@ pub mod link;
 #[cfg(feature = "native")]
 pub mod local;
 pub mod machine;
-pub mod participants;
+/// A conversation's participants, derived the same way everywhere.
+pub use aidaemon_client_protocol::participants;
 #[cfg(feature = "dial")]
 pub mod remote;
 #[cfg(feature = "native")]

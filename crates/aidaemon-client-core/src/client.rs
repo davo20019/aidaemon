@@ -2263,7 +2263,16 @@ impl Client {
     /// that worked in it, working ones first ([`crate::participants`]).
     pub fn participants(&self, session: &str) -> Vec<crate::participants::Participant> {
         let runs: Vec<_> = self.state.runs_for(session).into_iter().cloned().collect();
-        crate::participants::participants(&runs, &self.state.agent_names)
+        crate::participants::participants(&runs, &self.state.agent_names, &self.asking_runs())
+    }
+
+    /// The runs an open approval card names: their agents wait on the owner.
+    pub fn asking_runs(&self) -> std::collections::BTreeSet<String> {
+        self.state
+            .approvals
+            .values()
+            .filter_map(|approval| approval.card.as_ref()?.run.clone())
+            .collect()
     }
 
     /// Name the agent of conversation `session` whose thread is `thread`

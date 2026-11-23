@@ -617,6 +617,7 @@ pub fn build_child_channel_context(facts: &ToolCallContext) -> ChannelContext {
         workspace_grant: None,
         trusted: facts.trusted_session,
         in_run: None,
+        agents: Vec::new(),
     }
 }
 

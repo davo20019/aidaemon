@@ -281,6 +281,7 @@ async fn test_memory_failure_patterns_injected_into_public_prompt() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
@@ -555,6 +556,7 @@ async fn test_public_channel_hides_personal_memory() {
                 workspace_grant: None,
                 trusted: false,
                 in_run: None,
+                agents: Vec::new(),
             },
             None,
         )
