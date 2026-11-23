@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::events::EventStore;
-use crate::oauth::OAuthGateway;
+use crate::oauth::{OAuthCallbackOutcome, OAuthGateway};
 use crate::traits::{MandateWakeSignal, StateStore};
 
 const KEYCHAIN_FIELD: &str = "dashboard_token";
@@ -212,23 +212,7 @@ async fn oauth_callback_handler(
         .handle_callback(state_param, params.code.as_deref(), params.error.as_deref())
         .await
     {
-        Ok(msg) => {
-            let safe_msg = html_escape(&msg);
-            let is_error =
-                msg.contains("denied") || msg.contains("failed") || msg.contains("expired");
-            let (icon, title) = if is_error {
-                ("&#10060;", "OAuth Error")
-            } else {
-                ("&#9989;", "Connected!")
-            };
-            Html(format!(
-                "<html><head><title>{title}</title></head>\
-                 <body style=\"font-family:sans-serif;text-align:center;padding:60px\">\
-                 <h1>{icon}</h1><h2>{title}</h2><p>{safe_msg}</p>\
-                 <p style=\"color:#888\">You can close this tab and return to your chat.</p>\
-                 </body></html>"
-            ))
-        }
+        Ok(outcome) => Html(oauth_callback_page(&outcome)),
         Err(e) => {
             warn!("OAuth callback error: {}", e);
             let safe_err = html_escape(&e.to_string());
@@ -241,6 +225,24 @@ async fn oauth_callback_handler(
             ))
         }
     }
+}
+
+/// The page a finished OAuth callback shows; success or error styling comes
+/// from the outcome's variant.
+fn oauth_callback_page(outcome: &OAuthCallbackOutcome) -> String {
+    let safe_msg = html_escape(outcome.message());
+    let (icon, title) = if outcome.is_connected() {
+        ("&#9989;", "Connected!")
+    } else {
+        ("&#10060;", "OAuth Error")
+    };
+    format!(
+        "<html><head><title>{title}</title></head>\
+         <body style=\"font-family:sans-serif;text-align:center;padding:60px\">\
+         <h1>{icon}</h1><h2>{title}</h2><p>{safe_msg}</p>\
+         <p style=\"color:#888\">You can close this tab and return to your chat.</p>\
+         </body></html>"
+    )
 }
 
 /// Escape HTML special characters to prevent XSS in rendered pages.
@@ -286,4 +288,39 @@ pub async fn start_dashboard_server(
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_callback_page_styles_from_the_outcome_variant() {
+        let connected = oauth_callback_page(&OAuthCallbackOutcome::Connected {
+            message: "Connected to Linear".to_string(),
+        });
+        assert!(connected.contains("Connected!"));
+        assert!(!connected.contains("OAuth Error"));
+
+        // A failure whose text names none of the old keywords is still an error.
+        let failed = oauth_callback_page(&OAuthCallbackOutcome::Failed {
+            message: "No authorization code in callback".to_string(),
+        });
+        assert!(failed.contains("OAuth Error"));
+        assert!(!failed.contains("Connected!"));
+
+        // A success whose text happens to contain "failed" stays a success.
+        let worded = oauth_callback_page(&OAuthCallbackOutcome::Connected {
+            message: "Connected; an earlier attempt failed".to_string(),
+        });
+        assert!(worded.contains("Connected!"));
+    }
+
+    #[test]
+    fn oauth_callback_page_escapes_the_message() {
+        let page = oauth_callback_page(&OAuthCallbackOutcome::Failed {
+            message: "<script>x</script>".to_string(),
+        });
+        assert!(!page.contains("<script>"));
+    }
 }

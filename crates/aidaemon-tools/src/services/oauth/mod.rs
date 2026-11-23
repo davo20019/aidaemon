@@ -231,8 +231,37 @@ struct PendingFlow {
     result_tx: oneshot::Sender<OAuthFlowResult>,
 }
 
+/// How a browser OAuth callback ended. The callback page shows the message
+/// and picks success or error styling from the variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthCallbackOutcome {
+    /// Tokens were exchanged and stored.
+    Connected { message: String },
+    /// The provider denied access, the flow expired or was already used, or
+    /// the token exchange failed.
+    Failed { message: String },
+}
+
+impl OAuthCallbackOutcome {
+    fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: message.into(),
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Connected { message } | Self::Failed { message } => message,
+        }
+    }
+}
+
 struct RecentFlowResult {
-    message: String,
+    outcome: OAuthCallbackOutcome,
     recorded_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -406,37 +435,41 @@ impl OAuthGateway {
         created_at < Self::flow_cutoff()
     }
 
-    async fn remember_recent_flow_result(&self, state: &str, message: String) {
+    async fn remember_recent_flow_result(&self, state: &str, outcome: OAuthCallbackOutcome) {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RECENT_FLOW_RESULT_TTL_SECS);
         let mut recent = self.recent_flow_results.write().await;
         recent.retain(|_, result| result.recorded_at >= cutoff);
         recent.insert(
             state.to_string(),
             RecentFlowResult {
-                message,
+                outcome,
                 recorded_at: chrono::Utc::now(),
             },
         );
     }
 
-    async fn recent_flow_result(&self, state: &str) -> Option<String> {
+    async fn recent_flow_result(&self, state: &str) -> Option<OAuthCallbackOutcome> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(RECENT_FLOW_RESULT_TTL_SECS);
         let mut recent = self.recent_flow_results.write().await;
         recent.retain(|_, result| result.recorded_at >= cutoff);
-        recent.get(state).map(|result| result.message.clone())
+        recent.get(state).map(|result| result.outcome.clone())
     }
 
-    async fn finalize_flow_result(&self, flow: ResolvedPendingFlow, message: String) -> String {
-        self.remember_recent_flow_result(&flow.state, message.clone())
+    async fn finalize_flow_result(
+        &self,
+        flow: ResolvedPendingFlow,
+        outcome: OAuthCallbackOutcome,
+    ) -> OAuthCallbackOutcome {
+        self.remember_recent_flow_result(&flow.state, outcome.clone())
             .await;
         if let Some(result_tx) = flow.result_tx {
             let _ = result_tx.send(OAuthFlowResult {
                 service: flow.provider_name,
                 username: None,
-                message: message.clone(),
+                message: outcome.message().to_string(),
             });
         }
-        message
+        outcome
     }
 
     async fn resolve_pending_flow(
@@ -492,11 +525,13 @@ impl OAuthGateway {
         };
         let service = flow.provider_name.clone();
         let message = message.unwrap_or_else(|| Self::expired_flow_message().to_string());
-        let final_message = self.finalize_flow_result(flow, message).await;
+        let final_outcome = self
+            .finalize_flow_result(flow, OAuthCallbackOutcome::failed(message))
+            .await;
         info!(
             service = %service,
             state = %state,
-            message = %final_message,
+            message = %final_outcome.message(),
             "Expired pending OAuth flow"
         );
         Ok(true)
@@ -772,28 +807,33 @@ impl OAuthGateway {
         state: &str,
         code: Option<&str>,
         error: Option<&str>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<OAuthCallbackOutcome> {
         let Some(flow) = self.resolve_pending_flow(state).await? else {
-            if let Some(message) = self.recent_flow_result(state).await {
-                return Ok(message);
+            if let Some(outcome) = self.recent_flow_result(state).await {
+                return Ok(outcome);
             }
-            return Ok(INVALID_OR_USED_FLOW_MESSAGE.to_string());
+            return Ok(OAuthCallbackOutcome::failed(INVALID_OR_USED_FLOW_MESSAGE));
         };
 
         if Self::flow_is_expired(flow.created_at) {
             return Ok(self
-                .finalize_flow_result(flow, Self::expired_flow_message().to_string())
+                .finalize_flow_result(
+                    flow,
+                    OAuthCallbackOutcome::failed(Self::expired_flow_message()),
+                )
                 .await);
         }
 
         // Check for error from provider
         if let Some(err) = error {
             let msg = format!("OAuth authorization denied: {}", err);
-            return Ok(self.finalize_flow_result(flow, msg).await);
+            return Ok(self
+                .finalize_flow_result(flow, OAuthCallbackOutcome::failed(msg))
+                .await);
         }
 
         let service = flow.provider_name.clone();
-        let message = match async {
+        let outcome = match async {
             let code = code.ok_or_else(|| anyhow::anyhow!("No authorization code in callback"))?;
 
             let provider = self
@@ -854,7 +894,7 @@ impl OAuthGateway {
         {
             Ok(message) => {
                 info!(service = %service, "OAuth connection established");
-                message
+                OAuthCallbackOutcome::Connected { message }
             }
             Err(err) => {
                 warn!(
@@ -863,11 +903,11 @@ impl OAuthGateway {
                     error = %err,
                     "OAuth callback failed"
                 );
-                err.to_string()
+                OAuthCallbackOutcome::failed(err.to_string())
             }
         };
 
-        Ok(self.finalize_flow_result(flow, message).await)
+        Ok(self.finalize_flow_result(flow, outcome).await)
     }
 
     /// Remove expired pending flows (older than 10 minutes).
@@ -1580,7 +1620,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("Connected to Linear"));
+        assert!(result.is_connected());
+        assert!(result.message().contains("Connected to Linear"));
         assert!(
             gateway
                 .state_store
@@ -1630,8 +1671,55 @@ mod tests {
             .unwrap();
         let second = gateway.handle_callback(&state, None, None).await.unwrap();
 
-        assert_eq!(first, "OAuth authorization denied: access_denied");
+        assert_eq!(
+            first,
+            OAuthCallbackOutcome::Failed {
+                message: "OAuth authorization denied: access_denied".to_string()
+            }
+        );
         assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn callback_without_code_is_a_failed_outcome() {
+        let isolation = TestSecrets::new();
+
+        let gateway = test_gateway(&isolation).await.unwrap();
+        gateway
+            .register_provider(OAuthProvider {
+                name: "linear".to_string(),
+                display_name: "Linear".to_string(),
+                auth_type: OAuthType::OAuth2AuthorizationCode,
+                authorize_url: "https://linear.app/oauth/authorize".to_string(),
+                token_url: "https://api.linear.app/oauth/token".to_string(),
+                scopes: vec!["read".to_string()],
+                allowed_domains: vec!["api.linear.app".to_string()],
+            })
+            .await;
+
+        std::fs::write(
+            isolation.env_file_path(),
+            "OAUTH_LINEAR_CLIENT_ID=abc\nOAUTH_LINEAR_CLIENT_SECRET=def\n",
+        )
+        .unwrap();
+        let (authorize_url, _result_rx) =
+            gateway.start_oauth2_flow("linear", "test").await.unwrap();
+        let state = state_from_authorize_url(&authorize_url);
+
+        // The error text says nothing like "failed" or "denied"; the outcome
+        // is still a failure because the variant says so.
+        let outcome = gateway.handle_callback(&state, None, None).await.unwrap();
+        assert_eq!(
+            outcome,
+            OAuthCallbackOutcome::Failed {
+                message: "No authorization code in callback".to_string()
+            }
+        );
+        let unknown = gateway
+            .handle_callback("never-issued", Some("code"), None)
+            .await
+            .unwrap();
+        assert!(!unknown.is_connected());
     }
 
     #[tokio::test]
@@ -1661,11 +1749,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let message = gateway
+        let outcome = gateway
             .handle_callback("expired-state", Some("unused"), None)
             .await
             .unwrap();
-        assert_eq!(message, OAuthGateway::expired_flow_message());
+        assert!(!outcome.is_connected());
+        assert_eq!(outcome.message(), OAuthGateway::expired_flow_message());
     }
 
     #[tokio::test]

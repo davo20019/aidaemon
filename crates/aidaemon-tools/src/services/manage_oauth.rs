@@ -2151,7 +2151,8 @@ allowed_domains = ["api.linear.app"]
             .handle_callback(&state, Some("auth-code"), None)
             .await
             .unwrap();
-        assert!(callback_result.contains("Connected to Linear"));
+        assert!(callback_result.is_connected());
+        assert!(callback_result.message().contains("Connected to Linear"));
 
         let second_update = tokio::time::timeout(Duration::from_secs(2), status_rx.recv())
             .await
