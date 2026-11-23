@@ -198,25 +198,54 @@ fn shorten(text: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-/// The program a command line runs: its first word that is not a variable
-/// assignment, as a file name. Machine format (a shell command line),
+/// The program a command line runs: the first command of its chain
+/// (`&&`, `||`, `;`, `|`) that does work, past setup commands that only
+/// change the shell (`cd`, `export`, `source`, ...) and variable
+/// assignments, as a file name. Machine format (a shell command line),
 /// tokenized; the rest of the line is never kept.
 pub fn program_of(command: &str) -> Option<String> {
+    // Shell builtins that set up the next command rather than do the work
+    // (a machine format: command words).
+    const SETUP: &[&str] = &[
+        "cd", "pushd", "popd", "export", "unset", "set", "source", ".", "alias", "umask",
+    ];
     let words = shell_words::split(command).unwrap_or_else(|_| {
         command
             .split_whitespace()
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
-    words
-        .into_iter()
-        .find(|word| {
-            !word
+    let mut first: Option<String> = None;
+    let mut at_start = true;
+    for word in words {
+        // A separator glued to a word (`cd x;`) ends its command too.
+        let (word, ends) = match word.strip_suffix(';') {
+            Some(stripped) => (stripped.to_string(), true),
+            None => (word, false),
+        };
+        if matches!(word.as_str(), "&&" | "||" | ";" | "|" | "&") {
+            at_start = true;
+            continue;
+        }
+        if at_start && !word.is_empty() {
+            let assignment = word
                 .split_once('=')
-                .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/'))
-        })
-        .map(|word| file_name(&word))
-        .filter(|word| !word.is_empty())
+                .is_some_and(|(name, _)| !name.is_empty() && !name.contains('/'));
+            if !assignment {
+                at_start = false;
+                let name = file_name(&word);
+                if !SETUP.contains(&name.as_str()) {
+                    return Some(name).filter(|name| !name.is_empty());
+                }
+                first.get_or_insert(name);
+            }
+        }
+        if ends {
+            at_start = true;
+        }
+    }
+    // Only setup commands: say the first.
+    first.filter(|name| !name.is_empty())
 }
 
 /// A URL's host. Machine format (a URL).
@@ -247,6 +276,15 @@ mod tests {
             Some("curl")
         );
         assert_eq!(program_of("   "), None);
+        assert_eq!(
+            program_of("cd /w/synthetic && python3 -c 'print(1)'").as_deref(),
+            Some("python3")
+        );
+        assert_eq!(
+            program_of("cd /w/x; export A=1; cargo test").as_deref(),
+            Some("cargo")
+        );
+        assert_eq!(program_of("cd /w/x").as_deref(), Some("cd"));
         assert_eq!(
             StepTool::Run {
                 program: program_of("git push origin HEAD")
