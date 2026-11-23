@@ -276,15 +276,40 @@ fn run_group(store: Store, session: String, key: String, headed: bool) -> View {
             if !heading {
                 return run_rows(store, runs).into_element();
             }
+            // Stop all: the background runs still going, one press.
+            let running = computed(move || {
+                runs.with(|runs| {
+                    runs.iter()
+                        .filter(|run| run.phase.is_running() && run.background)
+                        .map(|run| run.id.clone())
+                        .collect::<Vec<_>>()
+                })
+            });
             view()
                 .gap_1()
-                .child(ui::quiet_disclosure(
-                    move || {
-                        store.tick();
-                        SharedString::from(runs.with(|runs| group_summary(runs)))
-                    },
-                    open,
-                ))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(view().flex_1().min_w(px(0.0)).child(ui::quiet_disclosure(
+                            move || {
+                                store.tick();
+                                SharedString::from(runs.with(|runs| group_summary(runs)))
+                            },
+                            open,
+                        )))
+                        .child(when(
+                            move || running.with(|ids| ids.len() > 1),
+                            move || {
+                                ui::btn("Stop all", Variant::Ghost, Size::Sm, move || {
+                                    for id in untracked(|| running.get()) {
+                                        store.stop_run(&id);
+                                    }
+                                })
+                            },
+                        )),
+                )
                 .child(ui::unfold(open, move || run_rows(store, runs)))
                 .into_element()
         }))

@@ -460,6 +460,9 @@ pub struct Store {
     project_editing: Signal<Option<String>>,
     /// The details pane's open tab (an index of [`DETAIL_TABS`]).
     inspector_tab: Signal<usize>,
+    /// A changed file the Changes tab is asked to open (its full path),
+    /// until the tab finds it among the changes.
+    change_to_open: Signal<Option<String>>,
     /// The sidebar's source filter.
     source: Signal<Source>,
     /// The automation whose edit form is open: the page's timed refresh
@@ -582,6 +585,7 @@ impl Store {
             project_form: signal(false),
             project_editing: signal(None),
             inspector_tab: signal(STEPS_TAB),
+            change_to_open: signal(None),
             source: signal(Source::All),
             automation_editing: signal(None),
             composer_focus: signal(0),
@@ -3189,6 +3193,23 @@ impl Store {
     /// Close the run view: the details pane shows its tabs again.
     pub fn close_run(&self) {
         self.act(Client::close_run);
+    }
+
+    /// Show file `path` (a full path) changed: the Changes tab, on its diff
+    /// when it is among the changes, else on the list.
+    pub fn show_change(&self, path: &str) {
+        self.close_run();
+        self.change_to_open.set(Some(path.to_string()));
+        self.show_changes();
+    }
+
+    /// The changed file the Changes tab is asked to open, taken once.
+    pub fn take_change_to_open(&self) -> Option<String> {
+        let path = self.change_to_open.get();
+        if path.is_some() {
+            untracked(|| self.change_to_open.set(None));
+        }
+        path
     }
 
     /// The run whose view is open.

@@ -1145,6 +1145,15 @@ impl ClientGateway {
                     .device
                     .clone()
                     .or_else(|| caller.principal.device_name.clone());
+                // Who answered: a card that goes away is traceable to the
+                // client and device that answered it.
+                tracing::info!(
+                    approval_id = %approval_id,
+                    ?decision,
+                    client = ?caller.kind,
+                    device = device.as_deref().unwrap_or("this machine"),
+                    "An approval was answered from a client"
+                );
                 self.resolve_approval(
                     &approval_id,
                     decision,

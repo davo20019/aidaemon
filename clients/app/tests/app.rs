@@ -792,6 +792,10 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     app.wait_for("text:0 of 2 done · Claude Code, Codex")?;
     app.press("Truncate the synthetic slugs >> nth=0")?;
     app.wait_for("text:2 agents working together")?;
+    // Two agents running in the background: one press stops both.
+    let before = sent("cancel_task");
+    app.press("Stop all")?;
+    wait_sent_new("cancel_task", before)?;
     feed([frame(
         r#"{"type":"event","seq":10,"at_ms":3,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-a","session_id":"app:synthetic-pair","label":"Truncate on branch a","agent":"Claude Code","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-1","edited":["/w/synthetic/slug.py","/w/synthetic/test_slug.py"]}}}"#,
     )]);
@@ -805,6 +809,8 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     ))]);
     app.wait_for("text:Add truncate_slug on branch a")?;
     app.wait_for("text:write: /w/synthetic/slug.py · allowed")?;
+    // What it changed (a conversation with no Changes tab names them).
+    app.wait_for("text:test_slug.py")?;
     app.press("Back")?;
     app.wait_for("text:2 agents working together · 1 done")?;
     // Both ended: their line says how, what they changed and how long,

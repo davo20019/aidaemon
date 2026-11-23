@@ -23,6 +23,25 @@ pub fn code(store: Store) -> View {
         store.selected();
         open.set(None);
     });
+    // A changed file asked for (a run's "Changed" list): its diff, once the
+    // changes are read, when it is among them.
+    effect(move || {
+        let ChangesRead::Ready(changes) = store.changes() else {
+            return;
+        };
+        let Some(path) = store.take_change_to_open() else {
+            return;
+        };
+        for repo in changes.repos {
+            let root = repo.root.trim_end_matches('/');
+            if let Some(relative) = path.strip_prefix(&format!("{root}/"))
+                && repo.files.iter().any(|file| file.path == relative)
+            {
+                open.set(Some((repo.root.clone(), relative.to_string())));
+                return;
+            }
+        }
+    });
     view().flex_1().child(dynamic(move || {
         let shown = open.get();
         Some(untracked(move || match shown {

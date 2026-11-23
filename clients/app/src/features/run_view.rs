@@ -6,6 +6,7 @@
 use aidaemon_client_protocol::{
     RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
 };
+use nsh_base::button;
 use nsh_core::prelude::*;
 
 use crate::store::{Read, Store};
@@ -55,8 +56,14 @@ pub fn run_view(store: Store, id: String) -> View {
                 .flex_1()
                 .child(view().px_3().pb_4().gap_3().child(dynamic(move || {
                     let read = store.run_view();
+                    // The files it changed, as its record has them so far.
+                    let (edited, coding) = summary.with(|run| {
+                        run.as_ref().map_or((Vec::new(), false), |run| {
+                            (run.edited.clone(), store.is_coding(&run.session_id))
+                        })
+                    });
                     Some(untracked(move || match read {
-                        Read::Ready(detail) => body(detail),
+                        Read::Ready(detail) => body(store, detail, edited, coding),
                         Read::Failed(why) => note(format!("Could not read this run: {why}")),
                         _ => note("Reading what it did…".to_string()),
                     }))
@@ -95,7 +102,9 @@ fn note(words: String) -> View {
     )
 }
 
-fn body(detail: RunDetail) -> View {
+/// `coding`: its conversation has a Changes tab, where each changed file
+/// opens its diff.
+fn body(store: Store, detail: RunDetail, edited: Vec<String>, coding: bool) -> View {
     let mut page = view().gap_3().pt_2();
     if !detail.task.is_empty() {
         page = page.child(section(
@@ -153,6 +162,42 @@ fn body(detail: RunDetail) -> View {
         }
         page = page.child(section("Permissions", asked));
     }
+    // Each file it changed opens its diff in the Changes tab.
+    if !edited.is_empty() {
+        let mut files = view().gap_1();
+        for path in edited {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
+            let tint = if coding {
+                colors::ACCENT
+            } else {
+                colors::MUTED
+            };
+            let line = view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(ui::icon(Glyph::File).text_color(tint))
+                .child(
+                    text(name.clone())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .text_size(px(type_scale::SM))
+                        .text_color(tint),
+                );
+            files = if coding {
+                files.child(
+                    button()
+                        .accessibility_label(format!("{name}, show what changed"))
+                        .on_press(move || store.show_change(&path))
+                        .child(line),
+                )
+            } else {
+                files.child(line)
+            };
+        }
+        page = page.child(section("Changed", files));
+    }
     if let Some(result) = &detail.result {
         page = page.child(section(
             "Reported",
@@ -185,17 +230,26 @@ fn body(detail: RunDetail) -> View {
     if let Some(session) = &detail.agent_session_id {
         facts.push(format!("Its session: {session}"));
     }
+    // What it ran on and what it cost, folded: the work comes first.
     if !facts.is_empty() {
-        let mut list = view().gap_1();
-        for fact in facts {
-            list = list.child(
-                text(fact)
-                    .selectable(true)
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
-            );
-        }
-        page = page.child(list);
+        let open = signal(false);
+        page = page.child(
+            view()
+                .gap_1()
+                .child(ui::quiet_disclosure("Details", open))
+                .child(ui::unfold(open, move || {
+                    let mut list = view().gap_1().pl(px(4.0));
+                    for fact in facts.clone() {
+                        list = list.child(
+                            text(fact)
+                                .selectable(true)
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                        );
+                    }
+                    list
+                })),
+        );
     }
     page
 }
