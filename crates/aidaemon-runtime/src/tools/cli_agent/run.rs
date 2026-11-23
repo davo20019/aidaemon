@@ -190,14 +190,14 @@ pub(super) struct StartedRun {
 fn tracked(
     call: &RunCall,
     shared: &RunShared,
-    started_at: Instant,
+    accepted_at: Instant,
     claim_dir: Option<String>,
 ) -> RunningCliAgent {
     RunningCliAgent {
         tool_name: call.tool_name.clone(),
         label: call.label.clone(),
         prompt_summary: call.short_summary.clone(),
-        started_at,
+        accepted_at,
         display_buf: shared.display_buf.clone(),
         stdout_buf: shared.stdout_buf.clone(),
         process: shared.process.clone(),
@@ -1037,7 +1037,10 @@ impl CliAgentTool {
     /// at once: its task id, its record (reading [`WAITING_FOR_SLOT`]) and
     /// its working-dir claim; it starts by itself, first come first served,
     /// when a slot frees, and runs from then on as an immediate launch
-    /// does. Stopped before then, it ends without ever starting.
+    /// does. Stopped before then, it ends without ever starting. What
+    /// `prepare_run` decided (its mode, model, readiness and sandbox
+    /// paths) holds from when it was accepted: a change the owner makes
+    /// while it waits applies to the next launch.
     async fn queue_run<F>(
         &self,
         call: RunCall,

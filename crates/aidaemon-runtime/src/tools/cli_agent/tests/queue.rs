@@ -317,3 +317,45 @@ async fn cancelling_a_queued_run_says_it_never_started() {
 
     tool.handle_cancel_all(chat).await.unwrap();
 }
+
+/// A queued run's time is counted from when its process started, not from
+/// when it was queued.
+#[tokio::test]
+async fn a_started_queued_run_counts_its_time_from_its_start() {
+    let (tool, _runs, _watcher, _db) = one_slot_tool().await;
+    let chat = "app:synthetic-queue-time";
+    launch(
+        &tool,
+        chat,
+        r#"{"action":"run","tool":"bash-agent","prompt":"sleep 1","async_mode":true}"#,
+    )
+    .await;
+    let queued = launch(
+        &tool,
+        chat,
+        r#"{"action":"run","tool":"bash-agent","prompt":"sleep 5","async_mode":true}"#,
+    )
+    .await;
+    let queued_id = extract_task_id_from_background_message(&queued);
+    assert_eq!(
+        tool.running.lock().await[&queued_id].process.started_at(),
+        None
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (accepted, since) = loop {
+        {
+            let running = tool.running.lock().await;
+            let agent = &running[&queued_id];
+            if agent.process.started_at().is_some() {
+                break (agent.accepted_at, agent.running_since());
+            }
+        }
+        assert!(tokio::time::Instant::now() < deadline, "it never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        since.duration_since(accepted) >= Duration::from_millis(500),
+        "its time starts when it started, after its wait"
+    );
+    tool.handle_cancel_all(chat).await.unwrap();
+}

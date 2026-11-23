@@ -51,14 +51,20 @@ struct BootRecord {
     /// Chats whose background job that boot started again.
     #[serde(default)]
     restarted_jobs: Vec<String>,
+    /// The coding agents that boot started again, by chat and label: one
+    /// started again runs under a new id, so its chat and label are what
+    /// the next boot knows it by.
+    #[serde(default)]
+    restarted_agents: Vec<(String, String)>,
 }
 
 /// The previous boot's mark, the chats it continued and the chats whose
-/// background jobs it started again.
+/// background jobs (and the coding agents) it started again.
 pub struct PreviousBoot {
     since: String,
     continued: Vec<String>,
     restarted_jobs: Vec<String>,
+    restarted_agents: Vec<(String, String)>,
 }
 
 pub struct ResumeDeps {
@@ -110,6 +116,7 @@ pub async fn mark_boot(
         since: record.boot_at,
         continued: record.continued,
         restarted_jobs: record.restarted_jobs,
+        restarted_agents: record.restarted_agents,
     })
 }
 
@@ -146,6 +153,7 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
         since,
         continued: continued_last_boot,
         restarted_jobs,
+        restarted_agents,
     }) = previous
     else {
         for job in &jobs {
@@ -157,7 +165,12 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
         .into_iter()
         .partition(|job| aidaemon_runtime::tools::cli_agent::is_cli_agent_run(&job.id));
     let mut job_notes = plan_jobs(&deps, jobs, &since, &restarted_jobs).await;
-    for (chat, note) in plan_agent_jobs(&deps, agent_jobs, &restarted_jobs).await {
+    // The chats whose sub-agent jobs this boot starts again (a coding
+    // agent's restart is recorded on its own).
+    let restarted_job_chats: Vec<String> = job_notes.keys().cloned().collect();
+    let (agent_notes, agents_restarted) =
+        plan_agent_jobs(&deps, agent_jobs, &restarted_agents).await;
+    for (chat, note) in agent_notes {
         job_notes
             .entry(chat)
             .and_modify(|existing| {
@@ -177,9 +190,12 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
     let Some(hub) = deps.hub.upgrade() else {
         return;
     };
-    if !job_notes.is_empty() {
-        let chats: Vec<String> = job_notes.keys().cloned().collect();
-        update_record(&*deps.state, |record| record.restarted_jobs = chats).await;
+    if !restarted_job_chats.is_empty() || !agents_restarted.is_empty() {
+        update_record(&*deps.state, |record| {
+            record.restarted_jobs = restarted_job_chats;
+            record.restarted_agents = agents_restarted;
+        })
+        .await;
     }
     let mut to_continue = Vec::new();
     for run in runs {
@@ -282,6 +298,9 @@ enum JobFate {
     AgentNeverStarted,
     /// A coding agent whose process had started: not started again.
     AgentStopped,
+    /// A coding agent started again last boot that again never got a slot
+    /// before the restart: not started a third time.
+    AgentNeverStartedAgain,
 }
 
 /// Tell the job's chat what became of it, through the notification queue
@@ -311,6 +330,11 @@ async fn notify_job(deps: &ResumeDeps, job: &crate::traits::BackgroundSpawn, fat
         JobFate::AgentNeverStarted => format!(
             "\u{26a0}\u{fe0f} A restart dropped this coding agent while it was waiting for a \
              free slot: {mission}\n\nNothing of it had run. Starting it again."
+        ),
+        JobFate::AgentNeverStartedAgain => format!(
+            "\u{26a0}\u{fe0f} The daemon restarted again before this coding agent, started \
+             again after the last restart, got a free slot: {mission}\n\nNothing of it ran. \
+             I stopped starting it again; say continue to start it."
         ),
         JobFate::AgentStopped => format!(
             "\u{26a0}\u{fe0f} A restart stopped this coding agent while it was working: \
@@ -445,13 +469,21 @@ async fn plan_jobs(
 }
 
 /// Each cut-off coding agent's fate (see the module docs), its chat told;
-/// returns the note that starts the ones that never ran again, per chat.
+/// returns the note that starts the ones that never ran again, per chat,
+/// and those agents by chat and label (for the next boot's
+/// [`BootRecord::restarted_agents`]). One this boot started again last
+/// time is not started a third time: known by its chat and label, a
+/// different agent in the same chat is never held back by it.
 async fn plan_agent_jobs(
     deps: &ResumeDeps,
     mut jobs: Vec<crate::traits::BackgroundSpawn>,
-    restarted_last_boot: &[String],
-) -> std::collections::HashMap<String, String> {
+    restarted_last_boot: &[(String, String)],
+) -> (
+    std::collections::HashMap<String, String>,
+    Vec<(String, String)>,
+) {
     let mut notes: std::collections::HashMap<String, String> = Default::default();
+    let mut restarted = Vec::new();
     jobs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     for job in jobs {
         // Its process started if it logged an invocation under its run id.
@@ -477,17 +509,31 @@ async fn plan_agent_jobs(
             JobFate::Lost
         } else if invocation.is_some() {
             JobFate::AgentStopped
-        } else if restarted_last_boot.contains(&job.session_id) {
-            JobFate::CutOffAgain
+        } else if restarted_last_boot
+            .iter()
+            .any(|(chat, label)| *chat == job.session_id && *label == job.mission)
+        {
+            JobFate::AgentNeverStartedAgain
         } else {
             JobFate::AgentNeverStarted
         };
         if matches!(fate, JobFate::AgentNeverStarted) {
+            restarted.push((job.session_id.clone(), job.mission.clone()));
+            // Its launch is found by the task id its result gave, never by
+            // its label alone: several launches in one chat can share one.
+            let launch = match aidaemon_runtime::tools::cli_agent::cli_agent_task_id(&job.id) {
+                Some(task_id) => format!(
+                    "Its launch is the `cli_agent` call above whose result said it was queued \
+                     with task_id={task_id}: repeat that call once with exactly the same \
+                     arguments (agent, prompt, working_dir, paths)."
+                ),
+                None => "Start it again once, the same way as its launch above.".to_string(),
+            };
             let note = format!(
                 "The daemon restarted while a coding agent you started in this conversation \
-                 with `cli_agent` was waiting for a free slot, so it never ran: \"{}\". Start \
-                 it again once, the same way as its launch above. The owner was already told \
-                 it is being started again; reply only if something needs their attention.",
+                 with `cli_agent` was waiting for a free slot, so it never ran: \"{}\". \
+                 {launch} The owner was already told it is being started again; reply only if \
+                 something needs their attention.",
                 job.mission.trim()
             );
             notes
@@ -500,7 +546,7 @@ async fn plan_agent_jobs(
         }
         notify_job(deps, &job, fate).await;
     }
-    notes
+    (notes, restarted)
 }
 
 /// The internal message that starts a cut-off background job again in its
@@ -988,7 +1034,47 @@ mod tests {
             "{}",
             notice(working)
         );
+        assert!(
+            agent.0.lock().unwrap()[0].followup.contains("task_id=q1"),
+            "its launch is named by the task id its result gave"
+        );
         let closed = state.cli_agent_run("cli-agent-w1").await.unwrap().unwrap();
         assert!(closed.output_summary.is_some(), "{closed:?}");
+
+        // Cut off again: the agent started again last boot (known by its
+        // chat and label) is not started a third time; another agent in
+        // the same chat is, and a sub-agent job there is not held back.
+        boot_with_jobs(
+            &store,
+            &state,
+            &sessions,
+            &agent,
+            &hub,
+            vec![
+                agent_job(waiting, "cli-agent-q2", "Review the synthetic notes", 3),
+                agent_job(waiting, "cli-agent-q3", "Draft the synthetic summary", 4),
+                job(waiting, "Build the synthetic site", 5),
+            ],
+        )
+        .await;
+        {
+            let answers = agent.0.lock().unwrap();
+            assert_eq!(answers.len(), 2, "one continuation for the chat");
+            let followup = &answers[1].followup;
+            assert!(
+                followup.contains("Draft the synthetic summary")
+                    && followup.contains("Build the synthetic site")
+                    && !followup.contains("Review the synthetic notes"),
+                "{followup}"
+            );
+        }
+        let notices = state.get_pending_notifications(20).await.unwrap();
+        assert!(
+            notices.iter().any(
+                |entry| entry.message.contains("I stopped starting it again")
+                    && entry.message.contains("Review the synthetic notes")
+            ),
+            "{notices:#?}"
+        );
     }
 }

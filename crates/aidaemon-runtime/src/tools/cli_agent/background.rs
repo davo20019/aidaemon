@@ -88,7 +88,7 @@ impl CliAgentTool {
         backend: &SharedExecutionBackend,
         agent: &RunningCliAgent,
     ) -> String {
-        let elapsed = agent.started_at.elapsed().as_secs();
+        let elapsed = agent.running_since().elapsed().as_secs();
         let stdout_output = agent.stdout_buf.lock().await.clone();
         if agent.auth_failed.load(Ordering::Acquire) {
             return format!(
@@ -376,16 +376,17 @@ impl CliAgentTool {
             ));
         };
 
-        let elapsed = agent.started_at.elapsed().as_secs();
         if agent.process.is_queued() {
+            let waited = agent.accepted_at.elapsed().as_secs();
             mark_left_in_background();
             return Ok(format!(
-                "CLI agent '{}' is queued (task_id={task_id}): it has waited {elapsed}s for a \
+                "CLI agent '{}' is queued (task_id={task_id}): it has waited {waited}s for a \
                  free slot and starts by itself when one frees. Do not start it again.\n\
                  Task: {}...",
                 agent.tool_name, agent.prompt_summary
             ));
         }
+        let elapsed = agent.running_since().elapsed().as_secs();
         let display_output = agent.display_buf.lock().await.clone();
 
         let is_running = !agent.finished.load(Ordering::Acquire);
@@ -439,7 +440,9 @@ impl CliAgentTool {
         self.completed.lock().await.remove(task_id);
 
         let display_output = agent.display_buf.lock().await.clone();
-        let elapsed = agent.started_at.elapsed().as_secs();
+        // A queued run's time is how long it waited; a started one's, how
+        // long it has run.
+        let elapsed = agent.running_since().elapsed().as_secs();
 
         // Release working-dir claim owned by this task.
         if let Some(ref dir) = agent.claim_dir {
@@ -537,7 +540,7 @@ impl CliAgentTool {
 
         let mut lines = vec!["Running CLI agents:".to_string()];
         for (task_id, agent) in running.iter() {
-            let elapsed = agent.started_at.elapsed().as_secs();
+            let elapsed = agent.running_since().elapsed().as_secs();
             let status = if agent.process.is_queued() {
                 "queued, waiting for a free slot"
             } else if !agent.finished.load(Ordering::Acquire) {

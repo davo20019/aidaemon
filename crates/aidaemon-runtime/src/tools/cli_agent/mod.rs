@@ -55,7 +55,7 @@ mod state;
 mod tests;
 mod tool_impl;
 
-pub use state::is_cli_agent_run;
+pub use state::{cli_agent_task_id, is_cli_agent_run};
 
 use args::*;
 use claims::*;

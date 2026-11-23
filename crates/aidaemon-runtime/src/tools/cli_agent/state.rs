@@ -49,7 +49,8 @@ pub(super) struct RunningCliAgent {
     /// what it is ("bash-agent coding agent"), never its prompt.
     pub(super) label: String,
     pub(super) prompt_summary: String,
-    pub(super) started_at: Instant,
+    /// When its call accepted it: a queued run has waited since then.
+    pub(super) accepted_at: Instant,
     /// Combined output for display (includes [stderr] prefixes)
     pub(super) display_buf: Arc<Mutex<String>>,
     /// Pure stdout for JSON extraction
@@ -90,7 +91,8 @@ enum ProcessState {
     /// Waiting for a free slot: no process yet.
     #[default]
     Queued,
-    Started(ProcessHandle),
+    /// Its process, and when it started.
+    Started(ProcessHandle, Instant),
     /// Stopped while it waited: it never starts.
     Stopped,
 }
@@ -105,7 +107,15 @@ impl RunProcess {
     /// Its process, once started.
     pub(super) fn handle(&self) -> Option<ProcessHandle> {
         match &*self.lock() {
-            ProcessState::Started(handle) => Some(handle.clone()),
+            ProcessState::Started(handle, _) => Some(handle.clone()),
+            _ => None,
+        }
+    }
+
+    /// When its process started.
+    pub(super) fn started_at(&self) -> Option<Instant> {
+        match &*self.lock() {
+            ProcessState::Started(_, at) => Some(*at),
             _ => None,
         }
     }
@@ -127,7 +137,7 @@ impl RunProcess {
         if matches!(*state, ProcessState::Stopped) {
             return false;
         }
-        *state = ProcessState::Started(handle);
+        *state = ProcessState::Started(handle, Instant::now());
         true
     }
 
@@ -136,7 +146,7 @@ impl RunProcess {
         let handle = {
             let mut state = self.lock();
             match &*state {
-                ProcessState::Started(handle) => Some(handle.clone()),
+                ProcessState::Started(handle, _) => Some(handle.clone()),
                 ProcessState::Queued | ProcessState::Stopped => {
                     *state = ProcessState::Stopped;
                     None
@@ -152,6 +162,13 @@ impl RunProcess {
     /// Resolves once it is stopped while it waits.
     pub(super) async fn stopped(&self) {
         self.stop.notified().await;
+    }
+}
+
+impl RunningCliAgent {
+    /// When its process started; while it waits, when it was accepted.
+    pub(super) fn running_since(&self) -> Instant {
+        self.process.started_at().unwrap_or(self.accepted_at)
     }
 }
 
@@ -204,6 +221,12 @@ pub(super) fn cli_run_id(task_id: &str) -> String {
 /// tells the coding agents a restart cut off from the other background
 /// jobs on record.
 pub fn is_cli_agent_run(id: &str) -> bool {
+    cli_agent_task_id(id).is_some()
+}
+
+/// The task id a launched agent's run id (`cli-agent-<task id>`) carries:
+/// the `task_id=` its launch's result gave.
+pub fn cli_agent_task_id(run_id: &str) -> Option<&str> {
     // A marker the daemon itself writes (`cli_run_id`).
-    id.starts_with(CLI_RUN_PREFIX)
+    run_id.strip_prefix(CLI_RUN_PREFIX)
 }

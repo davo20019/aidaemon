@@ -170,7 +170,7 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
                     key: task_id.clone(),
                     title: agent.label.clone(),
                     started_at: now
-                        - chrono::Duration::from_std(agent.started_at.elapsed())
+                        - chrono::Duration::from_std(agent.accepted_at.elapsed())
                             .unwrap_or_default(),
                     task_id: agent.delegated_task_id.clone(),
                     run: Some(cli_run_id(task_id)),
