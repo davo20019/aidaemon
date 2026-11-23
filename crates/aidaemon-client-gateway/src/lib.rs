@@ -278,6 +278,24 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no projects".to_string())
     }
 
+    /// What run `run_id` did, as its record keeps it (`get_run`).
+    async fn run_detail(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<aidaemon_client_protocol::RunDetail> {
+        Ok(aidaemon_client_protocol::RunDetail {
+            run_id: run_id.to_string(),
+            agent_session_id: None,
+            working_dir: None,
+            task: String::new(),
+            result: None,
+            steps: Vec::new(),
+            plan: Vec::new(),
+            permissions: Vec::new(),
+            usage: None,
+        })
+    }
+
     /// Everything that runs on its own, next to run first.
     async fn automations(
         &self,
@@ -857,6 +875,7 @@ impl ClientGateway {
             | Command::GetChanges { .. }
             | Command::ListProjects
             | Command::ListAutomations
+            | Command::GetRun { .. }
             | Command::ListModels
             | Command::GetSessionModel { .. } => Some(Scope::Observe),
             Command::SetSessionModel { .. } => Some(Scope::Chat),
@@ -1307,6 +1326,13 @@ impl ClientGateway {
                     );
                 }
                 Ok(CommandResult::Projects { projects })
+            }
+            Command::GetRun { run_id } => {
+                let run = self.host.run_detail(&run_id).await.map_err(|e| {
+                    warn!(error = %e, "Reading a run failed");
+                    ProtocolError::new(ErrorCode::Internal, "Could not read the run")
+                })?;
+                Ok(CommandResult::Run { run })
             }
             Command::ListAutomations => {
                 let automations = self.host.automations().await.map_err(|e| {
@@ -2426,10 +2452,14 @@ impl ClientGateway {
                     &session_id,
                     &run.id,
                     &run.view,
-                    run.activity.as_deref(),
-                    run.agent.as_deref(),
-                    run.started_at,
-                    run.ended_at,
+                    observer::RunRecord {
+                        activity: run.activity.as_deref(),
+                        agent: run.agent.as_deref(),
+                        group: run.group.as_deref(),
+                        edited: &run.edited,
+                        started_at: run.started_at,
+                        ended_at: run.ended_at,
+                    },
                 ));
             }
         }

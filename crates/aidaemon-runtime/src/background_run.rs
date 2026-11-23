@@ -216,6 +216,7 @@ impl BackgroundRun {
         // The runs one turn leaves running are one group, whatever kind they
         // are: the chat is answered once, after the last of them.
         if let Some(task) = start.task_id.filter(|task| !task.trim().is_empty()) {
+            home.runs.for_request(start.id, task);
             home.runs
                 .join_group(start.id, &crate::run_state::turn_group(start.chat, task));
         }

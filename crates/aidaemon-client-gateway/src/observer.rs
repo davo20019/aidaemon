@@ -442,10 +442,14 @@ impl TurnObserver for GatewayObserver {
                     &change.session_id,
                     &change.id,
                     &change.view,
-                    change.activity.as_deref(),
-                    change.agent.as_deref(),
-                    change.started_at,
-                    change.ended_at,
+                    RunRecord {
+                        activity: change.activity.as_deref(),
+                        agent: change.agent.as_deref(),
+                        group: change.group.as_deref(),
+                        edited: &change.edited,
+                        started_at: change.started_at,
+                        ended_at: change.ended_at,
+                    },
                 ),
             },
         );
@@ -504,15 +508,30 @@ impl TurnObserver for GatewayObserver {
 /// A run's record as the owner's app reads it. Every field is the
 /// runtime's: phase, step, reason and time taken come from the run's typed
 /// record ([`aidaemon_core::card::HelperView`]), never from its reply.
+/// What a run's record adds to its view, for its summary.
+pub(crate) struct RunRecord<'a> {
+    pub activity: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub edited: &'a [String],
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub(crate) fn run_summary(
     session_id: &str,
     id: &str,
     view: &aidaemon_core::card::HelperView,
-    activity: Option<&str>,
-    agent: Option<&str>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    record: RunRecord<'_>,
 ) -> RunSummary {
+    let RunRecord {
+        activity,
+        agent,
+        group,
+        edited,
+        started_at,
+        ended_at,
+    } = record;
     use aidaemon_core::card::RunPhase as Phase;
     let phase = match view.phase {
         Phase::Running => RunPhase::Running,
@@ -534,6 +553,8 @@ pub(crate) fn run_summary(
         took: view.took.clone(),
         reason: view.reason.clone(),
         stopped_by_owner: view.stopped_by_owner,
+        group: group.map(str::to_string),
+        edited: edited.to_vec(),
     }
 }
 

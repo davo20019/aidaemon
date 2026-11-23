@@ -447,6 +447,9 @@ pub struct RunState {
     pub activity: Option<String>,
     /// The coding agent it is ("Claude Code"), for a run that launched one.
     pub agent: Option<String>,
+    /// The files the coding agent it launched changed, as its typed steps
+    /// named them, in the order first changed.
+    pub edited: Vec<String>,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -742,6 +745,7 @@ impl RunStates {
             step: None,
             activity: None,
             agent: None,
+            edited: Vec::new(),
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -853,6 +857,8 @@ impl RunStates {
             view,
             activity: state.activity.clone(),
             agent: state.agent.clone(),
+            group: state.request.clone(),
+            edited: state.edited.clone(),
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -992,6 +998,21 @@ impl RunStates {
             self.report(id, true);
         }
         set
+    }
+
+    /// The coding agent run `id` launched changed file `path` (once per
+    /// file).
+    pub fn edited(&self, id: &str, path: &str) {
+        let added = match self.lock().get_mut(id) {
+            Some(entry) if !entry.state.edited.iter().any(|known| known == path) => {
+                entry.state.edited.push(path.to_string());
+                true
+            }
+            _ => false,
+        };
+        if added {
+            self.report(id, false);
+        }
     }
 
     /// Run `id` is coding agent `agent` ("Claude Code").
@@ -1398,6 +1419,22 @@ mod tests {
     /// A run the owner stopped says so, however its program's end reads; a
     /// run that finished its work anyway keeps its success.
     #[test]
+    fn a_runs_changed_files_are_kept_once_each_in_order() {
+        let runs = RunStates::default();
+        runs.begin("job-1", "chat", "Claude Code: synthetic", None);
+        runs.edited("job-1", "/w/synthetic/b.py");
+        runs.edited("job-1", "/w/synthetic/a.py");
+        runs.edited("job-1", "/w/synthetic/b.py");
+        assert_eq!(
+            runs.get("job-1").map(|run| run.edited),
+            Some(vec![
+                "/w/synthetic/b.py".to_string(),
+                "/w/synthetic/a.py".to_string()
+            ])
+        );
+    }
+
+    #[test]
     fn a_run_the_owner_stopped_ends_stopped_by_the_owner() {
         let runs = RunStates::default();
         runs.begin("command-1", "chat", "sleep", None);
@@ -1510,6 +1547,7 @@ mod tests {
             step: None,
             activity: None,
             agent: None,
+            edited: Vec::new(),
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,

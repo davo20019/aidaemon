@@ -858,6 +858,8 @@ mod tests {
             took: None,
             reason: None,
             stopped_by_owner: false,
+            group: None,
+            edited: Vec::new(),
         }
     }
 

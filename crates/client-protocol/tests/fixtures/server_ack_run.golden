@@ -1,0 +1,38 @@
+{
+  "request_id": "5d0c2b1e-0001",
+  "result": {
+    "run": {
+      "agent_session_id": "synthetic-session-1",
+      "permissions": [
+        {
+          "label": "write: /w/synthetic/release.md",
+          "outcome": "allowed"
+        }
+      ],
+      "plan": [
+        {
+          "status": "done",
+          "text": "Write the notes"
+        }
+      ],
+      "result": "Wrote release.md",
+      "run_id": "run-3f2a",
+      "steps": [
+        {
+          "at_ms": 1767225660000,
+          "state": "done",
+          "words": "Editing release.md"
+        }
+      ],
+      "task": "Prepare the synthetic release notes",
+      "usage": {
+        "cost_usd": 0.02,
+        "input_tokens": 1200,
+        "output_tokens": 300
+      },
+      "working_dir": "/w/synthetic"
+    },
+    "type": "run"
+  },
+  "type": "ack"
+}

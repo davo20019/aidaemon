@@ -4,6 +4,10 @@
     "run": {
       "agent": "Claude Code",
       "background": true,
+      "edited": [
+        "/w/synthetic/release.md"
+      ],
+      "group": "task-9b1d",
       "id": "run-3f2a",
       "label": "Claude Code: prepare the synthetic release",
       "phase": "running",

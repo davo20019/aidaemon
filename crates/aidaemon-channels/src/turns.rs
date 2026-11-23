@@ -357,6 +357,11 @@ pub struct RunChange {
     pub activity: Option<String>,
     /// The coding agent it is ("Claude Code"), when it launched one.
     pub agent: Option<String>,
+    /// The chat turn (its task id) that started it: runs one request
+    /// started share it.
+    pub group: Option<String>,
+    /// The files the coding agent it launched changed.
+    pub edited: Vec<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
@@ -1634,6 +1639,8 @@ mod tests {
                         ended_at: None,
                         activity: None,
                         agent: None,
+                        group: None,
+                        edited: Vec::new(),
                         this_request: false,
                     })
                 })

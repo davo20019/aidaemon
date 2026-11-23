@@ -172,6 +172,19 @@ pub struct CliAgentEvent {
     pub data: String,
 }
 
+/// The invocation behind one run of the runtime's records
+/// ([`DynamicCliAgentStore::cli_agent_run`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliAgentRun {
+    pub invocation: i64,
+    pub agent_name: String,
+    /// The agent's own session id, once it gave one.
+    pub agent_session: Option<String>,
+    pub working_dir: Option<String>,
+    pub prompt_summary: String,
+    pub output_summary: Option<String>,
+}
+
 /// Runtime-managed CLI agents persistence + invocation logs.
 #[async_trait]
 pub trait DynamicCliAgentStore: Send + Sync {
@@ -245,6 +258,12 @@ pub trait DynamicCliAgentStore: Send + Sync {
         _data: &str,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// The invocation that is run `run_id` in the runtime's records, when
+    /// one is.
+    async fn cli_agent_run(&self, _run_id: &str) -> anyhow::Result<Option<CliAgentRun>> {
+        Ok(None)
     }
 
     /// Invocation `id`'s events, in order.

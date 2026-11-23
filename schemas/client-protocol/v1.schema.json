@@ -1328,6 +1328,23 @@
           "type": "object"
         },
         {
+          "description": "What one run did, as its record keeps it (protocol 1.46): a coding\nagent's steps, plan, permission decisions and usage. Answers with\n`run`.",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "get_run",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "run_id"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "cursor": {
               "type": [
@@ -2726,6 +2743,23 @@
           "required": [
             "type",
             "projects"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`get_run`.",
+          "properties": {
+            "run": {
+              "$ref": "#/$defs/RunDetail"
+            },
+            "type": {
+              "const": "run",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "run"
           ],
           "type": "object"
         },
@@ -5664,6 +5698,74 @@
       ],
       "type": "string"
     },
+    "RunDetail": {
+      "description": "What one run did (protocol 1.46, `get_run`), from its record. Only a\ncoding agent's run keeps steps; any other has its summary alone.",
+      "properties": {
+        "agent_session_id": {
+          "description": "The coding agent's own session id (Claude Code's session id, Codex's\nthread id, an ACP session id): what resumes it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissions": {
+          "description": "What it asked permission for and the answer, in order.",
+          "items": {
+            "$ref": "#/$defs/RunPermission"
+          },
+          "type": "array"
+        },
+        "plan": {
+          "description": "Its plan, as it last wrote it.",
+          "items": {
+            "$ref": "#/$defs/RunPlanItem"
+          },
+          "type": "array"
+        },
+        "result": {
+          "description": "What it reported at its end, shortened.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "steps": {
+          "description": "Its steps, in order.",
+          "items": {
+            "$ref": "#/$defs/RunStepItem"
+          },
+          "type": "array"
+        },
+        "task": {
+          "description": "What it was asked, shortened.",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "working_dir": {
+          "description": "The folder it worked in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
     "RunOutcome": {
       "description": "How a run ended, or that it has not yet.",
       "oneOf": [
@@ -5692,6 +5794,39 @@
         }
       ]
     },
+    "RunPermission": {
+      "description": "One permission a run asked for and how it was answered.",
+      "properties": {
+        "label": {
+          "description": "What it asked, as the owner reads it (\"write: /w/notes.md\").",
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/RunPermissionOutcome"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "RunPermissionOutcome": {
+      "enum": [
+        "allowed",
+        "refused",
+        "declined",
+        "unanswered",
+        "unknown"
+      ],
+      "type": "string"
+    },
     "RunPhase": {
       "description": "Where a run is (protocol 1.46).",
       "oneOf": [
@@ -5718,6 +5853,76 @@
         }
       ]
     },
+    "RunPlanItem": {
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/RunPlanStatus"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "status"
+      ],
+      "type": "object"
+    },
+    "RunPlanStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "done",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "RunStepItem": {
+      "description": "One step of a run, in plain words from its typed event.",
+      "properties": {
+        "at_ms": {
+          "description": "When it started, ms since the epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "by_helper": {
+          "description": "One of the agent's own helpers ran it.",
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/RunStepState"
+        },
+        "words": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "words",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RunStepState": {
+      "oneOf": [
+        {
+          "enum": [
+            "done",
+            "failed",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "started",
+          "description": "Started; no end is on record (yet).",
+          "type": "string"
+        }
+      ]
+    },
     "RunSummary": {
       "description": "One helper run as the daemon records it (protocol 1.46): a sub-agent, a\ncoding agent it launched (Claude Code, Codex, ...) or a background\ncommand. Every field comes from the run's typed record, never from what\na model wrote.",
       "properties": {
@@ -5732,11 +5937,25 @@
           "description": "It goes on after the turn that started it ended.",
           "type": "boolean"
         },
+        "edited": {
+          "description": "The files the coding agent it launched changed, as full paths, in\nthe order first changed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "ended_at_ms": {
           "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "The request (its turn's id) that started it: the runs one request\nstarted share it, and a client shows them together.",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -5790,6 +6009,33 @@
         "phase",
         "background",
         "started_at_ms"
+      ],
+      "type": "object"
+    },
+    "RunUsage": {
+      "description": "Tokens and cost, as the agent counted them.",
+      "properties": {
+        "cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens"
       ],
       "type": "object"
     },

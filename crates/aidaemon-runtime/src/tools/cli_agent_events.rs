@@ -76,6 +76,9 @@ impl AgentEventRecorder {
                     return;
                 }
                 self.runs.activity(&self.run_id, step.tool.words());
+                if let aidaemon_coding_agents::StepTool::Edit { path: Some(path) } = &step.tool {
+                    self.runs.edited(&self.run_id, path);
+                }
             }
             AgentEvent::Session { id, .. } if self.invocation != 0 => {
                 if let Err(error) = self.store.set_cli_agent_session(self.invocation, id).await {

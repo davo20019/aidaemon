@@ -266,6 +266,10 @@ pub enum Command {
     },
     /// Stop one entry of the running-work list.
     CancelTask { task_id: String },
+    /// What one run did, as its record keeps it (protocol 1.46): a coding
+    /// agent's steps, plan, permission decisions and usage. Answers with
+    /// `run`.
+    GetRun { run_id: String },
     ListSessions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
@@ -923,6 +927,10 @@ pub enum CommandResult {
     /// `list_projects` and `delete_project`.
     Projects {
         projects: Vec<ProjectSummary>,
+    },
+    /// `get_run`.
+    Run {
+        run: RunDetail,
     },
     /// `list_automations` and `change_automation`: every automation, next
     /// to run first; after a change, what happened (`note`) and whether it
@@ -2918,6 +2926,115 @@ pub struct RunSummary {
     /// It ended because the owner stopped it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped_by_owner: bool,
+    /// The request (its turn's id) that started it: the runs one request
+    /// started share it, and a client shows them together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The files the coding agent it launched changed, as full paths, in
+    /// the order first changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edited: Vec<String>,
+}
+
+/// What one run did (protocol 1.46, `get_run`), from its record. Only a
+/// coding agent's run keeps steps; any other has its summary alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct RunDetail {
+    pub run_id: String,
+    /// The coding agent's own session id (Claude Code's session id, Codex's
+    /// thread id, an ACP session id): what resumes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// The folder it worked in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// What it was asked, shortened.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub task: String,
+    /// What it reported at its end, shortened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Its steps, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<RunStepItem>,
+    /// Its plan, as it last wrote it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<RunPlanItem>,
+    /// What it asked permission for and the answer, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<RunPermission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
+}
+
+/// One step of a run, in plain words from its typed event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunStepItem {
+    pub words: String,
+    pub state: RunStepState,
+    /// When it started, ms since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    /// One of the agent's own helpers ran it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_helper: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStepState {
+    /// Started; no end is on record (yet).
+    Started,
+    Done,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunPlanItem {
+    pub text: String,
+    pub status: RunPlanStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPlanStatus {
+    Pending,
+    InProgress,
+    Done,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One permission a run asked for and how it was answered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunPermission {
+    /// What it asked, as the owner reads it ("write: /w/notes.md").
+    pub label: String,
+    pub outcome: RunPermissionOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPermissionOutcome {
+    Allowed,
+    Refused,
+    Declined,
+    Unanswered,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Tokens and cost, as the agent counted them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+pub struct RunUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Where a run is (protocol 1.46).

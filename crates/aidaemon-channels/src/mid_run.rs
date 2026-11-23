@@ -250,6 +250,8 @@ mod tests {
             ended_at: None,
             activity: None,
             agent: None,
+            group: None,
+            edited: Vec::new(),
             this_request,
         }
     }

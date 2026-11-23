@@ -214,6 +214,8 @@ fn run() -> RunSummary {
         took: None,
         reason: None,
         stopped_by_owner: false,
+        group: Some("task-9b1d".into()),
+        edited: vec!["/w/synthetic/release.md".into()],
     }
 }
 
@@ -231,6 +233,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::StopTurn { .. } => "stop_turn",
         Command::ResolveApproval { .. } => "resolve_approval",
         Command::CancelTask { .. } => "cancel_task",
+        Command::GetRun { .. } => "get_run",
         Command::ListSessions { .. } => "list_sessions",
         Command::GetHistory { .. } => "get_history",
         Command::ClearSession { .. } => "clear_session",
@@ -317,6 +320,7 @@ fn result_name(result: &CommandResult) -> &'static str {
         CommandResult::ProjectFile { .. } => "project_file",
         CommandResult::Projects { .. } => "projects",
         CommandResult::Automations { .. } => "automations",
+        CommandResult::Run { .. } => "run",
         CommandResult::Project { .. } => "project",
         CommandResult::Models { .. } => "models",
         CommandResult::SessionModel { .. } => "session_model",
@@ -535,6 +539,12 @@ fn client_samples() -> Vec<ClientFrame> {
             },
         ),
         command("5d0c2b1e-001b", Command::ListAutomations),
+        command(
+            "5d0c2b1e-00r1",
+            Command::GetRun {
+                run_id: "run-3f2a".into(),
+            },
+        ),
         command(
             "5d0c2b1e-001c",
             Command::ChangeAutomation {
@@ -1380,6 +1390,35 @@ fn server_samples() -> Vec<ServerFrame> {
                     patch: "diff --git a/src/contact.rs b/src/contact.rs\n--- a/src/contact.rs\n+++ b/src/contact.rs\n@@ -1,2 +1,3 @@\n-fn send() {}\n+fn send() {\n+}\n fn main() {}\n".into(),
                     truncated: false,
                 }],
+            },
+        }),
+        ack(CommandResult::Run {
+            run: RunDetail {
+                run_id: "run-3f2a".into(),
+                agent_session_id: Some("synthetic-session-1".into()),
+                working_dir: Some("/w/synthetic".into()),
+                task: "Prepare the synthetic release notes".into(),
+                result: Some("Wrote release.md".into()),
+                steps: vec![RunStepItem {
+                    words: "Editing release.md".into(),
+                    state: RunStepState::Done,
+                    at_ms: Some(1_767_225_660_000),
+                    by_helper: false,
+                }],
+                plan: vec![RunPlanItem {
+                    text: "Write the notes".into(),
+                    status: RunPlanStatus::Done,
+                }],
+                permissions: vec![RunPermission {
+                    label: "write: /w/synthetic/release.md".into(),
+                    outcome: RunPermissionOutcome::Allowed,
+                    reason: None,
+                }],
+                usage: Some(RunUsage {
+                    input_tokens: 1200,
+                    output_tokens: 300,
+                    cost_usd: Some(0.02),
+                }),
             },
         }),
         ack(CommandResult::Automations {

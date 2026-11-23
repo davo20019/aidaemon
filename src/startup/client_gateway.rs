@@ -702,6 +702,13 @@ impl ClientHost for DaemonClientHost {
         super::client_projects::send_bot(self.state.as_ref(), channel, project_id).await
     }
 
+    async fn run_detail(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<aidaemon_client_protocol::RunDetail> {
+        super::client_runs::run_detail(self.state.as_ref(), run_id).await
+    }
+
     async fn automations(
         &self,
     ) -> anyhow::Result<Vec<aidaemon_client_protocol::AutomationSummary>> {

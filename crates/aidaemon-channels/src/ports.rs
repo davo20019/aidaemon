@@ -151,6 +151,11 @@ pub struct ChatRun {
     pub activity: Option<String>,
     /// The coding agent it is ("Claude Code"), when it launched one.
     pub agent: Option<String>,
+    /// The chat turn (its task id) that started it: runs one request
+    /// started share it.
+    pub group: Option<String>,
+    /// The files the coding agent it launched changed.
+    pub edited: Vec<String>,
     /// The chat's running turn started it (an earlier turn's helper runs on
     /// in the background).
     pub this_request: bool,

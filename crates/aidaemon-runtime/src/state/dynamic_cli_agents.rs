@@ -167,6 +167,28 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         Ok(())
     }
 
+    async fn cli_agent_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<aidaemon_tools::services::CliAgentRun>> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT id, agent_name, agent_session_id, working_dir, prompt_summary, output_summary
+             FROM cli_agent_invocations WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| aidaemon_tools::services::CliAgentRun {
+            invocation: row.get("id"),
+            agent_name: row.get("agent_name"),
+            agent_session: row.get("agent_session_id"),
+            working_dir: row.get("working_dir"),
+            prompt_summary: row.get("prompt_summary"),
+            output_summary: row.get("output_summary"),
+        }))
+    }
+
     async fn get_cli_agent_events(
         &self,
         id: i64,

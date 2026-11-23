@@ -2532,6 +2532,7 @@ mod group_tests {
             step: None,
             activity: None,
             agent: None,
+            edited: Vec::new(),
             steps: Vec::new(),
             evidence: Default::default(),
             failure: None,
@@ -2639,6 +2640,7 @@ mod group_tests {
                 step: None,
                 activity: None,
                 agent: None,
+                edited: Vec::new(),
                 steps: Vec::new(),
                 evidence: crate::run_state::RunEvidence {
                     delivered,
