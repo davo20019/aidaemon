@@ -201,8 +201,10 @@ debug = "line-tables-only"
 debug = false
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Thin LTO with the default codegen units: fat LTO with one unit optimized the
+# whole daemon on one core (62-70 minutes on GitHub's 3-core Mac runners) and
+# ran the ARM Linux runner out of memory.
+lto = "thin"
 strip = true
 
 [dev-dependencies]
