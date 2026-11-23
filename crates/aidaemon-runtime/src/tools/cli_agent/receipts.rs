@@ -54,6 +54,9 @@ pub(super) struct TreeReceipt {
     pub(super) newest: Option<std::time::SystemTime>,
 }
 
+/// A file root's size and change time; `None` while it does not exist.
+pub(super) type FileMark = (String, Option<(u64, Option<std::time::SystemTime>)>);
+
 /// Each write root that is a file (or not there yet): its size and change
 /// time, `None` while it does not exist. Compared after the run
 /// ([`changed_files`]), it names the files the run wrote however it wrote
@@ -61,7 +64,7 @@ pub(super) struct TreeReceipt {
 pub(super) async fn file_marks(
     backend: &SharedExecutionBackend,
     roots: &[String],
-) -> Vec<(String, Option<(u64, Option<std::time::SystemTime>)>)> {
+) -> Vec<FileMark> {
     let mut marks = Vec::new();
     for root in roots {
         match backend.metadata(&BackendPath::new(root)).await {
@@ -76,7 +79,7 @@ pub(super) async fn file_marks(
 /// The file roots of `before` that exist now and differ from then.
 pub(super) async fn changed_files(
     backend: &SharedExecutionBackend,
-    before: &[(String, Option<(u64, Option<std::time::SystemTime>)>)],
+    before: &[FileMark],
 ) -> Vec<String> {
     let mut changed = Vec::new();
     for (path, mark) in before {
