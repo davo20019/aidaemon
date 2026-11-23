@@ -1,7 +1,7 @@
 {
   "name": "AIdaemon",
   "id": "ai.aidaemon.app",
-  "version": "0.22.0",
+  "version": "0.22.2",
   "build": 1,
   "rust": ".",
   "root": "App",

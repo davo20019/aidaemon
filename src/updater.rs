@@ -318,12 +318,6 @@ impl Updater {
             info!("Self-update system disabled");
             return;
         }
-        // A debug build is a developer's own build from source: a release
-        // replacing it would silently swap their code for the published one.
-        if cfg!(debug_assertions) {
-            info!("Self-update skipped: this is a debug build");
-            return;
-        }
 
         info!(mode = ?self.config.mode, "Self-update system started");
 
