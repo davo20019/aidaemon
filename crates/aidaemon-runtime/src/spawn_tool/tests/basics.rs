@@ -84,6 +84,7 @@ pub(super) fn ended_run(
         work_began: first_step.map(|secs| start + chrono::Duration::seconds(secs)),
         waited: Duration::from_secs(waited),
         step: None,
+        activity: None,
         steps: Vec::new(),
         evidence: crate::run_state::RunEvidence {
             unconfirmed: unconfirmed
