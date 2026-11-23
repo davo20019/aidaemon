@@ -211,6 +211,38 @@ fn tracked(
     }
 }
 
+/// Keep a background run on record until its process ends, so a restart
+/// that cuts it off is reported (or, if it never started, started again)
+/// at the next boot: `resume_turns` in the daemon.
+async fn record_background(state: &Arc<dyn CliAgentStore>, call: &RunCall) {
+    if call.session_id.trim().is_empty() {
+        return;
+    }
+    let record = aidaemon_work::goals::BackgroundSpawn {
+        id: cli_run_id(&call.task_id),
+        session_id: call.session_id.clone(),
+        mission: call.label.chars().take(BACKGROUND_MISSION_CHARS).collect(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(error) = state.record_background_spawn(&record).await {
+        warn!(%error, task_id = %call.task_id, "Could not record a background CLI agent");
+    }
+}
+
+/// Most characters of a background run's label kept on its record.
+const BACKGROUND_MISSION_CHARS: usize = 200;
+
+/// The run's process ended (or it never will): a restart from now on has
+/// nothing of it to report.
+async fn forget_background(state: &Arc<dyn CliAgentStore>, call: &RunCall) {
+    if let Err(error) = state
+        .finish_background_spawn(&cli_run_id(&call.task_id))
+        .await
+    {
+        warn!(%error, task_id = %call.task_id, "Could not clear a background CLI agent's record");
+    }
+}
+
 impl CliAgentTool {
     pub(super) fn run_handles(&self) -> RunHandles {
         RunHandles {
@@ -371,6 +403,7 @@ impl CliAgentTool {
                 run_began,
             )
             .await;
+            record_background(&self.state, &call).await;
         } else if !session_id.trim().is_empty() {
             handles.runs.begin_waited(
                 &cli_run_id(&task_id),
@@ -642,6 +675,13 @@ impl CliAgentTool {
                     run_began,
                 )
                 .await;
+                record_background(&self.state, &call).await;
+                // Its process may have ended (and its record been cleared)
+                // just before the line above: its end is set before that
+                // clearing, so a record written after it is cleared here.
+                if shared.end_record.get().is_some() {
+                    forget_background(&self.state, &call).await;
+                }
                 shared.should_notify.store(true, Ordering::Relaxed);
 
                 // Store the running agent for later checking/cancellation
@@ -1024,6 +1064,7 @@ impl CliAgentTool {
             call.began,
         )
         .await;
+        record_background(&self.state, &call).await;
         let handles = self.run_handles();
         handles.runs.set_agent(&run_id, prep.coding_agent.name());
         handles.runs.activity(&run_id, WAITING_FOR_SLOT.to_string());
@@ -1757,6 +1798,8 @@ async fn watch_run(
     if run_phase.phase() != crate::run_state::RunPhase::Succeeded {
         crate::helper_run::folders::release_new_folders(&folders_for_task);
     }
+    // Its process ended: a restart from now on cuts off nothing of it.
+    forget_background(&handles.state, &call).await;
     // Persist completion even if the caller timed out and moved the task to background.
     if invocation_id != 0 {
         let duration = invocation_started_at.elapsed().as_secs_f64();
@@ -2220,6 +2263,7 @@ async fn end_unstarted(
         report,
         BUFFER_CAP,
     );
+    forget_background(&handles.state, call).await;
     // Finished before its chat hears of it, as a run that ran is.
     shared.finished.store(true, Ordering::Release);
     deliver_end(

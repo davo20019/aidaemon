@@ -94,6 +94,21 @@ async fn started_task_ids(tool: &CliAgentTool) -> Vec<String> {
     ids
 }
 
+/// The background runs on record for `chat` (what a restart would report),
+/// by run id.
+async fn on_record(tool: &CliAgentTool, chat: &str) -> Vec<String> {
+    let mut ids: Vec<String> = tool
+        .state
+        .background_spawns_for_session(chat)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|spawn| spawn.id)
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// Every slot taken, a background launch is accepted at once: it has its
 /// task id and its record (reading "Waiting for a free slot"), and it starts
 /// by itself, in the order launches came in, once a running one ends.
@@ -147,6 +162,13 @@ async fn a_background_launch_past_the_cap_waits_and_starts_when_a_slot_frees() {
     assert_eq!(started_task_ids(&tool).await, vec![first_id.clone()]);
     let check = tool.handle_check(&second_id, chat).await.unwrap();
     assert!(check.contains("is queued"), "{check}");
+    // Running and queued alike, each is on record until its process ends.
+    let mut expected: Vec<String> = [&first_id, &second_id, &third_id]
+        .iter()
+        .map(|id| cli_run_id(id))
+        .collect();
+    expected.sort();
+    assert_eq!(on_record(&tool, chat).await, expected);
     let listed = tool.handle_list().await.unwrap();
     assert!(
         listed.contains("queued, waiting for a free slot"),
@@ -167,6 +189,7 @@ async fn a_background_launch_past_the_cap_waits_and_starts_when_a_slot_frees() {
         started_task_ids(&tool).await,
         vec![first_id, second_id.clone(), third_id]
     );
+    assert!(on_record(&tool, chat).await.is_empty());
     let result = tool.handle_check(&second_id, chat).await.unwrap();
     assert!(result.contains("second-done"), "{result}");
 }
@@ -233,6 +256,11 @@ async fn a_queued_run_stopped_before_it_starts_never_runs_and_frees_its_claim() 
     );
     assert!(run.view.stopped_by_owner, "{run:?}");
     assert!(!lock_claims(&tool.working_dir_claims).contains_key(&normalized));
+    assert!(
+        !on_record(&tool, chat)
+            .await
+            .contains(&cli_run_id(&queued_id))
+    );
 
     // Its place is free: once the running one ends, the next launch starts
     // at once, and the stopped one never does.
