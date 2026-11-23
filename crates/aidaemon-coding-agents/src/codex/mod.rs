@@ -511,7 +511,10 @@ mod tests {
         };
         let plan = Codex.prepare(&asked, &mut launch).unwrap();
         assert!(plan.host.is_none());
-        assert!(plan.keeps_session, "exec keeps its thread for the next follow-up");
+        assert!(
+            plan.keeps_session,
+            "exec keeps its thread for the next follow-up"
+        );
         assert_eq!(launch.args[0], "exec");
         assert!(!launch.args.iter().any(|arg| arg == "app-server"));
         assert_eq!(

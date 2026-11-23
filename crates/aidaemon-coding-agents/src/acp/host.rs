@@ -854,6 +854,7 @@ mod tests {
             vec![crate::AgentEvent::Session {
                 id: "s1".into(),
                 model: Some("synthetic-large".into()),
+                resumable: None,
             }]
         );
         let prompt: Value =

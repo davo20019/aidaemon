@@ -148,8 +148,9 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         Ok(())
     }
 
-    async fn note_cli_agent_keeps_session(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query("UPDATE cli_agent_invocations SET keeps_session = 1 WHERE id = ?")
+    async fn set_cli_agent_keeps_session(&self, id: i64, kept: bool) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cli_agent_invocations SET keeps_session = ? WHERE id = ?")
+            .bind(i64::from(kept))
             .bind(id)
             .execute(&self.pool)
             .await?;

@@ -17,7 +17,11 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
     };
     match event.get("type").and_then(Value::as_str) {
         Some("thread.started") => text(&event, "/thread_id")
-            .map(|id| AgentEvent::Session { id, model: None })
+            .map(|id| AgentEvent::Session {
+                id,
+                model: None,
+                resumable: None,
+            })
             .into_iter()
             .collect(),
         Some(kind @ ("item.started" | "item.updated" | "item.completed")) => {
@@ -113,7 +117,8 @@ mod tests {
             read_events(r#"{"type":"thread.started","thread_id":"th-1"}"#),
             vec![AgentEvent::Session {
                 id: "th-1".into(),
-                model: None
+                model: None,
+                resumable: None,
             }]
         );
         assert_eq!(

@@ -90,9 +90,19 @@ impl AgentEventRecorder {
                     self.runs.edited(&self.run_id, path);
                 }
             }
-            AgentEvent::Session { id, .. } if self.invocation != 0 => {
+            AgentEvent::Session { id, resumable, .. } if self.invocation != 0 => {
                 if let Err(error) = self.store.set_cli_agent_session(self.invocation, id).await {
                     tracing::warn!(%error, "Could not keep a coding agent's session id");
+                }
+                // The agent said, as it ran, whether its session can be
+                // continued (its launch could not tell).
+                if let Some(kept) = *resumable
+                    && let Err(error) = self
+                        .store
+                        .set_cli_agent_keeps_session(self.invocation, kept)
+                        .await
+                {
+                    tracing::warn!(%error, "Could not note whether a coding agent kept its session");
                 }
             }
             _ => {}

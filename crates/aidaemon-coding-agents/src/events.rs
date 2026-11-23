@@ -20,7 +20,15 @@ use serde_json::{Value, json};
 pub enum AgentEvent {
     /// Its own session (Claude Code's session id, Codex's thread id, an ACP
     /// session id): what resumes it or finds its own transcript.
-    Session { id: String, model: Option<String> },
+    /// `resumable`: whether a later run can continue it, when the agent
+    /// says so only once it runs (an ACP agent's `loadSession`
+    /// capability); `None`: its launch already said
+    /// ([`crate::Plan::keeps_session`]).
+    Session {
+        id: String,
+        model: Option<String>,
+        resumable: Option<bool>,
+    },
     /// It started a step.
     Step(AgentStep),
     /// A step ended.
@@ -125,7 +133,14 @@ impl AgentEvent {
     /// Its stored form: a kind and a JSON body.
     pub fn to_record(&self) -> (&'static str, Value) {
         match self {
-            Self::Session { id, model } => ("session", json!({"id": id, "model": model})),
+            Self::Session {
+                id,
+                model,
+                resumable,
+            } => (
+                "session",
+                json!({"id": id, "model": model, "resumable": resumable}),
+            ),
             Self::Step(step) => (
                 "step",
                 json!({

@@ -25,6 +25,7 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
                 .map(|id| AgentEvent::Session {
                     id,
                     model: text(&message, "/model"),
+                    resumable: None,
                 })
                 .into_iter()
                 .collect()
@@ -152,7 +153,8 @@ mod tests {
             ),
             vec![AgentEvent::Session {
                 id: "s-1".into(),
-                model: Some("synthetic-model".into())
+                model: Some("synthetic-model".into()),
+                resumable: None,
             }]
         );
         let steps = read_events(

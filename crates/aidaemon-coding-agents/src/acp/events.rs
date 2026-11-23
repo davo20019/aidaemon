@@ -21,6 +21,7 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
             .map(|id| AgentEvent::Session {
                 id,
                 model: text(&event, "/model"),
+                resumable: None,
             })
             .into_iter()
             .collect(),
@@ -94,7 +95,8 @@ mod tests {
             read_events(r#"{"type":"acp.session","session_id":"sess-1"}"#),
             vec![AgentEvent::Session {
                 id: "sess-1".into(),
-                model: None
+                model: None,
+                resumable: None,
             }]
         );
         assert_eq!(

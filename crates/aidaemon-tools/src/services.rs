@@ -191,7 +191,7 @@ pub struct CliAgentRun {
     /// How it ended, once it did: whether it succeeded.
     pub success: Option<bool>,
     /// Its agent kept its session where a follow-up can continue it
-    /// ([`DynamicCliAgentStore::note_cli_agent_keeps_session`]).
+    /// ([`DynamicCliAgentStore::set_cli_agent_keeps_session`]).
     pub keeps_session: bool,
 }
 
@@ -258,9 +258,9 @@ pub trait DynamicCliAgentStore: Send + Sync {
         Ok(())
     }
 
-    /// Invocation `id`'s agent keeps its session where a later run can
-    /// continue it.
-    async fn note_cli_agent_keeps_session(&self, _id: i64) -> anyhow::Result<()> {
+    /// Whether invocation `id`'s agent keeps its session where a later run
+    /// can continue it.
+    async fn set_cli_agent_keeps_session(&self, _id: i64, _kept: bool) -> anyhow::Result<()> {
         Ok(())
     }
 

@@ -1330,7 +1330,10 @@ impl RunHandles {
         }
         if invocation_id != 0
             && prep.keeps_session
-            && let Err(error) = self.state.note_cli_agent_keeps_session(invocation_id).await
+            && let Err(error) = self
+                .state
+                .set_cli_agent_keeps_session(invocation_id, true)
+                .await
         {
             warn!(%error, "Could not note that a coding agent kept its session");
         }
