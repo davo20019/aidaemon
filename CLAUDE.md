@@ -74,7 +74,8 @@ pre-commit checklist, commit everything including `Cargo.lock` and push to
 `master`. `tag-release.yml` tags `vX.Y.Z` once CI passes on that commit and
 starts `release.yml`, which reuses CI's result, builds, creates the GitHub
 release and publishes the crates in `scripts/publish-order.py` order (CI's
-"Package crates" job keeps every crate publishable on each pull request).
+"Package crates" job packages every crate on each pull request and builds
+each from its package on master, so a release never meets an unbuilt one).
 `cargo publish` packages only git-tracked files: never use `--allow-dirty`;
 inspect size problems with `cargo package --list`.
 

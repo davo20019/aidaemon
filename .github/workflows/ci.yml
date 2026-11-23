@@ -233,8 +233,12 @@ jobs:
         with:
           packages: libdbus-1-dev pkg-config libssl-dev
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Restored everywhere, saved from master only (below): a pull
+      # request's copy serves only that pull request and crowds master's
+      # build caches out of the 10 GB budget.
+      - name: Restore cargo registry
+        id: msrv-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -256,11 +260,24 @@ jobs:
           -p aidaemon-channel-slack -p aidaemon-channel-discord -p aidaemon-macros
           -p aidaemon-sdk
 
+      - name: Save cargo registry
+        if: github.ref == 'refs/heads/master' && steps.msrv-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.msrv-cache.outputs.cache-primary-key }}
+
   # Every crate the release publishes, packaged and built from its packaged
   # sources as crates.io will see them: catches `publish = false`, files
   # outside a crate (include_str! from the repository root) and a missing
-  # dependency version on the pull request instead of at release time. The
-  # release then publishes with --no-verify.
+  # dependency version before release time. The release then publishes with
+  # --no-verify. A pull request packages without building (--no-verify:
+  # manifests, versions, the files each crate ships), which takes about a
+  # minute instead of ~18; master builds each package from its packaged
+  # sources, and the release reuses master's result, so a crate that only
+  # breaks when built from its package fails on master before it ships.
   package:
     name: Package crates
     runs-on: ubuntu-latest
@@ -289,7 +306,10 @@ jobs:
         run: |
           set -euo pipefail
           packages="$(scripts/publish-order.py --check)"
-          cargo package --locked $(printf -- '-p %s ' $packages)
+          verify=()
+          if [ "${{ github.event_name }}" = pull_request ]; then verify=(--no-verify); fi
+          # shellcheck disable=SC2046,SC2086 # one -p per crate
+          cargo package --locked "${verify[@]}" $(printf -- '-p %s ' $packages)
 
   # Semver check of the public-contract tier against the last published
   # version on crates.io. Before the first publish there is no baseline, so a
@@ -501,13 +521,16 @@ jobs:
           df -h
 
       # Registry plus the compiled dependencies (workspace crates are
-      # dropped before saving). Saved from master only, so pull requests
-      # restore it without evicting each other from the 10 GB cache budget.
+      # dropped before saving). The one cache pull requests save too: this
+      # build is the step every run waits on, and a pull request whose
+      # lockfile or toolchain differs from master's otherwise rebuilds every
+      # dependency on each push (~15 minutes on macOS). rust-cache saves only
+      # on a miss, so a pull request adds a copy (~0.6 GB per OS) only when
+      # its dependencies change. Every other build cache saves from master.
       - name: Cache cargo registry and dependencies
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v3-test
-          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -935,8 +958,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # ONNX Runtime's prebuilt library, shared with release.yml's builds.
-      - name: Cache ONNX Runtime download
-        uses: actions/cache@v4
+      # Saved from master only, as the MSRV registry is.
+      - name: Restore ONNX Runtime download
+        id: ort-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ort.pyke.io
           key: ort-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
@@ -944,6 +969,13 @@ jobs:
 
       - name: Build release
         run: cargo build --release --features "browser"
+
+      - name: Save ONNX Runtime download
+        if: github.ref == 'refs/heads/master' && steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ort.pyke.io
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
 
   coverage:
     name: Code coverage
