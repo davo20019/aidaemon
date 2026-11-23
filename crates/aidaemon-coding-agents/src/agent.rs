@@ -59,6 +59,12 @@ pub trait CodingAgent: Send + Sync {
         false
     }
 
+    /// How to ask it which models it offers, when its readiness check does
+    /// not say (an ACP session's does). `None`: it cannot be asked.
+    fn model_listing(&self) -> Option<crate::ModelListing> {
+        None
+    }
+
     /// How to ask whether it can do work now (signed in, served by its
     /// provider), without a task. `None`: it cannot be asked.
     fn readiness_probe(&self) -> Option<crate::Probe> {

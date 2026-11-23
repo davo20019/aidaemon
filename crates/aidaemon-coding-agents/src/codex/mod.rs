@@ -200,12 +200,16 @@ impl CodingAgent for Codex {
         mode != PermissionMode::EveryCommand || can_host
     }
 
-    /// `codex login status` exits 0 when signed in, 1 when not (verified
-    /// with an empty `CODEX_HOME`, 0.170.0).
     fn takes_model(&self) -> bool {
         true
     }
 
+    fn model_listing(&self) -> Option<crate::ModelListing> {
+        Some(crate::ModelListing::Codex)
+    }
+
+    /// `codex login status` exits 0 when signed in, 1 when not (verified
+    /// with an empty `CODEX_HOME`, 0.170.0).
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::Status {
             args: vec!["login".into(), "status".into()],

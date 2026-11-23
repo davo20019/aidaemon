@@ -128,12 +128,23 @@ fn remember_checked(name: &str, checked: Checked) {
 /// Ask one agent now (its own probe; one that cannot be asked, or does not
 /// run here, is unchecked).
 async fn ask(info: &AgentInfo) -> Checked {
-    match info.agent.readiness_probe() {
+    let mut checked: Checked = match info.agent.readiness_probe() {
         Some(probe) if info.local => {
             aidaemon_coding_agents::check_models(&probe, &info.command, &info.prefix, None).await
         }
         _ => Readiness::Unchecked.into(),
+    };
+    // One whose check does not list its models is asked for them, unless
+    // it said it cannot work.
+    if checked.models.is_none()
+        && info.local
+        && checked.readiness.is_usable()
+        && let Some(listing) = info.agent.model_listing()
+    {
+        checked.models =
+            aidaemon_coding_agents::list_models(listing, &info.command, &info.prefix, None).await;
     }
+    checked
 }
 
 /// Ask the agent named `name` again, and keep its answer.

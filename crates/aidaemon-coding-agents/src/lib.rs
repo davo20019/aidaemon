@@ -27,6 +27,7 @@ pub mod claude;
 pub mod codex;
 mod events;
 mod mode;
+mod models;
 pub mod plain;
 mod readiness;
 mod registry;
@@ -39,5 +40,6 @@ pub use agent::{
 };
 pub use events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, program_of};
 pub use mode::{PermissionMode, mode_within, modes_within};
+pub use models::{ModelListing, list_models};
 pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, check_models};
 pub use registry::CodingAgents;

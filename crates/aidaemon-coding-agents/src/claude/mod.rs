@@ -216,11 +216,15 @@ impl CodingAgent for ClaudeCode {
         mode == PermissionMode::FullAccess || can_host
     }
 
-    /// `claude auth status` answers with typed JSON (`loggedIn`).
     fn takes_model(&self) -> bool {
         true
     }
 
+    fn model_listing(&self) -> Option<crate::ModelListing> {
+        Some(crate::ModelListing::Claude)
+    }
+
+    /// `claude auth status` answers with typed JSON (`loggedIn`).
     fn readiness_probe(&self) -> Option<crate::Probe> {
         Some(crate::Probe::Status {
             args: vec!["auth".into(), "status".into()],
