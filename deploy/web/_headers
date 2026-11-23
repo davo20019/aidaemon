@@ -3,13 +3,19 @@
   Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' data:; connect-src 'self' https: wss:; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
-# The page, the service worker and the iroh module keep their names across
-# releases: always revalidated, so a release reaches every phone.
+# The page, the service worker and the iroh module's unversioned copy keep
+# their names across releases: always revalidated, so a release reaches
+# every phone.
 /
   Cache-Control: no-cache
 /index.html
   Cache-Control: no-cache
 /sw.js
   Cache-Control: no-cache
-/remote/*
+/remote/aidaemon_app_remote.js
   Cache-Control: no-cache
+/remote/aidaemon_app_remote_bg.wasm
+  Cache-Control: no-cache
+# The iroh module under its content's name (build.sh): never changes.
+/remote/v/*
+  Cache-Control: public, max-age=31536000, immutable

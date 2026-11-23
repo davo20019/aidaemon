@@ -75,6 +75,17 @@ impl Daemon {
         self.dialer.endpoint()
     }
 
+    /// Reach the daemon now (the relay, then the connection), ahead of the
+    /// app's first request, which then takes this connection. Rejects when
+    /// the daemon cannot be reached; the request reports that itself.
+    pub fn dial(&self) -> js_sys::Promise {
+        let (url, dialer) = (self.url.clone(), self.dialer.clone());
+        wasm_bindgen_futures::future_to_promise(async move {
+            remote::dial(&url, &dialer).await.map_err(error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
     /// One request to the daemon: `path` with its query, `headers` as flat
     /// pairs. Resolves to a [`Reply`], whatever its status; rejects when the
     /// daemon cannot be reached.

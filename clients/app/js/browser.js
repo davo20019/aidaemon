@@ -145,12 +145,33 @@ let remoteDaemon = null;
 
 function daemon() {
   remoteDaemon ??= (async () => {
-    const module = await import(new URL("remote/aidaemon_app_remote.js", document.baseURI).href);
+    const module = await import(new URL(remoteModule(), document.baseURI).href);
     await module.default();
     return new module.Daemon(remoteAddress(), endpointSecret());
   })();
   remoteDaemon.catch(() => (remoteDaemon = null));
   return remoteDaemon;
+}
+
+/**
+ * The iroh module's script: the one the page names (a site that gives the
+ * module's files versioned names, deploy/web/build.sh), else remote/'s own.
+ */
+function remoteModule() {
+  return document.querySelector('meta[name="aidaemon-remote"]')?.content || "remote/aidaemon_app_remote.js";
+}
+
+// A page that already knows its daemon's address (paired before, or opened
+// from a pairing link) starts reaching it now: the service worker, the iroh
+// module and the connection come up while the app itself downloads and
+// starts, instead of after its first request. This script runs before the
+// app's code does. Failures here are only early: the app's own requests
+// try again and report them.
+if (remoteAddress().startsWith("iroh://")) {
+  remoteReady().catch(() => {});
+  daemon()
+    .then((d) => d.dial())
+    .catch(() => {});
 }
 
 /** Where the app addresses the daemon over iroh (no trailing slash). */
