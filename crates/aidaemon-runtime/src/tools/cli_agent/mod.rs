@@ -173,8 +173,10 @@ const LOOP_DETECTION_WINDOW: usize = 100;
 /// Loop detection: threshold - if same line appears this many times in window, it's a loop
 const LOOP_DETECTION_THRESHOLD: usize = 50;
 
-/// Max concurrent CLI agent processes
-const DEFAULT_MAX_CONCURRENT: usize = 3;
+/// Max concurrent CLI agent processes, across every conversation: room for
+/// each kind of agent in two conversations at once (as `spawn_agent` runs up
+/// to six tasks).
+const DEFAULT_MAX_CONCURRENT: usize = 6;
 
 /// Max enriched prompt size (16 KB)
 const MAX_PROMPT_SIZE: usize = 16384;

@@ -6,21 +6,24 @@ use super::*;
 async fn test_concurrent_limit_enforced() {
     let (tool, _db) = setup_bash_tool().await;
 
-    // Start 3 long-running async tasks to fill the concurrent limit
+    // Start long-running async tasks to fill the concurrent limit
     // (real processes so reap_finished won't clean them up)
-    for _ in 0..3 {
+    for _ in 0..tool.max_concurrent {
         tool.call(r#"{"action":"run","tool":"bash-agent","prompt":"sleep 30","async_mode":true}"#)
             .await
             .unwrap();
     }
 
-    // The 4th should be rejected
+    // The next one is refused
     let result = tool
         .call(r#"{"action":"run","tool":"bash-agent","prompt":"echo should-not-run"}"#)
         .await
         .unwrap();
     assert!(
-        result.contains("Maximum 3 CLI agents already running"),
+        result.contains(&format!(
+            "Maximum {} CLI agents already running",
+            tool.max_concurrent
+        )) && result.contains("NOT started"),
         "Expected concurrent limit message, got: {}",
         result
     );

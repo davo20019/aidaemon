@@ -391,9 +391,21 @@ impl CliAgentTool {
             Ok(permit) => permit,
             Err(_) => {
                 // claim_guard drops on return and releases the claim.
+                let running: Vec<String> = self
+                    .running
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(id, agent)| {
+                        format!("{} ({}, task_id={id})", agent.label, agent.tool_name)
+                    })
+                    .collect();
                 let message = format!(
-                    "Maximum {} CLI agents already running. Use action='list' to see running tasks, or action='cancel' to stop one.",
-                    self.max_concurrent
+                    "Maximum {} CLI agents already running: {}. This one was NOT started and will not start by itself. \
+                     Start it again once one of them ends (you are told when your own background runs end), \
+                     or cancel one with action='cancel'.",
+                    self.max_concurrent,
+                    running.join("; ")
                 );
                 if let Some(task_id) = delegated_task_id {
                     Self::persist_delegated_cli_result_with_state(
