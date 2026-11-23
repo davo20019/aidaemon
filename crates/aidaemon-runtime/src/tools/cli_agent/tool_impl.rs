@@ -1,0 +1,817 @@
+//! The `Tool` and `ToolSemantics` impls and the call's typed outcome.
+
+use super::*;
+
+#[async_trait]
+impl Tool for CliAgentTool {
+    fn name(&self) -> &str {
+        "cli_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Delegate a task to a CLI-based AI coding agent running on this machine"
+    }
+
+    fn schema(&self) -> Value {
+        let tool_names = self.tool_names.read().unwrap();
+
+        let tools_help = tool_names.join(", ");
+        let names_vec: Vec<Value> = tool_names.iter().map(|n| json!(n)).collect();
+
+        json!({
+            "name": "cli_agent",
+            "description": format!(
+                "Delegate coding or research to an installed CLI agent. Available agents: {}. \
+                 Runs can be checked or cancelled. {}",
+                tools_help,
+                CLI_SANDBOX.describe()
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "check", "cancel", "list"],
+                        "description": "run, check, cancel, or list"
+                    },
+                    "tool": {
+                        "type": "string",
+                        "enum": names_vec,
+                        "description": "Agent name"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "For run: what the work is in a few plain words, e.g. 'Refactor the parser'. The owner sees it on the run's card."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Task prompt"
+                    },
+                    "new_folders": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute folders that don't exist yet, created empty for this run to work in (a new project)."
+                    },
+                    "scope": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files or directories this run will change."
+                    },
+                    "working_dir": {
+                        "type": "string",
+                        "description": "Absolute execution directory; readable but not implicitly writable."
+                    },
+                    "read_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Additional exact readable files/directories for run."
+                    },
+                    "write_paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Exact writable files/directories for read_write run. Required and non-empty for read_write; working_dir never implies write authority."
+                    },
+                    "workspace_mode": {
+                        "type": "string",
+                        "enum": ["read_only", "read_write"],
+                        "description": "Run authority: enforced read_only or mutation-capable read_write."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID"
+                    },
+                    "system_instruction": {
+                        "type": "string",
+                        "description": "Optional system instruction shaping the agent into a specialist (e.g. 'You are a security auditor')"
+                    },
+                    "async_mode": {
+                        "type": "boolean",
+                        "description": "Run in background; use true to dispatch independent sub-tasks in parallel"
+                    },
+                    "checklist_items": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 0 },
+                        "uniqueItems": true,
+                        "description": "The indices of your checklist items this run carries out, so a change it makes settles them."
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    async fn execute(
+        &self,
+        arguments: &str,
+        facts: &crate::tools::traits::ToolCallContext,
+    ) -> anyhow::Result<crate::tools::traits::ToolCallOutcome> {
+        let status_tx = aidaemon_tools::status::status_sender(facts);
+        let exec_ctx = facts.clone();
+
+        self.outcome_with_facts(arguments, status_tx, true, &exec_ctx)
+            .await
+    }
+}
+
+/// Direct calls from tests, without the dispatcher's native-access checks.
+#[cfg(test)]
+impl CliAgentTool {
+    pub(super) async fn call(&self, arguments: &str) -> anyhow::Result<String> {
+        self.call_with_status(arguments, None).await
+    }
+
+    pub(super) async fn call_with_status(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<String> {
+        self.call_with_status_under_contract(
+            arguments,
+            status_tx,
+            false,
+            false,
+            &ToolCallContext::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn call_with_status_outcome(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        self.outcome_with_facts(arguments, status_tx, false, &ToolCallContext::default())
+            .await
+    }
+}
+
+#[async_trait]
+impl crate::tools::traits::ToolSemantics for CliAgentTool {
+    async fn background_jobs(
+        &self,
+        session_id: &str,
+    ) -> Vec<aidaemon_tools::semantics::BackgroundJob> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now();
+        let mut jobs: Vec<aidaemon_tools::semantics::BackgroundJob> = self
+            .running
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, agent)| {
+                agent.session_id == session_id && !agent.finished.load(Ordering::Acquire)
+            })
+            .map(
+                |(task_id, agent)| aidaemon_tools::semantics::BackgroundJob {
+                    key: task_id.clone(),
+                    title: agent.label.clone(),
+                    started_at: now
+                        - chrono::Duration::from_std(agent.started_at.elapsed())
+                            .unwrap_or_default(),
+                    task_id: agent.delegated_task_id.clone(),
+                    run: Some(cli_run_id(task_id)),
+                },
+            )
+            .collect();
+        jobs.sort_by_key(|job| job.started_at);
+        jobs
+    }
+
+    async fn stop_background_job(&self, key: &str) -> bool {
+        let finished = match self.running.lock().await.get(key) {
+            Some(agent) => agent.finished.clone(),
+            None => return true,
+        };
+        if let Err(error) = self.handle_cancel(key).await {
+            warn!(task_id = key, %error, "Could not stop a background CLI agent for the owner");
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        finished.load(Ordering::Acquire)
+    }
+
+    fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
+        crate::tools::traits::ToolDispatchFacts {
+            task_lead_delegation: true,
+            manages_own_timeout: true,
+            goal_context: crate::tools::traits::GoalContext::BackgroundDelivery,
+            checkpoints_writes: true,
+            // A CLI agent's run is a helper run like a sub-agent's: it
+            // inherits the turn's authority, narrowed by its declaration
+            // ([`crate::helper_run::helper_authority`]).
+            spawns_child_agents: true,
+            activity: aidaemon_tools::semantics::ToolActivity::Fixed(
+                aidaemon_core::card::ActivityKind::Delegate,
+            ),
+            project_dir_argument: aidaemon_tools::semantics::ProjectDirArgument::WorkingDir,
+            status_label: Some("delegating to a CLI agent"),
+            result_fit: aidaemon_tools::semantics::ResultFit {
+                cap_large_errors: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn validate_arguments(&self, arguments: &str) -> Result<(), ToolArgumentContractViolation> {
+        let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
+            return Ok(());
+        };
+        let is_read_write = parsed.get("action").and_then(Value::as_str) == Some("run")
+            && parsed.get("workspace_mode").and_then(Value::as_str) == Some("read_write");
+        let has_write_paths = parsed
+            .get("write_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
+            });
+        if is_read_write && !has_write_paths {
+            return Err(ToolArgumentContractViolation::new(
+                "read-write CLI delegation requires an explicit non-empty write_paths access manifest",
+            )
+            .with_recovery_hint(
+                "Retry with readable context separate from exact mutation paths.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities {
+            read_only: false,
+            external_side_effect: true,
+            needs_approval: true,
+            idempotent: false,
+            high_impact_write: true,
+        }
+    }
+
+    /// A delegated agent may do anything its own tools allow.
+    fn call_effects(&self, _arguments: &str) -> aidaemon_core::CallEffects {
+        aidaemon_core::CallEffects::unknown()
+    }
+
+    fn receipt_kind(&self, arguments: &str) -> crate::tools::traits::ToolReceiptKind {
+        let action = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "run".to_string());
+        if action == "run" {
+            crate::tools::traits::ToolReceiptKind::Process
+        } else {
+            crate::tools::traits::ToolReceiptKind::Generic
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.has_tools()
+    }
+
+    fn call_semantics(&self, arguments: &str) -> ToolCallSemantics {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("run");
+        let mut semantics = match action {
+            "list" | "check" => ToolCallSemantics::observation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            "run"
+                if parsed
+                    .as_ref()
+                    .and_then(|value| value.get("workspace_mode"))
+                    .and_then(Value::as_str)
+                    == Some("read_only") =>
+            {
+                ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent)
+            }
+            // A read-write delegated run may both inspect and change state.
+            // Keep the effect conservative for preflight policy, but omit a
+            // synthetic mutation-effect bit so a structured pre-launch
+            // failure can authoritatively downgrade to administrative.
+            "run" => ToolCallSemantics::observation_and_mutation()
+                .with_verification_mode(ToolVerificationMode::ResultContent),
+            "cancel" | "cancel_all" => ToolCallSemantics::mutation(),
+            _ => ToolCallSemantics::mutation(),
+        };
+        if let Some(working_dir) = parsed
+            .as_ref()
+            .and_then(|value| value.get("working_dir"))
+            .and_then(Value::as_str)
+        {
+            semantics = semantics.with_target_hint(ToolTargetHintKind::ProjectScope, working_dir);
+        }
+        semantics
+    }
+
+    fn call_access_manifest(&self, arguments: &str) -> ToolCallAccessManifest {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let execution_cwd = parsed
+            .as_ref()
+            .and_then(|value| value.get("working_dir"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let workspace_mode = parsed
+            .as_ref()
+            .and_then(|value| value.get("workspace_mode"))
+            .and_then(Value::as_str)
+            .unwrap_or("read_write");
+        let mut read_targets = Vec::new();
+        if let Some(cwd) = execution_cwd.as_deref()
+            && let Some(target) = ToolTargetHint::new(ToolTargetHintKind::ProjectScope, cwd)
+        {
+            read_targets.push(target);
+        }
+        for path in parsed
+            .as_ref()
+            .and_then(|value| value.get("read_paths"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let path = execution_cwd
+                .as_deref()
+                .filter(|_| !aidaemon_tools::BackendPath::is_anchored(path))
+                .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
+                .unwrap_or_else(|| path.to_string());
+            if let Some(target) = ToolTargetHint::new(ToolTargetHintKind::Path, path)
+                && !read_targets.contains(&target)
+            {
+                read_targets.push(target);
+            }
+        }
+        let mut write_targets = parsed
+            .as_ref()
+            .and_then(|value| value.get("write_paths"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|path| {
+                execution_cwd
+                    .as_deref()
+                    .filter(|_| !aidaemon_tools::BackendPath::is_anchored(path))
+                    .map(|cwd| aidaemon_tools::BackendPath::new(cwd).join(path).to_string())
+                    .unwrap_or_else(|| path.to_string())
+            })
+            .filter_map(|path| ToolTargetHint::new(ToolTargetHintKind::Path, path))
+            .collect::<Vec<_>>();
+        if workspace_mode == "read_only" {
+            write_targets.clear();
+        }
+        ToolCallAccessManifest {
+            execution_cwd,
+            read_targets,
+            write_targets,
+            adapter_read_targets: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn cli_agent_outcome(
+    action: &str,
+    output: String,
+    read_only_run: bool,
+    left_in_background: bool,
+    never_started: bool,
+) -> ToolCallOutcome {
+    let exit_code = cli_agent_exit_code(&output);
+    let prelaunch_failure = never_started;
+    let policy_block = output.trim_start().starts_with("Blocked:");
+    let reported_failure = output.trim_start().starts_with("ERROR: CLI agent");
+    let metadata = if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
+            exit_code,
+            transport_error: prelaunch_failure.then(|| first_cli_failure_detail(&output)),
+            semantics: if prelaunch_failure || policy_block || reported_failure {
+                ToolCallSemantics::administrative()
+            } else {
+                ToolCallSemantics::default()
+            },
+            ..ToolCallMetadata::default()
+        }
+    } else if left_in_background {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Backgrounded),
+            background_started: true,
+            completion_notifications_enabled: action == "run",
+            ..ToolCallMetadata::default()
+        }
+    } else if action == "check"
+        && (output.starts_with("No CLI agent task matched")
+            || output.starts_with("No running CLI agent"))
+    {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::CompletedWithNegativeResult),
+            ..ToolCallMetadata::default()
+        }
+    } else {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::Succeeded),
+            semantics: if read_only_run {
+                ToolCallSemantics::observation()
+                    .with_verification_mode(ToolVerificationMode::ResultContent)
+            } else {
+                ToolCallSemantics::default()
+            },
+            ..ToolCallMetadata::default()
+        }
+    };
+    // A run the agent moved to background tracking hands the turn off to it.
+    let handed_off = metadata.background_started;
+    let outcome = ToolCallOutcome {
+        output,
+        metadata,
+        finish: None,
+    };
+    if handed_off {
+        outcome.handed_to_background()
+    } else {
+        outcome
+    }
+}
+
+impl CliAgentTool {
+    /// One call's typed outcome with the dispatcher's `facts`. Only the
+    /// dispatcher's path enforces the native access contract.
+    pub(super) async fn outcome_with_facts(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        enforce_native_access: bool,
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<ToolCallOutcome> {
+        let parsed = serde_json::from_str::<CliAgentArgs>(arguments).ok();
+        let action = parsed
+            .as_ref()
+            .and_then(|args| args.action.clone())
+            .unwrap_or_else(|| "run".to_string());
+        let read_only_run = action == "run"
+            && (facts.mutation_forbidden
+                || parsed
+                    .as_ref()
+                    .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
+        let (output, left_in_background, settled, changed, run_label, never_started) =
+            NEVER_STARTED
+                .scope(
+                    std::cell::Cell::new(false),
+                    BACKGROUND_RUN_LABEL.scope(
+                        std::cell::RefCell::new(None),
+                        RUN_CHANGED_LOCALLY.scope(
+                            std::cell::Cell::new(false),
+                            BACKGROUND_SETTLED.scope(
+                                std::cell::Cell::new(false),
+                                LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
+                                    let output = self
+                                        .call_with_status_under_contract(
+                                            arguments,
+                                            status_tx,
+                                            read_only_run,
+                                            enforce_native_access,
+                                            facts,
+                                        )
+                                        .await?;
+                                    anyhow::Ok((
+                                        output,
+                                        LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                                        BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                                        RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
+                                        BACKGROUND_RUN_LABEL.with(|slot| slot.borrow_mut().take()),
+                                        NEVER_STARTED.with(std::cell::Cell::get),
+                                    ))
+                                }),
+                            ),
+                        ),
+                    ),
+                )
+                .await?;
+        let mut outcome = cli_agent_outcome(
+            &action,
+            output,
+            read_only_run,
+            left_in_background,
+            never_started,
+        );
+        if changed && outcome.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded) {
+            outcome.metadata.semantics = changed_locally_semantics(true)
+                .with_verification_mode(ToolVerificationMode::ResultContent);
+            // The change receipt says the run's write roots changed, not
+            // which files or what kind of write: a delegated agent's edits
+            // are untyped. The items the run says it carries out are settled
+            // by it (`UNSPECIFIED`); without a claim, the one change item in
+            // progress may be (live 2026-11-20: an agy run that built the
+            // site was read as not proving its "write the source" item, and
+            // the turn spent four more model calls ticking it).
+            let claimed = parsed
+                .as_ref()
+                .map(|args| args.checklist_items.clone())
+                .unwrap_or_default();
+            if claimed.is_empty() {
+                outcome.metadata.changes_untyped = true;
+            } else {
+                outcome.metadata.semantics = outcome.metadata.semantics.with_untyped_change();
+                if outcome.metadata.checklist_items.is_empty() {
+                    outcome.metadata.checklist_items = claimed;
+                }
+            }
+        }
+        outcome.metadata.background_settled = settled && !left_in_background;
+        if outcome.metadata.background_started {
+            outcome.metadata.background_run_labels = run_label.into_iter().collect();
+        }
+        Ok(outcome)
+    }
+
+    pub(super) async fn call_with_status_under_contract(
+        &self,
+        arguments: &str,
+        status_tx: Option<mpsc::Sender<StatusUpdate>>,
+        read_only_run: bool,
+        enforce_native_access: bool,
+        // The dispatcher's typed facts; never the arguments.
+        facts: &ToolCallContext,
+    ) -> anyhow::Result<String> {
+        let mut args: CliAgentArgs = serde_json::from_str(arguments)?;
+        args.bind_facts(facts);
+        let trusted_session = facts.trusted_session;
+
+        // Reap any finished tasks
+        self.reap_finished().await;
+
+        let action = args.action.as_deref().unwrap_or("run");
+
+        // Default to the caller session (often an internal child-agent session).
+        // If this CLI agent is running in the context of an orchestration goal,
+        // route background notifications and cancel_all scoping to the *origin*
+        // session_id (goal.session_id), which is routable via the ChannelHub.
+        let mut session_id = args.call_session.clone().unwrap_or_default();
+        if let Some(ref goal_id) = args.call_goal_id
+            && let Ok(Some(goal)) = self.state.get_goal(goal_id).await
+            && !goal.session_id.trim().is_empty()
+        {
+            session_id = goal.session_id;
+        }
+
+        match action {
+            "run" => {
+                // An agent asked for by name runs when its owner-set mode
+                // lets it run this run here (`agent_mode`).
+                let can_host = self.can_host(facts);
+                let by_mode = match args
+                    .tool
+                    .as_deref()
+                    .and_then(|name| self.configured_tool(name))
+                {
+                    Some(name)
+                        if enforce_native_access
+                            && self.runnable(&name, read_only_run, can_host).await =>
+                    {
+                        Some(name)
+                    }
+                    _ => None,
+                };
+                let mut tool = if by_mode.is_some() {
+                    by_mode
+                } else if !enforce_native_access {
+                    args.tool
+                        .as_deref()
+                        .and_then(|name| self.configured_tool(name))
+                        .or_else(|| self.default_tool_name())
+                } else if read_only_run {
+                    args.tool
+                        .as_deref()
+                        .and_then(|name| self.configured_tool(name))
+                        .or_else(|| self.default_tool_name())
+                } else {
+                    self.scoped_read_write_tool_name(args.tool.as_deref())
+                }
+                .ok_or_else(|| {
+                    if enforce_native_access {
+                        anyhow::anyhow!(
+                            "No configured CLI agent has a native adapter for this access contract"
+                        )
+                    } else {
+                        anyhow::anyhow!("No CLI agents available")
+                    }
+                })?;
+                let prompt = if let Some(prompt) = args.run_prompt() {
+                    prompt
+                } else if let Some(prompt) = args.contextual_run_prompt(&self.state).await {
+                    warn!(
+                        task_id = ?args.call_task_id,
+                        goal_id = ?args.call_goal_id,
+                        working_dir = ?args.working_dir,
+                        "cli_agent run omitted prompt; synthesized delegated prompt from stored task/goal context"
+                    );
+                    prompt
+                } else {
+                    warn!(
+                        task_id = ?args.call_task_id,
+                        goal_id = ?args.call_goal_id,
+                        has_prompt = args.prompt.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        has_mission = args.mission.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        has_task = args.task.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        has_description = args
+                            .description
+                            .as_ref()
+                            .is_some_and(|s| !s.trim().is_empty()),
+                        has_command = args.command.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                        "cli_agent run missing prompt and had no recoverable delegated context"
+                    );
+                    anyhow::bail!("Missing 'prompt' parameter for action=run");
+                };
+
+                // Trusted sessions bypass the interactive approval boundary.
+                // A CLI delegate is an opaque, mutation-capable executor, so
+                // prompt wording cannot narrow its effects. Require a concrete
+                // clean repository for every unattended run rather than trying
+                // to recognize deployment verbs or negations in prose.
+                if trusted_session {
+                    let Some(working_dir) = args.working_dir.as_deref() else {
+                        return Ok(
+                            "Blocked: unattended CLI delegation requires an explicit working_dir so repository cleanliness can be verified."
+                                .to_string(),
+                        );
+                    };
+                    if let Some(entry_count) =
+                        Self::dirty_worktree_entry_count(&self.backend, working_dir)
+                            .await
+                            .filter(|count| *count > 0)
+                    {
+                        return Ok(format!(
+                            "Blocked: unattended CLI delegation found {entry_count} pre-existing changed or untracked worktree entries. Use a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not exposed to opaque delegated mutation."
+                        ));
+                    }
+                }
+
+                // Goal-scoped cli_agent runs should not detach immediately:
+                // the goal/task lead is already running in the background, and
+                // returning early makes results easy to drop.
+                let async_mode = if args.call_goal_id.is_some() {
+                    false
+                } else {
+                    args.async_mode.unwrap_or(false)
+                };
+
+                // The run is a helper run: declared, named and given its
+                // authority exactly as a sub-agent is.
+                let made_folders = if args.new_folders.is_empty() {
+                    Vec::new()
+                } else {
+                    match crate::helper_run::folders::claim_request_folders(
+                        &args.new_folders,
+                        facts,
+                    ) {
+                        Ok(made) => made,
+                        Err(error) => return Ok(format!("Blocked: {error}")),
+                    }
+                };
+                let spec = crate::helper_run::HelperSpec {
+                    title: args
+                        .title
+                        .clone()
+                        .or_else(|| args.description.clone())
+                        .filter(|title| !title.trim().is_empty()),
+                    mission: String::new(),
+                    new_folders: made_folders.clone(),
+                    scope: args.scope.clone(),
+                };
+                let write_paths = helper_write_paths(&args, &spec, &session_id, facts);
+                let working_dir = args
+                    .working_dir
+                    .clone()
+                    .or_else(|| made_folders.first().cloned());
+                let grant_session = if facts.grant_session.trim().is_empty() {
+                    session_id.clone()
+                } else {
+                    facts.grant_session.clone()
+                };
+
+                let mut unavailable = Vec::new();
+                let output = loop {
+                    match self
+                        .handle_run(
+                            &tool,
+                            &prompt,
+                            working_dir.as_deref(),
+                            &session_id,
+                            args.call_goal_id.as_deref(),
+                            args.call_task_id.as_deref(),
+                            args.system_instruction.as_deref(),
+                            if read_only_run {
+                                CliWorkspaceMode::ReadOnly
+                            } else {
+                                CliWorkspaceMode::ReadWrite
+                            },
+                            &args.read_paths,
+                            &write_paths,
+                            enforce_native_access,
+                            async_mode,
+                            status_tx.clone(),
+                            &spec,
+                            &grant_session,
+                            facts.project.as_ref(),
+                            facts
+                                .extensions
+                                .get::<aidaemon_core::NestedCalls>()
+                                .cloned(),
+                        )
+                        .await
+                    {
+                        Ok(output) => break Ok(output),
+                        Err(error) => {
+                            let Some(failure) = error.downcast_ref::<CliAgentUnavailableError>()
+                            else {
+                                break Err(error);
+                            };
+                            unavailable.push((failure.tool_name.clone(), failure.message.clone()));
+
+                            let Some(next_tool) =
+                                self.fallback_tool_name(enforce_native_access, read_only_run)
+                            else {
+                                let mut message = String::from(
+                                    "ERROR: CLI agent recovery exhausted before task execution. \
+                                     No configured CLI agent was able to start the delegated task.",
+                                );
+                                for (name, detail) in &unavailable {
+                                    message.push_str(&format!("\n- {name}: {detail}"));
+                                }
+                                if let Some(task_id) = args.call_task_id.as_deref() {
+                                    self.persist_delegated_cli_result(
+                                        task_id,
+                                        None,
+                                        Some(&message),
+                                    )
+                                    .await;
+                                }
+                                mark_never_started();
+                                break Ok(message);
+                            };
+
+                            info!(
+                                unavailable_tool = %tool,
+                                fallback_tool = %next_tool,
+                                "Retrying delegated task with another configured CLI agent"
+                            );
+                            tool = next_tool;
+                        }
+                    }
+                };
+                // Folders made for a run that never started are given back
+                // (only while still empty), as for a sub-agent.
+                let started = matches!(&output, Ok(text) if !run_did_not_start(text));
+                if !started {
+                    crate::helper_run::folders::release_request_folders(&made_folders, facts);
+                }
+                // Which agent did the work is the daemon's fact to state: a
+                // run that went to another agent than the one asked for says
+                // so first (live 2026-11-18: codex ran a run asked of claude
+                // and the reply said "Claude Code reported").
+                match (output, args.tool.as_deref()) {
+                    (Ok(text), Some(asked)) if started && !asked.eq_ignore_ascii_case(&tool) => {
+                        Ok(format!("{}\n{text}", substituted_agent_note(asked, &tool)))
+                    }
+                    (output, _) => output,
+                }
+            }
+            "check" => {
+                let task_id = args.task_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing 'task_id' parameter for action=check")
+                })?;
+                self.handle_check(task_id, &session_id).await
+            }
+            "cancel" => {
+                let task_id = args.task_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Missing 'task_id' parameter for action=cancel")
+                })?;
+                self.handle_cancel(task_id).await
+            }
+            "cancel_all" => self.handle_cancel_all(&session_id).await,
+            "list" => self.handle_list().await,
+            _ => Ok(format!(
+                "Unknown action '{}'. Use run, check, cancel, cancel_all, or list.",
+                action
+            )),
+        }
+    }
+}
