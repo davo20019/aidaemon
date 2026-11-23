@@ -216,6 +216,10 @@ impl CodingAgent for ClaudeCode {
         mode == PermissionMode::FullAccess || can_host
     }
 
+    fn account(&self) -> &str {
+        "Its own Claude Code sign-in: a Claude subscription or an Anthropic API key."
+    }
+
     fn takes_model(&self) -> bool {
         true
     }

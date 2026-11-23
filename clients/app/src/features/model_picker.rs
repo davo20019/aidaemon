@@ -194,7 +194,7 @@ fn choices(store: Store, (model, effort): (ModelChoice, Effort)) -> Vec<ui::Pick
                 Some((model, provider)) => (model.to_owned(), provider.to_owned()),
                 None if value == "auto" => (
                     "Auto".to_owned(),
-                    "The daemon picks for each message".to_owned(),
+                    "AIdaemon picks its hard-work or quick-jobs model for each message".to_owned(),
                 ),
                 None => (title, String::new()),
             };

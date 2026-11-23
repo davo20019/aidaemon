@@ -29,6 +29,8 @@ pub struct AcpAgent {
     serve: Vec<String>,
     discovery: Option<Discovery>,
     arguments: Option<LaunchArguments>,
+    /// Whose account it works with, in plain words.
+    account: &'static str,
 }
 
 impl AcpAgent {
@@ -41,6 +43,7 @@ impl AcpAgent {
             serve: serve.iter().map(|arg| arg.to_string()).collect(),
             discovery: None,
             arguments: None,
+            account: "",
         }
     }
 
@@ -58,6 +61,7 @@ impl AcpAgent {
                 valued: &["--agent", "--model"],
                 subcommands: &["acp"],
             }),
+            account: "Its own Antigravity sign-in: your Google account and its plan.",
             ..Self::custom("Antigravity CLI", "agy", &["acp"])
         }
     }
@@ -78,6 +82,7 @@ impl AcpAgent {
                 valued: &["--model", "-m"],
                 subcommands: &[],
             }),
+            account: "Its own Gemini CLI sign-in: a Google account or a Gemini API key.",
             ..Self::custom("Gemini CLI", "gemini", &["--acp"])
         }
     }
@@ -126,6 +131,10 @@ impl CodingAgent for AcpAgent {
             PermissionMode::EveryCommand => can_host,
             PermissionMode::Checked => false,
         }
+    }
+
+    fn account(&self) -> &str {
+        self.account
     }
 
     /// Set over the protocol once its session opens (`session/set_model`).

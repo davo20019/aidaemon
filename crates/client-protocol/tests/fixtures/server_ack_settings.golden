@@ -23,6 +23,7 @@
       },
       "coding_agents": [
         {
+          "account": "Its own Codex sign-in.",
           "capped": false,
           "default_model": "synthetic-small",
           "mode": "checked",

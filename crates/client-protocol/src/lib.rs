@@ -1458,6 +1458,10 @@ pub struct CodingAgent {
     /// the level allows (protocol 1.43).
     #[serde(default)]
     pub capped: bool,
+    /// Whose account it works with, in plain words: its own sign-in,
+    /// never AIdaemon's providers (protocol 1.47).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
     /// It can be given a model to work with (protocol 1.47).
     #[serde(default)]
     pub takes_model: bool,

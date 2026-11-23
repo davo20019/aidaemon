@@ -1518,6 +1518,7 @@ async fn coding_agents(permissions: &Permissions) -> Vec<aidaemon_client_protoco
             ),
             modes: agent.modes().iter().copied().map(wire).collect(),
             note: agent.note().to_string(),
+            account: agent.account().to_string(),
             takes_model: agent.takes_model(),
             model: agent
                 .takes_model()

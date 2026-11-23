@@ -53,6 +53,13 @@ pub trait CodingAgent: Send + Sync {
     /// cannot run as asked, in words for the owner).
     fn prepare(&self, request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String>;
 
+    /// Whose account it works with, in plain words for its owner ("your
+    /// Claude Code sign-in"): its own, never the embedding agent's
+    /// providers. Empty when it is not known.
+    fn account(&self) -> &str {
+        ""
+    }
+
     /// Whether a run can be given a model ([`RunRequest::model`]): its
     /// launch or its protocol sets one. `false`: it runs on its own.
     fn takes_model(&self) -> bool {

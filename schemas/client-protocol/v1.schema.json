@@ -1151,6 +1151,10 @@
     "CodingAgent": {
       "description": "A coding agent the daemon can hand work to (Claude Code, Codex, ...)\nand its permission mode (protocol 1.36).",
       "properties": {
+        "account": {
+          "description": "Whose account it works with, in plain words: its own sign-in,\nnever AIdaemon's providers (protocol 1.47).",
+          "type": "string"
+        },
         "capped": {
           "default": false,
           "description": "The owner's pick is above the level, so it runs as `mode`, the most\nthe level allows (protocol 1.43).",

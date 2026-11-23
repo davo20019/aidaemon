@@ -343,10 +343,17 @@ fn ready(
                 ));
         }
         0 => return page.child(settings_general::general(store, &settings)),
+        // Grouped by who works: AIdaemon itself, the coding agents it
+        // hands work to, then what runs behind the scenes.
         1 => {
-            return page
-                .child(providers(store, &settings, form))
-                .child(settings_general::decisions(store, &settings));
+            let mut page = page.child(providers(store, &settings, form));
+            if settings.coding_agents.iter().any(|agent| agent.takes_model) {
+                page = page.child(settings_general::agent_models(
+                    store,
+                    &settings.coding_agents,
+                ));
+            }
+            return page.child(settings_general::decisions(store, &settings));
         }
         CONNECTIONS => {
             return page
@@ -893,7 +900,7 @@ fn form_at(store: Store, form: ProviderForm, known: Known, at: usize) -> View {
 
 /// The providers the daemon uses, main first, each saying how it signs in.
 fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -> View {
-    let mut section = view().gap_2().child(section_label("Providers in use"));
+    let mut section = view().gap_2().child(section_label("AIdaemon"));
     // A daemon before protocol 1.8 sends no list.
     if settings.connected.is_empty() {
         return section
@@ -909,13 +916,13 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
             .child(form_at(store, form, known, BELOW));
     }
     section = section.child(muted(
-        "The main provider answers. If it can't, each failover is tried in order until one \
-         answers, with the same kind of model (hard work stays on a strong model).",
+        "The coordinator: it answers you, and hands coding work to the coding agents \
+         below. It uses a strong model for hard work and a fast one for quick jobs; a \
+         conversation can pick another of these models from the composer.",
     ));
-    let mut list = ui::surface().gap_0();
     let count = settings.connected.len();
-    for (at, provider) in settings.connected.iter().cloned().enumerate() {
-        list = list
+    let row = |at: usize, provider: ConnectedProvider| {
+        view()
             .child(connected_row(
                 store,
                 provider,
@@ -925,18 +932,47 @@ fn in_use(store: Store, settings: &Settings, form: ProviderForm, known: Known) -
                 at,
                 count - 1,
             ))
-            .child(view().px_3().child(form_at(store, form, known.clone(), at)));
-        if at + 1 < count {
-            list = list.child(ui::separator());
+            .child(view().px_3().child(form_at(store, form, known.clone(), at)))
+    };
+    // The main provider, then its backups under a heading of their own:
+    // they answer only when it can't.
+    let mut main = ui::surface().gap_0();
+    let mut backups = ui::surface().gap_0();
+    for (at, provider) in settings.connected.iter().cloned().enumerate() {
+        if at == 0 {
+            main = main.child(row(at, provider));
+            continue;
         }
+        if at > 1 {
+            backups = backups.child(ui::separator());
+        }
+        backups = backups.child(row(at, provider));
+    }
+    section = section.child(main);
+    if count > 1 {
+        section = section
+            .child(
+                view()
+                    .gap_1()
+                    .pt_2()
+                    .child(
+                        text("If the main provider can't answer")
+                            .text_size(px(ui::fit::small()))
+                            .font_weight(FontWeight::MEDIUM),
+                    )
+                    .child(faint(
+                        "Each backup is tried in order, with the same kind of model (hard \
+                         work stays on a strong model).",
+                    )),
+            )
+            .child(backups);
     }
     section
-        .child(list)
         .child(when(
             move || form.adding.get() != Some(Adding::Failover),
             move || {
                 view().flex_row().child(
-                    ui::btn("Add a failover", Variant::Secondary, Size::Sm, move || {
+                    ui::btn("Add a backup", Variant::Secondary, Size::Sm, move || {
                         form.open(Adding::Failover, String::new(), BELOW)
                     })
                     .disabled(move || store.settings_busy()),
@@ -1231,7 +1267,7 @@ fn connected_row(
     let main = provider.failover.is_none();
     let role = match provider.failover {
         None => "Main".to_string(),
-        Some(index) => format!("Failover {}", index + 1),
+        Some(index) => format!("Backup {}", index + 1),
     };
     let (credential, tone) = credential_words(provider.credential);
     let credential: String = match provider.usage.as_ref().map(|u| u.plan.as_str()) {
@@ -1384,7 +1420,7 @@ fn connected_row(
         let removed_name = provider.name.clone();
         view().child(ui::icon_btn(
             Glyph::Close,
-            "Remove this failover",
+            "Remove this backup",
             Size::Sm,
             move || {
                 ui::confirm(
@@ -1595,7 +1631,7 @@ fn add_form(store: Store, adding: Adding, form: ProviderForm, known: Known) -> V
             },
         ),
         Adding::Failover => (
-            "Add a failover",
+            "Add a backup",
             "Tried when the providers before it fail.".to_string(),
         ),
     };
@@ -1774,7 +1810,7 @@ fn provider_form(
             .child(key_row);
         if borrows {
             body = body.child(faint(
-                "Leave it empty to use the key its failover already has.",
+                "Leave it empty to use the key this backup already has.",
             ));
         }
         match checked {
@@ -1888,7 +1924,7 @@ fn submit(store: Store, adding: Adding, form: ProviderForm, ready: Rc<dyn Fn() -
     };
     let label = match adding {
         Adding::Main => "Make it the main provider",
-        Adding::Failover => "Add as failover",
+        Adding::Failover => "Add as backup",
     };
     view()
         .flex_row()

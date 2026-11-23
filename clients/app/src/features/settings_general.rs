@@ -159,7 +159,7 @@ const GENERAL: &[(&str, &[Item])] = &[
             item(
                 "cli_agents.enabled",
                 "Coding agents",
-                "Hand coding work to Claude Code, Codex or Gemini CLI when installed.",
+                "Hand coding work to Claude Code, Codex, Antigravity or Gemini CLI when installed.",
                 Control::Switch,
                 "false",
             ),
@@ -363,7 +363,7 @@ fn coding_agents(store: Store, agents: &[CodingAgent], level: Option<PermissionL
         .items_center()
         .justify_between()
         .gap_2()
-        .child(section_label("Coding agents"))
+        .child(section_label("Coding agent permissions"))
         .child(ui::btn(
             "Check again",
             Variant::Ghost,
@@ -464,9 +464,7 @@ fn coding_agent(store: Store, agent: &CodingAgent, level: Option<PermissionLevel
     if agent.mode.is_none() {
         row = row.child(muted("Not allowed to run delegated work yet."));
     }
-    if agent.takes_model {
-        row = row.child(shown(agent_model(store, agent, available)));
-    }
+
     if let Some(level) = level {
         if agent.capped {
             row = row.child(muted(format!(
@@ -494,6 +492,48 @@ fn coding_agent(store: Store, agent: &CodingAgent, level: Option<PermissionLevel
         ));
     }
     row
+}
+
+/// The coding agents' models, for the Models tab: each works with its own
+/// sign-in, not AIdaemon's providers, so each picks among its own models.
+pub fn agent_models(store: Store, agents: &[CodingAgent]) -> View {
+    let mut list = ui::surface().gap_0();
+    let mut first = true;
+    for agent in agents.iter().filter(|agent| agent.takes_model) {
+        if !first {
+            list = list.child(ui::separator());
+        }
+        first = false;
+        let available = agent.readiness != AgentReadiness::NotUsable;
+        let mut title = view().flex_row().flex_wrap().items_center().gap_2().child(
+            text(agent.program.clone())
+                .text_size(px(ui::fit::body()))
+                .font_weight(FontWeight::MEDIUM),
+        );
+        if agent.readiness == AgentReadiness::NotUsable {
+            title = title.child(ui::status("Unavailable", Tone::Danger));
+        }
+        let mut row = view().p_3().gap_2().child(title);
+        if !agent.account.is_empty() {
+            row = row.child(faint(agent.account.clone()));
+        }
+        let picker = agent_model(store, agent, available);
+        row = row.child(if available {
+            picker
+        } else {
+            ui::inactive(picker)
+        });
+        list = list.child(row);
+    }
+    view()
+        .gap_2()
+        .child(section_label("Coding agents"))
+        .child(muted(
+            "AIdaemon hands coding work to these. Each runs on its own sign-in, not on \
+             AIdaemon's providers above, so each offers its own models. Their permissions \
+             are on the General tab.",
+        ))
+        .child(list)
 }
 
 /// The pick that leaves an agent on its own default model (no model id
@@ -796,10 +836,11 @@ pub fn decisions(store: Store, settings: &Settings) -> View {
     let key_set = find(settings, "decisions.api_key").is_some_and(|s| s.secret_set);
     let mut section = view()
         .gap_2()
-        .child(section_label("Decision model"))
+        .child(section_label("Behind the scenes: decision model"))
         .child(muted(
             "A fast model that answers small yes-or-which questions with a confidence, so \
-             the assistant routes and recalls without a full model call.",
+             the assistant routes and recalls without a full model call. It never answers \
+             you.",
         ));
     let mut card = ui::surface().p_3().gap_3().child(
         view()

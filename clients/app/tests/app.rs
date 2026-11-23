@@ -459,7 +459,7 @@ fn the_settings_page_reads_the_settings_and_says_what_changed() -> Result<(), St
         r#"{"type":"event","at_ms":2,"event":{"type":"settings_updated","ok":true,"message":"Updated provider.fallbacks[0].models.smart"}}"#,
     )]);
     app.wait_for("Updated provider.fallbacks[0].models.smart")?;
-    app.press("Add a failover")?;
+    app.press("Add a backup")?;
     app.wait_for("Tried when the providers before it fail.")?;
     app.wait_for("Every provider here is already in use.")?;
     if app.shows("Billed per use") {

@@ -200,6 +200,10 @@ impl CodingAgent for Codex {
         mode != PermissionMode::EveryCommand || can_host
     }
 
+    fn account(&self) -> &str {
+        "Its own Codex sign-in: ChatGPT or an OpenAI API key."
+    }
+
     fn takes_model(&self) -> bool {
         true
     }
