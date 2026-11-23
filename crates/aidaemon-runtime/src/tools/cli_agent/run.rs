@@ -397,6 +397,7 @@ impl CliAgentTool {
             Vec::new()
         };
         let receipt_before = tree_receipt(&self.backend, &watched_roots).await;
+        let files_before = file_marks(&self.backend, &watched_roots).await;
 
         let slot_permit = match self.concurrency_limiter.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -674,6 +675,7 @@ impl CliAgentTool {
         let grant_session_for_task = grant_session.to_string();
         let folders_for_task = spec.new_folders.clone();
         let receipt_before_for_task = receipt_before.clone();
+        let files_before_for_task = files_before;
         let run_began = chrono::Utc::now();
         // A run its turn waits on has the same record as a background one,
         // as a waited-on sub-agent has, so every surface (the app's run
@@ -941,6 +943,11 @@ impl CliAgentTool {
             // reply never decides it.
             let changed_something = tree_receipt(&backend_for_receipt, &watched_for_task).await
                 != receipt_before_for_task;
+            // The files it wrote among its write paths, however it wrote
+            // them: what its run says it changed.
+            for path in changed_files(&backend_for_receipt, &files_before_for_task).await {
+                waited_runs.edited(&waited_run_id, &path);
+            }
             let auth_failed = cli_auth_failed(
                 &stdout_buf_writer.lock().await,
                 &display_buf_writer.lock().await,

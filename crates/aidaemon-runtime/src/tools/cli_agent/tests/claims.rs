@@ -451,3 +451,18 @@ async fn runs_that_change_different_files_in_one_folder_start_side_by_side() {
 
     tool.handle_cancel_all("").await.unwrap();
 }
+
+/// A run's write paths that are files name what it wrote, however it wrote
+/// them: a file created or changed is listed, one left alone is not.
+#[tokio::test]
+async fn the_files_a_run_wrote_are_found_by_their_marks() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let written = dir.path().join("review.md").to_string_lossy().to_string();
+    let kept = dir.path().join("notes.md").to_string_lossy().to_string();
+    std::fs::write(&kept, "kept").unwrap();
+    let roots = vec![written.clone(), kept.clone()];
+    let before = file_marks(&tool.backend, &roots).await;
+    std::fs::write(&written, "a synthetic review").unwrap();
+    assert_eq!(changed_files(&tool.backend, &before).await, vec![written]);
+}

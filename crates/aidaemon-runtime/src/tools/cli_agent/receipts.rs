@@ -54,6 +54,42 @@ pub(super) struct TreeReceipt {
     pub(super) newest: Option<std::time::SystemTime>,
 }
 
+/// Each write root that is a file (or not there yet): its size and change
+/// time, `None` while it does not exist. Compared after the run
+/// ([`changed_files`]), it names the files the run wrote however it wrote
+/// them (an edit tool, a shell redirect, a script).
+pub(super) async fn file_marks(
+    backend: &SharedExecutionBackend,
+    roots: &[String],
+) -> Vec<(String, Option<(u64, Option<std::time::SystemTime>)>)> {
+    let mut marks = Vec::new();
+    for root in roots {
+        match backend.metadata(&BackendPath::new(root)).await {
+            Ok(meta) if meta.file_type == BackendFileType::Directory => {}
+            Ok(meta) => marks.push((root.clone(), Some((meta.len, meta.modified)))),
+            Err(_) => marks.push((root.clone(), None)),
+        }
+    }
+    marks
+}
+
+/// The file roots of `before` that exist now and differ from then.
+pub(super) async fn changed_files(
+    backend: &SharedExecutionBackend,
+    before: &[(String, Option<(u64, Option<std::time::SystemTime>)>)],
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (path, mark) in before {
+        if let Ok(meta) = backend.metadata(&BackendPath::new(path)).await
+            && meta.file_type != BackendFileType::Directory
+            && *mark != Some((meta.len, meta.modified))
+        {
+            changed.push(path.clone());
+        }
+    }
+    changed
+}
+
 /// What the run's write roots hold: every file and folder under each root
 /// that is a folder, and each root that is a file itself (live 2026-11-18:
 /// a run given the exact file `notes.txt` to write created it, and its
