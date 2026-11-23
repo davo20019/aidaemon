@@ -166,6 +166,10 @@ fn plan() -> Plan {
 }
 
 impl CodingAgent for ClaudeCode {
+    fn reports_steps(&self) -> bool {
+        true
+    }
+
     fn read_events(&self, line: &str) -> Vec<crate::AgentEvent> {
         events::read_events(line)
     }

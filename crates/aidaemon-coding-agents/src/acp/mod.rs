@@ -89,6 +89,10 @@ impl AcpAgent {
 }
 
 impl CodingAgent for AcpAgent {
+    fn reports_steps(&self) -> bool {
+        true
+    }
+
     fn read_events(&self, line: &str) -> Vec<crate::AgentEvent> {
         events::read_events(line)
     }

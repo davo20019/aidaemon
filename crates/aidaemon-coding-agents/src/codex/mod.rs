@@ -156,6 +156,10 @@ fn hosted(launch: &mut Launch, request: &RunRequest<'_>, asks: host::Asks) -> Re
 }
 
 impl CodingAgent for Codex {
+    fn reports_steps(&self) -> bool {
+        true
+    }
+
     fn read_events(&self, line: &str) -> Vec<crate::AgentEvent> {
         events::read_events(line)
     }

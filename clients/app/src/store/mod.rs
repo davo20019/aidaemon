@@ -411,6 +411,9 @@ pub struct Store {
     /// Whether the inspector shows on a wide window: what the platform
     /// starts with, restored when a narrow window widens again.
     inspector_default: Stored<bool>,
+    /// The open run's view opened the details pane (it was closed): Back
+    /// closes the pane again, not only the run.
+    run_opened_details: Stored<bool>,
     /// A narrow window (a phone): the side panes open full-screen, one at a
     /// time, and picking a conversation closes them.
     compact: Signal<bool>,
@@ -562,6 +565,7 @@ impl Store {
             sidebar: signal(true),
             inspector: signal(true),
             inspector_default: stored(true),
+            run_opened_details: stored(false),
             compact: signal(false),
             suggestion: signal(None),
             spotlight: signal(None),
@@ -3183,6 +3187,12 @@ impl Store {
     /// Open run `run`'s view in the details pane: what it did, step by
     /// step, from its record (a phone opens the pane over the chat).
     pub fn open_run(&self, run: &str) {
+        // Opened from the page with the details closed (a phone, always):
+        // Back goes back to the page, not to the details' tabs.
+        if untracked(|| self.open_run_id()).is_none() {
+            self.run_opened_details
+                .replace(!self.inspector.get_untracked());
+        }
         self.act(|c| c.open_run(run));
         if self.compact.get_untracked() {
             self.sidebar.set(false);
@@ -3190,9 +3200,13 @@ impl Store {
         self.inspector.set(true);
     }
 
-    /// Close the run view: the details pane shows its tabs again.
+    /// Close the run view: back to where it was opened from (the page, or
+    /// the details pane's tabs).
     pub fn close_run(&self) {
         self.act(Client::close_run);
+        if self.run_opened_details.replace(false) {
+            self.inspector.set(false);
+        }
     }
 
     /// Show file `path` (a full path) changed: the Changes tab, on its diff

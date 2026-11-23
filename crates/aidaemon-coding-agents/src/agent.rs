@@ -92,6 +92,13 @@ pub trait CodingAgent: Send + Sync {
     fn read_events(&self, _line: &str) -> Vec<crate::AgentEvent> {
         Vec::new()
     }
+
+    /// Its protocol reports each step it takes ([`Self::read_events`]
+    /// reads them): what it is doing comes from those, never from how
+    /// much it printed, even before its first step.
+    fn reports_steps(&self) -> bool {
+        false
+    }
 }
 
 /// One run, as the embedding agent asks for it.

@@ -74,7 +74,7 @@ impl AgentEventRecorder {
 
     /// Whether its output reads as typed events ([`Self::read`] found one).
     pub(super) fn structured(&self) -> bool {
-        self.structured
+        self.structured || self.agent.reports_steps()
     }
 
     async fn record(&mut self, event: AgentEvent) {
