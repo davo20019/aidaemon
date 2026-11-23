@@ -587,3 +587,6 @@ mod tests {
         assert!(!effects.intersects(crate::tools::traits::EGRESS_EFFECTS));
     }
 }
+
+#[cfg(test)]
+mod call_tests;

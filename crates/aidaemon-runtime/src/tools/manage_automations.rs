@@ -2080,3 +2080,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod call_tests;

@@ -3,6 +3,7 @@
 
 pub use aidaemon_runtime::tools::image_generation::GenerateImageTool;
 
+// Stays here: the live tests use the daemon's stored ChatGPT login (its secret store).
 #[cfg(test)]
 mod tests {
     use super::*;
