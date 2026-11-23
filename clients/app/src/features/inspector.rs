@@ -29,6 +29,9 @@ pub fn inspector(store: Store) -> View {
 fn tabs(store: Store) -> View {
     let coding = computed(move || store.coding_on_screen());
     let agents = computed(move || store.has_participants());
+    // A medium window's drawer (narrower than the page's side pane): a
+    // phone's room, so a phone's tabs and its Close.
+    let drawer = computed(move || store.details_drawer() && window().width.0 < 1180.0);
     view()
         .w_full()
         .flex_1()
@@ -46,14 +49,19 @@ fn tabs(store: Store) -> View {
                     // beside the chat (a phone has them under each reply);
                     // every conversation has its terminal and browser.
                     view().flex_1().child(dynamic(move || {
-                        let tabs = detail_tabs(coding.get(), store.is_compact(), agents.get());
+                        let tabs = detail_tabs(
+                            coding.get(),
+                            store.is_compact() || drawer.get(),
+                            agents.get(),
+                        );
                         Some(untracked(move || {
                             ui::tab_bar_of(store.inspector_tab(), &tabs)
                         }))
                     })),
                 )
                 .child(when(
-                    move || store.is_compact(),
+                    // A phone's, or a medium window's drawer.
+                    move || store.is_compact() || drawer.get(),
                     move || {
                         ui::icon_btn(ui::Glyph::Close, "Close", ui::Size::Md, move || {
                             store.close_panes()
@@ -63,7 +71,11 @@ fn tabs(store: Store) -> View {
         )
         .child(dynamic(move || {
             // A tab this conversation does not show falls back to its first.
-            let tabs = detail_tabs(coding.get(), store.is_compact(), agents.get());
+            let tabs = detail_tabs(
+                coding.get(),
+                store.is_compact() || drawer.get(),
+                agents.get(),
+            );
             let picked = store.inspector_tab().get();
             let tab = if tabs.iter().any(|(i, _)| *i == picked) {
                 picked

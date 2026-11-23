@@ -186,10 +186,19 @@ pub const AGENTS_TAB: usize = 5;
 /// under each reply), Agents once a coding agent worked in it, Terminal and
 /// Browser always.
 pub fn detail_tabs(coding: bool, compact: bool, agents: bool) -> Vec<(usize, &'static str)> {
-    DETAIL_TABS
+    // The work's tabs first (what changed, the files, who did it), then
+    // the turn's steps and the shared terminal and browser.
+    const ORDER: [usize; 6] = [
+        CHANGES_TAB,
+        FILES_TAB,
+        AGENTS_TAB,
+        STEPS_TAB,
+        TERMINAL_TAB,
+        BROWSER_TAB,
+    ];
+    ORDER
         .iter()
-        .copied()
-        .enumerate()
+        .map(|&index| (index, DETAIL_TABS[index]))
         .filter(|(index, _)| match *index {
             CHANGES_TAB | FILES_TAB => coding,
             STEPS_TAB => !compact,
@@ -418,6 +427,9 @@ pub struct Store {
     /// The open run's view opened the details pane (it was closed): Back
     /// closes the pane again, not only the run.
     run_opened_details: Stored<bool>,
+    /// A medium window's details, asked for (the Agents chip): they slide
+    /// in from the right over the page, as a run's view does there.
+    details_drawer: Signal<bool>,
     /// A narrow window (a phone): the side panes open full-screen, one at a
     /// time, and picking a conversation closes them.
     compact: Signal<bool>,
@@ -570,6 +582,7 @@ impl Store {
             inspector: signal(true),
             inspector_default: stored(true),
             run_opened_details: stored(false),
+            details_drawer: signal(false),
             compact: signal(false),
             suggestion: signal(None),
             spotlight: signal(None),
@@ -2745,6 +2758,13 @@ impl Store {
             self.sidebar.set(false);
         }
         self.inspector.set(true);
+        // A medium window has no details beside the page: they slide in.
+        self.details_drawer.set(true);
+    }
+
+    /// A medium window's details drawer is open ([`Self::show_detail`]).
+    pub fn details_drawer(&self) -> bool {
+        self.details_drawer.get()
     }
 
     pub fn open_inspector(&self) {
@@ -2780,6 +2800,7 @@ impl Store {
             self.sidebar.set(false);
             self.inspector.set(false);
         }
+        self.details_drawer.set(false);
         self.focus_composer();
     }
 

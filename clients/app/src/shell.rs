@@ -186,15 +186,19 @@ pub fn shell(store: Store) -> View {
             },
         ))
         // A window too narrow for the details beside the page but not a
-        // phone: a run's view, opened from its row, slides in from the
-        // right over the page, as on a phone.
+        // phone: a run's view, opened from its row, or the details asked
+        // for (the Agents chip) slide in from the right over the page, as
+        // on a phone.
         .child(when(
             move || !store.is_compact() && !wide.get(),
             move || {
                 ui::drawer(
                     Placement::Right,
-                    move || store.open_run_id().is_some(),
-                    move || store.close_run(),
+                    move || store.open_run_id().is_some() || store.details_drawer(),
+                    move || {
+                        store.close_run();
+                        store.close_panes();
+                    },
                     move || store.drawer_gone(),
                     inspector(store),
                 )

@@ -430,7 +430,11 @@ pub fn tab_bar_of(selected: Signal<usize>, tabs_shown: &[(usize, &'static str)])
                 ),
         );
     }
-    view().child(bar)
+    // More tabs than the width holds (a medium window's drawer) scroll
+    // sideways rather than run off its edge.
+    view()
+        .w_full()
+        .child(scroll().horizontal().scrollbar(false).w_full().child(bar))
 }
 
 /// A table with a table's semantics: a header row of `heads`, then `rows`
