@@ -387,6 +387,9 @@ struct RunningProcess {
     /// task-owned processes that never enter the notifier path.
     notify_session_id: String,
     notify_goal_id: String,
+    /// The run it is in the runtime's records, once it went to the
+    /// background as one: the chat's list of running work names it by this.
+    run_id: Option<String>,
     /// Idle-reap bookkeeping: total output bytes observed at the last sweep and
     /// the instant any progress signal last advanced. A notifier-active,
     /// non-detached process that makes no objective progress becomes a stall
@@ -5991,6 +5994,7 @@ impl TerminalTool {
                     notifier_active: false,
                     notify_session_id: notify_session_id.trim().to_string(),
                     notify_goal_id: notify_goal_id.unwrap_or("").to_string(),
+                    run_id: None,
                     last_progress_len: 0,
                     last_progress_at: Instant::now(),
                     last_cpu_ms: 0,
@@ -6187,6 +6191,11 @@ impl TerminalTool {
                         )
                     };
                     run_label = run.as_ref().map(|run| run.label().to_string());
+                    if let Some(run) = run.as_ref()
+                        && let Some(proc) = self.running.lock().await.get_mut(&pid)
+                    {
+                        proc.run_id = Some(run.id().to_string());
+                    }
                     if let (Some(stdout_buf), Some(stderr_buf)) =
                         (stdout_for_notify, stderr_for_notify)
                     {
@@ -8893,6 +8902,7 @@ impl crate::tools::traits::ToolSemantics for TerminalTool {
                 started_at: now
                     - chrono::Duration::from_std(proc.started_at.elapsed()).unwrap_or_default(),
                 task_id: proc.origin_task_id.clone(),
+                run: proc.run_id.clone(),
             })
             .collect();
         jobs.sort_by_key(|job| job.started_at);

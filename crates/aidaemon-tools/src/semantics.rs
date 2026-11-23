@@ -2669,6 +2669,8 @@ pub struct BackgroundJob {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// The task (turn) that started it, when known.
     pub task_id: Option<String>,
+    /// The run it is in the runtime's records, when it is one.
+    pub run: Option<String>,
 }
 
 /// What a tool says about a call without executing it: its capabilities,

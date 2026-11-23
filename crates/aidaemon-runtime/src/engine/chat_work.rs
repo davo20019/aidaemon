@@ -75,7 +75,7 @@ pub trait ChatWorkControl: TurnHost {
                     started_at: job.started_at,
                     request: job.task_id,
                     step: None,
-                    run: None,
+                    run: job.run,
                 });
             }
         }

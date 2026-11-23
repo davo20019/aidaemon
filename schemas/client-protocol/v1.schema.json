@@ -5734,7 +5734,7 @@
           ]
         },
         "id": {
-          "description": "Stable while the daemon runs; the key every update finds it by.",
+          "description": "Stable while the daemon runs; the key every update finds it by.\n`cancel_task` takes it while the run runs.",
           "type": "string"
         },
         "label": {

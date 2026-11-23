@@ -828,6 +828,7 @@ impl crate::traits::ToolSemantics for ChatJob {
             title: "Background command: count to 300".to_string(),
             started_at: chrono::Utc::now(),
             task_id: Some("turn-a".to_string()),
+            run: None,
         }]
     }
 

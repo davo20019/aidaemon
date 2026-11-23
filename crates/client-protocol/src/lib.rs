@@ -2890,6 +2890,7 @@ pub struct TaskSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct RunSummary {
     /// Stable while the daemon runs; the key every update finds it by.
+    /// `cancel_task` takes it while the run runs.
     pub id: String,
     /// The conversation it reports to.
     pub session_id: String,

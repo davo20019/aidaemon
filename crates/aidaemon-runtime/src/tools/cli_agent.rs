@@ -677,6 +677,11 @@ fn default_tool_definitions() -> Vec<(&'static str, &'static str, Vec<&'static s
         .collect()
 }
 
+/// The id of a launched agent's background run in the runtime's records.
+fn cli_run_id(task_id: &str) -> String {
+    format!("cli-agent-{task_id}")
+}
+
 /// Preferred fallback order when `action=run` omits `tool`.
 ///
 /// Rationale: keep common coding agents at the front so orchestrator calls can
@@ -3796,7 +3801,7 @@ impl CliAgentTool {
         let run = BackgroundRun::start(
             self.run_home(),
             crate::background_run::RunStart {
-                id: &format!("cli-agent-{task_id}"),
+                id: &cli_run_id(task_id),
                 chat: session_id,
                 label,
                 task_id: turn_task_id,
@@ -4857,6 +4862,7 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
                         - chrono::Duration::from_std(agent.started_at.elapsed())
                             .unwrap_or_default(),
                     task_id: agent.delegated_task_id.clone(),
+                    run: Some(cli_run_id(task_id)),
                 },
             )
             .collect();

@@ -1076,7 +1076,13 @@ impl ClientGateway {
                 Ok(CommandResult::Stopped { report })
             }
             Command::CancelTask { task_id } => {
-                let Some((session_id, number)) = self.ids.parse_task(&task_id) else {
+                // A task's id, or a run's (protocol 1.46: a run's card stops
+                // it by the id its `run_updated` carries).
+                let found = match self.ids.parse_task(&task_id) {
+                    Some(found) => Some(found),
+                    None => self.running_run(&task_id).await,
+                };
+                let Some((session_id, number)) = found else {
                     return Err(ProtocolError::new(
                         ErrorCode::NotFound,
                         format!("No task {task_id} is running"),
@@ -2377,6 +2383,32 @@ impl ClientGateway {
                 runs: self.runs().await,
             },
         )
+    }
+
+    /// The conversation and running-work number of run `run_id`, while it
+    /// runs: what a stop of it takes.
+    async fn running_run(&self, run_id: &str) -> Option<(String, u64)> {
+        let sessions: Vec<String> = self
+            .active
+            .lock()
+            .map(|active| active.iter().cloned().collect())
+            .unwrap_or_default();
+        for session_id in sessions {
+            let list = stop::running_work(
+                &self.turns.task_registry,
+                self.turns.agent.as_ref(),
+                &session_id,
+            )
+            .await;
+            if let Some(entry) = list
+                .entries
+                .iter()
+                .find(|entry| entry.run.as_deref() == Some(run_id))
+            {
+                return Some((session_id, entry.number));
+            }
+        }
+        None
     }
 
     /// The helper runs of every session that ran a turn this boot, running
