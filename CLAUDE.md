@@ -33,8 +33,8 @@ A pre-push hook (`scripts/git-hooks/pre-push`) runs the checks CI most often
 fails on, scoped to what the push changes: app boundary, fmt, clippy (daemon
 and SDK crates, all targets), rustdoc `-D warnings` per changed SDK crate, the
 `aidaemon-core` public API snapshot, the tool schema goldens and the app's
-clippy. Install it once per clone with
-`ln -sf ../../scripts/git-hooks/pre-push "$(git rev-parse --git-common-dir)/hooks/pre-push"`.
+clippy. Install it once per clone with `scripts/git-hooks/install.sh` (each worktree
+then runs its own branch's copy).
 A failure only in files with uncommitted edits (another session's) warns
 instead of blocking. When a tool schema or the core API changes on purpose,
 update its snapshot in the same commit:

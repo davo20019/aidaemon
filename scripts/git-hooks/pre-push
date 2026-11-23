@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Pre-push gate: the CI checks that fail most often after a push, run here
-# first and only for what the push changes. Install once per clone:
+# first and only for what the push changes. Install once per clone (each
+# worktree then runs its own branch's copy):
 #
-#   ln -sf ../../scripts/git-hooks/pre-push "$(git rev-parse --git-common-dir)/hooks/pre-push"
+#   scripts/git-hooks/install.sh
 #
 # It checks the working tree, which in a shared checkout can hold another
 # session's uncommitted edits: a failure in a file you did not touch is
@@ -113,8 +114,18 @@ if touches '^crates/aidaemon-core/'; then
     run_whole "core public API" '^crates/aidaemon-core/' scripts/check-core-api.sh
 fi
 
-# Tool schemas: per-tool goldens and the catalog budget.
-if touches '^(src|crates)/.*\.rs$|schema_goldens'; then
+# Tool schemas: per-tool goldens and the catalog budget, when a pushed file
+# defines a tool's schema (`fn schema(&self)`, Rust source) or the goldens
+# change. Building the daemon's test binary is the hook's slowest step, so it
+# is not run for every Rust change; CI checks the rest.
+defines_schema() {
+    local file
+    while read -r file; do
+        [[ "$file" =~ \.rs$ && -f "$file" ]] && grep -q 'fn schema(&self)' "$file" && return 0
+    done < <(grep -E '^(src|crates)/' <<<"$changed")
+    return 1
+}
+if touches 'schema_goldens' || defines_schema; then
     run_whole "tool schema goldens" '^(src|crates)/.*\.rs$|schema_goldens' env RUST_MIN_STACK=8388608 \
         cargo test -q --all-features --lib catalog_
 fi
@@ -122,12 +133,8 @@ fi
 if touches '^clients/app/'; then
     run "app clippy" bash -c 'cd clients/app && cargo clippy --all-targets -- -D warnings'
 fi
-# The app's headless tests: the app draws what client-core and the protocol
-# decide, so a change there can break them without touching the app.
-if touches '^(clients/app/|crates/(aidaemon-)?client-(core|protocol)/)'; then
-    run_whole "app tests" '^(clients/app/|crates/(aidaemon-)?client-(core|protocol)/)' \
-        bash -c 'cd clients/app && cargo test -q'
-fi
+# The app's headless tests run in CI, not here: they build the whole app
+# (about a minute) and fail far less often than clippy.
 
 if ((${#warned[@]})); then
     echo
