@@ -1330,11 +1330,18 @@ fn transcript(store: Store, session: String) -> View {
         // conversation): say so instead of showing an empty page.
         .child(when(
             move || all.with(Vec::is_empty) && store.history_pending(&loading_id),
-            || {
+            move || {
+                // The history comes once the link is up: until then, say
+                // what the link is doing, as the composer does.
                 view().flex_1().items_center().justify_center().child(
-                    text("Loading…")
-                        .text_size(px(type_scale::SM))
-                        .text_color(colors::FAINT),
+                    text(move || match store.felt() {
+                        Felt::Online => "Loading…",
+                        Felt::Connecting | Felt::NeedsPairing | Felt::NoDaemon => "Connecting…",
+                        Felt::Reconnecting => "Reconnecting…",
+                        Felt::Down { .. } => "Offline",
+                    })
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::FAINT),
                 )
             },
         ))
