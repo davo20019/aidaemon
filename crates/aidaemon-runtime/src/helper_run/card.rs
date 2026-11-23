@@ -266,6 +266,12 @@ pub fn show_helper_steps_on_card(
     Some(tx)
 }
 
+/// What a run's answer is told where its chat shows each run as its own
+/// row ([`chat_shows_runs`]): the row already says the rest.
+pub const ROWS_SHOW_THE_END: &str = "This chat shows each run as its own row: \
+    which agent ran, how it ended, how long it took and which files it changed. Don't \
+    repeat those; answer with what the work found or did that matters for the request.";
+
 /// Whether `chat` shows its background runs as their own rows, kept with
 /// how each ended and its time (the app's clients): there a run's result
 /// says only what it found, as under a card.

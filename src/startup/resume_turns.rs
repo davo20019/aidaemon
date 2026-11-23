@@ -22,6 +22,10 @@
 //! twice, so the chat is only told. A job started again that is cut off
 //! again is not started a third time.
 //!
+//! A background run that ended just before the stop, whose chat's answer
+//! was still owed (`aidaemon_runtime::owed_reports`), has that answer
+//! given now, once.
+//!
 //! Coding agents left running in the background (`cli_agent`) are on the
 //! same record. One that was still waiting for a free slot never ran, so
 //! it is started again once through its chat. One whose process had
@@ -239,6 +243,25 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
     for (chat, note) in job_notes {
         info!(session_id = %chat, "Starting again a background job the last stop cut off");
         continuations.push((chat, None, note));
+    }
+    // Background runs' answers the stop came between their end and their
+    // answer: given now, once (taking them clears them, so one that takes
+    // the daemon down is not given again).
+    for owed in aidaemon_runtime::owed_reports::take_all(&*deps.state).await {
+        if !deps.sessions.read().await.contains_key(&owed.chat) {
+            continue;
+        }
+        info!(session_id = %owed.chat, run = %owed.run, "Giving a background run's answer the last stop cut off");
+        match continuations
+            .iter_mut()
+            .find(|(chat, _, _)| *chat == owed.chat)
+        {
+            Some((_, _, followup)) => {
+                followup.push_str("\n\n");
+                followup.push_str(&owed.followup);
+            }
+            None => continuations.push((owed.chat, owed.parent_task_id, owed.followup)),
+        }
     }
     if continuations.is_empty() {
         return;
@@ -816,6 +839,44 @@ mod tests {
         let sent = hub.0.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].1.contains("stopped retrying"), "{}", sent[0].1);
+    }
+
+    /// Live 2026-11-23: a coding agent finished three seconds before a
+    /// deploy restart, before its chat's answer kept a checkpoint, and the
+    /// chat showed "Stopped." with the work done and unreported. An answer
+    /// owed when the daemon stops is given at the next boot, once.
+    #[tokio::test]
+    async fn an_answer_owed_at_the_stop_is_given_once_at_the_next_boot() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let state = settings().await;
+        let chat = "app:synthetic-owed";
+        let sessions: SessionMap = Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+            chat.to_string(),
+            "app".to_string(),
+        )])));
+        let agent = Arc::new(Answers::default());
+        let hub = Arc::new(Sent::default());
+        boot(&store, &state, &sessions, &agent, &hub).await;
+        aidaemon_runtime::owed_reports::owe(
+            &*state,
+            aidaemon_runtime::owed_reports::OwedReport {
+                run: "77873e4a".into(),
+                chat: chat.into(),
+                parent_task_id: Some("task-1".into()),
+                followup: "[Background command completed] Command: `cli_agent codex`".into(),
+            },
+        )
+        .await;
+        boot(&store, &state, &sessions, &agent, &hub).await;
+        {
+            let answers = agent.0.lock().unwrap();
+            assert_eq!(answers.len(), 1);
+            assert_eq!(answers[0].chat, chat);
+            assert_eq!(answers[0].parent_task_id.as_deref(), Some("task-1"));
+            assert!(answers[0].followup.contains("cli_agent codex"));
+        }
+        boot(&store, &state, &sessions, &agent, &hub).await;
+        assert_eq!(agent.0.lock().unwrap().len(), 1, "given once");
     }
 
     fn job(chat: &str, mission: &str, minute: u32) -> crate::traits::BackgroundSpawn {

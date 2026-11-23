@@ -2112,6 +2112,15 @@ async fn deliver_end(
                     None,
                 ),
             };
+            // Where the chat shows the run's own row, the answer need not
+            // say again how it ended.
+            let followup = match &handles.hub {
+                Some(hub) if hub.shows_runs(&notify_session_id).await => format!(
+                    "{followup}\n\n{}",
+                    crate::helper_run::card::ROWS_SHOW_THE_END
+                ),
+                _ => followup,
+            };
             info!(
                 task_id = %task_id_for_notify,
                 session_id = %notify_session_id,
@@ -2120,6 +2129,18 @@ async fn deliver_end(
             if let Some(run) = run.as_ref() {
                 run.step(Step::Reporting).await;
             }
+            // Owed until given: a stop before the answer leaves it to the
+            // next boot instead of to no one.
+            crate::owed_reports::owe(
+                &*handles.state,
+                crate::owed_reports::OwedReport {
+                    run: task_id_for_notify.to_string(),
+                    chat: notify_session_id.clone(),
+                    parent_task_id: parent_task_id.clone(),
+                    followup: followup.clone(),
+                },
+            )
+            .await;
             let (continued, _followup_end) = crate::tools::terminal::run_background_continuation(
                 agent.as_ref(),
                 ConversationRequest {
@@ -2239,6 +2260,7 @@ async fn deliver_end(
             );
         }
     }
+    crate::owed_reports::paid(&*handles.state, task_id_for_notify).await;
 }
 
 /// However a run ended, its record ends with it (a second end is a no-op),
