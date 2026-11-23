@@ -841,6 +841,32 @@ fn a_phone_shows_agents_under_their_conversation_and_opens_a_run() -> Result<(),
     Ok(())
 }
 
+/// A window too narrow for the details beside the page (but not a phone)
+/// opens a run's view from the right, over the page.
+#[test]
+fn a_medium_window_opens_a_run_over_the_page() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_at(1000.0, 800.0);
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-mid","channel":"app","title":"Review the synthetic notes","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-m1","session_id":"app:synthetic-mid","label":"Review the notes","agent":"Codex","phase":"running","background":true,"step":"Reading notes.md","started_at_ms":9999999950000}]}}"#,
+        ),
+    ]);
+    settle(&mut app)?;
+    app.press("Review the synthetic notes >> nth=0")?;
+    app.press("Codex · Reading notes.md, show its steps")?;
+    let id = wait_sent("get_run")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-m1","task":"Review notes.md for typos","steps":[{{"words":"Reading notes.md","state":"started"}}]}}}}}}"#
+    ))]);
+    app.wait_for("text:Review notes.md for typos")?;
+    app.press("Back")?;
+    app.wait_for("text:Codex · Reading notes.md")?;
+    Ok(())
+}
+
 #[test]
 fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());

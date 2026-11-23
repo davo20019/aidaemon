@@ -185,6 +185,21 @@ pub fn shell(store: Store) -> View {
                     ))
             },
         ))
+        // A window too narrow for the details beside the page but not a
+        // phone: a run's view, opened from its row, slides in from the
+        // right over the page, as on a phone.
+        .child(when(
+            move || !store.is_compact() && !wide.get(),
+            move || {
+                ui::drawer(
+                    Placement::Right,
+                    move || store.open_run_id().is_some(),
+                    move || store.close_run(),
+                    move || store.drawer_gone(),
+                    inspector(store),
+                )
+            },
+        ))
         // A narrow window (a phone): the page alone, as wide as the screen.
         // A roomy one: the panes beside the page, each as wide as the owner
         // drags it. Only crossing between the two remakes the layout.
