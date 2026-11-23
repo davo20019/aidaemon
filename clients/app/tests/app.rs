@@ -810,6 +810,37 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     Ok(())
 }
 
+/// On a phone: the drawer's row counts the agents under the conversation,
+/// the working line heads them, and a run's row opens its view in the
+/// details drawer, Back returning to the conversation.
+#[test]
+fn a_phone_shows_agents_under_their_conversation_and_opens_a_run() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_at(390.0, 844.0);
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-phone","channel":"app","title":"Review the synthetic slugs","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-p1","session_id":"app:synthetic-phone","label":"Review on a","agent":"Claude Code","phase":"running","background":true,"step":"Reading slug.py","started_at_ms":9999999950000,"group":"task-p"},{"id":"cli-agent-p2","session_id":"app:synthetic-phone","label":"Review on b","agent":"Codex","phase":"running","background":true,"step":"Running pytest","started_at_ms":9999999950000,"group":"task-p"}]}}"#,
+        ),
+    ]);
+    settle(&mut app)?;
+    app.press("Conversations")?;
+    app.wait_for("text:Claude Code · Codex · 0 of 2 done")?;
+    assert!(app.wait_for("text:Running now").is_err());
+    app.press("Review the synthetic slugs >> nth=0")?;
+    app.wait_for("text:Codex · Running pytest")?;
+    app.press("Codex · Running pytest, show its steps")?;
+    let id = wait_sent("get_run")?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-p2","task":"Review slug.py on branch b","steps":[{{"words":"Running pytest","state":"started"}}]}}}}}}"#
+    ))]);
+    app.wait_for("text:Review slug.py on branch b")?;
+    app.press("Back")?;
+    app.wait_for("text:Codex · Running pytest")?;
+    Ok(())
+}
+
 #[test]
 fn a_file_write_gives_a_conversation_its_changes_tab() -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
