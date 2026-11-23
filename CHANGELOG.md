@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-22
+
 ### Added
 
 - **Nodes on your network reach the daemon directly.** The Node Gateway is also served on this computer's local address over HTTPS (on by default; `[nodes.gateway.lan] enabled = false` turns it off), with a certificate from the daemon's own CA, reissued when the address changes. Nodes that report the `gateway.trust` capability get the local address first in their heartbeat's `gateway_endpoints`, with its CA in the new `gateway_trust`, over the channel they already use, and verify the listener against it from then on; other Nodes see no change. The Rust Node SDK and the simulator follow it (`switch_gateway`).
@@ -16,26 +18,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pair a phone from the desktop app.** Settings → Paired devices → Pair a phone shows a QR code the phone's camera opens, a **Send to my phone** button (the system's share menu: Messages, mail, AirDrop) and **Copy link**; you approve the phone right there. The phone app also picks up a pairing link you copied.
 - **The app shows its own version.** The System page lists "This app" (for example `0.22.0 (57)`) beside the daemon's version.
 - **Pairing links open the phone app.** `/pair_device` replies with a link to your own daemon's pairing page (`/client/v1/pair#…` at its public address) to tap on the phone, and the QR codes (the desktop app's and `aidaemon pair`'s) carry it too: chat apps and phone cameras open it, and the page opens the AIDaemon app (or its store page when it is missing) or pairs the browser instead. The pairing details stay in the link's fragment, which the browser never sends to the server.
+- **A terminal in every conversation.** The app's conversation details have a Terminal tab: the conversation's own shell, started in its project's folder with a clean environment and kept running on the daemon, with End and Restart (client protocol 1.42; `[shells]` turns them off). Only a device that may approve with no risk ceiling can open one. The agent can read it (`shared_terminal`) and type a line into it only once you allow that exact text on a card.
+- **The live browser docks in the conversation.** The Browser tab shows the agent's live browser view in the details pane instead of over the window.
+- **Send a waiting message now.** A message queued for its own turn has **Send now**, which hands it to the running work at its next step without interrupting anything (client protocol 1.41).
+- **The System page lists your devices and the connection.** Each Node shows its name, kind, whether it is online, its firmware and how its last heartbeat arrived (client protocol 1.44), and the page says how the app reaches the daemon: this computer, peer to peer (direct or via relay) or a tunnel.
+- **Pair again without a cable.** An app the daemon refused, or that has not reached it for two minutes, offers Pair again, and a pairing link opened at any time is used (asking first when the app is already paired).
+- **Background jobs resume after a restart.** A job a restart cut off is started once more in its chat, told to check what the stopped run did and continue; a job that was mid an outside call, or was cut off again, is only reported.
+- **Apps find a daemon that moved relays.** A daemon on the project's relays publishes which relay it is on to `dns.aidaemon.ai` (the relay URL only, signed with its key, never an IP address), and an app whose saved relay no longer answers looks the daemon up by its key. Self-hosted relays use neither. A daemon built without the `remote` feature (on by default) serves loopback and tunnels only.
 
 ### Changed
 
 - The app and its CI and release builds use nsh 0.6.1 (fixes to reactive memos, keyed rows and animations).
 - The web app raises the iPhone keyboard when you start a new conversation (nsh 0.6.1 from a fork with an autoFocus fix, longbridge/nsh#2889, until it is released); a narrow window's drawer slides out smoothly and keeps its list between openings.
 - **Android builds publish themselves.** Releases, and the new "Android beta" workflow (run by hand from any branch), build the signed app and upload it to Google Play's internal testing track once a service account key is set (`PLAY_SERVICE_ACCOUNT_JSON`); `scripts/ci-android-package.sh` holds the steps for both.
-
 - **The name is AIDaemon.** The app, messages, help text, README and crate descriptions say AIDaemon. Commands, crate names and the domain stay lowercase `aidaemon`; release file names (`AIdaemon-macos-*.dmg`, `AIdaemon.app`) and the Windows scheduled task keep their current names so downloads and existing installs keep working.
 - **`--help` and the installer point to the current commands.** `aidaemon --help` lists `setup`, `service install` and `service uninstall`, and marks `install-service` as the legacy system-wide service. `install.sh` suggests `aidaemon-app`, `aidaemon setup` and `aidaemon service install` instead of the old setup wizard and `install-service` (#21).
 - **README:** the SDK installs from crates.io (`aidaemon-sdk = "0.22"`) and the daemon with `cargo install --locked aidaemon`.
+- **One permission level.** AIDaemon has one permission level, Read only, Standard or Full access (`[authority] owner_default`, client protocol 1.43), that its own turns, sub-agents and specialists follow; Full access is the terminal's trust-all and `/trustall` switches the same setting. Each coding agent follows it ("Same as AIdaemon") or is stricter (`[cli_agents.permissions]`), and Settings shows the level and any capped pick. Older settings move into the config once at start without widening anything (trust-all rows, `permission_mode = "yolo"` and `owner_default = "unrestricted"` become Full access or Standard). Raising the level from an app or a chat takes one approval from a paired device (or a chat's own `/trustall on confirm` when none is paired); lowering it is immediate.
+- **Longer terminal output.** Terminal output keeps 16k inline (was 4k); a longer output is saved whole in the session's spill folder, and the cut keeps head and tail and names the file holding the rest.
+- **Claude reuses the conversation's prompt cache.** Earlier turns end in a cache breakpoint of their own, so the next turn reads the conversation from cache, not only the system prompt and tools. Claude's summarized thinking is kept on each call's event, secrets redacted.
+- **`web_fetch` keeps a page's structure.** Headings and block breaks come through as markdown, led by the page's title.
+- **Terminal logs never carry command text.** Logs at INFO and WARN show a command's program and a fingerprint; the full command stays in the call's record.
 
 ### Fixed
 
 - **A phone connects right after pairing.** The link started by the pairing screen stopped when that screen gave way, so a newly paired phone stayed on "Connecting…" until the app was opened again; the link now outlives the screen that starts it.
 - **The app reconnects at once when you come back to it.** Back in the foreground (or a computer back from sleep), the app checks its connection right away and tries again now instead of after the retry wait it built up in the background, and a drop that happened while you were away does not show as an outage while it reconnects.
 - **The app no longer hangs on "Connecting…".** Signing in and opening the connection time out (30 s and 20 s) and the app shows why, instead of waiting forever on a network that drops packets; error messages name the underlying cause. The daemon logs each device sign-in, accepted or refused.
-
 - **`aidaemon app` and `aidaemon tui` work on a fresh install.** With no config yet they open `aidaemon-app`, whose first run sets AIDaemon up, instead of failing with "The Client Gateway is off". `app`, `tui`, `pair`, `web` and `client-token` also find `~/.aidaemon/config.toml` when run from another folder (#20).
 - **Settings nothing reads now say so.** `[provider] streaming` and `[people] auto_extract`, `auto_extract_categories` and `restricted_categories` log a warning at startup; `restricted_categories` never kept any category out of memory (#22).
 - **An API key sent over plain HTTP is flagged.** An OpenAI-compatible provider whose `base_url` is plain `http://` to another machine logs a warning at startup, since the key crosses the network unencrypted. Local servers (`localhost`, `127.0.0.1`, `::1`) and keyless servers are unaffected (#23).
+- **An Anthropic spend limit fails over.** Anthropic's spend-limit error is treated as a used-up quota, so every model call, the safety check included, goes to the failover provider instead of failing.
+- **ChatGPT tools with optional arguments.** Under strict schemas, unset optional arguments are sent as null and dropped, instead of placeholder values that made tools refuse the call.
+- **A long write cut off at the output limit recovers.** The model gets more output room and is asked to work in smaller parts instead of the turn ending.
+- **Memory keeps rules to their scope and your corrections.** A rule you limit to this chat, task or request is never stored as a lasting preference, and background extraction no longer brings back a value you corrected later.
+- **Stopping work.** A stopped run's terminal command ends with it (a stopped sub-agent kept writing); a stop that asks for more ("stop it and delete what it made") stops the work and then runs the rest as a turn; the untrusted-call check counts messages you sent while the run worked.
+- **Removed approvals stay removed.** A terminal approval you removed, or `/trustall off`, came back at the next restart.
+- **Quiet hours do not hold notices for a chat you just wrote in** (in the last 30 minutes).
+- **Tool results say what they found.** `search_files` counts matching lines and files apart and searches a single file; `read_file` ignores line ranges on images and binary files; a terminal script reads all of itself before it runs, so a command in it that reads stdin no longer eats the rest.
+- **Mandate tasks keep their dependencies,** and one-time backfills no longer rerun at every start.
 
 ## [0.21.0] - 2026-11-18
 

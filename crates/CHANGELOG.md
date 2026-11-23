@@ -12,10 +12,18 @@ stability promise.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-22
+
 ### Added
+- New crate `aidaemon-remote`: remote access over iroh. It serves the client gateway's own router over iroh QUIC streams (direct between devices when the network allows, an encrypted relay otherwise), with `Relays::Aidaemon` (`relay.aidaemon.ai`) as the default relay set and key lookup through `dns.aidaemon.ai`; the transport authenticates the peer's key and admits only paired devices, and the gateway's tokens still authorize every request. The daemon's `remote` feature (on by default) gates it.
+- New crate `aidaemon-shells`: conversation shells, one pseudo-terminal per conversation started in its folder with a clean environment, with a replayable backlog for apps that attach later and a parsed screen the agent can read.
+- `aidaemon-client-protocol` 1.41 to 1.45: `edit_queued` "now" (1.41), conversation shells (`open_shell`, `shell_updated`, `shell_closed`, `snapshot.shells`, capability `shells`; 1.42), the owner's permission level (1.43), `SystemStatus.nodes` (1.44) and `PairingOffer.web_app` (1.45). `aidaemon-client-gateway` serves them, and the iroh peer guard (`remote_router`).
+- `aidaemon-nodes`: the Node Gateway's local-network listener (`NodeLanConfig`, `LanAuthority`, the daemon's own CA for it). `aidaemon-node-protocol`: `HeartbeatResponse.gateway_trust`, the local listener's CA for Nodes that report `gateway.trust`.
 - `aidaemon-client-core`: iOS and Android clients. `KeychainKeyStore` (iOS) keeps a paired device's key in the keychain, readable after first unlock and never synced; `local::set_data_dir` puts the key file in an app's own data directory (Android); `local::is_paired`, `local::unpair` and `local::default_device_name`. On Android the link and its HTTP calls trust the bundled Mozilla roots (`webpki-roots`), since the platform verifier needs a Java component an nsh app does not ship.
 
 ### Changed
+- **Breaking:** `aidaemon-channels`: `QueuedMessage` gained `listed_by_client` and `MidRunReading` gained `also_asks`, so every SDK crate moves to 0.22.0. Both structs are now `#[non_exhaustive]` (build `MidRunReading` with `new`/`stops`), so a later field is not a break.
+- **Breaking:** `aidaemon-tools`: `StatusUpdate::ToolStart` and `ToolComplete` are `#[non_exhaustive]`; build them with `StatusUpdate::tool_start` / `tool_complete`.
 - `aidaemon-client-core`: `local::device_store` returns `Arc<dyn KeyStore>` (the keychain on iOS, a file elsewhere) instead of `Arc<FileKeyStore>`. Sign-in, pairing and screen-share HTTP calls use the link's own TLS configuration.
 
 ## [0.21.0] - 2026-11-18: first release on crates.io
