@@ -241,6 +241,11 @@ pub fn program_of(command: &str) -> Option<String> {
             Some(stripped) => (stripped.to_string(), true),
             None => (word, false),
         };
+        // A subshell's parentheses glued to its words (`(cd x && make)`).
+        let word = word
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .to_string();
         if matches!(word.as_str(), "&&" | "||" | ";" | "|" | "&") {
             at_start = true;
             in_header = false;
@@ -334,6 +339,10 @@ mod tests {
         assert_eq!(
             program_of("while true; do sleep 1; done").as_deref(),
             Some("sleep")
+        );
+        assert_eq!(
+            program_of("(cd /w/x && make test)").as_deref(),
+            Some("make")
         );
         assert_eq!(
             StepTool::Run {
