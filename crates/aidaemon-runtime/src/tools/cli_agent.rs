@@ -2796,6 +2796,12 @@ impl CliAgentTool {
         let folders_for_task = spec.new_folders.clone();
         let receipt_before_for_task = receipt_before.clone();
         let run_began = chrono::Utc::now();
+        // A run its turn waits on has the same record as a background one,
+        // as a waited-on sub-agent has, so every surface (the app's run
+        // rows, a question about running work) reads it the same way. If it
+        // is moved to the background later, its background run takes the
+        // record over under the same id.
+        let waited_runs = self.runs.get_or_init(Default::default).clone();
         if async_mode {
             self.start_background_run(
                 &run_slot,
@@ -2807,7 +2813,16 @@ impl CliAgentTool {
                 run_began,
             )
             .await;
+        } else if !session_id.trim().is_empty() {
+            waited_runs.begin_waited(
+                &cli_run_id(&task_id),
+                session_id,
+                &run_label,
+                run_began,
+                delegated_task_id,
+            );
         }
+        let waited_run_id = cli_run_id(&task_id);
         tokio::spawn(async move {
             let _slot_permit = slot_permit_for_task;
             // What the agent's launch needs until the run is over.
@@ -3480,6 +3495,23 @@ impl CliAgentTool {
                 tokio::spawn(async move {
                     run.finish(run_phase, run_evidence).await;
                 });
+            } else {
+                // The waited-on record (none for a run with no chat): ended
+                // here, with the end the runtime observed.
+                waited_runs.finish(
+                    &waited_run_id,
+                    run_phase,
+                    crate::run_state::RunMeasure {
+                        ended_at: chrono::Utc::now(),
+                        work_began: None,
+                        waited: std::time::Duration::ZERO,
+                    },
+                    run_evidence,
+                    crate::run_state::RunReport {
+                        text: String::new(),
+                        untrusted: false,
+                    },
+                );
             }
             // Publish completion only after durable invocation/task state has
             // been flushed. Reapers and `check` callers must never observe a
@@ -8202,6 +8234,38 @@ mod tests {
     /// header and total come from the runs' phases; each is named from its
     /// task; and the card settles the moment the programs end, though the
     /// parent's continuation turn never gets its slot.
+
+    /// A run its turn waits on has a record like a background one: it is
+    /// listed in its chat while it runs and ends there with how it ended.
+    #[tokio::test]
+    async fn a_waited_on_cli_run_has_a_record_in_its_chat() {
+        let (tool, _db) = setup_bash_tool().await;
+        let runs = Arc::new(crate::run_state::RunStates::default());
+        tool.set_runs(runs.clone());
+        let facts = aidaemon_tools::testing::call_facts("app:synthetic-waited");
+        let out = tool
+            .call_with_status_under_contract(
+                r#"{"action":"run","tool":"bash-agent","prompt":"echo reviewed"}"#,
+                None,
+                false,
+                false,
+                &facts,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("reviewed"), "{out}");
+        let mut chat = Vec::new();
+        for _ in 0..100 {
+            chat = runs.for_chat("app:synthetic-waited");
+            if chat.iter().any(|run| run.phase.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(chat.len(), 1, "{chat:?}");
+        assert!(!chat[0].background);
+        assert_eq!(chat[0].phase, crate::run_state::RunPhase::Succeeded);
+    }
     #[tokio::test]
     async fn a_refused_cli_run_ends_failed_and_the_card_agrees_at_once() {
         let (tool, _db) = setup_bash_tool().await;

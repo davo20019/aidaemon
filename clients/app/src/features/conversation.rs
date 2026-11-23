@@ -206,7 +206,9 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
         |run| run.id.clone(),
         move |run, _| {
             let id = run.with_untracked(|r| r.id.clone());
-            let running = computed(move || run.with(|r| r.phase.is_running()));
+            // A run its turn waits on is stopped by the turn's own Stop (the
+            // composer's); only work that outlives its turn has its own.
+            let stoppable = computed(move || run.with(|r| r.phase.is_running() && r.background));
             let line = computed(move || {
                 run.with(|r| {
                     let state = match r.phase {
@@ -274,7 +276,7 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
                     .text_color(colors::FAINT),
                 )
                 .child(when(
-                    move || running.get(),
+                    move || stoppable.get(),
                     move || {
                         let id = id.clone();
                         ui::btn("Stop", Variant::Ghost, Size::Sm, move || store.cancel(&id))
