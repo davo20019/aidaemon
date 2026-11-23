@@ -102,6 +102,7 @@ sign --identifier ai.aidaemon "$helper"
 # entitlement.
 sign --identifier ai.aidaemon.app --entitlements "$here/scripts/macos/AIdaemon.entitlements" "$app"
 codesign --verify --deep --strict "$app"
+echo "Signed and verified ${app}"
 
 # The disk image: the app and a link to Applications to drag it onto. The
 # link goes inside one source folder: a link given as a source of its own is
@@ -112,7 +113,23 @@ mv "$app" "$volume/"
 app="$volume/AIdaemon.app"
 ln -s /Applications "$volume/Applications"
 rm -f "$out_dmg"
-hdiutil create -quiet -volname "AIdaemon" -srcfolder "$volume" -ov -format UDZO "$out_dmg"
+# hdiutil fails now and then on CI's macOS runners while something else
+# holds the new image ("Resource busy"), and -quiet hid why: say what it
+# reported and try again a few times.
+made=0
+for attempt in 1 2 3 4 5; do
+  if hdiutil create -volname "AIdaemon" -srcfolder "$volume" -ov -format UDZO "$out_dmg"; then
+    made=1
+    break
+  fi
+  echo "hdiutil create failed (attempt ${attempt} of 5); trying again" >&2
+  rm -f "$out_dmg"
+  sleep $((attempt * 5))
+done
+if [ "$made" != 1 ]; then
+  echo "error: could not create ${out_dmg}" >&2
+  exit 1
+fi
 if [ "$identity" != "-" ]; then
   codesign --force --timestamp --sign "$identity" "$out_dmg"
 fi
