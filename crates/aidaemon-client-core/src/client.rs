@@ -442,6 +442,9 @@ pub struct Client {
     /// Stop requests in flight, by request id: the conversation each was
     /// for, so its report lands there and not on every page.
     stop_sends: BTreeMap<String, String>,
+    /// Run stops in flight, by request id: their report is shown by the
+    /// run's own row ("Stopped by you"), so it is not said again.
+    run_stops: BTreeSet<String>,
     /// The file undo in flight: its request and the file.
     revert_request: Option<(String, String)>,
     /// A project delete in flight, and the project's name.
@@ -649,6 +652,12 @@ impl Client {
                 if let Some(session) = self.stop_sends.remove(request_id) {
                     self.state.note(&session, report.clone());
                 }
+                return true;
+            }
+            ServerFrame::Ack {
+                request_id,
+                result: CommandResult::Stopped { .. },
+            } if self.run_stops.remove(request_id) => {
                 return true;
             }
             ServerFrame::Ack {
@@ -2548,6 +2557,15 @@ impl Client {
         self.send(Command::CancelTask {
             task_id: task.to_owned(),
         });
+    }
+
+    /// Stop helper run `run` (protocol 1.46): its row says how it ended, so
+    /// the stop's report is not shown again.
+    pub fn stop_run(&mut self, run: &str) {
+        let id = self.send(Command::CancelTask {
+            task_id: run.to_owned(),
+        });
+        self.run_stops.insert(id);
     }
 
     /// Name conversation `id` (`None` or blank: back to the name taken

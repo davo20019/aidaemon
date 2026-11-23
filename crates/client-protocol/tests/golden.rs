@@ -205,6 +205,7 @@ fn run() -> RunSummary {
         id: "run-3f2a".into(),
         session_id: "app:6c1f".into(),
         label: "Claude Code: prepare the synthetic release".into(),
+        agent: Some("Claude Code".into()),
         phase: RunPhase::Running,
         background: true,
         step: "Running a command".into(),

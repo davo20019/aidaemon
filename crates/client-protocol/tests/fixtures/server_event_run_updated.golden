@@ -2,6 +2,7 @@
   "at_ms": 1767225600000,
   "event": {
     "run": {
+      "agent": "Claude Code",
       "background": true,
       "id": "run-3f2a",
       "label": "Claude Code: prepare the synthetic release",

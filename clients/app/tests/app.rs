@@ -739,23 +739,23 @@ fn a_background_run_shows_its_step_and_its_end() -> Result<(), String> {
     feed([
         Update::Connected,
         frame(
-            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-runs","channel":"app","title":"Prepare the synthetic release","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Claude Code: prepare the release","phase":"running","background":true,"started_at_ms":1}]}}"#,
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-runs","channel":"app","title":"Prepare the synthetic release","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Prepare the release","agent":"Claude Code","phase":"running","background":true,"started_at_ms":1}]}}"#,
         ),
     ]);
     settle(&mut app)?;
     app.press("Prepare the synthetic release >> nth=0")?;
-    app.wait_for("text:Claude Code: prepare the release")?;
+    app.wait_for("text:Claude Code · Prepare the release")?;
     feed([frame(
         r#"{"type":"event","seq":null,"at_ms":2,"session_id":"app:synthetic-runs","event":{"type":"run_step","run_id":"cli-agent-r1","session_id":"app:synthetic-runs","step":"Running a command","at_ms":2}}"#,
     )]);
-    app.wait_for("text:Claude Code: prepare the release · Running a command")?;
+    app.wait_for("text:Claude Code · Running a command")?;
     let before = sent("cancel_task");
     app.press("text:Stop")?;
     wait_sent_new("cancel_task", before)?;
     feed([frame(
-        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-runs","event":{"type":"run_updated","run":{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Claude Code: prepare the release","phase":"stopped","background":true,"started_at_ms":9999999757999,"ended_at_ms":9999999999999,"took":"Took 4m 2s (synthetic)","stopped_by_owner":true}}}"#,
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-runs","event":{"type":"run_updated","run":{"id":"cli-agent-r1","session_id":"app:synthetic-runs","label":"Prepare the release","agent":"Claude Code","phase":"stopped","background":true,"started_at_ms":9999999757999,"ended_at_ms":9999999999999,"took":"Took 4m 2s (synthetic)","stopped_by_owner":true}}}"#,
     )]);
-    app.wait_for("text:Claude Code: prepare the release · Stopped by you")?;
+    app.wait_for("text:Claude Code · Stopped by you")?;
     // How long it took, short, from its start and end times.
     app.wait_for("text:4m")?;
     Ok(())

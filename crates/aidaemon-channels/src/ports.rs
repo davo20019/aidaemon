@@ -149,6 +149,8 @@ pub struct ChatRun {
     /// What a coding agent it launched last said it was doing, in plain
     /// words; `None` for any other run.
     pub activity: Option<String>,
+    /// The coding agent it is ("Claude Code"), when it launched one.
+    pub agent: Option<String>,
     /// The chat's running turn started it (an earlier turn's helper runs on
     /// in the background).
     pub this_request: bool,

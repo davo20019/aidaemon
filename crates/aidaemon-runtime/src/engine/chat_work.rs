@@ -106,6 +106,7 @@ pub trait ChatWorkControl: TurnHost {
                 started_at: run.started_at,
                 ended_at: run.ended_at,
                 activity: run.activity.clone(),
+                agent: run.agent.clone(),
                 this_request: request.is_some() && run.request == request,
             })
             .collect();
@@ -139,14 +140,14 @@ pub trait ChatWorkControl: TurnHost {
             else {
                 return false;
             };
-            if !tool
-                .background_jobs(session_id)
-                .await
-                .iter()
-                .any(|listed| listed.key == job_key)
-            {
+            let jobs = tool.background_jobs(session_id).await;
+            let Some(listed) = jobs.iter().find(|listed| listed.key == job_key) else {
                 // Not running for this chat (it ended, or it is not its).
                 return true;
+            };
+            // The owner stops it: its run's end says so.
+            if let Some(run) = listed.run.as_deref() {
+                self.running_children().runs().owner_stopping(run);
             }
             return tool.stop_background_job(job_key).await;
         }

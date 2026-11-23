@@ -2531,6 +2531,7 @@ mod group_tests {
             waited: Duration::ZERO,
             step: None,
             activity: None,
+            agent: None,
             steps: Vec::new(),
             evidence: Default::default(),
             failure: None,
@@ -2637,6 +2638,7 @@ mod group_tests {
                 waited: Duration::ZERO,
                 step: None,
                 activity: None,
+                agent: None,
                 steps: Vec::new(),
                 evidence: crate::run_state::RunEvidence {
                     delivered,

@@ -249,6 +249,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             ended_at: None,
             activity: None,
+            agent: None,
             this_request,
         }
     }

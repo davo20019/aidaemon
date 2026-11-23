@@ -226,10 +226,18 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
                         },
                         RunPhase::Unknown => String::new(),
                     };
-                    if state.is_empty() {
+                    // A coding agent's run names the agent, then what it is
+                    // doing (its task's title until its first step).
+                    let name = r.agent.clone().unwrap_or_else(|| r.label.clone());
+                    let state = if state.is_empty() && r.agent.is_some() {
                         r.label.clone()
                     } else {
-                        format!("{} · {state}", r.label)
+                        state
+                    };
+                    if state.is_empty() {
+                        name
+                    } else {
+                        format!("{name} · {state}")
                     }
                 })
             });
@@ -276,7 +284,7 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
                     move || stoppable.get(),
                     move || {
                         let id = id.clone();
-                        ui::btn("Stop", Variant::Ghost, Size::Sm, move || store.cancel(&id))
+                        ui::btn("Stop", Variant::Ghost, Size::Sm, move || store.stop_run(&id))
                     },
                 ))
         },

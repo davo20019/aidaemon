@@ -3101,6 +3101,11 @@ impl Store {
         self.act(|c| c.cancel(task));
     }
 
+    /// Stop helper run `run` from its row.
+    pub fn stop_run(&self, run: &str) {
+        self.act(|c| c.stop_run(run));
+    }
+
     // ----- Naming, archiving, undoing, waiting messages ------------------
 
     pub fn renaming(&self) -> Option<String> {

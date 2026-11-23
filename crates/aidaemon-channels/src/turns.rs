@@ -355,6 +355,8 @@ pub struct RunChange {
     /// What a coding agent it launched last said it was doing, in plain
     /// words ("Editing state.rs"); `None` for any other run.
     pub activity: Option<String>,
+    /// The coding agent it is ("Claude Code"), when it launched one.
+    pub agent: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
@@ -1631,6 +1633,7 @@ mod tests {
                         started_at: chrono::Utc::now(),
                         ended_at: None,
                         activity: None,
+                        agent: None,
                         this_request: false,
                     })
                 })

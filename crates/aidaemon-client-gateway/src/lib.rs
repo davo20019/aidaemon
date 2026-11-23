@@ -2427,6 +2427,7 @@ impl ClientGateway {
                     &run.id,
                     &run.view,
                     run.activity.as_deref(),
+                    run.agent.as_deref(),
                     run.started_at,
                     run.ended_at,
                 ));

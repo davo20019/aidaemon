@@ -698,6 +698,8 @@ impl CliAgentTool {
                 delegated_task_id,
             );
         }
+        // Which agent it is, for every surface that shows the run.
+        waited_runs.set_agent(&cli_run_id(&task_id), coding_agent.name());
         let waited_run_id = cli_run_id(&task_id);
         tokio::spawn(async move {
             let _slot_permit = slot_permit_for_task;

@@ -85,6 +85,7 @@ pub(super) fn ended_run(
         waited: Duration::from_secs(waited),
         step: None,
         activity: None,
+        agent: None,
         steps: Vec::new(),
         evidence: crate::run_state::RunEvidence {
             unconfirmed: unconfirmed

@@ -669,7 +669,21 @@ impl State {
     /// runs of its conversation.
     fn put_run(&mut self, run: RunSummary) {
         let session = run.session_id.clone();
+        let ended = !run.phase.is_running();
         self.runs.insert(run.id.clone(), run);
+        // Its last background run ended and no turn runs: the conversation
+        // is not working any more, though no report turn may come (a run
+        // stopped by its owner reports nothing).
+        if ended
+            && !self
+                .runs
+                .values()
+                .any(|run| run.session_id == session && run.phase.is_running())
+            && let Some(view) = self.sessions.get_mut(&session)
+            && view.live.is_none()
+        {
+            view.background = false;
+        }
         let mut ended: Vec<(u64, String)> = self
             .runs
             .values()
@@ -835,6 +849,7 @@ mod tests {
             id: id.into(),
             session_id: "app:s1".into(),
             label: "Claude Code: synthetic release".into(),
+            agent: None,
             phase,
             background: true,
             step: String::new(),
@@ -901,6 +916,30 @@ mod tests {
             },
         ));
         assert!(state.runs_for("app:s1")[0].step.is_empty());
+    }
+
+    /// A conversation that handed work to the background stops working once
+    /// its last run ended, even when no report turn comes (its owner
+    /// stopped it).
+    #[test]
+    fn a_conversation_is_not_working_once_its_last_run_ended() {
+        use aidaemon_client_protocol::RunPhase;
+        let mut state = State::default();
+        state.session("app:s1").background = true;
+        state.apply(event(
+            Some(1),
+            Event::RunUpdated {
+                run: run("r1", RunPhase::Running, 10),
+            },
+        ));
+        assert!(state.sessions["app:s1"].background);
+        state.apply(event(
+            Some(2),
+            Event::RunUpdated {
+                run: run("r1", RunPhase::Stopped, 10),
+            },
+        ));
+        assert!(!state.sessions["app:s1"].background);
     }
 
     /// A conversation keeps only its newest ended runs; running ones always

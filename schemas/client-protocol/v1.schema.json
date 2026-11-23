@@ -5721,6 +5721,13 @@
     "RunSummary": {
       "description": "One helper run as the daemon records it (protocol 1.46): a sub-agent, a\ncoding agent it launched (Claude Code, Codex, ...) or a background\ncommand. Every field comes from the run's typed record, never from what\na model wrote.",
       "properties": {
+        "agent": {
+          "description": "The coding agent it is (\"Claude Code\"), for a run that launched one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "background": {
           "description": "It goes on after the turn that started it ended.",
           "type": "boolean"

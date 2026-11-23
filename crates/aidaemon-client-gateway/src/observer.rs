@@ -443,6 +443,7 @@ impl TurnObserver for GatewayObserver {
                     &change.id,
                     &change.view,
                     change.activity.as_deref(),
+                    change.agent.as_deref(),
                     change.started_at,
                     change.ended_at,
                 ),
@@ -508,6 +509,7 @@ pub(crate) fn run_summary(
     id: &str,
     view: &aidaemon_core::card::HelperView,
     activity: Option<&str>,
+    agent: Option<&str>,
     started_at: chrono::DateTime<chrono::Utc>,
     ended_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> RunSummary {
@@ -523,6 +525,7 @@ pub(crate) fn run_summary(
         id: id.to_string(),
         session_id: session_id.to_string(),
         label: view.label.clone(),
+        agent: agent.map(str::to_string),
         phase,
         background: view.background,
         step: step_words(view, activity),

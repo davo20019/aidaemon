@@ -2896,6 +2896,9 @@ pub struct RunSummary {
     pub session_id: String,
     /// The name the owner reads for it.
     pub label: String,
+    /// The coding agent it is ("Claude Code"), for a run that launched one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub phase: RunPhase,
     /// It goes on after the turn that started it ended.
     pub background: bool,

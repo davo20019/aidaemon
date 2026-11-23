@@ -445,6 +445,8 @@ pub struct RunState {
     /// words from the agent's typed events ("Editing state.rs"); `None` for
     /// any other run.
     pub activity: Option<String>,
+    /// The coding agent it is ("Claude Code"), for a run that launched one.
+    pub agent: Option<String>,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -605,6 +607,9 @@ pub struct RunStates {
     /// The step last reported per running run and when, so a run that
     /// prints a line at a time is reported at most every [`STEP_EVERY`].
     stepped: Mutex<HashMap<String, (std::time::Instant, String)>>,
+    /// Runs the owner asked to stop: when one ends short of done, it ended
+    /// because the owner stopped it ([`Self::owner_stopping`]).
+    owner_stopping: Mutex<std::collections::HashSet<String>>,
 }
 
 /// The least time between two step reports of one run.
@@ -736,6 +741,7 @@ impl RunStates {
             waited: Duration::ZERO,
             step: None,
             activity: None,
+            agent: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -846,6 +852,7 @@ impl RunStates {
             id: state.id.clone(),
             view,
             activity: state.activity.clone(),
+            agent: state.agent.clone(),
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -987,6 +994,20 @@ impl RunStates {
         set
     }
 
+    /// Run `id` is coding agent `agent` ("Claude Code").
+    pub fn set_agent(&self, id: &str, agent: &str) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry) => {
+                entry.state.agent = Some(agent.to_string());
+                true
+            }
+            None => false,
+        };
+        if set {
+            self.report(id, false);
+        }
+    }
+
     /// The chat's kept card when run `id` began: its own card is the first
     /// one the chat keeps after this. Ignored once the card is known.
     pub fn card_before(&self, id: &str, before: Option<String>) {
@@ -1007,6 +1028,16 @@ impl RunStates {
         }
     }
 
+    /// The owner asked to stop run `id` (its process is about to be
+    /// killed): if it then ends short of done, its record says the owner
+    /// stopped it, not that its program was stopped.
+    pub fn owner_stopping(&self, id: &str) {
+        self.owner_stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_string());
+    }
+
     /// Record how run `id` ended, with what the runtime measured, and push
     /// it to its subscriber. A run ends once: a second end is ignored.
     pub fn finish(
@@ -1017,6 +1048,18 @@ impl RunStates {
         evidence: RunEvidence,
         report: RunReport,
     ) -> Option<RunState> {
+        let owner_stopped = self
+            .owner_stopping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        let end = if owner_stopped && end.phase() != RunPhase::Succeeded {
+            RunEnd::Stopped(Some(RunFailure::Cancelled {
+                by: CancelledBy::Owner,
+            }))
+        } else {
+            end
+        };
         let phase = end.phase();
         let (state, on_end) = {
             let mut runs = self.lock();
@@ -1352,6 +1395,39 @@ mod tests {
         assert!(heard[2].ended_at.is_some());
     }
 
+    /// A run the owner stopped says so, however its program's end reads; a
+    /// run that finished its work anyway keeps its success.
+    #[test]
+    fn a_run_the_owner_stopped_ends_stopped_by_the_owner() {
+        let runs = RunStates::default();
+        runs.begin("command-1", "chat", "sleep", None);
+        runs.owner_stopping("command-1");
+        let ended = runs
+            .finish(
+                "command-1",
+                RunEnd::of_exit(None),
+                measure(),
+                RunEvidence::default(),
+                report(),
+            )
+            .unwrap();
+        assert!(ended.stopped_by_owner());
+        assert!(ended.view().stopped_by_owner);
+
+        runs.begin("command-2", "chat", "echo", None);
+        runs.owner_stopping("command-2");
+        let ended = runs
+            .finish(
+                "command-2",
+                RunEnd::Succeeded,
+                measure(),
+                RunEvidence::default(),
+                report(),
+            )
+            .unwrap();
+        assert_eq!(ended.phase, RunPhase::Succeeded);
+    }
+
     /// A waited-on helper is reported once its record is complete: not as
     /// a background run first.
     #[test]
@@ -1433,6 +1509,7 @@ mod tests {
             waited: Duration::ZERO,
             step: None,
             activity: None,
+            agent: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
