@@ -8228,13 +8228,6 @@ mod tests {
         }
     }
 
-    /// Live 2026-11-13: two codex runs, one refused `ddev` by its sandbox,
-    /// both read "Done" under "All 2 done". A run that changed nothing it
-    /// was sent to change ends Failed with a typed reason; the card's
-    /// header and total come from the runs' phases; each is named from its
-    /// task; and the card settles the moment the programs end, though the
-    /// parent's continuation turn never gets its slot.
-
     /// A run its turn waits on has a record like a background one: it is
     /// listed in its chat while it runs and ends there with how it ended.
     #[tokio::test]
@@ -8266,6 +8259,12 @@ mod tests {
         assert!(!chat[0].background);
         assert_eq!(chat[0].phase, crate::run_state::RunPhase::Succeeded);
     }
+    /// Live 2026-11-13: two codex runs, one refused `ddev` by its sandbox,
+    /// both read "Done" under "All 2 done". A run that changed nothing it
+    /// was sent to change ends Failed with a typed reason; the card's
+    /// header and total come from the runs' phases; each is named from its
+    /// task; and the card settles the moment the programs end, though the
+    /// parent's continuation turn never gets its slot.
     #[tokio::test]
     async fn a_refused_cli_run_ends_failed_and_the_card_agrees_at_once() {
         let (tool, _db) = setup_bash_tool().await;

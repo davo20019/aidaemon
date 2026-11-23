@@ -49,20 +49,11 @@ use crate::types::{ChannelContext, UserRole};
 #[cfg(test)]
 use crate::traits::Task;
 
-/// Validation state lives in `aidaemon-runtime`.
-#[cfg(test)]
-mod validation_state {
-    pub(crate) use aidaemon_runtime::turn::validation_state::*;
-}
-#[cfg(test)]
-pub(crate) use validation_state::{ExecutorHandoff, persist_executor_handoff_context};
 #[cfg(test)]
 #[path = "turn/execution_state.rs"]
 mod execution_state;
 #[cfg(test)]
 pub(crate) use execution_state::ExecutionBudget;
-#[cfg(test)]
-pub(crate) use execution_state::TargetScope;
 /// The post-run learning context lives in `aidaemon-runtime`.
 mod post_task {
     pub(crate) use aidaemon_runtime::turn::post_task::*;

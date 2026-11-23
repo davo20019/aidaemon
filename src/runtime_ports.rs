@@ -7,9 +7,7 @@
 use async_trait::async_trait;
 
 #[cfg(test)]
-pub(crate) use aidaemon_runtime::spawn::ChildWorkReport;
-#[cfg(test)]
-pub(crate) use aidaemon_runtime::spawn::{ChildAgentRequest, ChildAgentRun, SalvagedTaskOutcome};
+pub(crate) use aidaemon_runtime::spawn::ChildAgentRequest;
 pub(crate) use aidaemon_runtime::spawn::{ChildAgentRuntime, ConversationRuntime};
 #[cfg(test)]
 pub(crate) use aidaemon_runtime::spawn::{ChildTimeLimit, ChildTimedOut};
