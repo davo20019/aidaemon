@@ -138,6 +138,8 @@ pub(super) struct RunCall {
     new_folders: Vec<String>,
     /// When the call accepted it: its run record's start.
     began: chrono::DateTime<chrono::Utc>,
+    /// The owner's own follow-up ([`crate::helper_run::HelperSpec::owner_follow_up`]).
+    owner_follow_up: bool,
 }
 
 /// What a run shares with its entry in the tool's task table.
@@ -323,6 +325,7 @@ impl CliAgentTool {
             grant_session: grant_session.to_string(),
             new_folders: spec.new_folders.clone(),
             began: chrono::Utc::now(),
+            owner_follow_up: spec.owner_follow_up,
         };
 
         // Slots go first come, first served: polled once here, a launch
@@ -2105,8 +2108,11 @@ async fn deliver_end(
         crate::background_run::RunsTurn::Answer(answer) => Some(answer),
         // Its record says who stopped it: the owner's Stop marks it there,
         // and the agent's own exit does not know.
+        // The owner's own follow-up: its end shows in its thread, where
+        // the owner talks to that agent; nothing reviews it.
         crate::background_run::RunsTurn::Alone
             if !end.answer_alone
+                || call.owner_follow_up
                 || end.phase.stopped_by_owner()
                 || ended
                     .as_ref()

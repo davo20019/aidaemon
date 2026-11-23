@@ -782,6 +782,11 @@ impl CliAgentTool {
                     mission: String::new(),
                     new_folders: made_folders.clone(),
                     scope: args.scope.clone(),
+                    owner_follow_up: continues.is_some()
+                        && facts
+                            .tool_call_id
+                            .as_deref()
+                            .is_some_and(crate::helper_run::is_owner_follow_up),
                     continues,
                 };
                 let write_paths = helper_write_paths(&args, &spec, &session_id, facts);

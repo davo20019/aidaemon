@@ -99,8 +99,12 @@ fn follow_up_script(
     if user_role != UserRole::Owner || user_text.trim().is_empty() {
         return None;
     }
+    let id = format!("follow-up-{}", uuid::Uuid::new_v4().simple());
+    // The daemon writes this call from the owner's typed follow-up: the run
+    // it starts is the owner's, its end shown in its thread, not reviewed.
+    crate::helper_run::mark_owner_follow_up(&id);
     let call = sdk::ToolCall {
-        id: format!("follow-up-{}", uuid::Uuid::new_v4().simple()),
+        id,
         name: "cli_agent".to_string(),
         arguments: serde_json::json!({
             "action": "run",

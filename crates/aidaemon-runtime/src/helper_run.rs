@@ -34,6 +34,31 @@ pub struct HelperSpec {
     /// The earlier run it goes on from: its coding agent's own session,
     /// resumed. `None` for new work.
     pub continues: Option<Continues>,
+    /// The owner's own follow-up, written in the earlier run's thread and
+    /// passed on with no model ([`is_owner_follow_up`]): its end shows in
+    /// that thread and is not reviewed by the agent loop.
+    pub owner_follow_up: bool,
+}
+
+/// The calls the daemon wrote itself from an owner's follow-up (typed, in
+/// a run's thread), by their call ids, until the tool takes them.
+static OWNER_FOLLOW_UPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Call `call_id` passes on the owner's own follow-up.
+pub fn mark_owner_follow_up(call_id: &str) {
+    OWNER_FOLLOW_UPS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(call_id.to_string());
+}
+
+/// Whether call `call_id` passes on the owner's own follow-up; taken once.
+pub fn is_owner_follow_up(call_id: &str) -> bool {
+    OWNER_FOLLOW_UPS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(call_id)
 }
 
 /// An earlier coding agent run that a new one goes on from.
@@ -551,6 +576,7 @@ mod tests {
             new_folders: vec!["/Users/someone/projects/claude-drupal-7".to_string()],
             scope: Vec::new(),
             continues: None,
+            owner_follow_up: false,
         };
         let narrowed = helper_authority(&parent, spec.declaration("chat"), None);
         assert_eq!(
@@ -564,5 +590,15 @@ mod tests {
         };
         let narrowed = helper_authority(&parent, outside.declaration("chat"), None);
         assert_eq!(write_roots(&narrowed), Some(Vec::new()));
+    }
+
+    /// Only a call the daemon wrote from the owner's follow-up is one, and
+    /// it is taken once.
+    #[test]
+    fn an_owner_follow_up_is_known_by_its_call_once() {
+        mark_owner_follow_up("follow-up-synthetic");
+        assert!(!is_owner_follow_up("call-from-a-model"));
+        assert!(is_owner_follow_up("follow-up-synthetic"));
+        assert!(!is_owner_follow_up("follow-up-synthetic"));
     }
 }
