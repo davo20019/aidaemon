@@ -121,6 +121,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     // there once they end: which agents ran and how each ended. A request
     // still being answered has its runs under its live line.
     let tail = place_runs(&mut rows, &store.runs_for(session));
+    let mut rows = without_launch_lines(rows);
     let live = store.live(session).is_some();
     let tail = tail.into_iter().map(|key| Row::Runs { key, headed: !live });
     if live {
@@ -146,6 +147,21 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             .map(|a| Row::Approval(a.id)),
     );
     rows
+}
+
+/// `rows` without each launch line ("Started in the background: …") that
+/// sits over its own runs' rows: the rows say it, live.
+fn without_launch_lines(rows: Vec<Row>) -> Vec<Row> {
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut iter = rows.into_iter().peekable();
+    while let Some(row) = iter.next() {
+        let launch_over_runs = matches!(row, Row::Assistant(_, _, _, true, ..))
+            && matches!(iter.peek(), Some(Row::Runs { .. }));
+        if !launch_over_runs {
+            kept.push(row);
+        }
+    }
+    kept
 }
 
 /// A run's group: the request that started it, or the run alone.
@@ -497,14 +513,16 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
         })
     });
     let line = computed(move || run.with(|r| r.as_ref().map(run_line).unwrap_or_default()));
-    let color = move || {
+    // How it ended by its mark as well as its colour: a check, a warning,
+    // or the work mark while it runs.
+    let mark = computed(move || {
         run.with(|r| match r.as_ref().map(|r| r.phase) {
-            Some(RunPhase::Succeeded) => colors::SUCCESS,
-            Some(RunPhase::Failed) => colors::DANGER,
-            Some(RunPhase::Stopped) => colors::WARNING,
-            _ => colors::MUTED,
+            Some(RunPhase::Succeeded) => (Glyph::Check, colors::SUCCESS),
+            Some(RunPhase::Failed) => (Glyph::Warning, colors::DANGER),
+            Some(RunPhase::Stopped) => (Glyph::Warning, colors::WARNING),
+            _ => (Glyph::Work, colors::MUTED),
         })
-    };
+    });
     let open = id.clone();
     view()
         .w_full()
@@ -529,7 +547,10 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
                         .flex_row()
                         .items_center()
                         .gap_2()
-                        .child(ui::icon(Glyph::Work).text_color(color))
+                        .child(dynamic(move || {
+                            let (glyph, color) = mark.get();
+                            Some(untracked(move || ui::icon(glyph).text_color(color)))
+                        }))
                         .child(
                             text(move || line.get())
                                 .flex_1()
@@ -3105,5 +3126,38 @@ mod tests {
         // The third request has no reply yet: its runs come at the end.
         assert_eq!(tail, vec!["task-3".to_string()]);
         assert_eq!(rows.len(), 7);
+    }
+
+    #[test]
+    fn a_launch_line_over_its_runs_gives_way_to_them() {
+        let launch = Row::Assistant(
+            "Started in the background: x".into(),
+            200,
+            Vec::new(),
+            true,
+            false,
+            None,
+        );
+        let runs = Row::Runs {
+            key: "task-1".into(),
+            headed: true,
+        };
+        let rows = without_launch_lines(vec![
+            Row::User("go".into(), 100, Vec::new()),
+            launch.clone(),
+            runs.clone(),
+            // A launch line whose runs are not on record stays.
+            launch.clone(),
+            reply(300),
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                Row::User("go".into(), 100, Vec::new()),
+                runs,
+                launch,
+                reply(300)
+            ]
+        );
     }
 }

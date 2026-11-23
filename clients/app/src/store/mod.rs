@@ -58,7 +58,7 @@ pub fn agent_work(runs: &[RunSummary]) -> Option<AgentWork> {
     };
     let mut kinds: Vec<(String, usize)> = Vec::new();
     for run in &members {
-        let name = run.agent.clone().unwrap_or_else(|| "Helper".to_string());
+        let name = run.agent.clone().unwrap_or_else(|| "Agent".to_string());
         match kinds.iter_mut().find(|(kind, _)| *kind == name) {
             Some((_, count)) => *count += 1,
             None => kinds.push((name, 1)),

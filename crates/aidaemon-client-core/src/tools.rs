@@ -49,7 +49,9 @@ fn verb(kind: ToolKind) -> Option<&'static str> {
         ToolKind::Write => "Changed",
         ToolKind::Run => "Ran",
         ToolKind::Web => "Looked up",
-        ToolKind::Delegate => "Asked a helper",
+        // Sub-agents and launched coding agents alike: "agent", the word
+        // their own rows use.
+        ToolKind::Delegate => "Started an agent",
         ToolKind::Recall => "Checked memory",
         ToolKind::Remember => "Updated memory",
         ToolKind::Remind => "Set a reminder",
@@ -229,7 +231,7 @@ fn phrases(tools: &[String], calls: &[ToolCallInfo]) -> Vec<(Option<String>, usi
                     Some(format!("{} online", count(calls, "lookup", "lookups")))
                 }
                 Some(ToolKind::Delegate) => {
-                    Some(format!("asked {}", count(calls, "helper", "helpers")))
+                    Some(format!("started {}", count(calls, "agent", "agents")))
                 }
                 Some(ToolKind::Recall) => Some("checked memory".into()),
                 Some(ToolKind::Remember) => Some("updated memory".into()),
@@ -395,7 +397,7 @@ mod tests {
         let tools: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             summary(&tools, &calls, 0, false),
-            "Asked 1 helper, 1 lookup online and 2 more steps"
+            "Started 1 agent, 1 lookup online and 2 more steps"
         );
     }
 }
