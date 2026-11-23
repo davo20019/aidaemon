@@ -42,7 +42,14 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent]) -> RunDetail
         model: None,
         working_dir: run.working_dir,
         task: run.task.unwrap_or(run.prompt_summary),
-        result: run.output_summary.filter(|text| !text.trim().is_empty()),
+        // Its report: what it said at its end. An agent whose protocol
+        // was read as typed events (its events are on record) that did not
+        // finish left its raw stream there, not a report: its steps and how
+        // it ended say what happened instead.
+        result: run
+            .output_summary
+            .filter(|text| !text.trim().is_empty())
+            .filter(|_| run.success == Some(true) || events.is_empty()),
         steps: Vec::new(),
         plan: Vec::new(),
         permissions: Vec::new(),
@@ -216,6 +223,7 @@ mod tests {
             working_dir: Some("/w/synthetic".into()),
             prompt_summary: "Review the slug".into(),
             task: Some("Review the slug module".into()),
+            success: Some(true),
             output_summary: Some("Fixed one bug".into()),
         };
         let events = [
@@ -266,6 +274,38 @@ mod tests {
         assert_eq!(detail.plan[1].status, RunPlanStatus::InProgress);
         assert_eq!(detail.permissions[0].outcome, RunPermissionOutcome::Allowed);
         assert_eq!(detail.usage.as_ref().map(|u| u.output_tokens), Some(30));
+    }
+
+    /// Live 2026-11-23: a Codex run stopped by the owner showed its raw
+    /// protocol stream (`{"type":"thread.started"...}`) as its report.
+    #[test]
+    fn a_structured_agent_that_did_not_finish_has_no_report() {
+        let run = |success| CliAgentRun {
+            invocation: 8,
+            agent_name: "codex".into(),
+            agent_session: None,
+            working_dir: None,
+            prompt_summary: "Review".into(),
+            task: None,
+            output_summary: Some(r#"{"type":"thread.started","thread_id":"t-1"}"#.into()),
+            success,
+        };
+        let events = [event(1, "session", r#"{"id":"t-1","model":null}"#)];
+        assert_eq!(
+            detail("cli-agent-8", run(Some(false)), &events).result,
+            None
+        );
+        assert!(
+            detail("cli-agent-8", run(Some(true)), &events)
+                .result
+                .is_some()
+        );
+        // An agent read as plain text keeps what it printed.
+        assert!(
+            detail("cli-agent-8", run(Some(false)), &[])
+                .result
+                .is_some()
+        );
     }
 
     #[tokio::test]

@@ -182,7 +182,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
     ) -> anyhow::Result<Option<aidaemon_tools::services::CliAgentRun>> {
         use sqlx::Row;
         let row = sqlx::query(
-            "SELECT id, agent_name, agent_session_id, working_dir, prompt_summary, task, output_summary
+            "SELECT id, agent_name, agent_session_id, working_dir, prompt_summary, task, output_summary, success
              FROM cli_agent_invocations WHERE run_id = ? ORDER BY id DESC LIMIT 1",
         )
         .bind(run_id)
@@ -196,6 +196,7 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
             prompt_summary: row.get("prompt_summary"),
             task: row.get("task"),
             output_summary: row.get("output_summary"),
+            success: row.get("success"),
         }))
     }
 

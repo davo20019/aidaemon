@@ -186,6 +186,8 @@ pub struct CliAgentRun {
     /// an invocation from before it was kept has its summary alone.
     pub task: Option<String>,
     pub output_summary: Option<String>,
+    /// How it ended, once it did: whether it succeeded.
+    pub success: Option<bool>,
 }
 
 /// Runtime-managed CLI agents persistence + invocation logs.
