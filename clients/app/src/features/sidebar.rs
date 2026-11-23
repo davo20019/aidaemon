@@ -12,6 +12,7 @@ use nsh_core::prelude::*;
 use crate::store::{Felt, Page, SearchRead, SidebarView, Source, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
+use aidaemon_client_protocol::{Approval, ApprovalDecision};
 
 pub fn sidebar(store: Store) -> View {
     // While the pointer is over the list its rows hold still: a row that
@@ -189,8 +190,128 @@ fn session_row(store: Store, id: String, dated: bool) -> View {
             move || store.renaming().as_deref() == Some(editing.as_str()),
             move || rename_field(store, id.clone()),
         )
-        .otherwise(move || menu_row(store, shown.clone(), dated)),
+        .otherwise(move || {
+            let work = shown.clone();
+            view()
+                .child(menu_row(store, shown.clone(), dated))
+                .child(work_line(store, work))
+        }),
     )
+}
+
+/// Under a conversation's row, while it has agents at work: what waits on
+/// the owner (an approval, answered here), else a failure, else how many
+/// agents of each kind and how far along ("Claude Code ×2 · Codex · 1 of 3
+/// done"). Steps stay in the conversation.
+fn work_line(store: Store, id: String) -> View {
+    let ask_id = id.clone();
+    let asking = computed(move || store.approvals_for(&ask_id).into_iter().next());
+    let work_id = id;
+    let work = computed(move || store.agent_work(&work_id));
+    view().child(dynamic(move || {
+        if let Some(approval) = asking.get() {
+            return Some(untracked(move || ask_line(store, approval)));
+        }
+        let work = work.get()?;
+        Some(untracked(move || {
+            let (words, color) = work_words(&work);
+            let began = work.began_at_ms;
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .pl(px(WORK_INDENT))
+                .pr_2()
+                .pb_1()
+                .child(
+                    text(words)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                        .text_color(color),
+                )
+                .child(
+                    text(move || {
+                        store.tick();
+                        ui::time::span(now_ms().saturating_sub(began) / 1000)
+                    })
+                    .tabular_nums()
+                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                    .text_color(colors::FAINT),
+                )
+        }))
+    }))
+}
+
+/// Where a row's work line starts: under its title, past the unread dot.
+const WORK_INDENT: f32 = 26.0;
+
+/// The work line's words and colour: a failure first, else progress.
+fn work_words(work: &crate::store::AgentWork) -> (String, AdaptiveColor) {
+    if let Some(failed) = work.failed.first() {
+        let running = work.total - work.done;
+        let words = match running {
+            0 => format!("{failed} failed"),
+            n => format!("{failed} failed · {n} still running"),
+        };
+        return (words, colors::DANGER);
+    }
+    let kinds = work
+        .kinds
+        .iter()
+        .map(|(name, count)| match count {
+            1 => name.clone(),
+            n => format!("{name} ×{n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let words = if work.total > 1 {
+        format!("{kinds} · {} of {} done", work.done, work.total)
+    } else {
+        kinds
+    };
+    (words, colors::MUTED)
+}
+
+/// A waiting approval under its conversation's row: who asks and what,
+/// and Allow once / Deny when the card offers them, answered from here.
+fn ask_line(store: Store, approval: Approval) -> View {
+    let words = match approval
+        .card
+        .as_ref()
+        .and_then(|card| card.asked_by.clone())
+    {
+        Some(who) => format!("{who}: {}", approval.summary),
+        None => approval.summary.clone(),
+    };
+    let mut line = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .pl(px(WORK_INDENT))
+        .pr_2()
+        .pb_1()
+        .child(
+            text(words)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(2)
+                .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                .text_color(colors::WARNING),
+        );
+    for (decision, label, variant) in [
+        (ApprovalDecision::ApproveOnce, "Allow", ui::Variant::Primary),
+        (ApprovalDecision::Deny, "Deny", ui::Variant::Ghost),
+    ] {
+        if approval.options.contains(&decision) {
+            let id = approval.id.clone();
+            line = line.child(ui::btn(label, variant, ui::Size::Sm, move || {
+                store.resolve(&id, decision)
+            }));
+        }
+    }
+    line
 }
 
 /// The row with its menu.
@@ -465,7 +586,6 @@ fn home(store: Store, needs: Memo<Vec<String>>, rest: Memo<Vec<String>>) -> View
     view()
         .gap(px(1.0))
         .child(group(store, "Needs you", needs))
-        .child(running_now(store))
         .child(group(store, "Pinned", pinned))
         .child(section_label("Projects"))
         .child(when(
@@ -1341,31 +1461,7 @@ fn session_button(store: Store, id: String, dated: bool) -> nsh_base::ButtonElem
         let at = date_id.clone();
         Some(untracked(move || match state {
             RowState::NeedsYou => ui::badge_dot("Needs you", Tone::Warning),
-            RowState::Working => {
-                // Its coding agents, counted, beside the ring.
-                let id = at.clone();
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(when(
-                        {
-                            let id = id.clone();
-                            move || store.agents_running(&id) > 0
-                        },
-                        move || {
-                            let id = id.clone();
-                            text(move || match store.agents_running(&id) {
-                                1 => "1 agent".to_string(),
-                                n => format!("{n} agents"),
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                            .text_color(colors::FAINT)
-                        },
-                    ))
-                    .child(ui::spinner("Working"))
-            }
+            RowState::Working => ui::spinner("Working"),
             RowState::WasWorking => ui::spinner_stale("Was working when the connection dropped"),
             RowState::Quiet => view().child(when(dated, move || {
                 let at = at.clone();
@@ -1672,74 +1768,6 @@ fn pages(store: Store) -> View {
 }
 
 /// A titled group of conversations, shown only when it has any.
-/// What runs now, anywhere, while anything does: a line per run (its
-/// agent or name, its conversation, how long), opening its conversation.
-/// What each is doing step by step is in the conversation, not here.
-fn running_now(store: Store) -> View {
-    let runs = computed(move || store.running_runs());
-    view()
-        .gap(px(1.0))
-        .child(when(
-            move || !runs.with(Vec::is_empty),
-            || section_label("Running now"),
-        ))
-        .child(each(
-            runs,
-            |run| run.id.clone(),
-            move |run, _| {
-                let session = run.with_untracked(|r| r.session_id.clone());
-                let lit = session.clone();
-                let name = computed(move || {
-                    run.with(|r| r.agent.clone().unwrap_or_else(|| r.label.clone()))
-                });
-                let place = computed(move || run.with(|r| store.title(&r.session_id)));
-                row(
-                    move || {
-                        store.page() == Page::Conversation
-                            && store.selected().as_deref() == Some(lit.as_str())
-                    },
-                    move || {
-                        let session = session.clone();
-                        store.leave_drawer(move || store.select(Some(session)))
-                    },
-                )
-                .accessibility_label(move || {
-                    Some(SharedString::from(format!(
-                        "{}, running in {}",
-                        name.get(),
-                        place.get()
-                    )))
-                })
-                .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
-                .child(
-                    text(move || name.get())
-                        .number_of_lines(1)
-                        .text_size(px(ui::fit::body()))
-                        .text_color(colors::TEXT),
-                )
-                .child(
-                    text(move || place.get())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .number_of_lines(1)
-                        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                        .text_color(colors::FAINT),
-                )
-                .child(
-                    text(move || {
-                        store.tick();
-                        run.with(|r| {
-                            ui::time::span(now_ms().saturating_sub(r.started_at_ms) / 1000)
-                        })
-                    })
-                    .tabular_nums()
-                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                    .text_color(colors::FAINT),
-                )
-            },
-        ))
-}
-
 fn group(store: Store, title: &'static str, ids: Memo<Vec<String>>) -> View {
     view()
         .gap(px(1.0))

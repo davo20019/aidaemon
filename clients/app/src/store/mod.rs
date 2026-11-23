@@ -29,6 +29,58 @@ pub use aidaemon_client_core::client::{
 
 /// The Automations page's list, as last read.
 pub type AutomationsRead = Read<Vec<aidaemon_client_protocol::AutomationSummary>>;
+/// A conversation's agents at work, as its row in the drawer counts them
+/// ([`Store::agent_work`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentWork {
+    /// Each kind of agent and how many, in the order they started.
+    pub kinds: Vec<(String, usize)>,
+    pub total: usize,
+    /// How many of them ended.
+    pub done: usize,
+    /// The agents that failed, by name.
+    pub failed: Vec<String>,
+    /// When the first of them started.
+    pub began_at_ms: u64,
+}
+
+/// The work a drawer row counts, from its runs: while one runs, the runs
+/// started with it (the same request: `RunSummary.group`), else the running
+/// ones alone. `None` when nothing runs.
+pub fn agent_work(runs: &[RunSummary]) -> Option<AgentWork> {
+    let running = runs.iter().rev().find(|run| run.phase.is_running())?;
+    let members: Vec<&RunSummary> = match &running.group {
+        Some(group) => runs
+            .iter()
+            .filter(|run| run.group.as_ref() == Some(group))
+            .collect(),
+        None => runs.iter().filter(|run| run.phase.is_running()).collect(),
+    };
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    for run in &members {
+        let name = run.agent.clone().unwrap_or_else(|| "Helper".to_string());
+        match kinds.iter_mut().find(|(kind, _)| *kind == name) {
+            Some((_, count)) => *count += 1,
+            None => kinds.push((name, 1)),
+        }
+    }
+    Some(AgentWork {
+        kinds,
+        total: members.len(),
+        done: members.iter().filter(|run| !run.phase.is_running()).count(),
+        failed: members
+            .iter()
+            .filter(|run| run.phase == aidaemon_client_protocol::RunPhase::Failed)
+            .map(|run| run.agent.clone().unwrap_or_else(|| run.label.clone()))
+            .collect(),
+        began_at_ms: members
+            .iter()
+            .map(|run| run.started_at_ms)
+            .min()
+            .unwrap_or(0),
+    })
+}
+
 /// The record of the run whose view is open.
 pub type RunRead = Read<aidaemon_client_protocol::RunDetail>;
 /// The details pane's Changes: a session's uncommitted changes.
@@ -3156,6 +3208,11 @@ impl Store {
             .into_iter()
             .filter(|run| run.phase.is_running())
             .collect()
+    }
+
+    /// Conversation `session`'s agents at work, for its drawer row.
+    pub fn agent_work(&self, session: &str) -> Option<AgentWork> {
+        agent_work(&self.runs_for(session))
     }
 
     /// How many coding agents are running for conversation `session`.
