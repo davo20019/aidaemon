@@ -201,8 +201,8 @@ fn session_row(store: Store, id: String, dated: bool) -> View {
 
 /// Under a conversation's row, while it has agents at work: what waits on
 /// the owner (an approval, answered here), else a failure, else how many
-/// agents of each kind and how far along ("Claude Code ×2 · Codex · 1 of 3
-/// done"). Steps stay in the conversation.
+/// agents of each kind and how far along ("1 of 3 done · Claude Code ×2,
+/// Codex"). Steps stay in the conversation.
 fn work_line(store: Store, id: String) -> View {
     let ask_id = id.clone();
     let asking = computed(move || store.approvals_for(&ask_id).into_iter().next());
@@ -265,9 +265,10 @@ fn work_words(work: &crate::store::AgentWork) -> (String, AdaptiveColor) {
             n => format!("{name} ×{n}"),
         })
         .collect::<Vec<_>>()
-        .join(" · ");
+        .join(", ");
+    // Progress first: a narrow row cuts the end, never the count.
     let words = if work.total > 1 {
-        format!("{kinds} · {} of {} done", work.done, work.total)
+        format!("{} of {} done · {kinds}", work.done, work.total)
     } else {
         kinds
     };

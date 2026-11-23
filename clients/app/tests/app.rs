@@ -777,7 +777,7 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     ]);
     settle(&mut app)?;
     // The drawer's row counts its agents and how far along they are.
-    app.wait_for("text:Claude Code · Codex · 0 of 2 done")?;
+    app.wait_for("text:0 of 2 done · Claude Code, Codex")?;
     // What waits on the owner takes the line, answered from the drawer.
     feed([frame(
         r#"{"type":"event","seq":8,"at_ms":2,"session_id":"app:synthetic-pair","event":{"type":"approval_requested","approval":{"id":"ap-pair","session_id":"app:synthetic-pair","kind":"command","risk":"medium","summary":"Write /w/synthetic/reviews/codex.md","options":["approve_once","deny"],"requested_at_ms":2,"card":{"asked_by":"Codex","action":{"kind":"command","line":"write"}}}}}"#,
@@ -789,14 +789,14 @@ fn agents_started_together_are_shown_together_and_open_their_steps() -> Result<(
     feed([frame(
         r#"{"type":"event","seq":9,"at_ms":3,"session_id":"app:synthetic-pair","event":{"type":"approval_resolved","approval_id":"ap-pair","outcome":"approved"}}"#,
     )]);
-    app.wait_for("text:Claude Code · Codex · 0 of 2 done")?;
+    app.wait_for("text:0 of 2 done · Claude Code, Codex")?;
     app.press("Truncate the synthetic slugs >> nth=0")?;
     app.wait_for("text:2 agents working together")?;
     feed([frame(
         r#"{"type":"event","seq":10,"at_ms":3,"session_id":"app:synthetic-pair","event":{"type":"run_updated","run":{"id":"cli-agent-a","session_id":"app:synthetic-pair","label":"Truncate on branch a","agent":"Claude Code","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-1","edited":["/w/synthetic/slug.py","/w/synthetic/test_slug.py"]}}}"#,
     )]);
     app.wait_for("text:2 agents working together · 1 done")?;
-    app.wait_for("text:Claude Code · Codex · 1 of 2 done")?;
+    app.wait_for("text:1 of 2 done · Claude Code, Codex")?;
     app.wait_for("text:Claude Code · Finished · changed 2 files")?;
     app.press("Claude Code · Finished · changed 2 files, show its steps")?;
     let id = wait_sent("get_run")?;
@@ -826,7 +826,7 @@ fn a_phone_shows_agents_under_their_conversation_and_opens_a_run() -> Result<(),
     ]);
     settle(&mut app)?;
     app.press("Conversations")?;
-    app.wait_for("text:Claude Code · Codex · 0 of 2 done")?;
+    app.wait_for("text:0 of 2 done · Claude Code, Codex")?;
     assert!(app.wait_for("text:Running now").is_err());
     app.press("Review the synthetic slugs >> nth=0")?;
     app.wait_for("text:Codex · Running pytest")?;
