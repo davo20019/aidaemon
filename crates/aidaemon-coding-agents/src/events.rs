@@ -43,6 +43,13 @@ pub enum AgentEvent {
     },
     /// Its turn is over.
     TurnEnded { failed: bool },
+    /// What it ended its run with: its final message as its protocol gives
+    /// it, and the report in it when it was held to the report schema
+    /// ([`crate::report`]); `None`: it reported text alone.
+    Reported {
+        text: String,
+        report: Option<crate::Report>,
+    },
 }
 
 /// One step of a coding agent's work.
@@ -176,6 +183,10 @@ impl AgentEvent {
                 json!({"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}),
             ),
             Self::TurnEnded { failed } => ("turn_ended", json!({"failed": failed})),
+            Self::Reported { text, report } => (
+                "reported",
+                json!({"text": text, "report": report.as_ref().map(crate::Report::to_value)}),
+            ),
         }
     }
 }
@@ -307,6 +318,18 @@ pub fn host_of(url: &str) -> Option<String> {
     let host = rest.split(['/', '?', '#']).next()?;
     let host = host.rsplit('@').next()?;
     (!host.is_empty()).then(|| host.to_string())
+}
+
+/// A final message as [`AgentEvent::Reported`]: its report when the
+/// whole text is one ([`crate::Report::from_text`]), and then the report's
+/// summary as its text rather than the JSON.
+pub(crate) fn reported_text(text: &str) -> AgentEvent {
+    let report = crate::Report::from_text(text);
+    let text = match &report {
+        Some(report) => report.summary.clone(),
+        None => text.trim().to_string(),
+    };
+    AgentEvent::Reported { text, report }
 }
 
 pub(crate) fn text(value: &Value, pointer: &str) -> Option<String> {

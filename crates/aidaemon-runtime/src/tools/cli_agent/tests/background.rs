@@ -883,7 +883,8 @@ async fn a_coding_agents_events_are_kept_and_its_step_is_its_runs_activity() {
             (3, "permission"),
             (4, "step_ended"),
             (5, "usage"),
-            (6, "turn_ended"),
+            (6, "reported"),
+            (7, "turn_ended"),
         ]
     );
     assert!(events.iter().all(|(invocation, ..)| *invocation == 7));

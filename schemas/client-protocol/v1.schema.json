@@ -5828,6 +5828,22 @@
       ],
       "type": "string"
     },
+    "RunCheck": {
+      "description": "A check a coding agent says it ran.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "command",
+        "passed"
+      ],
+      "type": "object"
+    },
     "RunDetail": {
       "description": "What one run did (protocol 1.46, `get_run`), from its record. Only a\ncoding agent's run keeps steps; any other has its summary alone.",
       "properties": {
@@ -5906,6 +5922,79 @@
         "run_id"
       ],
       "type": "object"
+    },
+    "RunMismatch": {
+      "description": "A claim the run's recorded actions don't bear out.",
+      "oneOf": [
+        {
+          "description": "It says it changed the file; no change to it was recorded.",
+          "properties": {
+            "kind": {
+              "const": "change_not_seen",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A change to the file was recorded; it doesn't say so.",
+          "properties": {
+            "kind": {
+              "const": "change_not_claimed",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "It says it ran the check; no run of that program was recorded.",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "check_not_run",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "It says the check passed; the recorded run failed.",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "check_failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "command"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "RunOutcome": {
       "description": "How a run ended, or that it has not yet.",
@@ -6018,6 +6107,71 @@
       ],
       "type": "string"
     },
+    "RunReport": {
+      "description": "A coding agent's report: its claims, each one checked\n([`RunResult::mismatches`]).",
+      "properties": {
+        "changed_files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/RunCheck"
+          },
+          "type": "array"
+        },
+        "needs_owner": {
+          "description": "It can't go on without the owner.",
+          "type": "boolean"
+        },
+        "open_questions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "type": "object"
+    },
+    "RunResult": {
+      "description": "What a run's coding agent ended with (protocol 1.48).",
+      "properties": {
+        "mismatches": {
+          "description": "Where its report disagrees with its recorded actions; the record\nwins.",
+          "items": {
+            "$ref": "#/$defs/RunMismatch"
+          },
+          "type": "array"
+        },
+        "report": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunReport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its report, when its agent was held to the report's fields."
+        },
+        "text": {
+          "description": "Its reply, shortened: its report's summary when it reported in\nfields, else its final message.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
     "RunStepItem": {
       "description": "One step of a run, in plain words from its typed event.",
       "properties": {
@@ -6128,6 +6282,17 @@
             "string",
             "null"
           ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What its coding agent ended with (protocol 1.48): its reply, its\ntyped report and where the report disagrees with what it was seen\ndoing. Set once it ended."
         },
         "session_id": {
           "description": "The conversation it reports to.",

@@ -31,6 +31,7 @@ mod models;
 pub mod plain;
 mod readiness;
 mod registry;
+pub mod report;
 mod stdin;
 
 pub use action::{ActionJudge, AgentAction, AllowAll, TextEdit, Verdict};
@@ -43,3 +44,4 @@ pub use mode::{PermissionMode, mode_within, modes_within};
 pub use models::{ModelListing, list_models};
 pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, check_models};
 pub use registry::CodingAgents;
+pub use report::{Check, Report};

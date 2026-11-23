@@ -737,6 +737,9 @@ pub fn render_conversation_agents(
             "\n- \"{}\" ({}), latest run `{}`: {state}",
             agent.name, agent.agent, agent.latest_run
         ));
+        if let Some(result) = &agent.latest_result {
+            section.push_str(&format!(". Its last result: {result}"));
+        }
     }
     section
 }
@@ -821,11 +824,15 @@ mod environment_tests {
             agent: "Codex".into(),
             latest_run: "cli-agent-synthetic".into(),
             state: AgentState::CanContinue,
+            latest_result: Some("Added the slug test. Checks: pytest -q passed.".into()),
         }]);
         assert!(
             section
                 .contains("\"Designer\" (Codex), latest run `cli-agent-synthetic`: can continue")
         );
         assert!(section.contains("continue_run"));
+        assert!(
+            section.contains("Its last result: Added the slug test. Checks: pytest -q passed.")
+        );
     }
 }

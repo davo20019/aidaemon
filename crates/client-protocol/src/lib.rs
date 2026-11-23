@@ -3024,6 +3024,66 @@ pub struct RunSummary {
     /// the session id too).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_continue: bool,
+    /// What its coding agent ended with (protocol 1.48): its reply, its
+    /// typed report and where the report disagrees with what it was seen
+    /// doing. Set once it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResult>,
+}
+
+/// What a run's coding agent ended with (protocol 1.48).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunResult {
+    /// Its reply, shortened: its report's summary when it reported in
+    /// fields, else its final message.
+    pub text: String,
+    /// Its report, when its agent was held to the report's fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<RunReport>,
+    /// Where its report disagrees with its recorded actions; the record
+    /// wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mismatches: Vec<RunMismatch>,
+}
+
+/// A coding agent's report: its claims, each one checked
+/// ([`RunResult::mismatches`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunReport {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<RunCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_questions: Vec<String>,
+    /// It can't go on without the owner.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_owner: bool,
+}
+
+/// A check a coding agent says it ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunCheck {
+    pub command: String,
+    pub passed: bool,
+}
+
+/// A claim the run's recorded actions don't bear out.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunMismatch {
+    /// It says it changed the file; no change to it was recorded.
+    ChangeNotSeen { path: String },
+    /// A change to the file was recorded; it doesn't say so.
+    ChangeNotClaimed { path: String },
+    /// It says it ran the check; no run of that program was recorded.
+    CheckNotRun { command: String },
+    /// It says the check passed; the recorded run failed.
+    CheckFailed { command: String },
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
 }
 
 /// What one run did (protocol 1.46, `get_run`), from its record. Only a

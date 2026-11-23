@@ -936,6 +936,7 @@ impl CliAgentTool {
                     .continues
                     .as_ref()
                     .map(|earlier| earlier.agent_session.as_str()),
+                report: true,
             },
             &mut launch,
         ) {
@@ -1809,6 +1810,19 @@ async fn watch_run(
     // them: what its run says it changed.
     for path in changed_files(&backend_for_receipt, &files_before_for_task).await {
         handles.runs.edited(&cli_run_id(&call.task_id), &path);
+    }
+    // What its agent ended with, each claim checked against that record.
+    {
+        let run_id = cli_run_id(&call.task_id);
+        let edited = handles
+            .runs
+            .get(&run_id)
+            .map(|state| state.edited)
+            .unwrap_or_default();
+        let fallback = extract_meaningful_output(&stdout_buf_writer.lock().await, 4_000);
+        handles
+            .runs
+            .result(&run_id, agent_events.result(&edited, &fallback));
     }
     let auth_failed = cli_auth_failed(
         &stdout_buf_writer.lock().await,

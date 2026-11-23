@@ -458,6 +458,8 @@ pub struct RunState {
     pub thread: Option<String>,
     /// Its coding agent keeps its session where a follow-up can continue it.
     pub keeps_session: bool,
+    /// What its coding agent ended with, once it ended ([`aidaemon_channels::turns::RunResult`]).
+    pub result: Option<aidaemon_channels::turns::RunResult>,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -757,6 +759,7 @@ impl RunStates {
             continues: None,
             thread: None,
             keeps_session: false,
+            result: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -873,6 +876,7 @@ impl RunStates {
             continues: state.continues.clone(),
             thread: state.thread.clone(),
             keeps_session: state.keeps_session,
+            result: state.result.clone(),
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -1049,6 +1053,20 @@ impl RunStates {
             Some(entry) => {
                 entry.state.continues = Some(earlier.to_string());
                 entry.state.thread = Some(thread.to_string());
+                true
+            }
+            None => false,
+        };
+        if set {
+            self.report(id, false);
+        }
+    }
+
+    /// What run `id`'s coding agent ended with.
+    pub fn result(&self, id: &str, result: aidaemon_channels::turns::RunResult) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry) => {
+                entry.state.result = Some(result);
                 true
             }
             None => false,
@@ -1609,6 +1627,7 @@ mod tests {
             continues: None,
             thread: None,
             keeps_session: false,
+            result: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,

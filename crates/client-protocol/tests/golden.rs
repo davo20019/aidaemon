@@ -222,6 +222,7 @@ fn run() -> RunSummary {
         continues: None,
         thread: None,
         can_continue: false,
+        result: None,
     }
 }
 

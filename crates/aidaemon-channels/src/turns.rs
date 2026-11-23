@@ -370,10 +370,49 @@ pub struct RunChange {
     pub thread: Option<String>,
     /// Its coding agent keeps its session where a follow-up can continue it.
     pub keeps_session: bool,
+    /// What its coding agent ended with, once it ended ([`crate::turns::RunResult`]).
+    pub result: Option<crate::turns::RunResult>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
     pub step_only: bool,
+}
+
+/// What a run's coding agent ended with: its reply, its typed claims, and
+/// where those claims disagree with what it was seen doing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunResult {
+    /// Its final message, shortened; its report's summary when it reported
+    /// in fields.
+    pub text: String,
+    /// Its report, when its protocol held it to the report schema.
+    pub claims: Option<RunClaims>,
+    /// Where its claims disagree with its recorded actions.
+    pub mismatches: Vec<RunMismatch>,
+}
+
+/// A coding agent's typed report: its claims.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunClaims {
+    pub summary: String,
+    pub changed_files: Vec<String>,
+    /// Each check it says it ran, and whether it says it passed.
+    pub checks: Vec<(String, bool)>,
+    pub open_questions: Vec<String>,
+    pub needs_owner: bool,
+}
+
+/// A claim its recorded actions don't bear out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMismatch {
+    /// It says it changed the file; no change to it was recorded.
+    ChangeNotSeen { path: String },
+    /// A change to the file was recorded; it doesn't say so.
+    ChangeNotClaimed { path: String },
+    /// It says it ran the check; no run of that program was recorded.
+    CheckNotRun { command: String },
+    /// It says the check passed; the recorded run failed.
+    CheckFailed { command: String },
 }
 
 /// Where a runner reports its turns: empty until an observer is set, which
@@ -1652,6 +1691,7 @@ mod tests {
                         continues: None,
                         thread: None,
                         keeps_session: false,
+                        result: None,
                         this_request: false,
                     })
                 })

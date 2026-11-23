@@ -4,7 +4,9 @@
 //! model), `assistant` (with `tool_use` blocks: a tool's name, input and
 //! id; `parent_tool_use_id` when one of its own helpers runs it), `user`
 //! (with `tool_result` blocks: the call's id and `is_error`) and `result`
-//! (its turn's end, cost and usage). A tool is told apart by its name, the
+//! (its turn's end, cost and usage, and its final message: `result`, the
+//! text, and `structured_output`, the report when it was held to the
+//! schema with `--json-schema`). A tool is told apart by its name, the
 //! protocol's identifier for it.
 
 use serde_json::Value;
@@ -60,6 +62,7 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
                     cost_usd: message.get("total_cost_usd").and_then(Value::as_f64),
                 });
             }
+            events.push(reported(&message));
             events.push(AgentEvent::TurnEnded {
                 failed: message.get("is_error").and_then(Value::as_bool) == Some(true),
             });
@@ -67,6 +70,27 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Its final message, from its `result` event: the report in
+/// `structured_output` (live probe, 2.1.327: a run with `--json-schema`
+/// writes the report there, and its JSON as `result`), the text in
+/// `result`. Text that is the report's own JSON reads as its summary.
+fn reported(result: &Value) -> AgentEvent {
+    let report = result
+        .get("structured_output")
+        .and_then(crate::Report::from_value);
+    let text = result
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let text = match &report {
+        Some(report) if text.is_empty() || serde_json::from_str::<Value>(text).is_ok() => {
+            report.summary.clone()
+        }
+        _ => text.trim().to_string(),
+    };
+    AgentEvent::Reported { text, report }
 }
 
 fn blocks(message: &Value) -> impl Iterator<Item = &Value> {
@@ -125,7 +149,9 @@ fn tool_use(block: &Value, parent: Option<String>) -> Vec<AgentEvent> {
             events.push(AgentEvent::Plan(items));
             StepTool::Plan
         }
-        "" => return events,
+        // The tool its final answer is written with when held to a schema:
+        // its report, read from the `result` event, is not a step.
+        "" | "StructuredOutput" => return events,
         other => StepTool::Other {
             name: other.to_string(),
         },
@@ -198,8 +224,73 @@ mod tests {
                     output_tokens: 5,
                     cost_usd: Some(0.25)
                 },
+                AgentEvent::Reported {
+                    text: String::new(),
+                    report: None
+                },
                 AgentEvent::TurnEnded { failed: false }
             ]
+        );
+    }
+
+    fn reported_of(line: &str) -> Vec<AgentEvent> {
+        read_events(line)
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::Reported { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn its_final_result_is_its_report_when_held_to_the_schema() {
+        // As a `--json-schema` run writes it (live probe shape, 2.1.327).
+        let held = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"summary\":\"Added a test.\",\"changed_files\":[\"tests/test_slug.py\"],\"checks\":[{\"command\":\"pytest -q\",\"passed\":true}],\"open_questions\":[],\"needs_owner\":false}","structured_output":{"summary":"Added a test.","changed_files":["tests/test_slug.py"],"checks":[{"command":"pytest -q","passed":true}],"open_questions":[],"needs_owner":false}}"#;
+        assert_eq!(
+            reported_of(held),
+            vec![AgentEvent::Reported {
+                text: "Added a test.".into(),
+                report: Some(crate::Report {
+                    summary: "Added a test.".into(),
+                    changed_files: vec!["tests/test_slug.py".into()],
+                    checks: vec![crate::Check {
+                        command: "pytest -q".into(),
+                        passed: true,
+                    }],
+                    open_questions: Vec::new(),
+                    needs_owner: false,
+                }),
+            }]
+        );
+        // Without the schema: its text alone, even when it looks like JSON
+        // (only `structured_output` is a report).
+        assert_eq!(
+            reported_of(
+                r#"{"type":"result","subtype":"success","result":"Added a test.\n","structured_output":null}"#
+            ),
+            vec![AgentEvent::Reported {
+                text: "Added a test.".into(),
+                report: None
+            }]
+        );
+        assert_eq!(
+            reported_of(r#"{"type":"result","subtype":"success","result":"{\"summary\":\"x\"}"}"#),
+            vec![AgentEvent::Reported {
+                text: "{\"summary\":\"x\"}".into(),
+                report: None
+            }]
+        );
+        // The tool it writes the report with is not a step.
+        assert!(
+            read_events(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t-9","name":"StructuredOutput","input":{"summary":"x"}}]}}"#
+            )
+            .is_empty()
+        );
+        // Only its `result` event ends a run with a report.
+        assert!(
+            reported_of(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#
+            )
+            .is_empty()
         );
     }
 

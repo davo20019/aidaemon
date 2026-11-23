@@ -389,7 +389,9 @@ impl WorkRow {
     fn key(&self) -> String {
         match self {
             Self::Group { key, .. } => format!("group:{key}"),
-            Self::Run { run, .. } => run.id.clone(),
+            // A run that replied is drawn as its agent's message: a new
+            // row when the reply lands.
+            Self::Run { run, .. } => format!("{}:{}", run.id, run.result.is_some()),
         }
     }
 }
@@ -518,6 +520,13 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
         .gap_1()
         .child(each(rows, WorkRow::key, move |row, _| {
             match row.get_untracked() {
+                // An agent's run alone in its request, once it replied, is
+                // its message: who it is and what it said.
+                WorkRow::Run { run, grouped }
+                    if !grouped && run.agent.is_some() && run.result.is_some() =>
+                {
+                    agent_message(store, run.id, row)
+                }
                 WorkRow::Run { run, grouped } => run_row(store, run.id, row, grouped),
                 WorkRow::Group { .. } => view(),
             }
@@ -537,37 +546,7 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
                 .is_some_and(|r| r.phase.is_running() && r.background)
         })
     });
-    // The runs of its thread after it: the follow-ups to its agent.
-    let follow_ups = {
-        let id = id.clone();
-        computed(move || {
-            store
-                .all_runs()
-                .iter()
-                .filter(|later| later.thread.as_deref() == Some(id.as_str()))
-                .count()
-        })
-    };
-    let line = computed(move || {
-        let mut words = run.with(|r| {
-            r.as_ref()
-                .map(|r| {
-                    let line = run_line(r);
-                    if r.continues.is_some() {
-                        format!("{line} · follow-up")
-                    } else {
-                        line
-                    }
-                })
-                .unwrap_or_default()
-        });
-        match follow_ups.get() {
-            0 => {}
-            1 => words.push_str(" · 1 follow-up"),
-            n => words.push_str(&format!(" · {n} follow-ups")),
-        }
-        words
-    });
+    let line = computed(move || run.with(|r| r.as_ref().map(run_line).unwrap_or_default()));
     // How it ended by its mark as well as its colour: a check, a warning,
     // or the work mark while it runs.
     let mark = computed(move || {
@@ -644,6 +623,187 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
                 })
             },
         ))
+}
+
+/// A coding agent's reply as its message in the conversation: who it is
+/// (the name the owner gave it, else what it was started for, and its
+/// agent), how it ended and how long it took, what it said, and its typed
+/// report: the files it changed, its checks, what it left open, whether it
+/// needs the owner, and each claim the record doesn't bear out. A press
+/// opens its view.
+fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
+    let run = computed(move || match row.get() {
+        WorkRow::Run { run, .. } => Some(*run),
+        WorkRow::Group { .. } => None,
+    });
+    let head = computed(move || {
+        let Some(r) = run.get() else {
+            return String::new();
+        };
+        let thread = r.thread.clone().unwrap_or_else(|| r.id.clone());
+        let name = store
+            .participants()
+            .into_iter()
+            .find(|p| p.thread == thread)
+            .map(|p| p.name)
+            .unwrap_or_else(|| r.label.clone());
+        let agent = r.agent.clone().unwrap_or_default();
+        let state = match r.phase {
+            RunPhase::Failed => " · failed",
+            RunPhase::Stopped => " · stopped",
+            _ => "",
+        };
+        format!("{name} · {agent}{state}")
+    });
+    let open = id.clone();
+    let body = move || {
+        let Some(r) = run.get() else {
+            return view();
+        };
+        let Some(result) = r.result.clone() else {
+            return view();
+        };
+        let mut body = view().gap_1();
+        if !result.text.is_empty() {
+            body = body.child(
+                text(result.text.clone())
+                    .selectable(true)
+                    .text_size(px(ui::fit::body()))
+                    .text_color(colors::TEXT),
+            );
+        }
+        let fact = |glyph: Glyph, tone: ui::Tone, words: String| {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .child(ui::icon(glyph).text_color(tone.color()))
+                .child(
+                    text(words)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(2)
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::MUTED),
+                )
+        };
+        if let Some(report) = &result.report {
+            if !report.changed_files.is_empty() {
+                let names: Vec<&str> = report.changed_files.iter().map(|p| file_name(p)).collect();
+                body = body.child(fact(
+                    Glyph::File,
+                    ui::Tone::Neutral,
+                    format!("Changed {}", names.join(", ")),
+                ));
+            }
+            for check in &report.checks {
+                body = body.child(if check.passed {
+                    fact(
+                        Glyph::Check,
+                        ui::Tone::Success,
+                        format!("{} passed", check.command),
+                    )
+                } else {
+                    fact(
+                        Glyph::Warning,
+                        ui::Tone::Danger,
+                        format!("{} failed", check.command),
+                    )
+                });
+            }
+            for question in &report.open_questions {
+                body = body.child(fact(
+                    Glyph::Dot,
+                    ui::Tone::Info,
+                    format!("Open: {question}"),
+                ));
+            }
+            if report.needs_owner {
+                body = body.child(fact(
+                    Glyph::Approval,
+                    ui::Tone::Warning,
+                    "Needs you".to_string(),
+                ));
+            }
+        }
+        for mismatch in &result.mismatches {
+            use aidaemon_client_protocol::RunMismatch;
+            let words = match mismatch {
+                RunMismatch::ChangeNotSeen { path } => {
+                    format!(
+                        "Says it changed {}, but no change was seen",
+                        file_name(path)
+                    )
+                }
+                RunMismatch::ChangeNotClaimed { path } => {
+                    format!("Changed {} without saying so", file_name(path))
+                }
+                RunMismatch::CheckNotRun { command } => {
+                    format!("Says it ran {command}, but no run was seen")
+                }
+                RunMismatch::CheckFailed { command } => {
+                    format!("Says {command} passed, but it failed")
+                }
+                RunMismatch::Unknown => continue,
+            };
+            body = body.child(fact(Glyph::Warning, ui::Tone::Warning, words));
+        }
+        body
+    };
+    view().w_full().px_1().child(
+        button()
+            .w_full()
+            .accessibility_label(move || {
+                Some(SharedString::from(format!(
+                    "{}, show what it did",
+                    head.get()
+                )))
+            })
+            .on_press(move || store.open_run(&open))
+            .child(
+                view()
+                    .w_full()
+                    .gap_1()
+                    .p_3()
+                    .rounded(px(ui::radius::CONTROL))
+                    .bg(colors::SURFACE)
+                    .border_1()
+                    .border_color(colors::EDGE)
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
+                            .child(
+                                text(move || head.get())
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .number_of_lines(1)
+                                    .text_size(px(ui::fit::small()))
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            )
+                            .child(
+                                text(move || {
+                                    run.with(|r| {
+                                        r.as_ref()
+                                            .and_then(|r| {
+                                                r.ended_at_ms.map(|end| (r.started_at_ms, end))
+                                            })
+                                            .map(|(start, end)| {
+                                                ui::time::span(end.saturating_sub(start) / 1000)
+                                            })
+                                            .unwrap_or_default()
+                                    })
+                                })
+                                .tabular_nums()
+                                .text_size(px(type_scale::XS))
+                                .text_color(colors::FAINT),
+                            ),
+                    )
+                    .child(dynamic(move || Some(untracked(body)))),
+            ),
+    )
 }
 
 /// An older daemon's background work: its task list.

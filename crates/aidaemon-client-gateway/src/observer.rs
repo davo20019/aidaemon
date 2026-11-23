@@ -447,6 +447,7 @@ impl TurnObserver for GatewayObserver {
                 continues: change.continues.as_deref(),
                 thread: change.thread.as_deref(),
                 keeps_session: change.keeps_session,
+                result: change.result.as_ref(),
                 started_at: change.started_at,
                 ended_at: change.ended_at,
             },
@@ -520,6 +521,7 @@ pub(crate) struct RunRecord<'a> {
     pub continues: Option<&'a str>,
     pub thread: Option<&'a str>,
     pub keeps_session: bool,
+    pub result: Option<&'a aidaemon_channels::turns::RunResult>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -538,6 +540,7 @@ pub(crate) fn run_summary(
         continues,
         thread,
         keeps_session,
+        result,
         started_at,
         ended_at,
     } = record;
@@ -568,6 +571,46 @@ pub(crate) fn run_summary(
         thread: thread.map(str::to_string),
         // A follow-up goes on from an ended run whose agent kept its session.
         can_continue: keeps_session && ended_at.is_some(),
+        result: result.map(run_result),
+    }
+}
+
+/// A run's result as the app reads it: the runtime's typed record.
+fn run_result(result: &aidaemon_channels::turns::RunResult) -> aidaemon_client_protocol::RunResult {
+    use aidaemon_channels::turns::RunMismatch as Seen;
+    use aidaemon_client_protocol::{RunCheck, RunMismatch, RunReport};
+    aidaemon_client_protocol::RunResult {
+        text: result.text.clone(),
+        report: result.claims.as_ref().map(|claims| RunReport {
+            summary: claims.summary.clone(),
+            changed_files: claims.changed_files.clone(),
+            checks: claims
+                .checks
+                .iter()
+                .map(|(command, passed)| RunCheck {
+                    command: command.clone(),
+                    passed: *passed,
+                })
+                .collect(),
+            open_questions: claims.open_questions.clone(),
+            needs_owner: claims.needs_owner,
+        }),
+        mismatches: result
+            .mismatches
+            .iter()
+            .map(|mismatch| match mismatch {
+                Seen::ChangeNotSeen { path } => RunMismatch::ChangeNotSeen { path: path.clone() },
+                Seen::ChangeNotClaimed { path } => {
+                    RunMismatch::ChangeNotClaimed { path: path.clone() }
+                }
+                Seen::CheckNotRun { command } => RunMismatch::CheckNotRun {
+                    command: command.clone(),
+                },
+                Seen::CheckFailed { command } => RunMismatch::CheckFailed {
+                    command: command.clone(),
+                },
+            })
+            .collect(),
     }
 }
 

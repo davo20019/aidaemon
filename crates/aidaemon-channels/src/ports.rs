@@ -164,6 +164,8 @@ pub struct ChatRun {
     pub thread: Option<String>,
     /// Its coding agent keeps its session where a follow-up can continue it.
     pub keeps_session: bool,
+    /// What its coding agent ended with, once it ended ([`crate::turns::RunResult`]).
+    pub result: Option<crate::turns::RunResult>,
     /// The chat's running turn started it (an earlier turn's helper runs on
     /// in the background).
     pub this_request: bool,

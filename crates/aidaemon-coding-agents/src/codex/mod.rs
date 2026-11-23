@@ -23,10 +23,21 @@
 //! under its own sandbox, model and approval policy, whatever the thread
 //! last ran with.
 //!
+//! A run asked for a report ([`RunRequest::report`]) holds its final
+//! message to the report schema: an `exec` run with `--output-schema
+//! <file>` (a file this run keeps, among the options before `resume`), a
+//! hosted run with `turn/start`'s `outputSchema`. Its final message is
+//! then the report's JSON. Either launch is read through a host that writes
+//! the turn's final message on the line ending it ([`events`]); an `exec`
+//! run's ([`exec::ExecHost`]) answers nothing. An `exec` run whose stdin
+//! can't stay open (not a local process) has neither: the schema file is
+//! this machine's, and no host reads it.
+//!
 //! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18; continuing
-//! threads across launches, 2026-11-23).
+//! threads across launches, 2026-11-23; the report, 2026-11-23).
 
 pub mod events;
+pub mod exec;
 pub mod host;
 
 use crate::{
@@ -189,6 +200,7 @@ fn hosted(
             working_dir: request.working_dir.map(str::to_string),
             asks,
             thread,
+            output_schema: request.report.then(crate::report::schema),
         })),
         keep_alive: Some(Box::new(home)),
         ..Plan::plain()
@@ -197,6 +209,12 @@ fn hosted(
 
 impl CodingAgent for Codex {
     fn reports_steps(&self) -> bool {
+        true
+    }
+
+    /// `--output-schema` (`exec`) and `outputSchema` (hosted) hold its
+    /// final message to the report schema.
+    fn reports_in_fields(&self) -> bool {
         true
     }
 
@@ -296,16 +314,67 @@ fn prepare(
     // Both launches keep the thread in the owner's sessions, unless the
     // launch says not to.
     plan.keeps_session = !ephemeral;
-    if plan.host.is_none()
-        && let Some(session) = request.resume
-    {
+    if plan.host.is_some() {
+        // Hosted: its thread and schema go in its requests.
+        return Ok(plan);
+    }
+    // `exec`: options first.
+    if request.report && request.stdin_open {
+        match SchemaFile::write() {
+            Ok(file) => {
+                let path = file.path.to_string_lossy().into_owned();
+                crate::agent::set_option(
+                    &mut launch.args,
+                    launch.start,
+                    "--output-schema",
+                    &[],
+                    &path,
+                );
+                plan.keep_alive = Some(match plan.keep_alive.take() {
+                    Some(kept) => Box::new((kept, file)),
+                    None => Box::new(file),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "A Codex run reports in text: its schema file could not be written");
+            }
+        }
+    }
+    if let Some(session) = request.resume {
         // After every option, before the task (its last argument). A
         // hosted run names it in its `thread/resume` instead.
         launch
             .args
             .extend(["resume".to_string(), session.to_string()]);
     }
+    if request.stdin_open {
+        plan.host = Some(Box::new(exec::ExecHostStarter));
+    }
     Ok(plan)
+}
+
+/// The report schema in a file of its own for `--output-schema`, removed
+/// when the run is over.
+#[derive(Debug)]
+struct SchemaFile {
+    path: std::path::PathBuf,
+}
+
+impl SchemaFile {
+    fn write() -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "aidaemon-codex-report-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, crate::report::schema().to_string())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SchemaFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// `launch` in `request`'s mode, and how the run goes.
@@ -386,6 +455,7 @@ mod tests {
             stdin_open: true,
             model: None,
             resume: None,
+            report: false,
         }
     }
 
@@ -426,7 +496,7 @@ mod tests {
         );
         assert!(joined.contains("network.enabled=false"));
         assert!(joined.contains("approval_policy=\"never\""));
-        assert!(plan.host.is_none());
+        assert_eq!(plan.prompt, PromptPlacement::LastArgument);
         // A write with no path to write is refused.
         assert!(
             Codex
@@ -470,7 +540,7 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox"
             ])
         );
-        assert!(plan.host.is_none());
+        assert_eq!(plan.prompt, PromptPlacement::LastArgument);
     }
 
     #[test]
@@ -693,7 +763,7 @@ mod tests {
             start: 0,
         };
         let plan = prepare(&asked, &mut launch, &no_home).unwrap();
-        assert!(plan.host.is_none());
+        assert_eq!(plan.prompt, PromptPlacement::LastArgument);
         assert!(plan.keeps_session);
         assert_eq!(launch.args[0], "exec");
         assert_eq!(
@@ -722,5 +792,105 @@ mod tests {
                 .unwrap()
                 .keeps_session
         );
+    }
+
+    #[test]
+    fn an_exec_run_asked_for_a_report_names_its_schema_file_before_resume() {
+        assert!(Codex.reports_in_fields());
+        let mut asked = request(PermissionMode::Checked, true, &[]);
+        asked.report = true;
+        asked.resume = Some("s-1");
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = Codex.prepare(&asked, &mut launch).unwrap();
+        let args = &launch.args;
+        let at = args
+            .iter()
+            .position(|arg| arg == "--output-schema")
+            .expect("its schema");
+        let path = std::path::PathBuf::from(&args[at + 1]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path).unwrap())
+                .unwrap(),
+            crate::report::schema()
+        );
+        // Options before `resume`, the thread last (the task follows it).
+        assert_eq!(&args[at + 2..], &strings(&["resume", "s-1"])[..]);
+        assert!(args.join(" ").contains("--sandbox read-only"));
+        // Read through its exec host; the task stays its last argument.
+        assert!(plan.host.is_some());
+        assert_eq!(plan.prompt, PromptPlacement::LastArgument);
+        // The file lasts as long as the run.
+        drop(plan);
+        assert!(!path.exists());
+
+        // No report asked: no schema, still read through its host.
+        asked.report = false;
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = Codex.prepare(&asked, &mut launch).unwrap();
+        assert!(!launch.args.iter().any(|arg| arg == "--output-schema"));
+        assert!(plan.host.is_some() && plan.keep_alive.is_none());
+
+        // Not a local process: no file of this machine's, no host.
+        asked.report = true;
+        asked.stdin_open = false;
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = Codex.prepare(&asked, &mut launch).unwrap();
+        assert!(!launch.args.iter().any(|arg| arg == "--output-schema"));
+        assert!(plan.host.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hosted_run_asked_for_a_report_sends_its_schema_with_its_turn() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let owner = owner_home();
+        let home = || host::CodexHome::linked_to(&owner);
+        let mut asked = request(PermissionMode::EveryCommand, false, &[]);
+        asked.can_host = true;
+        asked.report = true;
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        let plan = prepare(&asked, &mut launch, &home).unwrap();
+        assert_eq!(launch.args[0], "app-server");
+        assert!(!launch.args.iter().any(|arg| arg == "--output-schema"));
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = plan
+            .host
+            .expect("a hosted plan")
+            .start(
+                child.stdin.take().unwrap(),
+                std::sync::Arc::new(AllowAll),
+                "go on",
+            )
+            .await;
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        sent.next_line().await.unwrap();
+        host.on_line(r#"{"id":1,"result":{}}"#).await;
+        sent.next_line().await.unwrap();
+        sent.next_line().await.unwrap();
+        host.on_line(r#"{"id":2,"result":{"thread":{"id":"t1"}}}"#)
+            .await;
+        let turn: serde_json::Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(turn["params"]["outputSchema"], crate::report::schema());
+        host.close().await;
+        let _ = child.wait().await;
+        std::fs::remove_dir_all(&owner).unwrap();
     }
 }

@@ -24,7 +24,8 @@
 //! later run can continue it (`resumable`: the agent's `loadSession`).
 //!
 //! The run's reader is given a `{"type": "result"}` line with the agent's
-//! final message, as a stream-json agent writes it.
+//! final message, as a stream-json agent writes it, and that message alone
+//! as `final_message` (its `result` says why a turn that failed stopped).
 //!
 //! The host advertises no file system or terminal of its own: the agent
 //! acts with its own tools, after asking.
@@ -523,8 +524,13 @@ impl AcpHost {
                 self.stdin.close().await;
                 if completed {
                     vec![
-                        json!({"type": "result", "subtype": "success", "result": message})
-                            .to_string(),
+                        json!({
+                            "type": "result",
+                            "subtype": "success",
+                            "result": message,
+                            "final_message": message,
+                        })
+                        .to_string(),
                     ]
                 } else {
                     vec![
@@ -533,6 +539,7 @@ impl AcpHost {
                             "subtype": "error",
                             "is_error": true,
                             "result": format!("The agent stopped ({stop}). {message}").trim().to_string(),
+                            "final_message": message,
                         })
                         .to_string(),
                     ]
@@ -876,6 +883,13 @@ mod tests {
         let end: Value = serde_json::from_str(&end[0]).unwrap();
         assert_eq!(end["type"], "result");
         assert_eq!(end["result"], "Created note.txt.");
+        assert_eq!(
+            super::super::events::read_events(&end.to_string())[0],
+            crate::AgentEvent::Reported {
+                text: "Created note.txt.".into(),
+                report: None
+            }
+        );
         assert!(!host.unfinished());
         // The end of its turn closed stdin.
         assert!(sent.next_line().await.unwrap().is_none());

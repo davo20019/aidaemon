@@ -3,7 +3,9 @@
 //! (its session id, its model, and whether a later run can continue it:
 //! the agent's own `loadSession`), `tool_call` (the call's id, its ACP `kind`, the paths
 //! it names, its command or URL), `tool_call_update` (a call completed or
-//! failed), `acp.plan` (its plan entries) and `result` (its turn's end).
+//! failed), `acp.plan` (its plan entries) and `result` (its turn's end,
+//! with its final message as `final_message`: the protocol holds it to no
+//! schema, so it is text alone).
 //! A step's kind is the protocol's `kind` value, never its title.
 
 use serde_json::Value;
@@ -81,9 +83,21 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
                 })
                 .collect(),
         )],
-        Some("result") => vec![AgentEvent::TurnEnded {
-            failed: event.get("is_error").and_then(Value::as_bool) == Some(true),
-        }],
+        Some("result") => {
+            let mut events: Vec<AgentEvent> = event
+                .get("final_message")
+                .and_then(Value::as_str)
+                .map(|text| AgentEvent::Reported {
+                    text: text.trim().to_string(),
+                    report: None,
+                })
+                .into_iter()
+                .collect();
+            events.push(AgentEvent::TurnEnded {
+                failed: event.get("is_error").and_then(Value::as_bool) == Some(true),
+            });
+            events
+        }
         _ => Vec::new(),
     }
 }
@@ -146,6 +160,45 @@ mod tests {
         assert_eq!(
             read_events(r#"{"type":"result","subtype":"success","result":"ok"}"#),
             vec![AgentEvent::TurnEnded { failed: false }]
+        );
+    }
+
+    #[test]
+    fn its_final_message_is_text_alone_even_when_it_is_a_report() {
+        assert_eq!(
+            read_events(
+                r#"{"type":"result","subtype":"success","result":"Created note.txt.","final_message":"Created note.txt."}"#
+            ),
+            vec![
+                AgentEvent::Reported {
+                    text: "Created note.txt.".into(),
+                    report: None
+                },
+                AgentEvent::TurnEnded { failed: false }
+            ]
+        );
+        // Held to no schema: JSON it writes is its text, never a report.
+        let json = r#"{"summary":"x","changed_files":[],"checks":[],"open_questions":[],"needs_owner":false}"#;
+        let line = serde_json::json!({"type": "result", "subtype": "success", "result": json, "final_message": json});
+        assert_eq!(
+            read_events(&line.to_string())[0],
+            AgentEvent::Reported {
+                text: json.into(),
+                report: None
+            }
+        );
+        // A turn that stopped: its message, not the reason.
+        assert_eq!(
+            read_events(
+                r#"{"type":"result","subtype":"error","is_error":true,"result":"The agent stopped (refusal). Half done.","final_message":"Half done."}"#
+            ),
+            vec![
+                AgentEvent::Reported {
+                    text: "Half done.".into(),
+                    report: None
+                },
+                AgentEvent::TurnEnded { failed: true }
+            ]
         );
     }
 }

@@ -29,9 +29,17 @@
 //!
 //! Its notifications are translated into the `codex exec --json` events an
 //! `exec` run writes, so the embedding agent reads both launches the same
-//! way.
+//! way. The line that ends the turn also carries the turn's final message
+//! ([`super::events::FINAL_MESSAGE`]): the last `agentMessage` among the
+//! turn's own items in `turn/completed` (live probe, 0.170.0: they hold
+//! its final answer), else the last one it reported.
 //!
-//! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18).
+//! A run asked for a report sends the report schema as `turn/start`'s
+//! `outputSchema` ("constrain the final assistant message for this turn",
+//! its protocol schema says): the final message is then the report's JSON.
+//!
+//! Verified against Codex CLI 0.170.0 (live probes, 2026-11-18; the
+//! report, 2026-11-23).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -388,6 +396,8 @@ struct HostState {
     answers: HostAnswers,
     /// Its turn ended, and how: `Some(true)` completed.
     completed: Option<bool>,
+    /// The last message it reported (an `agentMessage` item completed).
+    last_message: Option<String>,
 }
 
 /// Starts a [`CodexHost`].
@@ -396,6 +406,9 @@ pub struct CodexHostStarter {
     pub asks: Asks,
     /// Which thread its run starts or continues.
     pub thread: ThreadRequest,
+    /// The schema its final message is held to (`turn/start`'s
+    /// `outputSchema`); `None`: free text.
+    pub output_schema: Option<Value>,
 }
 
 /// The thread a hosted run works on.
@@ -425,7 +438,8 @@ impl HostStarter for CodexHostStarter {
         prompt: &str,
     ) -> Arc<dyn AgentHost> {
         let host = CodexHost::new(stdin, judge, self.working_dir, prompt, self.asks)
-            .on_thread(self.thread);
+            .on_thread(self.thread)
+            .with_output_schema(self.output_schema);
         host.stdin.write(&initialize_line()).await;
         Arc::new(host)
     }
@@ -441,6 +455,7 @@ pub struct CodexHost {
     prompt: Arc<str>,
     asks: Asks,
     thread: Arc<ThreadRequest>,
+    output_schema: Option<Arc<Value>>,
     state: Arc<Mutex<HostState>>,
 }
 
@@ -459,8 +474,15 @@ impl CodexHost {
             prompt: Arc::from(prompt),
             asks,
             thread: Arc::default(),
+            output_schema: None,
             state: Arc::default(),
         }
+    }
+
+    /// Holds its final message to `schema` (none by default).
+    pub fn with_output_schema(mut self, schema: Option<Value>) -> Self {
+        self.output_schema = schema.map(Arc::new);
+        self
     }
 
     /// Works on `thread` (a new stored thread by default).
@@ -520,10 +542,13 @@ impl CodexHost {
                     .pointer("/result/thread/id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let params = json!({
+                let mut params = json!({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": &*self.prompt}],
                 });
+                if let Some(schema) = &self.output_schema {
+                    params["outputSchema"] = (**schema).clone();
+                }
                 self.stdin
                     .write(&request_line(TURN_START_ID, "turn/start", params))
                     .await;
@@ -557,8 +582,16 @@ impl CodexHost {
             "turn/started" => event(json!({"type": "turn.started"})),
             "item/started" | "item/completed" => {
                 let item = params.get("item").unwrap_or(&Value::Null);
-                if item.get("type").and_then(Value::as_str) == Some("fileChange") {
-                    self.remember_changes(item);
+                match item.get("type").and_then(Value::as_str) {
+                    Some("fileChange") => self.remember_changes(item),
+                    Some("agentMessage") if method == "item/completed" => {
+                        if let (Some(text), Ok(mut state)) =
+                            (item.get("text").and_then(Value::as_str), self.state.lock())
+                        {
+                            state.last_message = Some(text.to_string());
+                        }
+                    }
+                    _ => {}
                 }
                 let kind = if method == "item/started" {
                     "item.started"
@@ -581,12 +614,15 @@ impl CodexHost {
             "turn/completed" => {
                 let status = text("/turn/status");
                 let completed = status == "completed";
-                let usage = {
+                let (usage, final_message) = {
                     let Ok(mut state) = self.state.lock() else {
                         return Vec::new();
                     };
                     state.completed = Some(completed);
-                    state.usage.clone()
+                    let final_message = final_message(params)
+                        .or_else(|| state.last_message.clone())
+                        .unwrap_or_default();
+                    (state.usage.clone(), final_message)
                 };
                 // Its turn is over: closing stdin lets it exit.
                 self.stdin.close().await;
@@ -600,6 +636,7 @@ impl CodexHost {
                             "cached_input_tokens": count("cachedInputTokens"),
                             "output_tokens": count("outputTokens"),
                         },
+                        (super::events::FINAL_MESSAGE): final_message,
                     }))
                 } else {
                     let message = params
@@ -607,7 +644,11 @@ impl CodexHost {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("the turn ended {status}"));
-                    event(json!({"type": "turn.failed", "error": {"message": message}}))
+                    event(json!({
+                        "type": "turn.failed",
+                        "error": {"message": message},
+                        (super::events::FINAL_MESSAGE): final_message,
+                    }))
                 }
             }
             _ => Vec::new(),
@@ -777,6 +818,19 @@ impl AgentHost for CodexHost {
     async fn close(&self) {
         self.stdin.close().await;
     }
+}
+
+/// The last `agentMessage` among a `turn/completed`'s own items (its
+/// typed summary of the turn), when it lists one.
+fn final_message(params: &Value) -> Option<String> {
+    params
+        .pointer("/turn/items")
+        .and_then(Value::as_array)?
+        .iter()
+        .rev()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .and_then(|item| item.get("text").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// An app-server item as `codex exec --json` writes it, for the items an
@@ -1032,6 +1086,8 @@ mod tests {
             serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(turn_start["params"]["threadId"], "t1");
         assert_eq!(turn_start["params"]["input"][0]["text"], "fix it");
+        // No report asked: its final message is free text.
+        assert!(turn_start["params"].get("outputSchema").is_none());
 
         host.on_line(r#"{"id":0,"method":"item/commandExecution/requestApproval","params":{"kind":"command","command":"/bin/zsh -lc 'npm install'","cwd":"/w","itemId":"i1"}}"#).await;
         let reply: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
@@ -1065,6 +1121,15 @@ mod tests {
         let end: Value = serde_json::from_str(&end[0]).unwrap();
         assert_eq!(end["type"], "turn.completed");
         assert_eq!(end["usage"]["input_tokens"], 10);
+        // Its turn's items listed none: the last message it reported.
+        assert_eq!(end["final_message"], "All set.");
+        assert_eq!(
+            super::super::events::read_events(&end.to_string())[1],
+            crate::AgentEvent::Reported {
+                text: "All set.".into(),
+                report: None
+            }
+        );
         assert!(!host.unfinished());
         // The end of its turn closed stdin: `cat` reads end-of-file and exits.
         assert!(sent.next_line().await.unwrap().is_none());
@@ -1101,7 +1166,8 @@ mod tests {
         .on_thread(ThreadRequest::Resume {
             id: "thread-a1".to_string(),
             settings: settings.clone(),
-        });
+        })
+        .with_output_schema(Some(crate::report::schema()));
         let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
         host.on_line(r#"{"id":1,"result":{}}"#).await;
         assert!(
@@ -1137,8 +1203,52 @@ mod tests {
         assert_eq!(turn_start["method"], "turn/start");
         assert_eq!(turn_start["params"]["threadId"], "thread-a1");
         assert_eq!(turn_start["params"]["input"][0]["text"], "go on");
+        assert_eq!(
+            turn_start["params"]["outputSchema"],
+            crate::report::schema()
+        );
+
+        // As the app-server reports a turn held to the schema (live probe
+        // shape, 0.170.0): its commentary, then its final answer, which the
+        // turn's own items repeat.
+        let report = r#"{\"summary\":\"Added a test.\",\"changed_files\":[\"tests/test_slug.py\"],\"checks\":[],\"open_questions\":[],\"needs_owner\":false}"#;
+        host.on_line(r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m0","text":"I'll add the test.","phase":"commentary"}}}"#).await;
+        let end = host
+            .on_line(&format!(
+                r#"{{"method":"turn/completed","params":{{"turn":{{"id":"u","status":"completed","items":[{{"type":"agentMessage","id":"m1","text":"{report}","phase":"final_answer"}}]}}}}}}"#
+            ))
+            .await;
+        let reported: Vec<crate::AgentEvent> = super::super::events::read_events(&end[0])
+            .into_iter()
+            .filter(|event| matches!(event, crate::AgentEvent::Reported { .. }))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![crate::AgentEvent::Reported {
+                text: "Added a test.".into(),
+                report: Some(crate::Report {
+                    summary: "Added a test.".into(),
+                    changed_files: vec!["tests/test_slug.py".into()],
+                    ..crate::Report::default()
+                }),
+            }]
+        );
         host.close().await;
         let _ = child.wait().await;
+    }
+
+    #[test]
+    fn a_turns_final_message_is_the_last_agent_message_among_its_items() {
+        assert_eq!(
+            final_message(&json!({"turn": {"items": [
+                {"type": "agentMessage", "text": "first"},
+                {"type": "agentMessage", "text": "last"},
+                {"type": "commandExecution", "command": "ls"},
+            ]}}))
+            .as_deref(),
+            Some("last")
+        );
+        assert_eq!(final_message(&json!({"turn": {"items": []}})), None);
     }
 
     #[cfg(unix)]

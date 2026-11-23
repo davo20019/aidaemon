@@ -220,6 +220,7 @@ mod tests {
             stdin_open: true,
             model: None,
             resume: None,
+            report: false,
         }
     }
 

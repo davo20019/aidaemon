@@ -5,10 +5,21 @@
 //! says what it is (`command_execution`, `file_change`, `web_search`,
 //! `mcp_tool_call`, `todo_list`, ...); `turn.completed`/`turn.failed` end
 //! its turn.
+//!
+//! Its final message is the turn's last `agent_message` item, which a
+//! line alone can't tell apart from the ones before it: this crate's hosts
+//! (the app-server's, and the one an `exec` run is read through) write it
+//! on the line that ends the turn, as [`FINAL_MESSAGE`], and the run's
+//! report is read from there ([`AgentEvent::Reported`]). A turn's end
+//! without it (an `exec` run read directly) reports nothing.
 
 use serde_json::Value;
 
 use crate::events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, program_of, text};
+
+/// The field of a `turn.completed`/`turn.failed` line that carries the
+/// turn's final message (this crate's own, added by its hosts).
+pub const FINAL_MESSAGE: &str = "final_message";
 
 /// The events one stdout line carries.
 pub fn read_events(line: &str) -> Vec<AgentEvent> {
@@ -35,18 +46,30 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
             };
-            vec![
-                AgentEvent::Usage {
-                    input_tokens: count("input_tokens"),
-                    output_tokens: count("output_tokens"),
-                    cost_usd: None,
-                },
-                AgentEvent::TurnEnded { failed: false },
-            ]
+            let mut events = vec![AgentEvent::Usage {
+                input_tokens: count("input_tokens"),
+                output_tokens: count("output_tokens"),
+                cost_usd: None,
+            }];
+            events.extend(reported(&event));
+            events.push(AgentEvent::TurnEnded { failed: false });
+            events
         }
-        Some("turn.failed") => vec![AgentEvent::TurnEnded { failed: true }],
+        Some("turn.failed") => {
+            let mut events: Vec<AgentEvent> = reported(&event).into_iter().collect();
+            events.push(AgentEvent::TurnEnded { failed: true });
+            events
+        }
         _ => Vec::new(),
     }
+}
+
+/// The turn's final message, when its end carries one ([`FINAL_MESSAGE`]):
+/// the report when the message is one (a run held to the report schema
+/// with `--output-schema`/`outputSchema` writes nothing else).
+fn reported(end: &Value) -> Option<AgentEvent> {
+    let text = end.get(FINAL_MESSAGE)?.as_str()?;
+    Some(crate::events::reported_text(text))
 }
 
 /// An item's step (when it is one), and its end once it completed. An item
@@ -164,6 +187,40 @@ mod tests {
         assert_eq!(
             read_events(r#"{"type":"turn.failed","error":{"message":"x"}}"#),
             vec![AgentEvent::TurnEnded { failed: true }]
+        );
+    }
+
+    #[test]
+    fn a_turns_end_reports_the_final_message_its_host_wrote_on_it() {
+        // `exec` read directly: its end names no final message.
+        assert!(
+            !read_events(r#"{"type":"turn.completed","usage":{}}"#)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Reported { .. }))
+        );
+        assert_eq!(
+            read_events(r#"{"type":"turn.completed","usage":{},"final_message":"Done.\n"}"#)[1],
+            AgentEvent::Reported {
+                text: "Done.".into(),
+                report: None
+            }
+        );
+        let report = crate::Report {
+            summary: "Added a test.".into(),
+            needs_owner: true,
+            ..crate::Report::default()
+        };
+        let line = serde_json::json!({
+            "type": "turn.completed",
+            "usage": {},
+            FINAL_MESSAGE: report.to_value().to_string(),
+        });
+        assert_eq!(
+            read_events(&line.to_string())[1],
+            AgentEvent::Reported {
+                text: "Added a test.".into(),
+                report: Some(report)
+            }
         );
     }
 }

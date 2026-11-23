@@ -127,6 +127,10 @@ pub struct ConversationAgent {
     /// Its latest run: what a follow-up continues.
     pub latest_run: String,
     pub state: AgentState,
+    /// What its latest run ended with, in one short line built from its
+    /// typed result (reply, files changed, checks, mismatches); `None`
+    /// while it works or when it ended with nothing.
+    pub latest_result: Option<String>,
 }
 
 /// Where a conversation's agent stands.

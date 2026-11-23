@@ -15,7 +15,14 @@
 //! A run continues an earlier session with `--resume <session id>`, in
 //! print mode as in its terminal. Claude Code keeps a session under the
 //! folder it ran in, so the run must work in the same folder.
-//! Verified against Claude Code 2.1.327 (live probes, 2026-11-17/18).
+//!
+//! A run asked for a report ([`RunRequest::report`]) is launched with
+//! `--json-schema <the report schema>`, plain or hosted alike: its final
+//! `result` event then carries the report as `structured_output`
+//! ([`events`]).
+//!
+//! Verified against Claude Code 2.1.327 (live probes, 2026-11-17/18; the
+//! report, 2026-11-23).
 
 pub mod events;
 pub mod host;
@@ -177,6 +184,16 @@ fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> 
     if let Some(session) = request.resume {
         crate::agent::set_option(&mut launch.args, launch.start, "--resume", &["-r"], session);
     }
+    if request.report {
+        let schema = crate::report::schema().to_string();
+        crate::agent::set_option(
+            &mut launch.args,
+            launch.start,
+            "--json-schema",
+            &[],
+            &schema,
+        );
+    }
     let args = &mut launch.args;
     basics(args);
     if !request.enforce {
@@ -212,6 +229,11 @@ fn shape(request: &RunRequest<'_>, launch: &mut Launch) -> Result<Plan, String> 
 
 impl CodingAgent for ClaudeCode {
     fn reports_steps(&self) -> bool {
+        true
+    }
+
+    /// `--json-schema` holds its final message to the report schema.
+    fn reports_in_fields(&self) -> bool {
         true
     }
 
@@ -379,6 +401,7 @@ mod tests {
             stdin_open: true,
             model: None,
             resume: None,
+            report: false,
         }
     }
 
@@ -551,6 +574,51 @@ mod tests {
                 "{joined}"
             );
             assert!(joined.contains("--resume s-1"), "{joined}");
+        }
+    }
+
+    #[test]
+    fn a_run_asked_for_a_report_holds_its_final_message_to_the_schema() {
+        assert!(ClaudeCode.reports_in_fields());
+        let schema_of = |launch: &Launch| {
+            let at = launch.args.iter().position(|arg| arg == "--json-schema")?;
+            serde_json::from_str::<Value>(&launch.args[at + 1]).ok()
+        };
+        for (mode, can_host) in [
+            (PermissionMode::FullAccess, false),
+            (PermissionMode::Checked, true),
+            (PermissionMode::EveryCommand, true),
+        ] {
+            let mut asked = request(mode, false, can_host);
+            asked.report = true;
+            // A stored launch's own schema is replaced.
+            let mut launch = Launch {
+                args: strings(&["-p", "--json-schema", "{}"]),
+                start: 0,
+            };
+            let plan = ClaudeCode.prepare(&asked, &mut launch).unwrap();
+            assert_eq!(
+                schema_of(&launch),
+                Some(crate::report::schema()),
+                "{mode:?}"
+            );
+            assert_eq!(
+                launch
+                    .args
+                    .iter()
+                    .filter(|arg| *arg == "--json-schema")
+                    .count(),
+                1
+            );
+            // Hosted (the task on stdin) or not, the flag goes with it.
+            assert_eq!(plan.host.is_some(), can_host);
+            asked.report = false;
+            let mut launch = Launch {
+                args: strings(&["-p"]),
+                start: 0,
+            };
+            ClaudeCode.prepare(&asked, &mut launch).unwrap();
+            assert_eq!(schema_of(&launch), None);
         }
     }
 }

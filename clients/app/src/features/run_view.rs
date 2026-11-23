@@ -75,8 +75,13 @@ pub fn run_view(store: Store, id: String) -> View {
                                 )
                             })
                         });
+                        // Its typed result, once it ended.
+                        let result =
+                            summary.with(|run| run.as_ref().and_then(|run| run.result.clone()));
                         Some(untracked(move || match read {
-                            Read::Ready(detail) => body(store, detail, edited, coding, running),
+                            Read::Ready(detail) => {
+                                body(store, detail, result, edited, coding, running)
+                            }
                             Read::Failed(why) => note(format!("Could not read this run: {why}")),
                             _ => note("Reading what it did…".to_string()),
                         }))
@@ -98,7 +103,21 @@ fn thread(store: Store, id: String) -> View {
         let id = id.clone();
         (runs.len() > 1).then(|| {
             untracked(move || {
-                let mut list = view().gap_1();
+                // The agent's earlier runs: what it was asked before, and
+                // how each went.
+                let thread = runs
+                    .first()
+                    .map(|first| first.id.clone())
+                    .unwrap_or_default();
+                let name = store
+                    .participants()
+                    .into_iter()
+                    .find(|p| p.thread == thread)
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| "this agent".to_string());
+                let mut list = view()
+                    .gap_1()
+                    .child(section_label(format!("Earlier with {name}")));
                 for run in runs {
                     let this = run.id == id;
                     let words = format!("{} · {}", title(&run), run.label);
@@ -124,7 +143,7 @@ fn thread(store: Store, id: String) -> View {
                         )
                     };
                 }
-                section("Thread", list)
+                list
             })
         })
     }))
@@ -287,7 +306,14 @@ fn note(words: String) -> View {
 
 /// `coding`: its conversation has a Changes tab, where each changed file
 /// opens its diff.
-fn body(store: Store, detail: RunDetail, edited: Vec<String>, coding: bool, running: bool) -> View {
+fn body(
+    store: Store,
+    detail: RunDetail,
+    result: Option<aidaemon_client_protocol::RunResult>,
+    edited: Vec<String>,
+    coding: bool,
+    running: bool,
+) -> View {
     let mut page = view().gap_3().pt_2();
     if !detail.task.is_empty() {
         page = page.child(section(
@@ -385,16 +411,77 @@ fn body(store: Store, detail: RunDetail, edited: Vec<String>, coding: bool, runn
         }
         page = page.child(section("Changed", files));
     }
-    if let Some(result) = &detail.result {
-        page = page.child(section(
-            "Reported",
-            view().child(
-                text(result.clone())
-                    .selectable(true)
-                    .text_size(px(type_scale::SM))
-                    .text_color(colors::MUTED),
-            ),
-        ));
+    // What it ended with: its typed result (its report's claims, each one
+    // the record doesn't bear out flagged), else what its record kept.
+    let said = result
+        .as_ref()
+        .map(|result| result.text.clone())
+        .filter(|text| !text.is_empty())
+        .or(detail.result.clone());
+    if let Some(said) = said {
+        let mut reported = view().gap_1().child(
+            text(said)
+                .selectable(true)
+                .text_size(px(type_scale::SM))
+                .text_color(colors::MUTED),
+        );
+        if let Some(result) = &result {
+            if let Some(report) = &result.report {
+                for check in &report.checks {
+                    reported = reported.child(if check.passed {
+                        line(
+                            Glyph::Check,
+                            Tone::Success,
+                            format!("{} passed", check.command),
+                            false,
+                        )
+                    } else {
+                        line(
+                            Glyph::Warning,
+                            Tone::Danger,
+                            format!("{} failed", check.command),
+                            false,
+                        )
+                    });
+                }
+                for question in &report.open_questions {
+                    reported = reported.child(line(
+                        Glyph::Dot,
+                        Tone::Info,
+                        format!("Open: {question}"),
+                        false,
+                    ));
+                }
+                if report.needs_owner {
+                    reported = reported.child(line(
+                        Glyph::Approval,
+                        Tone::Warning,
+                        "Needs you".into(),
+                        false,
+                    ));
+                }
+            }
+            for mismatch in &result.mismatches {
+                use aidaemon_client_protocol::RunMismatch;
+                let words = match mismatch {
+                    RunMismatch::ChangeNotSeen { path } => {
+                        format!("Says it changed {path}, but no change was seen")
+                    }
+                    RunMismatch::ChangeNotClaimed { path } => {
+                        format!("Changed {path} without saying so")
+                    }
+                    RunMismatch::CheckNotRun { command } => {
+                        format!("Says it ran {command}, but no run was seen")
+                    }
+                    RunMismatch::CheckFailed { command } => {
+                        format!("Says {command} passed, but it failed")
+                    }
+                    RunMismatch::Unknown => continue,
+                };
+                reported = reported.child(line(Glyph::Warning, Tone::Warning, words, false));
+            }
+        }
+        page = page.child(section("Reported", reported));
     }
     let mut facts = Vec::new();
     if let Some(model) = &detail.model {

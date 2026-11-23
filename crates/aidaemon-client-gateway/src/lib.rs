@@ -2584,6 +2584,7 @@ impl ClientGateway {
                     continues: run.continues.as_deref(),
                     thread: run.thread.as_deref(),
                     keeps_session: run.keeps_session,
+                    result: run.result.as_ref(),
                     started_at: run.started_at,
                     ended_at: run.ended_at,
                 },
@@ -2625,6 +2626,7 @@ impl ClientGateway {
                 } else {
                     AgentState::Ended
                 },
+                latest_result: p.latest.result.as_ref().map(result_line),
                 name: p.name,
                 agent: p.agent,
                 latest_run: p.latest.id,
@@ -2655,6 +2657,7 @@ impl ClientGateway {
                         continues: run.continues.as_deref(),
                         thread: run.thread.as_deref(),
                         keeps_session: run.keeps_session,
+                        result: run.result.as_ref(),
                         started_at: run.started_at,
                         ended_at: run.ended_at,
                     },
@@ -2708,6 +2711,61 @@ fn internal(error: anyhow::Error) -> ProtocolError {
         ErrorCode::Internal,
         "The daemon could not complete the command",
     )
+}
+
+/// A run's result in one short line for its conversation's turn: its reply,
+/// then its typed facts. Every part is from the typed result.
+fn result_line(result: &aidaemon_client_protocol::RunResult) -> String {
+    use aidaemon_client_protocol::RunMismatch;
+    let mut line = aidaemon_channels::presentation::word_preview(&result.text, 240);
+    if let Some(report) = &result.report {
+        if !report.changed_files.is_empty() {
+            line.push_str(&format!(" Changed: {}.", report.changed_files.join(", ")));
+        }
+        if !report.checks.is_empty() {
+            let checks: Vec<String> = report
+                .checks
+                .iter()
+                .map(|check| {
+                    format!(
+                        "{} {}",
+                        check.command,
+                        if check.passed { "passed" } else { "failed" }
+                    )
+                })
+                .collect();
+            line.push_str(&format!(" Checks: {}.", checks.join("; ")));
+        }
+        if !report.open_questions.is_empty() {
+            line.push_str(&format!(" Open: {}.", report.open_questions.join("; ")));
+        }
+        if report.needs_owner {
+            line.push_str(" It needs the owner.");
+        }
+    }
+    let mismatches: Vec<String> = result
+        .mismatches
+        .iter()
+        .filter_map(|mismatch| match mismatch {
+            RunMismatch::ChangeNotSeen { path } => {
+                Some(format!("claimed {path} changed, no change seen"))
+            }
+            RunMismatch::ChangeNotClaimed { path } => {
+                Some(format!("changed {path} without saying so"))
+            }
+            RunMismatch::CheckNotRun { command } => {
+                Some(format!("claimed `{command}` ran, no run seen"))
+            }
+            RunMismatch::CheckFailed { command } => {
+                Some(format!("claimed `{command}` passed, it failed"))
+            }
+            RunMismatch::Unknown => None,
+        })
+        .collect();
+    if !mismatches.is_empty() {
+        line.push_str(&format!(" Record disagrees: {}.", mismatches.join("; ")));
+    }
+    line
 }
 
 #[cfg(test)]

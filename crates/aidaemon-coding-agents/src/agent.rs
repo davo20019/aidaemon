@@ -106,6 +106,12 @@ pub trait CodingAgent: Send + Sync {
     fn reports_steps(&self) -> bool {
         false
     }
+
+    /// Its final message can be held to the report schema
+    /// ([`RunRequest::report`]): it ends with a [`crate::Report`].
+    fn reports_in_fields(&self) -> bool {
+        false
+    }
 }
 
 /// One run, as the embedding agent asks for it.
@@ -132,6 +138,9 @@ pub struct RunRequest<'a> {
     /// The model the owner chose for it (an id it knows); `None`: its own
     /// default. Only an agent that [`CodingAgent::takes_model`] uses it.
     pub model: Option<&'a str>,
+    /// Hold its final message to the report schema ([`crate::report`])
+    /// where it can be ([`CodingAgent::reports_in_fields`]).
+    pub report: bool,
     /// The agent's own id for a session an earlier run of it started (the
     /// one its [`crate::AgentEvent::Session`] reported), to continue with
     /// what it learned there; `None`: a new session. Only an agent that
