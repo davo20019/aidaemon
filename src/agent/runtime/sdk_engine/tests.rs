@@ -1898,12 +1898,10 @@ async fn bridged_terminal_access_lists_command_and_script() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
         .await
         .unwrap();
-    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -1935,12 +1933,10 @@ async fn bridged_terminal_ls_is_read_only_rm_is_not() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
         .await
         .unwrap();
-    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -2027,12 +2023,10 @@ async fn same_tool_limit_still_limits_distinct_terminal_commands() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
         .await
         .unwrap();
-    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(1);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(approval_tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -3920,13 +3914,10 @@ async fn judged_terminal_escalation_is_the_dispatched_one() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    let (tx, rx) = mpsc::channel(1);
-    drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
-            crate::tools::ApprovalBroker::new(tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -4077,13 +4068,10 @@ async fn sandbox_dotdot_read_out_of_the_project_asks() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    let (tx, rx) = mpsc::channel(1);
-    drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
-            crate::tools::ApprovalBroker::new(tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -4178,13 +4166,10 @@ async fn judged_terminal_rules(
         .await
         .unwrap();
     aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
-    let (tx, rx) = mpsc::channel(1);
-    drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
-            crate::tools::ApprovalBroker::new(tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -4769,13 +4754,10 @@ async fn canonical_hook_anchors_a_call_before_it_is_judged() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    let (tx, rx) = mpsc::channel(1);
-    drop(rx);
     let tool: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["cat".to_string()],
-            crate::tools::ApprovalBroker::new(tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -5711,12 +5693,9 @@ async fn a_code_change_is_checked_once_before_the_run_reports() {
         let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_file.path().display()))
             .await
             .unwrap();
-        let (approval_tx, _approval_rx) =
-            tokio::sync::mpsc::channel::<crate::tools::terminal::ApprovalRequest>(1);
         let terminal = crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx),
             30,
             8000,
             crate::tools::command_risk::PermissionMode::Yolo,

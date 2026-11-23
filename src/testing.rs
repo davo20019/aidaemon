@@ -1556,14 +1556,13 @@ pub async fn setup_full_stack_test_agent_with_extra_tools(
 
     // Approval channel
     let (approval_tx, approval_rx) = mpsc::channel(16);
-    let approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
+    let _approval_tx = crate::tools::ApprovalBroker::new(approval_tx);
 
     // TerminalTool in Yolo mode — auto-approves everything
     let terminal_tool = Arc::new(
         TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["*".to_string()],
-            approval_tx,
             30,
             8000,
             PermissionMode::Yolo,
@@ -1729,18 +1728,10 @@ pub async fn setup_live_agent(
     let pool = state.pool();
     let event_store = Arc::new(EventStore::new(pool.clone()).await?);
 
-    let (approval_tx, mut approval_rx) =
-        mpsc::channel::<crate::tools::terminal::ApprovalRequest>(16);
-    tokio::spawn(async move {
-        while let Some(request) = approval_rx.recv().await {
-            let _ = request.response_tx.send(ApprovalResponse::AllowOnce);
-        }
-    });
     let terminal_tool = Arc::new(
         TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec!["*".to_string()],
-            crate::tools::ApprovalBroker::new(approval_tx),
             60,
             8000,
             PermissionMode::Yolo,

@@ -959,11 +959,9 @@ async fn a_helper_that_waited_for_its_background_command_finished() {
     ]);
     let helper_terminal = Arc::new(HelperTerminal(std::sync::OnceLock::new()));
     let harness = root(provider, vec![helper_terminal.clone()]).await;
-    let (approval_tx, _approvals) = tokio::sync::mpsc::channel(1);
     let terminal = crate::tools::TerminalTool::new(
         crate::execution::active_execution_backend(),
         vec!["*".to_string()],
-        crate::tools::ApprovalBroker::new(approval_tx),
         30,
         4000,
         crate::tools::command_risk::PermissionMode::Yolo,

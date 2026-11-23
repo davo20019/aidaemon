@@ -91,13 +91,10 @@ async fn approvals_harness_with(
     aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
     // The tools' own brokers must never be used: a card on them fails the
     // test (nobody answers, and the card count below stays on the agent's).
-    let (tool_tx, _tool_rx) = tokio::sync::mpsc::channel(1);
-    std::mem::forget(_tool_rx);
     let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
         crate::tools::TerminalTool::new(
             crate::execution::active_execution_backend(),
             vec![],
-            crate::tools::ApprovalBroker::new(tool_tx),
             1,
             1000,
             crate::types::PermissionMode::Default,
@@ -1011,12 +1008,9 @@ async fn terminal_harness(
         .await
         .unwrap();
     aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
-    let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
-    drop(tool_rx);
     let terminal = crate::tools::TerminalTool::new(
         crate::execution::active_execution_backend(),
         setup.allowed,
-        crate::tools::ApprovalBroker::new(tool_tx),
         5,
         4000,
         setup.mode,
@@ -1244,12 +1238,9 @@ async fn terminal_outside_kernel_requires_kernel_approval() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", pool_file.path().display()))
         .await
         .unwrap();
-    let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(1);
-    drop(tool_rx);
     let terminal = crate::tools::TerminalTool::new(
         crate::execution::active_execution_backend(),
         Vec::new(),
-        crate::tools::ApprovalBroker::new(tool_tx),
         5,
         4000,
         crate::types::PermissionMode::Default,

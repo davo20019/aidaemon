@@ -895,13 +895,10 @@ mod tests {
             .await
             .unwrap();
         aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(rx);
         let terminal: Arc<dyn crate::traits::Tool> = Arc::new(
             crate::tools::TerminalTool::new(
                 crate::execution::active_execution_backend(),
                 allowed.iter().map(|p| p.to_string()).collect(),
-                crate::tools::ApprovalBroker::new(tx),
                 1,
                 1000,
                 crate::types::PermissionMode::Default,
@@ -1169,13 +1166,10 @@ mod tests {
             .await
             .unwrap();
         aidaemon_tools::testing::delete_at_exit(pool_file.into_temp_path().keep().unwrap());
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(rx);
         let confined: Arc<dyn crate::traits::Tool> = Arc::new(
             crate::tools::TerminalTool::new(
                 crate::execution::active_execution_backend(),
                 vec!["cat".to_string()],
-                crate::tools::ApprovalBroker::new(tx),
                 1,
                 1000,
                 crate::types::PermissionMode::Default,

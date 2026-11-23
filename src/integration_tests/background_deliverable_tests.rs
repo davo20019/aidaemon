@@ -11,14 +11,14 @@ use crate::testing::CallWithFacts;
 use crate::channels::{ChannelHub, SessionMap};
 use crate::state::SqliteStateStore;
 use crate::tools::command_risk::PermissionMode;
-use crate::tools::terminal::{ApprovalRequest, TerminalTool};
+use crate::tools::terminal::TerminalTool;
 use crate::traits::{HubChannel, ChannelCapabilities};
 use crate::types::{MediaKind, MediaMessage};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 
 /// How many 200 ms polls a test waits for a background command to finish
 /// and its result to arrive: a minute. The commands start Python, which a
@@ -120,13 +120,10 @@ async fn make_terminal_with_hub(
     let pool = state.pool();
     let plan_store = Arc::new(crate::plans::PlanStore::new(pool.clone()).await.unwrap());
 
-    let (approval_tx_raw, _approval_rx) = mpsc::channel::<ApprovalRequest>(1);
-    let approval_tx = crate::tools::ApprovalBroker::new(approval_tx_raw);
 
     let tool = Arc::new(
         TerminalTool::new(crate::execution::active_execution_backend(),
             vec!["*".to_string()],
-            approval_tx,
             1, // 1-second initial timeout — moves long commands to background fast
             8000,
             PermissionMode::Yolo,
