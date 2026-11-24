@@ -1483,6 +1483,19 @@ pub trait ConversationRuntime: Send + Sync {
         None
     }
 
+    /// Keeps a background result the owner was shown with no turn written
+    /// around it in the session's history, so the chat shows it again and
+    /// later turns can refer to it. Untrusted output joins a turn recorded
+    /// tainted. A no-op where this host keeps no history.
+    async fn record_delivered_result(
+        &self,
+        _session_id: &str,
+        _text: &str,
+        _trust: aidaemon_core::SourceTrust,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Where its continuations are shown live as turns; `None` when no one
     /// watches.
     fn turn_watch(&self) -> Option<aidaemon_channels::turns::TurnWatch> {

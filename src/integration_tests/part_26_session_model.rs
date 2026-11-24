@@ -241,3 +241,40 @@ async fn a_coding_agent_conversation_reports_a_refused_run_as_it_is() {
     assert!(reply.contains("another run is working"), "{reply}");
     assert!(!reply.contains("completed 1 action"), "{reply}");
 }
+
+/// An agent's result shown with no turn written around it (a conversation
+/// set to that agent) stays in history, so the chat shows it again after a
+/// reload, and the untrusted output joins a turn recorded tainted.
+#[tokio::test]
+async fn a_coding_agent_result_delivered_as_it_is_stays_in_history() {
+    use aidaemon_runtime::spawn::ConversationRuntime;
+    let provider = MockProvider::with_responses(vec![]);
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, Vec::new(), None)
+        .await
+        .unwrap();
+
+    harness
+        .agent
+        .record_delivered_result(
+            "app:direct",
+            "The submit button now reads Send.",
+            aidaemon_core::SourceTrust::Untrusted,
+        )
+        .await
+        .unwrap();
+
+    let history = harness.state.get_history("app:direct", 20).await.unwrap();
+    let note = history
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("the result is kept");
+    let content = note.content.as_deref().unwrap_or_default();
+    assert_eq!(
+        aidaemon_runtime::turn::notes::parent_note_shown_text(content),
+        Some("The submit button now reads Send.")
+    );
+    let tainted = crate::agent::untrusted::tainted_turns(harness.state.as_ref(), "app:direct")
+        .await
+        .unwrap();
+    assert!(tainted.iter().any(|turn| Some(turn) == note.turn_id.as_ref()));
+}

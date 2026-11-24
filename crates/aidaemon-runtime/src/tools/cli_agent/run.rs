@@ -2685,6 +2685,27 @@ async fn deliver_end(
         match hub.send_text_tracked(&notify_session_id, &text).await {
             Ok(platform_id) => {
                 delivered = true;
+                // No turn wrote this answer (a conversation set to the agent,
+                // or no re-engagement): keep it in history so a reload shows
+                // it and later turns can refer to it. The agent's output is
+                // untrusted.
+                if envelope.is_none()
+                    && let Some(agent) = handles.agent.as_ref()
+                    && let Err(error) = agent
+                        .record_delivered_result(
+                            &notify_session_id,
+                            &text,
+                            aidaemon_core::SourceTrust::Untrusted,
+                        )
+                        .await
+                {
+                    warn!(
+                        task_id = %task_id_for_notify,
+                        session_id = %notify_session_id,
+                        %error,
+                        "cli_agent result was delivered but not kept in history"
+                    );
+                }
                 if let (Some(envelope), Some(agent)) = (envelope.as_ref(), handles.agent.as_ref()) {
                     let _ = agent
                         .record_continuation_delivery(

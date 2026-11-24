@@ -26,6 +26,9 @@ pub enum ParentDeliveryKind {
     GoalNotification,
     /// Completion/failure message from a backgrounded `spawn_agent`.
     BackgroundSpawnResult,
+    /// A coding agent's result delivered as it is, with no turn written
+    /// around it (a conversation set to that agent).
+    CodingAgentResult,
 }
 
 impl ParentDeliveryKind {
@@ -34,15 +37,17 @@ impl ParentDeliveryKind {
             ParentDeliveryKind::ExecutorResult => "Parent-visible result (executor)",
             ParentDeliveryKind::GoalNotification => "Parent-visible result (goal notification)",
             ParentDeliveryKind::BackgroundSpawnResult => "Parent-visible result (background spawn)",
+            ParentDeliveryKind::CodingAgentResult => "Parent-visible result (coding agent)",
         }
     }
 }
 
 impl ParentDeliveryKind {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::ExecutorResult,
         Self::GoalNotification,
         Self::BackgroundSpawnResult,
+        Self::CodingAgentResult,
     ];
 }
 

@@ -259,6 +259,27 @@ impl ConversationRuntime for Agent {
         Agent::interpret_background_result(self, command, output).await
     }
 
+    async fn record_delivered_result(
+        &self,
+        session_id: &str,
+        text: &str,
+        trust: aidaemon_core::SourceTrust,
+    ) -> anyhow::Result<()> {
+        let turn_id = match trust {
+            aidaemon_core::SourceTrust::Trusted => None,
+            aidaemon_core::SourceTrust::Untrusted => {
+                Some(self.tainted_note_turn(session_id).await?)
+            }
+        };
+        self.record_parent_visible_result_note_in_turn(
+            session_id,
+            crate::turn::notes::ParentDeliveryKind::CodingAgentResult.note_prefix(),
+            text,
+            turn_id.as_deref(),
+        )
+        .await
+    }
+
     fn turn_watch(&self) -> Option<aidaemon_channels::turns::TurnWatch> {
         Agent::turn_watch(self)
     }
