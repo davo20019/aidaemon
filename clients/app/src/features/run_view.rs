@@ -246,11 +246,13 @@ fn answer(store: Store, run: &RunSummary) -> View {
     match (&reply, run.phase) {
         (Some(reply), _) => {
             // The agent's reply is Markdown, as a model's is.
-            let reply = reply.clone();
-            said = said.child(super::conversation::markdown(
-                move || reply.clone().into(),
-                || false,
-            ));
+            let shown = reply.clone();
+            said = said
+                .child(super::conversation::markdown(
+                    move || shown.clone().into(),
+                    || false,
+                ))
+                .child(reply_actions(store, reply.clone()));
         }
         (None, RunPhase::Failed | RunPhase::Stopped) => {
             let why = run.reason.clone().unwrap_or_else(|| match run.phase {
@@ -273,6 +275,22 @@ fn answer(store: Store, run: &RunSummary) -> View {
         }
     }
     said
+}
+
+/// Under the agent's reply: Copy and Read aloud, as under a model's.
+fn reply_actions(store: Store, reply: String) -> View {
+    let copied = reply.clone();
+    view()
+        .flex_row()
+        .items_center()
+        .gap_4()
+        .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
+            set_clipboard(copied.clone());
+            store.say("Copied the reply");
+        }))
+        .child(super::conversation::read_aloud(store, move || {
+            reply.clone()
+        }))
 }
 
 /// What a run's result says beyond its reply, a line each: each check it

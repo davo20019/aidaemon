@@ -2093,7 +2093,7 @@ fn reply_footer(
 
 /// Beside Copy: read the reply aloud, and Stop while it reads. Shown only
 /// where something can speak (the browser's voice, or macOS's).
-fn read_aloud(store: Store, content: impl Fn() -> String + 'static) -> View {
+pub(crate) fn read_aloud(store: Store, content: impl Fn() -> String + 'static) -> View {
     if !crate::link::can_speak() {
         return view();
     }

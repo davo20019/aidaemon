@@ -853,6 +853,8 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.wait_for("text:aidaemon asked")?;
     app.wait_for("text:Fix the slug in slug.py")?;
     app.wait_for("text:Fixed the slug.")?;
+    // The reply can be copied, as a model's can.
+    app.press("label:Copy >> nth=0")?;
     app.wait_for("text:1 step")?;
     app.wait_for("text:Ready for a follow-up")?;
     app.type_text("label:Follow-up for the agent", "Also add a test")?;
