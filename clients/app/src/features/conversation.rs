@@ -1643,7 +1643,10 @@ fn transcript(store: Store, session: String) -> View {
         });
         let before = shown_len.replace(len);
         if before == 0 {
-            // It opened (or its history came): at its end.
+            // Its history came after it opened: at its end.
+            if len > 0 {
+                list.scroll_to_end(false);
+            }
             last_seen.set(usize::MAX);
             return;
         }
@@ -1750,7 +1753,6 @@ fn transcript_list(
     last_seen: Signal<usize>,
     unfolding: ui::Unfolding,
 ) -> VirtualList {
-    let count = all.with_untracked(Vec::len);
     virtual_list(
         move || all.with(Vec::len),
         move |at| {
@@ -1899,7 +1901,10 @@ fn transcript_list(
         }
     })
     .estimated_item_size(px(96.0))
-    .initial_scroll_index(count.saturating_sub(1))
+    // At the newest message, kept there while the rows in view are
+    // measured: an index scroll landed by estimated heights, short of the
+    // end (opened mid-conversation, live 2026-11-23).
+    .initial_scroll_at_end()
     // Following the end, except while a section unfolds: the list would
     // jump to the new end in one step under the sliding region. No
     // distance is within a negative threshold, so it keeps its place.
