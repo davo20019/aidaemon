@@ -645,13 +645,28 @@ impl CliAgentTool {
                         .agent
                         .as_deref()
                         == Some(agent.as_str())
-                    && let Ok(Some(run)) = self
+                {
+                    match self
                         .state
                         .latest_kept_cli_agent_run(&session_id, &agent)
                         .await
-                    && self.earlier_run(&run, &session_id).await.is_ok()
-                {
-                    args.continue_run = Some(run);
+                    {
+                        Ok(Some(run)) => match self.earlier_run(&run, &session_id).await {
+                            Ok(_) => {
+                                info!(%session_id, %agent, %run, "Coding agent conversation: going on from the agent's last session");
+                                args.continue_run = Some(run);
+                            }
+                            Err(why) => {
+                                info!(%session_id, %agent, %run, %why, "Coding agent conversation: a new session (the last one can't be continued)");
+                            }
+                        },
+                        Ok(None) => {
+                            info!(%session_id, %agent, "Coding agent conversation: a new session (no earlier run here kept its session)");
+                        }
+                        Err(error) => {
+                            warn!(%session_id, %agent, %error, "Coding agent conversation: could not look up the agent's last session");
+                        }
+                    }
                 }
                 // A follow-up to an earlier run: the same agent, in its
                 // folder, going on in its own session.
