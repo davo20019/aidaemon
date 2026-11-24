@@ -30,11 +30,13 @@ struct TestStore {
     events: std::sync::Mutex<Vec<(i64, i64, String, String)>>,
     sessions: std::sync::Mutex<Vec<(i64, String)>>,
     /// Run metadata keyed by invocation id: (run_id, mode, keeps_session, thread).
-    run_meta:
-        std::sync::Mutex<HashMap<i64, (Option<String>, Option<String>, bool, Option<String>)>>,
+    run_meta: std::sync::Mutex<HashMap<i64, RunMeta>>,
     /// Settings a test stored (a conversation set to a coding agent).
     settings: std::sync::Mutex<HashMap<String, String>>,
 }
+
+/// A kept run's metadata: (run_id, mode, keeps_session, thread).
+type RunMeta = (Option<String>, Option<String>, bool, Option<String>);
 
 impl TestStore {
     async fn open(path: &str) -> Self {

@@ -738,11 +738,11 @@ async fn single_pass_snapshot_skips_unmarked_dirs_consistently() {
     std::fs::write(dir.path().join("target/cache"), "v1").unwrap();
     std::fs::write(dir.path().join("lib.rs"), "fn main() {}\n").unwrap();
 
-    let before = snapshot_roots(&tool.backend, &[root.clone()]).await;
+    let before = snapshot_roots(&tool.backend, std::slice::from_ref(&root)).await;
     // Mutate only unmarked directories.
     std::fs::write(dir.path().join(".git/index"), "v2-longer").unwrap();
     std::fs::write(dir.path().join("target/new_artifact"), "bytes").unwrap();
-    let after_unmarked = snapshot_roots(&tool.backend, &[root.clone()]).await;
+    let after_unmarked = snapshot_roots(&tool.backend, std::slice::from_ref(&root)).await;
     assert_eq!(
         before.receipt, after_unmarked.receipt,
         "unmarked directory churn must not alter TreeReceipt"
