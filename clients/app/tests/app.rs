@@ -888,16 +888,22 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     )]);
     app.wait_for("text:working · 2 runs")?;
     feed([frame(
-        r#"{"type":"event","seq":11,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true,"result":{"text":"Added a test for the slug.","report":{"summary":"Added a test for the slug.","changed_files":["tests/test_slug.py"],"checks":[{"command":"pytest -q","passed":true}]},"mismatches":[{"kind":"check_not_run","command":"pytest -q"}]}}}}"#,
+        r#"{"type":"event","seq":11,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999995000,"ended_at_ms":9999999999000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","can_continue":true,"asked":{"text":"Also add a test","by_owner":true},"result":{"text":"Added a test for the slug.","report":{"summary":"Added a test for the slug.","changed_files":["tests/test_slug.py"],"checks":[{"command":"pytest -q","passed":true}]},"mismatches":[{"kind":"check_not_run","command":"pytest -q"}]}}}}"#,
     )]);
     app.wait_for("text:can continue · 2 runs · now")?;
-    // Its reply is its message in the conversation: who it is, what it
-    // said, its report, and the claim the record doesn't bear out.
+    // The owner's exchange with it lives in its thread: the conversation
+    // shows the first run's message and its reply count, which opens the
+    // thread at the newest reply (what it said, its checks, and the claim
+    // the record doesn't bear out).
     app.wait_for("text:Fix the slug · Codex")?;
+    assert!(app.wait_for("text:Added a test for the slug.").is_err());
+    let before = sent("get_run");
+    app.press("1 reply, open the thread")?;
+    wait_sent_new("get_run", before)?;
     app.wait_for("text:Added a test for the slug.")?;
-    app.wait_for("text:Changed test_slug.py")?;
     app.wait_for("text:pytest -q passed")?;
     app.wait_for("text:Says it ran pytest -q, but no run was seen")?;
+    app.press("Back")?;
     app.press("1 agent")?;
     // The owner names it; the daemon keeps the name and every client shows it.
     app.press("Rename this agent")?;

@@ -17,21 +17,11 @@ use crate::store::{ActivityMode, DraftFileState, Felt, Store};
 use crate::ui::{self, Glyph, Size, Variant, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
-/// The agent an owner's message went to directly: its name as the owner
-/// reads it, and the run that took the message.
-#[derive(Debug, Clone, PartialEq)]
-struct To {
-    name: String,
-    run: String,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum Row {
     /// A day break: "Today", "Yesterday", "Mar 3".
     Day(String),
-    /// The owner's message: its text, time and files, and the agent it
-    /// went to directly, when it was a follow-up to one.
-    User(String, u64, Vec<AttachmentRef>, Option<To>),
+    User(String, u64, Vec<AttachmentRef>),
     /// A reply: its text, time and files, whether it only says the work
     /// went on in the background, whether its time and Copy show (the
     /// last reply before the owner speaks again), and the provider and
@@ -101,7 +91,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
                 at_ms,
                 attachments,
                 ..
-            } => Row::User(text, at_ms, attachments, None),
+            } => Row::User(text, at_ms, attachments),
             Line::Assistant {
                 text,
                 at_ms,
@@ -132,15 +122,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     // still being answered has its runs under its live line.
     let runs = store.runs_for(session);
     let tail = place_runs(&mut rows, &runs);
-    let people = store.participants();
-    let mut rows = to_agents(without_launch_lines(rows), &runs, |run| {
-        let thread = run.thread.clone().unwrap_or_else(|| run.id.clone());
-        let agent = run.agent.clone().unwrap_or_else(|| run.label.clone());
-        match people.iter().find(|p| p.thread == thread) {
-            Some(p) if p.name != agent => format!("{} · {agent}", p.name),
-            _ => agent,
-        }
-    });
+    let mut rows = without_launch_lines(rows);
     let live = store.live(session).is_some();
     let tail = tail.into_iter().map(|key| Row::Runs { key, headed: !live });
     if live {
@@ -165,7 +147,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
             .into_iter()
             .map(|a| Row::Approval(a.id)),
     );
-    rows
+    threaded(rows, &runs)
 }
 
 /// `rows` without each launch line ("Started in the background: …") that
@@ -183,16 +165,12 @@ fn without_launch_lines(rows: Vec<Row>) -> Vec<Row> {
     kept
 }
 
-/// Each owner's message that went to an agent directly (its request's one
-/// run was the owner's follow-up, `RunSummary::asked`) names that agent,
-/// and the turn's own activity line between the message and the agent's
-/// reply goes: the agent's reply answers the message.
-fn to_agents(
-    rows: Vec<Row>,
-    runs: &[RunSummary],
-    name: impl Fn(&RunSummary) -> String,
-) -> Vec<Row> {
-    let mut rows = rows;
+/// The conversation is the owner's with aidaemon: each exchange the owner
+/// had with an agent directly (a request whose one run was the owner's
+/// follow-up, `RunSummary::asked`) lives in that agent's thread, not here.
+/// Its message, its turn's activity line and its run's row go; the
+/// thread's first run counts its replies.
+fn threaded(rows: Vec<Row>, runs: &[RunSummary]) -> Vec<Row> {
     let mut dropped = vec![false; rows.len()];
     for at in 0..rows.len() {
         let Row::Runs { key, .. } = &rows[at] else {
@@ -205,29 +183,75 @@ fn to_agents(
         if !run.asked.as_ref().is_some_and(|asked| asked.by_owner) {
             continue;
         }
+        dropped[at] = true;
         let Some(user) = rows[..at]
             .iter()
             .rposition(|row| matches!(row, Row::User(..)))
         else {
             continue;
         };
+        dropped[user] = true;
         for between in user + 1..at {
             if matches!(rows[between], Row::Activity(..)) {
                 dropped[between] = true;
             }
-        }
-        let to = To {
-            name: name(run),
-            run: run.id.clone(),
-        };
-        if let Row::User(.., slot) = &mut rows[user] {
-            *slot = Some(to);
         }
     }
     rows.into_iter()
         .zip(dropped)
         .filter_map(|(row, dropped)| (!dropped).then_some(row))
         .collect()
+}
+
+/// The replies in run `root`'s thread (the runs that go on from it), and
+/// its newest run: how many, whether the newest works, when it last moved.
+fn replies_of(runs: &[RunSummary], root: &str) -> Option<(usize, bool, u64, String)> {
+    let replies: Vec<&RunSummary> = runs
+        .iter()
+        .filter(|run| run.id != root && run.thread.as_deref() == Some(root))
+        .collect();
+    let newest = replies.iter().max_by_key(|run| run.started_at_ms)?;
+    Some((
+        replies.len(),
+        newest.phase.is_running(),
+        newest.ended_at_ms.unwrap_or(newest.started_at_ms),
+        newest.id.clone(),
+    ))
+}
+
+/// Under a thread's first run: how many replies it has and when the last
+/// came, or that its agent works on one; opening the thread at its newest.
+fn replies(store: Store, root: String) -> View {
+    let info = computed(move || replies_of(&store.all_runs(), &root));
+    view().child(dynamic(move || {
+        let (count, working, at, newest) = info.get()?;
+        Some(untracked(move || {
+            let noun = if count == 1 { "reply" } else { "replies" };
+            let words = if working {
+                format!("{count} {noun} · working…")
+            } else {
+                format!("{count} {noun} · last {}", ui::time::clock(at))
+            };
+            button()
+                .self_start()
+                .accessibility_label(format!("{count} {noun}, open the thread"))
+                .on_press(move || store.open_run(&newest))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .pl(px(12.0))
+                        .child(ui::icon(Glyph::Chat).text_color(colors::ACCENT))
+                        .child(
+                            text(words)
+                                .text_size(px(type_scale::XS))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors::ACCENT),
+                        ),
+                )
+        }))
+    }))
 }
 
 /// A run's group: the request that started it, or the run alone.
@@ -591,9 +615,15 @@ fn run_rows(store: Store, runs: Memo<Vec<RunSummary>>) -> View {
                 WorkRow::Run { run, grouped }
                     if !grouped && run.agent.is_some() && run.result.is_some() =>
                 {
-                    agent_message(store, run.id, row)
+                    view()
+                        .gap_1()
+                        .child(agent_message(store, run.id.clone(), row))
+                        .child(replies(store, run.id))
                 }
-                WorkRow::Run { run, grouped } => run_row(store, run.id, row, grouped),
+                WorkRow::Run { run, grouped } => view()
+                    .gap_1()
+                    .child(run_row(store, run.id.clone(), row, grouped))
+                    .child(replies(store, run.id)),
                 WorkRow::Group { .. } => view(),
             }
         }))
@@ -1793,13 +1823,13 @@ fn transcript_list(
                     };
                     let at = move || {
                         row.with(|r| match r.as_ref() {
-                            Some(Row::User(_, at, ..) | Row::Assistant(_, at, ..)) => *at,
+                            Some(Row::User(_, at, _) | Row::Assistant(_, at, ..)) => *at,
                             _ => 0,
                         })
                     };
                     let attached = move || {
                         row.with(|r| match r {
-                            Some(Row::User(_, _, files, _) | Row::Assistant(_, _, files, ..)) => {
+                            Some(Row::User(_, _, files) | Row::Assistant(_, _, files, ..)) => {
                                 files.clone()
                             }
                             _ => Vec::new(),
@@ -1809,13 +1839,6 @@ fn transcript_list(
                         0 => column
                             .items_end()
                             .gap_1()
-                            .child(dynamic(move || {
-                                let to = row.with(|r| match r {
-                                    Some(Row::User(.., to)) => to.clone(),
-                                    _ => None,
-                                })?;
-                                Some(untracked(move || to_agent(store, to)))
-                            }))
                             .child(files(store, attached, true))
                             .child(when(
                                 move || !content().trim().is_empty(),
@@ -2278,29 +2301,6 @@ fn draft_files(store: Store) -> View {
             list
         }))
     }))
-}
-
-/// Over an owner's message that went to an agent directly: which agent,
-/// opening its view.
-fn to_agent(store: Store, to: To) -> View {
-    let words = format!("To {}", to.name);
-    view().child(
-        button()
-            .accessibility_label(format!("{words}, show the agent"))
-            .on_press(move || store.open_run(&to.run))
-            .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(ui::icon(Glyph::Send).text_color(colors::ACCENT))
-                    .child(
-                        text(words)
-                            .text_size(px(type_scale::XS))
-                            .text_color(colors::MUTED),
-                    ),
-            ),
-    )
 }
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
@@ -3443,57 +3443,58 @@ mod tests {
         Row::Assistant(format!("reply {at}"), at, Vec::new(), false, false, None)
     }
 
-    /// The owner's follow-up to an agent names it over the message, and
-    /// the turn's own activity line goes; aidaemon's delegation keeps both.
+    /// An exchange the owner had with an agent directly lives in its
+    /// thread: its message, its activity line and its run's row leave the
+    /// conversation, which counts the thread's replies; aidaemon's own
+    /// delegation stays.
     #[test]
-    fn an_owner_follow_up_names_its_agent_over_the_message() {
-        let mut asked = run("follow", Some("task-2"), 310);
-        asked.asked = Some(aidaemon_client_protocol::RunAsked {
+    fn an_owner_follow_up_lives_in_its_agents_thread() {
+        let mut follow = run("follow", Some("task-2"), 310);
+        follow.thread = Some("first".into());
+        follow.asked = Some(aidaemon_client_protocol::RunAsked {
             text: "explain it".into(),
             by_owner: true,
         });
-        let runs = [run("first", Some("task-1"), 110), asked];
+        let runs = [run("first", Some("task-1"), 110), follow];
         let activity = || Row::Activity(vec!["cli_agent".into()], 6, Vec::new());
+        let first = Row::Runs {
+            key: "task-1".into(),
+            headed: true,
+        };
         let rows = vec![
-            Row::User("fix it".into(), 100, Vec::new(), None),
+            Row::User("fix it".into(), 100, Vec::new()),
             activity(),
-            Row::Runs {
-                key: "task-1".into(),
-                headed: true,
-            },
-            Row::User("explain it".into(), 300, Vec::new(), None),
+            first.clone(),
+            Row::User("explain it".into(), 300, Vec::new()),
             activity(),
             Row::Runs {
                 key: "task-2".into(),
                 headed: true,
             },
+            Row::User("and you, aidaemon?".into(), 400, Vec::new()),
         ];
-        let rows = to_agents(rows, &runs, |_| "Coder · Codex".into());
-        assert_eq!(rows.len(), 5, "only the follow-up's activity line goes");
-        assert_eq!(rows[0], Row::User("fix it".into(), 100, Vec::new(), None));
         assert_eq!(
-            rows[3],
-            Row::User(
-                "explain it".into(),
-                300,
-                Vec::new(),
-                Some(To {
-                    name: "Coder · Codex".into(),
-                    run: "follow".into(),
-                }),
-            )
+            threaded(rows, &runs),
+            vec![
+                Row::User("fix it".into(), 100, Vec::new()),
+                activity(),
+                first,
+                Row::User("and you, aidaemon?".into(), 400, Vec::new()),
+            ]
         );
-        assert!(matches!(rows[4], Row::Runs { .. }));
+        let (count, working, _, newest) = replies_of(&runs, "first").expect("a reply");
+        assert_eq!((count, working, newest.as_str()), (1, false, "follow"));
+        assert_eq!(replies_of(&runs, "follow"), None);
     }
 
     #[test]
     fn a_requests_runs_sit_under_the_reply_that_started_them() {
         let mut rows = vec![
-            Row::User("first".into(), 100, Vec::new(), None),
+            Row::User("first".into(), 100, Vec::new()),
             reply(200),
-            Row::User("second".into(), 300, Vec::new(), None),
+            Row::User("second".into(), 300, Vec::new()),
             reply(400),
-            Row::User("third".into(), 500, Vec::new(), None),
+            Row::User("third".into(), 500, Vec::new()),
         ];
         let tail = place_runs(
             &mut rows,
@@ -3530,7 +3531,7 @@ mod tests {
             headed: true,
         };
         let rows = without_launch_lines(vec![
-            Row::User("go".into(), 100, Vec::new(), None),
+            Row::User("go".into(), 100, Vec::new()),
             launch.clone(),
             runs.clone(),
             // A launch line whose runs are not on record stays.
@@ -3540,7 +3541,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                Row::User("go".into(), 100, Vec::new(), None),
+                Row::User("go".into(), 100, Vec::new()),
                 runs,
                 launch,
                 reply(300)
