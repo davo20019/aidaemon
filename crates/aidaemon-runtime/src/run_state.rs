@@ -460,6 +460,8 @@ pub struct RunState {
     pub keeps_session: bool,
     /// What its coding agent ended with, once it ended ([`aidaemon_channels::turns::RunResult`]).
     pub result: Option<aidaemon_channels::turns::RunResult>,
+    /// What it was asked, and whether the owner sent it directly.
+    pub asked: Option<aidaemon_channels::turns::RunAsk>,
     /// The plan steps it was started for (`checklist_items`).
     pub steps: Vec<usize>,
     pub evidence: RunEvidence,
@@ -760,6 +762,7 @@ impl RunStates {
             thread: None,
             keeps_session: false,
             result: None,
+            asked: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,
@@ -877,6 +880,7 @@ impl RunStates {
             thread: state.thread.clone(),
             keeps_session: state.keeps_session,
             result: state.result.clone(),
+            asked: state.asked.clone(),
             started_at: state.started_at,
             ended_at: state.ended_at,
             step_only,
@@ -1063,6 +1067,20 @@ impl RunStates {
     }
 
     /// What run `id`'s coding agent ended with.
+    /// What run `id` was asked, and whether the owner sent it directly.
+    pub fn asked(&self, id: &str, asked: aidaemon_channels::turns::RunAsk) {
+        let set = match self.lock().get_mut(id) {
+            Some(entry) => {
+                entry.state.asked = Some(asked);
+                true
+            }
+            None => false,
+        };
+        if set {
+            self.report(id, false);
+        }
+    }
+
     pub fn result(&self, id: &str, result: aidaemon_channels::turns::RunResult) {
         let set = match self.lock().get_mut(id) {
             Some(entry) => {
@@ -1628,6 +1646,7 @@ mod tests {
             thread: None,
             keeps_session: false,
             result: None,
+            asked: None,
             steps: Vec::new(),
             evidence: RunEvidence::default(),
             failure: None,

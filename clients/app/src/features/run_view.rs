@@ -1,12 +1,15 @@
-//! One run's view, opened from its row over the composer: what it was
-//! asked, its steps as its coding agent reported them, its plan, the
-//! permissions it asked for, what it reported at its end and what it cost,
-//! read from the run's record (`get_run`) and read again as it moves.
+//! A coding agent's view, opened from one of its runs: the owner's thread
+//! with that agent, as a chat. Each run is one exchange: what it was asked
+//! (the owner's own follow-up on the right, aidaemon's delegation on the
+//! left) and what the agent answered (its reply, the files it changed, its
+//! checks, where its report and its record disagree). The run the view was
+//! opened on also shows its steps, plan, permissions and cost, folded,
+//! read from its record (`get_run`) and read again as it moves.
 //!
-//! A run its agent can go on from takes a follow-up at its foot: the
-//! owner's message goes to the same agent, in its own session (`in_run`).
-//! The runs that continue one another are one thread: the view lists them,
-//! and moves to the follow-up's run once it starts.
+//! An agent that kept its session takes a follow-up at the foot: the
+//! owner's message goes to the same agent, in its own session (`in_run`),
+//! continuing the thread's latest run; the view moves to the run that takes
+//! it as soon as that starts.
 
 use aidaemon_client_protocol::{
     RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
@@ -18,10 +21,50 @@ use crate::store::{Read, Store};
 use crate::ui::{self, Glyph, Size, Tone, colors, section_label, type_scale};
 
 pub fn run_view(store: Store, id: String) -> View {
-    let summary = {
+    // The agent's runs, oldest first: this one's thread.
+    let thread = {
         let id = id.clone();
-        computed(move || store.all_runs().into_iter().find(|run| run.id == id))
+        computed(move || thread_of(&store.all_runs(), &id))
     };
+    let latest = computed(move || thread.with(|runs| runs.last().cloned()));
+    // Who it is: the owner's name for it, and which agent.
+    let who = computed(move || {
+        let Some(first) = thread.with(|runs| runs.first().cloned()) else {
+            return (String::new(), String::new(), false);
+        };
+        let agent = first.agent.clone().unwrap_or_else(|| first.label.clone());
+        let person = store
+            .participants()
+            .into_iter()
+            .find(|p| p.thread == first.id);
+        let name = person
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| agent.clone());
+        let waiting = person.is_some_and(|p| p.waiting);
+        (name, agent, waiting)
+    });
+    let ready = computed(move || matches!(store.run_view(), Read::Ready(_)));
+    let scroller = element_ref();
+    let opened = element_ref();
+    // At the newest message, as any chat opens; on an older run the view
+    // was opened on, at that one. A new message brings the end into view.
+    {
+        let id = id.clone();
+        effect(move || {
+            let count = thread.with(Vec::len);
+            let at_end = latest.with(|run| run.as_ref().is_none_or(|run| run.id == id));
+            untracked(|| {
+                if at_end {
+                    scroller.scroll_to_end(false);
+                } else if count > 0 {
+                    let mut options = nsh_core::RevealOptions::default();
+                    options.animated = false;
+                    opened.reveal(options);
+                }
+            });
+        });
+    }
     view()
         .w_full()
         .flex_1()
@@ -39,111 +82,337 @@ pub fn run_view(store: Store, id: String) -> View {
                     store.close_run()
                 }))
                 .child(
-                    text(move || summary.with(|run| run.as_ref().map(title).unwrap_or_default()))
+                    view()
                         .flex_1()
                         .min_w(px(0.0))
-                        .number_of_lines(1)
-                        .text_size(px(ui::fit::body()))
-                        .font_weight(FontWeight::SEMIBOLD),
-                )
-                .child(
-                    text(move || {
-                        store.tick();
-                        summary.with(|run| run.as_ref().map(span).unwrap_or_default())
-                    })
-                    .tabular_nums()
-                    .text_size(px(type_scale::XS))
-                    .text_color(colors::FAINT),
+                        .child(
+                            text(move || {
+                                who.with(|(name, agent, _)| {
+                                    if name == agent || name.is_empty() {
+                                        agent.clone()
+                                    } else {
+                                        format!("{name} · {agent}")
+                                    }
+                                })
+                            })
+                            .number_of_lines(1)
+                            .text_size(px(ui::fit::body()))
+                            .font_weight(FontWeight::SEMIBOLD),
+                        )
+                        .child(
+                            text(move || {
+                                let waiting = who.with(|(_, _, waiting)| *waiting);
+                                latest.with(|run| {
+                                    run.as_ref()
+                                        .map(|run| state(run, waiting))
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
+                        ),
                 ),
         )
-        .child(
-            scroll().flex_1().child(
-                view()
-                    .px_3()
-                    .pb_4()
-                    .gap_3()
-                    .child(thread(store, id.clone()))
-                    .child(dynamic(move || {
-                        let read = store.run_view();
-                        // The files it changed, as its record has them so far.
-                        let (edited, coding, running) = summary.with(|run| {
-                            run.as_ref().map_or((Vec::new(), false, false), |run| {
-                                (
-                                    run.edited.clone(),
-                                    store.is_coding(&run.session_id),
-                                    run.phase == RunPhase::Running,
-                                )
-                            })
+        .child(scroll().flex_1().element_ref(&scroller).child(
+            view().px_3().pt_2().pb_4().gap_4().child(dynamic(move || {
+                // Drawn again once the opened run's record is read: an
+                // older run's ask is its record's task.
+                let _ = ready.get();
+                let runs = thread.get();
+                let id = id.clone();
+                Some(untracked(move || {
+                    let mut list = view().gap_4();
+                    for run in runs {
+                        let this = run.id == id;
+                        let exchange = exchange(store, run, this);
+                        list = list.child(if this {
+                            exchange.element_ref(&opened)
+                        } else {
+                            exchange
                         });
-                        // Its typed result, once it ended.
-                        let result =
-                            summary.with(|run| run.as_ref().and_then(|run| run.result.clone()));
-                        Some(untracked(move || match read {
-                            Read::Ready(detail) => {
-                                body(store, detail, result, edited, coding, running)
-                            }
-                            Read::Failed(why) => note(format!("Could not read this run: {why}")),
-                            _ => note("Reading what it did…".to_string()),
-                        }))
-                    })),
-            ),
-        )
-        .child(follow_up(store, id, summary))
+                    }
+                    list
+                }))
+            })),
+        ))
+        .child(follow_up(store, latest, who))
 }
 
-/// The runs that go on from one another (`continues`), oldest first, when
-/// there are several: each opens its own view; this one is marked.
-fn thread(store: Store, id: String) -> View {
-    let runs = {
-        let id = id.clone();
-        computed(move || thread_of(&store.all_runs(), &id))
+/// The agent's state, under its name: what its latest run is doing.
+fn state(run: &RunSummary, waiting: bool) -> String {
+    if waiting {
+        return "Waiting on you".into();
+    }
+    match run.phase {
+        RunPhase::Running => "Working".into(),
+        _ if run.can_continue => "Ready for a follow-up".into(),
+        RunPhase::Succeeded => "Finished".into(),
+        RunPhase::Failed => "Failed".into(),
+        RunPhase::Stopped if run.stopped_by_owner => "Stopped by you".into(),
+        RunPhase::Stopped => "Stopped".into(),
+        RunPhase::Unknown => String::new(),
+    }
+}
+
+/// One run as an exchange: what it was asked, then what the agent
+/// answered; `this`: the run the view was opened on, with its steps.
+fn exchange(store: Store, run: RunSummary, this: bool) -> View {
+    view()
+        .gap_2()
+        .child(asked(store, &run, this))
+        .child(answer(store, &run))
+        .child(if this {
+            steps(store, &run)
+        } else {
+            more(store, &run)
+        })
+}
+
+/// What it was asked: the owner's follow-up as the owner's message, on the
+/// right; aidaemon's delegation on the left, its first lines, unfolding.
+fn asked(store: Store, run: &RunSummary, this: bool) -> View {
+    // A record from before runs kept what they were asked: the task the
+    // opened run's record has, else its label.
+    let task = match untracked(|| store.run_view()) {
+        Read::Ready(detail) if this && !detail.task.is_empty() => Some(detail.task),
+        _ => None,
     };
-    view().child(dynamic(move || {
-        let runs = runs.get();
-        let id = id.clone();
-        (runs.len() > 1).then(|| {
-            untracked(move || {
-                // The agent's earlier runs: what it was asked before, and
-                // how each went.
-                let thread = runs
-                    .first()
-                    .map(|first| first.id.clone())
-                    .unwrap_or_default();
-                let name = store
-                    .participants()
-                    .into_iter()
-                    .find(|p| p.thread == thread)
-                    .map(|p| p.name)
-                    .unwrap_or_else(|| "this agent".to_string());
-                let mut list = view()
-                    .gap_1()
-                    .child(section_label(format!("Earlier with {name}")));
-                for run in runs {
-                    let this = run.id == id;
-                    let words = format!("{} · {}", title(&run), run.label);
-                    let (glyph, tone) = if this {
-                        (Glyph::Dot, Tone::Accent)
-                    } else {
-                        match run.phase {
-                            RunPhase::Succeeded => (Glyph::Check, Tone::Success),
-                            RunPhase::Failed => (Glyph::Warning, Tone::Danger),
-                            RunPhase::Stopped => (Glyph::Warning, Tone::Warning),
-                            _ => (Glyph::Work, Tone::Accent),
-                        }
-                    };
-                    let row = line(glyph, tone, words.clone(), false);
-                    list = if this {
-                        list.child(row)
-                    } else {
-                        list.child(
-                            button()
-                                .accessibility_label(format!("{words}, show it"))
-                                .on_press(move || store.open_run(&run.id))
-                                .child(row),
-                        )
-                    };
+    let (words, by_owner) = run.asked.as_ref().map_or_else(
+        || (task.unwrap_or_else(|| run.label.clone()), false),
+        |asked| (asked.text.clone(), asked.by_owner),
+    );
+    if by_owner {
+        return view().w_full().items_end().child(
+            view()
+                .max_w(percentage(0.85))
+                .rounded(px(ui::radius::SURFACE))
+                .bg(colors::BUBBLE)
+                .px_3()
+                .py_2()
+                .child(text(words).selectable(true).text_size(px(ui::fit::body()))),
+        );
+    }
+    let open = signal(false);
+    let long = words.chars().count() > 240 || words.lines().count() > 4;
+    let short = words.clone();
+    view()
+        .gap_1()
+        .child(section_label("aidaemon asked"))
+        .child(
+            when(move || open.get() || !long, {
+                let words = words.clone();
+                move || {
+                    text(words.clone())
+                        .selectable(true)
+                        .text_size(px(type_scale::SM))
+                        .text_color(colors::MUTED)
                 }
-                list
+            })
+            .otherwise(move || {
+                text(short.clone())
+                    .number_of_lines(4)
+                    .text_size(px(type_scale::SM))
+                    .text_color(colors::MUTED)
+            }),
+        )
+        .child(when(
+            move || long,
+            move || {
+                ui::quiet_disclosure(move || if open.get() { "Less" } else { "All of it" }, open)
+            },
+        ))
+}
+
+/// What the agent answered: working while it runs; its reply, the files
+/// its record shows changed, its checks and open questions, and each claim
+/// its record doesn't bear out, once it ended.
+fn answer(store: Store, run: &RunSummary) -> View {
+    let mut said = view().gap_1();
+    if run.phase == RunPhase::Running {
+        let step = if run.step.is_empty() {
+            "Working".to_string()
+        } else {
+            run.step.clone()
+        };
+        return said.child(ui::working(step));
+    }
+    let reply = run
+        .result
+        .as_ref()
+        .map(|result| result.text.clone())
+        .filter(|text| !text.is_empty());
+    match (&reply, run.phase) {
+        (Some(reply), _) => {
+            said = said.child(
+                text(reply.clone())
+                    .selectable(true)
+                    .text_size(px(ui::fit::body()))
+                    .text_color(colors::TEXT),
+            );
+        }
+        (None, RunPhase::Failed | RunPhase::Stopped) => {
+            let why = run.reason.clone().unwrap_or_else(|| match run.phase {
+                RunPhase::Failed => "It failed.".into(),
+                _ => "It was stopped.".into(),
+            });
+            said = said.child(line(Glyph::Warning, Tone::Danger, why, false));
+        }
+        _ => {
+            said = said.child(note("It ended without a reply.".into()));
+        }
+    }
+    let coding = store.is_coding(&run.session_id);
+    for path in run.edited.clone() {
+        said = said.child(changed_file(store, path, coding));
+    }
+    if let Some(result) = &run.result {
+        if let Some(report) = &result.report {
+            for check in &report.checks {
+                said = said.child(if check.passed {
+                    line(
+                        Glyph::Check,
+                        Tone::Success,
+                        format!("{} passed", check.command),
+                        false,
+                    )
+                } else {
+                    line(
+                        Glyph::Warning,
+                        Tone::Danger,
+                        format!("{} failed", check.command),
+                        false,
+                    )
+                });
+            }
+            for question in &report.open_questions {
+                said = said.child(line(
+                    Glyph::Dot,
+                    Tone::Info,
+                    format!("Open: {question}"),
+                    false,
+                ));
+            }
+            if report.needs_owner {
+                said = said.child(line(
+                    Glyph::Approval,
+                    Tone::Warning,
+                    "Needs you".into(),
+                    false,
+                ));
+            }
+        }
+        for mismatch in &result.mismatches {
+            use aidaemon_client_protocol::RunMismatch;
+            let words = match mismatch {
+                RunMismatch::ChangeNotSeen { path } => {
+                    format!(
+                        "Says it changed {}, but no change was seen",
+                        file_name(path)
+                    )
+                }
+                RunMismatch::ChangeNotClaimed { path } => {
+                    format!("Changed {} without saying so", file_name(path))
+                }
+                RunMismatch::CheckNotRun { command } => {
+                    format!("Says it ran {command}, but no run was seen")
+                }
+                RunMismatch::CheckFailed { command } => {
+                    format!("Says {command} passed, but it failed")
+                }
+                RunMismatch::Unknown => continue,
+            };
+            said = said.child(line(Glyph::Warning, Tone::Warning, words, false));
+        }
+    }
+    said
+}
+
+/// A file a run changed; in a coding conversation it opens its diff.
+fn changed_file(store: Store, path: String, coding: bool) -> View {
+    let name = file_name(&path).to_string();
+    let tint = if coding {
+        colors::ACCENT
+    } else {
+        colors::MUTED
+    };
+    let row = view()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(ui::icon(Glyph::File).text_color(tint))
+        .child(
+            text(name.clone())
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .text_size(px(type_scale::SM))
+                .text_color(tint),
+        );
+    if coding {
+        view().child(
+            button()
+                .accessibility_label(format!("{name}, show what changed"))
+                .on_press(move || store.show_change(&path))
+                .child(row),
+        )
+    } else {
+        row
+    }
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// The steps of a run the view wasn't opened on: one quiet line that
+/// opens them.
+fn more(store: Store, run: &RunSummary) -> View {
+    if run.phase == RunPhase::Running {
+        return view();
+    }
+    let id = run.id.clone();
+    view().child(
+        button()
+            .self_start()
+            .accessibility_label("Show its steps")
+            .on_press(move || store.open_run(&id))
+            .child(
+                text("Steps")
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+            ),
+    )
+}
+
+/// The steps, plan, permissions and cost of the run the view was opened
+/// on, folded, from its record; nothing when it kept none.
+fn steps(store: Store, run: &RunSummary) -> View {
+    let running = run.phase == RunPhase::Running;
+    let open = signal(running);
+    view().child(dynamic(move || {
+        let Read::Ready(detail) = store.run_view() else {
+            return None;
+        };
+        let has = !detail.steps.is_empty()
+            || !detail.plan.is_empty()
+            || !detail.permissions.is_empty()
+            || detail.model.is_some()
+            || detail.usage.is_some();
+        has.then(|| {
+            untracked(move || {
+                let count = detail.steps.len();
+                let label = if count == 0 {
+                    "Details".to_string()
+                } else if count == 1 {
+                    "1 step".to_string()
+                } else {
+                    format!("{count} steps")
+                };
+                view()
+                    .gap_1()
+                    .child(ui::quiet_disclosure(label, open))
+                    .child(ui::unfold(open, move || body(detail.clone())))
             })
         })
     }))
@@ -166,166 +435,128 @@ fn thread_of(runs: &[RunSummary], id: &str) -> Vec<RunSummary> {
     thread
 }
 
-/// A follow-up for the run's agent, at the view's foot: only when its agent
-/// kept its session, it ended, and nothing goes on from it yet. Once sent,
-/// the view moves to the run that takes it as soon as that starts.
-fn follow_up(store: Store, id: String, summary: Memo<Option<RunSummary>>) -> View {
+/// A follow-up at the view's foot, continuing the thread's latest run: only
+/// when its agent kept its session, it ended, and nothing goes on from it
+/// yet. Once sent, the message shows as sent until the run that takes it
+/// starts, and the view moves to that run.
+fn follow_up(
+    store: Store,
+    latest: Memo<Option<RunSummary>>,
+    who: Memo<(String, String, bool)>,
+) -> View {
     let draft = signal(String::new());
-    let sent = signal(false);
-    let continued = {
-        let id = id.clone();
-        computed(move || {
-            store
-                .all_runs()
-                .into_iter()
-                .filter(|run| run.continues.as_deref() == Some(id.as_str()))
-                .max_by_key(|run| run.started_at_ms)
-                .map(|run| run.id)
-        })
-    };
+    // What was sent, and to which run, until a run continues it.
+    let sent: Signal<Option<(String, String)>> = signal(None);
+    let continued = computed(move || {
+        let (_, earlier) = sent.get()?;
+        store
+            .all_runs()
+            .into_iter()
+            .filter(|run| run.continues.as_deref() == Some(earlier.as_str()))
+            .max_by_key(|run| run.started_at_ms)
+            .map(|run| run.id)
+    });
     effect(move || {
-        if sent.get()
-            && let Some(next) = continued.get()
-        {
-            sent.set(false);
+        if let Some(next) = continued.get() {
+            sent.set(None);
             untracked(|| store.open_run(&next));
         }
     });
     let open = computed(move || {
-        let can = matches!(store.run_view(), Read::Ready(detail) if detail.can_continue);
-        let ended = summary.with(|run| {
+        latest.with(|run| {
             run.as_ref()
-                .is_some_and(|run| run.phase != RunPhase::Running)
-        });
-        can && ended && continued.with(Option::is_none)
-    });
-    let agent = computed(move || {
-        summary.with(|run| {
-            run.as_ref()
-                .and_then(|run| run.agent.clone())
-                .unwrap_or_else(|| "its agent".to_string())
+                .is_some_and(|run| run.can_continue && run.phase != RunPhase::Running)
         })
     });
-    let send = {
-        let id = id.clone();
-        move || {
-            let text = draft.get_untracked();
-            if text.trim().is_empty() {
-                return;
-            }
-            let Some(session) =
-                summary.with_untracked(|run| run.as_ref().map(|run| run.session_id.clone()))
-            else {
-                return;
-            };
-            store.follow_up(&session, &id, &text);
-            draft.set(String::new());
-            sent.set(true);
+    let name = computed(move || who.with(|(name, _, _)| name.clone()));
+    let send = move || {
+        let text = draft.get_untracked();
+        if text.trim().is_empty() {
+            return;
         }
+        let Some((session, run)) = latest.with_untracked(|run| {
+            run.as_ref()
+                .map(|run| (run.session_id.clone(), run.id.clone()))
+        }) else {
+            return;
+        };
+        store.follow_up(&session, &run, &text);
+        draft.set(String::new());
+        sent.set(Some((text.trim().to_string(), run)));
     };
     view()
         .child(when(
-            move || open.get() && !sent.get(),
+            move || sent.with(Option::is_some),
             move || {
-                let send = send.clone();
-                let submit = send.clone();
                 view()
                     .px_3()
                     .py_2()
                     .gap_1()
+                    .items_end()
                     .border_t_1()
                     .border_color(colors::LINE)
                     .child(
-                        text(move || format!("Follow up with {}", agent.get()))
+                        view()
+                            .max_w(percentage(0.85))
+                            .rounded(px(ui::radius::SURFACE))
+                            .bg(colors::BUBBLE)
+                            .px_3()
+                            .py_2()
+                            .child(
+                                text(move || {
+                                    sent.with(|sent| {
+                                        sent.as_ref()
+                                            .map(|(text, _)| text.clone())
+                                            .unwrap_or_default()
+                                    })
+                                })
+                                .text_size(px(ui::fit::body())),
+                            ),
+                    )
+                    .child(
+                        text(move || format!("Sending to {}…", name.get()))
                             .text_size(px(type_scale::XS))
                             .text_color(colors::FAINT),
                     )
+            },
+        ))
+        .child(when(
+            move || open.get() && sent.with(Option::is_none),
+            move || {
+                view()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(colors::LINE)
                     .child(
                         view()
                             .flex_row()
                             .items_center()
                             .gap_2()
                             .child(
-                                ui::field("Ask it to do more…", draft)
+                                ui::field("Reply…", draft)
                                     .label("Follow-up for the agent")
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .on_submit(move |_: &str| submit()),
+                                    .on_submit(move |_: &str| send()),
                             )
                             .child(ui::icon_btn_primary(Glyph::Send, "Send to the agent", send)),
                     )
             },
         ))
-        .child(when(
-            move || sent.get(),
-            move || {
-                view()
-                    .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(colors::LINE)
-                    .child(
-                        text(move || format!("Sent. Passing it to {}…", agent.get()))
-                            .text_size(px(type_scale::SM))
-                            .text_color(colors::FAINT),
-                    )
-            },
-        ))
-}
-
-/// The run's name: its agent, else its label.
-fn title(run: &RunSummary) -> String {
-    let state = match run.phase {
-        RunPhase::Running => "running",
-        RunPhase::Succeeded => "finished",
-        RunPhase::Failed => "failed",
-        RunPhase::Stopped if run.stopped_by_owner => "stopped by you",
-        RunPhase::Stopped => "stopped",
-        RunPhase::Unknown => "",
-    };
-    let name = run.agent.clone().unwrap_or_else(|| run.label.clone());
-    if state.is_empty() {
-        name
-    } else {
-        format!("{name} · {state}")
-    }
-}
-
-fn span(run: &RunSummary) -> String {
-    let end = run.ended_at_ms.unwrap_or_else(crate::store::now_ms);
-    ui::time::span(end.saturating_sub(run.started_at_ms) / 1000)
 }
 
 fn note(words: String) -> View {
-    view().px_1().pt_2().child(
+    view().px_1().child(
         text(words)
             .text_size(px(type_scale::SM))
             .text_color(colors::FAINT),
     )
 }
 
-/// `coding`: its conversation has a Changes tab, where each changed file
-/// opens its diff.
-fn body(
-    store: Store,
-    detail: RunDetail,
-    result: Option<aidaemon_client_protocol::RunResult>,
-    edited: Vec<String>,
-    coding: bool,
-    running: bool,
-) -> View {
-    let mut page = view().gap_3().pt_2();
-    if !detail.task.is_empty() {
-        page = page.child(section(
-            "Asked",
-            view().child(
-                text(detail.task.clone())
-                    .selectable(true)
-                    .text_size(px(type_scale::SM))
-                    .text_color(colors::MUTED),
-            ),
-        ));
-    }
+/// The run's steps, plan, permissions, and what it ran on and cost.
+fn body(detail: RunDetail) -> View {
+    let mut page = view().gap_3().pt_1().pl(px(4.0));
     if !detail.plan.is_empty() {
         let mut plan = view().gap_1();
         for item in &detail.plan {
@@ -338,13 +569,7 @@ fn body(
         }
         page = page.child(section("Plan", plan));
     }
-    let steps = if detail.steps.is_empty() {
-        note(if running {
-            "No steps yet.".to_string()
-        } else {
-            "No steps were kept for this run.".to_string()
-        })
-    } else {
+    if !detail.steps.is_empty() {
         let mut steps = view().gap_1();
         for step in &detail.steps {
             let (glyph, tone) = match step.state {
@@ -354,9 +579,8 @@ fn body(
             };
             steps = steps.child(line(glyph, tone, step.words.clone(), step.by_helper));
         }
-        steps
-    };
-    page = page.child(section("Steps", steps));
+        page = page.child(steps);
+    }
     if !detail.permissions.is_empty() {
         let mut asked = view().gap_1();
         for permission in &detail.permissions {
@@ -374,114 +598,6 @@ fn body(
             asked = asked.child(line(glyph, tone, words, false));
         }
         page = page.child(section("Permissions", asked));
-    }
-    // Each file it changed opens its diff in the Changes tab.
-    if !edited.is_empty() {
-        let mut files = view().gap_1();
-        for path in edited {
-            let name = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
-            let tint = if coding {
-                colors::ACCENT
-            } else {
-                colors::MUTED
-            };
-            let line = view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(ui::icon(Glyph::File).text_color(tint))
-                .child(
-                    text(name.clone())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .number_of_lines(1)
-                        .text_size(px(type_scale::SM))
-                        .text_color(tint),
-                );
-            files = if coding {
-                files.child(
-                    button()
-                        .accessibility_label(format!("{name}, show what changed"))
-                        .on_press(move || store.show_change(&path))
-                        .child(line),
-                )
-            } else {
-                files.child(line)
-            };
-        }
-        page = page.child(section("Changed", files));
-    }
-    // What it ended with: its typed result (its report's claims, each one
-    // the record doesn't bear out flagged), else what its record kept.
-    let said = result
-        .as_ref()
-        .map(|result| result.text.clone())
-        .filter(|text| !text.is_empty())
-        .or(detail.result.clone());
-    if let Some(said) = said {
-        let mut reported = view().gap_1().child(
-            text(said)
-                .selectable(true)
-                .text_size(px(type_scale::SM))
-                .text_color(colors::MUTED),
-        );
-        if let Some(result) = &result {
-            if let Some(report) = &result.report {
-                for check in &report.checks {
-                    reported = reported.child(if check.passed {
-                        line(
-                            Glyph::Check,
-                            Tone::Success,
-                            format!("{} passed", check.command),
-                            false,
-                        )
-                    } else {
-                        line(
-                            Glyph::Warning,
-                            Tone::Danger,
-                            format!("{} failed", check.command),
-                            false,
-                        )
-                    });
-                }
-                for question in &report.open_questions {
-                    reported = reported.child(line(
-                        Glyph::Dot,
-                        Tone::Info,
-                        format!("Open: {question}"),
-                        false,
-                    ));
-                }
-                if report.needs_owner {
-                    reported = reported.child(line(
-                        Glyph::Approval,
-                        Tone::Warning,
-                        "Needs you".into(),
-                        false,
-                    ));
-                }
-            }
-            for mismatch in &result.mismatches {
-                use aidaemon_client_protocol::RunMismatch;
-                let words = match mismatch {
-                    RunMismatch::ChangeNotSeen { path } => {
-                        format!("Says it changed {path}, but no change was seen")
-                    }
-                    RunMismatch::ChangeNotClaimed { path } => {
-                        format!("Changed {path} without saying so")
-                    }
-                    RunMismatch::CheckNotRun { command } => {
-                        format!("Says it ran {command}, but no run was seen")
-                    }
-                    RunMismatch::CheckFailed { command } => {
-                        format!("Says {command} passed, but it failed")
-                    }
-                    RunMismatch::Unknown => continue,
-                };
-                reported = reported.child(line(Glyph::Warning, Tone::Warning, words, false));
-            }
-        }
-        page = page.child(section("Reported", reported));
     }
     let mut facts = Vec::new();
     if let Some(model) = &detail.model {
@@ -504,26 +620,17 @@ fn body(
     if let Some(session) = &detail.agent_session_id {
         facts.push(format!("Its session: {session}"));
     }
-    // What it ran on and what it cost, folded: the work comes first.
     if !facts.is_empty() {
-        let open = signal(false);
-        page = page.child(
-            view()
-                .gap_1()
-                .child(ui::quiet_disclosure("Details", open))
-                .child(ui::unfold(open, move || {
-                    let mut list = view().gap_1().pl(px(4.0));
-                    for fact in facts.clone() {
-                        list = list.child(
-                            text(fact)
-                                .selectable(true)
-                                .text_size(px(type_scale::XS))
-                                .text_color(colors::FAINT),
-                        );
-                    }
-                    list
-                })),
-        );
+        let mut list = view().gap_1();
+        for fact in facts {
+            list = list.child(
+                text(fact)
+                    .selectable(true)
+                    .text_size(px(type_scale::XS))
+                    .text_color(colors::FAINT),
+            );
+        }
+        page = page.child(list);
     }
     page
 }

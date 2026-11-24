@@ -835,33 +835,42 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     feed([
         Update::Connected,
         frame(
-            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-thread","channel":"app","title":"Fix the synthetic slug","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-t1","session_id":"app:synthetic-thread","label":"Fix the slug","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-t"}]}}"#,
+            r#"{"type":"snapshot","seq":7,"state":{"sessions":[{"id":"app:synthetic-thread","channel":"app","title":"Fix the synthetic slug","writable":true}],"running_tasks":[],"pending_approvals":[],"runs":[{"id":"cli-agent-t1","session_id":"app:synthetic-thread","label":"Fix the slug","agent":"Codex","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999990000,"group":"task-t","can_continue":true,"asked":{"text":"Fix the slug in slug.py"},"result":{"text":"Fixed the slug."}}]}}"#,
         ),
     ]);
     settle(&mut app)?;
     app.press("Fix the synthetic slug >> nth=0")?;
-    app.wait_for("text:Codex · Finished")?;
-    app.press("Codex · Finished, show its steps")?;
+    app.wait_for("text:Fix the slug · Codex")?;
+    app.press("Fix the slug · Codex, show what it did")?;
     let id = wait_sent("get_run")?;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-t1","can_continue":true,"task":"Fix the slug","steps":[{{"words":"Editing slug.py","state":"done"}}]}}}}}}"#
     ))]);
-    app.wait_for("text:Follow up with Codex")?;
+    // The agent's view is the owner's thread with it: aidaemon's ask, the
+    // agent's reply, its steps folded.
+    app.wait_for("text:aidaemon asked")?;
+    app.wait_for("text:Fix the slug in slug.py")?;
+    app.wait_for("text:Fixed the slug.")?;
+    app.wait_for("text:1 step")?;
+    app.wait_for("text:Ready for a follow-up")?;
     app.type_text("label:Follow-up for the agent", "Also add a test")?;
     let before = sent("send_message");
     app.press("Send to the agent")?;
     wait_sent_new("send_message", before)?;
-    app.wait_for("text:Sent. Passing it to Codex…")?;
+    app.wait_for("text:Also add a test")?;
+    app.wait_for("text:Sending to Fix the slug…")?;
     // The run that takes it starts: the view moves to it.
     let before = sent("get_run");
     feed([frame(
-        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999995000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1"}}}"#,
+        r#"{"type":"event","seq":8,"at_ms":3,"session_id":"app:synthetic-thread","event":{"type":"run_updated","run":{"id":"cli-agent-t2","session_id":"app:synthetic-thread","label":"Add a test","agent":"Codex","phase":"running","background":true,"started_at_ms":9999999995000,"group":"task-u","continues":"cli-agent-t1","thread":"cli-agent-t1","asked":{"text":"Also add a test","by_owner":true}}}}"#,
     )]);
     wait_sent_new("get_run", before)?;
-    app.wait_for("text:Earlier with Fix the slug")?;
-    app.wait_for("text:Codex · finished · Fix the slug")?;
+    // Both exchanges, the owner's message on the newest, which works.
+    app.wait_for("text:Fixed the slug.")?;
+    app.wait_for("text:Also add a test")?;
+    app.wait_for("text:Working")?;
     app.press("Back")?;
-    app.wait_for("text:Codex · Finished")?;
+    app.wait_for("text:Fixed the slug.")?;
     // Its participants: one agent session, working, its two runs.
     app.wait_for("text:1 agent · 1 working")?;
     app.press("1 agent · 1 working")?;

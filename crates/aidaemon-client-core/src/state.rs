@@ -898,6 +898,7 @@ mod tests {
             thread: None,
             can_continue: false,
             result: None,
+            asked: None,
         }
     }
 

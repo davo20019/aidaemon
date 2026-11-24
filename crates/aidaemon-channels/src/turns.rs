@@ -372,10 +372,20 @@ pub struct RunChange {
     pub keeps_session: bool,
     /// What its coding agent ended with, once it ended ([`crate::turns::RunResult`]).
     pub result: Option<crate::turns::RunResult>,
+    /// What it was asked, and by whom.
+    pub asked: Option<crate::turns::RunAsk>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Only its current step changed: it started or ended earlier.
     pub step_only: bool,
+}
+
+/// What a run was asked: the task as given (without the daemon's rules),
+/// and whether the owner sent it to the agent directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunAsk {
+    pub text: String,
+    pub by_owner: bool,
 }
 
 /// What a run's coding agent ended with: its reply, its typed claims, and
@@ -1692,6 +1702,7 @@ mod tests {
                         thread: None,
                         keeps_session: false,
                         result: None,
+                        asked: None,
                         this_request: false,
                     })
                 })

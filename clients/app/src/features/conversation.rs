@@ -17,11 +17,21 @@ use crate::store::{ActivityMode, DraftFileState, Felt, Store};
 use crate::ui::{self, Glyph, Size, Variant, colors, radius, size, type_scale, working};
 
 /// A row of the transcript.
+/// The agent an owner's message went to directly: its name as the owner
+/// reads it, and the run that took the message.
+#[derive(Debug, Clone, PartialEq)]
+struct To {
+    name: String,
+    run: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Row {
     /// A day break: "Today", "Yesterday", "Mar 3".
     Day(String),
-    User(String, u64, Vec<AttachmentRef>),
+    /// The owner's message: its text, time and files, and the agent it
+    /// went to directly, when it was a follow-up to one.
+    User(String, u64, Vec<AttachmentRef>, Option<To>),
     /// A reply: its text, time and files, whether it only says the work
     /// went on in the background, whether its time and Copy show (the
     /// last reply before the owner speaks again), and the provider and
@@ -91,7 +101,7 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
                 at_ms,
                 attachments,
                 ..
-            } => Row::User(text, at_ms, attachments),
+            } => Row::User(text, at_ms, attachments, None),
             Line::Assistant {
                 text,
                 at_ms,
@@ -120,8 +130,17 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
     // Each request's runs sit under the reply that started them, and stay
     // there once they end: which agents ran and how each ended. A request
     // still being answered has its runs under its live line.
-    let tail = place_runs(&mut rows, &store.runs_for(session));
-    let mut rows = without_launch_lines(rows);
+    let runs = store.runs_for(session);
+    let tail = place_runs(&mut rows, &runs);
+    let people = store.participants();
+    let mut rows = to_agents(without_launch_lines(rows), &runs, |run| {
+        let thread = run.thread.clone().unwrap_or_else(|| run.id.clone());
+        let agent = run.agent.clone().unwrap_or_else(|| run.label.clone());
+        match people.iter().find(|p| p.thread == thread) {
+            Some(p) if p.name != agent => format!("{} · {agent}", p.name),
+            _ => agent,
+        }
+    });
     let live = store.live(session).is_some();
     let tail = tail.into_iter().map(|key| Row::Runs { key, headed: !live });
     if live {
@@ -162,6 +181,53 @@ fn without_launch_lines(rows: Vec<Row>) -> Vec<Row> {
         }
     }
     kept
+}
+
+/// Each owner's message that went to an agent directly (its request's one
+/// run was the owner's follow-up, `RunSummary::asked`) names that agent,
+/// and the turn's own activity line between the message and the agent's
+/// reply goes: the agent's reply answers the message.
+fn to_agents(
+    rows: Vec<Row>,
+    runs: &[RunSummary],
+    name: impl Fn(&RunSummary) -> String,
+) -> Vec<Row> {
+    let mut rows = rows;
+    let mut dropped = vec![false; rows.len()];
+    for at in 0..rows.len() {
+        let Row::Runs { key, .. } = &rows[at] else {
+            continue;
+        };
+        let group: Vec<&RunSummary> = runs.iter().filter(|run| run_key(run) == *key).collect();
+        let [run] = group.as_slice() else {
+            continue;
+        };
+        if !run.asked.as_ref().is_some_and(|asked| asked.by_owner) {
+            continue;
+        }
+        let Some(user) = rows[..at]
+            .iter()
+            .rposition(|row| matches!(row, Row::User(..)))
+        else {
+            continue;
+        };
+        for between in user + 1..at {
+            if matches!(rows[between], Row::Activity(..)) {
+                dropped[between] = true;
+            }
+        }
+        let to = To {
+            name: name(run),
+            run: run.id.clone(),
+        };
+        if let Row::User(.., slot) = &mut rows[user] {
+            *slot = Some(to);
+        }
+    }
+    rows.into_iter()
+        .zip(dropped)
+        .filter_map(|(row, dropped)| (!dropped).then_some(row))
+        .collect()
 }
 
 /// A run's group: the request that started it, or the run alone.
@@ -1725,13 +1791,13 @@ fn transcript_list(
                     };
                     let at = move || {
                         row.with(|r| match r.as_ref() {
-                            Some(Row::User(_, at, _) | Row::Assistant(_, at, ..)) => *at,
+                            Some(Row::User(_, at, ..) | Row::Assistant(_, at, ..)) => *at,
                             _ => 0,
                         })
                     };
                     let attached = move || {
                         row.with(|r| match r {
-                            Some(Row::User(_, _, files) | Row::Assistant(_, _, files, ..)) => {
+                            Some(Row::User(_, _, files, _) | Row::Assistant(_, _, files, ..)) => {
                                 files.clone()
                             }
                             _ => Vec::new(),
@@ -1741,6 +1807,13 @@ fn transcript_list(
                         0 => column
                             .items_end()
                             .gap_1()
+                            .child(dynamic(move || {
+                                let to = row.with(|r| match r {
+                                    Some(Row::User(.., to)) => to.clone(),
+                                    _ => None,
+                                })?;
+                                Some(untracked(move || to_agent(store, to)))
+                            }))
                             .child(files(store, attached, true))
                             .child(when(
                                 move || !content().trim().is_empty(),
@@ -2200,6 +2273,29 @@ fn draft_files(store: Store) -> View {
             list
         }))
     }))
+}
+
+/// Over an owner's message that went to an agent directly: which agent,
+/// opening its view.
+fn to_agent(store: Store, to: To) -> View {
+    let words = format!("To {}", to.name);
+    view().child(
+        button()
+            .accessibility_label(format!("{words}, show the agent"))
+            .on_press(move || store.open_run(&to.run))
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(ui::icon(Glyph::Send).text_color(colors::ACCENT))
+                    .child(
+                        text(words)
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::MUTED),
+                    ),
+            ),
+    )
 }
 
 fn user_bubble(content: impl Fn() -> String + 'static) -> View {
@@ -3342,14 +3438,57 @@ mod tests {
         Row::Assistant(format!("reply {at}"), at, Vec::new(), false, false, None)
     }
 
+    /// The owner's follow-up to an agent names it over the message, and
+    /// the turn's own activity line goes; aidaemon's delegation keeps both.
+    #[test]
+    fn an_owner_follow_up_names_its_agent_over_the_message() {
+        let mut asked = run("follow", Some("task-2"), 310);
+        asked.asked = Some(aidaemon_client_protocol::RunAsked {
+            text: "explain it".into(),
+            by_owner: true,
+        });
+        let runs = [run("first", Some("task-1"), 110), asked];
+        let activity = || Row::Activity(vec!["cli_agent".into()], 6, Vec::new());
+        let rows = vec![
+            Row::User("fix it".into(), 100, Vec::new(), None),
+            activity(),
+            Row::Runs {
+                key: "task-1".into(),
+                headed: true,
+            },
+            Row::User("explain it".into(), 300, Vec::new(), None),
+            activity(),
+            Row::Runs {
+                key: "task-2".into(),
+                headed: true,
+            },
+        ];
+        let rows = to_agents(rows, &runs, |_| "Coder · Codex".into());
+        assert_eq!(rows.len(), 5, "only the follow-up's activity line goes");
+        assert_eq!(rows[0], Row::User("fix it".into(), 100, Vec::new(), None));
+        assert_eq!(
+            rows[3],
+            Row::User(
+                "explain it".into(),
+                300,
+                Vec::new(),
+                Some(To {
+                    name: "Coder · Codex".into(),
+                    run: "follow".into(),
+                }),
+            )
+        );
+        assert!(matches!(rows[4], Row::Runs { .. }));
+    }
+
     #[test]
     fn a_requests_runs_sit_under_the_reply_that_started_them() {
         let mut rows = vec![
-            Row::User("first".into(), 100, Vec::new()),
+            Row::User("first".into(), 100, Vec::new(), None),
             reply(200),
-            Row::User("second".into(), 300, Vec::new()),
+            Row::User("second".into(), 300, Vec::new(), None),
             reply(400),
-            Row::User("third".into(), 500, Vec::new()),
+            Row::User("third".into(), 500, Vec::new(), None),
         ];
         let tail = place_runs(
             &mut rows,
@@ -3386,7 +3525,7 @@ mod tests {
             headed: true,
         };
         let rows = without_launch_lines(vec![
-            Row::User("go".into(), 100, Vec::new()),
+            Row::User("go".into(), 100, Vec::new(), None),
             launch.clone(),
             runs.clone(),
             // A launch line whose runs are not on record stays.
@@ -3396,7 +3535,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                Row::User("go".into(), 100, Vec::new()),
+                Row::User("go".into(), 100, Vec::new(), None),
                 runs,
                 launch,
                 reply(300)

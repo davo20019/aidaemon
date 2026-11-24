@@ -5828,6 +5828,24 @@
       ],
       "type": "string"
     },
+    "RunAsked": {
+      "description": "What a run was asked (protocol 1.48).",
+      "properties": {
+        "by_owner": {
+          "default": false,
+          "description": "The owner sent it to the agent directly (a follow-up), rather than\naidaemon delegating it.",
+          "type": "boolean"
+        },
+        "text": {
+          "description": "The task as given, without the daemon's own rules; shortened.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
     "RunCheck": {
       "description": "A check a coding agent says it ran.",
       "properties": {
@@ -6227,6 +6245,17 @@
             "string",
             "null"
           ]
+        },
+        "asked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunAsked"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What it was asked, and whether the owner asked it directly\n(protocol 1.48): a client shows a follow-up the owner sent an agent\nas the owner's message to that agent."
         },
         "background": {
           "description": "It goes on after the turn that started it ended.",

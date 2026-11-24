@@ -91,6 +91,7 @@ pub(super) fn ended_run(
         thread: None,
         keeps_session: false,
         result: None,
+        asked: None,
         steps: Vec::new(),
         evidence: crate::run_state::RunEvidence {
             unconfirmed: unconfirmed

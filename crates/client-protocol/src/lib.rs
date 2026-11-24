@@ -3029,6 +3029,22 @@ pub struct RunSummary {
     /// doing. Set once it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<RunResult>,
+    /// What it was asked, and whether the owner asked it directly
+    /// (protocol 1.48): a client shows a follow-up the owner sent an agent
+    /// as the owner's message to that agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<RunAsked>,
+}
+
+/// What a run was asked (protocol 1.48).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct RunAsked {
+    /// The task as given, without the daemon's own rules; shortened.
+    pub text: String,
+    /// The owner sent it to the agent directly (a follow-up), rather than
+    /// aidaemon delegating it.
+    #[serde(default)]
+    pub by_owner: bool,
 }
 
 /// What a run's coding agent ended with (protocol 1.48).

@@ -118,6 +118,22 @@ pub(super) struct PreparedRun {
     claim: Option<WorkingDirClaimGuard>,
 }
 
+/// The longest task a run's record keeps of what it was asked.
+const ASKED_CHARS: usize = 2000;
+
+/// What a run was asked, as its record keeps it: the task without the
+/// daemon's rules, and whether the owner sent it to the agent directly.
+fn run_ask(prep: &PreparedRun, call: &RunCall) -> aidaemon_channels::turns::RunAsk {
+    let mut text: String = prep.task.chars().take(ASKED_CHARS).collect();
+    if text.len() < prep.task.len() {
+        text.push('…');
+    }
+    aidaemon_channels::turns::RunAsk {
+        text,
+        by_owner: call.owner_follow_up,
+    }
+}
+
 /// Who launched a run and where it reports.
 #[derive(Clone)]
 pub(super) struct RunCall {
@@ -426,6 +442,9 @@ impl CliAgentTool {
         handles
             .runs
             .set_agent(&cli_run_id(&task_id), prep.coding_agent.name());
+        handles
+            .runs
+            .asked(&cli_run_id(&task_id), run_ask(&prep, &call));
         if let Some(earlier) = &prep.continues {
             handles
                 .runs
@@ -1099,6 +1118,7 @@ impl CliAgentTool {
         record_background(&self.state, &call).await;
         let handles = self.run_handles();
         handles.runs.set_agent(&run_id, prep.coding_agent.name());
+        handles.runs.asked(&run_id, run_ask(&prep, &call));
         if let Some(earlier) = &prep.continues {
             handles
                 .runs

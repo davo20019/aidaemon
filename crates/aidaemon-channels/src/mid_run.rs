@@ -256,6 +256,7 @@ mod tests {
             thread: None,
             keeps_session: false,
             result: None,
+            asked: None,
             this_request,
         }
     }
