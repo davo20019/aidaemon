@@ -297,7 +297,9 @@ impl Tool for TrackRequirementsTool {
          a request naming two or more distinct operations, deliverables, or targets gets one item \
          each (an ordered sequence like create/write/read/remove/verify is one item per step). \
          Give each item its exact targets (paths/URLs) and mutation_effects, or requires_observation \
-         for reads/verifications. The runtime compiles typed items into obligations closed only by \
+         for reads/verifications. Work you hand to a coding agent (cli_agent) is one item, closed \
+         by its run: add no item to verify what the agent changes, since its report is checked \
+         against the run's record. The runtime compiles typed items into obligations closed only by \
          real tool receipts and will keep asking for open reachable items, so declare exactly what \
          you will do and do all of it. Pass the FULL list every time; it replaces the previous list. \
          An item with mutation_effects, targets or requires_observation is marked done by the \

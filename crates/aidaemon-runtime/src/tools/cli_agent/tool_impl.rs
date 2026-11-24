@@ -22,6 +22,8 @@ impl Tool for CliAgentTool {
             "name": "cli_agent",
             "description": format!(
                 "Delegate coding or research to an installed CLI agent. Available agents: {}. \
+                 Hand it the task directly: it reads the folder itself, so don't look around \
+                 first unless what you ask depends on something you must find out before. \
                  Runs can be checked or cancelled. The owner sees a run's reply as the agent's \
                  own message, its report checked against the run's record (the files it \
                  changed, the commands it ran); the result says whether the record bears out \
