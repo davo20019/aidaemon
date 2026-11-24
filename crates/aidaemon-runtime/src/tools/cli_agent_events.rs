@@ -93,6 +93,18 @@ impl AgentEventRecorder {
         run_result(self.reported.as_ref(), fallback, edited, &self.ran)
     }
 
+    /// What its agent ended with, as its adapter read it: a report's text
+    /// ([`aidaemon_coding_agents::Report::to_text`]) or its final message.
+    /// `None` when it reported nothing typed (a plain program).
+    pub(super) fn reported_text(&self) -> Option<String> {
+        let (text, report) = self.reported.as_ref()?;
+        let text = match report {
+            Some(report) => report.to_text(),
+            None => text.trim().to_string(),
+        };
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Whether its output reads as typed events ([`Self::read`] found one).
     pub(super) fn structured(&self) -> bool {
         self.structured || self.agent.reports_steps()

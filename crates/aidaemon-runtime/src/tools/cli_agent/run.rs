@@ -2284,13 +2284,24 @@ async fn watch_run(
             // Prefer stdout for success summaries; fall back to display output for failures.
             let stdout_text = stdout_buf_writer.lock().await.clone();
             let display_text = display_buf_writer.lock().await.clone();
-            CliAgentTool::classify_completion_result(
+            let mut completion = CliAgentTool::classify_completion_result(
                 &tool_name_owned,
                 exit_code,
                 &stdout_text,
                 &display_text,
                 max_output_for_log,
-            )
+            );
+            // A successful run's answer is what its adapter read from its
+            // typed events (its report, or its final message), not a second
+            // reading of its raw output.
+            if completion.success
+                && let Some(reported) = agent_events.reported_text()
+            {
+                let reported = truncate_with_note(&reported, max_output_for_log);
+                completion.persisted_output = reported.clone();
+                completion.response = Some(reported);
+            }
+            completion
         };
         let success =
             completion.success && run_phase.phase() == crate::run_state::RunPhase::Succeeded;
