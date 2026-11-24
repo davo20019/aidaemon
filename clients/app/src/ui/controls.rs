@@ -171,12 +171,25 @@ pub fn icon_btn(
     size: Size,
     on_press: impl Fn() + 'static,
 ) -> View {
+    icon_btn_disabled(glyph, label, size, false, on_press)
+}
+
+/// [`icon_btn`] that can be disabled (step navigation at the first or last
+/// item).
+pub fn icon_btn_disabled(
+    glyph: Glyph,
+    label: impl Into<SharedString>,
+    size: Size,
+    disabled: bool,
+    on_press: impl Fn() + 'static,
+) -> View {
     let label: SharedString = label.into();
     with_hint(
         label.clone(),
         frame(Variant::Ghost, size, motion::PRESS_SCALE_ICON)
             .w(px(size.height()))
             .accessibility_label(label)
+            .disabled(disabled)
             .on_press(on_press)
             .child(
                 icon(glyph)

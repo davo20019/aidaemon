@@ -1,10 +1,14 @@
 //! A coding agent's view, opened from one of its runs: the owner's thread
 //! with that agent, as a chat. Each run is one exchange: what it was asked
-//! (the owner's own follow-up on the right, aidaemon's delegation on the
-//! left) and what the agent answered (its reply, the files it changed, its
-//! checks, where its report and its record disagree). The run the view was
-//! opened on also shows its steps, plan, permissions and cost, folded,
-//! read from its record (`get_run`) and read again as it moves.
+//! (the owner's own prompt or follow-up on the right, clearly marked "You";
+//! aidaemon's delegation on the left in an inset block) and what the agent
+//! answered (its changed files and checks up front, its reply — previewed and
+//! collapsible when verbose so long outputs never block navigation — and its
+//! steps, plan, permissions and cost folded from its record (`get_run`)).
+//!
+//! When a thread has multiple exchanges, a fixed navigation bar under the
+//! header steps directly between exchanges (`Previous`, `Next`, `Latest`)
+//! without scrolling past verbose responses.
 //!
 //! An agent that kept its session takes a follow-up at the foot: the
 //! owner's message goes to the same agent, in its own session (`in_run`),
@@ -12,13 +16,37 @@
 //! it as soon as that starts.
 
 use aidaemon_client_protocol::{
-    RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
+    ModelChoice, RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
 };
 use nsh_base::button;
 use nsh_core::prelude::*;
 
 use crate::store::{Read, Store};
-use crate::ui::{self, Glyph, Size, Tone, colors, section_label, type_scale};
+use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, type_scale};
+
+/// Verbosity thresholds for collapsing long agent replies so verbose CLI
+/// agents (such as Antigravity CLI) never bury checks, steps or later turns.
+#[derive(Clone, Copy)]
+struct CollapseBudget {
+    trigger_chars: usize,
+    trigger_lines: usize,
+    preview_chars: usize,
+    preview_lines: usize,
+}
+
+const FOCUSED_REPLY_BUDGET: CollapseBudget = CollapseBudget {
+    trigger_chars: 900,
+    trigger_lines: 18,
+    preview_chars: 520,
+    preview_lines: 10,
+};
+
+const OTHER_REPLY_BUDGET: CollapseBudget = CollapseBudget {
+    trigger_chars: 420,
+    trigger_lines: 8,
+    preview_chars: 260,
+    preview_lines: 5,
+};
 
 pub fn run_view(store: Store, id: String) -> View {
     // The agent's runs, oldest first: this one's thread.
@@ -27,6 +55,19 @@ pub fn run_view(store: Store, id: String) -> View {
         computed(move || thread_of(&store.all_runs(), &id))
     };
     let latest = computed(move || thread.with(|runs| runs.last().cloned()));
+    // In a direct coding-agent conversation (Code mode pinned to an agent),
+    // every message in the thread was written by the owner, never delegated
+    // by aidaemon.
+    let direct_agent = computed(move || {
+        latest.with(|run| {
+            run.as_ref().is_some_and(|run| {
+                matches!(
+                    store.model_of(Some(&run.session_id)).0,
+                    ModelChoice::Agent { .. }
+                )
+            })
+        })
+    });
     // Who it is: its name ("Codex 2", or the owner's "Designer"), how it
     // is headed ("Designer · Codex"), and whether it waits on the owner.
     let who = computed(move || {
@@ -50,65 +91,38 @@ pub fn run_view(store: Store, id: String) -> View {
     let opened = element_ref();
     // The earlier exchanges, folded until asked for: the view opens on the
     // latest (or the run it was opened on), at the top of its exchange,
-    // where its question is, and drawn again (its record read, a run
-    // added) it stays there.
+    // where its question is. Expanding earlier exchanges does not yank the
+    // viewport back down to `opened`.
     let earlier_shown = signal(false);
     effect(move || {
-        let _ = (ready.get(), thread.with(Vec::len), earlier_shown.get());
+        let _ = (ready.get(), thread.with(Vec::len));
+        if earlier_shown.get_untracked() {
+            return;
+        }
         untracked(|| {
             let mut options = nsh_core::RevealOptions::default();
             options.animated = false;
             opened.reveal(options);
         });
     });
+    let nav_id = id.clone();
     view()
         .w_full()
         .flex_1()
         .bg(colors::SIDEBAR)
         .border_l_1()
         .border_color(colors::LINE)
-        .child(
-            view()
-                .h(px(ui::fit::bar()))
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .child(ui::icon_btn(Glyph::Back, "Back", Size::Md, move || {
-                    store.close_run()
-                }))
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(
-                            text(move || who.with(|(_, title, _)| title.clone()))
-                                .number_of_lines(1)
-                                .text_size(px(ui::fit::body()))
-                                .font_weight(FontWeight::SEMIBOLD),
-                        )
-                        .child(
-                            text(move || {
-                                let waiting = who.with(|(_, _, waiting)| *waiting);
-                                latest.with(|run| {
-                                    run.as_ref()
-                                        .map(|run| state(run, waiting))
-                                        .unwrap_or_default()
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(type_scale::XS))
-                            .text_color(colors::FAINT),
-                        ),
-                ),
-        )
+        .child(header(store, latest, who))
+        .child(exchange_nav(store, thread, nav_id))
         .child(scroll().flex_1().element_ref(&scroller).child(
-            view().px_3().pt_2().pb_4().gap_4().child(dynamic(move || {
-                // Drawn again once the opened run's record is read: an
-                // older run's ask is its record's task.
+            view().px_3().pt_3().pb_4().gap_4().child(dynamic(move || {
+                // Drawn again once the opened run's record is read or the
+                // session's direct-agent state changes.
                 let _ = ready.get();
+                let direct = direct_agent.get();
                 let runs = thread.get();
                 let id = id.clone();
+                let total = runs.len();
                 // Folded: the runs before the one the view is on.
                 let at = runs.iter().position(|run| run.id == id).unwrap_or(0);
                 let folded = if earlier_shown.get() { 0 } else { at };
@@ -119,14 +133,28 @@ pub fn run_view(store: Store, id: String) -> View {
                             1 => "1 earlier exchange".to_owned(),
                             n => format!("{n} earlier exchanges"),
                         };
-                        list =
-                            list.child(ui::btn(words, ui::Variant::Ghost, Size::Sm, move || {
-                                earlier_shown.set(true)
-                            }));
+                        list = list.child(view().flex_row().justify_center().child(ui::btn(
+                            words,
+                            Variant::Outline,
+                            Size::Sm,
+                            move || earlier_shown.set(true),
+                        )));
+                    } else if at > 0 {
+                        list = list.child(view().flex_row().justify_center().child(ui::btn(
+                            "Hide earlier exchanges",
+                            Variant::Ghost,
+                            Size::Sm,
+                            move || earlier_shown.set(false),
+                        )));
                     }
-                    for run in runs.into_iter().skip(folded) {
+                    let mut first_visible = true;
+                    for (index, run) in runs.into_iter().enumerate().skip(folded) {
+                        if !first_visible {
+                            list = list.child(ui::separator());
+                        }
+                        first_visible = false;
                         let this = run.id == id;
-                        let exchange = exchange(store, run, this);
+                        let exchange = exchange(store, run, index, total, this, direct);
                         list = list.child(if this {
                             exchange.element_ref(&opened)
                         } else {
@@ -140,29 +168,202 @@ pub fn run_view(store: Store, id: String) -> View {
         .child(follow_up(store, latest, who))
 }
 
-/// The agent's state, under its name: what its latest run is doing.
-fn state(run: &RunSummary, waiting: bool) -> String {
+/// Top bar: back button, agent name with tone-coded status dot, and a Stop
+/// action while its latest background run is working.
+fn header(
+    store: Store,
+    latest: Memo<Option<RunSummary>>,
+    who: Memo<(String, String, bool)>,
+) -> View {
+    let status_info = computed(move || {
+        let waiting = who.with(|(_, _, waiting)| *waiting);
+        latest.with(|run| {
+            run.as_ref()
+                .map(|run| state_with_tone(run, waiting))
+                .unwrap_or_else(|| (String::new(), Tone::Neutral))
+        })
+    });
+    let stoppable = computed(move || {
+        latest.with(|run| {
+            run.as_ref()
+                .filter(|r| r.phase.is_running() && r.background)
+                .map(|r| r.id.clone())
+        })
+    });
+    view()
+        .h(px(ui::fit::bar()))
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .border_b_1()
+        .border_color(colors::LINE)
+        .child(ui::icon_btn(Glyph::Back, "Back", Size::Md, move || {
+            store.close_run()
+        }))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(
+                    text(move || who.with(|(_, title, _)| title.clone()))
+                        .number_of_lines(1)
+                        .role(AccessibilityRole::Header)
+                        .text_size(px(ui::fit::body()))
+                        .font_weight(FontWeight::SEMIBOLD),
+                )
+                .child(when(
+                    move || status_info.with(|(words, _)| !words.is_empty()),
+                    move || {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                view()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(move || status_info.with(|(_, tone)| tone.color()))
+                                    .accessibility_elements_hidden(true),
+                            )
+                            .child(
+                                text(move || status_info.with(|(words, _)| words.clone()))
+                                    .number_of_lines(1)
+                                    .text_size(px(type_scale::XS))
+                                    .text_color(move || {
+                                        status_info.with(|(_, tone)| match tone {
+                                            Tone::Neutral => colors::FAINT,
+                                            t => t.color(),
+                                        })
+                                    }),
+                            )
+                    },
+                )),
+        )
+        .child(when(
+            move || stoppable.with(Option::is_some),
+            move || {
+                ui::btn("Stop", Variant::Ghost, Size::Sm, move || {
+                    if let Some(run_id) = stoppable.get_untracked() {
+                        store.stop_run(&run_id);
+                    }
+                })
+            },
+        ))
+}
+
+/// Fixed stepper under the header when a thread has two or more exchanges:
+/// jump directly to the previous, next or latest exchange without scrolling
+/// past a verbose response.
+fn exchange_nav(store: Store, thread: Memo<Vec<RunSummary>>, id: String) -> View {
+    let nav = computed(move || {
+        thread.with(|runs| {
+            let total = runs.len();
+            if total <= 1 {
+                return None;
+            }
+            let at = runs.iter().position(|run| run.id == id).unwrap_or(0);
+            let prev = at
+                .checked_sub(1)
+                .and_then(|i| runs.get(i))
+                .map(|r| r.id.clone());
+            let next = runs.get(at + 1).map(|r| r.id.clone());
+            let last = (at + 1 < total).then(|| runs[total - 1].id.clone());
+            Some((at, total, prev, next, last))
+        })
+    });
+    view().child(dynamic(move || {
+        let (at, total, prev, next, last) = nav.get()?;
+        Some(untracked(move || {
+            let has_prev = prev.is_some();
+            let has_next = next.is_some();
+            let mut controls = view().flex_row().items_center().gap_1();
+            if let Some(last_id) = last {
+                controls = controls.child(ui::btn("Latest", Variant::Ghost, Size::Sm, move || {
+                    store.open_run(&last_id)
+                }));
+            }
+            controls = controls
+                .child(ui::icon_btn_disabled(
+                    Glyph::Up,
+                    "Previous exchange",
+                    Size::Sm,
+                    !has_prev,
+                    move || {
+                        if let Some(prev_id) = &prev {
+                            store.open_run(prev_id);
+                        }
+                    },
+                ))
+                .child(ui::icon_btn_disabled(
+                    Glyph::Down,
+                    "Next exchange",
+                    Size::Sm,
+                    !has_next,
+                    move || {
+                        if let Some(next_id) = &next {
+                            store.open_run(next_id);
+                        }
+                    },
+                ));
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(colors::LINE)
+                .child(
+                    text(format!("Exchange {} of {total}", at + 1))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .tabular_nums()
+                        .text_size(px(type_scale::XS))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors::MUTED),
+                )
+                .child(controls)
+        }))
+    }))
+}
+
+/// The agent's state and tone, under its name: what its latest run is doing.
+fn state_with_tone(run: &RunSummary, waiting: bool) -> (String, Tone) {
     if waiting {
-        return "Waiting on you".into();
+        return ("Waiting on you".into(), Tone::Warning);
     }
     match run.phase {
-        RunPhase::Running => "Working".into(),
-        _ if run.can_continue => "Ready for a follow-up".into(),
-        RunPhase::Succeeded => "Finished".into(),
-        RunPhase::Failed => "Failed".into(),
-        RunPhase::Stopped if run.stopped_by_owner => "Stopped by you".into(),
-        RunPhase::Stopped => "Stopped".into(),
-        RunPhase::Unknown => String::new(),
+        RunPhase::Running => ("Working".into(), Tone::Accent),
+        _ if run.can_continue => ("Ready for a follow-up".into(), Tone::Success),
+        RunPhase::Succeeded => ("Finished".into(), Tone::Neutral),
+        RunPhase::Failed => ("Failed".into(), Tone::Danger),
+        RunPhase::Stopped if run.stopped_by_owner => ("Stopped by you".into(), Tone::Warning),
+        RunPhase::Stopped => ("Stopped".into(), Tone::Warning),
+        RunPhase::Unknown => (String::new(), Tone::Neutral),
     }
 }
 
-/// One run as an exchange: what it was asked, then what the agent
-/// answered; `this`: the run the view was opened on, with its steps.
-fn exchange(store: Store, run: RunSummary, this: bool) -> View {
-    view()
-        .gap_2()
-        .child(asked(store, &run, this))
-        .child(answer(store, &run))
+/// One run as an exchange: optional multi-exchange strip, what it was asked,
+/// then what the agent answered; `this`: the run the view was opened on,
+/// with its steps.
+fn exchange(
+    store: Store,
+    run: RunSummary,
+    index: usize,
+    total: usize,
+    this: bool,
+    direct: bool,
+) -> View {
+    let mut block = view().gap_2();
+    if total > 1 {
+        block = block.child(exchange_meta(store, &run, index, this));
+    }
+    block
+        .child(asked(store, &run, this, direct))
+        .child(answer(store, &run, this))
         .child(if this {
             steps(store, &run)
         } else {
@@ -170,36 +371,152 @@ fn exchange(store: Store, run: RunSummary, this: bool) -> View {
         })
 }
 
-/// What it was asked: the owner's follow-up as the owner's message, on the
-/// right; aidaemon's delegation on the left, its first lines, unfolding.
-fn asked(store: Store, run: &RunSummary, this: bool) -> View {
+/// Quiet metadata strip over each exchange in a multi-exchange thread:
+/// index, status glyph, duration/clock time, and Open when viewing another.
+fn exchange_meta(store: Store, run: &RunSummary, index: usize, this: bool) -> View {
+    let (glyph, tone) = match run.phase {
+        RunPhase::Running => (Glyph::Work, Tone::Accent),
+        RunPhase::Succeeded => (Glyph::Check, Tone::Success),
+        RunPhase::Failed => (Glyph::Warning, Tone::Danger),
+        RunPhase::Stopped => (Glyph::Warning, Tone::Warning),
+        RunPhase::Unknown => (Glyph::Dot, Tone::Neutral),
+    };
+    let mut caption = format!("#{}", index + 1);
+    if let Some(ended) = run.ended_at_ms {
+        let dur = ui::time::span(ended.saturating_sub(run.started_at_ms) / 1000);
+        if !dur.is_empty() {
+            caption.push_str(&format!(" · {dur}"));
+        }
+    } else if run.phase == RunPhase::Running {
+        caption.push_str(" · working");
+    }
+    let clock = ui::time::clock(run.started_at_ms);
+    if !clock.is_empty() {
+        caption.push_str(&format!(" · {clock}"));
+    }
+    let mut row = view()
+        .flex_row()
+        .items_center()
+        .gap_1p5()
+        .child(
+            ui::icon_inline(glyph)
+                .text_color(tone.color())
+                .accessibility_elements_hidden(true),
+        )
+        .child(
+            text(caption)
+                .flex_1()
+                .min_w(px(0.0))
+                .number_of_lines(1)
+                .tabular_nums()
+                .text_size(px(type_scale::XS))
+                .font_weight(if this {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if this { colors::MUTED } else { colors::FAINT }),
+        );
+    if !this {
+        let open_id = run.id.clone();
+        row = row.child(ui::btn("Open", Variant::Ghost, Size::Sm, move || {
+            store.open_run(&open_id)
+        }));
+    }
+    row
+}
+
+/// Whether `run`'s prompt came directly from the owner (an `in_run` follow-up
+/// or any turn in a direct coding-agent conversation) rather than aidaemon
+/// delegating on their behalf.
+fn is_owner_prompt(run: &RunSummary, direct: bool) -> bool {
+    direct || run.asked.as_ref().is_some_and(|asked| asked.by_owner)
+}
+
+/// What it was asked: the owner's prompt or follow-up as a right-aligned
+/// bubble clearly attributed to "You"; aidaemon's delegation on the left in
+/// a recessed inset block labeled "aidaemon asked".
+fn asked(store: Store, run: &RunSummary, this: bool, direct: bool) -> View {
     // A record from before runs kept what they were asked: the task the
     // opened run's record has, else its label.
     let task = match untracked(|| store.run_view()) {
         Read::Ready(detail) if this && !detail.task.is_empty() => Some(detail.task),
         _ => None,
     };
-    let (words, by_owner) = run.asked.as_ref().map_or_else(
-        || (task.unwrap_or_else(|| run.label.clone()), false),
-        |asked| (asked.text.clone(), asked.by_owner),
-    );
-    if by_owner {
-        return view().w_full().items_end().child(
-            view()
-                .max_w(percentage(0.85))
-                .rounded(px(ui::radius::SURFACE))
-                .bg(colors::BUBBLE)
-                .px_3()
-                .py_2()
-                .child(text(words).selectable(true).text_size(px(ui::fit::body()))),
-        );
+    let words = run
+        .asked
+        .as_ref()
+        .map(|asked| asked.text.clone())
+        .unwrap_or_else(|| task.unwrap_or_else(|| run.label.clone()));
+    if is_owner_prompt(run, direct) {
+        let open = signal(false);
+        let long = words.chars().count() > 420 || words.lines().count() > 6;
+        let short = words.clone();
+        return view()
+            .w_full()
+            .items_end()
+            .gap_1()
+            .child(
+                text("You")
+                    .px_1()
+                    .text_size(px(type_scale::XS))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors::FAINT),
+            )
+            .child(
+                view()
+                    .max_w(percentage(0.88))
+                    .rounded(px(ui::radius::SURFACE))
+                    .bg(colors::BUBBLE)
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .child(
+                        when(move || open.get() || !long, {
+                            let words = words.clone();
+                            move || {
+                                text(words.clone())
+                                    .selectable(true)
+                                    .text_size(px(ui::fit::body()))
+                                    .text_color(colors::TEXT)
+                            }
+                        })
+                        .otherwise(move || {
+                            text(short.clone())
+                                .number_of_lines(6)
+                                .text_size(px(ui::fit::body()))
+                                .text_color(colors::TEXT)
+                        }),
+                    )
+                    .child(when(
+                        move || long,
+                        move || {
+                            ui::quiet_disclosure(
+                                move || if open.get() { "Less" } else { "All of it" },
+                                open,
+                            )
+                        },
+                    )),
+            );
     }
     let open = signal(false);
     let long = words.chars().count() > 240 || words.lines().count() > 4;
     let short = words.clone();
     view()
+        .w_full()
+        .rounded(px(ui::radius::CONTROL))
+        .bg(colors::INSET)
+        .border_1()
+        .border_color(colors::LINE)
+        .px_3()
+        .py_2()
         .gap_1()
-        .child(section_label("aidaemon asked"))
+        .child(
+            text("aidaemon asked")
+                .text_size(px(type_scale::XS))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(colors::FAINT),
+        )
         .child(
             when(move || open.get() || !long, {
                 let words = words.clone();
@@ -225,11 +542,11 @@ fn asked(store: Store, run: &RunSummary, this: bool) -> View {
         ))
 }
 
-/// What the agent answered: working while it runs; its reply, the files
-/// its record shows changed, its checks and open questions, and each claim
-/// its record doesn't bear out, once it ended.
-fn answer(store: Store, run: &RunSummary) -> View {
-    let mut said = view().gap_1();
+/// What the agent answered: working while it runs; once ended, its changed
+/// files and checks up front in a compact summary card, then its reply
+/// (previewed and collapsible when verbose), then Copy / Read aloud.
+fn answer(store: Store, run: &RunSummary, this: bool) -> View {
+    let mut said = view().gap_2();
     if run.phase == RunPhase::Running {
         let step = if run.step.is_empty() {
             "Working".to_string()
@@ -238,21 +555,121 @@ fn answer(store: Store, run: &RunSummary) -> View {
         };
         return said.child(ui::working(step));
     }
+    let coding = store.is_coding(&run.session_id);
+    let facts: Vec<(Glyph, Tone, String)> =
+        run.result.as_ref().map(result_facts).unwrap_or_default();
+    if !run.edited.is_empty() || !facts.is_empty() {
+        let mut summary = view()
+            .w_full()
+            .rounded(px(ui::radius::CONTROL))
+            .bg(colors::SURFACE)
+            .border_1()
+            .border_color(colors::BORDER)
+            .px_3()
+            .py_2()
+            .gap_1();
+        for path in run.edited.clone() {
+            summary = summary.child(changed_file(store, path, coding));
+        }
+        for (glyph, tone, words) in facts {
+            summary = summary.child(line(glyph, tone, words, false));
+        }
+        said = said.child(summary);
+    }
     let reply = run
         .result
         .as_ref()
         .map(|result| result.text.clone())
         .filter(|text| !text.is_empty());
+    let agent_name = run.agent.clone().unwrap_or_else(|| "Agent".to_string());
     match (&reply, run.phase) {
         (Some(reply), _) => {
-            // The agent's reply is Markdown, as a model's is.
-            let shown = reply.clone();
-            said = said
-                .child(super::conversation::markdown(
-                    move || shown.clone().into(),
-                    || false,
-                ))
-                .child(reply_actions(store, reply.clone()));
+            let budget = if this {
+                FOCUSED_REPLY_BUDGET
+            } else {
+                OTHER_REPLY_BUDGET
+            };
+            let preview = markdown_preview(reply, budget);
+            let is_verbose = preview.is_some();
+            let expanded = signal(!is_verbose);
+            // Agent attribution row above the reply, with a quick Collapse
+            // button at the top when a verbose reply is expanded.
+            said = said.child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        ui::icon_inline(Glyph::Work)
+                            .text_color(colors::ACCENT)
+                            .accessibility_elements_hidden(true),
+                    )
+                    .child(
+                        text(agent_name)
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::XS))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(colors::MUTED),
+                    )
+                    .child(when(
+                        move || is_verbose && expanded.get(),
+                        move || {
+                            ui::btn("Collapse", Variant::Ghost, Size::Sm, move || {
+                                expanded.set(false)
+                            })
+                        },
+                    )),
+            );
+            match preview {
+                Some((short, total_lines)) => {
+                    let full = reply.clone();
+                    let expand_label = if total_lines >= 6 {
+                        format!("Show full response ({total_lines} lines)")
+                    } else {
+                        "Show full response".to_string()
+                    };
+                    said = said
+                        .child(dynamic(move || {
+                            let text = if expanded.get() {
+                                full.clone()
+                            } else {
+                                short.clone()
+                            };
+                            Some(untracked(move || {
+                                super::conversation::markdown(move || text.clone().into(), || false)
+                            }))
+                        }))
+                        .child(view().flex_row().items_center().child(dynamic(move || {
+                            if expanded.get() {
+                                Some(untracked(move || {
+                                    ui::btn(
+                                        "Collapse response",
+                                        Variant::Ghost,
+                                        Size::Sm,
+                                        move || expanded.set(false),
+                                    )
+                                }))
+                            } else {
+                                let label = expand_label.clone();
+                                Some(untracked(move || {
+                                    ui::btn(label.clone(), Variant::Outline, Size::Sm, move || {
+                                        expanded.set(true)
+                                    })
+                                }))
+                            }
+                        })));
+                }
+                None => {
+                    let shown = reply.clone();
+                    said = said.child(super::conversation::markdown(
+                        move || shown.clone().into(),
+                        || false,
+                    ));
+                }
+            }
+            said = said.child(reply_actions(store, reply.clone()));
         }
         (None, RunPhase::Failed | RunPhase::Stopped) => {
             let why = run.reason.clone().unwrap_or_else(|| match run.phase {
@@ -265,16 +682,92 @@ fn answer(store: Store, run: &RunSummary) -> View {
             said = said.child(note("It ended without a reply.".into()));
         }
     }
-    let coding = store.is_coding(&run.session_id);
-    for path in run.edited.clone() {
-        said = said.child(changed_file(store, path, coding));
+    said
+}
+
+/// Build a safe Markdown preview for verbose replies: returns `None` when
+/// `text` fits within `budget`'s trigger limits; otherwise returns
+/// `Some((preview, total_lines))` cut at a clean line/word boundary with any
+/// open fenced code block closed so Markdown stays well-formed.
+fn markdown_preview(text: &str, budget: CollapseBudget) -> Option<(String, usize)> {
+    let trimmed = text.trim();
+    let total_lines = trimmed.lines().count();
+    if trimmed.chars().count() <= budget.trigger_chars && total_lines <= budget.trigger_lines {
+        return None;
     }
-    if let Some(result) = &run.result {
-        for (glyph, tone, words) in result_facts(result) {
-            said = said.child(line(glyph, tone, words, false));
+    let mut out = String::new();
+    let mut used_chars = 0usize;
+    let mut open_fence: Option<&'static str> = None;
+
+    for raw_line in trimmed.lines().take(budget.preview_lines) {
+        let line_chars = raw_line.chars().count();
+        let sep_chars = usize::from(!out.is_empty());
+        if used_chars + sep_chars + line_chars > budget.preview_chars {
+            if !out.is_empty() && used_chars >= budget.preview_chars / 3 {
+                break;
+            }
+            let remaining = budget.preview_chars.saturating_sub(used_chars + sep_chars);
+            if remaining == 0 {
+                break;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let cut = truncate_at_word(raw_line, remaining);
+            out.push_str(cut);
+            update_fence(&mut open_fence, cut);
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+            used_chars += 1;
+        }
+        out.push_str(raw_line);
+        used_chars += line_chars;
+        update_fence(&mut open_fence, raw_line);
+    }
+
+    let mut preview = out.trim_end().to_string();
+    if let Some(fence) = open_fence {
+        preview.push('\n');
+        preview.push_str(fence);
+    } else if !preview.ends_with('…') {
+        preview.push('…');
+    }
+    Some((preview, total_lines))
+}
+
+/// Update open fenced code block tracker (` ``` ` or `~~~`) for one line.
+fn update_fence(open_fence: &mut Option<&'static str>, line: &str) {
+    let lead = line.trim_start();
+    let marker = if lead.starts_with("```") {
+        Some("```")
+    } else if lead.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    };
+    if let Some(m) = marker {
+        match *open_fence {
+            Some(current) if current == m => *open_fence = None,
+            None => *open_fence = Some(m),
+            Some(_) => {}
         }
     }
-    said
+}
+
+/// Slice `s` to at most `max_chars` characters, preferring the last whitespace
+/// break in the second half so words stay intact.
+fn truncate_at_word(s: &str, max_chars: usize) -> &str {
+    let Some((byte_at, _)) = s.char_indices().nth(max_chars) else {
+        return s;
+    };
+    let head = &s[..byte_at];
+    let cut = head
+        .rfind(char::is_whitespace)
+        .filter(|&pos| pos > byte_at / 2)
+        .unwrap_or(byte_at);
+    head[..cut].trim_end()
 }
 
 /// Under the agent's reply: Copy and Read aloud, as under a model's.
@@ -439,10 +932,14 @@ fn more(store: Store, run: &RunSummary) -> View {
 }
 
 /// The steps, plan, permissions and cost of the run the view was opened
-/// on, folded, from its record; nothing when it kept none.
+/// on, folded once it has a reply (open while working or when it ended
+/// without a reply); nothing when it kept none.
 fn steps(store: Store, run: &RunSummary) -> View {
-    let running = run.phase == RunPhase::Running;
-    let open = signal(running);
+    let has_reply = run
+        .result
+        .as_ref()
+        .is_some_and(|result| !result.text.trim().is_empty());
+    let open = signal(run.phase == RunPhase::Running || !has_reply);
     view().child(dynamic(move || {
         let Read::Ready(detail) = store.run_view() else {
             return None;
@@ -490,8 +987,8 @@ fn thread_of(runs: &[RunSummary], id: &str) -> Vec<RunSummary> {
 
 /// A follow-up at the view's foot, continuing the thread's latest run: only
 /// when its agent kept its session, it ended, and nothing goes on from it
-/// yet. Once sent, the message shows as sent until the run that takes it
-/// starts, and the view moves to that run.
+/// yet. Once sent, the message shows as sent (under "You") until the run
+/// that takes it starts, and the view moves to that run.
 fn follow_up(
     store: Store,
     latest: Memo<Option<RunSummary>>,
@@ -549,8 +1046,15 @@ fn follow_up(
                     .border_t_1()
                     .border_color(colors::LINE)
                     .child(
+                        text("You")
+                            .px_1()
+                            .text_size(px(type_scale::XS))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors::FAINT),
+                    )
+                    .child(
                         view()
-                            .max_w(percentage(0.85))
+                            .max_w(percentage(0.88))
                             .rounded(px(ui::radius::SURFACE))
                             .bg(colors::BUBBLE)
                             .px_3()
@@ -593,7 +1097,10 @@ fn follow_up(
                                     .min_w(px(0.0))
                                     .on_submit(move |_: &str| send()),
                             )
-                            .child(ui::icon_btn_primary(Glyph::Send, "Send to the agent", send)),
+                            .child(
+                                ui::icon_btn_primary(Glyph::Send, "Send to the agent", send)
+                                    .disabled(move || draft.with(|d| d.trim().is_empty())),
+                            ),
                     )
             },
         ))
@@ -709,4 +1216,78 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
                 .selectable(true)
                 .text_size(px(type_scale::SM)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FOCUSED_REPLY_BUDGET, is_owner_prompt, markdown_preview};
+    use aidaemon_client_protocol::{RunAsked, RunPhase, RunSummary};
+
+    fn sample_run(asked: Option<RunAsked>) -> RunSummary {
+        RunSummary {
+            id: "cli-agent-1".into(),
+            session_id: "app:synthetic-1".into(),
+            label: "Review the codebase".into(),
+            agent: Some("Antigravity CLI".into()),
+            phase: RunPhase::Succeeded,
+            background: true,
+            step: String::new(),
+            started_at_ms: 1000,
+            ended_at_ms: Some(2000),
+            took: None,
+            reason: None,
+            stopped_by_owner: false,
+            group: None,
+            edited: Vec::new(),
+            continues: None,
+            thread: None,
+            can_continue: true,
+            result: None,
+            asked,
+        }
+    }
+
+    #[test]
+    fn owner_prompt_covers_direct_agent_and_owner_follow_ups() {
+        let delegated = sample_run(Some(RunAsked {
+            text: "Check the logs".into(),
+            by_owner: false,
+        }));
+        assert!(!is_owner_prompt(&delegated, false));
+        assert!(is_owner_prompt(&delegated, true));
+
+        let follow_up = sample_run(Some(RunAsked {
+            text: "Also add tests".into(),
+            by_owner: true,
+        }));
+        assert!(is_owner_prompt(&follow_up, false));
+        assert!(is_owner_prompt(&follow_up, true));
+
+        let legacy = sample_run(None);
+        assert!(!is_owner_prompt(&legacy, false));
+        assert!(is_owner_prompt(&legacy, true));
+    }
+
+    #[test]
+    fn short_reply_is_not_collapsed() {
+        assert!(markdown_preview("Fixed the slug in `slug.py`.", FOCUSED_REPLY_BUDGET).is_none());
+    }
+
+    #[test]
+    fn verbose_reply_collapses_and_closes_open_code_fence() {
+        let mut text = String::from("Summary line.\n\n```rust\n");
+        for i in 0..30 {
+            text.push_str(&format!("let step_{i} = {i};\n"));
+        }
+        text.push_str("```\n\nClosing remarks.");
+        let (preview, lines) =
+            markdown_preview(&text, FOCUSED_REPLY_BUDGET).expect("verbose reply collapses");
+        assert!(lines > 30);
+        assert!(preview.starts_with("Summary line."));
+        assert_eq!(
+            preview.matches("```").count() % 2,
+            0,
+            "code fence closed: {preview}"
+        );
+    }
 }

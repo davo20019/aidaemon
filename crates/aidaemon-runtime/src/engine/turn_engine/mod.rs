@@ -95,7 +95,6 @@ fn follow_up_script(
     runs: Arc<crate::run_state::RunStates>,
 ) -> Option<Arc<crate::engine::provider::ScriptedSteps>> {
     let thread = channel_ctx.in_run.as_ref()?;
-    let working_dir = thread.working_dir.clone()?;
     if user_role != UserRole::Owner || user_text.trim().is_empty() {
         return None;
     }
@@ -103,19 +102,26 @@ fn follow_up_script(
     // The daemon writes this call from the owner's typed follow-up: the run
     // it starts is the owner's, its end shown in its thread, not reviewed.
     crate::helper_run::mark_owner_follow_up(&id);
+    let mut arguments = serde_json::json!({
+        "action": "run",
+        "continue_run": thread.run,
+        "prompt": user_text.trim(),
+        "title": aidaemon_channels::presentation::word_preview(user_text.trim(), 50),
+        "workspace_mode": "read_write",
+        "async_mode": true,
+    });
+    if let Some(working_dir) = thread
+        .working_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
+        arguments["working_dir"] = serde_json::Value::String(working_dir.to_string());
+        arguments["write_paths"] = serde_json::json!([working_dir]);
+    }
     let call = sdk::ToolCall {
         id,
         name: "cli_agent".to_string(),
-        arguments: serde_json::json!({
-            "action": "run",
-            "continue_run": thread.run,
-            "prompt": user_text.trim(),
-            "title": aidaemon_channels::presentation::word_preview(user_text.trim(), 50),
-            "working_dir": working_dir,
-            "workspace_mode": "read_write",
-            "write_paths": [working_dir],
-            "async_mode": true,
-        }),
+        arguments,
         provider_data: None,
     };
     let (earlier, chat, since) = (

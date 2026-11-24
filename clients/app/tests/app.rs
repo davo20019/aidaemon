@@ -931,6 +931,73 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.wait_for("1 earlier exchange")?;
     app.press("1 earlier exchange")?;
     app.wait_for_gone("1 earlier exchange", std::time::Duration::from_secs(2))?;
+    app.wait_for("Hide earlier exchanges")?;
+    Ok(())
+}
+
+/// In a direct coding-agent conversation: the owner's prompts show under
+/// "You" (never "aidaemon asked"), verbose replies start collapsed with a
+/// toggle to expand/collapse, and a multi-exchange thread steps directly
+/// between exchanges without scrolling through long responses.
+#[test]
+fn a_direct_agent_thread_marks_owner_prompts_collapses_verbose_replies_and_steps_exchanges()
+-> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let mut verbose = String::from("Opening summary of the synthetic review.");
+    for i in 1..=24 {
+        verbose.push_str(&format!("\n- Finding {i}: synthetic detail line {i}."));
+    }
+    verbose.push_str("\n\nFinal synthetic conclusion.");
+    let verbose_json = serde_json::to_string(&verbose).unwrap();
+    let before_models = sent("list_models");
+    feed([
+        Update::Connected,
+        frame(&format!(
+            r#"{{"type":"snapshot","seq":7,"state":{{"sessions":[{{"id":"app:synthetic-direct","channel":"app","title":"Review synthetic CLI","writable":true,"project_id":"project-acme"}}],"projects":[{{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"}}],"running_tasks":[],"pending_approvals":[],"runs":[{{"id":"cli-agent-d1","session_id":"app:synthetic-direct","label":"Review synthetic CLI","agent":"Antigravity CLI","phase":"succeeded","background":true,"started_at_ms":9999999950000,"ended_at_ms":9999999960000,"can_continue":true,"asked":{{"text":"Review how synthetic coordination works","by_owner":false}},"result":{{"text":{verbose_json}}}}},{{"id":"cli-agent-d2","session_id":"app:synthetic-direct","label":"Follow-up check","agent":"Antigravity CLI","phase":"succeeded","background":true,"started_at_ms":9999999970000,"ended_at_ms":9999999980000,"continues":"cli-agent-d1","thread":"cli-agent-d1","can_continue":true,"asked":{{"text":"Summarize the top fix","by_owner":true}},"result":{{"text":"Top fix: collapse verbose replies."}}}}]}}}}"#
+        )),
+    ]);
+    let models_id = wait_sent_new("list_models", before_models)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{models_id}","result":{{"type":"models","options":{{"providers":[],"agents":[{{"id":"agy","name":"Antigravity CLI"}}]}}}}}}"#
+    ))]);
+    settle(&mut app)?;
+    let before_session_model = sent("get_session_model");
+    app.press("Review synthetic CLI >> nth=0")?;
+    let sm_id = wait_sent_new("get_session_model", before_session_model)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{sm_id}","result":{{"type":"session_model","session_model":{{"session_id":"app:synthetic-direct","model":{{"mode":"agent","agent":"agy"}},"effort":"auto"}}}}}}"#
+    ))]);
+    settle(&mut app)?;
+    let before_run = sent("get_run");
+    app.press("Antigravity CLI, show what it did")?;
+    let run_id = wait_sent_new("get_run", before_run)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{run_id}","result":{{"type":"run","run":{{"run_id":"cli-agent-d1","can_continue":true,"task":"Review how synthetic coordination works","steps":[{{"words":"Reading files","state":"done"}}]}}}}}}"#
+    ))]);
+    // Direct coding-agent prompt is attributed to "You", never "aidaemon asked".
+    app.wait_for("text:You >> nth=0")?;
+    assert!(app.wait_for("text:aidaemon asked").is_err());
+    // Multi-exchange stepper is visible right under the header.
+    app.wait_for("text:Exchange 1 of 2")?;
+    // Verbose reply starts collapsed to a preview; expanding reveals the end.
+    app.wait_for("text:Opening summary of the synthetic review.")?;
+    app.wait_for("Show full response (27 lines)")?;
+    assert!(app.wait_for("text:Final synthetic conclusion.").is_err());
+    app.press("Show full response (27 lines)")?;
+    app.wait_for("text:Final synthetic conclusion.")?;
+    app.press("Collapse response")?;
+    app.wait_for("Show full response (27 lines)")?;
+    // Next exchange jumps directly to exchange 2 without scrolling.
+    let before_next = sent("get_run");
+    app.press("Next exchange")?;
+    let next_id = wait_sent_new("get_run", before_next)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{next_id}","result":{{"type":"run","run":{{"run_id":"cli-agent-d2","can_continue":true,"task":"Summarize the top fix"}}}}}}"#
+    ))]);
+    app.wait_for("text:Exchange 2 of 2")?;
+    app.wait_for("text:Top fix: collapse verbose replies.")?;
     Ok(())
 }
 

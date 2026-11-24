@@ -115,6 +115,7 @@ pub fn Offline() -> impl IntoElement {
             "get_history",
             "get_settings",
             "list_models",
+            "get_session_model",
             "set_session_model",
             "edit_queued",
             "archive_session",
