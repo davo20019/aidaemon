@@ -295,6 +295,16 @@ pub trait DynamicCliAgentStore: Send + Sync {
         Ok(None)
     }
 
+    /// The latest run of conversation `session_id` by agent `agent_name`
+    /// that kept its agent's session (a follow-up can go on from it).
+    async fn latest_kept_cli_agent_run(
+        &self,
+        _session_id: &str,
+        _agent_name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Invocation `id`'s events, in order.
     async fn get_cli_agent_events(&self, _id: i64) -> anyhow::Result<Vec<CliAgentEvent>> {
         Ok(vec![])

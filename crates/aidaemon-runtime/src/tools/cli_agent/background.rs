@@ -101,8 +101,8 @@ impl CliAgentTool {
         let result = extract_meaningful_output(&stdout_output, 10000);
 
         // Capture git diff for finished background tasks.
-        let diff_section = if let Some(dir) = agent.diff_dir.get() {
-            Self::capture_git_diff(backend, dir)
+        let diff_section = if let Some(base) = agent.diff_dir.get() {
+            Self::capture_git_diff(backend, base)
                 .await
                 .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
         } else {

@@ -224,6 +224,24 @@ impl crate::state::types::DynamicCliAgentStore for SqliteStateStore {
         }))
     }
 
+    async fn latest_kept_cli_agent_run(
+        &self,
+        session_id: &str,
+        agent_name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let run: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM cli_agent_invocations
+             WHERE session_id = ? AND agent_name = ? AND COALESCE(keeps_session, 0) != 0
+               AND agent_session_id IS NOT NULL AND run_id IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(agent_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(run)
+    }
+
     async fn get_cli_agent_events(
         &self,
         id: i64,

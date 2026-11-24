@@ -3068,8 +3068,8 @@ pub struct RunAsked {
 /// What a run's coding agent ended with (protocol 1.48).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct RunResult {
-    /// Its reply, shortened: its report's summary when it reported in
-    /// fields, else its final message.
+    /// Its whole reply (bounded only against a runaway agent): its
+    /// report's summary when it reported in fields, else its final message.
     pub text: String,
     /// Its report, when its agent was held to the report's fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]

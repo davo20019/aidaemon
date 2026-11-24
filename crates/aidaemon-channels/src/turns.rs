@@ -392,8 +392,8 @@ pub struct RunAsk {
 /// where those claims disagree with what it was seen doing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunResult {
-    /// Its final message, shortened; its report's summary when it reported
-    /// in fields.
+    /// Its final message, whole (bounded only against a runaway agent); its
+    /// report's summary when it reported in fields.
     pub text: String,
     /// Its report, when its protocol held it to the report schema.
     pub claims: Option<RunClaims>,

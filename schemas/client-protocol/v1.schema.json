@@ -6223,7 +6223,7 @@
           "description": "Its report, when its agent was held to the report's fields."
         },
         "text": {
-          "description": "Its reply, shortened: its report's summary when it reported in\nfields, else its final message.",
+          "description": "Its whole reply (bounded only against a runaway agent): its\nreport's summary when it reported in fields, else its final message.",
           "type": "string"
         }
       },

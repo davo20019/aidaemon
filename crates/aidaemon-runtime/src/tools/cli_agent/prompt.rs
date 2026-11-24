@@ -271,11 +271,34 @@ impl CliAgentTool {
         parts.join("\n\n")
     }
 
-    /// Capture git diff after CLI agent completes (for any exit code).
-    pub(super) async fn capture_git_diff(
+    /// The commit `working_dir`'s checkout is at, when it is a repository
+    /// with one.
+    pub(super) async fn git_head(
         backend: &SharedExecutionBackend,
         working_dir: &str,
     ) -> Option<String> {
+        let head = aidaemon_tools::fs_utils::run_cmd_backend(
+            backend.as_ref(),
+            "git rev-parse HEAD",
+            Some(&BackendPath::new(working_dir)),
+            5,
+        )
+        .await
+        .ok()?;
+        let sha = head.stdout.trim();
+        // A commit id is hexadecimal (machine format): anything else is not one.
+        (head.exit_code == 0 && !sha.is_empty() && sha.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| sha.to_string())
+    }
+
+    /// Capture git diff after CLI agent completes (for any exit code): what
+    /// changed since `base` was taken, uncommitted or committed by the run.
+    /// A commit made before the run started is never its own.
+    pub(super) async fn capture_git_diff(
+        backend: &SharedExecutionBackend,
+        base: &DiffBase,
+    ) -> Option<String> {
+        let working_dir = base.dir.as_str();
         let directory = BackendPath::new(working_dir);
         let git_check = aidaemon_tools::fs_utils::run_cmd_backend(
             backend.as_ref(),
@@ -316,10 +339,16 @@ impl CliAgentTool {
             }
         }
 
-        // No uncommitted changes — check if the agent committed something
+        // No uncommitted changes: what the run committed, when HEAD moved
+        // since it started.
+        let start = base.head.as_deref()?;
+        let now = Self::git_head(backend, working_dir).await?;
+        if now == start {
+            return None;
+        }
         let log = aidaemon_tools::fs_utils::run_cmd_backend(
             backend.as_ref(),
-            "git log -1 --stat --format=%s",
+            &format!("git log --format=%s {start}..HEAD"),
             Some(&directory),
             10,
         )
@@ -330,7 +359,7 @@ impl CliAgentTool {
         if !log_output.trim().is_empty() {
             let committed_diff = aidaemon_tools::fs_utils::run_cmd_backend(
                 backend.as_ref(),
-                "git diff HEAD~1..HEAD",
+                &format!("git diff {start}..HEAD"),
                 Some(&directory),
                 10,
             )
@@ -376,4 +405,12 @@ impl CliAgentTool {
                 .count(),
         )
     }
+}
+
+/// Where a run's diff is taken and from what: its folder (clean when it
+/// started) and the commit it was at then.
+#[derive(Debug, Clone)]
+pub(super) struct DiffBase {
+    pub(super) dir: String,
+    pub(super) head: Option<String>,
 }

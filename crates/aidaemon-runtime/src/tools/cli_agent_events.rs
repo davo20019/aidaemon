@@ -153,8 +153,9 @@ impl AgentEventRecorder {
     }
 }
 
-/// How long a run's reply is kept.
-const REPLY_CHARS: usize = 2_000;
+/// How long a run's reply is kept: whole, as a client shows it in the run's
+/// own view, with a bound only against a runaway agent.
+const REPLY_CHARS: usize = 50_000;
 
 /// A run's result: the agent's reply (its report's summary when it reported
 /// in fields), its claims, and each claim its recorded actions don't bear

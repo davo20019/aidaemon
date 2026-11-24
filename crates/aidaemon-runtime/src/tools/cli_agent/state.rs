@@ -69,7 +69,7 @@ pub(super) struct RunningCliAgent {
     pub(super) delegated_task_id: Option<String>,
     /// The working directory whose diff its result shows: set when it
     /// starts from a clean read-write checkout.
-    pub(super) diff_dir: Arc<OnceLock<String>>,
+    pub(super) diff_dir: Arc<OnceLock<super::prompt::DiffBase>>,
     /// The working directory it claimed ([`WorkingDirClaim`]), released
     /// when it ends or is cancelled.
     pub(super) claim_dir: Option<String>,

@@ -732,6 +732,21 @@ fn run_row(store: Store, id: String, row: ReadSignal<WorkRow>, grouped: bool) ->
         ))
 }
 
+/// How much of an agent's reply its card shows.
+const CARD_REPLY_CHARS: usize = 600;
+
+/// The start of `text` up to about `max` characters, cut at the last line
+/// break before it when there is one, with an ellipsis when cut.
+fn excerpt(text: &str, max: usize) -> String {
+    let text = text.trim();
+    let Some((at, _)) = text.char_indices().nth(max) else {
+        return text.to_owned();
+    };
+    let head = &text[..at];
+    let cut = head.rfind('\n').filter(|&line| line > at / 2).unwrap_or(at);
+    format!("{}…", head[..cut].trim_end())
+}
+
 /// A coding agent's reply as its message in the conversation: who it is
 /// (the name the owner gave it, else what it was started for, and its
 /// agent), how it ended and how long it took, what it said, and its typed
@@ -786,7 +801,8 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             })
         });
         if !result.text.is_empty() && !direct {
-            let reply = result.text.clone();
+            // The card's excerpt; its view (a press) has the whole reply.
+            let reply = excerpt(&result.text, CARD_REPLY_CHARS);
             body = body.child(markdown(move || reply.clone().into(), || false));
         }
         let fact = |glyph: Glyph, tone: ui::Tone, words: String| {
@@ -3333,6 +3349,13 @@ fn speech_note(error: nsh_core::speech::SpeechError) -> Option<&'static str> {
 #[cfg(test)]
 mod dictation_tests {
     use super::Dictated;
+
+    #[test]
+    fn a_card_shows_an_excerpt_cut_at_a_line() {
+        assert_eq!(super::excerpt("short", 600), "short");
+        let long = format!("{}\n{}", "a".repeat(400), "b".repeat(400));
+        assert_eq!(super::excerpt(&long, 600), format!("{}…", "a".repeat(400)));
+    }
 
     #[test]
     fn words_follow_what_was_typed() {

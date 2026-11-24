@@ -243,7 +243,7 @@ pub(super) struct RunShared {
     /// Whether its end is delivered to its chat: a background run's is,
     /// and a foreground one's once it moved to the background.
     should_notify: Arc<AtomicBool>,
-    diff_dir: Arc<OnceLock<String>>,
+    diff_dir: Arc<OnceLock<super::prompt::DiffBase>>,
     process: Arc<RunProcess>,
     /// The agent it waits on to leave its folder, while it does.
     folder_wait: FolderWaitOn,
@@ -278,7 +278,7 @@ pub(super) struct StartedRun {
     receipt_before: TreeReceipt,
     /// Its file write roots' marks when it started ([`file_marks`]).
     files_before: Vec<FileMark>,
-    diff_dir: Option<String>,
+    diff_dir: Option<super::prompt::DiffBase>,
 }
 
 /// The task table's entry for a run.
@@ -688,8 +688,8 @@ impl CliAgentTool {
                 );
 
                 // Capture git diff
-                let diff_section = if let Some(ref dir) = working_dir_owned {
-                    Self::capture_git_diff(&self.backend, dir)
+                let diff_section = if let Some(ref base) = working_dir_owned {
+                    Self::capture_git_diff(&self.backend, base)
                         .await
                         .map(|diff| format!("\n\n## File Changes\n```diff\n{}\n```", diff))
                 } else {
@@ -1492,9 +1492,13 @@ impl RunHandles {
         // from a clean baseline. Otherwise it attributes and exposes unrelated
         // pre-existing work to the child. Read-only runs never need a diff.
         let diff_dir = if prep.workspace_mode == CliWorkspaceMode::ReadWrite {
-            if let Some(dir) = prep.working_dir.as_deref() {
-                (CliAgentTool::dirty_worktree_entry_count(&self.backend, dir).await == Some(0))
-                    .then(|| dir.to_string())
+            if let Some(dir) = prep.working_dir.as_deref()
+                && CliAgentTool::dirty_worktree_entry_count(&self.backend, dir).await == Some(0)
+            {
+                Some(super::prompt::DiffBase {
+                    dir: dir.to_string(),
+                    head: CliAgentTool::git_head(&self.backend, dir).await,
+                })
             } else {
                 None
             }
@@ -2222,7 +2226,7 @@ async fn watch_run(
                     report: &agent_report,
                     persisted_output: &persisted_output,
                     left: &left,
-                    diff_dir: notify_working_dir.as_deref(),
+                    diff_dir: notify_working_dir.as_ref(),
                     max_output: max_output_for_log,
                     answer_alone: true,
                 },
@@ -2247,7 +2251,7 @@ struct EndDelivery<'a> {
     /// Its report with what it left running: what the parent reads.
     persisted_output: &'a str,
     left: &'a left_running::LeftRunning,
-    diff_dir: Option<&'a str>,
+    diff_dir: Option<&'a super::prompt::DiffBase>,
     max_output: usize,
     /// Whether a run that ends alone (in no group of its turn's runs)
     /// answers its chat. A queued run stopped before it started does not:
@@ -2281,9 +2285,24 @@ async fn deliver_end(
         Some(run) => Some(run.finish(phase, end.evidence.clone()).await),
         None => None,
     };
-    let notification_summary: String = end.report.chars().take(500).collect();
-    let diff_section = if let Some(dir) = end.diff_dir {
-        CliAgentTool::capture_git_diff(&handles.backend, dir)
+    // A conversation set to a coding agent takes its result as it is: no
+    // model call follows the agent's run.
+    let direct = !notify_session_id.trim().is_empty()
+        && crate::session_model::get(handles.state.as_ref(), &notify_session_id)
+            .await
+            .agent
+            .is_some();
+    // There, the agent's whole report is the answer, and the conversation's
+    // own changes view shows the diff.
+    let notification_summary: String = if direct {
+        end.report.to_string()
+    } else {
+        end.report.chars().take(500).collect()
+    };
+    let diff_section = if direct {
+        None
+    } else if let Some(base) = end.diff_dir {
+        CliAgentTool::capture_git_diff(&handles.backend, base)
             .await
             .map(|diff| format!("\n\n{}", diff))
     } else {
@@ -2386,13 +2405,6 @@ async fn deliver_end(
         .goal_id
         .as_deref()
         .is_some_and(|goal_id| !goal_id.is_empty());
-    // A conversation set to a coding agent takes its result as it is: no
-    // model call follows the agent's run.
-    let direct = !notify_session_id.trim().is_empty()
-        && crate::session_model::get(handles.state.as_ref(), &notify_session_id)
-            .await
-            .agent
-            .is_some();
     if direct {
         info!(
             session_id = %notify_session_id,

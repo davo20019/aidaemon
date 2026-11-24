@@ -635,6 +635,24 @@ impl CliAgentTool {
 
         match action {
             "run" => {
+                // In a conversation set to this agent, each message goes on
+                // from the agent's latest run here that kept its session,
+                // so the agent has the conversation so far.
+                if args.continue_run.is_none()
+                    && let Some(agent) = args.tool.clone()
+                    && crate::session_model::get(self.state.as_ref(), &session_id)
+                        .await
+                        .agent
+                        .as_deref()
+                        == Some(agent.as_str())
+                    && let Ok(Some(run)) = self
+                        .state
+                        .latest_kept_cli_agent_run(&session_id, &agent)
+                        .await
+                    && self.earlier_run(&run, &session_id).await.is_ok()
+                {
+                    args.continue_run = Some(run);
+                }
                 // A follow-up to an earlier run: the same agent, in its
                 // folder, going on in its own session.
                 let continues = match args

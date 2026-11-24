@@ -7,7 +7,10 @@ async fn test_capture_git_diff_no_repo() {
     let tmp = tempfile::TempDir::new().unwrap();
     let result = CliAgentTool::capture_git_diff(
         &aidaemon_tools::testing::active_execution_backend(),
-        tmp.path().to_str().unwrap(),
+        &crate::tools::cli_agent::prompt::DiffBase {
+            dir: tmp.path().to_str().unwrap().to_string(),
+            head: None,
+        },
     )
     .await;
     assert!(result.is_none(), "Non-git directory should return None");
@@ -119,8 +122,12 @@ async fn test_capture_git_diff_with_changes() {
         Some(1)
     );
 
+    let base = crate::tools::cli_agent::prompt::DiffBase {
+        dir: dir.to_string(),
+        head: None,
+    };
     let result =
-        CliAgentTool::capture_git_diff(&aidaemon_tools::testing::active_execution_backend(), dir)
+        CliAgentTool::capture_git_diff(&aidaemon_tools::testing::active_execution_backend(), &base)
             .await;
     assert!(result.is_some(), "Should capture uncommitted changes");
     let diff = result.unwrap();
@@ -202,3 +209,48 @@ async fn test_enriched_prompt_uses_scoped_agents_instead_of_readme() {
 // -----------------------------------------------------------------------
 // Scenario replication: exact user prompt that caused the hang
 // -----------------------------------------------------------------------
+
+/// A run reports only commits made since it started: the folder's last
+/// commit from before the run is someone else's work.
+#[tokio::test]
+async fn a_commit_from_before_the_run_is_not_reported_as_its_change() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    let git = |args: &'static [&'static str]| {
+        let dir = dir.to_string();
+        async move {
+            tokio::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+    git(&["init"]).await;
+    git(&["config", "user.email", "synthetic@example.com"]).await;
+    git(&["config", "user.name", "Synthetic Tester"]).await;
+    std::fs::write(tmp.path().join("old.txt"), "before the run").unwrap();
+    git(&["add", "."]).await;
+    git(&["commit", "-m", "earlier work"]).await;
+    let backend = aidaemon_tools::testing::active_execution_backend();
+    let base = crate::tools::cli_agent::prompt::DiffBase {
+        dir: dir.to_string(),
+        head: CliAgentTool::git_head(&backend, dir).await,
+    };
+    assert!(base.head.is_some());
+    assert!(
+        CliAgentTool::capture_git_diff(&backend, &base)
+            .await
+            .is_none(),
+        "the earlier commit is not the run's"
+    );
+    std::fs::write(tmp.path().join("new.txt"), "made by the run").unwrap();
+    git(&["add", "."]).await;
+    git(&["commit", "-m", "the run's work"]).await;
+    let diff = CliAgentTool::capture_git_diff(&backend, &base)
+        .await
+        .unwrap();
+    assert!(diff.contains("new.txt"), "{diff}");
+    assert!(!diff.contains("old.txt"), "{diff}");
+}
