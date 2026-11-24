@@ -137,9 +137,8 @@ fn shown_note(run: &crate::run_state::RunState) -> String {
     }
     if result.mismatches.is_empty() {
         return format!(
-            "[The owner sees this run as {agent}'s message, with its report; the run's record \
-             bears out every claim in it. Don't re-check its work. If nothing else in the \
-             request remains, end your turn with no reply: the owner already has the answer.]"
+            "[The owner sees this run as {agent}'s message, with its report. The run's record \
+             bears out every claim in it.]"
         );
     }
     let disagrees: Vec<String> = result
@@ -162,7 +161,7 @@ fn shown_note(run: &crate::run_state::RunState) -> String {
         .collect();
     format!(
         "[The owner sees this run as {agent}'s message, with its report. The run's record \
-         disagrees with it: {}. Check those before relying on them, and tell the owner.]",
+         disagrees with it: {}.]",
         disagrees.join("; ")
     )
 }

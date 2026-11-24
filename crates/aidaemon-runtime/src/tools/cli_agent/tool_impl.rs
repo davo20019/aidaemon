@@ -22,7 +22,11 @@ impl Tool for CliAgentTool {
             "name": "cli_agent",
             "description": format!(
                 "Delegate coding or research to an installed CLI agent. Available agents: {}. \
-                 Runs can be checked or cancelled. {}",
+                 Runs can be checked or cancelled. The owner sees a run's reply as the agent's \
+                 own message, its report checked against the run's record; the result says \
+                 whether the record bears out every claim. When it does, don't re-check or \
+                 restate the agent's work: if nothing else in the request remains, end your turn \
+                 with no reply. {}",
                 tools_help,
                 CLI_SANDBOX.describe()
             ),
