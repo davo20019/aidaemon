@@ -2737,10 +2737,11 @@ fn run_line(run: &aidaemon_client_protocol::RunSummary) -> Option<String> {
     let result = result_line(run.result.as_ref()?);
     let asked = run.asked.as_ref().map(|asked| {
         let what = aidaemon_channels::presentation::word_preview(&asked.text, 120);
+        // Named, never "you": a reader took "You asked" for the owner.
         if asked.by_owner {
-            format!("The owner asked it directly (not you): \"{what}\"")
+            format!("Asked by the owner, directly (not by aidaemon): \"{what}\"")
         } else {
-            format!("You asked: \"{what}\"")
+            format!("Asked by aidaemon: \"{what}\"")
         }
     });
     let ended = match run.phase {
@@ -2829,13 +2830,13 @@ mod run_line_tests {
         assert_eq!(
             run_line(&run(serde_json::json!({"text": "What did you append?", "by_owner": true}), "succeeded")),
             Some(
-                "The owner asked it directly (not you): \"What did you append?\" → Appended a line."
+                "Asked by the owner, directly (not by aidaemon): \"What did you append?\" → Appended a line."
                     .into()
             )
         );
         assert_eq!(
             run_line(&run(serde_json::json!({"text": "Fix the slug"}), "failed")),
-            Some("You asked: \"Fix the slug\" → It failed. → Appended a line.".into())
+            Some("Asked by aidaemon: \"Fix the slug\" → It failed. → Appended a line.".into())
         );
     }
 }

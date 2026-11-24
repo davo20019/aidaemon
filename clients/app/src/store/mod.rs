@@ -814,9 +814,12 @@ impl Store {
                 self.drafts.update(|d| {
                     d.remove(NEW);
                 });
+                // It is the open conversation, here after a reload too.
+                let _ = nsh_core::storage::Storage::set_item(OPEN_KEY, session.clone());
                 self.selected.set(Some(session));
             }
             Effect::OpenGreeting(session) => {
+                let _ = nsh_core::storage::Storage::set_item(OPEN_KEY, session.clone());
                 self.selected.set(Some(session));
                 self.page.set(Page::Conversation);
             }

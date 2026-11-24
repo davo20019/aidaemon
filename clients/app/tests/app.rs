@@ -901,8 +901,9 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.press("1 reply, open the thread")?;
     wait_sent_new("get_run", before)?;
     app.wait_for("text:Added a test for the slug.")?;
-    app.wait_for("text:pytest -q passed")?;
-    app.wait_for("text:Says it ran pytest -q, but no run was seen")?;
+    // Its check the record doesn't show run: one warning, not a pass.
+    app.wait_for("text:pytest -q: said passed, but no run of it was seen")?;
+    assert!(app.wait_for("text:pytest -q passed").is_err());
     app.press("Back")?;
     app.press("1 agent")?;
     // The owner names it; the daemon keeps the name and every client shows it.

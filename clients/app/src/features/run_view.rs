@@ -267,65 +267,99 @@ fn answer(store: Store, run: &RunSummary) -> View {
         said = said.child(changed_file(store, path, coding));
     }
     if let Some(result) = &run.result {
-        if let Some(report) = &result.report {
-            for check in &report.checks {
-                said = said.child(if check.passed {
-                    line(
-                        Glyph::Check,
-                        Tone::Success,
-                        format!("{} passed", check.command),
-                        false,
-                    )
-                } else {
-                    line(
-                        Glyph::Warning,
-                        Tone::Danger,
-                        format!("{} failed", check.command),
-                        false,
-                    )
-                });
-            }
-            for question in &report.open_questions {
-                said = said.child(line(
-                    Glyph::Dot,
-                    Tone::Info,
-                    format!("Open: {question}"),
-                    false,
-                ));
-            }
-            if report.needs_owner {
-                said = said.child(line(
-                    Glyph::Approval,
-                    Tone::Warning,
-                    "Needs you".into(),
-                    false,
-                ));
-            }
-        }
-        for mismatch in &result.mismatches {
-            use aidaemon_client_protocol::RunMismatch;
-            let words = match mismatch {
-                RunMismatch::ChangeNotSeen { path } => {
-                    format!(
-                        "Says it changed {}, but no change was seen",
-                        file_name(path)
-                    )
-                }
-                RunMismatch::ChangeNotClaimed { path } => {
-                    format!("Changed {} without saying so", file_name(path))
-                }
-                RunMismatch::CheckNotRun { command } => {
-                    format!("Says it ran {command}, but no run was seen")
-                }
-                RunMismatch::CheckFailed { command } => {
-                    format!("Says {command} passed, but it failed")
-                }
-                RunMismatch::Unknown => continue,
-            };
-            said = said.child(line(Glyph::Warning, Tone::Warning, words, false));
+        for (glyph, tone, words) in result_facts(result) {
+            said = said.child(line(glyph, tone, words, false));
         }
     }
     said
+}
+
+/// What a run's result says beyond its reply, a line each: each check it
+/// reports, as its record bears it out (a check the record doesn't show
+/// run, or shows failing, is one warning, not a pass and a warning), its
+/// open questions, that it needs the owner, and each other claim the
+/// record doesn't bear out.
+pub(crate) fn result_facts(
+    result: &aidaemon_client_protocol::RunResult,
+) -> Vec<(Glyph, Tone, String)> {
+    use aidaemon_client_protocol::RunMismatch;
+    let mut facts = Vec::new();
+    let checks = result
+        .report
+        .as_ref()
+        .map(|report| report.checks.as_slice())
+        .unwrap_or_default();
+    let not_run = |command: &str| {
+        result
+            .mismatches
+            .iter()
+            .any(|m| matches!(m, RunMismatch::CheckNotRun { command: c } if c == command))
+    };
+    let failed = |command: &str| {
+        result
+            .mismatches
+            .iter()
+            .any(|m| matches!(m, RunMismatch::CheckFailed { command: c } if c == command))
+    };
+    for check in checks {
+        let command = &check.command;
+        facts.push(if failed(command) {
+            (
+                Glyph::Warning,
+                Tone::Danger,
+                format!("{command} failed (it said passed)"),
+            )
+        } else if not_run(command) {
+            (
+                Glyph::Warning,
+                Tone::Warning,
+                format!(
+                    "{command}: said {}, but no run of it was seen",
+                    if check.passed { "passed" } else { "failed" }
+                ),
+            )
+        } else if check.passed {
+            (Glyph::Check, Tone::Success, format!("{command} passed"))
+        } else {
+            (Glyph::Warning, Tone::Danger, format!("{command} failed"))
+        });
+    }
+    if let Some(report) = &result.report {
+        for question in &report.open_questions {
+            facts.push((Glyph::Dot, Tone::Info, format!("Open: {question}")));
+        }
+        if report.needs_owner {
+            facts.push((Glyph::Approval, Tone::Warning, "Needs you".into()));
+        }
+    }
+    let reported = |command: &str| checks.iter().any(|check| check.command == command);
+    for mismatch in &result.mismatches {
+        let words = match mismatch {
+            RunMismatch::ChangeNotSeen { path } => {
+                format!(
+                    "Says it changed {}, but no change was seen",
+                    file_name(path)
+                )
+            }
+            RunMismatch::ChangeNotClaimed { path } => {
+                format!("Changed {} without saying so", file_name(path))
+            }
+            RunMismatch::CheckNotRun { command } | RunMismatch::CheckFailed { command }
+                if reported(command) =>
+            {
+                continue;
+            }
+            RunMismatch::CheckNotRun { command } => {
+                format!("Says it ran {command}, but no run was seen")
+            }
+            RunMismatch::CheckFailed { command } => {
+                format!("Says {command} passed, but it failed")
+            }
+            RunMismatch::Unknown => continue,
+        };
+        facts.push((Glyph::Warning, Tone::Warning, words));
+    }
+    facts
 }
 
 /// A file a run changed; in a coding conversation it opens its diff.

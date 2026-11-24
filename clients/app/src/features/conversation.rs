@@ -783,66 +783,18 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
                         .text_color(colors::MUTED),
                 )
         };
-        if let Some(report) = &result.report {
-            if !report.changed_files.is_empty() {
-                let names: Vec<&str> = report.changed_files.iter().map(|p| file_name(p)).collect();
-                body = body.child(fact(
-                    Glyph::File,
-                    ui::Tone::Neutral,
-                    format!("Changed {}", names.join(", ")),
-                ));
-            }
-            for check in &report.checks {
-                body = body.child(if check.passed {
-                    fact(
-                        Glyph::Check,
-                        ui::Tone::Success,
-                        format!("{} passed", check.command),
-                    )
-                } else {
-                    fact(
-                        Glyph::Warning,
-                        ui::Tone::Danger,
-                        format!("{} failed", check.command),
-                    )
-                });
-            }
-            for question in &report.open_questions {
-                body = body.child(fact(
-                    Glyph::Dot,
-                    ui::Tone::Info,
-                    format!("Open: {question}"),
-                ));
-            }
-            if report.needs_owner {
-                body = body.child(fact(
-                    Glyph::Approval,
-                    ui::Tone::Warning,
-                    "Needs you".to_string(),
-                ));
-            }
+        if let Some(report) = &result.report
+            && !report.changed_files.is_empty()
+        {
+            let names: Vec<&str> = report.changed_files.iter().map(|p| file_name(p)).collect();
+            body = body.child(fact(
+                Glyph::File,
+                ui::Tone::Neutral,
+                format!("Changed {}", names.join(", ")),
+            ));
         }
-        for mismatch in &result.mismatches {
-            use aidaemon_client_protocol::RunMismatch;
-            let words = match mismatch {
-                RunMismatch::ChangeNotSeen { path } => {
-                    format!(
-                        "Says it changed {}, but no change was seen",
-                        file_name(path)
-                    )
-                }
-                RunMismatch::ChangeNotClaimed { path } => {
-                    format!("Changed {} without saying so", file_name(path))
-                }
-                RunMismatch::CheckNotRun { command } => {
-                    format!("Says it ran {command}, but no run was seen")
-                }
-                RunMismatch::CheckFailed { command } => {
-                    format!("Says {command} passed, but it failed")
-                }
-                RunMismatch::Unknown => continue,
-            };
-            body = body.child(fact(Glyph::Warning, ui::Tone::Warning, words));
+        for (glyph, tone, words) in super::run_view::result_facts(&result) {
+            body = body.child(fact(glyph, tone, words));
         }
         body
     };

@@ -49,13 +49,16 @@ pub fn schema() -> Value {
             "changed_files": strings.clone(),
             "checks": {
                 "type": "array",
-                "description": "Each test, build or lint command you ran, and whether it passed.",
+                "description": "Each test, build or lint command you ran, and whether it passed. Only commands you ran: a check you made by reading a file is not one.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["command", "passed"],
                     "properties": {
-                        "command": {"type": "string"},
+                        "command": {
+                            "type": "string",
+                            "description": "The command line exactly as you ran it."
+                        },
                         "passed": {"type": "boolean"}
                     }
                 }
