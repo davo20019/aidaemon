@@ -349,20 +349,43 @@ pub(super) fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
 }
 
 /// Try to extract meaningful content from CLI output.
+/// A schema-held agent's report reads as its text
+/// ([`aidaemon_coding_agents::Report::to_text`]), never as its JSON.
 pub(super) fn extract_meaningful_output(raw: &str, max_chars: usize) -> String {
     // Try JSON extraction first
     if let Some(content) = extract_json_content(raw) {
-        return truncate_with_note(&content, max_chars);
+        return truncate_with_note(&report_or_text(content), max_chars);
     }
     if let Some(content) = extract_jsonl_content(raw) {
-        return truncate_with_note(&content, max_chars);
+        return truncate_with_note(&report_or_text(content), max_chars);
     }
     truncate_with_note(raw, max_chars)
+}
+
+/// A final message that is a report's JSON (what a schema-held agent
+/// writes) as the report's text; any other text as it is.
+fn report_or_text(text: String) -> String {
+    match aidaemon_coding_agents::Report::from_text(&text) {
+        Some(report) => report.to_text(),
+        None => text,
+    }
+}
+
+/// The report in a final event's `structured_output` (Claude Code with
+/// `--json-schema` writes it there, its `result` text may be empty), as text.
+fn structured_report(v: &Value) -> Option<String> {
+    v.get("structured_output")
+        .and_then(aidaemon_coding_agents::Report::from_value)
+        .map(|report| report.to_text())
 }
 
 /// Try to extract content from JSON output.
 pub(super) fn extract_json_content(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
+
+    if let Some(report) = structured_report(&v) {
+        return Some(report);
+    }
 
     // Claude Code JSON: "result" field
     if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
@@ -390,6 +413,9 @@ pub(super) fn extract_jsonl_content(raw: &str) -> Option<String> {
     let mut last_content: Option<String> = None;
     for line in raw.lines().rev() {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if let Some(report) = structured_report(&v) {
+                return Some(report);
+            }
             // Codex CLI JSONL emits the final response as:
             // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
             //

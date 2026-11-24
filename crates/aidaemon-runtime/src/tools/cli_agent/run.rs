@@ -2429,13 +2429,10 @@ async fn deliver_end(
             .is_some();
     // There, the agent's whole report is the answer, and the conversation's
     // own changes view shows the diff.
-    // A schema-held agent's report is shown as what it says, not as its
-    // JSON.
-    let shown = shown_report(end.report);
     let notification_summary: String = if direct {
-        shown
+        end.report.to_string()
     } else {
-        shown.chars().take(500).collect()
+        end.report.chars().take(500).collect()
     };
     let diff_section = if direct {
         None
@@ -2837,40 +2834,4 @@ async fn end_unstarted(
     )
     .await;
     settle_run(handles, call, shared, phase, evidence);
-}
-
-/// A run's final text as the owner reads it: a report
-/// ([`aidaemon_coding_agents::Report::from_text`]) as its summary and the
-/// questions it left open; any other text as it is.
-pub(super) fn shown_report(text: &str) -> String {
-    let Some(report) = aidaemon_coding_agents::Report::from_text(text) else {
-        return text.to_string();
-    };
-    let mut shown = report.summary.trim().to_string();
-    if !report.open_questions.is_empty() {
-        shown.push_str("\n\nOpen questions:");
-        for question in &report.open_questions {
-            shown.push_str(&format!("\n- {}", question.trim()));
-        }
-    }
-    shown
-}
-
-#[cfg(test)]
-mod shown_report_tests {
-    use super::shown_report;
-
-    #[test]
-    fn a_report_reads_as_its_summary_and_open_questions() {
-        let text = r#"{"summary":"Renamed the button to Send.","changed_files":["form.html"],"checks":[],"open_questions":["Keep the old label in the French copy?"],"needs_owner":false}"#;
-        assert_eq!(
-            shown_report(text),
-            "Renamed the button to Send.\n\nOpen questions:\n- Keep the old label in the French copy?"
-        );
-    }
-
-    #[test]
-    fn plain_text_is_kept_as_it_is() {
-        assert_eq!(shown_report("Added a test."), "Added a test.");
-    }
 }

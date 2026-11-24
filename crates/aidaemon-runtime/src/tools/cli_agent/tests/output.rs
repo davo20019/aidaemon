@@ -268,3 +268,31 @@ async fn test_progress_extraction_from_claude_stream() {
 // -----------------------------------------------------------------------
 // Multi-line stderr output test
 // -----------------------------------------------------------------------
+
+/// A schema-held agent's report reads as its text wherever its output is
+/// used (the run's record, a check, a synchronous result), never as JSON.
+#[test]
+fn a_report_reads_as_its_text_not_its_json() {
+    let report = r#"{"summary":"Renamed the button to Send.","changed_files":["form.html"],"checks":[],"open_questions":[],"needs_owner":false}"#;
+    let shown = "Renamed the button to Send.\n\nChanged files:\n- form.html";
+
+    // Claude Code's last stream line: the report as `structured_output`
+    // and as the JSON text of `result`.
+    let claude = format!(
+        "{{\"type\":\"system\"}}\n{}",
+        serde_json::json!({"type": "result", "result": report, "structured_output": serde_json::from_str::<serde_json::Value>(report).unwrap()})
+    );
+    assert_eq!(extract_meaningful_output(&claude, 4_000), shown);
+
+    // The report only in `structured_output`, with an empty `result`.
+    let empty_result = serde_json::json!({"type": "result", "result": "", "structured_output": serde_json::from_str::<serde_json::Value>(report).unwrap()}).to_string();
+    assert_eq!(extract_meaningful_output(&empty_result, 4_000), shown);
+
+    // Codex's final agent message whose text is the report's JSON.
+    let codex = serde_json::json!({"type": "item.completed", "item": {"type": "agent_message", "text": report}}).to_string();
+    assert_eq!(extract_meaningful_output(&codex, 4_000), shown);
+
+    // Prose stays as it is.
+    let prose = serde_json::json!({"type": "result", "result": "Added a test."}).to_string();
+    assert_eq!(extract_meaningful_output(&prose, 4_000), "Added a test.");
+}

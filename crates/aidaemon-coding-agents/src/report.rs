@@ -121,6 +121,37 @@ impl Report {
             .and_then(|value| Self::from_value(&value))
     }
 
+    /// The report as text a person or a model reads: its summary, then the
+    /// files it says it changed, the checks it says it ran, what it left
+    /// open and whether it waits on the owner. Its claims, as the agent
+    /// made them.
+    pub fn to_text(&self) -> String {
+        let mut text = self.summary.trim().to_string();
+        if !self.changed_files.is_empty() {
+            text.push_str("\n\nChanged files:");
+            for path in &self.changed_files {
+                text.push_str(&format!("\n- {}", path.trim()));
+            }
+        }
+        if !self.checks.is_empty() {
+            text.push_str("\n\nChecks:");
+            for check in &self.checks {
+                let how = if check.passed { "passed" } else { "failed" };
+                text.push_str(&format!("\n- {} ({how})", check.command.trim()));
+            }
+        }
+        if !self.open_questions.is_empty() {
+            text.push_str("\n\nOpen questions:");
+            for question in &self.open_questions {
+                text.push_str(&format!("\n- {}", question.trim()));
+            }
+        }
+        if self.needs_owner {
+            text.push_str("\n\nIt needs the owner before the work can go on.");
+        }
+        text
+    }
+
     /// Its stored form.
     pub fn to_value(&self) -> Value {
         json!({
@@ -169,5 +200,28 @@ mod tests {
         );
         assert_eq!(Report::from_value(&json!({"summary": "  "})), None);
         assert_eq!(schema()["required"].as_array().map(Vec::len), Some(5));
+    }
+
+    #[test]
+    fn a_report_reads_as_text_with_only_the_parts_it_has() {
+        let report = Report {
+            summary: "Renamed the button to Send.".into(),
+            changed_files: vec!["form.html".into()],
+            checks: vec![Check {
+                command: "npm test".into(),
+                passed: false,
+            }],
+            open_questions: vec!["Keep the old label in the French copy?".into()],
+            needs_owner: true,
+        };
+        assert_eq!(
+            report.to_text(),
+            "Renamed the button to Send.\n\nChanged files:\n- form.html\n\nChecks:\n- npm test (failed)\n\nOpen questions:\n- Keep the old label in the French copy?\n\nIt needs the owner before the work can go on."
+        );
+        let bare = Report {
+            summary: "Nothing to change.".into(),
+            ..Report::default()
+        };
+        assert_eq!(bare.to_text(), "Nothing to change.");
     }
 }
