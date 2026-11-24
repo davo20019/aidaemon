@@ -37,8 +37,8 @@ struct CollapseBudget {
 const FOCUSED_REPLY_BUDGET: CollapseBudget = CollapseBudget {
     trigger_chars: 900,
     trigger_lines: 18,
-    preview_chars: 520,
-    preview_lines: 10,
+    preview_chars: 360,
+    preview_lines: 7,
 };
 
 const OTHER_REPLY_BUDGET: CollapseBudget = CollapseBudget {
@@ -95,8 +95,13 @@ pub fn run_view(store: Store, id: String) -> View {
     // viewport back down to `opened`.
     let earlier_shown = signal(false);
     effect(move || {
-        let _ = (ready.get(), thread.with(Vec::len));
-        if earlier_shown.get_untracked() {
+        let Some(_) = ready.try_get() else {
+            return;
+        };
+        let Some(_) = thread.try_get() else {
+            return;
+        };
+        if untracked(|| earlier_shown.try_get()).unwrap_or(true) {
             return;
         }
         untracked(|| {
@@ -321,7 +326,7 @@ fn exchange_nav(store: Store, thread: Memo<Vec<RunSummary>>, id: String) -> View
                         .min_w(px(0.0))
                         .number_of_lines(1)
                         .tabular_nums()
-                        .text_size(px(type_scale::XS))
+                        .text_size(px(ui::fit::small()))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(colors::MUTED),
                 )
@@ -609,7 +614,7 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
                             .flex_1()
                             .min_w(px(0.0))
                             .number_of_lines(1)
-                            .text_size(px(type_scale::XS))
+                            .text_size(px(ui::fit::small()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(colors::MUTED),
                     )

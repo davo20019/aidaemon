@@ -780,6 +780,16 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
     // What this run was for: the agent's name stays, its task changes.
     let task =
         computed(move || run.with(|r| r.as_ref().map(|r| r.label.clone()).unwrap_or_default()));
+    // In a conversation set to a coding agent, the card is the agent's
+    // answer, kept short: what it said is in its view, a press away.
+    let direct = computed(move || {
+        store.selected().is_some_and(|session| {
+            matches!(
+                store.model_of(Some(&session)).0,
+                aidaemon_client_protocol::ModelChoice::Agent { .. }
+            )
+        })
+    });
     let open = id.clone();
     let body = move || {
         let Some(r) = run.get() else {
@@ -789,16 +799,7 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             return view();
         };
         let mut body = view().gap_1();
-        // In a conversation set to a coding agent, the card is the agent's
-        // answer, kept short: what it said is in its view, a press away.
-        let direct = untracked(|| {
-            store.selected().is_some_and(|session| {
-                matches!(
-                    store.model_of(Some(&session)).0,
-                    aidaemon_client_protocol::ModelChoice::Agent { .. }
-                )
-            })
-        });
+        let direct = direct.get();
         if !result.text.is_empty() && !direct {
             // The card's excerpt; its view (a press) has the whole reply.
             let reply = excerpt(&result.text, CARD_REPLY_CHARS);
@@ -912,7 +913,10 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
                             .text_size(px(type_scale::XS))
                             .text_color(colors::FAINT),
                     )
-                    .child(dynamic(move || Some(untracked(body)))),
+                    .child(dynamic(move || {
+                        let _ = (run.get(), direct.get());
+                        Some(untracked(body))
+                    })),
             ),
     )
 }
