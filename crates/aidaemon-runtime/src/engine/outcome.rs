@@ -162,6 +162,10 @@ pub struct TurnVerdict {
     /// tells the user the work continues instead of shipping the model's own
     /// verdict on unfinished work.
     pub handoff_reply: std::sync::Mutex<Option<String>>,
+    /// The coding agents this turn started answered it themselves
+    /// ([`crate::run_state::RunStates::agents_answered`]) and the model added
+    /// nothing: the turn ships no reply of its own.
+    pub answered_by_agents: std::sync::atomic::AtomicBool,
 }
 
 impl TurnVerdict {
@@ -229,7 +233,15 @@ impl TurnVerdict {
                 Some(answer) if reply.trim().is_empty() => answer,
                 _ => reply,
             };
-            finalize_reply(&reply, tool_calls, note.as_deref())
+            if reply.trim().is_empty()
+                && self
+                    .answered_by_agents
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                String::new()
+            } else {
+                finalize_reply(&reply, tool_calls, note.as_deref())
+            }
         } else {
             // A stopped run's text (the model's partial answer, or the
             // daemon's own explanation) gets the same reply sanitization; a

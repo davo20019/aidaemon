@@ -118,6 +118,55 @@ pub(super) struct PreparedRun {
     claim: Option<WorkingDirClaimGuard>,
 }
 
+/// What the model is told of a waited run's end that the owner already sees:
+/// the run is drawn as its agent's message, with its report and where its
+/// record disagrees. With nothing to disagree with and nothing else to do,
+/// the model's turn may end without a reply of its own
+/// ([`crate::run_state::RunStates::agents_answered`]).
+fn shown_note(run: &crate::run_state::RunState) -> String {
+    use aidaemon_channels::turns::RunMismatch;
+    let agent = run.agent.as_deref().unwrap_or("The agent");
+    let Some(result) = &run.result else {
+        return format!("[The owner sees this run as {agent}'s message.]");
+    };
+    if result.claims.is_none() {
+        return format!(
+            "[The owner sees this run as {agent}'s message. It reported in text only: \
+             nothing in it was checked against the run's record.]"
+        );
+    }
+    if result.mismatches.is_empty() {
+        return format!(
+            "[The owner sees this run as {agent}'s message, with its report; the run's record \
+             bears out every claim in it. Don't re-check its work. If nothing else in the \
+             request remains, end your turn with no reply: the owner already has the answer.]"
+        );
+    }
+    let disagrees: Vec<String> = result
+        .mismatches
+        .iter()
+        .map(|mismatch| match mismatch {
+            RunMismatch::ChangeNotSeen { path } => {
+                format!("it says it changed {path}; no change seen")
+            }
+            RunMismatch::ChangeNotClaimed { path } => {
+                format!("it changed {path} without saying so")
+            }
+            RunMismatch::CheckNotRun { command } => {
+                format!("it says it ran `{command}`; no run seen")
+            }
+            RunMismatch::CheckFailed { command } => {
+                format!("it says `{command}` passed; it failed")
+            }
+        })
+        .collect();
+    format!(
+        "[The owner sees this run as {agent}'s message, with its report. The run's record \
+         disagrees with it: {}. Check those before relying on them, and tell the owner.]",
+        disagrees.join("; ")
+    )
+}
+
 /// The longest task a run's record keeps of what it was asked.
 const ASKED_CHARS: usize = 2000;
 
@@ -667,8 +716,11 @@ impl CliAgentTool {
                     }
                 }
 
-                // Success path
-                let mut final_result = result_text;
+                // Success path: what the owner already sees of it first.
+                let mut final_result = match self.run_handles().runs.get(&cli_run_id(&task_id)) {
+                    Some(run) => format!("{}\n\n{result_text}", shown_note(&run)),
+                    None => result_text,
+                };
                 if let Some(diff) = diff_section {
                     final_result.push_str(&diff);
                 }

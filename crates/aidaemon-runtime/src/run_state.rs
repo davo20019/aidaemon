@@ -1204,6 +1204,27 @@ impl RunStates {
         self.lock().get(id).map(|entry| entry.state.clone())
     }
 
+    /// Whether the runs chat turn `request` started answered it themselves:
+    /// at least one, and every one a coding agent's that ended succeeded
+    /// with a typed report its record bears out in full. The owner sees
+    /// each as that agent's message, so the turn needs no reply of its own.
+    pub fn agents_answered(&self, request: &str) -> bool {
+        let runs = self.lock();
+        let mut started = runs
+            .values()
+            .filter(|entry| entry.state.request.as_deref() == Some(request))
+            .peekable();
+        started.peek().is_some()
+            && started.all(|entry| {
+                let run = &entry.state;
+                run.agent.is_some()
+                    && run.phase == RunPhase::Succeeded
+                    && run.result.as_ref().is_some_and(|result| {
+                        result.claims.is_some() && result.mismatches.is_empty()
+                    })
+            })
+    }
+
     /// The chat's runs, oldest first.
     pub fn for_chat(&self, chat: &str) -> Vec<RunState> {
         let runs = self.lock();
@@ -1399,6 +1420,73 @@ mod tests {
     /// A helper its turn waits on has the same record as a background one:
     /// two attempts under one label are two records, each read by its id,
     /// and a waited-on helper's view is not a background one.
+    /// A turn's agents answered it only when every run it started is an
+    /// agent's, succeeded, with a report its record bears out in full.
+    #[test]
+    fn a_turn_s_agents_answered_it_only_when_every_report_is_borne_out() {
+        use aidaemon_channels::turns::{RunClaims, RunMismatch, RunResult};
+        let runs = RunStates::default();
+        let now = Utc::now();
+        let measure = RunMeasure {
+            ended_at: now,
+            work_began: None,
+            waited: Duration::ZERO,
+        };
+        let clean = || RunResult {
+            text: "Created heron_note.md.".into(),
+            claims: Some(RunClaims::default()),
+            mismatches: Vec::new(),
+        };
+        assert!(!runs.agents_answered("task-1"), "no run, no answer");
+        runs.begin_waited("cli-agent-a", "chat", "Create the note", now, Some("task-1"));
+        runs.set_agent("cli-agent-a", "Codex");
+        runs.result("cli-agent-a", clean());
+        assert!(!runs.agents_answered("task-1"), "still running");
+        runs.finish(
+            "cli-agent-a",
+            RunEnd::Succeeded,
+            measure,
+            RunEvidence::default(),
+            report(),
+        );
+        assert!(runs.agents_answered("task-1"));
+        assert!(!runs.agents_answered("task-2"), "another turn's");
+
+        // A claim the record doesn't bear out: the turn has more to say.
+        runs.result(
+            "cli-agent-a",
+            RunResult {
+                mismatches: vec![RunMismatch::CheckNotRun {
+                    command: "pytest -q".into(),
+                }],
+                ..clean()
+            },
+        );
+        assert!(!runs.agents_answered("task-1"));
+
+        // Text alone, nothing checked.
+        runs.result(
+            "cli-agent-a",
+            RunResult {
+                claims: None,
+                ..clean()
+            },
+        );
+        assert!(!runs.agents_answered("task-1"));
+
+        // A helper run that isn't an agent's answers nothing for the turn.
+        runs.result("cli-agent-a", clean());
+        runs.begin_waited("helper:b", "chat", "Look it up", now, Some("task-1"));
+        runs.finish(
+            "helper:b",
+            RunEnd::Succeeded,
+            measure,
+            RunEvidence::default(),
+            report(),
+        );
+        assert!(!runs.agents_answered("task-1"));
+    }
+
     #[test]
     fn waited_on_attempts_with_one_label_are_two_records() {
         let runs = RunStates::default();

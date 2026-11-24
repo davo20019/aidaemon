@@ -534,6 +534,22 @@ impl TurnEngine<'_> {
         scope: &TurnScope<'_>,
         final_text: &str,
     ) -> sdk::StopDecision {
+        // The coding agents this turn started answered it, each shown to the
+        // owner as its own message with its record-checked report: a model
+        // that adds nothing ends the turn with no reply, not a repeat. From
+        // the runs' typed records, never the reply.
+        if final_text.trim().is_empty()
+            && self
+                .running_children()
+                .runs()
+                .agents_answered(scope.task_id)
+        {
+            scope
+                .verdict
+                .answered_by_agents
+                .store(true, Ordering::Relaxed);
+            return sdk::StopDecision::Accept;
+        }
         let latest = scope
             .latest_tool_output
             .lock()

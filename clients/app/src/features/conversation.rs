@@ -92,6 +92,10 @@ fn rows(store: Store, session: &str) -> Vec<Row> {
                 attachments,
                 ..
             } => Row::User(text, at_ms, attachments),
+            // A turn its agents answered ships no reply: nothing to show.
+            Line::Assistant {
+                text, attachments, ..
+            } if text.trim().is_empty() && attachments.is_empty() => continue,
             Line::Assistant {
                 text,
                 at_ms,
@@ -276,11 +280,18 @@ fn place_runs(rows: &mut Vec<Row>, runs: &[RunSummary]) -> Vec<String> {
     let mut tail = Vec::new();
     // From the last group back, so each insert leaves earlier places as
     // they were.
+    // A request its agents answered has no reply of its own: its runs sit
+    // before the owner's next message instead.
     for (key, at) in groups.into_iter().rev() {
-        let reply = rows
-            .iter()
-            .position(|row| matches!(row, Row::Assistant(_, reply_at, ..) if *reply_at >= at));
-        match reply {
+        let place = rows.iter().position(|row| match row {
+            Row::Assistant(_, reply_at, ..) => *reply_at >= at,
+            Row::User(_, asked_at, _) => *asked_at > at,
+            _ => false,
+        });
+        match place {
+            Some(index) if matches!(rows[index], Row::User(..)) => {
+                rows.insert(index, Row::Runs { key, headed: true })
+            }
             Some(index) => rows.insert(index + 1, Row::Runs { key, headed: true }),
             None => tail.insert(0, key),
         }
@@ -3466,6 +3477,27 @@ mod tests {
         // The third request has no reply yet: its runs come at the end.
         assert_eq!(tail, vec!["task-3".to_string()]);
         assert_eq!(rows.len(), 7);
+    }
+
+    /// A request its agent answered has no reply: its runs sit before the
+    /// owner's next message, not at the conversation's end.
+    #[test]
+    fn an_answer_only_request_s_runs_sit_before_the_next_message() {
+        let mut rows = vec![
+            Row::User("first".into(), 100, Vec::new()),
+            Row::User("second".into(), 300, Vec::new()),
+            reply(400),
+        ];
+        let tail = place_runs(&mut rows, &[run("a", Some("task-1"), 150)]);
+        assert!(tail.is_empty());
+        assert_eq!(
+            rows[1],
+            Row::Runs {
+                key: "task-1".into(),
+                headed: true,
+            }
+        );
+        assert_eq!(rows[2], Row::User("second".into(), 300, Vec::new()));
     }
 
     #[test]
