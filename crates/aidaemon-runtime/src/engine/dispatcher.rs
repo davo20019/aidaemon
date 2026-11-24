@@ -654,6 +654,9 @@ pub trait ToolDispatch: TurnHost {
         if let Some(nested) = ctx.nested {
             facts.extensions.insert(nested.clone());
         }
+        if let Some(detached) = ctx.detached_judge.clone() {
+            facts.extensions.insert(detached);
+        }
         // A child inherits this turn's authority, not a re-resolution.
         if dispatch.spawns_child_agents
             && let Some(turn_authority) = ctx.turn_authority

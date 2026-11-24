@@ -748,6 +748,8 @@ impl TurnEngine<'_> {
             .and_then(|parent| parent.spawn_family.clone())
             .unwrap_or_else(|| crate::authority::SpawnFamily::new(self.turn_limits().spawn_family));
         let owned_folders = spawn_family.owned_folders().clone();
+        let mut detached_tools: std::collections::HashMap<String, Arc<dyn sdk::Tool>> =
+            std::collections::HashMap::new();
         if user_role != UserRole::Public {
             for tool in self
                 .tools()
@@ -769,14 +771,17 @@ impl TurnEngine<'_> {
                         ),
                         DaemonToolOffer::Hidden => continue,
                     };
-                let bridged = turn_tool(
-                    spec,
-                    tool.clone(),
-                    goal_actions_only,
-                    calls_tx.clone(),
-                    bridge_roots.clone(),
-                )
-                .with_owned_folders(owned_folders.clone());
+                let bridged: Arc<dyn sdk::Tool> = Arc::new(
+                    turn_tool(
+                        spec,
+                        tool.clone(),
+                        goal_actions_only,
+                        calls_tx.clone(),
+                        bridge_roots.clone(),
+                    )
+                    .with_owned_folders(owned_folders.clone()),
+                );
+                detached_tools.insert(tool.name().to_string(), bridged.clone());
                 // Core tools are sent on every call; the rest are listed by
                 // `load_tools` until the run (or an earlier turn of this
                 // session) loads them.
@@ -788,9 +793,9 @@ impl TurnEngine<'_> {
                     || facts.offering.always_sent()
                     || (task_lead && facts.task_lead_delegation);
                 builder = if core {
-                    builder.tool(bridged)
+                    builder.tool_arc(bridged)
                 } else {
-                    builder.deferred_tool_arc(Arc::new(bridged))
+                    builder.deferred_tool_arc(bridged)
                 };
             }
         }
@@ -1101,7 +1106,24 @@ impl TurnEngine<'_> {
                 calls: calls_tx.clone(),
             },
         };
-        for (_, hook) in hooks.chain() {
+        let chain = hooks.chain();
+        let detached_hooks: Vec<Arc<dyn sdk::Hook>> = chain
+            .iter()
+            .filter(|(slot, _)| {
+                matches!(
+                    slot,
+                    HookSlot::Canonical
+                        | HookSlot::Authority
+                        | HookSlot::ProtectedPaths
+                        | HookSlot::Network
+                        | HookSlot::Egress
+                        | HookSlot::Untrusted
+                        | HookSlot::Approval
+                )
+            })
+            .map(|(_, hook)| hook.clone())
+            .collect();
+        for (_, hook) in chain {
             builder = builder.hook_arc(hook);
         }
         drop(calls_tx);
@@ -1322,6 +1344,35 @@ impl TurnEngine<'_> {
         if direct_agent.is_some() {
             verdict.direct_agent.store(true, Ordering::Relaxed);
         }
+        let untrusted_seen = Arc::new(AtomicBool::new(starts_tainted));
+        let detached_mission = self
+            .inherited_authority()
+            .as_ref()
+            .and_then(|inherited| {
+                inherited
+                    .card_title
+                    .as_deref()
+                    .or(inherited.lineage.last().map(String::as_str))
+            })
+            .map(str::to_string);
+        let can_ask_owner_untrusted = user_role == UserRole::Owner
+            && channel_ctx.visibility == aidaemon_core::ChannelVisibility::Private
+            && !crate::turn::loop_utils::is_trigger_session(session_id)
+            && !trusted_session
+            && !mandate_run;
+        let detached_judge = Arc::new(crate::approvals::DetachedNestedJudge::new(
+            detached_tools,
+            detached_hooks,
+            approvals.clone(),
+            rules.clone(),
+            shared_declines.clone(),
+            run_id,
+            session_id.to_string(),
+            grant_session.clone(),
+            detached_mission,
+            untrusted_seen.clone(),
+            can_ask_owner_untrusted,
+        ));
         let scope = TurnScope {
             direct_agent,
             daemon_paths: self.daemon_paths(),
@@ -1357,7 +1408,8 @@ impl TurnEngine<'_> {
             ceiling: ceiling.clone(),
             trust_roots,
             cwd,
-            untrusted_seen: AtomicBool::new(starts_tainted),
+            untrusted_seen,
+            detached_judge: Some(detached_judge),
             origin_request,
             origin_trusted,
             authorized_scopes,

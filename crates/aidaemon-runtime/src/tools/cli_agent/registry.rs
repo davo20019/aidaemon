@@ -56,7 +56,11 @@ impl CliAgentTool {
         let host = facts
             .extensions
             .get::<aidaemon_core::NestedCalls>()
-            .is_some();
+            .is_some()
+            || facts
+                .extensions
+                .get::<Arc<crate::approvals::DetachedNestedJudge>>()
+                .is_some();
         let local = self.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
         let authority = crate::authority::parent_authority(facts);
         let clean = authority.is_some_and(|authority| !authority.untrusted_context);

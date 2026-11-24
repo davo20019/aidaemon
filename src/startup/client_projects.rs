@@ -123,16 +123,21 @@ pub(crate) async fn update(
         Some(path) => Some(Some(folder(path, create_folder)?)),
         None => None,
     };
+    let clears_folder = matches!(path, Some(None));
     let bots = state
         .channel_work_projects()
         .await
         .map_err(|e| refused(e.to_string()))?;
-    state
+    let updated = state
         .update_work_project(id, name, path.as_ref().map(|p| p.as_deref()))
         .await
         .map_err(|e| refused(e.to_string()))?
         .map(|project| summary(project, &bots))
-        .ok_or_else(|| refused("There is no such project"))
+        .ok_or_else(|| refused("There is no such project"))?;
+    if clears_folder {
+        clear_project_agent_pins(state, id).await;
+    }
+    Ok(updated)
 }
 
 /// Delete a project; its conversations go to no project and its folder
@@ -141,8 +146,20 @@ pub(crate) async fn delete(state: &dyn StateStore, id: &str) -> Result<(), Proto
     if id == DEFAULT_PROJECT_ID {
         return Err(refused("Conversations in no project cannot be deleted"));
     }
+    let sessions: Vec<String> = state
+        .session_work_projects()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(session_id, project_id)| (project_id == id).then_some(session_id))
+        .collect();
     match state.delete_work_project(id).await {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            for session_id in sessions {
+                clear_agent_pin(state, &session_id).await;
+            }
+            Ok(())
+        }
         Ok(false) => Err(refused("There is no such project")),
         Err(e) => Err(refused(e.to_string())),
     }
@@ -155,9 +172,34 @@ pub(crate) async fn place(
 ) -> Result<(), String> {
     let project_id = project_id.unwrap_or(DEFAULT_PROJECT_ID);
     match state.set_session_work_project(session_id, project_id).await {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            // A coding-agent pin requires a folder-backed project: clear it
+            // when a conversation moves out of one.
+            if session_folder(state, session_id).await.is_none() {
+                clear_agent_pin(state, session_id).await;
+            }
+            Ok(())
+        }
         Ok(false) => Err("There is no such project".to_string()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+async fn clear_agent_pin(state: &dyn StateStore, session_id: &str) {
+    let mut setting = aidaemon_runtime::session_model::get(state, session_id).await;
+    if setting.agent.take().is_some() {
+        let _ = aidaemon_runtime::session_model::set(state, session_id, &setting).await;
+    }
+}
+
+async fn clear_project_agent_pins(state: &dyn StateStore, project_id: &str) {
+    let Ok(assignments) = state.session_work_projects().await else {
+        return;
+    };
+    for (session_id, assigned) in assignments {
+        if assigned == project_id {
+            clear_agent_pin(state, &session_id).await;
+        }
     }
 }
 
@@ -712,5 +754,87 @@ mod project_memory_command_tests {
             dir.path().join("p")
         );
         assert!(project_notes_from(&dir.path().join("missing.toml")).is_some());
+    }
+
+    #[tokio::test]
+    async fn losing_project_folder_clears_coding_agent_pin() {
+        use aidaemon_runtime::session_model::{self, SessionModelSetting};
+        use std::sync::Arc;
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = db_file.path().to_str().unwrap();
+        let state: Arc<dyn StateStore> = Arc::new(
+            crate::state::SqliteStateStore::for_tests(
+                db_path,
+                100,
+                None,
+                Arc::new(crate::memory::embeddings::EmbeddingService::deterministic()),
+            )
+            .await
+            .unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().display().to_string();
+
+        // 1. Moving a conversation out of a folder-backed project clears its agent pin.
+        let p1 = create(state.as_ref(), "Proj One", Some(&folder), false)
+            .await
+            .unwrap();
+        place(state.as_ref(), "app:s1", Some(&p1.id)).await.unwrap();
+        session_model::set(
+            state.as_ref(),
+            "app:s1",
+            &SessionModelSetting {
+                agent: Some("codex".into()),
+                ..SessionModelSetting::default()
+            },
+        )
+        .await
+        .unwrap();
+        place(state.as_ref(), "app:s1", None).await.unwrap();
+        assert_eq!(
+            session_model::get(state.as_ref(), "app:s1").await.agent,
+            None
+        );
+
+        // 2. Deleting a project clears its sessions' agent pins.
+        place(state.as_ref(), "app:s2", Some(&p1.id)).await.unwrap();
+        session_model::set(
+            state.as_ref(),
+            "app:s2",
+            &SessionModelSetting {
+                agent: Some("claude".into()),
+                ..SessionModelSetting::default()
+            },
+        )
+        .await
+        .unwrap();
+        delete(state.as_ref(), &p1.id).await.unwrap();
+        assert_eq!(
+            session_model::get(state.as_ref(), "app:s2").await.agent,
+            None
+        );
+
+        // 3. Clearing a project's folder via update clears its sessions' agent pins.
+        let p2 = create(state.as_ref(), "Proj Two", Some(&folder), false)
+            .await
+            .unwrap();
+        place(state.as_ref(), "app:s3", Some(&p2.id)).await.unwrap();
+        session_model::set(
+            state.as_ref(),
+            "app:s3",
+            &SessionModelSetting {
+                agent: Some("codex".into()),
+                ..SessionModelSetting::default()
+            },
+        )
+        .await
+        .unwrap();
+        update(state.as_ref(), &p2.id, None, Some(""), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_model::get(state.as_ref(), "app:s3").await.agent,
+            None
+        );
     }
 }

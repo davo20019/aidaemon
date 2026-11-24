@@ -691,6 +691,24 @@ impl AgentHost for AcpHost {
             .is_ok_and(|state| state.completed == Some(true))
     }
 
+    async fn interrupt(&self) {
+        let session = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.session_id.clone());
+        if let Some(session_id) = session {
+            let mut line = json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": session_id},
+            })
+            .to_string();
+            line.push('\n');
+            self.stdin.write(&line).await;
+        }
+    }
+
     async fn close(&self) {
         self.stdin.close().await;
     }
@@ -1128,5 +1146,22 @@ mod tests {
             "Synthetic Agent could not load its earlier session (synthetic-missing): Session not found: synthetic-missing"
         );
         assert!(sent.next_line().await.unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_sends_session_cancel_once_session_is_open() {
+        let (_child, host, mut sent) = hosted(None);
+        host.on_line(LOADS).await;
+        let _ = sent.next_line().await.unwrap().unwrap(); // session/new
+        host.on_line(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"synthetic-acp-1"}}"#)
+            .await;
+        let _ = sent.next_line().await.unwrap().unwrap(); // session/prompt
+        host.interrupt().await;
+        let cancel: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "synthetic-acp-1");
+        host.close().await;
     }
 }

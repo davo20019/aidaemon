@@ -1515,6 +1515,7 @@ impl TurnEngine<'_> {
             trust_roots: Some((scope.trust_roots.as_slice(), scope.cwd.as_str())),
             lone_root_call: self.depth() == 0 && scope.last_batch_size.load(Ordering::Relaxed) == 1,
             nested: request.nested.as_ref(),
+            detached_judge: scope.detached_judge.clone(),
         }
     }
 

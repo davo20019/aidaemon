@@ -149,13 +149,15 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
     }
     let label = computed(move || {
         let (model, effort) = current.get();
+        let is_code = code.get();
         let model = match model {
+            ModelChoice::Pinned { model, .. } if is_code => format!("AIDaemon · {model}"),
             ModelChoice::Pinned { model, .. } => model,
             ModelChoice::Agent { agent } => match store.model_options() {
                 Read::Ready(options) => agent_name(&options, &agent),
                 _ => agent,
             },
-            _ if code.get() => "AIDaemon".to_owned(),
+            _ if is_code => "AIDaemon".to_owned(),
             _ => "Auto".to_owned(),
         };
         match effort {
@@ -165,7 +167,15 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
     });
     let shown = computed(move || match store.model_options() {
         Read::Ready(options) if code.get() => {
-            !options.agents.is_empty() || matches!(current.get().0, ModelChoice::Agent { .. })
+            !options.agents.is_empty()
+                || matches!(current.get().0, ModelChoice::Agent { .. })
+                || options
+                    .providers
+                    .iter()
+                    .map(|p| p.models.len())
+                    .sum::<usize>()
+                    >= 2
+                || !store.efforts_of(&current.get().0).is_empty()
         }
         Read::Ready(options) => {
             options
@@ -210,7 +220,7 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
                     },
                     items: move || {
                         if code.get_untracked() {
-                            agent_choices(store, current.get_untracked().0)
+                            code_choices(store, current.get_untracked())
                         } else {
                             choices(store, current.get_untracked())
                         }
@@ -253,6 +263,35 @@ fn effort_word(effort: Effort) -> &'static str {
         Effort::High => "High",
         _ => "Auto",
     }
+}
+
+/// In a code conversation: the `Agent` group (AIDaemon and each ready coding
+/// agent), plus AIDaemon's `Model` and `Effort` groups whenever AIDaemon is
+/// selected so the owner can still pin a model or effort for AIDaemon in Code.
+fn code_choices(store: Store, (model, effort): (ModelChoice, Effort)) -> Vec<ui::PickItem> {
+    let is_agent = matches!(model, ModelChoice::Agent { .. });
+    let mut items = agent_choices(store, model.clone());
+    if !is_agent {
+        let model_and_effort = choices(store, (model, effort));
+        let has_models = matches!(
+            untracked(|| store.model_options()),
+            Read::Ready(options)
+                if options
+                    .providers
+                    .iter()
+                    .map(|p| p.models.len())
+                    .sum::<usize>()
+                    >= 2
+        );
+        let has_efforts = !untracked(|| store.efforts_of(&ModelChoice::Auto)).is_empty()
+            || model_and_effort
+                .iter()
+                .any(|item| item.id.starts_with("effort:"));
+        if has_models || has_efforts {
+            items.extend(model_and_effort);
+        }
+    }
+    items
 }
 
 /// AIDaemon (its own model, picked for each message), then each coding

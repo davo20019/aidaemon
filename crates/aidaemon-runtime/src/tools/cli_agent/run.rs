@@ -90,9 +90,18 @@ pub(super) const WAITING_FOR_SLOT: &str = "Waiting for a free slot";
 pub(super) struct PreparedRun {
     command: String,
     args: Vec<String>,
+    /// The launch arguments prior to `coding_agent.prepare`, kept so a queued
+    /// folder waiter can re-prepare with `resume` if an earlier run finishes
+    /// and stores a resumable session while it waits.
+    base_launch: aidaemon_coding_agents::Launch,
+    enforce_native_access: bool,
+    read_paths: Vec<String>,
+    model: Option<String>,
+    can_host: bool,
     mode: aidaemon_coding_agents::PermissionMode,
     coding_agent: Arc<dyn aidaemon_coding_agents::CodingAgent>,
     nested: Option<aidaemon_core::NestedCalls>,
+    detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
     timeout: Duration,
     max_output: usize,
     workspace_mode: CliWorkspaceMode,
@@ -225,6 +234,8 @@ pub(super) struct RunCall {
     began: chrono::DateTime<chrono::Utc>,
     /// The owner's own follow-up ([`crate::helper_run::HelperSpec::owner_follow_up`]).
     owner_follow_up: bool,
+    /// Conversation pinned directly to a coding agent (no model reads the tool output).
+    direct_agent: bool,
 }
 
 /// What a run shares with its entry in the tool's task table.
@@ -376,17 +387,18 @@ impl CliAgentTool {
         grant_session: &str,
         project: Option<&aidaemon_core::ProjectRef>,
         nested: Option<aidaemon_core::NestedCalls>,
+        detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
     ) -> anyhow::Result<String> {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
         // A background launch in a conversation set to a coding agent is
         // the owner's own message to it: one that finds its folder taken
         // waits for it rather than being refused.
-        let waits_for_folder = async_mode
-            && !session_id.trim().is_empty()
+        let direct_agent = !session_id.trim().is_empty()
             && crate::session_model::get(self.state.as_ref(), session_id)
                 .await
                 .agent
                 .is_some();
+        let waits_for_folder = async_mode && direct_agent;
         let mut prep = match self
             .prepare_run(
                 tool_name,
@@ -403,7 +415,9 @@ impl CliAgentTool {
                 spec,
                 project,
                 nested,
+                detached_judge,
                 waits_for_folder,
+                direct_agent,
             )
             .await?
         {
@@ -424,6 +438,7 @@ impl CliAgentTool {
             new_folders: spec.new_folders.clone(),
             began: chrono::Utc::now(),
             owner_follow_up: spec.owner_follow_up,
+            direct_agent,
         };
 
         if prep.folder_wait.is_some() {
@@ -486,7 +501,9 @@ impl CliAgentTool {
         // prep's claim guard drops on an error return and releases the
         // claim.
         let started = handles.start_process(&call, &mut prep, &shared).await?;
-        shared.process.start(started.handle.clone());
+        shared
+            .process
+            .start(started.handle.clone(), started.host.clone());
         let started_at_instant = started.started_at;
         let run_label = call.label.clone();
         let run_began = call.began;
@@ -858,7 +875,9 @@ impl CliAgentTool {
         spec: &crate::helper_run::HelperSpec,
         project: Option<&aidaemon_core::ProjectRef>,
         nested: Option<aidaemon_core::NestedCalls>,
+        detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
         waits_for_folder: bool,
+        direct_agent: bool,
     ) -> anyhow::Result<Result<PreparedRun, String>> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic, coding_agent) = {
@@ -931,8 +950,9 @@ impl CliAgentTool {
         );
         // Full access: nothing is asked; the owner chose it.
         let nested = nested.filter(|_| mode != PermissionMode::FullAccess);
-        let can_host =
-            nested.is_some() && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
+        let detached_judge = detached_judge.filter(|_| mode != PermissionMode::FullAccess);
+        let can_host = (nested.is_some() || detached_judge.is_some())
+            && self.backend.kind() == aidaemon_tools::backend::BackendKind::Local;
 
         // Re-check both the launcher and a wrapped nested executable. Agent
         // binaries may move during self-update, and GUI daemon PATH values can
@@ -1028,10 +1048,11 @@ impl CliAgentTool {
         // The agent shapes its own launch for its mode
         // (`aidaemon_coding_agents`): its sandbox, its flags, and whether a
         // host answers its requests.
-        let mut launch = aidaemon_coding_agents::Launch {
+        let base_launch = aidaemon_coding_agents::Launch {
             args,
             start: launch_start,
         };
+        let mut launch = base_launch.clone();
         let plan = match coding_agent.prepare(
             &aidaemon_coding_agents::RunRequest {
                 mode,
@@ -1053,6 +1074,12 @@ impl CliAgentTool {
         ) {
             Ok(plan) => plan,
             Err(error) => {
+                if direct_agent {
+                    return Ok(Err(format!(
+                        "{} could not start: {error}.",
+                        coding_agent.name()
+                    )));
+                }
                 return Ok(Err(format!(
                     "Blocked: CLI delegation was not started because {error}. Select an agent with a registered native sandbox adapter or provide a narrower access manifest."
                 )));
@@ -1164,9 +1191,15 @@ impl CliAgentTool {
         Ok(Ok(PreparedRun {
             command,
             args,
+            base_launch,
+            enforce_native_access,
+            read_paths: canonical_read_paths,
+            model,
+            can_host,
             mode,
             coding_agent,
             nested,
+            detached_judge,
             timeout,
             max_output,
             workspace_mode,
@@ -1340,6 +1373,12 @@ impl CliAgentTool {
                     }
                 }
                 info!(task_id = %call.task_id, tool = %call.tool_name, "A CLI agent's folder is free");
+                // While this message waited behind an earlier run in the same
+                // folder, that earlier run may have finished and kept its
+                // session: continue from it so the agent keeps the full thread.
+                if call.direct_agent {
+                    refresh_direct_session(&handles, &call, &mut prep).await;
+                }
             }
             let mut slot = slot.unwrap_or_else(|| Box::pin(limiter.acquire_owned()));
             let waited = match futures::poll!(slot.as_mut()) {
@@ -1416,7 +1455,10 @@ impl CliAgentTool {
                     return;
                 }
             };
-            if !shared.process.start(started.handle.clone()) {
+            if !shared
+                .process
+                .start(started.handle.clone(), started.host.clone())
+            {
                 // Stopped while it was being started: its process stops now
                 // and its run ends as any stopped run does.
                 kill_process(&handles.backend, &started.handle).await;
@@ -1474,6 +1516,94 @@ impl CliAgentTool {
 
 fn lock_folder_wait(on: &FolderWaitOn) -> std::sync::MutexGuard<'_, Option<String>> {
     on.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// If a run that waited for its folder in a direct coding-agent conversation
+/// finds a newer finished resumable session once the folder frees, re-prepare
+/// its launch so it continues that session instead of starting cold or forking.
+async fn refresh_direct_session(handles: &RunHandles, call: &RunCall, prep: &mut PreparedRun) {
+    let Ok(Some(run)) = handles
+        .state
+        .latest_kept_cli_agent_run(&call.session_id, &call.tool_name)
+        .await
+    else {
+        return;
+    };
+    if prep
+        .continues
+        .as_ref()
+        .is_some_and(|earlier| earlier.run == run)
+    {
+        return;
+    }
+    let Ok(Some(found)) = handles.state.cli_agent_run(&run).await else {
+        return;
+    };
+    if found.session_id != call.session_id {
+        return;
+    }
+    if handles
+        .runs
+        .get(&run)
+        .is_some_and(|state| state.ended_at.is_none())
+    {
+        return;
+    }
+    let Some(agent_session) = found.agent_session.filter(|_| found.keeps_session) else {
+        return;
+    };
+    let mut launch = prep.base_launch.clone();
+    let plan = match prep.coding_agent.prepare(
+        &aidaemon_coding_agents::RunRequest {
+            mode: prep.mode,
+            enforce: prep.enforce_native_access,
+            read_only: prep.workspace_mode == CliWorkspaceMode::ReadOnly,
+            working_dir: prep.working_dir.as_deref(),
+            read_paths: &prep.read_paths,
+            write_paths: &prep.write_paths,
+            can_host: prep.can_host,
+            stdin_open: handles.backend.kind() == aidaemon_tools::backend::BackendKind::Local,
+            model: prep.model.as_deref(),
+            resume: Some(agent_session.as_str()),
+            report: true,
+        },
+        &mut launch,
+    ) {
+        Ok(plan) => plan,
+        Err(why) => {
+            info!(
+                task_id = %call.task_id,
+                session_id = %call.session_id,
+                earlier_run = %run,
+                %why,
+                "Queued coding agent run could not continue the newly finished session; keeping prepared launch"
+            );
+            return;
+        }
+    };
+    let thread = found.thread.unwrap_or_else(|| run.clone());
+    let continues = crate::helper_run::Continues {
+        run: run.clone(),
+        agent_session,
+        thread: thread.clone(),
+    };
+    info!(
+        task_id = %call.task_id,
+        session_id = %call.session_id,
+        earlier_run = %run,
+        "Queued coding agent run continuing the session that finished in its folder"
+    );
+    prep.args = launch.args;
+    prep.prompt_placement = plan.prompt;
+    prep.env = plan.env;
+    prep.env_remove = plan.env_remove;
+    prep.host = plan.host;
+    prep.keep_alive = plan.keep_alive;
+    prep.keeps_session = plan.keeps_session;
+    prep.continues = Some(continues);
+    let run_id = cli_run_id(&call.task_id);
+    handles.runs.continues(&run_id, &run, &thread);
+    handles.runs.keeps_session(&run_id, prep.keeps_session);
 }
 
 impl RunHandles {
@@ -1666,26 +1796,31 @@ impl RunHandles {
             }
         };
         let handle = spawned.handle().clone();
-        // Its host answers its approval requests (judged by this run) and
-        // sends it its task.
+        // Its host answers its approval requests (judged by this run, with
+        // detached fallback once the launching batch returns) and sends it
+        // its task.
         let host: Option<Arc<dyn aidaemon_coding_agents::AgentHost>> =
             match (prep.host.take(), spawned.take_stdin()) {
                 (Some(starter), Some(stdin)) => {
                     // Full access: an agent whose protocol still asks is
                     // allowed as it asks, unjudged.
-                    let judge: Arc<dyn aidaemon_coding_agents::ActionJudge> = match prep
-                        .nested
-                        .take()
-                    {
-                        Some(nested) => Arc::new(crate::tools::agent_mode::DaemonJudge::for_run(
-                            nested,
-                            crate::tools::agent_mode::Asker {
-                                run: cli_run_id(task_id),
-                                agent: prep.coding_agent.name().to_string(),
-                            },
-                        )),
-                        None => Arc::new(aidaemon_coding_agents::AllowAll),
-                    };
+                    let nested = prep.nested.take();
+                    let detached = prep.detached_judge.take();
+                    let judge: Arc<dyn aidaemon_coding_agents::ActionJudge> =
+                        if nested.is_some() || detached.is_some() {
+                            Arc::new(
+                                crate::tools::agent_mode::DaemonJudge::for_run_with_detached(
+                                    nested,
+                                    detached,
+                                    crate::tools::agent_mode::Asker {
+                                        run: cli_run_id(task_id),
+                                        agent: prep.coding_agent.name().to_string(),
+                                    },
+                                ),
+                            )
+                        } else {
+                            Arc::new(aidaemon_coding_agents::AllowAll)
+                        };
                     let judge = events.judging(judge);
                     Some(starter.start(stdin, judge, &prep.final_prompt).await)
                 }

@@ -216,6 +216,18 @@ fn response_line(response: Value) -> String {
     line
 }
 
+/// A control request asking Claude Code to interrupt its active turn.
+pub fn interrupt_line() -> String {
+    let mut line = json!({
+        "type": "control_request",
+        "request_id": "aidaemon-interrupt",
+        "request": {"subtype": "interrupt"},
+    })
+    .to_string();
+    line.push('\n');
+    line
+}
+
 /// Starts a [`ClaudeHost`] for a run in `working_dir`.
 pub struct ClaudeHostStarter {
     pub working_dir: Option<String>,
@@ -302,6 +314,10 @@ impl AgentHost for ClaudeHost {
 
     fn answers(&self) -> HostAnswers {
         self.answers.lock().map(|a| a.clone()).unwrap_or_default()
+    }
+
+    async fn interrupt(&self) {
+        self.stdin.write(&interrupt_line()).await;
     }
 
     async fn close(&self) {
@@ -563,5 +579,25 @@ if read more; then echo '{"type":"stdin_open"}'; else echo '{"type":"stdin_close
             host.answers().declined,
             vec!["command: touch notes.txt".to_string()]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_writes_a_claude_interrupt_control_request() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = ClaudeHost::new(child.stdin.take().unwrap(), Arc::new(crate::AllowAll), None);
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        host.interrupt().await;
+        let line: Value = serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(line["type"], "control_request");
+        assert_eq!(line["request"]["subtype"], "interrupt");
+        host.close().await;
+        let _ = child.wait().await;
     }
 }

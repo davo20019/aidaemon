@@ -72,6 +72,9 @@ pub struct ToolExecCtx<'a> {
     /// (a coding agent it drives asking to act), handed to the tool in its
     /// call context's extensions.
     pub nested: Option<&'a aidaemon_core::NestedCalls>,
+    /// Owned fallback judge for detached/background coding-agent runs whose
+    /// permission requests arrive after the launching tool batch returns.
+    pub detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
 }
 
 /// No adapter (native or MCP) is registered under the requested name, so the

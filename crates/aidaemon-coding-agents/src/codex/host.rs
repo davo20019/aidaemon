@@ -389,6 +389,8 @@ struct FileChange {
 
 #[derive(Default)]
 struct HostState {
+    thread_id: Option<String>,
+    turn_id: Option<String>,
     usage: Option<Value>,
     /// The changes of each `fileChange` item, by item id: its approval
     /// request names only the item.
@@ -542,6 +544,11 @@ impl CodexHost {
                     .pointer("/result/thread/id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if !thread_id.is_empty()
+                    && let Ok(mut state) = self.state.lock()
+                {
+                    state.thread_id = Some(thread_id.to_string());
+                }
                 let mut params = json!({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": &*self.prompt}],
@@ -561,6 +568,16 @@ impl CodexHost {
                     ];
                 }
             }
+            Some(TURN_START_ID) => {
+                if let Some(turn_id) = message
+                    .pointer("/result/turn/id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    && let Ok(mut state) = self.state.lock()
+                {
+                    state.turn_id = Some(turn_id.to_string());
+                }
+            }
             _ => {}
         }
         Vec::new()
@@ -577,9 +594,23 @@ impl CodexHost {
         let event = |value: Value| vec![value.to_string()];
         match method {
             "thread/started" => {
-                event(json!({"type": "thread.started", "thread_id": text("/thread/id")}))
+                let id = text("/thread/id");
+                if !id.is_empty()
+                    && let Ok(mut state) = self.state.lock()
+                {
+                    state.thread_id = Some(id.clone());
+                }
+                event(json!({"type": "thread.started", "thread_id": id}))
             }
-            "turn/started" => event(json!({"type": "turn.started"})),
+            "turn/started" => {
+                let id = text("/turn/id");
+                if !id.is_empty()
+                    && let Ok(mut state) = self.state.lock()
+                {
+                    state.turn_id = Some(id);
+                }
+                event(json!({"type": "turn.started"}))
+            }
             "item/started" | "item/completed" => {
                 let item = params.get("item").unwrap_or(&Value::Null);
                 match item.get("type").and_then(Value::as_str) {
@@ -813,6 +844,23 @@ impl AgentHost for CodexHost {
             .state
             .lock()
             .is_ok_and(|state| state.completed == Some(true))
+    }
+
+    async fn interrupt(&self) {
+        let ids = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| Some((state.thread_id.clone()?, state.turn_id.clone()?)));
+        if let Some((thread_id, turn_id)) = ids {
+            self.stdin
+                .write(&request_line(
+                    9001,
+                    "turn/interrupt",
+                    json!({"threadId": thread_id, "turnId": turn_id}),
+                ))
+                .await;
+        }
     }
 
     async fn close(&self) {
@@ -1427,6 +1475,41 @@ mod tests {
             host.answers().refused,
             vec!["write: /etc/hosts".to_string()]
         );
+        host.close().await;
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_sends_turn_interrupt_when_thread_and_turn_are_known() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat");
+        let host = CodexHost::new(
+            child.stdin.take().unwrap(),
+            Arc::new(crate::AllowAll),
+            None,
+            "do work",
+            Asks::BeyondSandbox,
+        );
+        let mut sent = BufReader::new(child.stdout.take().unwrap()).lines();
+        host.on_line(r#"{"id":2,"result":{"thread":{"id":"thr_synthetic"}}}"#)
+            .await;
+        let turn_start: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(turn_start["method"], "turn/start");
+        host.on_line(r#"{"id":3,"result":{"turn":{"id":"turn_synthetic"}}}"#)
+            .await;
+        host.interrupt().await;
+        let cancel: Value =
+            serde_json::from_str(&sent.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(cancel["method"], "turn/interrupt");
+        assert_eq!(cancel["params"]["threadId"], "thr_synthetic");
+        assert_eq!(cancel["params"]["turnId"], "turn_synthetic");
         host.close().await;
         let _ = child.wait().await;
     }

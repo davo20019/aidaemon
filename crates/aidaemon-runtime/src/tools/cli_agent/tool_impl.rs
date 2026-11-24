@@ -638,13 +638,15 @@ impl CliAgentTool {
                 // In a conversation set to this agent, each message goes on
                 // from the agent's latest run here that kept its session,
                 // so the agent has the conversation so far.
-                if args.continue_run.is_none()
-                    && let Some(agent) = args.tool.clone()
+                let direct_agent_conversation = args.tool.as_deref().is_some()
                     && crate::session_model::get(self.state.as_ref(), &session_id)
                         .await
                         .agent
                         .as_deref()
-                        == Some(agent.as_str())
+                        == args.tool.as_deref();
+                if args.continue_run.is_none()
+                    && direct_agent_conversation
+                    && let Some(agent) = args.tool.clone()
                 {
                     match self
                         .state
@@ -841,6 +843,16 @@ impl CliAgentTool {
                     facts.grant_session.clone()
                 };
 
+                let prompt = if direct_agent_conversation && spec.continues.is_none() {
+                    self.prepend_direct_conversation_context(&session_id, &prompt)
+                        .await
+                } else {
+                    prompt
+                };
+                let detached_judge = facts
+                    .extensions
+                    .get::<Arc<crate::approvals::DetachedNestedJudge>>()
+                    .cloned();
                 let mut unavailable = Vec::new();
                 let output = loop {
                     match self
@@ -869,6 +881,7 @@ impl CliAgentTool {
                                 .extensions
                                 .get::<aidaemon_core::NestedCalls>()
                                 .cloned(),
+                            detached_judge.clone(),
                         )
                         .await
                     {

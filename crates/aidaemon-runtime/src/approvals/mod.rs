@@ -1104,6 +1104,251 @@ fn unanswered_reason(tool: &str, why: &str) -> String {
     )
 }
 
+/// Owned nested-call judge for detached/background tools (such as a hosted
+/// coding agent started with `async_mode: true`, queued in line, or moved to
+/// the background after a timeout) whose process outlives the launching
+/// turn's kernel tool batch.
+///
+/// Runs the exact same safety hook chain, tool metadata, session grants,
+/// approval broker, and shared decline set as `aidaemon_core`'s in-turn
+/// `NestedCalls` seam.
+pub struct DetachedNestedJudge {
+    tools: HashMap<String, Arc<dyn sdk::Tool>>,
+    hooks: Vec<Arc<dyn sdk::Hook>>,
+    approvals: Arc<OwnerApprovals>,
+    rules: Arc<AppApprovalRules>,
+    shared_declines: sdk::SharedDeclines,
+    run_id: sdk::RunId,
+    session_id: String,
+    grant_session: String,
+    mission: Option<String>,
+    untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
+    can_ask_owner_untrusted: bool,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl DetachedNestedJudge {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tools: HashMap<String, Arc<dyn sdk::Tool>>,
+        hooks: Vec<Arc<dyn sdk::Hook>>,
+        approvals: Arc<OwnerApprovals>,
+        rules: Arc<AppApprovalRules>,
+        shared_declines: sdk::SharedDeclines,
+        run_id: sdk::RunId,
+        session_id: String,
+        grant_session: String,
+        mission: Option<String>,
+        untrusted_seen: Arc<std::sync::atomic::AtomicBool>,
+        can_ask_owner_untrusted: bool,
+    ) -> Self {
+        Self {
+            tools,
+            hooks,
+            approvals,
+            rules,
+            shared_declines,
+            run_id,
+            session_id,
+            grant_session,
+            mission,
+            untrusted_seen,
+            can_ask_owner_untrusted,
+            cancel: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Judge one nested tool call using the launching turn's safety hooks and
+    /// owner approval broker after the launching turn's batch has ended.
+    pub async fn authorize(&self, call: sdk::ToolCall) -> sdk::NestedVerdict {
+        use sdk::{
+            EffectClass, EffectKey, HookContext, InterruptKind, NestedVerdict, OWNER_DECLINED,
+            OWNER_UNANSWERED, ToolDecision, ToolInfo, Usage,
+        };
+        let deny = |reason: String| NestedVerdict::Deny { reason };
+        let Some(tool) = self.tools.get(&call.name) else {
+            return deny(format!("this run has no tool `{}`", call.name));
+        };
+        let info = ToolInfo {
+            annotations: tool.annotations_for(&call.arguments),
+            access: tool.access(&call.arguments),
+            effects: tool.effects(&call.arguments),
+            outbound: tool.outbound(&call.arguments),
+        };
+        let declined: Vec<EffectKey> = self.shared_declines.snapshot();
+        if let Some(effect) = info
+            .effects
+            .keys
+            .iter()
+            .find(|key| declined.iter().any(|d| d.overlaps(key)))
+        {
+            return deny(format!(
+                "{OWNER_DECLINED} The owner declined {} {} earlier in this run. Do not attempt it \
+                 another way; tell the owner it was not done.",
+                effect.class, effect.target
+            ));
+        }
+        let ctx = HookContext {
+            run_id: self.run_id,
+            agent_id: "aidaemon",
+            session_id: &self.session_id,
+            turn: 0,
+            messages: &[],
+            receipts: &[],
+            usage: Usage::default(),
+            run_usage: Usage::default(),
+            untrusted_seen: self.untrusted_seen.load(Ordering::SeqCst),
+            declined: &declined,
+        };
+        let mut waived: Vec<usize> = Vec::new();
+        let mut index = 0;
+        while let Some(hook) = self.hooks.get(index) {
+            if waived.contains(&index) {
+                index += 1;
+                continue;
+            }
+            match hook.before_tool(&ctx, &call, &info).await {
+                ToolDecision::Allow => {}
+                ToolDecision::Rewrite { arguments } if arguments == call.arguments => {}
+                ToolDecision::Deny { reason } => return deny(reason),
+                ToolDecision::Answer { .. } | ToolDecision::Rewrite { .. } => {
+                    return deny(format!(
+                        "the safety check `{}` would answer or change this call, which a program \
+                         acting on its own cannot take",
+                        hook.name()
+                    ));
+                }
+                ToolDecision::Interrupt {
+                    kind: InterruptKind::OwnerApproval(request),
+                    ..
+                } => {
+                    let kind = self.rules.card_kind(&call.name, &request);
+                    match self.ask_owner(&call, &request, kind).await {
+                        Answer::Granted(response) => {
+                            if self.rules.keeps_own_grants(&call.name) {
+                                self.rules
+                                    .record_owner_answer(self.run_id, &call, Some(response))
+                                    .await;
+                            } else if matches!(
+                                response,
+                                ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways
+                            ) {
+                                self.approvals.record_grant(&self.grant_session, &request);
+                            }
+                            waived.push(index);
+                        }
+                        Answer::Declined(reason) => {
+                            if self.rules.keeps_own_grants(&call.name) {
+                                let answer =
+                                    (reason == DECLINED_BY_OWNER).then_some(ApprovalResponse::Deny);
+                                self.rules
+                                    .record_owner_answer(self.run_id, &call, answer)
+                                    .await;
+                            }
+                            if reason == DECLINED_BY_OWNER {
+                                self.record_decline(&request);
+                                return NestedVerdict::Declined {
+                                    reason: format!("{OWNER_DECLINED} {reason}"),
+                                };
+                            }
+                            return NestedVerdict::Unanswered {
+                                reason: format!(
+                                    "{OWNER_UNANSWERED} {}",
+                                    unanswered_reason(&call.name, &reason)
+                                ),
+                            };
+                        }
+                    }
+                }
+                ToolDecision::Interrupt {
+                    kind: InterruptKind::Untrusted,
+                    reason,
+                } => {
+                    if !self.can_ask_owner_untrusted {
+                        return deny(reason);
+                    }
+                    let effects = self
+                        .rules
+                        .tool(&call.name)
+                        .map(|t| t.call_effects(&call.arguments.to_string()).keys)
+                        .unwrap_or_default();
+                    let request = refused_call_request(&call.name, &call.arguments, effects, None);
+                    let declined_subject = EffectKey::named(EffectClass::Call, &request.subject);
+                    if declined.contains(&declined_subject) {
+                        return NestedVerdict::Declined {
+                            reason: format!("{OWNER_DECLINED} {DECLINED_BY_OWNER}"),
+                        };
+                    }
+                    match self
+                        .ask_owner(&call, &request, ApprovalKind::CommandOnce)
+                        .await
+                    {
+                        Answer::Granted(_) => {
+                            self.approvals
+                                .grants_for(&self.grant_session)
+                                .allow_call_once(&request.subject);
+                            waived.push(index);
+                        }
+                        Answer::Declined(why) if why == DECLINED_BY_OWNER => {
+                            self.record_decline(&request);
+                            return NestedVerdict::Declined {
+                                reason: format!("{OWNER_DECLINED} {why}"),
+                            };
+                        }
+                        Answer::Declined(_) => return deny(reason),
+                    }
+                }
+                ToolDecision::Interrupt { reason, .. } => return deny(reason),
+            }
+            index += 1;
+        }
+        NestedVerdict::Allow
+    }
+
+    async fn ask_owner(
+        &self,
+        call: &sdk::ToolCall,
+        request: &sdk::OwnerApprovalRequest,
+        kind: ApprovalKind,
+    ) -> Answer {
+        let card = asked_by(self.mission.as_deref(), request);
+        let card = match crate::tools::agent_mode::asker_of(&call.id) {
+            Some(asker) => {
+                let mut shown = card.into_owned();
+                if let Some(card) = &mut shown.card {
+                    card.asked_by.get_or_insert(asker.agent);
+                    card.run = Some(asker.run);
+                }
+                std::borrow::Cow::Owned(shown)
+            }
+            None => card,
+        };
+        self.approvals
+            .ask(
+                &self.session_id,
+                card.as_ref(),
+                self.rules.card_permission_mode(&call.name),
+                kind,
+                &self.cancel,
+            )
+            .await
+    }
+
+    fn record_decline(&self, request: &sdk::OwnerApprovalRequest) {
+        let keys = if !request.effects.is_empty() {
+            request.effects.clone()
+        } else if request.subject.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![sdk::EffectKey::named(
+                sdk::EffectClass::Call,
+                &request.subject,
+            )]
+        };
+        self.shared_declines.record(&keys);
+    }
+}
+
 /// Settles a run the daemon left unfinished, ahead of the owner's new message.
 /// Nobody is asked: a card for the old request would answer the new message
 /// with an unrelated question. Its owner approvals are declined and listed,

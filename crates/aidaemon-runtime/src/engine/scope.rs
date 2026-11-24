@@ -157,7 +157,10 @@ pub struct TurnScope<'a> {
     /// Where relative file paths resolve (see `turn_cwd`).
     pub cwd: String,
     /// A dispatched call returned untrusted content this turn.
-    pub untrusted_seen: AtomicBool,
+    pub untrusted_seen: Arc<AtomicBool>,
+    /// Owned fallback judge for detached/background coding-agent runs whose
+    /// permission requests arrive after the launching tool batch returns.
+    pub detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
     /// The root request egress is judged against (a child's is its root's),
     /// and whether the owner wrote it.
     pub origin_request: &'a str,

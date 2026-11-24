@@ -97,8 +97,12 @@ enum ProcessState {
     /// Waiting for a free slot: no process yet.
     #[default]
     Queued,
-    /// Its process, and when it started.
-    Started(ProcessHandle, Instant),
+    /// Its process, its protocol host (when hosted), and when it started.
+    Started(
+        ProcessHandle,
+        Option<Arc<dyn aidaemon_coding_agents::AgentHost>>,
+        Instant,
+    ),
     /// Stopped while it waited: it never starts.
     Stopped,
 }
@@ -113,7 +117,7 @@ impl RunProcess {
     /// Its process, once started.
     pub(super) fn handle(&self) -> Option<ProcessHandle> {
         match &*self.lock() {
-            ProcessState::Started(handle, _) => Some(handle.clone()),
+            ProcessState::Started(handle, _, _) => Some(handle.clone()),
             _ => None,
         }
     }
@@ -121,7 +125,7 @@ impl RunProcess {
     /// When its process started.
     pub(super) fn started_at(&self) -> Option<Instant> {
         match &*self.lock() {
-            ProcessState::Started(_, at) => Some(*at),
+            ProcessState::Started(_, _, at) => Some(*at),
             _ => None,
         }
     }
@@ -138,29 +142,41 @@ impl RunProcess {
 
     /// Record its started process. False when it was stopped while it
     /// waited: its caller stops the process it just started.
-    pub(super) fn start(&self, handle: ProcessHandle) -> bool {
+    pub(super) fn start(
+        &self,
+        handle: ProcessHandle,
+        host: Option<Arc<dyn aidaemon_coding_agents::AgentHost>>,
+    ) -> bool {
         let mut state = self.lock();
         if matches!(*state, ProcessState::Stopped) {
             return false;
         }
-        *state = ProcessState::Started(handle, Instant::now());
+        *state = ProcessState::Started(handle, host, Instant::now());
         true
     }
 
-    /// Stop it: a started process is killed, a queued run never starts.
+    /// Stop it: a started hosted process is asked to interrupt cooperatively
+    /// first before falling back to process termination; a queued run never
+    /// starts.
     pub(super) async fn stop(&self, backend: &SharedExecutionBackend) {
-        let handle = {
+        let started = {
             let mut state = self.lock();
             match &*state {
-                ProcessState::Started(handle, _) => Some(handle.clone()),
+                ProcessState::Started(handle, host, _) => Some((handle.clone(), host.clone())),
                 ProcessState::Queued | ProcessState::Stopped => {
                     *state = ProcessState::Stopped;
                     None
                 }
             }
         };
-        match handle {
-            Some(handle) => kill_process(backend, &handle).await,
+        match started {
+            Some((handle, host)) => {
+                if let Some(host) = host {
+                    host.interrupt().await;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                kill_process(backend, &handle).await;
+            }
             None => self.stop.notify_one(),
         }
     }

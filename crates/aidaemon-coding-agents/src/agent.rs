@@ -271,6 +271,13 @@ pub trait AgentHost: Send + Sync {
         false
     }
 
+    /// Ask the agent to stop its current turn cooperatively through its own
+    /// protocol (for example ACP `session/cancel`, Codex `turn/interrupt`,
+    /// or Claude Code's `interrupt` control request) before falling back to
+    /// process termination. Default is a no-op for agents without a cancel
+    /// message.
+    async fn interrupt(&self) {}
+
     /// Close its stdin: the agent exits.
     async fn close(&self);
 }

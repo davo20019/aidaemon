@@ -1739,28 +1739,37 @@ fn a_code_conversation_picks_who_does_the_work() -> Result<(), String> {
         ],"agents":[{{"id":"claude","name":"Claude Code"}},{{"id":"codex","name":"Codex"}}]}}}}}}"#
     ))]);
     app.wait_for("Model and effort: Auto")?;
-    // On code the composer names who does the work instead of a model:
-    // AIDaemon, or a coding agent ready on the daemon's computer.
+    // On code the composer lists who does the work (AIDaemon or a ready
+    // coding agent) and keeps AIDaemon's model choices while AIDaemon is
+    // selected; picking a coding agent hides model choices.
     app.press("Code")?;
     app.wait_for("Who does the work: AIDaemon")?;
     app.press("Who does the work: AIDaemon")?;
     app.wait_for("Claude Code")?;
-    app.wait_for_gone("synthetic-claude-small", std::time::Duration::from_secs(2))?;
+    app.wait_for("synthetic-claude-small")?;
     app.press("Codex")?;
     app.wait_for("Who does the work: Codex")?;
+    app.press("Who does the work: Codex")?;
+    app.wait_for_gone("synthetic-claude-small", std::time::Duration::from_secs(2))?;
+    app.press("Codex")?;
     // A chat has no folder for an agent: it goes back to AIDaemon's model.
     app.press("Chat")?;
     app.wait_for("Model and effort: Auto")?;
     // Code again starts with the agent this device picked last.
     app.press("Code")?;
     app.wait_for("Who does the work: Codex")?;
-    // AIDaemon picked is remembered too.
+    // AIDaemon picked is remembered too, and restores model choices in Code.
     app.press("Who does the work: Codex")?;
     app.press("AIDaemon")?;
     app.wait_for("Who does the work: AIDaemon")?;
+    app.press("Who does the work: AIDaemon")?;
+    app.wait_for("synthetic-claude-small")?;
+    app.press("synthetic-claude-small")?;
+    app.wait_for("Who does the work: AIDaemon · synthetic-claude-small")?;
     app.press("Chat")?;
+    app.wait_for("Model and effort: synthetic-claude-small")?;
     app.press("Code")?;
-    app.wait_for("Who does the work: AIDaemon")?;
+    app.wait_for("Who does the work: AIDaemon · synthetic-claude-small")?;
     Ok(())
 }
 

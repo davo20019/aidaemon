@@ -930,7 +930,18 @@ fn direct_agent_response(
         .lock()
         .ok()
         .and_then(|output| output.clone())
-        .filter(|output| !output.trim().is_empty());
+        .filter(|output| !output.trim().is_empty())
+        .map(|output| {
+            // Strip model-only follow-up instructions (`Use action="check"...`)
+            // when a background launch line is echoed directly to the user.
+            if let Some(first) = output.lines().next()
+                && crate::background_run::is_launch_line(first)
+            {
+                first.to_string()
+            } else {
+                output
+            }
+        });
     sdk::ModelResponse {
         text: output.unwrap_or_else(|| format!("Sent to {agent}.")),
         ..sdk::ModelResponse::default()

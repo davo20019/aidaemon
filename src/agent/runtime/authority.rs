@@ -147,6 +147,7 @@ mod tests {
             trust_roots: None,
             lone_root_call: false,
             nested: None,
+            detached_judge: None,
         };
         use aidaemon_runtime::engine::dispatcher::ToolDispatch as _;
         let error = harness

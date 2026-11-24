@@ -51,7 +51,8 @@ pub fn publish(lister: Lister) {
     }
 }
 
-/// The agents the daemon can hand work to now, by name, each once.
+/// The agents the daemon can hand work to now, preferred first (matching
+/// [`CodingAgents::builtin`] preference order), then alphabetically by name.
 pub fn agents() -> Vec<AgentInfo> {
     let listers = registry()
         .lock()
@@ -65,7 +66,22 @@ pub fn agents() -> Vec<AgentInfo> {
             }
         }
     }
-    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    let preference: Vec<&'static str> = CodingAgents::builtin()
+        .all()
+        .iter()
+        .filter_map(|agent| agent.discovery().map(|found| found.name))
+        .collect();
+    let rank = |name: &str| {
+        preference
+            .iter()
+            .position(|preferred| preferred.eq_ignore_ascii_case(name))
+            .unwrap_or(usize::MAX)
+    };
+    agents.sort_by(|a, b| {
+        rank(&a.name)
+            .cmp(&rank(&b.name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     agents
 }
 
@@ -196,9 +212,12 @@ pub fn mark_not_usable(name: &str, reason: &str, fix: Option<&str>) {
     );
 }
 
-/// Judges a hosted agent's requests through the run's nested-call seam.
+/// Judges a hosted agent's requests through the run's nested-call seam,
+/// falling back to a detached safety judge when the launching turn's tool
+/// batch has already returned (`async_mode`, queued runs, or timeout detach).
 pub struct DaemonJudge {
-    nested: NestedCalls,
+    nested: Option<NestedCalls>,
+    detached: Option<Arc<crate::approvals::DetachedNestedJudge>>,
     /// The run whose agent asks, named on any card its asks raise.
     asker: Option<Asker>,
 }
@@ -206,7 +225,8 @@ pub struct DaemonJudge {
 impl DaemonJudge {
     pub fn new(nested: NestedCalls) -> Self {
         Self {
-            nested,
+            nested: Some(nested),
+            detached: None,
             asker: None,
         }
     }
@@ -214,8 +234,42 @@ impl DaemonJudge {
     /// Its asks name run `asker` on the cards they raise.
     pub fn for_run(nested: NestedCalls, asker: Asker) -> Self {
         Self {
-            nested,
+            nested: Some(nested),
+            detached: None,
             asker: Some(asker),
+        }
+    }
+
+    /// Judge via `nested` while the launching turn is active, falling back to
+    /// `detached` once the launching tool batch has returned.
+    pub fn for_run_with_detached(
+        nested: Option<NestedCalls>,
+        detached: Option<Arc<crate::approvals::DetachedNestedJudge>>,
+        asker: Asker,
+    ) -> Self {
+        Self {
+            nested,
+            detached,
+            asker: Some(asker),
+        }
+    }
+
+    async fn authorize(&self, call: ToolCall) -> Verdict {
+        if let Some(nested) = &self.nested {
+            let verdict = nested.authorize(call.clone()).await;
+            let run_gone = matches!(
+                &verdict,
+                Verdict::Deny { reason } if reason == "the run ended before this call could be checked"
+            );
+            if !run_gone || self.detached.is_none() {
+                return verdict;
+            }
+        }
+        if let Some(detached) = &self.detached {
+            return detached.authorize(call).await;
+        }
+        Verdict::Deny {
+            reason: "the run ended before this call could be checked".to_string(),
         }
     }
 }
@@ -319,14 +373,14 @@ impl ActionJudge for DaemonJudge {
     async fn judge(&self, action: AgentAction) -> Verdict {
         let call = daemon_call(&action);
         let Some(asker) = &self.asker else {
-            return self.nested.authorize(call).await;
+            return self.authorize(call).await;
         };
         let id = call.id.clone();
         ASKING
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id.clone(), asker.clone());
-        let verdict = self.nested.authorize(call).await;
+        let verdict = self.authorize(call).await;
         ASKING.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
         verdict
     }
@@ -447,5 +501,68 @@ mod tests {
             .await;
         assert!(matches!(verdict, Verdict::Declined { .. }));
         assert_eq!(asked.lock().unwrap()[0].name, "terminal");
+    }
+
+    /// When a hosted agent runs detached (`async_mode`, queued, or timeout
+    /// fallback) and its launching tool batch has already returned (dropping
+    /// `NestedCalls`'s receiver), `DaemonJudge` falls back to its owned
+    /// `DetachedNestedJudge` instead of failing with `the run ended`.
+    #[tokio::test]
+    async fn detached_judge_handles_asks_after_nested_channel_closes() {
+        use aidaemon_core as sdk;
+        struct AllowTool;
+        #[async_trait]
+        impl sdk::Tool for AllowTool {
+            fn spec(&self) -> sdk::ToolSpec {
+                sdk::ToolSpec {
+                    name: "terminal".into(),
+                    description: "terminal".into(),
+                    parameters: serde_json::json!({}),
+                }
+            }
+            async fn call(
+                &self,
+                _arguments: serde_json::Value,
+                _ctx: &sdk::ToolContext,
+            ) -> Result<sdk::ToolOutput, sdk::ToolError> {
+                Ok(sdk::ToolOutput::text("ok"))
+            }
+        }
+        let mut tools: std::collections::HashMap<String, Arc<dyn sdk::Tool>> =
+            std::collections::HashMap::new();
+        tools.insert("terminal".into(), Arc::new(AllowTool));
+        let approvals = Arc::new(crate::approvals::OwnerApprovals::default());
+        let rules = Arc::new(crate::approvals::AppApprovalRules::default());
+        let detached = Arc::new(crate::approvals::DetachedNestedJudge::new(
+            tools,
+            Vec::new(),
+            approvals,
+            rules,
+            sdk::SharedDeclines::default(),
+            sdk::RunId::new(),
+            "app:synthetic".into(),
+            "app:synthetic".into(),
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            false,
+        ));
+        let judge = DaemonJudge::for_run_with_detached(
+            None,
+            Some(detached),
+            Asker {
+                run: "cli-agent-detached".into(),
+                agent: "Codex".into(),
+            },
+        );
+        let verdict = judge
+            .judge(AgentAction::RunCommand {
+                command: "cargo test".into(),
+                working_dir: Some("/w/synthetic".into()),
+            })
+            .await;
+        assert!(
+            verdict.is_allowed(),
+            "detached judge should allow: {verdict:?}"
+        );
     }
 }

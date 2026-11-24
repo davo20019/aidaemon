@@ -1433,11 +1433,18 @@ fn agent_mode(
 pub(crate) async fn direct_agents(
     permissions: &Permissions,
 ) -> Vec<aidaemon_client_protocol::AgentOption> {
-    use aidaemon_runtime::tools::agent_mode;
+    use aidaemon_runtime::tools::agent_mode::{self, Readiness};
     agent_mode::ensure_checked().await;
     agent_mode::agents()
         .into_iter()
-        .filter(|info| agent_mode::readiness_of(&info.name).is_usable())
+        .filter(|info| {
+            let readiness = agent_mode::readiness_of(&info.name);
+            if info.local && info.agent.readiness_probe().is_some() {
+                matches!(readiness, Readiness::Ready)
+            } else {
+                readiness.is_usable()
+            }
+        })
         .filter(|info| permissions.agent_mode(&info.name, &*info.agent).is_some())
         .map(|info| aidaemon_client_protocol::AgentOption {
             name: info.agent.name().to_string(),
