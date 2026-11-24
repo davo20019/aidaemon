@@ -1195,6 +1195,30 @@ impl Client {
     /// A reply landed: unread unless the owner is looking at it; a stop
     /// asked for is over once its turn ends.
     fn note_reply(&mut self, session: Option<&str>, event: &Event, at_ms: u64, cx: &Context) {
+        // In a conversation set to a coding agent, the agent's answer is its
+        // run's card, not a message: its run ending (read before the
+        // reducer applies it, so once) is the reply that landed.
+        if let Event::RunUpdated { run } = event {
+            let was_running = self
+                .state
+                .runs
+                .get(&run.id)
+                .is_some_and(|before| before.phase.is_running());
+            let ended =
+                !run.phase.is_running() && run.phase != aidaemon_client_protocol::RunPhase::Unknown;
+            let set_to_agent = matches!(
+                self.session_models.get(&run.session_id),
+                Some(Read::Ready(model)) if matches!(model.model, ModelChoice::Agent { .. })
+            );
+            if was_running && ended && run.background && run.agent.is_some() && set_to_agent {
+                let session = run.session_id.as_str();
+                if !(cx.looking && cx.selected.as_deref() == Some(session)) {
+                    self.unread.insert(session.to_owned());
+                }
+                self.finished = Some((session.to_owned(), cx.now_ms));
+            }
+            return;
+        }
         let (session, done) = match event {
             Event::AssistantMessage { session_id, .. } => (session_id.as_str(), false),
             Event::TurnCompleted { .. } => match session {

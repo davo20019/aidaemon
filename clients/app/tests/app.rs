@@ -843,6 +843,8 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.wait_for("text:Codex")?;
     // The agent is named by its kind; its run's task heads the card's body.
     app.wait_for("text:Fix the slug")?;
+    // The card says what a press does.
+    app.wait_for("text:See everything it did and reply")?;
     app.press("Codex, show what it did")?;
     let id = wait_sent("get_run")?;
     feed([frame(&format!(

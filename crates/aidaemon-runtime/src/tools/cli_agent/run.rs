@@ -2785,7 +2785,25 @@ async fn deliver_end(
     };
 
     let mut delivered = false;
-    if let Some(ref hub) = handles.hub {
+    // A conversation set to a coding agent, where the chat shows the run's
+    // card: the card is the agent's answer (what it said is its view, a
+    // press away), so no message repeats it. Its result is in the
+    // session's history above, for any later turn.
+    let on_card = direct
+        && envelope.is_none()
+        && run.is_some()
+        && match handles.hub.as_ref() {
+            Some(hub) => hub.shows_runs(&notify_session_id).await,
+            None => false,
+        };
+    if on_card {
+        info!(
+            task_id = %task_id_for_notify,
+            session_id = %notify_session_id,
+            "Coding agent conversation: the run's card carries its answer"
+        );
+        delivered = true;
+    } else if let Some(ref hub) = handles.hub {
         if let (Some(envelope), Some(agent)) = (envelope.as_ref(), handles.agent.as_ref()) {
             let _ = agent
                 .record_continuation_delivery(

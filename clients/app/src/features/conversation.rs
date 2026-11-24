@@ -789,9 +789,8 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             return view();
         };
         let mut body = view().gap_1();
-        // In a conversation set to a coding agent, the agent's whole reply
-        // follows as the conversation's answer: the card does not repeat
-        // it, shortened.
+        // In a conversation set to a coding agent, the card is the agent's
+        // answer, kept short: what it said is in its view, a press away.
         let direct = untracked(|| {
             store.selected().is_some_and(|session| {
                 matches!(
@@ -833,7 +832,28 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
         for (glyph, tone, words) in super::run_view::result_facts(&result) {
             body = body.child(fact(glyph, tone, words));
         }
-        body
+        // What a press does, said on the card.
+        let hint = match (direct, r.can_continue) {
+            (true, true) => "See what it said and reply",
+            (true, false) => "See what it said",
+            (false, true) => "See everything it did and reply",
+            (false, false) => "See everything it did",
+        };
+        body.child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .pt_1()
+                .child(
+                    text(hint)
+                        .text_size(px(type_scale::XS))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors::ACCENT),
+                )
+                .child(ui::icon(Glyph::Chevron).text_color(colors::ACCENT))
+                .accessibility_elements_hidden(true),
+        )
     };
     view().w_full().px_1().child(
         button()
