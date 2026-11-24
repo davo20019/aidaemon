@@ -1438,7 +1438,13 @@ mod tests {
             mismatches: Vec::new(),
         };
         assert!(!runs.agents_answered("task-1"), "no run, no answer");
-        runs.begin_waited("cli-agent-a", "chat", "Create the note", now, Some("task-1"));
+        runs.begin_waited(
+            "cli-agent-a",
+            "chat",
+            "Create the note",
+            now,
+            Some("task-1"),
+        );
         runs.set_agent("cli-agent-a", "Codex");
         runs.result("cli-agent-a", clean());
         assert!(!runs.agents_answered("task-1"), "still running");
