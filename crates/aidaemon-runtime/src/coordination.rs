@@ -1353,6 +1353,11 @@ impl Coordination {
         });
     }
 
+    /// The tracked paths a finished shell or CLI agent run must look at again.
+    pub fn tracked_paths(&self) -> Vec<String> {
+        self.paths_to_recheck()
+    }
+
     /// The tracked paths a finished shell call must look at again.
     fn paths_to_recheck(&self) -> Vec<String> {
         self.ledger()
@@ -1361,6 +1366,26 @@ impl Coordination {
             .take(SHELL_RECHECK_PATHS)
             .cloned()
             .collect()
+    }
+
+    /// Close a delegated CLI agent's open shell window, absorb any changed or
+    /// tracked files it modified, and mark the member finished.
+    pub fn finish_cli_run(
+        &self,
+        member: &str,
+        call_id: &str,
+        observed: Vec<(String, Option<Vec<u8>>)>,
+    ) {
+        // Ensure newly written files from the CLI agent enter the ledger
+        // before `shell_finished` computes line-ownership diffs.
+        {
+            let mut ledger = self.ledger();
+            for (path, _) in &observed {
+                ledger.track(path, None);
+            }
+        }
+        self.shell_finished(member, call_id, observed);
+        self.finish_member(member);
     }
 
     /// `member`'s shell call ended and the tracked files now hold `observed`:

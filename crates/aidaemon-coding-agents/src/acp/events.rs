@@ -10,9 +10,7 @@
 
 use serde_json::Value;
 
-use crate::events::{
-    AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, program_of, text,
-};
+use crate::events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, text};
 
 /// The events one line carries.
 pub fn read_events(line: &str) -> Vec<AgentEvent> {
@@ -37,9 +35,7 @@ pub fn read_events(line: &str) -> Vec<AgentEvent> {
                 Some("read") => StepTool::Read { path },
                 Some("edit" | "delete" | "move") => StepTool::Edit { path },
                 Some("search") => StepTool::Search { pattern: None },
-                Some("execute") => StepTool::Run {
-                    program: text(&event, "/command").as_deref().and_then(program_of),
-                },
+                Some("execute") => StepTool::run(text(&event, "/command").as_deref()),
                 Some("fetch") => StepTool::Fetch {
                     host: text(&event, "/url").as_deref().and_then(host_of),
                 },
@@ -147,7 +143,7 @@ mod tests {
         );
         assert!(
             matches!(&read_events(r#"{"type":"tool_call","id":"c2","kind":"execute","command":"pytest -q"}"#)[0],
-                AgentEvent::Step(step) if step.tool == StepTool::Run { program: Some("pytest".into()) })
+                AgentEvent::Step(step) if step.tool == StepTool::Run { program: Some("pytest".into()), subcommand: None })
         );
         assert!(read_events(r#"{"type":"tool_call","id":"c3","kind":"think"}"#).is_empty());
         assert_eq!(

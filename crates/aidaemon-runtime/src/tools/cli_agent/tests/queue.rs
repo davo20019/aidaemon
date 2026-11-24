@@ -494,3 +494,284 @@ async fn a_delegated_launch_in_a_taken_folder_is_still_refused() {
     assert_eq!(started_task_ids(&tool).await, vec![first_id.clone()]);
     tool.handle_cancel(&first_id).await.unwrap();
 }
+
+/// A folder waiter in a subfolder must not jump ahead of an earlier waiter
+/// targeting the enclosing parent folder, whereas an earlier waiter with a
+/// disjoint `write_paths` scope does not block a later waiter.
+#[tokio::test]
+async fn folder_waiter_blocks_subfolder_waiter_but_allows_disjoint_write_paths() {
+    let (tool, _runs, _watcher, _db) = one_slot_tool().await;
+    let claims = tool.working_dir_claims.clone();
+    let notify = tool.claims_changed.clone();
+
+    // Seed an earlier waiter waiting on the parent folder `/w/synthetic`.
+    let earlier_shared = RunShared::default();
+    *earlier_shared.folder_wait.lock().unwrap() = Some("bash-agent".to_string());
+    let earlier_call = RunCall {
+        task_id: "early-parent".to_string(),
+        tool_name: "bash-agent".to_string(),
+        session_id: "app:synthetic-wait-order".to_string(),
+        goal_id: None,
+        delegated_task_id: None,
+        label: "parent task".to_string(),
+        short_summary: "parent".to_string(),
+        async_mode: true,
+        status_tx: None,
+        grant_session: "app:synthetic-wait-order".to_string(),
+        new_folders: Vec::new(),
+        began: chrono::Utc::now(),
+        owner_follow_up: false,
+        direct_agent: true,
+    };
+    let earlier_at = Instant::now() - Duration::from_secs(5);
+    let later_shared = RunShared::default();
+    *later_shared.folder_wait.lock().unwrap() = Some("bash-agent".to_string());
+    let later_at = Instant::now();
+    {
+        let mut table = tool.running.lock().await;
+        table.insert(
+            "early-parent".to_string(),
+            tracked(
+                &earlier_call,
+                &earlier_shared,
+                earlier_at,
+                Some("/w/synthetic".to_string()),
+                WriteScope::Whole,
+                4096,
+            ),
+        );
+        table.insert(
+            "later-sub".to_string(),
+            tracked(
+                &RunCall {
+                    task_id: "later-sub".to_string(),
+                    ..earlier_call.clone()
+                },
+                &later_shared,
+                later_at,
+                Some("/w/synthetic/src".to_string()),
+                WriteScope::Whole,
+                4096,
+            ),
+        );
+        table.insert(
+            "later-disjoint".to_string(),
+            tracked(
+                &RunCall {
+                    task_id: "later-disjoint".to_string(),
+                    ..earlier_call.clone()
+                },
+                &later_shared,
+                later_at,
+                Some("/w/synthetic".to_string()),
+                WriteScope::Paths(vec!["/w/synthetic/b.md".to_string()]),
+                4096,
+            ),
+        );
+    }
+
+    // Later waiter targeting a subfolder `/w/synthetic/src` collides with
+    // `/w/synthetic` (Whole), so it must wait.
+    let sub_wait = FolderWait {
+        dir: "/w/synthetic/src".to_string(),
+        writes: WriteScope::Whole,
+        prompt_summary: "sub".to_string(),
+        behind: "bash-agent".to_string(),
+    };
+    assert!(
+        matches!(
+            try_take_folder(
+                &tool.running,
+                &claims,
+                &notify,
+                "later-sub",
+                "bash-agent",
+                &sub_wait,
+            )
+            .await,
+            FolderTurn::Waits(_)
+        ),
+        "subfolder waiter should wait behind earlier parent-folder waiter"
+    );
+
+    // Replace the earlier waiter with a narrow `write_paths` scope on `a.md`.
+    tool.running.lock().await.insert(
+        "early-parent".to_string(),
+        tracked(
+            &earlier_call,
+            &earlier_shared,
+            earlier_at,
+            Some("/w/synthetic".to_string()),
+            WriteScope::Paths(vec!["/w/synthetic/a.md".to_string()]),
+            4096,
+        ),
+    );
+
+    // A later waiter targeting disjoint `/w/synthetic/b.md` does NOT collide
+    // and can take the folder immediately.
+    let disjoint_wait = FolderWait {
+        dir: "/w/synthetic".to_string(),
+        writes: WriteScope::Paths(vec!["/w/synthetic/b.md".to_string()]),
+        prompt_summary: "disjoint".to_string(),
+        behind: "bash-agent".to_string(),
+    };
+    let turn = try_take_folder(
+        &tool.running,
+        &claims,
+        &notify,
+        "later-disjoint",
+        "bash-agent",
+        &disjoint_wait,
+    )
+    .await;
+    assert!(
+        matches!(turn, FolderTurn::Taken(_)),
+        "disjoint write_paths waiter should not be blocked by earlier narrow waiter"
+    );
+}
+
+/// When a direct-agent follow-up wakes from waiting on its folder, it
+/// refreshes and resumes the prior run's session even if `RunState::ended_at`
+/// has not yet been stamped, as long as durable completion (`output_summary`)
+/// is recorded.
+#[tokio::test]
+async fn folder_queued_direct_run_refreshes_session_before_ended_at_is_stamped() {
+    let (tool, runs, _watcher, _db) = one_slot_tool().await;
+    let chat = "app:synthetic-direct-refresh";
+    set_direct(&tool, chat).await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let dir_path = dir.path().to_string_lossy().to_string();
+
+    // Register a fake `claude` tool so `prepare` supports `resume`.
+    {
+        let mut tools = tool.tools.write().unwrap();
+        tools.insert(
+            "claude".to_string(),
+            CliToolEntry {
+                command: "claude".to_string(),
+                args: vec!["-p".to_string()],
+                description: "Synthetic Claude".to_string(),
+                timeout: Duration::from_secs(10),
+                max_output_chars: 10_000,
+                is_dynamic: false,
+            },
+        );
+    }
+
+    // Record an earlier kept run in SQLite whose durable completion is saved,
+    // while `RunState` in memory still has `ended_at == None`.
+    let earlier_task = "first123";
+    let earlier_run = cli_run_id(earlier_task);
+    let inv_id = tool
+        .state
+        .log_cli_agent_start(
+            Some(earlier_task),
+            chat,
+            "claude",
+            "first turn",
+            Some(&dir_path),
+        )
+        .await
+        .unwrap();
+    tool.state
+        .note_cli_agent_run(inv_id, &earlier_run, Some("checked"))
+        .await
+        .unwrap();
+    tool.state
+        .set_cli_agent_keeps_session(inv_id, true)
+        .await
+        .unwrap();
+    tool.state
+        .set_cli_agent_session(inv_id, "sess-synthetic-42")
+        .await
+        .unwrap();
+    tool.state
+        .log_cli_agent_complete(inv_id, Some(0), "first turn done", true, 1.0)
+        .await
+        .unwrap();
+
+    // Leave `RunState::ended_at` unstamped (still Running in the registry).
+    runs.begin(&earlier_run, chat, "first turn", None);
+    assert!(runs.get(&earlier_run).unwrap().ended_at.is_none());
+
+    // Prepare a fresh second launch (before the first had finished).
+    let coding_agent = tool.agent_named("claude").unwrap();
+    let mut prep = PreparedRun {
+        command: "claude".to_string(),
+        args: vec!["-p".to_string()],
+        base_launch: aidaemon_coding_agents::Launch {
+            args: vec!["-p".to_string()],
+            start: 0,
+        },
+        enforce_native_access: false,
+        read_paths: vec![dir_path.clone()],
+        model: None,
+        can_host: false,
+        mode: aidaemon_coding_agents::PermissionMode::FullAccess,
+        coding_agent,
+        nested: None,
+        detached_judge: None,
+        spawn_family: None,
+        timeout: Duration::from_secs(10),
+        max_output: 10_000,
+        workspace_mode: CliWorkspaceMode::ReadWrite,
+        working_dir: Some(dir_path.clone()),
+        claim_dir: Some(dir_path.clone()),
+        write_scope: WriteScope::Paths(vec![dir_path.clone()]),
+        write_paths: vec![dir_path.clone()],
+        prompt_placement: aidaemon_coding_agents::PromptPlacement::LastArgument,
+        env: Vec::new(),
+        env_remove: Vec::new(),
+        host: None,
+        keep_alive: None,
+        keeps_session: true,
+        continues: None,
+        prompt: "second turn".to_string(),
+        task: "second turn".to_string(),
+        final_prompt: "second turn".to_string(),
+        claim: None,
+        folder_wait: None,
+    };
+    let call = RunCall {
+        task_id: "second456".to_string(),
+        tool_name: "claude".to_string(),
+        session_id: chat.to_string(),
+        goal_id: None,
+        delegated_task_id: None,
+        label: "second turn".to_string(),
+        short_summary: "second turn".to_string(),
+        async_mode: true,
+        status_tx: None,
+        grant_session: chat.to_string(),
+        new_folders: Vec::new(),
+        began: chrono::Utc::now(),
+        owner_follow_up: false,
+        direct_agent: true,
+    };
+
+    super::super::queue::refresh_direct_session(
+        &tool.run_handles(),
+        &tool.running,
+        &call,
+        &mut prep,
+    )
+    .await;
+
+    let continued = prep
+        .continues
+        .expect("should resume earlier kept session even before ended_at is stamped");
+    assert_eq!(continued.run, earlier_run);
+    assert_eq!(continued.agent_session, "sess-synthetic-42");
+    assert!(
+        prep.args
+            .windows(2)
+            .any(|w| w[0] == "--resume" && w[1] == "sess-synthetic-42"),
+        "re-prepared args should resume the session: {:?}",
+        prep.args
+    );
+    assert!(
+        !prep.args.iter().any(|arg| arg == "--json-schema"),
+        "direct_agent refresh must not attach the 3-sentence report schema: {:?}",
+        prep.args
+    );
+}

@@ -695,6 +695,12 @@ impl State {
     fn put_run(&mut self, run: RunSummary) {
         let session = run.session_id.clone();
         let ended = !run.phase.is_running();
+        // A history may have brought it back as it stood then (records are
+        // kept while runs go on): its copy follows, so the live one leaving
+        // this map later never shows an older state.
+        if let Some(past) = self.past_runs.get_mut(&run.id) {
+            *past = run.clone();
+        }
         self.runs.insert(run.id.clone(), run);
         // Its last background run ended and no turn runs: the conversation
         // is not working any more, though no report turn may come (a run
@@ -1009,8 +1015,8 @@ mod tests {
         assert!(!runs.iter().any(|run| run.id == "done-0"));
     }
 
-    /// A conversation's history brings back its ended runs; a snapshot
-    /// keeps them, and a live record of the same run wins.
+    /// A conversation's history brings back its runs; a snapshot keeps
+    /// them, and a live record of the same run wins and updates it.
     #[test]
     fn a_history_brings_back_its_ended_runs() {
         use aidaemon_client_protocol::RunPhase;
@@ -1032,8 +1038,10 @@ mod tests {
         let runs = state.runs_for("app:s1");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].phase, RunPhase::Failed);
+        // The history's copy follows the live record: once the live one
+        // leaves, the run still reads as it last stood.
         state.runs.clear();
-        assert_eq!(state.runs_for("app:s1")[0].phase, RunPhase::Succeeded);
+        assert_eq!(state.runs_for("app:s1")[0].phase, RunPhase::Failed);
     }
 
     /// A turn that hands its work to the background leaves the

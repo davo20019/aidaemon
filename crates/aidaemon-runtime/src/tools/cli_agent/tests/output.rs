@@ -296,3 +296,37 @@ fn a_report_reads_as_its_text_not_its_json() {
     let prose = serde_json::json!({"type": "result", "result": "Added a test."}).to_string();
     assert_eq!(extract_meaningful_output(&prose, 4_000), "Added a test.");
 }
+
+#[test]
+fn extract_terminal_commands_covers_claude_codex_and_acp_events() {
+    let claude = serde_json::json!({
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "sqlite3 aidaemon.db .tables"}}]}
+    })
+    .to_string();
+    assert_eq!(
+        extract_terminal_commands_from_json(&claude),
+        vec!["sqlite3 aidaemon.db .tables"]
+    );
+
+    let codex = serde_json::json!({
+        "type": "item.started",
+        "item": {"id": "cmd-1", "type": "command_execution", "command": "sqlite3 ~/.aidaemon/aidaemon.db 'SELECT 1'"}
+    })
+    .to_string();
+    assert_eq!(
+        extract_terminal_commands_from_json(&codex),
+        vec!["sqlite3 ~/.aidaemon/aidaemon.db 'SELECT 1'"]
+    );
+
+    let acp = serde_json::json!({
+        "type": "tool_call",
+        "kind": "execute",
+        "command": "rm -rf ~/.aidaemon/aidaemon.db"
+    })
+    .to_string();
+    assert_eq!(
+        extract_terminal_commands_from_json(&acp),
+        vec!["rm -rf ~/.aidaemon/aidaemon.db"]
+    );
+}

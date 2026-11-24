@@ -83,6 +83,13 @@ pub async fn run(
         crate::config::config_file(&config_path),
     );
 
+    // Runs the last process kept as running were cut off by its stop.
+    match crate::startup::client_runs::close_cut_off(&pool, state.as_ref()).await {
+        Ok(0) => {}
+        Ok(closed) => info!(closed, "Ended the run records a stop cut off"),
+        Err(error) => tracing::warn!(%error, "Could not end the run records a stop cut off"),
+    }
+
     let crate::providers::factory::ProviderRouterBundle {
         provider,
         primary_model: model,

@@ -15,7 +15,7 @@
 
 use serde_json::Value;
 
-use crate::events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, program_of, text};
+use crate::events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, text};
 
 /// The field of a `turn.completed`/`turn.failed` line that carries the
 /// turn's final message (this crate's own, added by its hosts).
@@ -78,9 +78,7 @@ fn reported(end: &Value) -> Option<AgentEvent> {
 fn item_events(item: &Value, completed: bool) -> Vec<AgentEvent> {
     let id = text(item, "/id");
     let tool = match item.get("type").and_then(Value::as_str) {
-        Some("command_execution") => StepTool::Run {
-            program: text(item, "/command").as_deref().and_then(program_of),
-        },
+        Some("command_execution") => StepTool::run(text(item, "/command").as_deref()),
         Some("file_change") => StepTool::Edit {
             path: text(item, "/changes/0/path"),
         },
@@ -152,7 +150,8 @@ mod tests {
                 id: Some("i1".into()),
                 parent: None,
                 tool: StepTool::Run {
-                    program: Some("npm".into())
+                    program: Some("npm".into()),
+                    subcommand: Some("test".into()),
                 }
             })]
         );

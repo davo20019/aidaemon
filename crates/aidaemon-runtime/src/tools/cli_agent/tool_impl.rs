@@ -132,6 +132,10 @@ struct EarlierRun {
     agent: String,
     working_dir: Option<String>,
     continues: crate::helper_run::Continues,
+    /// For a run that ended before it finished (a restart stopped it, it
+    /// failed part way): what it had done, by the events kept as it ran,
+    /// for the follow-up's agent ([`super::RunProgress::note`]).
+    progress: Option<String>,
 }
 
 impl CliAgentTool {
@@ -163,7 +167,22 @@ impl CliAgentTool {
                 found.agent_name
             ));
         };
+        let progress = match found.success {
+            Some(false) => {
+                let events = self
+                    .state
+                    .get_cli_agent_events(found.invocation)
+                    .await
+                    .unwrap_or_default();
+                Some(
+                    super::RunProgress::of(&events)
+                        .note(run, super::why_unfinished(found.output_summary.as_deref())),
+                )
+            }
+            _ => None,
+        };
         Ok(EarlierRun {
+            progress,
             agent: found.agent_name,
             working_dir: found.working_dir,
             continues: crate::helper_run::Continues {
@@ -243,8 +262,8 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
     }
 
     async fn stop_background_job(&self, key: &str) -> bool {
-        let finished = match self.running.lock().await.get(key) {
-            Some(agent) => agent.finished.clone(),
+        let (finished, done_notify) = match self.running.lock().await.get(key) {
+            Some(agent) => (agent.finished.clone(), agent.done_notify.clone()),
             None => return true,
         };
         if let Err(error) = self.handle_cancel(key).await {
@@ -252,10 +271,17 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
             return false;
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !finished.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        loop {
+            let notified = done_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if finished.load(Ordering::Acquire) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return finished.load(Ordering::Acquire);
+            }
         }
-        finished.load(Ordering::Acquire)
     }
 
     fn dispatch_facts(&self) -> crate::tools::traits::ToolDispatchFacts {
@@ -285,17 +311,34 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
         let Ok(parsed) = serde_json::from_str::<Value>(arguments) else {
             return Ok(());
         };
-        let is_read_write = parsed.get("action").and_then(Value::as_str) == Some("run")
-            && parsed.get("workspace_mode").and_then(Value::as_str) == Some("read_write");
-        let has_write_paths = parsed
-            .get("write_paths")
-            .and_then(Value::as_array)
-            .is_some_and(|paths| {
-                paths
-                    .iter()
-                    .any(|path| path.as_str().is_some_and(|path| !path.trim().is_empty()))
-            });
-        if is_read_write && !has_write_paths {
+        if parsed.get("action").and_then(Value::as_str) != Some("run") {
+            return Ok(());
+        }
+        let workspace_mode = parsed.get("workspace_mode").and_then(Value::as_str);
+        let explicit_read_write = workspace_mode == Some("read_write");
+        let has_working_dir = parsed
+            .get("working_dir")
+            .and_then(Value::as_str)
+            .is_some_and(|dir| !dir.trim().is_empty());
+        // `CliWorkspaceMode` defaults to `ReadWrite`, so omitting
+        // `workspace_mode` when targeting a `working_dir` is a read-write run
+        // and must also declare explicit write targets.
+        let requires_write_manifest =
+            explicit_read_write || (workspace_mode.is_none() && has_working_dir);
+        let non_empty_list = |key: &str| {
+            parsed
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(|s| !s.trim().is_empty()))
+                })
+        };
+        let has_declared_writes = non_empty_list("write_paths")
+            || non_empty_list("scope")
+            || non_empty_list("new_folders");
+        if requires_write_manifest && !has_declared_writes {
             return Err(ToolArgumentContractViolation::new(
                 "read-write CLI delegation requires an explicit non-empty write_paths access manifest",
             )
@@ -448,6 +491,7 @@ impl crate::tools::traits::ToolSemantics for CliAgentTool {
     }
 }
 
+#[cfg(test)]
 pub(super) fn cli_agent_outcome(
     action: &str,
     output: String,
@@ -455,11 +499,39 @@ pub(super) fn cli_agent_outcome(
     left_in_background: bool,
     never_started: bool,
 ) -> ToolCallOutcome {
+    cli_agent_outcome_with_refusal(
+        action,
+        output,
+        read_only_run,
+        left_in_background,
+        never_started,
+        None,
+    )
+}
+
+pub(super) fn cli_agent_outcome_with_refusal(
+    action: &str,
+    output: String,
+    read_only_run: bool,
+    left_in_background: bool,
+    never_started: bool,
+    refusal: Option<PrelaunchRefusal>,
+) -> ToolCallOutcome {
     let exit_code = cli_agent_exit_code(&output);
     let prelaunch_failure = never_started;
-    let policy_block = output.trim_start().starts_with("Blocked:");
-    let reported_failure = output.trim_start().starts_with("ERROR: CLI agent");
-    let metadata = if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
+    let trimmed = output.trim_start();
+    let contention_refusal = refusal == Some(PrelaunchRefusal::Contention)
+        || (action == "run"
+            && (trimmed.starts_with("BLOCKED:") || trimmed.starts_with("Maximum ")));
+    let policy_block = refusal == Some(PrelaunchRefusal::Policy) || trimmed.starts_with("Blocked:");
+    let reported_failure = trimmed.starts_with("ERROR: CLI agent");
+    let metadata = if contention_refusal {
+        ToolCallMetadata {
+            outcome_status: Some(ToolOutcomeStatus::FailedRetryable),
+            semantics: ToolCallSemantics::administrative(),
+            ..ToolCallMetadata::default()
+        }
+    } else if exit_code.is_some() || prelaunch_failure || policy_block || reported_failure {
         ToolCallMetadata {
             outcome_status: Some(ToolOutcomeStatus::FailedPermanent),
             exit_code,
@@ -532,46 +604,52 @@ impl CliAgentTool {
                 || parsed
                     .as_ref()
                     .is_some_and(|args| args.workspace_mode == CliWorkspaceMode::ReadOnly));
-        let (output, left_in_background, settled, changed, run_label, never_started) =
-            NEVER_STARTED
+        let (output, left_in_background, settled, changed, run_label, never_started, refusal) =
+            REFUSED_BEFORE_LAUNCH
                 .scope(
-                    std::cell::Cell::new(false),
-                    BACKGROUND_RUN_LABEL.scope(
-                        std::cell::RefCell::new(None),
-                        RUN_CHANGED_LOCALLY.scope(
-                            std::cell::Cell::new(false),
-                            BACKGROUND_SETTLED.scope(
+                    std::cell::Cell::new(None),
+                    NEVER_STARTED.scope(
+                        std::cell::Cell::new(false),
+                        BACKGROUND_RUN_LABEL.scope(
+                            std::cell::RefCell::new(None),
+                            RUN_CHANGED_LOCALLY.scope(
                                 std::cell::Cell::new(false),
-                                LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
-                                    let output = self
-                                        .call_with_status_under_contract(
-                                            arguments,
-                                            status_tx,
-                                            read_only_run,
-                                            enforce_native_access,
-                                            facts,
-                                        )
-                                        .await?;
-                                    anyhow::Ok((
-                                        output,
-                                        LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
-                                        BACKGROUND_SETTLED.with(std::cell::Cell::get),
-                                        RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
-                                        BACKGROUND_RUN_LABEL.with(|slot| slot.borrow_mut().take()),
-                                        NEVER_STARTED.with(std::cell::Cell::get),
-                                    ))
-                                }),
+                                BACKGROUND_SETTLED.scope(
+                                    std::cell::Cell::new(false),
+                                    LEFT_IN_BACKGROUND.scope(std::cell::Cell::new(false), async {
+                                        let output = self
+                                            .call_with_status_under_contract(
+                                                arguments,
+                                                status_tx,
+                                                read_only_run,
+                                                enforce_native_access,
+                                                facts,
+                                            )
+                                            .await?;
+                                        anyhow::Ok((
+                                            output,
+                                            LEFT_IN_BACKGROUND.with(std::cell::Cell::get),
+                                            BACKGROUND_SETTLED.with(std::cell::Cell::get),
+                                            RUN_CHANGED_LOCALLY.with(std::cell::Cell::get),
+                                            BACKGROUND_RUN_LABEL
+                                                .with(|slot| slot.borrow_mut().take()),
+                                            NEVER_STARTED.with(std::cell::Cell::get),
+                                            REFUSED_BEFORE_LAUNCH.with(std::cell::Cell::get),
+                                        ))
+                                    }),
+                                ),
                             ),
                         ),
                     ),
                 )
                 .await?;
-        let mut outcome = cli_agent_outcome(
+        let mut outcome = cli_agent_outcome_with_refusal(
             &action,
             output,
             read_only_run,
             left_in_background,
             never_started,
+            refusal,
         );
         if changed && outcome.metadata.outcome_status == Some(ToolOutcomeStatus::Succeeded) {
             outcome.metadata.semantics = changed_locally_semantics(true)
@@ -672,6 +750,7 @@ impl CliAgentTool {
                 }
                 // A follow-up to an earlier run: the same agent, in its
                 // folder, going on in its own session.
+                let mut unfinished = None;
                 let continues = match args
                     .continue_run
                     .as_deref()
@@ -685,9 +764,13 @@ impl CliAgentTool {
                             if args.working_dir.is_none() {
                                 args.working_dir = earlier.working_dir;
                             }
+                            unfinished = earlier.progress;
                             Some(earlier.continues)
                         }
-                        Err(why) => return Ok(format!("Blocked: {why}")),
+                        Err(why) => {
+                            mark_refused_before_launch(PrelaunchRefusal::Policy);
+                            return Ok(format!("Blocked: {why}"));
+                        }
                     },
                 };
                 // An agent asked for by name runs when its owner-set mode
@@ -738,6 +821,7 @@ impl CliAgentTool {
                         .and_then(|name| self.configured_tool(name))
                         != Some(tool.clone())
                 {
+                    mark_refused_before_launch(PrelaunchRefusal::Policy);
                     return Ok(format!(
                         "Blocked: {} can't take this follow-up here (its mode doesn't let it \
                          run this run), and no other agent can go on in its session.",
@@ -778,6 +862,7 @@ impl CliAgentTool {
                 // to recognize deployment verbs or negations in prose.
                 if trusted_session {
                     let Some(working_dir) = args.working_dir.as_deref() else {
+                        mark_refused_before_launch(PrelaunchRefusal::Policy);
                         return Ok(
                             "Blocked: unattended CLI delegation requires an explicit working_dir so repository cleanliness can be verified."
                                 .to_string(),
@@ -788,6 +873,7 @@ impl CliAgentTool {
                             .await
                             .filter(|count| *count > 0)
                     {
+                        mark_refused_before_launch(PrelaunchRefusal::Policy);
                         return Ok(format!(
                             "Blocked: unattended CLI delegation found {entry_count} pre-existing changed or untracked worktree entries. Use a clean isolated worktree containing only the intended change, or request explicit owner review; unrelated workspace state was not exposed to opaque delegated mutation."
                         ));
@@ -813,7 +899,10 @@ impl CliAgentTool {
                         facts,
                     ) {
                         Ok(made) => made,
-                        Err(error) => return Ok(format!("Blocked: {error}")),
+                        Err(error) => {
+                            mark_refused_before_launch(PrelaunchRefusal::Policy);
+                            return Ok(format!("Blocked: {error}"));
+                        }
                     }
                 };
                 let spec = crate::helper_run::HelperSpec {
@@ -849,10 +938,19 @@ impl CliAgentTool {
                 } else {
                     prompt
                 };
+                // Going on from a run that never finished: the agent is told
+                // where it stopped, from the daemon's record, whatever its
+                // own session kept.
+                let prompt = match unfinished {
+                    Some(note) => format!("{note}\n\n{prompt}"),
+                    None => prompt,
+                };
                 let detached_judge = facts
                     .extensions
                     .get::<Arc<crate::approvals::DetachedNestedJudge>>()
                     .cloned();
+                let spawn_family = crate::authority::parent_authority(facts)
+                    .and_then(|parent| parent.spawn_family.clone());
                 let mut unavailable = Vec::new();
                 let output = loop {
                     match self
@@ -882,6 +980,7 @@ impl CliAgentTool {
                                 .get::<aidaemon_core::NestedCalls>()
                                 .cloned(),
                             detached_judge.clone(),
+                            spawn_family.clone(),
                         )
                         .await
                     {

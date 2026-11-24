@@ -44,9 +44,13 @@ use aidaemon_tools::{BackendFileType, BackendPath, ExecutionRequest, ProcessHand
 mod args;
 mod background;
 mod claims;
+mod delivery;
 mod launch;
 mod output;
+mod prepare;
+mod progress;
 mod prompt;
+mod queue;
 mod receipts;
 mod registry;
 mod run;
@@ -54,16 +58,20 @@ mod state;
 #[cfg(test)]
 mod tests;
 mod tool_impl;
+mod watch;
 
+pub use progress::{RunProgress, STOPPED_BY_RESTART, why_unfinished};
 pub use state::{cli_agent_task_id, is_cli_agent_run};
 
 use args::*;
 use claims::*;
+use delivery::*;
 use launch::*;
 use output::*;
 use receipts::*;
 use run::*;
 use state::*;
+use watch::*;
 
 /// What the tool keeps in its host's store: the agents it may run and their
 /// invocation log, the chat's recent history for a run's context, the goal
@@ -98,6 +106,18 @@ pub struct CliAgentsConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_cli_agents_max_output_chars")]
     pub max_output_chars: usize,
+    /// Max concurrent CLI agent processes across every conversation.
+    #[serde(default = "default_cli_agents_max_concurrent")]
+    pub max_concurrent: usize,
+    /// Hard wall-clock limit for a CLI agent running in the background
+    /// (paused while waiting on an owner approval card).
+    #[serde(default = "default_cli_agents_background_timeout_secs")]
+    pub background_timeout_secs: u64,
+    /// Maximum silent interval without stdout/stderr output before a
+    /// background CLI agent is terminated as stalled (paused while waiting
+    /// on an owner approval card).
+    #[serde(default = "default_cli_agents_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
     #[serde(default)]
     pub tools: HashMap<String, CliToolConfig>,
     /// `[cli_agents.permissions]`: the owner's mode per agent, by name
@@ -113,6 +133,9 @@ impl Default for CliAgentsConfig {
             enabled: default_cli_agents_enabled(),
             timeout_secs: default_cli_agents_timeout_secs(),
             max_output_chars: default_cli_agents_max_output_chars(),
+            max_concurrent: default_cli_agents_max_concurrent(),
+            background_timeout_secs: default_cli_agents_background_timeout_secs(),
+            idle_timeout_secs: default_cli_agents_idle_timeout_secs(),
             tools: HashMap::new(),
             permissions: HashMap::new(),
         }
@@ -128,6 +151,15 @@ fn default_cli_agents_timeout_secs() -> u64 {
 }
 fn default_cli_agents_max_output_chars() -> usize {
     16000
+}
+fn default_cli_agents_max_concurrent() -> usize {
+    DEFAULT_MAX_CONCURRENT
+}
+fn default_cli_agents_background_timeout_secs() -> u64 {
+    DEFAULT_BACKGROUND_TIMEOUT_SECS
+}
+fn default_cli_agents_idle_timeout_secs() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_SECS
 }
 
 /// One `[cli_agents.tools.<name>]` entry.
@@ -162,12 +194,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 /// six minutes). Waiting turns each check into a long poll that returns the
 /// moment the task ends.
 #[cfg(test)]
-const CHECK_WAIT: Duration = Duration::from_millis(300);
+const CHECK_WAIT: Duration = Duration::from_millis(600);
 #[cfg(not(test))]
 const CHECK_WAIT: Duration = Duration::from_secs(60);
-
-/// How often a waiting check looks at the task's finished flag.
-const CHECK_POLL: Duration = Duration::from_millis(250);
 
 /// Loop detection: window size for tracking recent lines
 const LOOP_DETECTION_WINDOW: usize = 100;
@@ -180,11 +209,27 @@ const LOOP_DETECTION_THRESHOLD: usize = 50;
 /// to six tasks).
 const DEFAULT_MAX_CONCURRENT: usize = 6;
 
+/// Default hard wall-clock limit for a background CLI agent (30 minutes).
+const DEFAULT_BACKGROUND_TIMEOUT_SECS: u64 = 1800;
+
+/// Default silent-idle limit for a background CLI agent (10 minutes).
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+
 /// Max enriched prompt size (16 KB)
 const MAX_PROMPT_SIZE: usize = 16384;
 
 /// Max git diff size to append to results (4 KB)
 const MAX_DIFF_SIZE: usize = 4096;
+
+/// Typed pre-launch refusal reason, carried via task-local state so
+/// `cli_agent_outcome` never guesses refusal classification from output text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrelaunchRefusal {
+    /// Policy, mode, permission, or dirty-worktree refusal (permanent).
+    Policy,
+    /// Temporary contention: overlapping working-dir claim or concurrency cap.
+    Contention,
+}
 
 tokio::task_local! {
     /// Set by the call when it leaves its work running in the background
@@ -207,6 +252,14 @@ tokio::task_local! {
     /// launch (a typed [`CliAgentUnavailableError`]), or the launcher exited
     /// 127 before the agent wrote anything ([`exited_before_agent_output`]).
     static NEVER_STARTED: std::cell::Cell<bool>;
+    /// Set when `action="run"` refused to launch due to a policy/mode check
+    /// or working-dir/concurrency contention.
+    static REFUSED_BEFORE_LAUNCH: std::cell::Cell<Option<PrelaunchRefusal>>;
+}
+
+/// Record that `action="run"` was refused before launching a process.
+fn mark_refused_before_launch(kind: PrelaunchRefusal) {
+    let _ = REFUSED_BEFORE_LAUNCH.try_with(|slot| slot.set(Some(kind)));
 }
 
 /// Record that no agent started for this call.
@@ -253,8 +306,12 @@ pub struct CliAgentTool {
     running: Arc<Mutex<HashMap<String, RunningCliAgent>>>, // task_id -> RunningCliAgent
     completed: Arc<Mutex<HashMap<String, CompletedCliAgent>>>, // task_id -> finalized output
     working_dir_claims: Arc<WorkingDirClaims>, // normalized dir -> claim (std Mutex: see WorkingDirClaimGuard)
+    /// Wakes folder waiters whenever a claim is released or a run finishes.
+    claims_changed: Arc<tokio::sync::Notify>,
     state: Arc<dyn CliAgentStore>,
     default_timeout: Duration,
+    background_timeout: Duration,
+    idle_timeout: Duration,
     default_max_output: usize,
     max_concurrent: usize,
     concurrency_limiter: Arc<Semaphore>,

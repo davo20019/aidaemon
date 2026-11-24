@@ -165,27 +165,97 @@ fn detail(run_id: &str, run: CliAgentRun, events: &[CliAgentEvent], speaks: bool
 /// How many ended runs a conversation's history brings back.
 const PAST_RUNS: i64 = 200;
 
-/// Keep `run` as it ended (`client_runs`): its last word replaces any
-/// earlier one.
+/// Keep `run` as it stands now (`client_runs`), on every change the app is
+/// told of: its last word replaces any earlier one, so a run a restart cuts
+/// off still has its record ([`close_cut_off`] ends it at the next start).
+/// A running record never replaces an ended one (writes can land out of
+/// order). A running run sorts by its start, an ended one by its end.
 pub(crate) async fn keep(
     pool: &sqlx::SqlitePool,
     run: &aidaemon_client_protocol::RunSummary,
 ) -> anyhow::Result<()> {
-    let Some(ended) = run.ended_at_ms else {
-        return Ok(());
-    };
+    let at = run.ended_at_ms.unwrap_or(run.started_at_ms);
     sqlx::query(
         "INSERT INTO client_runs (run_id, session_id, ended_at_ms, data) VALUES (?, ?, ?, ?)
          ON CONFLICT(run_id) DO UPDATE SET session_id = excluded.session_id,
-             ended_at_ms = excluded.ended_at_ms, data = excluded.data",
+             ended_at_ms = excluded.ended_at_ms, data = excluded.data
+         WHERE json_extract(client_runs.data, '$.ended_at_ms') IS NULL
+            OR json_extract(excluded.data, '$.ended_at_ms') IS NOT NULL",
     )
     .bind(&run.id)
     .bind(&run.session_id)
-    .bind(i64::try_from(ended).unwrap_or(i64::MAX))
+    .bind(i64::try_from(at).unwrap_or(i64::MAX))
     .bind(serde_json::to_string(run)?)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Why a run kept as running at startup ended: the daemon stopped.
+const CUT_OFF_REASON: &str = "A daemon restart stopped it before it finished";
+
+/// `run`, kept as running, as a stop at `now` left it; `agent` is its
+/// coding agent's invocation and the events kept as it ran, when it was
+/// one.
+fn cut_off(
+    mut run: aidaemon_client_protocol::RunSummary,
+    agent: Option<(&CliAgentRun, &[CliAgentEvent])>,
+    now: u64,
+) -> aidaemon_client_protocol::RunSummary {
+    run.phase = aidaemon_client_protocol::RunPhase::Stopped;
+    run.ended_at_ms = Some(now.max(run.started_at_ms));
+    run.step.clear();
+    run.reason = Some(CUT_OFF_REASON.to_string());
+    if let Some((invocation, events)) = agent {
+        for path in aidaemon_runtime::tools::cli_agent::RunProgress::of(events).edited {
+            if !run.edited.contains(&path) {
+                run.edited.push(path);
+            }
+        }
+        run.can_continue = invocation.keeps_session && invocation.agent_session.is_some();
+    }
+    run
+}
+
+/// End every run kept as running: at startup each was cut off by the
+/// daemon's stop. Its record says so; a coding agent's gets the files it
+/// edited by the events kept as it ran, and whether a follow-up can go on
+/// in its session. Run before any client is served, so no live run is
+/// among them. Returns how many it ended.
+pub(crate) async fn close_cut_off(
+    pool: &sqlx::SqlitePool,
+    state: &dyn StateStore,
+) -> anyhow::Result<usize> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT data FROM client_runs WHERE json_extract(data, '$.ended_at_ms') IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let mut closed = 0;
+    for (data,) in rows {
+        let Ok(run) = serde_json::from_str::<aidaemon_client_protocol::RunSummary>(&data) else {
+            continue;
+        };
+        let agent = match state.cli_agent_run(&run.id).await {
+            Ok(Some(invocation)) => {
+                let events = state
+                    .get_cli_agent_events(invocation.invocation)
+                    .await
+                    .unwrap_or_default();
+                Some((invocation, events))
+            }
+            _ => None,
+        };
+        let run = cut_off(
+            run,
+            agent.as_ref().map(|(run, events)| (run, &events[..])),
+            now,
+        );
+        keep(pool, &run).await?;
+        closed += 1;
+    }
+    Ok(closed)
 }
 
 /// Conversation `session_id`'s newest kept runs, oldest first. A record
@@ -391,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_ended_run_is_kept_for_its_conversation() {
+    async fn a_run_is_kept_for_its_conversation_as_it_goes_and_as_it_ended() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::query(
             "CREATE TABLE client_runs (run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
@@ -407,17 +477,64 @@ mod tests {
                 "started_at_ms": 1000, "group": "task-1"
             }))
             .unwrap();
-        // Running: nothing kept yet.
-        keep(&pool, &run).await.unwrap();
-        assert!(past(&pool, "app:synthetic").await.unwrap().is_empty());
+        // Running: kept as it stands, so a stop does not lose it.
+        let running = run.clone();
+        keep(&pool, &running).await.unwrap();
+        assert_eq!(
+            past(&pool, "app:synthetic").await.unwrap(),
+            vec![running.clone()]
+        );
         run.phase = aidaemon_client_protocol::RunPhase::Succeeded;
         run.ended_at_ms = Some(5000);
         run.edited = vec!["/w/synthetic/review.md".into()];
         keep(&pool, &run).await.unwrap();
         keep(&pool, &run).await.unwrap();
+        // A running write that lands late never replaces its end.
+        keep(&pool, &running).await.unwrap();
         let kept = past(&pool, "app:synthetic").await.unwrap();
         assert_eq!(kept, vec![run]);
         assert!(past(&pool, "app:other").await.unwrap().is_empty());
+    }
+
+    /// A run a stop cut off reads as stopped by it, with the files its
+    /// agent edited by its kept events and whether its session goes on.
+    #[test]
+    fn a_run_kept_as_running_reads_as_cut_off_by_the_stop() {
+        let run: aidaemon_client_protocol::RunSummary = serde_json::from_value(serde_json::json!({
+            "id": "cli-agent-2", "session_id": "app:synthetic", "label": "Fix",
+            "agent": "Codex", "phase": "running", "background": true,
+            "step": "Editing lib.rs", "started_at_ms": 1000,
+            "edited": ["/w/synthetic/a.rs"]
+        }))
+        .unwrap();
+        let invocation = CliAgentRun {
+            invocation: 9,
+            session_id: "app:synthetic".into(),
+            agent_name: "codex".into(),
+            agent_session: Some("thread-9".into()),
+            working_dir: Some("/w/synthetic".into()),
+            prompt_summary: "Fix".into(),
+            task: None,
+            success: Some(false),
+            output_summary: None,
+            keeps_session: true,
+            thread: None,
+        };
+        let events = [
+            event(
+                1,
+                "step",
+                r#"{"id":"e1","parent":null,"tool":{"kind":"edit","path":"/w/synthetic/b.rs"},"words":"Editing b.rs"}"#,
+            ),
+            event(2, "step_ended", r#"{"id":"e1","failed":false}"#),
+        ];
+        let ended = cut_off(run, Some((&invocation, &events)), 9000);
+        assert_eq!(ended.phase, aidaemon_client_protocol::RunPhase::Stopped);
+        assert_eq!(ended.ended_at_ms, Some(9000));
+        assert!(ended.step.is_empty());
+        assert_eq!(ended.reason.as_deref(), Some(CUT_OFF_REASON));
+        assert_eq!(ended.edited, vec!["/w/synthetic/a.rs", "/w/synthetic/b.rs"]);
+        assert!(ended.can_continue);
     }
 
     /// A name the owner gives an agent is its conversation's, by thread,

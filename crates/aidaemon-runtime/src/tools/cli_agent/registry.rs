@@ -180,9 +180,11 @@ impl CliAgentTool {
             .to_string())
     }
 
-    /// Release a working-directory claim if it belongs to the given task.
+    /// Release a working-directory claim if it belongs to the given task and
+    /// wake any folder waiters.
     pub(super) fn release_working_dir_claim(&self, dir: &str, task_id: &str) {
         release_claim(&mut lock_claims(&self.working_dir_claims), dir, task_id);
+        self.claims_changed.notify_waiters();
     }
 
     pub async fn discover(
@@ -191,7 +193,10 @@ impl CliAgentTool {
         state: Arc<dyn CliAgentStore>,
     ) -> Self {
         let default_timeout = Duration::from_secs(config.timeout_secs);
+        let background_timeout = Duration::from_secs(config.background_timeout_secs.max(1));
+        let idle_timeout = Duration::from_secs(config.idle_timeout_secs.max(1));
         let default_max_output = config.max_output_chars;
+        let max_concurrent = config.max_concurrent.max(1);
 
         type ToolCandidate = (
             String,
@@ -293,11 +298,14 @@ impl CliAgentTool {
             running: Arc::new(Mutex::new(HashMap::new())),
             completed: Arc::new(Mutex::new(HashMap::new())),
             working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            claims_changed: Arc::new(tokio::sync::Notify::new()),
             state,
             default_timeout,
+            background_timeout,
+            idle_timeout,
             default_max_output,
-            max_concurrent: DEFAULT_MAX_CONCURRENT,
-            concurrency_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT)),
+            max_concurrent,
+            concurrency_limiter: Arc::new(Semaphore::new(max_concurrent)),
             hub: OnceLock::new(),
             runs: OnceLock::new(),
             plan_store: OnceLock::new(),

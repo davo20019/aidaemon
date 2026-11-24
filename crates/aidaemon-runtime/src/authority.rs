@@ -292,6 +292,9 @@ struct SpawnCounts {
 struct SpawnFamilyState {
     limits: SpawnFamilyLimits,
     counts: std::sync::Mutex<SpawnCounts>,
+    /// Delegated CLI agent runs registered in this family's coordination
+    /// ledger (never counted against sub-agent spawn limits).
+    cli_members: std::sync::atomic::AtomicUsize,
     budget: std::sync::Arc<crate::engine::budgets::TreeBudget>,
     coordination: crate::coordination::Coordination,
     /// The folders the runtime made fresh for this request's work (every
@@ -374,6 +377,7 @@ impl SpawnFamily {
         Self(std::sync::Arc::new(SpawnFamilyState {
             limits,
             counts: std::sync::Mutex::default(),
+            cli_members: std::sync::atomic::AtomicUsize::new(0),
             budget: std::sync::Arc::default(),
             coordination: crate::coordination::Coordination::new(
                 limits.max_escalations_per_child,
@@ -408,11 +412,26 @@ impl SpawnFamily {
         self.0.coordination.clone()
     }
 
-    /// The tree's shared knowledge, once it has a child: a lone agent has
-    /// nobody to coordinate with.
+    /// Record that a delegated CLI agent joined this family's coordination
+    /// ledger so file fences and combined verification activate even without
+    /// a `spawn_agent` child.
+    pub fn note_cli_member(&self) {
+        self.0
+            .cli_members
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The tree's shared knowledge, once it has a child or CLI agent member:
+    /// a lone agent has nobody to coordinate with.
     pub fn active_coordination(&self) -> Option<&crate::coordination::Coordination> {
         let counts = self.0.counts.lock().unwrap_or_else(|e| e.into_inner());
-        (self.0.limits.coordination && counts.started > 0).then_some(&self.0.coordination)
+        let has_cli = self
+            .0
+            .cli_members
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
+        (self.0.limits.coordination && (counts.started > 0 || has_cli))
+            .then_some(&self.0.coordination)
     }
 
     /// The tree's token counter, charged by every run in it.

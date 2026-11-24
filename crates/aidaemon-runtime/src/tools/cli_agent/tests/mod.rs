@@ -29,6 +29,9 @@ struct TestStore {
     /// Kept events: (invocation, seq, kind, data).
     events: std::sync::Mutex<Vec<(i64, i64, String, String)>>,
     sessions: std::sync::Mutex<Vec<(i64, String)>>,
+    /// Run metadata keyed by invocation id: (run_id, mode, keeps_session, thread).
+    run_meta:
+        std::sync::Mutex<HashMap<i64, (Option<String>, Option<String>, bool, Option<String>)>>,
     /// Settings a test stored (a conversation set to a coding agent).
     settings: std::sync::Mutex<HashMap<String, String>>,
 }
@@ -40,6 +43,7 @@ impl TestStore {
             invocations: Default::default(),
             events: Default::default(),
             sessions: Default::default(),
+            run_meta: Default::default(),
             settings: Default::default(),
         }
     }
@@ -164,6 +168,91 @@ impl crate::tools::traits::DynamicCliAgentStore for TestStore {
         let log = self.invocations.lock().unwrap();
         Ok(log.iter().rev().take(limit).cloned().collect())
     }
+
+    async fn note_cli_agent_run(
+        &self,
+        id: i64,
+        run_id: &str,
+        mode: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut meta = self.run_meta.lock().unwrap();
+        let entry = meta.entry(id).or_insert((None, None, false, None));
+        entry.0 = Some(run_id.to_string());
+        entry.1 = mode.map(str::to_string);
+        Ok(())
+    }
+
+    async fn set_cli_agent_keeps_session(&self, id: i64, kept: bool) -> anyhow::Result<()> {
+        let mut meta = self.run_meta.lock().unwrap();
+        let entry = meta.entry(id).or_insert((None, None, false, None));
+        entry.2 = kept;
+        Ok(())
+    }
+
+    async fn set_cli_agent_thread(&self, id: i64, thread: &str) -> anyhow::Result<()> {
+        let mut meta = self.run_meta.lock().unwrap();
+        let entry = meta.entry(id).or_insert((None, None, false, None));
+        entry.3 = Some(thread.to_string());
+        Ok(())
+    }
+
+    async fn latest_kept_cli_agent_run(
+        &self,
+        session_id: &str,
+        agent_name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let log = self.invocations.lock().unwrap();
+        let meta = self.run_meta.lock().unwrap();
+        let sessions = self.sessions.lock().unwrap();
+        for inv in log.iter().rev() {
+            if inv.session_id != session_id || inv.agent_name != agent_name {
+                continue;
+            }
+            let Some((Some(run_id), _, true, _)) = meta.get(&inv.id) else {
+                continue;
+            };
+            if sessions.iter().any(|(sid, _)| *sid == inv.id) {
+                return Ok(Some(run_id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn cli_agent_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<aidaemon_tools::services::CliAgentRun>> {
+        let log = self.invocations.lock().unwrap();
+        let meta = self.run_meta.lock().unwrap();
+        let sessions = self.sessions.lock().unwrap();
+        for inv in log.iter().rev() {
+            let Some((Some(rid), _, keeps_session, thread)) = meta.get(&inv.id) else {
+                continue;
+            };
+            if rid != run_id {
+                continue;
+            }
+            let agent_session = sessions
+                .iter()
+                .rev()
+                .find(|(sid, _)| *sid == inv.id)
+                .map(|(_, s)| s.clone());
+            return Ok(Some(aidaemon_tools::services::CliAgentRun {
+                invocation: inv.id,
+                session_id: inv.session_id.clone(),
+                agent_name: inv.agent_name.clone(),
+                prompt_summary: inv.prompt_summary.clone(),
+                task: None,
+                working_dir: inv.working_dir.clone(),
+                output_summary: inv.output_summary.clone(),
+                success: inv.success,
+                agent_session,
+                keeps_session: *keeps_session,
+                thread: thread.clone(),
+            }));
+        }
+        Ok(None)
+    }
 }
 
 fn extract_task_id_from_background_message(msg: &str) -> String {
@@ -206,8 +295,11 @@ async fn setup_echo_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
         running: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashMap::new())),
         working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        claims_changed: Arc::new(tokio::sync::Notify::new()),
         state: state as Arc<dyn CliAgentStore>,
         default_timeout: Duration::from_secs(10),
+        background_timeout: Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS),
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         default_max_output: 10000,
         max_concurrent: 3,
         concurrency_limiter: Arc::new(Semaphore::new(3)),
@@ -250,8 +342,11 @@ async fn setup_bash_tool() -> (CliAgentTool, tempfile::NamedTempFile) {
         running: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashMap::new())),
         working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        claims_changed: Arc::new(tokio::sync::Notify::new()),
         state: state as Arc<dyn CliAgentStore>,
         default_timeout: Duration::from_secs(10),
+        background_timeout: Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS),
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         default_max_output: 10000,
         max_concurrent: 3,
         concurrency_limiter: Arc::new(Semaphore::new(3)),

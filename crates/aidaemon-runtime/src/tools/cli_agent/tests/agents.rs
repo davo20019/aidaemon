@@ -100,6 +100,7 @@ async fn test_discover_finds_echo() {
         max_output_chars: 10000,
         tools,
         permissions: HashMap::new(),
+        ..CliAgentsConfig::default()
     };
 
     let tool = CliAgentTool::discover(
@@ -137,6 +138,7 @@ async fn test_discover_skips_nonexistent() {
         max_output_chars: 10000,
         tools,
         permissions: HashMap::new(),
+        ..CliAgentsConfig::default()
     };
 
     let tool = CliAgentTool::discover(

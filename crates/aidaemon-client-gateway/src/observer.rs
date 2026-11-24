@@ -453,10 +453,9 @@ impl TurnObserver for GatewayObserver {
                 ended_at: change.ended_at,
             },
         );
-        // An ended run stays in its conversation past a restart.
-        if run.ended_at_ms.is_some() {
-            self.host.keep_run(&run);
-        }
+        // Kept on every change, not only at its end: a run a restart cuts
+        // off still stays in its conversation, with what it did so far.
+        self.host.keep_run(&run);
         self.publisher.publish(session, Event::RunUpdated { run });
     }
 

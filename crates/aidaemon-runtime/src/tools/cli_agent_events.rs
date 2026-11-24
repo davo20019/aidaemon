@@ -17,6 +17,14 @@ use serde_json::json;
 use super::cli_agent::CliAgentStore;
 use crate::run_state::RunStates;
 
+/// One command execution recorded from a coding agent's typed events.
+pub(super) struct RecordedRun {
+    pub(super) id: Option<String>,
+    pub(super) program: Option<String>,
+    pub(super) subcommand: Option<String>,
+    pub(super) failed: Option<bool>,
+}
+
 pub(super) struct AgentEventRecorder {
     agent: Arc<dyn CodingAgent>,
     store: Arc<dyn CliAgentStore>,
@@ -32,9 +40,8 @@ pub(super) struct AgentEventRecorder {
     /// Its output read as typed events at least once: its steps come from
     /// them, not from how much it printed.
     structured: bool,
-    /// The commands it ran, as its steps named them: each program, by the
-    /// step's id, and whether its step ended failed (`None`: no end seen).
-    ran: Vec<(Option<String>, Option<String>, Option<bool>)>,
+    /// The commands it ran, as its steps named them (`failed == None`: no end seen).
+    ran: Vec<RecordedRun>,
     /// What it ended its run with ([`AgentEvent::Reported`]).
     reported: Option<(String, Option<aidaemon_coding_agents::Report>)>,
 }
@@ -71,12 +78,17 @@ impl AgentEventRecorder {
         })
     }
 
-    /// Read one output line (as the run reads it, after its host).
-    pub(super) async fn read(&mut self, line: &str) {
+    /// Read one output line (as the run reads it, after its host), returning
+    /// any human-readable step progress labels produced by typed events.
+    pub(super) async fn read(&mut self, line: &str) -> Vec<String> {
+        let mut progress = Vec::new();
         for event in self.agent.read_events(line) {
             self.structured = true;
-            self.record(event).await;
+            if let Some(words) = self.record(event).await {
+                progress.push(words);
+            }
         }
+        progress
     }
 
     /// What its coding agent ended with, checked against what it was seen
@@ -110,28 +122,43 @@ impl AgentEventRecorder {
         self.structured || self.agent.reports_steps()
     }
 
-    async fn record(&mut self, event: AgentEvent) {
+    async fn record(&mut self, event: AgentEvent) -> Option<String> {
+        let mut step_words = None;
         match &event {
             AgentEvent::Step(step) => {
                 if let Some(id) = step.id.as_deref()
                     && !self.steps.insert(id.to_string())
                 {
-                    return;
+                    return None;
                 }
-                self.runs.activity(&self.run_id, step.tool.words());
+                let words = step.tool.words();
+                self.runs.activity(&self.run_id, words.clone());
+                step_words = Some(words);
                 match &step.tool {
                     aidaemon_coding_agents::StepTool::Edit { path: Some(path) } => {
                         self.runs.edited(&self.run_id, path);
                     }
-                    aidaemon_coding_agents::StepTool::Run { program } => {
-                        self.ran.push((step.id.clone(), program.clone(), None));
+                    aidaemon_coding_agents::StepTool::Run {
+                        program,
+                        subcommand,
+                    } => {
+                        self.ran.push(RecordedRun {
+                            id: step.id.clone(),
+                            program: program.clone(),
+                            subcommand: subcommand.clone(),
+                            failed: None,
+                        });
                     }
                     _ => {}
                 }
             }
             AgentEvent::StepEnded { id, failed } => {
-                if let Some(run) = self.ran.iter_mut().find(|run| run.0.as_deref() == Some(id)) {
-                    run.2 = Some(*failed);
+                if let Some(run) = self
+                    .ran
+                    .iter_mut()
+                    .find(|run| run.id.as_deref() == Some(id))
+                {
+                    run.failed = Some(*failed);
                 }
             }
             AgentEvent::Reported { text, report } => {
@@ -158,10 +185,11 @@ impl AgentEventRecorder {
             _ => {}
         }
         if self.invocation == 0 {
-            return;
+            return step_words;
         }
         let (kind, data) = event.to_record();
         keep(&*self.store, self.invocation, &self.seq, kind, data).await;
+        step_words
     }
 }
 
@@ -172,13 +200,14 @@ const REPLY_CHARS: usize = 50_000;
 /// A run's result: the agent's reply (its report's summary when it reported
 /// in fields), its claims, and each claim its recorded actions don't bear
 /// out. Files are compared as paths (a claim may be relative to the folder
-/// it worked in); a check by the program it runs, as its steps named
-/// programs ([`aidaemon_coding_agents::program_of`], a machine format).
+/// it worked in); a check by its program and optional safe subcommand
+/// ([`aidaemon_coding_agents::command_key`], a machine format), judged by
+/// the latest matching invocation.
 pub(super) fn run_result(
     reported: Option<&(String, Option<aidaemon_coding_agents::Report>)>,
     fallback: &str,
     edited: &[String],
-    ran: &[(Option<String>, Option<String>, Option<bool>)],
+    ran: &[RecordedRun],
 ) -> aidaemon_channels::turns::RunResult {
     use aidaemon_channels::turns::{RunClaims, RunMismatch, RunResult};
     let shorten = |text: &str| -> String {
@@ -222,17 +251,25 @@ pub(super) fn run_result(
         }
     }
     for check in report.checks.iter().filter(|check| check.passed) {
-        let program = aidaemon_coding_agents::program_of(&check.command);
+        let (program, subcommand) = aidaemon_coding_agents::command_key(&check.command);
         let runs: Vec<Option<bool>> = ran
             .iter()
-            .filter(|(_, ran, _)| ran.is_some() && *ran == program)
-            .map(|(_, _, failed)| *failed)
+            .filter(|run| {
+                run.program.is_some()
+                    && run.program == program
+                    && match (&subcommand, &run.subcommand) {
+                        (Some(claimed), Some(actual)) => claimed == actual,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    }
+            })
+            .map(|run| run.failed)
             .collect();
         if runs.is_empty() {
             mismatches.push(RunMismatch::CheckNotRun {
                 command: check.command.clone(),
             });
-        } else if runs.iter().all(|failed| *failed == Some(true)) {
+        } else if runs.last() == Some(&Some(true)) {
             mismatches.push(RunMismatch::CheckFailed {
                 command: check.command.clone(),
             });
@@ -347,8 +384,18 @@ mod tests {
             "/w/synthetic/notes.md".to_string(),
         ];
         let ran = vec![
-            (Some("1".into()), Some("pytest".into()), Some(false)),
-            (Some("2".into()), Some("cargo".into()), Some(true)),
+            RecordedRun {
+                id: Some("1".into()),
+                program: Some("pytest".into()),
+                subcommand: None,
+                failed: Some(false),
+            },
+            RecordedRun {
+                id: Some("2".into()),
+                program: Some("cargo".into()),
+                subcommand: Some("test".into()),
+                failed: Some(true),
+            },
         ];
         let claimed = report(
             &["slug.py", "tests/test_slug.py"],
@@ -386,6 +433,53 @@ mod tests {
             ]
         );
         assert!(result.claims.is_some());
+    }
+
+    /// Running `cargo fmt` (passing) never vouches for a claimed `cargo test`,
+    /// and a passing `cargo test` followed by a failing `cargo test` reports
+    /// failed (the latest invocation decides).
+    #[test]
+    fn check_verification_distinguishes_subcommands_and_uses_latest_run() {
+        let ran = vec![
+            RecordedRun {
+                id: Some("1".into()),
+                program: Some("cargo".into()),
+                subcommand: Some("fmt".into()),
+                failed: Some(false),
+            },
+            RecordedRun {
+                id: Some("2".into()),
+                program: Some("cargo".into()),
+                subcommand: Some("check".into()),
+                failed: Some(false),
+            },
+            RecordedRun {
+                id: Some("3".into()),
+                program: Some("cargo".into()),
+                subcommand: Some("check".into()),
+                failed: Some(true),
+            },
+        ];
+        let claimed = report(
+            &[],
+            &[
+                ("cargo test", true),
+                ("cargo check", true),
+                ("cargo fmt", true),
+            ],
+        );
+        let result = run_result(Some(&("{...}".to_string(), Some(claimed))), "", &[], &ran);
+        assert_eq!(
+            result.mismatches,
+            vec![
+                RunMismatch::CheckNotRun {
+                    command: "cargo test".into()
+                },
+                RunMismatch::CheckFailed {
+                    command: "cargo check".into()
+                },
+            ]
+        );
     }
 
     /// Text alone: no claims, nothing to check. A plain program's output

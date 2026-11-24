@@ -345,6 +345,26 @@ pub(super) fn extract_terminal_commands_from_json(line: &str) -> Vec<String> {
         }
     }
 
+    // Codex JSONL / app-server translated item events:
+    // { "type": "item.started" | "item.completed", "item": { "type": "command_execution", "command": "..." } }
+    if matches!(
+        v.get("type").and_then(Value::as_str),
+        Some("item.started" | "item.updated" | "item.completed")
+    ) && v.pointer("/item/type").and_then(Value::as_str) == Some("command_execution")
+        && let Some(cmd) = v.pointer("/item/command").and_then(Value::as_str)
+    {
+        out.push(cmd.to_string());
+    }
+
+    // ACP host translated tool_call events:
+    // { "type": "tool_call", "kind": "execute", "command": "..." }
+    if v.get("type").and_then(Value::as_str) == Some("tool_call")
+        && v.get("kind").and_then(Value::as_str) == Some("execute")
+        && let Some(cmd) = v.get("command").and_then(Value::as_str)
+    {
+        out.push(cmd.to_string());
+    }
+
     out
 }
 

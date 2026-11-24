@@ -1158,9 +1158,26 @@ impl DetachedNestedJudge {
         }
     }
 
+    /// Create a child cancellation token bound to this detached judge so a
+    /// single background run can cancel its own pending approval cards when
+    /// stopped without cancelling sibling runs from the same turn.
+    pub fn child_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.child_token()
+    }
+
     /// Judge one nested tool call using the launching turn's safety hooks and
     /// owner approval broker after the launching turn's batch has ended.
     pub async fn authorize(&self, call: sdk::ToolCall) -> sdk::NestedVerdict {
+        self.authorize_with_cancel(call, &self.cancel).await
+    }
+
+    /// Like [`Self::authorize`], using `cancel` to abort any pending owner
+    /// approval card immediately when the hosted run is stopped.
+    pub async fn authorize_with_cancel(
+        &self,
+        call: sdk::ToolCall,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> sdk::NestedVerdict {
         use sdk::{
             EffectClass, EffectKey, HookContext, InterruptKind, NestedVerdict, OWNER_DECLINED,
             OWNER_UNANSWERED, ToolDecision, ToolInfo, Usage,
@@ -1223,7 +1240,7 @@ impl DetachedNestedJudge {
                     ..
                 } => {
                     let kind = self.rules.card_kind(&call.name, &request);
-                    match self.ask_owner(&call, &request, kind).await {
+                    match self.ask_owner(&call, &request, kind, cancel).await {
                         Answer::Granted(response) => {
                             if self.rules.keeps_own_grants(&call.name) {
                                 self.rules
@@ -1280,7 +1297,7 @@ impl DetachedNestedJudge {
                         };
                     }
                     match self
-                        .ask_owner(&call, &request, ApprovalKind::CommandOnce)
+                        .ask_owner(&call, &request, ApprovalKind::CommandOnce, cancel)
                         .await
                     {
                         Answer::Granted(_) => {
@@ -1310,6 +1327,7 @@ impl DetachedNestedJudge {
         call: &sdk::ToolCall,
         request: &sdk::OwnerApprovalRequest,
         kind: ApprovalKind,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Answer {
         let card = asked_by(self.mission.as_deref(), request);
         let card = match crate::tools::agent_mode::asker_of(&call.id) {
@@ -1329,7 +1347,7 @@ impl DetachedNestedJudge {
                 card.as_ref(),
                 self.rules.card_permission_mode(&call.name),
                 kind,
-                &self.cancel,
+                cancel,
             )
             .await
     }

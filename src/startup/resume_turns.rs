@@ -528,7 +528,7 @@ async fn plan_agent_jobs(
                 .log_cli_agent_complete(
                     invocation.invocation,
                     None,
-                    "Stopped by a daemon restart before it finished.",
+                    aidaemon_runtime::tools::cli_agent::STOPPED_BY_RESTART,
                     false,
                     0.0,
                 )

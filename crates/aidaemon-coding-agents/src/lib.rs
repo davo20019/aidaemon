@@ -39,7 +39,9 @@ pub use agent::{
     AgentHost, CodingAgent, Discovery, HostAnswers, HostStarter, Launch, LaunchArguments, Plan,
     PromptPlacement, RunRequest, read_through,
 };
-pub use events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, program_of};
+pub use events::{
+    AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, command_key, host_of, program_of,
+};
 pub use mode::{PermissionMode, mode_within, modes_within};
 pub use models::{ModelListing, list_models};
 pub use readiness::{AgentModel, AgentModels, Checked, Probe, Readiness, check, check_models};

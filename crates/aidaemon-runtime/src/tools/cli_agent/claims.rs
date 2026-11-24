@@ -81,12 +81,24 @@ fn holds(outer: &str, inner: &str) -> bool {
     std::path::Path::new(inner).starts_with(outer)
 }
 
+/// Whether a working-directory claim belongs to an actively executing process
+/// or a queued run reserving the folder while waiting for a concurrency slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ClaimState {
+    /// Queued in the concurrency-slot line; process has not started yet.
+    Reserved,
+    /// Process is actively running.
+    #[default]
+    Active,
+}
+
 /// A running run's claim on a folder, with enough to explain a conflict.
 pub(super) struct WorkingDirClaim {
     pub(super) task_id: String,
     pub(super) tool_name: String,
     pub(super) prompt_summary: String,
     pub(super) writes: WriteScope,
+    pub(super) state: ClaimState,
 }
 
 /// The live claim, in any folder, that a run in `dir` with `writes` would
@@ -109,8 +121,12 @@ pub(super) fn conflicting<'a>(
 
 /// Why a run cannot start beside `claim` in `dir`.
 pub(super) fn conflict_message(dir: &str, claim: &WorkingDirClaim) -> String {
+    let status = match claim.state {
+        ClaimState::Active => "is already working in",
+        ClaimState::Reserved => "is already queued (reserved) for",
+    };
     format!(
-        "BLOCKED: Another CLI agent is already working in {dir} and may change the same files \
+        "BLOCKED: Another CLI agent {status} {dir} and may change the same files \
          (task_id={}, agent={}, prompt=\"{}\", it may change: {}). \
          Wait for it to finish or cancel it, or give this run write_paths that do not overlap.",
         claim.task_id,
@@ -118,6 +134,19 @@ pub(super) fn conflict_message(dir: &str, claim: &WorkingDirClaim) -> String {
         claim.prompt_summary,
         claim.writes.words()
     )
+}
+
+/// Mark a queued run's reserved claim as active once its process starts.
+pub(super) fn activate_claim(
+    claims: &mut HashMap<String, Vec<WorkingDirClaim>>,
+    dir: &str,
+    task_id: &str,
+) {
+    if let Some(held) = claims.get_mut(dir)
+        && let Some(claim) = held.iter_mut().find(|claim| claim.task_id == task_id)
+    {
+        claim.state = ClaimState::Active;
+    }
 }
 
 /// A launch the owner sent to a coding agent directly that found another
@@ -150,6 +179,7 @@ pub(super) enum FolderTurn {
 pub(super) async fn try_take_folder(
     running: &Mutex<HashMap<String, RunningCliAgent>>,
     claims_map: &Arc<WorkingDirClaims>,
+    claims_changed: &Arc<tokio::sync::Notify>,
     task_id: &str,
     tool_name: &str,
     wait: &FolderWait,
@@ -166,7 +196,10 @@ pub(super) async fn try_take_folder(
         running.iter().any(|(id, agent)| {
             id != task_id
                 && !agent.finished.load(Ordering::Acquire)
-                && agent.claim_dir.as_deref() == Some(wait.dir.as_str())
+                && agent
+                    .claim_dir
+                    .as_deref()
+                    .is_some_and(|dir| agent.write_scope.collides(dir, &wait.writes, &wait.dir))
                 && agent.waits_for_folder().is_some()
                 && (agent.accepted_at, id.as_str()) < (accepted, task_id)
         })
@@ -190,9 +223,11 @@ pub(super) async fn try_take_folder(
             tool_name: tool_name.to_string(),
             prompt_summary: wait.prompt_summary.clone(),
             writes: wait.writes.clone(),
+            state: ClaimState::Reserved,
         });
     FolderTurn::Taken(WorkingDirClaimGuard::new(
         claims_map.clone(),
+        claims_changed.clone(),
         wait.dir.clone(),
         task_id.to_string(),
     ))
@@ -239,15 +274,22 @@ pub(super) fn lock_claims(
 /// that point the reaper / cancel paths own the release.
 pub(super) struct WorkingDirClaimGuard {
     pub(super) claims: Arc<WorkingDirClaims>,
+    pub(super) claims_changed: Arc<tokio::sync::Notify>,
     pub(super) dir: String,
     pub(super) task_id: String,
     pub(super) armed: bool,
 }
 
 impl WorkingDirClaimGuard {
-    pub(super) fn new(claims: Arc<WorkingDirClaims>, dir: String, task_id: String) -> Self {
+    pub(super) fn new(
+        claims: Arc<WorkingDirClaims>,
+        claims_changed: Arc<tokio::sync::Notify>,
+        dir: String,
+        task_id: String,
+    ) -> Self {
         Self {
             claims,
+            claims_changed,
             dir,
             task_id,
             armed: true,
@@ -267,5 +309,6 @@ impl Drop for WorkingDirClaimGuard {
             return;
         }
         release_claim(&mut lock_claims(&self.claims), &self.dir, &self.task_id);
+        self.claims_changed.notify_waiters();
     }
 }

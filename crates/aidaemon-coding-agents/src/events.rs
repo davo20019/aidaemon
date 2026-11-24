@@ -74,9 +74,11 @@ pub enum StepTool {
     Edit {
         path: Option<String>,
     },
-    /// A command; only the program it runs is kept.
+    /// A command; only the program (and optional safe subcommand word) it runs
+    /// is kept — never flags, paths, or arguments that could hold secrets.
     Run {
         program: Option<String>,
+        subcommand: Option<String>,
     },
     Fetch {
         host: Option<String>,
@@ -123,7 +125,7 @@ impl StepTool {
             }
             Self::Search { .. } => "Searching files".into(),
             Self::Edit { path } => named("Editing", path),
-            Self::Run { program } => named("Running", program),
+            Self::Run { program, .. } => named("Running", program),
             Self::Fetch { host: Some(h) } if !h.is_empty() => format!("Looking at {h}"),
             Self::Fetch { .. } => "Looking things up online".into(),
             Self::Delegate { what: Some(w) } if !w.trim().is_empty() => {
@@ -196,7 +198,15 @@ fn tool_record(tool: &StepTool) -> Value {
         StepTool::Read { path } => json!({"kind": "read", "path": path}),
         StepTool::Search { pattern } => json!({"kind": "search", "pattern": pattern}),
         StepTool::Edit { path } => json!({"kind": "edit", "path": path}),
-        StepTool::Run { program } => json!({"kind": "run", "program": program}),
+        StepTool::Run {
+            program,
+            subcommand,
+        } => match subcommand {
+            Some(subcommand) => {
+                json!({"kind": "run", "program": program, "subcommand": subcommand})
+            }
+            None => json!({"kind": "run", "program": program}),
+        },
         StepTool::Fetch { host } => json!({"kind": "fetch", "host": host}),
         StepTool::Delegate { what } => json!({"kind": "delegate", "what": what}),
         StepTool::Plan => json!({"kind": "plan"}),
@@ -230,6 +240,25 @@ fn shorten(text: &str, max: usize) -> String {
 /// assignments, as a file name. Machine format (a shell command line),
 /// tokenized; the rest of the line is never kept.
 pub fn program_of(command: &str) -> Option<String> {
+    command_key(command).0
+}
+
+/// Whether `word` is a safe subcommand identifier (short ASCII lowercase word
+/// with only letters, `_` or `-`, never flags, paths, URLs, digits or secrets).
+fn is_safe_subcommand(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    (2..=24).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || *b == b'-' || *b == b'_')
+}
+
+/// The program and optional safe subcommand word a command line runs (for
+/// example `("cargo", Some("test"))`, `("npm", Some("test"))`, or
+/// `("pytest", None)`). Machine format (a shell command line), tokenized;
+/// flags, paths, URLs, assignments, and arbitrary arguments are never kept.
+pub fn command_key(command: &str) -> (Option<String>, Option<String>) {
     // Shell builtins that set up the next command rather than do the work
     // (a machine format: command words).
     const SETUP: &[&str] = &[
@@ -248,9 +277,11 @@ pub fn program_of(command: &str) -> Option<String> {
         && SHELLS.contains(&file_name(shell).as_str())
         && flags.starts_with('-')
         && flags.contains('c')
-        && let Some(program) = program_of(inner)
     {
-        return Some(program);
+        let inner_key = command_key(inner);
+        if inner_key.0.is_some() {
+            return inner_key;
+        }
     }
     // Shell grammar words (a machine format): a compound command's header
     // (`for f in a b`, `while cond`, `if cond`) runs no work of its own up
@@ -261,11 +292,11 @@ pub fn program_of(command: &str) -> Option<String> {
     let mut first: Option<String> = None;
     let mut at_start = true;
     let mut in_header = false;
-    for word in words {
+    for (idx, raw_word) in words.iter().enumerate() {
         // A separator glued to a word (`cd x;`) ends its command too.
-        let (word, ends) = match word.strip_suffix(';') {
+        let (word, ends) = match raw_word.strip_suffix(';') {
             Some(stripped) => (stripped.to_string(), true),
-            None => (word, false),
+            None => (raw_word.clone(), false),
         };
         // A subshell's parentheses glued to its words (`(cd x && make)`).
         let word = word
@@ -299,7 +330,15 @@ pub fn program_of(command: &str) -> Option<String> {
                 at_start = false;
                 let name = file_name(&word);
                 if !SETUP.contains(&name.as_str()) {
-                    return Some(name).filter(|name| !name.is_empty());
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let subcommand = if ends {
+                        None
+                    } else {
+                        extract_subcommand(&name, &words[idx + 1..])
+                    };
+                    return (Some(name), subcommand);
                 }
                 first.get_or_insert(name);
             }
@@ -309,7 +348,41 @@ pub fn program_of(command: &str) -> Option<String> {
         }
     }
     // Only setup commands: say the first.
-    first.filter(|name| !name.is_empty())
+    (first.filter(|name| !name.is_empty()), None)
+}
+
+/// Extract a safe subcommand word from the tokens following `program`, stopping
+/// at command separators. For package script runners (`npm`/`pnpm`/`yarn`/`bun`)
+/// followed by `run <script>`, returns the script word when safe.
+fn extract_subcommand(program: &str, rest: &[String]) -> Option<String> {
+    let next = rest.first()?.as_str();
+    let next = next.trim_end_matches([';', ')']);
+    if matches!(next, "" | "&&" | "||" | ";" | "|" | "&") || next.starts_with('-') {
+        return None;
+    }
+    if !is_safe_subcommand(next) {
+        return None;
+    }
+    if matches!(program, "npm" | "pnpm" | "yarn" | "bun")
+        && next == "run"
+        && let Some(script) = rest.get(1).map(|s| s.trim_end_matches([';', ')']))
+        && is_safe_subcommand(script)
+    {
+        return Some(format!("run {script}"));
+    }
+    Some(next.to_string())
+}
+
+impl StepTool {
+    /// Construct [`StepTool::Run`] from a command line, keeping only its safe
+    /// program and optional subcommand word.
+    pub fn run(command: Option<&str>) -> Self {
+        let (program, subcommand) = command.map(command_key).unwrap_or((None, None));
+        Self::Run {
+            program,
+            subcommand,
+        }
+    }
 }
 
 /// A URL's host. Machine format (a URL).
@@ -383,11 +456,33 @@ mod tests {
             Some("make")
         );
         assert_eq!(
-            StepTool::Run {
-                program: program_of("git push origin HEAD")
-            }
-            .words(),
+            StepTool::run(Some("git push origin HEAD")).words(),
             "Running git"
+        );
+        assert_eq!(
+            command_key("cargo test -q"),
+            (Some("cargo".into()), Some("test".into()))
+        );
+        assert_eq!(
+            command_key("cargo clippy --all-features"),
+            (Some("cargo".into()), Some("clippy".into()))
+        );
+        assert_eq!(
+            command_key("npm run build"),
+            (Some("npm".into()), Some("run build".into()))
+        );
+        assert_eq!(
+            command_key("pytest -q tests/test_a.py"),
+            (Some("pytest".into()), None)
+        );
+        // Secrets, flags, paths, and tokens are never captured as subcommands.
+        assert_eq!(
+            command_key("curl https://secret.example/token123"),
+            (Some("curl".into()), None)
+        );
+        assert_eq!(
+            command_key("python3 /tmp/script.py"),
+            (Some("python3".into()), None)
         );
     }
 

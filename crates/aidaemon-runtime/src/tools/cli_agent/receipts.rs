@@ -43,13 +43,6 @@ pub(super) async fn list_backend_files(
 /// Most entries a run's write roots are read for its change receipt.
 pub(super) const CHANGE_RECEIPT_CAP: usize = 100_000;
 
-/// The daemon's own database files: a run in the folder that holds them
-/// (the daemon started from a checkout) did not change them, though the
-/// daemon writes them all the time.
-fn daemon_file(path: &str) -> bool {
-    crate::state::is_daemon_file(std::path::Path::new(path))
-}
-
 /// A receipt of what a run's write roots hold: how many entries, their
 /// total size and the newest change time. Two that differ show the run
 /// changed something there, whatever program it ran and whatever its reply
@@ -68,30 +61,54 @@ pub(super) type FileMark = (String, Option<(u64, Option<std::time::SystemTime>)>
 /// tree receipt alone says whether something changed.
 const FILE_MARK_CAP: usize = 20_000;
 
-/// Folders never marked file by file: a repository's own records, and
-/// dependency and build trees a tool rewrites wholesale (folder names, a
+/// The daemon's own database files: a run in the folder that holds them
+/// (the daemon started from a checkout) did not change them, though the
+/// daemon writes them all the time.
+fn daemon_file(path: &str) -> bool {
+    crate::state::is_daemon_file(std::path::Path::new(path))
+}
+
+/// Folders never marked or counted in receipts: a repository's own records,
+/// and dependency and build trees a tool rewrites wholesale (folder names, a
 /// machine format).
 const UNMARKED: [&str; 5] = [".git", "node_modules", "target", ".venv", "__pycache__"];
 
-/// Every file under the run's write roots, each with its size and change
-/// time: a root that is a file (or not there yet: `None`), and each file
-/// under a root that is a folder. Compared after the run
-/// ([`changed_files`]), they name the files the run wrote, created or
-/// removed however it did (an edit tool, a shell redirect, a script).
-pub(super) async fn file_marks(
+/// Single-pass filesystem snapshot of a run's write roots: aggregate tree
+/// receipt plus per-file marks (up to `FILE_MARK_CAP`), skipping `UNMARKED`
+/// subdirectories consistently so `changed_something` and `changed_files` agree.
+#[derive(Debug, Clone, Default)]
+pub(super) struct RootSnapshot {
+    pub(super) receipt: TreeReceipt,
+    pub(super) marks: Vec<FileMark>,
+}
+
+/// Capture both the aggregate [`TreeReceipt`] and per-file [`FileMark`] list
+/// in a single traversal of `roots`.
+pub(super) async fn snapshot_roots(
     backend: &SharedExecutionBackend,
     roots: &[String],
-) -> Vec<FileMark> {
+) -> RootSnapshot {
+    let mut receipt = TreeReceipt::default();
     let mut marks = Vec::new();
     let mut queue: VecDeque<BackendPath> = VecDeque::new();
     for root in roots {
-        match backend.metadata(&BackendPath::new(root)).await {
-            Ok(meta) if meta.file_type == BackendFileType::Directory => {
-                queue.push_back(BackendPath::new(root))
-            }
+        let path = BackendPath::new(root);
+        match backend.metadata(&path).await {
+            Ok(meta) if meta.file_type == BackendFileType::Directory => queue.push_back(path),
             Ok(_) if daemon_file(root) => {}
-            Ok(meta) => marks.push((root.clone(), Some((meta.len, meta.modified)))),
-            Err(_) => marks.push((root.clone(), None)),
+            Ok(meta) => {
+                receipt.entries += 1;
+                receipt.bytes = receipt.bytes.saturating_add(meta.len);
+                receipt.newest = receipt.newest.max(meta.modified);
+                if marks.len() < FILE_MARK_CAP {
+                    marks.push((root.clone(), Some((meta.len, meta.modified))));
+                }
+            }
+            Err(_) => {
+                if marks.len() < FILE_MARK_CAP {
+                    marks.push((root.clone(), None));
+                }
+            }
         }
     }
     while let Some(directory) = queue.pop_front() {
@@ -99,35 +116,42 @@ pub(super) async fn file_marks(
             continue;
         };
         for entry in entries {
-            if marks.len() >= FILE_MARK_CAP {
-                return marks;
+            if receipt.entries >= CHANGE_RECEIPT_CAP {
+                return RootSnapshot { receipt, marks };
             }
+            if entry.metadata.file_type == BackendFileType::Directory
+                && UNMARKED.contains(&entry.path.file_name().unwrap_or_default())
+            {
+                continue;
+            }
+            if entry.metadata.file_type != BackendFileType::Directory
+                && daemon_file(&entry.path.to_string())
+            {
+                continue;
+            }
+            receipt.entries += 1;
+            receipt.bytes = receipt.bytes.saturating_add(entry.metadata.len);
+            receipt.newest = receipt.newest.max(entry.metadata.modified);
             match entry.metadata.file_type {
                 BackendFileType::Directory => {
-                    if !UNMARKED.contains(&entry.path.file_name().unwrap_or_default()) {
-                        queue.push_back(entry.path);
-                    }
+                    queue.push_back(entry.path);
                 }
-                BackendFileType::File if daemon_file(&entry.path.to_string()) => {}
-                BackendFileType::File => marks.push((
-                    entry.path.to_string(),
-                    Some((entry.metadata.len, entry.metadata.modified)),
-                )),
+                BackendFileType::File if marks.len() < FILE_MARK_CAP => {
+                    marks.push((
+                        entry.path.to_string(),
+                        Some((entry.metadata.len, entry.metadata.modified)),
+                    ));
+                }
                 _ => {}
             }
         }
     }
-    marks
+    RootSnapshot { receipt, marks }
 }
 
-/// The files under `roots` the run changed, created or removed: their
-/// marks now ([`file_marks`]) against `before`.
-pub(super) async fn changed_files(
-    backend: &SharedExecutionBackend,
-    before: &[FileMark],
-    roots: &[String],
-) -> Vec<String> {
-    let after = file_marks(backend, roots).await;
+/// The files under `roots` that changed, were created, or were removed,
+/// computed from two [`FileMark`] snapshots without re-walking the filesystem.
+pub(super) fn changed_files_from(before: &[FileMark], after: &[FileMark]) -> Vec<String> {
     let was: std::collections::HashMap<&str, &Option<(u64, Option<std::time::SystemTime>)>> =
         before
             .iter()
@@ -150,50 +174,32 @@ pub(super) async fn changed_files(
     changed
 }
 
+/// Every file under the run's write roots, each with its size and change time.
+#[cfg(test)]
+pub(super) async fn file_marks(
+    backend: &SharedExecutionBackend,
+    roots: &[String],
+) -> Vec<FileMark> {
+    snapshot_roots(backend, roots).await.marks
+}
+
+/// The files under `roots` the run changed, created or removed.
+#[cfg(test)]
+pub(super) async fn changed_files(
+    backend: &SharedExecutionBackend,
+    before: &[FileMark],
+    roots: &[String],
+) -> Vec<String> {
+    let after = snapshot_roots(backend, roots).await.marks;
+    changed_files_from(before, &after)
+}
+
 /// What the run's write roots hold: every file and folder under each root
-/// that is a folder, and each root that is a file itself (live 2026-11-18:
-/// a run given the exact file `notes.txt` to write created it, and its
-/// receipt read only folders, so the run read as "did not do its work").
-/// A root that does not exist yet counts nothing, so creating it is a
-/// change.
+/// that is a folder, and each root that is a file itself.
+#[cfg(test)]
 pub(super) async fn tree_receipt(
     backend: &SharedExecutionBackend,
     roots: &[String],
 ) -> TreeReceipt {
-    let mut receipt = TreeReceipt::default();
-    let mut queue: VecDeque<BackendPath> = VecDeque::new();
-    for root in roots {
-        let path = BackendPath::new(root);
-        match backend.metadata(&path).await {
-            Ok(meta) if meta.file_type == BackendFileType::Directory => queue.push_back(path),
-            Ok(meta) => {
-                receipt.entries += 1;
-                receipt.bytes = receipt.bytes.saturating_add(meta.len);
-                receipt.newest = receipt.newest.max(meta.modified);
-            }
-            Err(_) => {}
-        }
-    }
-    while let Some(directory) = queue.pop_front() {
-        let Ok(entries) = backend.read_dir(&directory).await else {
-            continue;
-        };
-        for entry in entries {
-            if receipt.entries >= CHANGE_RECEIPT_CAP {
-                return receipt;
-            }
-            if entry.metadata.file_type == BackendFileType::File
-                && daemon_file(&entry.path.to_string())
-            {
-                continue;
-            }
-            receipt.entries += 1;
-            receipt.bytes = receipt.bytes.saturating_add(entry.metadata.len);
-            receipt.newest = receipt.newest.max(entry.metadata.modified);
-            if entry.metadata.file_type == BackendFileType::Directory {
-                queue.push_back(entry.path);
-            }
-        }
-    }
-    receipt
+    snapshot_roots(backend, roots).await.receipt
 }

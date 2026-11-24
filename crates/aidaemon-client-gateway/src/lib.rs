@@ -278,9 +278,10 @@ pub trait ClientHost: Send + Sync {
         Err("This daemon has no projects".to_string())
     }
 
-    /// Keep `run` as it ended, for its conversation's history
-    /// ([`Self::past_runs`]). Called inline as the run ends: hand the write
-    /// off rather than wait on it.
+    /// Keep `run` as it stands, for its conversation's history
+    /// ([`Self::past_runs`]): called inline on each change the app is told
+    /// of, its end included, so a run a restart cuts off keeps its record.
+    /// Hand the write off rather than wait on it.
     fn keep_run(&self, _run: &aidaemon_client_protocol::RunSummary) {}
 
     /// Name the agent session whose thread is `thread` in conversation
@@ -304,8 +305,9 @@ pub trait ClientHost: Send + Sync {
         Ok(Default::default())
     }
 
-    /// Conversation `session_id`'s ended runs as [`Self::keep_run`] kept
-    /// them, oldest first.
+    /// Conversation `session_id`'s runs as [`Self::keep_run`] last kept
+    /// them, oldest first (a live run's is held in memory too, and that one
+    /// wins).
     async fn past_runs(
         &self,
         _session_id: &str,

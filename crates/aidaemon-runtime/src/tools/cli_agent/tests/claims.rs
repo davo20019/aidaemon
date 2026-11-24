@@ -48,6 +48,7 @@ async fn test_working_dir_conflict_detection() {
             tool_name: "bash-agent".to_string(),
             prompt_summary: "sleep 60".to_string(),
             writes: WriteScope::Whole,
+            state: ClaimState::Active,
         }],
     );
 
@@ -333,11 +334,14 @@ async fn test_claim_guard_disarm_keeps_claim() {
             tool_name: "bash-agent".to_string(),
             prompt_summary: "sleep 60".to_string(),
             writes: WriteScope::Whole,
+            state: ClaimState::Active,
         }],
     );
 
+    let notify = Arc::new(tokio::sync::Notify::new());
     let mut guard = WorkingDirClaimGuard::new(
         Arc::clone(&claims),
+        Arc::clone(&notify),
         "/tmp/project".to_string(),
         "abc12345".to_string(),
     );
@@ -351,6 +355,7 @@ async fn test_claim_guard_disarm_keeps_claim() {
     // An armed guard owned by a DIFFERENT task must not steal the claim.
     let other_guard = WorkingDirClaimGuard::new(
         Arc::clone(&claims),
+        Arc::clone(&notify),
         "/tmp/project".to_string(),
         "other999".to_string(),
     );
@@ -363,6 +368,7 @@ async fn test_claim_guard_disarm_keeps_claim() {
     // The owning guard releases it.
     let owner_guard = WorkingDirClaimGuard::new(
         Arc::clone(&claims),
+        Arc::clone(&notify),
         "/tmp/project".to_string(),
         "abc12345".to_string(),
     );
@@ -528,6 +534,7 @@ fn a_claim_in_an_enclosing_folder_conflicts_unless_its_run_is_gone() {
             tool_name: "bash-agent".to_string(),
             prompt_summary: "refactor".to_string(),
             writes: WriteScope::Whole,
+            state: ClaimState::Active,
         }],
     );
     let (dir, claim) =
@@ -568,4 +575,193 @@ async fn exactly_one_of_a_runs_end_and_its_timed_out_caller_answers_for_it() {
     let shared = RunShared::default();
     shared.starts_in_background();
     assert_eq!(shared.ends_by(), EndsBy::Background);
+}
+
+/// Working-dir conflicts (`BLOCKED: ...`) and concurrency-cap refusals
+/// (`Maximum ...`) are typed as retryable administrative failures, whereas
+/// policy refusals (`Blocked: ...`) are permanent administrative failures.
+#[tokio::test]
+async fn prelaunch_refusals_have_typed_retryable_and_permanent_outcomes() {
+    let (mut tool, _db) = setup_bash_tool().await;
+    tool.max_concurrent = 1;
+    tool.concurrency_limiter = Arc::new(Semaphore::new(1));
+    let dir = tempfile::TempDir::new().unwrap();
+    let dir_path = dir.path().to_string_lossy().to_string();
+
+    // Start one background run in `dir_path`.
+    let first = tool
+        .call(&format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 30","working_dir":"{dir_path}","async_mode":true}}"#
+        ))
+        .await
+        .unwrap();
+    assert!(first.contains("started in background"), "{first}");
+
+    // 1. Working-dir conflict -> FailedRetryable + administrative.
+    let conflict = tool
+        .call_with_status_outcome(
+            &format!(
+                r#"{{"action":"run","tool":"bash-agent","prompt":"echo conflict","working_dir":"{dir_path}"}}"#
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(conflict.output.contains("BLOCKED"), "{}", conflict.output);
+    assert_eq!(
+        conflict.metadata.outcome_status,
+        Some(ToolOutcomeStatus::FailedRetryable),
+        "working-dir conflict must be FailedRetryable, not Succeeded"
+    );
+    assert_eq!(
+        conflict.metadata.semantics.effect,
+        aidaemon_tools::semantics::ToolCallEffect::Administrative
+    );
+
+    // 2. Foreground concurrency limit (different directory) -> FailedRetryable + administrative.
+    let other_dir = tempfile::TempDir::new().unwrap();
+    let other_path = other_dir.path().to_string_lossy().to_string();
+    let capped = tool
+        .call_with_status_outcome(
+            &format!(
+                r#"{{"action":"run","tool":"bash-agent","prompt":"echo capped","working_dir":"{other_path}"}}"#
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(capped.output.contains("Maximum 1"), "{}", capped.output);
+    assert_eq!(
+        capped.metadata.outcome_status,
+        Some(ToolOutcomeStatus::FailedRetryable),
+        "concurrency limit refusal must be FailedRetryable, not Succeeded"
+    );
+    assert_eq!(
+        capped.metadata.semantics.effect,
+        aidaemon_tools::semantics::ToolCallEffect::Administrative
+    );
+
+    // 3. Policy refusal (`Blocked: ...`) -> FailedPermanent + administrative.
+    let policy = super::super::tool_impl::cli_agent_outcome_with_refusal(
+        "run",
+        "Blocked: CLI delegation was not started because policy forbids it.".to_string(),
+        false,
+        false,
+        false,
+        Some(PrelaunchRefusal::Policy),
+    );
+    assert_eq!(
+        policy.metadata.outcome_status,
+        Some(ToolOutcomeStatus::FailedPermanent)
+    );
+    assert_eq!(
+        policy.metadata.semantics.effect,
+        aidaemon_tools::semantics::ToolCallEffect::Administrative
+    );
+
+    tool.handle_cancel_all("").await.unwrap();
+}
+
+/// A read-write run with `working_dir` omitted but explicit `write_paths`
+/// still acquires a claim and blocks overlapping concurrent writes.
+#[tokio::test]
+async fn explicit_write_paths_without_working_dir_enforce_claims() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let target = dir.path().join("notes.md").to_string_lossy().to_string();
+
+    let first = tool
+        .call(&format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"sleep 30","write_paths":["{target}"],"async_mode":true}}"#
+        ))
+        .await
+        .unwrap();
+    assert!(first.contains("started in background"), "{first}");
+
+    let second = tool
+        .call_with_status_outcome(
+            &format!(
+                r#"{{"action":"run","tool":"bash-agent","prompt":"echo overlap","write_paths":["{target}"]}}"#
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        second.output.contains("BLOCKED"),
+        "overlapping write_paths without working_dir must be blocked: {}",
+        second.output
+    );
+    assert_eq!(
+        second.metadata.outcome_status,
+        Some(ToolOutcomeStatus::FailedRetryable)
+    );
+
+    tool.handle_cancel_all("").await.unwrap();
+}
+
+/// Reserved claims (queued / starting) say "starting in" instead of claiming
+/// the agent is already running.
+#[test]
+fn reserved_claim_conflict_message_distinguishes_starting_from_running() {
+    let reserved = WorkingDirClaim {
+        task_id: "res-1".to_string(),
+        tool_name: "codex".to_string(),
+        prompt_summary: "edit lib.rs".to_string(),
+        writes: WriteScope::Whole,
+        state: ClaimState::Reserved,
+    };
+    let active = WorkingDirClaim {
+        task_id: "res-1".to_string(),
+        tool_name: "codex".to_string(),
+        prompt_summary: "edit lib.rs".to_string(),
+        writes: WriteScope::Whole,
+        state: ClaimState::Active,
+    };
+    let reserved_msg = conflict_message("/w/synthetic", &reserved);
+    let active_msg = conflict_message("/w/synthetic", &active);
+    assert!(reserved_msg.contains("queued (reserved)"), "{reserved_msg}");
+    assert!(active_msg.contains("is already working in"), "{active_msg}");
+}
+
+/// Single-pass `snapshot_roots` skips `UNMARKED` subdirectories consistently
+/// for both the aggregate receipt and per-file marks, so internal `.git` or
+/// `target` churn does not flip `changed_something`.
+#[tokio::test]
+async fn single_pass_snapshot_skips_unmarked_dirs_consistently() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_string_lossy().to_string();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::create_dir(dir.path().join("target")).unwrap();
+    std::fs::write(dir.path().join(".git/index"), "v1").unwrap();
+    std::fs::write(dir.path().join("target/cache"), "v1").unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn main() {}\n").unwrap();
+
+    let before = snapshot_roots(&tool.backend, &[root.clone()]).await;
+    // Mutate only unmarked directories.
+    std::fs::write(dir.path().join(".git/index"), "v2-longer").unwrap();
+    std::fs::write(dir.path().join("target/new_artifact"), "bytes").unwrap();
+    let after_unmarked = snapshot_roots(&tool.backend, &[root.clone()]).await;
+    assert_eq!(
+        before.receipt, after_unmarked.receipt,
+        "unmarked directory churn must not alter TreeReceipt"
+    );
+    assert!(
+        changed_files_from(&before.marks, &after_unmarked.marks).is_empty(),
+        "unmarked directory churn must not appear in changed_files"
+    );
+
+    // Now mutate a tracked source file.
+    std::fs::write(
+        dir.path().join("lib.rs"),
+        "fn main() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
+    let after_edit = snapshot_roots(&tool.backend, &[root]).await;
+    assert_ne!(before.receipt, after_edit.receipt);
+    assert_eq!(
+        changed_files_from(&before.marks, &after_edit.marks),
+        vec![dir.path().join("lib.rs").to_string_lossy().to_string()]
+    );
 }

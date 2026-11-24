@@ -11,9 +11,7 @@
 
 use serde_json::Value;
 
-use crate::events::{
-    AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, program_of, text,
-};
+use crate::events::{AgentEvent, AgentStep, PlanItem, PlanStatus, StepTool, host_of, text};
 
 /// The events one stdout line carries.
 pub fn read_events(line: &str) -> Vec<AgentEvent> {
@@ -119,9 +117,7 @@ fn tool_use(block: &Value, parent: Option<String>) -> Vec<AgentEvent> {
         "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => StepTool::Edit {
             path: field("file_path").or_else(|| field("notebook_path")),
         },
-        "Bash" => StepTool::Run {
-            program: field("command").as_deref().and_then(program_of),
-        },
+        "Bash" => StepTool::run(field("command").as_deref()),
         "WebFetch" => StepTool::Fetch {
             host: field("url").as_deref().and_then(host_of),
         },
@@ -193,7 +189,8 @@ mod tests {
                     id: Some("t-1".into()),
                     parent: Some("t-0".into()),
                     tool: StepTool::Run {
-                        program: Some("cargo".into())
+                        program: Some("cargo".into()),
+                        subcommand: Some("test".into()),
                     },
                 }),
                 AgentEvent::Step(AgentStep {

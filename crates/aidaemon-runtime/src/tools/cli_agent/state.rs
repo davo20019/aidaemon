@@ -69,6 +69,9 @@ pub(super) struct RunningCliAgent {
     pub(super) process: Arc<RunProcess>,
     /// Set by the stream/wait task after the backend process exits.
     pub(super) finished: Arc<AtomicBool>,
+    /// Woken when `finished` becomes true so `check` and `stop_background_job`
+    /// wait without polling.
+    pub(super) done_notify: Arc<tokio::sync::Notify>,
     /// Set by the stream/wait task when the run failed to authenticate
     /// ([`cli_auth_failed`]), before `finished`.
     pub(super) auth_failed: Arc<AtomicBool>,
@@ -79,9 +82,12 @@ pub(super) struct RunningCliAgent {
     /// The working directory whose diff its result shows: set when it
     /// starts from a clean read-write checkout.
     pub(super) diff_dir: Arc<OnceLock<super::prompt::DiffBase>>,
-    /// The working directory it claimed ([`WorkingDirClaim`]), released
-    /// when it ends or is cancelled.
+    /// The working directory (or claim key) it claimed ([`WorkingDirClaim`]),
+    /// released when it ends or is cancelled.
     pub(super) claim_dir: Option<String>,
+    /// The typed write scope for this run (used for collision-aware FIFO
+    /// folder waiting).
+    pub(super) write_scope: WriteScope,
     /// What the agent left running, set once it has exited.
     pub(super) left_running: Arc<OnceLock<left_running::LeftRunning>>,
     /// How it ended, set before `finished` once its end was judged.
@@ -103,6 +109,9 @@ pub(super) struct RunProcess {
     state: std::sync::Mutex<ProcessState>,
     /// Wakes a queued run that was stopped before it started.
     stop: tokio::sync::Notify,
+    /// Per-run cancellation token wired into `DaemonJudge` / `DetachedNestedJudge`
+    /// so stopping the run immediately cancels any pending approval card.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
@@ -168,10 +177,16 @@ impl RunProcess {
         true
     }
 
-    /// Stop it: a started hosted process is asked to interrupt cooperatively
-    /// first before falling back to process termination; a queued run never
-    /// starts.
+    /// Per-run cancellation token cancelled by [`Self::stop`].
+    pub(super) fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Stop it: cancels any pending owner approval card, asks a started hosted
+    /// process to interrupt cooperatively first before falling back to process
+    /// termination; a queued run never starts.
     pub(super) async fn stop(&self, backend: &SharedExecutionBackend) {
+        self.cancel.cancel();
         let started = {
             let mut state = self.lock();
             match &*state {

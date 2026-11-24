@@ -209,6 +209,9 @@ pub struct ProgramEnd {
     pub exit_code: Option<i32>,
     /// The runtime stopped it (a loop, a stop, an authentication failure).
     pub stopped: bool,
+    /// The runtime stopped it because it exceeded its background execution or
+    /// silent-idle time limit.
+    pub timed_out: bool,
     /// The run was given write authority: its work needs a change.
     pub expects_change: bool,
     /// Its write roots differ from how they were when it started.
@@ -226,6 +229,12 @@ pub struct ProgramEnd {
 /// failed; a normal exit succeeded only if it did its work, by the same
 /// [`nothing_done`] rule a sub-agent's run is judged by.
 pub fn program_phase(end: &ProgramEnd) -> (RunEnd, RunEvidence) {
+    if end.timed_out {
+        return (
+            RunEnd::Failed(RunFailure::NoProgress),
+            RunEvidence::default(),
+        );
+    }
     // Stopped by the runtime, its exit status says nothing about the work
     // (a stopped program can still exit 0): it was stopped.
     if end.stopped {
@@ -426,6 +435,7 @@ mod tests {
         let refused = ProgramEnd {
             exit_code: Some(0),
             stopped: false,
+            timed_out: false,
             expects_change: true,
             changed_something: false,
             step: "Install WordPress in claude-wordpress-7".to_string(),
@@ -460,10 +470,18 @@ mod tests {
         let stopped = ProgramEnd {
             exit_code: Some(0),
             stopped: true,
-            ..refused
+            ..refused.clone()
         };
         let (end, _) = program_phase(&stopped);
         assert_eq!(end, RunEnd::Failed(RunFailure::Exited { code: None }));
+        // Timed out (idle or background wall-clock limit): NoProgress.
+        let timed_out = ProgramEnd {
+            exit_code: None,
+            timed_out: true,
+            ..refused
+        };
+        let (end, _) = program_phase(&timed_out);
+        assert_eq!(end, RunEnd::Failed(RunFailure::NoProgress));
     }
 
     /// Live probe 2026-11-17: Claude Code run with `-p` denied `touch` on

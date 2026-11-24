@@ -220,6 +220,26 @@ pub struct DaemonJudge {
     detached: Option<Arc<crate::approvals::DetachedNestedJudge>>,
     /// The run whose agent asks, named on any card its asks raise.
     asker: Option<Asker>,
+    /// Cancels any in-flight detached approval card when the hosted run stops.
+    cancel: tokio_util::sync::CancellationToken,
+    /// Number of approval checks currently awaiting an answer (so the run's
+    /// idle watchdog pauses while the owner is deciding).
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct InFlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlightGuard {
+    fn enter(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl DaemonJudge {
@@ -228,6 +248,8 @@ impl DaemonJudge {
             nested: Some(nested),
             detached: None,
             asker: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            in_flight: Arc::default(),
         }
     }
 
@@ -237,6 +259,8 @@ impl DaemonJudge {
             nested: Some(nested),
             detached: None,
             asker: Some(asker),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            in_flight: Arc::default(),
         }
     }
 
@@ -247,16 +271,45 @@ impl DaemonJudge {
         detached: Option<Arc<crate::approvals::DetachedNestedJudge>>,
         asker: Asker,
     ) -> Self {
+        let cancel = detached
+            .as_ref()
+            .map(|d| d.child_token())
+            .unwrap_or_default();
         Self {
             nested,
             detached,
             asker: Some(asker),
+            cancel,
+            in_flight: Arc::default(),
         }
     }
 
+    /// Attach a per-run cancellation token and in-flight approval counter.
+    pub fn with_controls(
+        mut self,
+        cancel: tokio_util::sync::CancellationToken,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.cancel = cancel;
+        self.in_flight = in_flight;
+        self
+    }
+
     async fn authorize(&self, call: ToolCall) -> Verdict {
+        let _active = InFlightGuard::enter(&self.in_flight);
+        if self.cancel.is_cancelled() {
+            return Verdict::Deny {
+                reason: "the run was stopped before this call could be checked".to_string(),
+            };
+        }
         if let Some(nested) = &self.nested {
-            let verdict = nested.authorize(call.clone()).await;
+            let verdict = tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => Verdict::Deny {
+                    reason: "the run was stopped before this call could be checked".to_string(),
+                },
+                verdict = nested.authorize(call.clone()) => verdict,
+            };
             let run_gone = matches!(
                 &verdict,
                 Verdict::Deny { reason } if reason == "the run ended before this call could be checked"
@@ -266,7 +319,7 @@ impl DaemonJudge {
             }
         }
         if let Some(detached) = &self.detached {
-            return detached.authorize(call).await;
+            return detached.authorize_with_cancel(call, &self.cancel).await;
         }
         Verdict::Deny {
             reason: "the run ended before this call could be checked".to_string(),
@@ -563,6 +616,66 @@ mod tests {
         assert!(
             verdict.is_allowed(),
             "detached judge should allow: {verdict:?}"
+        );
+    }
+
+    /// Cancelling the run's token immediately aborts an in-flight approval
+    /// wait and decrements the `in_flight` counter back to zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_daemon_judge_aborts_pending_approval_and_tracks_in_flight() {
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel::<()>();
+        let arrived_tx = std::sync::Mutex::new(Some(arrived_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let (nested, _asked) = aidaemon_core::testing::nested_calls(move |_call| {
+            if let Some(tx) = arrived_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+            Verdict::Allow
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let judge = DaemonJudge::new(nested).with_controls(cancel.clone(), in_flight.clone());
+
+        let judge_task = tokio::spawn(async move {
+            judge
+                .judge(AgentAction::RunCommand {
+                    command: "cargo test".into(),
+                    working_dir: None,
+                })
+                .await
+        });
+
+        // Wait until the nested call arrives (so the judge is actively waiting).
+        tokio::time::timeout(std::time::Duration::from_secs(2), arrived_rx)
+            .await
+            .expect("nested call should arrive")
+            .expect("arrived sender open");
+        assert_eq!(
+            in_flight.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "in_flight should be 1 while waiting for owner approval"
+        );
+
+        // Cancel the run's token without ever answering the approval request.
+        cancel.cancel();
+        let verdict = tokio::time::timeout(std::time::Duration::from_secs(2), judge_task)
+            .await
+            .expect("cancelled judge should abort promptly")
+            .unwrap();
+        let _ = release_tx.send(());
+        assert!(
+            matches!(verdict, Verdict::Deny { ref reason } if reason.contains("stopped")),
+            "cancelled judge should deny as stopped: {verdict:?}"
+        );
+        assert_eq!(
+            in_flight.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "in_flight should return to 0 after abort"
         );
     }
 }

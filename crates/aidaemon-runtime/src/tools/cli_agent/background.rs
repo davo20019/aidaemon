@@ -175,13 +175,18 @@ impl CliAgentTool {
             // Lock ordering: running -> working_dir_claims.
             let mut claims = lock_claims(&self.working_dir_claims);
             let mut removed: Vec<(String, RunningCliAgent)> = Vec::new();
+            let mut released_any = false;
             for task_id in finished_ids {
                 if let Some(agent) = running.remove(&task_id) {
                     if let Some(ref dir) = agent.claim_dir {
                         release_claim(&mut claims, dir, &task_id);
+                        released_any = true;
                     }
                     removed.push((task_id, agent));
                 }
+            }
+            if released_any {
+                self.claims_changed.notify_waiters();
             }
             removed
         };
@@ -436,16 +441,25 @@ impl CliAgentTool {
     }
 
     /// Wait up to `wait` for a running task to finish, without holding the
-    /// task table's lock (the stream task and other calls need it). Returns at
-    /// once for a task that is unknown or already finished.
+    /// task table's lock (the stream task and other calls need it). Uses
+    /// `done_notify` instead of polling; returns at once for a task that is
+    /// unknown or already finished.
     pub(super) async fn wait_for_finish(&self, task_id: &str, wait: Duration) {
-        let finished = match self.running.lock().await.get(task_id) {
-            Some(agent) => agent.finished.clone(),
+        let (finished, done_notify) = match self.running.lock().await.get(task_id) {
+            Some(agent) => (agent.finished.clone(), agent.done_notify.clone()),
             None => return,
         };
         let deadline = tokio::time::Instant::now() + wait;
-        while !finished.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(CHECK_POLL).await;
+        loop {
+            let notified = done_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if finished.load(Ordering::Acquire) {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return;
+            }
         }
     }
 

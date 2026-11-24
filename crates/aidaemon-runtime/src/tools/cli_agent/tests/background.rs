@@ -123,8 +123,11 @@ async fn test_run_logs_invocation() {
         running: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashMap::new())),
         working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        claims_changed: Arc::new(tokio::sync::Notify::new()),
         state: state as Arc<dyn CliAgentStore>,
         default_timeout: Duration::from_secs(10),
+        background_timeout: Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS),
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         default_max_output: 10000,
         max_concurrent: 3,
         concurrency_limiter: Arc::new(Semaphore::new(3)),
@@ -188,8 +191,11 @@ async fn test_timeout_run_still_logs_completion() {
         running: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashMap::new())),
         working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        claims_changed: Arc::new(tokio::sync::Notify::new()),
         state: state as Arc<dyn CliAgentStore>,
         default_timeout: Duration::from_secs(10),
+        background_timeout: Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS),
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         default_max_output: 10000,
         max_concurrent: 3,
         concurrency_limiter: Arc::new(Semaphore::new(3)),
@@ -346,8 +352,11 @@ async fn test_background_cli_check_returns_result_after_reap() {
         running: Arc::new(Mutex::new(HashMap::new())),
         completed: Arc::new(Mutex::new(HashMap::new())),
         working_dir_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        claims_changed: Arc::new(tokio::sync::Notify::new()),
         state: state as Arc<dyn CliAgentStore>,
         default_timeout: Duration::from_secs(10),
+        background_timeout: Duration::from_secs(DEFAULT_BACKGROUND_TIMEOUT_SECS),
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         default_max_output: 10000,
         max_concurrent: 3,
         concurrency_limiter: Arc::new(Semaphore::new(3)),
@@ -1170,5 +1179,180 @@ async fn a_check_on_a_failed_background_run_reads_as_failed_with_why() {
             .metadata
             .outcome_status,
         Some(ToolOutcomeStatus::FailedPermanent)
+    );
+}
+
+/// A silent background CLI agent that exceeds `idle_timeout` is stopped and
+/// settled with `RunFailure::NoProgress`.
+#[tokio::test]
+async fn background_idle_timeout_stops_silent_run_with_no_progress() {
+    let (mut tool, _db) = setup_bash_tool().await;
+    tool.idle_timeout = Duration::from_millis(200);
+    tool.background_timeout = Duration::from_secs(30);
+    let runs = Arc::new(crate::run_state::RunStates::default());
+    tool.set_runs(runs.clone());
+
+    let chat = "app:synthetic-idle-timeout";
+    let started = tool
+        .call_with_status_under_contract(
+            r#"{"action":"run","tool":"bash-agent","prompt":"sleep 30","async_mode":true}"#,
+            None,
+            false,
+            false,
+            &aidaemon_tools::testing::call_facts(chat),
+        )
+        .await
+        .unwrap();
+    let task_id = started_task_id(&started);
+
+    tool.wait_for_finish(&task_id, Duration::from_secs(5)).await;
+    let verdict = tool
+        .running
+        .lock()
+        .await
+        .get(&task_id)
+        .and_then(|agent| agent.verdict.get().cloned())
+        .expect("silent run should finish and record its verdict");
+    assert!(!verdict.success);
+    assert!(verdict.text.contains("no output"), "{}", verdict.text);
+    let check = tool.handle_check(&task_id, chat).await.unwrap();
+    assert!(
+        check.contains("no output") && check.contains("failed"),
+        "expected idle timeout failure message, got: {check}"
+    );
+}
+
+/// A noisy runaway background CLI agent that exceeds `background_timeout` is
+/// stopped and settled as failed.
+#[tokio::test]
+async fn background_execution_timeout_stops_runaway_run() {
+    let (mut tool, _db) = setup_bash_tool().await;
+    {
+        let mut tools = tool.tools.write().unwrap();
+        tools.get_mut("bash-agent").unwrap().timeout = Duration::from_millis(50);
+    }
+    tool.background_timeout = Duration::from_millis(250);
+    tool.idle_timeout = Duration::from_secs(30);
+    let runs = Arc::new(crate::run_state::RunStates::default());
+    tool.set_runs(runs.clone());
+
+    let chat = "app:synthetic-bg-timeout";
+    let started = tool
+        .call_with_status_under_contract(
+            r#"{"action":"run","tool":"bash-agent","prompt":"i=0; while true; do i=$((i+1)); echo tick-$i; sleep 0.03; done","async_mode":true}"#,
+            None,
+            false,
+            false,
+            &aidaemon_tools::testing::call_facts(chat),
+        )
+        .await
+        .unwrap();
+    let task_id = started_task_id(&started);
+
+    tool.wait_for_finish(&task_id, Duration::from_secs(5)).await;
+    let verdict = tool
+        .running
+        .lock()
+        .await
+        .get(&task_id)
+        .and_then(|agent| agent.verdict.get().cloned())
+        .expect("runaway run should finish and record its verdict");
+    assert!(!verdict.success);
+    assert!(
+        verdict.text.contains("background execution limit"),
+        "{}",
+        verdict.text
+    );
+    let check = tool.handle_check(&task_id, chat).await.unwrap();
+    assert!(
+        check.contains("background execution limit") && check.contains("failed"),
+        "expected background timeout failure message, got: {check}"
+    );
+}
+
+/// A read-write `cli_agent` run launched inside a `SpawnFamily` activates
+/// coordination and commits its modified files to the shared coordination
+/// ledger so sibling sub-agents and `unverified_shared_files` see them.
+#[tokio::test]
+async fn read_write_cli_run_registers_in_spawn_family_coordination_ledger() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_string_lossy().to_string();
+    let file_path = dir.path().join("shared.txt").to_string_lossy().to_string();
+    std::fs::write(&file_path, "initial\n").unwrap();
+
+    let family = crate::authority::SpawnFamily::new(Default::default());
+    assert!(
+        family.active_coordination().is_none(),
+        "coordination starts inactive with a single member"
+    );
+    let mut facts = aidaemon_tools::testing::call_facts("app:synthetic-coord");
+    facts
+        .extensions
+        .insert(crate::authority::InheritedAuthority {
+            authority: aidaemon_core::Authority::full(),
+            owner_level: None,
+            task_access: None,
+            mode_session: None,
+            untrusted_context: false,
+            origin_request: None,
+            origin_trusted: true,
+            trusted_roots: Vec::new(),
+            declined: Vec::new(),
+            shared_declines: None,
+            learning: None,
+            spawn_family: Some(family.clone()),
+            child_declaration: None,
+            parent_run: None,
+            known_resources: Default::default(),
+            card_title: None,
+            card_steps: Vec::new(),
+            lineage: Vec::new(),
+            parent_task: None,
+        });
+
+    // Seed an earlier write by a sibling sub-agent on the same file.
+    let coord = family.coordination();
+    coord.add_member(crate::coordination::Member {
+        session: "sub-agent-1".to_string(),
+        parent: "app:synthetic-coord".to_string(),
+        mission: "sibling".to_string(),
+        specialist: Some("code".to_string()),
+        scope: vec![file_path.clone()],
+        running: true,
+    });
+    coord.test_write(
+        "sub-agent-1",
+        &file_path,
+        Some(b"initial\n"),
+        b"sibling-line\n",
+    );
+    std::fs::write(&file_path, "sibling-line\n").unwrap();
+
+    let args = json!({
+        "action": "run",
+        "tool": "bash-agent",
+        "prompt": format!("printf 'sibling-line\\ncli-line\\n' > '{file_path}'; echo done"),
+        "working_dir": root,
+        "write_paths": [file_path],
+    });
+    let outcome = tool
+        .outcome_with_facts(&args.to_string(), None, false, &facts)
+        .await
+        .unwrap();
+    assert!(outcome.output.contains("done"), "{}", outcome.output);
+
+    // Coordination is now active and knows both writers touched `shared.txt`.
+    let active = family
+        .active_coordination()
+        .expect("CLI agent joining family should activate coordination");
+    assert!(
+        active.tracked_paths().contains(&file_path),
+        "changed file should be tracked in coordination ledger"
+    );
+    let shared = active.unverified_shared_files();
+    assert!(
+        shared.iter().any(|path| path == &file_path),
+        "file edited by both a sub-agent and cli_agent should be flagged as unverified_shared_files: {shared:?}"
     );
 }

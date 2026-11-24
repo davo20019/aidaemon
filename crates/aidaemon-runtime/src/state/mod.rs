@@ -70,8 +70,9 @@ fn set_db_file_permissions(_db_path: &str) {}
 /// The files this daemon writes itself: its database and SQLite's
 /// companions to it. A coding agent run in a folder that holds them did not
 /// change them, whatever their marks say ([`is_daemon_file`]).
-static DAEMON_FILES: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<std::path::PathBuf>>> =
-    std::sync::OnceLock::new();
+static DAEMON_FILES: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
 
 fn daemon_files() -> &'static std::sync::RwLock<std::collections::HashSet<std::path::PathBuf>> {
     DAEMON_FILES.get_or_init(Default::default)
@@ -81,7 +82,10 @@ fn daemon_files() -> &'static std::sync::RwLock<std::collections::HashSet<std::p
 /// own, by their absolute paths.
 fn note_daemon_files(db_path: &str) {
     let path = std::path::Path::new(db_path);
-    let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
         return;
     };
     let dir = match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {

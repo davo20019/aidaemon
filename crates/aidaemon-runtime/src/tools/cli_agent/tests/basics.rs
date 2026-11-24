@@ -611,6 +611,62 @@ async fn test_run_with_working_dir() {
     );
 }
 
+#[tokio::test]
+async fn validate_arguments_requires_write_manifest_when_workspace_mode_omitted_with_working_dir() {
+    let (tool, _db) = setup_bash_tool().await;
+
+    // Omitting workspace_mode with working_dir defaults to ReadWrite -> rejected.
+    let omitted =
+        r#"{"action":"run","tool":"bash-agent","prompt":"edit","working_dir":"/tmp/proj"}"#;
+    assert!(
+        ToolSemantics::validate_arguments(&tool, omitted).is_err(),
+        "omitted workspace_mode with working_dir must require explicit write targets"
+    );
+
+    // Explicit read_only -> accepted.
+    let read_only = r#"{"action":"run","tool":"bash-agent","prompt":"inspect","working_dir":"/tmp/proj","workspace_mode":"read_only"}"#;
+    assert!(ToolSemantics::validate_arguments(&tool, read_only).is_ok());
+
+    // Explicit write_paths / scope / new_folders -> accepted.
+    for extra in [
+        r#""write_paths":["/tmp/proj/a.rs"]"#,
+        r#""scope":["/tmp/proj/src"]"#,
+        r#""new_folders":["/tmp/proj/new"]"#,
+    ] {
+        let args = format!(
+            r#"{{"action":"run","tool":"bash-agent","prompt":"edit","working_dir":"/tmp/proj",{extra}}}"#
+        );
+        assert!(
+            ToolSemantics::validate_arguments(&tool, &args).is_ok(),
+            "should accept {extra}"
+        );
+    }
+}
+
+#[test]
+fn cli_agents_config_deserializes_custom_limits_and_timeouts() {
+    let defaults: CliAgentsConfig = toml::from_str("").unwrap();
+    assert_eq!(defaults.max_concurrent, DEFAULT_MAX_CONCURRENT);
+    assert_eq!(
+        defaults.background_timeout_secs,
+        DEFAULT_BACKGROUND_TIMEOUT_SECS
+    );
+    assert_eq!(defaults.idle_timeout_secs, DEFAULT_IDLE_TIMEOUT_SECS);
+
+    let custom: CliAgentsConfig = toml::from_str(
+        r#"
+        enabled = true
+        max_concurrent = 10
+        background_timeout_secs = 900
+        idle_timeout_secs = 120
+        "#,
+    )
+    .unwrap();
+    assert_eq!(custom.max_concurrent, 10);
+    assert_eq!(custom.background_timeout_secs, 900);
+    assert_eq!(custom.idle_timeout_secs, 120);
+}
+
 // -----------------------------------------------------------------------
 // Prompt similarity tests
 // -----------------------------------------------------------------------

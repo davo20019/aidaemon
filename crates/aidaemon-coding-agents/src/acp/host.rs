@@ -798,7 +798,7 @@ mod tests {
         }));
         let events = super::super::events::read_events(&line);
         assert!(matches!(&events[0], crate::AgentEvent::Step(step)
-            if step.tool == crate::StepTool::Run { program: Some("python3".into()) }));
+            if step.tool == crate::StepTool::Run { program: Some("python3".into()), subcommand: None }));
     }
 
     #[test]

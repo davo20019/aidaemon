@@ -914,7 +914,9 @@ fn direct_agent_response(
             .as_ref()
             .and_then(|project| project.root.as_ref())
         {
-            arguments["working_dir"] = serde_json::Value::String(root.display().to_string());
+            let root = root.display().to_string();
+            arguments["working_dir"] = serde_json::Value::String(root.clone());
+            arguments["write_paths"] = serde_json::json!([root]);
         }
         return sdk::ModelResponse {
             tool_calls: vec![sdk::ToolCall::new(
