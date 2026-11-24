@@ -1334,15 +1334,6 @@ fn header(store: Store, session: Option<String>) -> View {
                 }))
             }))
         })
-        .child(when(
-            move || store.is_compact(),
-            move || {
-                // A new conversation in the same project.
-                ui::icon_btn(Glyph::Compose, "New conversation", Size::Md, move || {
-                    store.new_in_project(store.current_project())
-                })
-            },
-        ))
         // Its participants: one press to the Agents tab, the count of agent
         // sessions that worked here, how many work now.
         .child(when(

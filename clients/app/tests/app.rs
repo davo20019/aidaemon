@@ -2113,23 +2113,17 @@ fn a_new_conversation_on_a_phone_raises_the_keyboard() -> Result<(), String> {
     if app.shows("zq") {
         return Err("opening a conversation raised the phone's keyboard".into());
     }
-    // Starting a new one from the conversation's header asks to write:
+    // Starting a new one from the list of conversations asks to write:
     // typing goes in at once.
-    app.press("label:New conversation")?;
-    app.wait_for("What can I help you with?")?;
-    app.press_keys(&["a", "b"])?;
-    app.wait_for("ab")?;
-    // From the list of conversations too.
-    open(&mut app)?;
     app.press("label:Conversations")?;
     app.press("label:New conversation >> nth=0")?;
     app.wait_for("What can I help you with?")?;
-    app.press_keys(&["c", "d"])?;
-    app.wait_for("abcd")?;
-    // And a new one from the new one on screen: its composer stays and
-    // takes the keyboard back.
-    app.press("label:New conversation")?;
-    app.press_keys(&["e"])?;
-    app.wait_for("abcde")?;
+    app.press_keys(&["a", "b"])?;
+    app.wait_for("ab")?;
+    // The header has no New conversation of its own: the list has it.
+    open(&mut app)?;
+    if app.shows("label:New conversation") {
+        return Err("the conversation's header still offers New conversation".into());
+    }
     Ok(())
 }
