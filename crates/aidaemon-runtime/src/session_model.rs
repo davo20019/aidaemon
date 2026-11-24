@@ -22,6 +22,10 @@ fn key(session_id: &str) -> String {
     format!("session_model:{session_id}")
 }
 
+/// What a reply a coding agent wrote is recorded under, in place of a model
+/// (a marker the daemon writes): this, then the agent's registry name.
+pub const CODING_AGENT_AUTHOR: &str = "coding-agent:";
+
 /// A model pinned for a conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedModel {

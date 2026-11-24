@@ -179,6 +179,7 @@ async fn a_coding_agent_conversation_takes_the_message_with_no_model_call() {
 
     let calls = harness.provider.call_log.lock().await.clone();
     assert!(calls.is_empty(), "no model call expected: {calls:?}");
+    // The reply is the run's own text, not a summary in its place.
     assert_eq!(reply, "Codex finished the change.");
     let history = harness.state.get_history("app:direct", 20).await.unwrap();
     let launched = history.iter().any(|message| {
@@ -198,4 +199,45 @@ async fn a_coding_agent_conversation_takes_the_message_with_no_model_call() {
         })
     });
     assert!(launched, "the message should go to codex as it is: {history:?}");
+}
+
+/// A run that could not start is reported as the run said, never as a
+/// generic "I completed 1 action".
+#[tokio::test]
+async fn a_coding_agent_conversation_reports_a_refused_run_as_it_is() {
+    use aidaemon_runtime::session_model::{self, SessionModelSetting};
+    let provider = MockProvider::with_responses(vec![]);
+    let refusal = "BLOCKED: another run is working in this folder.";
+    let extra_tools = vec![
+        Arc::new(MockTool::new("cli_agent", "delegation tool", refusal))
+            as Arc<dyn crate::traits::Tool>,
+    ];
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, extra_tools, None)
+        .await
+        .unwrap();
+    session_model::set(
+        harness.state.as_ref(),
+        "app:direct-refused",
+        &SessionModelSetting {
+            agent: Some("codex".into()),
+            ..SessionModelSetting::default()
+        },
+    )
+    .await
+    .unwrap();
+    let reply = harness
+        .agent
+        .handle_message(
+            "app:direct-refused",
+            "Add a footer",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("app"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(harness.provider.call_log.lock().await.is_empty());
+    assert!(reply.contains("another run is working"), "{reply}");
+    assert!(!reply.contains("completed 1 action"), "{reply}");
 }

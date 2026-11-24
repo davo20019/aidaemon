@@ -116,7 +116,28 @@ pub(super) struct PreparedRun {
     /// Released on drop until the run is tracked in the task table, whose
     /// reaper and cancel paths then own it.
     claim: Option<WorkingDirClaimGuard>,
+    /// Another run holds its folder and it waits for it instead of being
+    /// refused (a launch the owner sent to the agent directly): it has no
+    /// claim until then.
+    folder_wait: Option<FolderWait>,
 }
+
+/// How often a run waiting for its folder looks at the claims again.
+const FOLDER_POLL: Duration = Duration::from_millis(250);
+
+/// What a run waiting for its folder reads on its row.
+fn waiting_for_folder(agent: &str) -> String {
+    format!("Waiting for {agent} to finish in this folder")
+}
+
+/// A concurrency slot being waited for, in line.
+type SlotWait = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
+            > + Send,
+    >,
+>;
 
 /// What the model is told of a waited run's end that the owner already sees:
 /// the run is drawn as its agent's message, with its report and where its
@@ -224,6 +245,8 @@ pub(super) struct RunShared {
     should_notify: Arc<AtomicBool>,
     diff_dir: Arc<OnceLock<String>>,
     process: Arc<RunProcess>,
+    /// The agent it waits on to leave its folder, while it does.
+    folder_wait: FolderWaitOn,
 }
 
 /// The tool's handles a run keeps after its call returned.
@@ -280,6 +303,7 @@ fn tracked(
         diff_dir: shared.diff_dir.clone(),
         claim_dir,
         left_running: shared.left_running.clone(),
+        folder_wait: shared.folder_wait.clone(),
     }
 }
 
@@ -354,6 +378,15 @@ impl CliAgentTool {
         nested: Option<aidaemon_core::NestedCalls>,
     ) -> anyhow::Result<String> {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
+        // A background launch in a conversation set to a coding agent is
+        // the owner's own message to it: one that finds its folder taken
+        // waits for it rather than being refused.
+        let waits_for_folder = async_mode
+            && !session_id.trim().is_empty()
+            && crate::session_model::get(self.state.as_ref(), session_id)
+                .await
+                .agent
+                .is_some();
         let mut prep = match self
             .prepare_run(
                 tool_name,
@@ -370,6 +403,7 @@ impl CliAgentTool {
                 spec,
                 project,
                 nested,
+                waits_for_folder,
             )
             .await?
         {
@@ -392,6 +426,10 @@ impl CliAgentTool {
             owner_follow_up: spec.owner_follow_up,
         };
 
+        if prep.folder_wait.is_some() {
+            return Ok(self.queue_run(call, prep, None).await);
+        }
+
         // Slots go first come, first served: polled once here, a launch
         // that finds every slot taken is in line for the next one from now
         // on (a background one keeps its place; a foreground one is refused
@@ -400,7 +438,7 @@ impl CliAgentTool {
         let slot_permit = match futures::poll!(slot.as_mut()) {
             std::task::Poll::Ready(Ok(permit)) => permit,
             std::task::Poll::Pending if async_mode => {
-                return Ok(self.queue_run(call, prep, slot).await);
+                return Ok(self.queue_run(call, prep, Some(slot)).await);
             }
             _ => {
                 // prep's claim guard drops on return and releases the claim.
@@ -799,8 +837,10 @@ impl CliAgentTool {
     /// Make a launch ready up to its process start: its agent in the
     /// owner's mode, its arguments, its prompt, and its claim on its
     /// working directory (taken now, so two runs that would change the
-    /// same files are refused up front, queued or not). `Ok(Err(..))` is
-    /// why it was not started.
+    /// same files are refused up front, queued or not, unless it
+    /// `waits_for_folder`: then it waits for the folder instead
+    /// ([`PreparedRun::folder_wait`])). `Ok(Err(..))` is why it was not
+    /// started.
     #[allow(clippy::too_many_arguments)]
     async fn prepare_run(
         &self,
@@ -818,6 +858,7 @@ impl CliAgentTool {
         spec: &crate::helper_run::HelperSpec,
         project: Option<&aidaemon_core::ProjectRef>,
         nested: Option<aidaemon_core::NestedCalls>,
+        waits_for_folder: bool,
     ) -> anyhow::Result<Result<PreparedRun, String>> {
         // Get entry from the tools map (clone what we need, release lock)
         let (mut command, mut args, timeout, max_output, is_dynamic, coding_agent) = {
@@ -1034,6 +1075,7 @@ impl CliAgentTool {
         // The claims (std) lock must not be held across an await, so the
         // conflict message is computed inside the block and persisted after.
         let mut claim_guard: Option<WorkingDirClaimGuard> = None;
+        let mut folder_wait: Option<FolderWait> = None;
         if let Some(ref dir) = canonical_working_dir {
             let blocked_message: Option<String> = {
                 let _running_guard = self.running.lock().await;
@@ -1041,7 +1083,17 @@ impl CliAgentTool {
 
                 let held = claims.entry(dir.clone()).or_default();
                 if let Some(claim) = conflicting(held, &writes) {
-                    Some(conflict_message(dir, claim))
+                    if waits_for_folder {
+                        folder_wait = Some(FolderWait {
+                            dir: dir.clone(),
+                            writes: writes.clone(),
+                            prompt_summary: short_summary.clone(),
+                            behind: claim.tool_name.clone(),
+                        });
+                        None
+                    } else {
+                        Some(conflict_message(dir, claim))
+                    }
                 } else {
                     held.push(WorkingDirClaim {
                         task_id: task_id.to_string(),
@@ -1069,11 +1121,13 @@ impl CliAgentTool {
             // From here on the claim is released by the guard's Drop on any
             // early return or future cancellation, unless it is disarmed when
             // the task hands off to the background `running` map.
-            claim_guard = Some(WorkingDirClaimGuard::new(
-                self.working_dir_claims.clone(),
-                dir.clone(),
-                task_id.to_string(),
-            ));
+            if folder_wait.is_none() {
+                claim_guard = Some(WorkingDirClaimGuard::new(
+                    self.working_dir_claims.clone(),
+                    dir.clone(),
+                    task_id.to_string(),
+                ));
+            }
         }
 
         // Every helper's mission carries the same rules, whichever program
@@ -1129,29 +1183,29 @@ impl CliAgentTool {
             task,
             final_prompt,
             claim: claim_guard,
+            folder_wait,
         }))
     }
 
-    /// Accept a background launch that found every slot taken. It is a run
-    /// at once: its task id, its record (reading [`WAITING_FOR_SLOT`]) and
-    /// its working-dir claim; it starts by itself, first come first served,
-    /// when a slot frees, and runs from then on as an immediate launch
-    /// does. Stopped before then, it ends without ever starting. What
-    /// `prepare_run` decided (its mode, model, readiness and sandbox
+    /// Accept a background launch that cannot start yet: every slot is
+    /// taken (`slot` is its place in line), or another run holds its folder
+    /// ([`PreparedRun::folder_wait`]; `slot` is `None`). It is a run at
+    /// once: its task id and its record, reading what it waits for. A
+    /// folder waiter takes its claim once nothing it would collide with
+    /// holds the folder (first come, first served among the folder's
+    /// waiters), then waits for a slot as any queued launch does; a slot
+    /// waiter already holds its claim. It starts by itself, first come first
+    /// served, when a slot frees, and runs from then on as an immediate
+    /// launch does. Stopped before then, it ends without ever starting.
+    /// What `prepare_run` decided (its mode, model, readiness and sandbox
     /// paths) holds from when it was accepted: a change the owner makes
     /// while it waits applies to the next launch.
-    async fn queue_run<F>(
+    async fn queue_run(
         &self,
         call: RunCall,
         mut prep: PreparedRun,
-        slot: std::pin::Pin<Box<F>>,
-    ) -> String
-    where
-        F: std::future::Future<
-                Output = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError>,
-            > + Send
-            + 'static,
-    {
+        slot: Option<SlotWait>,
+    ) -> String {
         let task_id = call.task_id.clone();
         let run_id = cli_run_id(&task_id);
         let shared = RunShared::default();
@@ -1176,20 +1230,39 @@ impl CliAgentTool {
                 .continues(&run_id, &earlier.run, &earlier.thread);
         }
         handles.runs.keeps_session(&run_id, prep.keeps_session);
-        handles.runs.activity(&run_id, WAITING_FOR_SLOT.to_string());
+        let folder_wait = prep.folder_wait.take();
+        // Each registered agent's name, for its row: a run waiting for its
+        // folder reads which agent holds it.
+        let names: HashMap<String, String> = self
+            .tools
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(tool, entry)| (tool.clone(), self.entry_agent(entry).name().to_string()))
+            .collect();
+        let display =
+            move |tool: &str| names.get(tool).cloned().unwrap_or_else(|| tool.to_string());
+        let behind = folder_wait.as_ref().map(|wait| display(&wait.behind));
+        *lock_folder_wait(&shared.folder_wait) = behind.clone();
+        handles.runs.activity(
+            &run_id,
+            behind
+                .as_deref()
+                .map_or_else(|| WAITING_FOR_SLOT.to_string(), waiting_for_folder),
+        );
         if let Some(ref tx) = call.status_tx {
             let _ = tx.try_send(StatusUpdate::ToolCancellable {
                 name: call.tool_name.clone(),
                 task_id: task_id.clone(),
             });
         }
-        // Every run still waiting was accepted before this one, so is ahead
-        // of it.
+        // Every run still waiting for a slot was accepted before this one,
+        // so is ahead of it.
         let ahead = {
             let mut running = self.running.lock().await;
             let ahead = running
                 .values()
-                .filter(|agent| agent.process.is_queued())
+                .filter(|agent| agent.process.is_queued() && agent.waits_for_folder().is_none())
                 .count();
             running.insert(
                 task_id.clone(),
@@ -1205,16 +1278,84 @@ impl CliAgentTool {
             task_id = %task_id,
             tool = %call.tool_name,
             ahead,
-            "A CLI agent waits for a free slot"
+            waits_for_folder = behind.is_some(),
+            "A CLI agent waits to start"
         );
 
         let label = call.label.clone();
         let tool_name = call.tool_name.clone();
+        let dir = folder_wait.as_ref().map(|wait| wait.dir.clone());
+        let waited_for_folder = folder_wait.is_some();
+        let mut shown = behind.clone();
+        let limiter = self.concurrency_limiter.clone();
+        let running = self.running.clone();
+        let claims = self.working_dir_claims.clone();
         tokio::spawn(async move {
-            let waited = tokio::select! {
-                biased;
-                () = shared.process.stopped() => None,
-                permit = slot => Some(permit),
+            // Its folder first, when another run holds it: released on any
+            // return below until its process is started.
+            if let Some(wait) = folder_wait {
+                loop {
+                    if shared.process.was_stopped() {
+                        end_unstarted(
+                            &handles,
+                            &call,
+                            &shared,
+                            crate::run_state::RunEnd::Stopped(None),
+                            &format!(
+                                "CLI agent '{}' was stopped while it waited for its folder; it \
+                                 never started.",
+                                call.tool_name
+                            ),
+                            false,
+                            prep.max_output,
+                        )
+                        .await;
+                        return;
+                    }
+                    match try_take_folder(&running, &claims, &call.task_id, &call.tool_name, &wait)
+                        .await
+                    {
+                        FolderTurn::Taken(guard) => {
+                            prep.claim = Some(guard);
+                            *lock_folder_wait(&shared.folder_wait) = None;
+                            break;
+                        }
+                        FolderTurn::Waits(Some(holder)) => {
+                            let holder = display(&holder);
+                            if shown.as_deref() != Some(holder.as_str()) {
+                                handles.runs.activity(
+                                    &cli_run_id(&call.task_id),
+                                    waiting_for_folder(&holder),
+                                );
+                                *lock_folder_wait(&shared.folder_wait) = Some(holder.clone());
+                                shown = Some(holder);
+                            }
+                        }
+                        FolderTurn::Waits(None) => {}
+                    }
+                    tokio::select! {
+                        biased;
+                        () = shared.process.stopped() => {}
+                        () = tokio::time::sleep(FOLDER_POLL) => {}
+                    }
+                }
+                info!(task_id = %call.task_id, tool = %call.tool_name, "A CLI agent's folder is free");
+            }
+            let mut slot = slot.unwrap_or_else(|| Box::pin(limiter.acquire_owned()));
+            let waited = match futures::poll!(slot.as_mut()) {
+                std::task::Poll::Ready(permit) => Some(permit),
+                std::task::Poll::Pending => {
+                    if waited_for_folder {
+                        handles
+                            .runs
+                            .activity(&cli_run_id(&call.task_id), WAITING_FOR_SLOT.to_string());
+                    }
+                    tokio::select! {
+                        biased;
+                        () = shared.process.stopped() => None,
+                        permit = slot => Some(permit),
+                    }
+                }
             };
             let permit = match waited {
                 Some(Ok(permit)) if !shared.process.was_stopped() => permit,
@@ -1280,6 +1421,11 @@ impl CliAgentTool {
                 // and its run ends as any stopped run does.
                 kill_process(&handles.backend, &started.handle).await;
             }
+            // A folder waiter's claim: the reaper / cancel paths own it now,
+            // as they do a slot waiter's.
+            if let Some(guard) = prep.claim.as_mut() {
+                guard.disarm();
+            }
             let (completion_tx, _completion_rx) = tokio::sync::oneshot::channel();
             let coding_agent = prep.coding_agent.clone();
             let keep_alive = prep.keep_alive.take();
@@ -1301,6 +1447,15 @@ impl CliAgentTool {
         });
 
         mark_background_run(&label);
+        if let (Some(behind), Some(dir)) = (behind, dir) {
+            return format!(
+                "{}\nCLI agent '{tool_name}' is queued (task_id={task_id}): {behind} is already \
+                 working in {dir}, so this run waits for it to finish there. It starts by itself \
+                 then, so do not start it again. Use action=\"check\" with task_id=\"{task_id}\" \
+                 to see output when done, or action=\"cancel\" to drop it.",
+                crate::background_run::started_in_background(&label),
+            );
+        }
         let place = if ahead == 0 {
             "it is next in line".to_string()
         } else {
@@ -1315,6 +1470,10 @@ impl CliAgentTool {
             self.max_concurrent,
         )
     }
+}
+
+fn lock_folder_wait(on: &FolderWaitOn) -> std::sync::MutexGuard<'_, Option<String>> {
+    on.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl RunHandles {

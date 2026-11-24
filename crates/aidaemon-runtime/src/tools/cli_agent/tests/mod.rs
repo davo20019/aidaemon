@@ -29,6 +29,8 @@ struct TestStore {
     /// Kept events: (invocation, seq, kind, data).
     events: std::sync::Mutex<Vec<(i64, i64, String, String)>>,
     sessions: std::sync::Mutex<Vec<(i64, String)>>,
+    /// Settings a test stored (a conversation set to a coding agent).
+    settings: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl TestStore {
@@ -38,13 +40,27 @@ impl TestStore {
             invocations: Default::default(),
             events: Default::default(),
             sessions: Default::default(),
+            settings: Default::default(),
         }
     }
 }
 
-/// No mode stored: each agent runs in its kind's default.
+/// Only what a test stored: with no agent mode stored, each agent runs in
+/// its kind's default.
 #[async_trait::async_trait]
-impl aidaemon_tools::services::SettingsStore for TestStore {}
+impl aidaemon_tools::services::SettingsStore for TestStore {
+    async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.settings.lock().unwrap().get(key).cloned())
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.settings
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+}
 
 impl aidaemon_work::sqlite::WorkDatabase for TestStore {
     fn work_pool(&self) -> &sqlx::SqlitePool {

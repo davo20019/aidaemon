@@ -67,6 +67,17 @@ pub(crate) fn served_by(
     config: Option<&toml::Table>,
     model: &str,
 ) -> Option<ServedBy> {
+    // A reply a coding agent wrote (the daemon's own marker): named by the
+    // agent.
+    if let Some(agent) = model.strip_prefix(session_model::CODING_AGENT_AUTHOR) {
+        let name = aidaemon_runtime::tools::agent_mode::agent_named(agent)
+            .map_or_else(|| agent.to_string(), |coding| coding.name().to_string());
+        return Some(ServedBy {
+            preset: String::new(),
+            provider: name.clone(),
+            model: name,
+        });
+    }
     let provider = pickable(&llm.snapshot())
         .into_iter()
         .find(|provider| provider.models.iter().any(|listed| listed == model))?;
@@ -426,6 +437,18 @@ mod tests {
             provider: provider.into(),
             model: model.into(),
         })
+    }
+
+    #[test]
+    fn a_reply_a_coding_agent_wrote_is_named_by_the_agent() {
+        let served = served_by(
+            &runtime(),
+            None,
+            &format!("{}synthetic-coder", session_model::CODING_AGENT_AUTHOR),
+        )
+        .unwrap();
+        assert_eq!(served.model, "synthetic-coder");
+        assert!(served.preset.is_empty());
     }
 
     #[test]

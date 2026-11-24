@@ -359,3 +359,138 @@ async fn a_started_queued_run_counts_its_time_from_its_start() {
     );
     tool.handle_cancel_all(chat).await.unwrap();
 }
+
+/// Set `chat` to a coding agent: each owner message goes to it directly.
+async fn set_direct(tool: &CliAgentTool, chat: &str) {
+    crate::session_model::set(
+        tool.state.as_ref(),
+        chat,
+        &crate::session_model::SessionModelSetting {
+            agent: Some("bash-agent".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// A launch in `dir` of `prompt`, in the background.
+fn in_dir(dir: &str, prompt: &str) -> String {
+    format!(
+        r#"{{"action":"run","tool":"bash-agent","prompt":"{prompt}","working_dir":"{dir}","async_mode":true}}"#
+    )
+}
+
+/// In a conversation set to a coding agent, a message sent while another
+/// run works in the same folder waits for it: accepted at once with its
+/// record reading which agent it waits on, no process started, and it
+/// starts by itself once the first run ends.
+#[tokio::test]
+async fn a_direct_agent_launch_in_a_taken_folder_waits_and_starts_when_it_frees() {
+    let (tool, runs, watcher, _db) = one_slot_tool().await;
+    let chat = "app:synthetic-direct-folder";
+    set_direct(&tool, chat).await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let dir_path = dir.path().to_string_lossy().to_string();
+
+    let first = launch(&tool, chat, &in_dir(&dir_path, "sleep 2; echo first-done")).await;
+    assert!(first.contains("started in background"), "{first}");
+    let first_id = extract_task_id_from_background_message(&first);
+
+    let second = launch(&tool, chat, &in_dir(&dir_path, "echo second-done")).await;
+    assert!(
+        !second.contains("BLOCKED")
+            && second.contains("is queued (task_id=")
+            && second.contains("waits for it to finish")
+            && second.contains("starts by itself"),
+        "{second}"
+    );
+    let second_id = extract_task_id_from_background_message(&second);
+
+    let holder = tool.agent_named("bash-agent").unwrap().name().to_string();
+    let waiting = runs.get(&cli_run_id(&second_id)).unwrap();
+    assert_eq!(waiting.phase, crate::run_state::RunPhase::Running);
+    assert_eq!(
+        waiting.activity.as_deref(),
+        Some(format!("Waiting for {holder} to finish in this folder").as_str())
+    );
+    assert_eq!(started_task_ids(&tool).await, vec![first_id.clone()]);
+    let listed = tool.handle_list().await.unwrap();
+    assert!(
+        listed.contains(&format!("waiting for {holder} to finish in its folder")),
+        "{listed}"
+    );
+
+    for id in [&first_id, &second_id] {
+        let run = watcher.ended(id, 20).await;
+        assert_eq!(
+            run.view.phase,
+            crate::run_state::RunPhase::Succeeded,
+            "{run:?}"
+        );
+        assert_eq!(run.activity, None, "{run:?}");
+    }
+    assert_eq!(
+        started_task_ids(&tool).await,
+        vec![first_id, second_id.clone()]
+    );
+    let result = tool.handle_check(&second_id, chat).await.unwrap();
+    assert!(result.contains("second-done"), "{result}");
+}
+
+/// A direct-agent launch stopped while it waits for its folder never
+/// starts, and holds no claim on the folder.
+#[tokio::test]
+async fn a_direct_agent_launch_stopped_while_it_waits_for_its_folder_never_runs() {
+    let (tool, runs, watcher, _db) = one_slot_tool().await;
+    let chat = "app:synthetic-direct-folder-stop";
+    set_direct(&tool, chat).await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let dir_path = dir.path().to_string_lossy().to_string();
+
+    let first = launch(&tool, chat, &in_dir(&dir_path, "sleep 30")).await;
+    let first_id = extract_task_id_from_background_message(&first);
+    let waiting = launch(&tool, chat, &in_dir(&dir_path, "touch never-ran")).await;
+    assert!(waiting.contains("is queued"), "{waiting}");
+    let waiting_id = extract_task_id_from_background_message(&waiting);
+
+    runs.owner_stopping(&cli_run_id(&waiting_id));
+    assert!(tool.stop_background_job(&waiting_id).await);
+    let run = watcher.ended(&waiting_id, 5).await;
+    assert_eq!(
+        run.view.phase,
+        crate::run_state::RunPhase::Stopped,
+        "{run:?}"
+    );
+    assert!(
+        lock_claims(&tool.working_dir_claims)
+            .values()
+            .flatten()
+            .all(|claim| claim.task_id != waiting_id)
+    );
+
+    tool.handle_cancel(&first_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(started_task_ids(&tool).await, vec![first_id]);
+    assert!(!dir.path().join("never-ran").exists());
+}
+
+/// Outside a conversation set to a coding agent (the model delegating), a
+/// launch in a folder another run holds is still refused.
+#[tokio::test]
+async fn a_delegated_launch_in_a_taken_folder_is_still_refused() {
+    let (tool, _runs, _watcher, _db) = one_slot_tool().await;
+    let chat = "app:synthetic-delegated-folder";
+    let dir = tempfile::TempDir::new().unwrap();
+    let dir_path = dir.path().to_string_lossy().to_string();
+
+    let first = launch(&tool, chat, &in_dir(&dir_path, "sleep 30")).await;
+    let first_id = extract_task_id_from_background_message(&first);
+    let second = launch(&tool, chat, &in_dir(&dir_path, "echo second")).await;
+    assert!(
+        second.contains("BLOCKED") && second.contains(&first_id),
+        "{second}"
+    );
+    assert_eq!(started_task_ids(&tool).await, vec![first_id.clone()]);
+    tool.handle_cancel(&first_id).await.unwrap();
+}

@@ -75,7 +75,13 @@ pub(super) struct RunningCliAgent {
     pub(super) claim_dir: Option<String>,
     /// What the agent left running, set once it has exited.
     pub(super) left_running: Arc<OnceLock<left_running::LeftRunning>>,
+    /// While it waits for another run to leave its folder: that run's
+    /// agent ([`FolderWait`]).
+    pub(super) folder_wait: FolderWaitOn,
 }
+
+/// The agent a run waits on to leave its folder, while it does.
+pub(super) type FolderWaitOn = Arc<std::sync::Mutex<Option<String>>>;
 
 /// Where a run's process stands: a background launch that found every slot
 /// taken waits in line ([`ProcessState::Queued`]) until one frees.
@@ -169,6 +175,14 @@ impl RunningCliAgent {
     /// When its process started; while it waits, when it was accepted.
     pub(super) fn running_since(&self) -> Instant {
         self.process.started_at().unwrap_or(self.accepted_at)
+    }
+
+    /// The agent it waits on to leave its folder, while it does.
+    pub(super) fn waits_for_folder(&self) -> Option<String> {
+        self.folder_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

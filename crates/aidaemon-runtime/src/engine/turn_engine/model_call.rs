@@ -894,6 +894,13 @@ fn direct_agent_response(
     request: &sdk::ModelRequest,
     iteration: u64,
 ) -> sdk::ModelResponse {
+    // The reply is the agent's: it is recorded under the agent, not a model.
+    if let Ok(mut author) = scope.answered_by.lock() {
+        *author = Some(format!(
+            "{}{agent}",
+            crate::session_model::CODING_AGENT_AUTHOR
+        ));
+    }
     let offers_tools = request.tool_choice != sdk::ToolChoice::None;
     if iteration == 1 && offers_tools {
         let mut arguments = serde_json::json!({

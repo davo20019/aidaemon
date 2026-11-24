@@ -134,6 +134,12 @@ impl TurnEngine<'_> {
     }
 
     async fn judge_sdk_stop(&self, scope: &TurnScope<'_>, check: StopCheck) {
+        // A coding agent's conversation: the agent's run is the whole turn,
+        // and nothing is asked of a reply no model wrote.
+        if scope.direct_agent.is_some() {
+            let _ = check.reply.send(sdk::StopDecision::Accept);
+            return;
+        }
         if let Some(ended) = self.sdk_wait_for_unreported_jobs(scope).await {
             let _ = check.reply.send(sdk::StopDecision::Continue {
                 message: crate::turn::system_directives::SystemDirective::BackgroundJobHeld {

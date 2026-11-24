@@ -1319,6 +1319,9 @@ impl TurnEngine<'_> {
         } else {
             None
         };
+        if direct_agent.is_some() {
+            verdict.direct_agent.store(true, Ordering::Relaxed);
+        }
         let scope = TurnScope {
             direct_agent,
             daemon_paths: self.daemon_paths(),

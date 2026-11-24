@@ -379,10 +379,15 @@ impl CliAgentTool {
         if agent.process.is_queued() {
             let waited = agent.accepted_at.elapsed().as_secs();
             mark_left_in_background();
+            let what = match agent.waits_for_folder() {
+                Some(holder) => {
+                    format!("for {holder} to finish in its folder and starts by itself once it has")
+                }
+                None => "for a free slot and starts by itself when one frees".to_string(),
+            };
             return Ok(format!(
-                "CLI agent '{}' is queued (task_id={task_id}): it has waited {waited}s for a \
-                 free slot and starts by itself when one frees. Do not start it again.\n\
-                 Task: {}...",
+                "CLI agent '{}' is queued (task_id={task_id}): it has waited {waited}s {what}. \
+                 Do not start it again.\nTask: {}...",
                 agent.tool_name, agent.prompt_summary
             ));
         }
@@ -541,12 +546,17 @@ impl CliAgentTool {
         let mut lines = vec!["Running CLI agents:".to_string()];
         for (task_id, agent) in running.iter() {
             let elapsed = agent.running_since().elapsed().as_secs();
-            let status = if agent.process.is_queued() {
-                "queued, waiting for a free slot"
+            let status = if let Some(holder) = agent
+                .waits_for_folder()
+                .filter(|_| agent.process.is_queued())
+            {
+                format!("queued, waiting for {holder} to finish in its folder")
+            } else if agent.process.is_queued() {
+                "queued, waiting for a free slot".to_string()
             } else if !agent.finished.load(Ordering::Acquire) {
-                "running"
+                "running".to_string()
             } else {
-                "finished"
+                "finished".to_string()
             };
             lines.push(format!(
                 "  {} - {} ({}, {}s): {}...",

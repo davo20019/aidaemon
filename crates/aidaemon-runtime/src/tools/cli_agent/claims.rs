@@ -84,6 +84,86 @@ pub(super) fn conflict_message(dir: &str, claim: &WorkingDirClaim) -> String {
     )
 }
 
+/// A launch the owner sent to a coding agent directly that found another
+/// run's claim on its folder: it waits for the folder instead of being
+/// refused, and takes its own claim once nothing it would collide with is
+/// held ([`try_take_folder`]).
+pub(super) struct FolderWait {
+    pub(super) dir: String,
+    pub(super) writes: WriteScope,
+    pub(super) prompt_summary: String,
+    /// The tool name of the run that holds the folder, from the conflicting
+    /// claim.
+    pub(super) behind: String,
+}
+
+/// What a folder waiter found when it looked again.
+pub(super) enum FolderTurn {
+    /// It holds its claim now, released on drop until its run is tracked
+    /// as started.
+    Taken(WorkingDirClaimGuard),
+    /// Still held by a run of this tool (`Some`), or an earlier waiter on
+    /// the same folder goes first (`None`).
+    Waits(Option<String>),
+}
+
+/// Take `wait`'s claim for `task_id` if no live claim on its folder would
+/// collide with it and no earlier waiter on that folder is still waiting
+/// (first come, first served). The claim of a run that already finished
+/// does not count: the reaper releases it only at the tool's next call.
+pub(super) async fn try_take_folder(
+    running: &Mutex<HashMap<String, RunningCliAgent>>,
+    claims_map: &Arc<WorkingDirClaims>,
+    task_id: &str,
+    tool_name: &str,
+    wait: &FolderWait,
+) -> FolderTurn {
+    // Lock ordering: running -> working_dir_claims.
+    let running = running.lock().await;
+    let finished = |id: &str| {
+        running
+            .get(id)
+            .is_some_and(|agent| agent.finished.load(Ordering::Acquire))
+    };
+    let mine = running.get(task_id).map(|agent| agent.accepted_at);
+    let earlier_waiter = mine.is_some_and(|accepted| {
+        running.iter().any(|(id, agent)| {
+            id != task_id
+                && !agent.finished.load(Ordering::Acquire)
+                && agent.claim_dir.as_deref() == Some(wait.dir.as_str())
+                && agent.waits_for_folder().is_some()
+                && (agent.accepted_at, id.as_str()) < (accepted, task_id)
+        })
+    });
+    if earlier_waiter {
+        return FolderTurn::Waits(None);
+    }
+    let mut claims = lock_claims(claims_map);
+    let blocker = claims.get(&wait.dir).and_then(|held| {
+        held.iter()
+            .filter(|claim| claim.task_id != task_id && !finished(&claim.task_id))
+            .find(|claim| claim.writes.overlaps(&wait.writes))
+            .map(|claim| claim.tool_name.clone())
+    });
+    if let Some(blocker) = blocker {
+        return FolderTurn::Waits(Some(blocker));
+    }
+    claims
+        .entry(wait.dir.clone())
+        .or_default()
+        .push(WorkingDirClaim {
+            task_id: task_id.to_string(),
+            tool_name: tool_name.to_string(),
+            prompt_summary: wait.prompt_summary.clone(),
+            writes: wait.writes.clone(),
+        });
+    FolderTurn::Taken(WorkingDirClaimGuard::new(
+        claims_map.clone(),
+        wait.dir.clone(),
+        task_id.to_string(),
+    ))
+}
+
 /// Release task `task_id`'s claim on `dir`, if it holds one.
 pub(super) fn release_claim(
     claims: &mut HashMap<String, Vec<WorkingDirClaim>>,

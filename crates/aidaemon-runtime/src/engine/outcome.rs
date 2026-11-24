@@ -211,6 +211,10 @@ pub struct TurnVerdict {
     /// The files those agents' runs changed, by their records: reading them
     /// back after the agents is no work of the turn's own.
     pub agents_edited: std::sync::Mutex<Vec<String>>,
+    /// The turn of a conversation set to a coding agent: its reply is what
+    /// the agent's run returned, as it is (no reply checks, no activity
+    /// summary in its place).
+    pub direct_agent: std::sync::atomic::AtomicBool,
 }
 
 impl TurnVerdict {
@@ -267,6 +271,10 @@ impl TurnVerdict {
         };
         let reply = if let (true, Some(handoff)) = (handed_off, handoff) {
             handoff
+        } else if self.direct_agent.load(std::sync::atomic::Ordering::Relaxed)
+            && !reply.trim().is_empty()
+        {
+            aidaemon_tools::sanitize::sanitize_user_facing_reply(&reply)
         } else if matches!(outcome.status, sdk::RunStatus::Completed) {
             let note = self.response_note.lock().ok().and_then(|note| note.clone());
             let interrupted = self
