@@ -970,6 +970,16 @@ fn a_direct_agent_thread_marks_owner_prompts_collapses_verbose_replies_and_steps
         r#"{{"type":"ack","request_id":"{sm_id}","result":{{"type":"session_model","session_model":{{"session_id":"app:synthetic-direct","model":{{"mode":"agent","agent":"agy"}},"effort":"auto"}}}}}}"#
     ))]);
     settle(&mut app)?;
+    // Direct coding-agent answer renders inline in the wide center column
+    // (verbose replies collapsed cleanly in place, with Steps & details on the
+    // side rather than hiding the whole reply behind a stub card).
+    app.wait_for("text:Opening summary of the synthetic review.")?;
+    app.wait_for("Show full response (27 lines)")?;
+    assert!(app.wait_for("text:Final synthetic conclusion.").is_err());
+    app.press("Show full response (27 lines)")?;
+    app.wait_for("text:Final synthetic conclusion.")?;
+    app.press("Collapse response")?;
+    app.wait_for("Show full response (27 lines)")?;
     let before_run = sent("get_run");
     app.press("Antigravity CLI, show what it did")?;
     let run_id = wait_sent_new("get_run", before_run)?;
@@ -979,16 +989,16 @@ fn a_direct_agent_thread_marks_owner_prompts_collapses_verbose_replies_and_steps
     // Direct coding-agent prompt is attributed to "You", never "aidaemon asked".
     app.wait_for("text:You >> nth=0")?;
     assert!(app.wait_for("text:aidaemon asked").is_err());
+    // Desktop direct-agent mode keeps one composer (in the center) and offers
+    // a Wider/Narrower toggle on the right pane.
+    assert!(app.wait_for("label:Follow-up for the agent").is_err());
+    app.wait_for("label:Wider pane")?;
+    app.press("Wider pane")?;
+    app.wait_for("label:Narrower pane")?;
+    app.press("Narrower pane")?;
+    app.wait_for("label:Wider pane")?;
     // Multi-exchange stepper is visible right under the header.
     app.wait_for("text:Exchange 1 of 2")?;
-    // Verbose reply starts collapsed to a preview; expanding reveals the end.
-    app.wait_for("text:Opening summary of the synthetic review.")?;
-    app.wait_for("Show full response (27 lines)")?;
-    assert!(app.wait_for("text:Final synthetic conclusion.").is_err());
-    app.press("Show full response (27 lines)")?;
-    app.wait_for("text:Final synthetic conclusion.")?;
-    app.press("Collapse response")?;
-    app.wait_for("Show full response (27 lines)")?;
     // Next exchange jumps directly to exchange 2 without scrolling.
     let before_next = sent("get_run");
     app.press("Next exchange")?;

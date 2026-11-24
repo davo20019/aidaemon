@@ -234,18 +234,60 @@ pub fn strip_internal_control_markers(content: &str) -> String {
 pub fn strip_diagnostic_blocks(content: &str) -> String {
     // Split into code-block vs non-code-block segments so we only strip
     // diagnostic markers from prose, preserving literal content in code fences.
+    // However, when an `[UNTRUSTED EXTERNAL DATA ...]` envelope opens in prose,
+    // everything inside it — including any fenced code blocks — belongs to that
+    // untrusted payload until the matching `[END UNTRUSTED EXTERNAL DATA]` tag
+    // closes it in prose (or end of input if unclosed).
+    static UNTRUSTED_OPEN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\[UNTRUSTED EXTERNAL DATA").unwrap());
+    static UNTRUSTED_CLOSE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\[END UNTRUSTED EXTERNAL DATA\][^\n]*").unwrap());
+    static INLINE_XML_TOOL_TAGS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
+
     let segments = split_preserving_code_blocks(content);
     let mut result = String::with_capacity(content.len());
+    let mut in_untrusted_envelope = false;
+
     for (text, is_code) in &segments {
+        if in_untrusted_envelope {
+            if *is_code {
+                continue;
+            }
+            if let Some(close) = UNTRUSTED_CLOSE_RE.find(text) {
+                in_untrusted_envelope = false;
+                let tail = &text[close.end()..];
+                if !tail.is_empty() {
+                    if let Some(open) = UNTRUSTED_OPEN_RE.find(tail)
+                        && !UNTRUSTED_CLOSE_RE.is_match(&tail[open.start()..])
+                    {
+                        in_untrusted_envelope = true;
+                    }
+                    let mut cleaned = tail.to_string();
+                    for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
+                        cleaned = pattern.replace_all(&cleaned, "").to_string();
+                    }
+                    cleaned = INLINE_XML_TOOL_TAGS.replace_all(&cleaned, "").to_string();
+                    result.push_str(&cleaned);
+                }
+            }
+            continue;
+        }
         if *is_code {
             result.push_str(text);
         } else {
+            // If an untrusted envelope opens in this prose segment without its
+            // closing marker, it spans across the following code fence(s).
+            if let Some(open) = UNTRUSTED_OPEN_RE.find(text) {
+                let after_open = &text[open.start()..];
+                if !UNTRUSTED_CLOSE_RE.is_match(after_open) {
+                    in_untrusted_envelope = true;
+                }
+            }
             let mut cleaned = text.to_string();
             for pattern in DIAGNOSTIC_BLOCK_PATTERNS.iter() {
                 cleaned = pattern.replace_all(&cleaned, "").to_string();
             }
-            static INLINE_XML_TOOL_TAGS: LazyLock<Regex> =
-                LazyLock::new(|| Regex::new(r"</?(?:tool_call|arg_(?:key|value))>").unwrap());
             cleaned = INLINE_XML_TOOL_TAGS.replace_all(&cleaned, "").to_string();
             result.push_str(&cleaned);
         }
@@ -1383,6 +1425,32 @@ mod tests {
             result.contains("That's the file."),
             "trailing text preserved"
         );
+    }
+
+    #[test]
+    fn test_strip_diagnostic_blocks_strips_untrusted_envelope_containing_code_blocks() {
+        let wrapped = wrap_untrusted_output(
+            "cli_agent",
+            "Background CLI task completed.\nResult:\nIntro line.\n```rust\nconst UNMARKED: [&str; 2] = [\".git\", \"target\"];\n```\nAfter-code explanation.",
+        );
+        let stripped = strip_diagnostic_blocks(&wrapped);
+        assert!(
+            stripped.is_empty(),
+            "whole wrapped untrusted block with fenced code should strip to empty, got: {stripped:?}"
+        );
+
+        let mixed = format!("Before note.\n\n{wrapped}\n\nAfter note.");
+        let stripped_mixed = strip_diagnostic_blocks(&mixed);
+        assert!(stripped_mixed.contains("Before note."));
+        assert!(stripped_mixed.contains("After note."));
+        assert!(!stripped_mixed.contains("UNMARKED"));
+        assert!(!stripped_mixed.contains("After-code explanation"));
+
+        // Literal marker text authored inside a code block outside an envelope stays intact.
+        let doc = "Example:\n\n```text\n[UNTRUSTED EXTERNAL DATA from 'demo']\nhello\n[END UNTRUSTED EXTERNAL DATA]\n```\n\nDone.";
+        let stripped_doc = strip_diagnostic_blocks(doc);
+        assert!(stripped_doc.contains("[UNTRUSTED EXTERNAL DATA from 'demo']"));
+        assert!(stripped_doc.contains("Done."));
     }
 
     #[test]

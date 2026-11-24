@@ -131,6 +131,12 @@ pub(super) async fn deliver_end(
             &continuity_output,
         )),
         importance: 0.8,
+        annotations: vec![
+            aidaemon_events::conversation::MessageAnnotation::InternalContinuation,
+            aidaemon_events::conversation::MessageAnnotation::WrappedUntrustedExternalData {
+                source_tool: Some("cli_agent".to_string()),
+            },
+        ],
         ..Message::new_runtime(
             Uuid::new_v4().to_string(),
             notify_session_id.clone(),

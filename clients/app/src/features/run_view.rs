@@ -27,18 +27,18 @@ use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, type_sc
 /// Verbosity thresholds for collapsing long agent replies so verbose CLI
 /// agents (such as Antigravity CLI) never bury checks, steps or later turns.
 #[derive(Clone, Copy)]
-struct CollapseBudget {
-    trigger_chars: usize,
-    trigger_lines: usize,
-    preview_chars: usize,
-    preview_lines: usize,
+pub(crate) struct CollapseBudget {
+    pub(crate) trigger_chars: usize,
+    pub(crate) trigger_lines: usize,
+    pub(crate) preview_chars: usize,
+    pub(crate) preview_lines: usize,
 }
 
 const FOCUSED_REPLY_BUDGET: CollapseBudget = CollapseBudget {
     trigger_chars: 900,
     trigger_lines: 18,
-    preview_chars: 360,
-    preview_lines: 7,
+    preview_chars: 460,
+    preview_lines: 9,
 };
 
 const OTHER_REPLY_BUDGET: CollapseBudget = CollapseBudget {
@@ -170,11 +170,11 @@ pub fn run_view(store: Store, id: String) -> View {
                 }))
             })),
         ))
-        .child(follow_up(store, latest, who))
+        .child(follow_up(store, latest, who, direct_agent))
 }
 
-/// Top bar: back button, agent name with tone-coded status dot, and a Stop
-/// action while its latest background run is working.
+/// Top bar: back button, agent name with tone-coded status dot, a desktop
+/// width toggle, and a Stop action while its latest background run is working.
 fn header(
     store: Store,
     latest: Memo<Option<RunSummary>>,
@@ -195,6 +195,7 @@ fn header(
                 .map(|r| r.id.clone())
         })
     });
+    let resizable_desktop = computed(move || !store.is_compact() && window().width.0 >= 1180.0);
     view()
         .h(px(ui::fit::bar()))
         .flex_row()
@@ -246,6 +247,24 @@ fn header(
                     },
                 )),
         )
+        .child(when(
+            move || resizable_desktop.get(),
+            move || {
+                view().child(dynamic(move || {
+                    let expanded = store.run_pane_expanded();
+                    let (glyph, label) = if expanded {
+                        (Glyph::Shrink, "Narrower pane")
+                    } else {
+                        (Glyph::Expand, "Wider pane")
+                    };
+                    Some(untracked(move || {
+                        ui::icon_btn(glyph, label, Size::Sm, move || {
+                            store.toggle_run_pane_expanded()
+                        })
+                    }))
+                }))
+            },
+        ))
         .child(when(
             move || stoppable.with(Option::is_some),
             move || {
@@ -648,7 +667,10 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
                                 short.clone()
                             };
                             Some(untracked(move || {
-                                super::conversation::markdown(move || text.clone().into(), || false)
+                                super::conversation::compact_markdown(
+                                    move || text.clone().into(),
+                                    || false,
+                                )
                             }))
                         }))
                         .child(view().flex_row().items_center().child(dynamic(move || {
@@ -673,7 +695,7 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
                 }
                 None => {
                     let shown = reply.clone();
-                    said = said.child(super::conversation::markdown(
+                    said = said.child(super::conversation::compact_markdown(
                         move || shown.clone().into(),
                         || false,
                     ));
@@ -718,7 +740,7 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
 
 /// Changed files under a reply: shown inline up to `INLINE_EDITED_MAX`, or
 /// folded behind a single `N files changed` disclosure when there are more.
-fn edited_files(store: Store, paths: Vec<String>, coding: bool) -> View {
+pub(crate) fn edited_files(store: Store, paths: Vec<String>, coding: bool) -> View {
     if paths.len() <= INLINE_EDITED_MAX {
         let mut list = view().gap_1();
         for path in paths {
@@ -744,7 +766,7 @@ fn edited_files(store: Store, paths: Vec<String>, coding: bool) -> View {
 /// `text` fits within `budget`'s trigger limits; otherwise returns
 /// `Some((preview, total_lines))` cut at a clean line/word boundary with any
 /// open fenced code block closed so Markdown stays well-formed.
-fn markdown_preview(text: &str, budget: CollapseBudget) -> Option<(String, usize)> {
+pub(crate) fn markdown_preview(text: &str, budget: CollapseBudget) -> Option<(String, usize)> {
     let trimmed = text.trim();
     let total_lines = trimmed.lines().count();
     if trimmed.chars().count() <= budget.trigger_chars && total_lines <= budget.trigger_lines {
@@ -1048,6 +1070,7 @@ fn follow_up(
     store: Store,
     latest: Memo<Option<RunSummary>>,
     who: Memo<(String, String, bool)>,
+    direct_agent: Memo<bool>,
 ) -> View {
     let draft = signal(String::new());
     // What was sent, and to which run, until a run continues it.
@@ -1067,7 +1090,14 @@ fn follow_up(
             untracked(|| store.open_run(&next));
         }
     });
+    // On desktop in a direct coding-agent conversation, the main center
+    // composer right next to this pane already talks to the same agent: skip
+    // the duplicate footer input there while keeping it for delegated threads
+    // and compact (mobile) full-screen sheets.
     let open = computed(move || {
+        if direct_agent.get() && !store.is_compact() {
+            return false;
+        }
         latest.with(|run| {
             run.as_ref()
                 .is_some_and(|run| run.can_continue && run.phase != RunPhase::Running)

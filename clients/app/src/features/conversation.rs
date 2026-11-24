@@ -747,12 +747,23 @@ fn excerpt(text: &str, max: usize) -> String {
     format!("{}…", head[..cut].trim_end())
 }
 
-/// A coding agent's reply as its message in the conversation: who it is
-/// (the name the owner gave it, else what it was started for, and its
-/// agent), how it ended and how long it took, what it said, and its typed
-/// report: the files it changed, its checks, what it left open, whether it
-/// needs the owner, and each claim the record doesn't bear out. A press
-/// opens its view.
+/// Verbosity budget for direct coding-agent answers rendered inline in the
+/// wide center transcript: normal answers read completely in place while
+/// multi-page dumps collapse cleanly with an inline expand toggle.
+const DIRECT_REPLY_BUDGET: super::run_view::CollapseBudget = super::run_view::CollapseBudget {
+    trigger_chars: 1400,
+    trigger_lines: 24,
+    preview_chars: 650,
+    preview_lines: 12,
+};
+
+/// A coding agent's reply in the conversation:
+/// - In a direct coding-agent conversation (Code mode pinned to an agent),
+///   the answer renders directly in the center column at full reading width
+///   (collapsible when verbose, with Copy / Read aloud, checks, folded changed
+///   files, and a `Steps & details` button that opens the right pane).
+/// - In a delegated conversation (AIDaemon spawned a sub-agent), the answer
+///   stays a compact card with an excerpt and highlights when open on the right.
 fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
     let run = computed(move || match row.get() {
         WorkRow::Run { run, .. } => Some(*run),
@@ -780,8 +791,6 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
     // What this run was for: the agent's name stays, its task changes.
     let task =
         computed(move || run.with(|r| r.as_ref().map(|r| r.label.clone()).unwrap_or_default()));
-    // In a conversation set to a coding agent, the card is the agent's
-    // answer, kept short: what it said is in its view, a press away.
     let direct = computed(move || {
         store.selected().is_some_and(|session| {
             matches!(
@@ -790,6 +799,281 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             )
         })
     });
+    // Highlight the run currently open in the right pane: exact run for
+    // direct inline answers (every center exchange has its own row), or any
+    // run in the same thread for delegated cards (whose follow-ups live inside
+    // the thread drawer).
+    let open_id = id.clone();
+    let selected = computed(move || {
+        let Some(active) = store.open_run_id() else {
+            return false;
+        };
+        if active == open_id {
+            return true;
+        }
+        if direct.get() {
+            return false;
+        }
+        let my_thread = run.with(|r| {
+            r.as_ref()
+                .map(|r| r.thread.clone().unwrap_or_else(|| r.id.clone()))
+        });
+        let Some(my_thread) = my_thread else {
+            return false;
+        };
+        store.all_runs().iter().any(|other| {
+            other.id == active && other.thread.as_deref().unwrap_or(other.id.as_str()) == my_thread
+        })
+    });
+    view().w_full().child(dynamic(move || {
+        let is_direct = direct.get();
+        let id = id.clone();
+        Some(untracked(move || {
+            if is_direct {
+                direct_agent_answer(store, id, run, head, selected)
+            } else {
+                delegated_agent_card(store, id, run, head, task, selected)
+            }
+        }))
+    }))
+}
+
+/// First-class inline answer for a conversation pinned directly to a coding
+/// agent: readable full-width Markdown in the center column so the right pane
+/// stays free for Changes, Files, Steps and Terminal.
+fn direct_agent_answer(
+    store: Store,
+    id: String,
+    run: Memo<Option<RunSummary>>,
+    head: Memo<String>,
+    selected: Memo<bool>,
+) -> View {
+    view().w_full().gap_2().child(dynamic(move || {
+        let r = run.get()?;
+        let result = r.result.clone()?;
+        let id = id.clone();
+        Some(untracked(move || {
+            let reply_text = result.text.trim().to_string();
+            let preview = (!reply_text.is_empty())
+                .then(|| super::run_view::markdown_preview(&reply_text, DIRECT_REPLY_BUDGET))
+                .flatten();
+            let is_verbose = preview.is_some();
+            let expanded = signal(!is_verbose);
+            let span = r
+                .ended_at_ms
+                .map(|end| ui::time::span(end.saturating_sub(r.started_at_ms) / 1000))
+                .unwrap_or_default();
+
+            let mut header_row = view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(ui::icon(Glyph::Work).text_color(colors::ACCENT))
+                .child(
+                    text(move || head.get())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .number_of_lines(1)
+                        .text_size(px(ui::fit::small()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(colors::MUTED),
+                );
+            if !span.is_empty() {
+                header_row = header_row.child(
+                    text(span)
+                        .tabular_nums()
+                        .text_size(px(type_scale::XS))
+                        .text_color(colors::FAINT),
+                );
+            }
+            header_row = header_row.child(when(
+                move || is_verbose && expanded.get(),
+                move || {
+                    ui::btn("Collapse", Variant::Ghost, Size::Sm, move || {
+                        expanded.set(false)
+                    })
+                },
+            ));
+            let mut col = view().w_full().gap_2().child(header_row);
+
+            if !reply_text.is_empty() {
+                match preview {
+                    Some((short, total_lines)) => {
+                        let full = reply_text.clone();
+                        let expand_label = if total_lines >= 6 {
+                            format!("Show full response ({total_lines} lines)")
+                        } else {
+                            "Show full response".to_string()
+                        };
+                        col = col
+                            .child(dynamic(move || {
+                                let text = if expanded.get() {
+                                    full.clone()
+                                } else {
+                                    short.clone()
+                                };
+                                Some(untracked(move || {
+                                    markdown(move || text.clone().into(), || false)
+                                }))
+                            }))
+                            .child(view().flex_row().items_center().child(dynamic(move || {
+                                if expanded.get() {
+                                    Some(untracked(move || {
+                                        ui::btn(
+                                            "Collapse response",
+                                            Variant::Ghost,
+                                            Size::Sm,
+                                            move || expanded.set(false),
+                                        )
+                                    }))
+                                } else {
+                                    let label = expand_label.clone();
+                                    Some(untracked(move || {
+                                        ui::btn(
+                                            label.clone(),
+                                            Variant::Outline,
+                                            Size::Sm,
+                                            move || expanded.set(true),
+                                        )
+                                    }))
+                                }
+                            })));
+                    }
+                    None => {
+                        let shown = reply_text.clone();
+                        col = col.child(markdown(move || shown.clone().into(), || false));
+                    }
+                }
+            } else {
+                let fallback = r.reason.clone().unwrap_or_else(|| match r.phase {
+                    RunPhase::Failed => "It failed.".into(),
+                    RunPhase::Stopped => "It was stopped.".into(),
+                    _ => "It ended without a reply.".into(),
+                });
+                col = col.child(
+                    text(fallback)
+                        .text_size(px(ui::fit::small()))
+                        .text_color(colors::MUTED),
+                );
+            }
+
+            let facts = super::run_view::result_facts(&result);
+            if !facts.is_empty() {
+                let mut checks = view()
+                    .w_full()
+                    .rounded(px(ui::radius::CONTROL))
+                    .bg(colors::SURFACE)
+                    .border_1()
+                    .border_color(colors::BORDER)
+                    .px_3()
+                    .py_2()
+                    .gap_1();
+                for (glyph, tone, words) in facts {
+                    checks = checks.child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1p5()
+                            .child(ui::icon(glyph).text_color(tone.color()))
+                            .child(
+                                text(words)
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .number_of_lines(2)
+                                    .text_size(px(type_scale::XS))
+                                    .text_color(colors::MUTED),
+                            ),
+                    );
+                }
+                col = col.child(checks);
+            }
+
+            if !r.edited.is_empty() {
+                let coding = store.is_coding(&r.session_id);
+                col = col.child(super::run_view::edited_files(
+                    store,
+                    r.edited.clone(),
+                    coding,
+                ));
+            }
+
+            // Quiet action bar: Copy, Read aloud, and Steps & details.
+            let open_id = id.clone();
+            let mut actions = view().flex_row().items_center().gap_3().pt_1();
+            if !reply_text.is_empty() {
+                let copied = reply_text.clone();
+                let spoken = reply_text.clone();
+                actions = actions
+                    .child(ui::icon_btn(Glyph::Copy, "Copy", Size::Sm, move || {
+                        set_clipboard(copied.clone());
+                        store.say("Copied the reply");
+                    }))
+                    .child(read_aloud(store, move || spoken.clone()));
+            }
+            let details_btn = button()
+                .accessibility_label(move || {
+                    Some(SharedString::from(format!(
+                        "{}, show what it did",
+                        head.get()
+                    )))
+                })
+                .on_press(move || store.open_run(&open_id))
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(ui::radius::CONTROL))
+                        .bg(move || {
+                            if selected.get() {
+                                ui::Tone::Accent.tint()
+                            } else {
+                                colors::TRANSPARENT
+                            }
+                        })
+                        .hover(|s| s.bg(colors::HOVER))
+                        .child(
+                            text(move || {
+                                if selected.get() {
+                                    "Details open"
+                                } else {
+                                    "Steps & details"
+                                }
+                            })
+                            .text_size(px(type_scale::XS))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(move || {
+                                if selected.get() {
+                                    colors::ACCENT
+                                } else {
+                                    colors::MUTED
+                                }
+                            }),
+                        )
+                        .child(ui::icon(Glyph::Chevron).text_color(move || {
+                            if selected.get() {
+                                colors::ACCENT
+                            } else {
+                                colors::FAINT
+                            }
+                        })),
+                );
+            col.child(actions.child(details_btn))
+        }))
+    }))
+}
+
+/// Compact summary card for a delegated sub-agent run spawned by AIDaemon.
+fn delegated_agent_card(
+    store: Store,
+    id: String,
+    run: Memo<Option<RunSummary>>,
+    head: Memo<String>,
+    task: Memo<String>,
+    selected: Memo<bool>,
+) -> View {
     let open = id.clone();
     let body = move || {
         let Some(r) = run.get() else {
@@ -799,8 +1083,7 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             return view();
         };
         let mut body = view().gap_1();
-        let direct = direct.get();
-        if !result.text.is_empty() && !direct {
+        if !result.text.is_empty() {
             // The card's excerpt; its view (a press) has the whole reply.
             let reply = excerpt(&result.text, CARD_REPLY_CHARS);
             body = body.child(markdown(move || reply.clone().into(), || false));
@@ -834,11 +1117,10 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             body = body.child(fact(glyph, tone, words));
         }
         // What a press does, said on the card.
-        let hint = match (direct, r.can_continue) {
-            (true, true) => "See what it said and reply",
-            (true, false) => "See what it said",
-            (false, true) => "See everything it did and reply",
-            (false, false) => "See everything it did",
+        let hint = if r.can_continue {
+            "See everything it did and reply"
+        } else {
+            "See everything it did"
         };
         body.child(
             view()
@@ -874,7 +1156,13 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
                     .rounded(px(ui::radius::CONTROL))
                     .bg(colors::SURFACE)
                     .border_1()
-                    .border_color(colors::EDGE)
+                    .border_color(move || {
+                        if selected.get() {
+                            colors::ACCENT
+                        } else {
+                            colors::EDGE
+                        }
+                    })
                     .child(
                         view()
                             .flex_row()
@@ -914,7 +1202,7 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
                             .text_color(colors::FAINT),
                     )
                     .child(dynamic(move || {
-                        let _ = (run.get(), direct.get());
+                        let _ = run.get();
                         Some(untracked(body))
                     })),
             ),
@@ -2377,6 +2665,33 @@ pub(crate) fn markdown(
         .gap_3()
         .text_size(px(ui::fit::read()))
         .line_height(px(ui::fit::read_lh()))
+        .text_color(colors::TEXT)
+}
+
+/// Body-scale Markdown for narrower side panes (`run_view`), keeping prose and
+/// inline code proportional to the inspector header and controls.
+pub(crate) fn compact_markdown(
+    content: impl Fn() -> SharedString + 'static,
+    streaming: impl Fn() -> bool + 'static,
+) -> impl IntoElement {
+    provide_context(TextViewParts::new().part(TextViewPart::Code, |s| {
+        s.text_size(px(ui::fit::body_code()))
+            .line_height(px(ui::fit::body_lh()))
+            .px(px(ui::fit::body_code_pad()))
+            .pt(px(ui::fit::body_code_pad()))
+    }));
+    text_view()
+        .markdown(move || Some(content()))
+        .options(move || MarkdownOptions {
+            streaming: streaming(),
+            html: false,
+            ..MarkdownOptions::default()
+        })
+        .links(TextViewLinks::Open)
+        .selectable(true)
+        .gap_2()
+        .text_size(px(ui::fit::body()))
+        .line_height(px(ui::fit::body_lh()))
         .text_color(colors::TEXT)
 }
 

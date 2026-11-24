@@ -1157,12 +1157,33 @@ pub fn pane(
     open: impl Fn() -> bool + Copy + 'static,
     content: impl IntoElement,
 ) -> nsh_base::ResizablePanelElement {
+    pane_sized(edge, move || size, min, max, open, content)
+}
+
+/// Like [`pane`], with a reactive `preferred` width (for example, widening
+/// the inspector while a coding-agent thread is open). Dragging the divider
+/// overrides the current width until `preferred` changes again.
+pub fn pane_sized(
+    edge: Edge,
+    preferred: impl Fn() -> f32 + Copy + 'static,
+    min: f32,
+    max: f32,
+    open: impl Fn() -> bool + Copy + 'static,
+    content: impl IntoElement,
+) -> nsh_base::ResizablePanelElement {
+    let initial = untracked(preferred).clamp(min, max);
     // The width the owner chose (a drag changes it), and the width shown
     // now: the same while still, between none and it while sliding.
-    let chosen = signal(size);
-    let shown = signal(if untracked(open) { size } else { 0.0 });
+    let chosen = signal(initial);
+    let shown = signal(if untracked(open) { initial } else { 0.0 });
     let sliding = stored(None::<Spawned<()>>);
+    let last_preferred = stored(initial);
     effect(move || {
+        let target = preferred().clamp(min, max);
+        let prev = last_preferred.replace(target);
+        if (target - prev).abs() >= 0.5 {
+            chosen.set(target);
+        }
         let opening = open();
         let from = shown.get_untracked();
         let to = if opening { chosen.get_untracked() } else { 0.0 };

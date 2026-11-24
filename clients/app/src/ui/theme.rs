@@ -176,8 +176,12 @@ pub mod size {
     pub const ROW: f32 = 30.0;
     /// The sidebar's width.
     pub const SIDEBAR: f32 = 280.0;
-    /// The inspector's width.
+    /// The inspector's default width (Changes, Files, Steps).
     pub const INSPECTOR: f32 = 320.0;
+    /// The inspector's reading width when a coding-agent thread is open.
+    pub const INSPECTOR_WIDE: f32 = 460.0;
+    /// The inspector's expanded width when the owner widens it for long code/diffs.
+    pub const INSPECTOR_EXPANDED: f32 = 640.0;
     /// The conversation's readable column.
     pub const COLUMN: f32 = 760.0;
     /// Icon glyph box.
@@ -227,6 +231,18 @@ pub mod fit {
     /// Body and control text.
     pub fn body() -> f32 {
         if touch() { 15.0 } else { super::text::BASE }
+    }
+    /// Line height for body-scale reading (side-pane Markdown).
+    pub fn body_lh() -> f32 {
+        if touch() { 23.0 } else { 20.0 }
+    }
+    /// Inline code inside body-scale Markdown.
+    pub fn body_code() -> f32 {
+        body() * 0.875
+    }
+    /// Padding around inline code inside body-scale Markdown.
+    pub fn body_code_pad() -> f32 {
+        body() * 0.25
     }
     /// Secondary text.
     pub fn small() -> f32 {

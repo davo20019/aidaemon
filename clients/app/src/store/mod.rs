@@ -431,6 +431,8 @@ pub struct Store {
     /// The open run's view opened the details pane (it was closed): Back
     /// closes the pane again, not only the run.
     run_opened_details: Stored<bool>,
+    /// The owner widened the right pane while reading a coding-agent thread.
+    run_pane_expanded: Signal<bool>,
     /// A medium window's details, asked for (the Agents chip): they slide
     /// in from the right over the page, as a run's view does there.
     details_drawer: Signal<bool>,
@@ -586,6 +588,7 @@ impl Store {
             inspector: signal(true),
             inspector_default: stored(true),
             run_opened_details: stored(false),
+            run_pane_expanded: signal(false),
             details_drawer: signal(false),
             compact: signal(false),
             suggestion: signal(None),
@@ -3281,9 +3284,20 @@ impl Store {
     /// the details pane's tabs).
     pub fn close_run(&self) {
         self.act(Client::close_run);
+        self.run_pane_expanded.set(false);
         if self.run_opened_details.replace(false) {
             self.inspector.set(false);
         }
+    }
+
+    /// Whether the right pane is widened for reading a coding-agent thread.
+    pub fn run_pane_expanded(&self) -> bool {
+        self.run_pane_expanded.get()
+    }
+
+    /// Toggle the right pane between its comfortable reading width and wide mode.
+    pub fn toggle_run_pane_expanded(&self) {
+        self.run_pane_expanded.update(|wide| *wide = !*wide);
     }
 
     /// Show file `path` (a full path) changed: the Changes tab, on its diff

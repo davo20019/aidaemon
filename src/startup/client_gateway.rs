@@ -567,6 +567,29 @@ async fn session_ends(pool: &sqlx::SqlitePool) -> SessionEnds {
     }
 }
 
+/// Whether a stored conversation message is internal bookkeeping for the model
+/// rather than an owner-facing transcript row.
+fn is_hidden_history_message(m: &crate::traits::Message) -> bool {
+    if m.annotations.iter().any(|a| {
+        matches!(
+            a,
+            crate::traits::MessageAnnotation::InternalContinuation
+                | crate::traits::MessageAnnotation::EntireSystemNotice
+        )
+    }) {
+        return true;
+    }
+    // Legacy background CLI continuity messages were persisted as unannotated
+    // `assistant` rows wrapped wholly in the daemon's untrusted-data envelope
+    // (`aidaemon_policies::UNTRUSTED_PREFIX`..`UNTRUSTED_SUFFIX`).
+    m.role == "assistant"
+        && m.content.as_deref().is_some_and(|c| {
+            let trimmed = c.trim();
+            trimmed.starts_with(aidaemon_policies::UNTRUSTED_PREFIX)
+                && trimmed.ends_with(aidaemon_policies::UNTRUSTED_SUFFIX)
+        })
+}
+
 #[async_trait]
 impl ClientHost for DaemonClientHost {
     async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
@@ -953,18 +976,13 @@ impl ClientHost for DaemonClientHost {
             .collect();
         let models = reply_models(&self.system.pool, session_id, &reply_ids).await;
         let config = self.config_table();
-        // Runtime continuations and system notices ride as user-role turns
-        // for the model; they are not what the owner said. A reply carries
-        // the tools its turn used before it.
+        // Runtime continuations, system notices, and internal untrusted-tool
+        // continuity records live in history for the model; they are not
+        // owner-facing transcript rows. A reply carries the tools its turn
+        // used before it.
         let messages = messages.into_iter().filter(|m| {
             matches!(m.role.as_str(), "user" | "assistant" | "tool")
-                && !m.annotations.iter().any(|a| {
-                    matches!(
-                        a,
-                        crate::traits::MessageAnnotation::InternalContinuation
-                            | crate::traits::MessageAnnotation::EntireSystemNotice
-                    )
-                })
+                && !is_hidden_history_message(m)
         });
         let mut pending: Vec<PendingCall> = Vec::new();
         let mut out = Vec::new();
@@ -1616,7 +1634,10 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_words, run_outcome, session_ends, shown_output, snippet, tool_calls};
+    use super::{
+        is_hidden_history_message, outcome_words, run_outcome, session_ends, shown_output, snippet,
+        tool_calls,
+    };
     use aidaemon_tools::shown::CALL_OUTPUT_CHARS;
 
     /// A run the scheduler skipped reaches the app as `missed`, never as
@@ -1759,5 +1780,24 @@ mod tests {
             ),
             "Quito is 17.8°C now. Source: Open-Meteo"
         );
+    }
+
+    #[test]
+    fn internal_and_legacy_wrapped_cli_continuity_messages_stay_out_of_history() {
+        let mut annotated = crate::traits::Message::new_runtime("m1", "app:s1", "assistant");
+        annotated.content = Some("Internal note".to_string());
+        annotated.annotations = vec![crate::traits::MessageAnnotation::InternalContinuation];
+        assert!(is_hidden_history_message(&annotated));
+
+        let mut legacy_cli = crate::traits::Message::new_runtime("m2", "app:s1", "assistant");
+        legacy_cli.content = Some(aidaemon_policies::wrap_untrusted(
+            "cli_agent",
+            "Background CLI task completed.\nResult:\n```rust\nconst X: usize = 1;\n```\nAfter code.",
+        ));
+        assert!(is_hidden_history_message(&legacy_cli));
+
+        let mut visible = crate::traits::Message::new_runtime("m3", "app:s1", "assistant");
+        visible.content = Some("Finished reviewing the synthetic module.".to_string());
+        assert!(!is_hidden_history_message(&visible));
     }
 }

@@ -227,11 +227,26 @@ pub fn shell(store: Store) -> View {
                             sidebar(store),
                         ))
                         .child(ui::pane_rest(page(store, in_setup)))
-                        .child(ui::pane(
+                        .child(ui::pane_sized(
                             ui::Edge::Right,
-                            ui::size::INSPECTOR,
+                            move || {
+                                let width = window().width.0;
+                                if store.open_run_id().is_some() {
+                                    if store.run_pane_expanded() {
+                                        (width * 0.52).clamp(
+                                            ui::size::INSPECTOR_WIDE,
+                                            ui::size::INSPECTOR_EXPANDED,
+                                        )
+                                    } else {
+                                        (width * 0.36)
+                                            .clamp(ui::size::INSPECTOR, ui::size::INSPECTOR_WIDE)
+                                    }
+                                } else {
+                                    ui::size::INSPECTOR
+                                }
+                            },
                             260.0,
-                            // Room for a terminal or the agent's browser.
+                            // Room for a terminal, a wide run thread, or the agent's browser.
                             1100.0,
                             move || store.details_open() && wide.get(),
                             inspector(store),
