@@ -151,7 +151,14 @@ async fn write_record(state: &dyn crate::traits::StateStore, record: &BootRecord
 }
 
 /// Continues each chat turn the last stop cut off (see the module docs).
-pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<PreviousBoot>) {
+///
+/// Returns the continuations' tasks, each of which ends by clearing its
+/// chat from this boot's record. Dropping them leaves them running (the
+/// daemon does); awaiting them is how a caller knows the record is settled.
+pub async fn resume_cut_off_turns(
+    mut deps: ResumeDeps,
+    previous: Option<PreviousBoot>,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let jobs = std::mem::take(&mut deps.interrupted_jobs);
     let Some(PreviousBoot {
         since,
@@ -163,7 +170,7 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
         for job in &jobs {
             notify_job(&deps, job, JobFate::Lost).await;
         }
-        return;
+        return Vec::new();
     };
     let (agent_jobs, jobs): (Vec<_>, Vec<_>) = jobs
         .into_iter()
@@ -187,12 +194,12 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
         Ok(runs) => runs,
         Err(error) => {
             warn!(%error, "Could not list the turns the last stop cut off");
-            return;
+            return Vec::new();
         }
     };
     let continued_last_boot: HashSet<String> = continued_last_boot.into_iter().collect();
     let Some(hub) = deps.hub.upgrade() else {
-        return;
+        return Vec::new();
     };
     if !restarted_job_chats.is_empty() || !agents_restarted.is_empty() {
         update_record(&*deps.state, |record| {
@@ -264,7 +271,7 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
         }
     }
     if continuations.is_empty() {
-        return;
+        return Vec::new();
     }
     // Recorded before the turns run: if one takes the daemon down, the next
     // boot does not run it again.
@@ -275,12 +282,13 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
             .collect();
     })
     .await;
+    let mut tasks = Vec::with_capacity(continuations.len());
     for (chat, parent_task_id, followup) in continuations {
         let agent = deps.agent.clone();
         let hub = Arc::downgrade(&hub);
         let state = deps.state.clone();
         // Chats are continued side by side, each on its own task.
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let answered = agent
                 .answer_after_runs(RunsAnswer {
                     hub: Some(hub),
@@ -301,8 +309,9 @@ pub async fn resume_cut_off_turns(mut deps: ResumeDeps, previous: Option<Previou
                 Ok(false) => warn!(session_id = %chat, "The continued turn gave no reply"),
                 Err(error) => warn!(session_id = %chat, %error, "Continuing a cut-off turn failed"),
             }
-        });
+        }));
     }
+    tasks
 }
 
 /// What happens to a background job the last stop cut off.
@@ -755,7 +764,7 @@ mod tests {
         let dyn_state = state.clone() as Arc<dyn crate::traits::StateStore>;
         let previous = mark_boot(store, &*dyn_state).await;
         let router: Arc<dyn OutboundRouter> = hub.clone();
-        resume_cut_off_turns(
+        let continuations = resume_cut_off_turns(
             ResumeDeps {
                 store: SqliteStore::from_pool(store_pool(store)).await.unwrap(),
                 state: dyn_state,
@@ -769,9 +778,13 @@ mod tests {
             previous,
         )
         .await;
-        // The continuations run on their own tasks.
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
+        // The continuations run on their own tasks; each ends by clearing
+        // its chat from the record, which the next boot reads. Wait for
+        // them, as a process stop would, rather than for a guessed number
+        // of scheduler turns: a clear landing after the test rewrites the
+        // record would undo it.
+        for continuation in continuations {
+            continuation.await.unwrap();
         }
     }
 
