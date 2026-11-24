@@ -48,24 +48,19 @@ pub fn run_view(store: Store, id: String) -> View {
     let ready = computed(move || matches!(store.run_view(), Read::Ready(_)));
     let scroller = element_ref();
     let opened = element_ref();
-    // At the newest message, as any chat opens; on an older run the view
-    // was opened on, at that one. A new message brings the end into view.
-    {
-        let id = id.clone();
-        effect(move || {
-            let count = thread.with(Vec::len);
-            let at_end = latest.with(|run| run.as_ref().is_none_or(|run| run.id == id));
-            untracked(|| {
-                if at_end {
-                    scroller.scroll_to_end(false);
-                } else if count > 0 {
-                    let mut options = nsh_core::RevealOptions::default();
-                    options.animated = false;
-                    opened.reveal(options);
-                }
-            });
+    // The earlier exchanges, folded until asked for: the view opens on the
+    // latest (or the run it was opened on), at the top of its exchange,
+    // where its question is, and drawn again (its record read, a run
+    // added) it stays there.
+    let earlier_shown = signal(false);
+    effect(move || {
+        let _ = (ready.get(), thread.with(Vec::len), earlier_shown.get());
+        untracked(|| {
+            let mut options = nsh_core::RevealOptions::default();
+            options.animated = false;
+            opened.reveal(options);
         });
-    }
+    });
     view()
         .w_full()
         .flex_1()
@@ -114,9 +109,22 @@ pub fn run_view(store: Store, id: String) -> View {
                 let _ = ready.get();
                 let runs = thread.get();
                 let id = id.clone();
+                // Folded: the runs before the one the view is on.
+                let at = runs.iter().position(|run| run.id == id).unwrap_or(0);
+                let folded = if earlier_shown.get() { 0 } else { at };
                 Some(untracked(move || {
                     let mut list = view().gap_4();
-                    for run in runs {
+                    if folded > 0 {
+                        let words = match folded {
+                            1 => "1 earlier exchange".to_owned(),
+                            n => format!("{n} earlier exchanges"),
+                        };
+                        list =
+                            list.child(ui::btn(words, ui::Variant::Ghost, Size::Sm, move || {
+                                earlier_shown.set(true)
+                            }));
+                    }
+                    for run in runs.into_iter().skip(folded) {
                         let this = run.id == id;
                         let exchange = exchange(store, run, this);
                         list = list.child(if this {

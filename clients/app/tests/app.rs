@@ -922,6 +922,11 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     let before = sent("get_run");
     app.press("Designer · Codex, can continue · 2 runs · now, open its thread")?;
     wait_sent_new("get_run", before)?;
+    // It opens on the latest exchange; the earlier one is folded above it,
+    // a press away.
+    app.wait_for("1 earlier exchange")?;
+    app.press("1 earlier exchange")?;
+    app.wait_for_gone("1 earlier exchange", std::time::Duration::from_secs(2))?;
     Ok(())
 }
 
