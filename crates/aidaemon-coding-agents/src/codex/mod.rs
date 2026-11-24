@@ -409,11 +409,22 @@ fn shape(
             Ok(Plan::plain())
         }
         PermissionMode::Checked => {
+            // No write paths: it may change anything in its folder (a
+            // conversation set to it), so its folder is its write root.
+            let folder: Vec<String> = match (request.write_paths, request.working_dir) {
+                ([], Some(dir)) => vec![dir.to_string()],
+                _ => Vec::new(),
+            };
+            let write_paths = if folder.is_empty() {
+                request.write_paths
+            } else {
+                folder.as_slice()
+            };
             scoped(
                 &mut launch.args,
                 launch.start,
                 request.read_paths,
-                request.write_paths,
+                write_paths,
             )?;
             if !request.can_host {
                 return Ok(Plan::plain());
@@ -497,12 +508,21 @@ mod tests {
         assert!(joined.contains("network.enabled=false"));
         assert!(joined.contains("approval_policy=\"never\""));
         assert_eq!(plan.prompt, PromptPlacement::LastArgument);
-        // A write with no path to write is refused.
-        assert!(
-            Codex
-                .prepare(&request(PermissionMode::Checked, false, &[]), &mut launch)
-                .is_err()
-        );
+        // A write with no path given may change anything in its folder: its
+        // folder is its write root (a conversation set to it).
+        let mut launch = Launch {
+            args: strings(&["exec", "--json"]),
+            start: 0,
+        };
+        Codex
+            .prepare(&request(PermissionMode::Checked, false, &[]), &mut launch)
+            .unwrap();
+        let joined = launch.args.join(" ");
+        assert!(joined.contains("\"/w/project\"=\"write\""), "{joined}");
+        // With no folder either, it is refused.
+        let mut nowhere = request(PermissionMode::Checked, false, &[]);
+        nowhere.working_dir = None;
+        assert!(Codex.prepare(&nowhere, &mut launch).is_err());
     }
 
     #[test]

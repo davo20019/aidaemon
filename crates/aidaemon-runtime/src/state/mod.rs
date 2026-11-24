@@ -67,6 +67,46 @@ impl aidaemon_work::sqlite::WorkDatabase for SqliteStateStore {
 #[cfg(not(unix))]
 fn set_db_file_permissions(_db_path: &str) {}
 
+/// The files this daemon writes itself: its database and SQLite's
+/// companions to it. A coding agent run in a folder that holds them did not
+/// change them, whatever their marks say ([`is_daemon_file`]).
+static DAEMON_FILES: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn daemon_files() -> &'static std::sync::RwLock<std::collections::HashSet<std::path::PathBuf>> {
+    DAEMON_FILES.get_or_init(Default::default)
+}
+
+/// Note the database at `db_path` and its companion files as the daemon's
+/// own, by their absolute paths.
+fn note_daemon_files(db_path: &str) {
+    let path = std::path::Path::new(db_path);
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let dir = match path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir.to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    };
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let mut files = daemon_files()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SQLite's own companion files, a machine format.
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        files.insert(dir.join(format!("{name}{suffix}")));
+    }
+}
+
+/// Whether `path` is one of the daemon's own files: its database or one of
+/// SQLite's companions to it.
+pub fn is_daemon_file(path: &std::path::Path) -> bool {
+    let files = daemon_files()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !files.is_empty() && files.contains(path)
+}
+
 /// Set restrictive file permissions (0600) on the database and WAL files.
 #[cfg(unix)]
 fn set_db_file_permissions(db_path: &str) {
@@ -311,6 +351,7 @@ impl SqliteStateStore {
 
         // Set restrictive file permissions (owner-only read/write)
         set_db_file_permissions(db_path);
+        note_daemon_files(db_path);
 
         migrations::migrate_state(&pool).await?;
         aidaemon_nodes::store::migrate(&pool).await?;

@@ -542,18 +542,30 @@ fn a_claim_in_an_enclosing_folder_conflicts_unless_its_run_is_gone() {
     );
 }
 
-#[test]
-fn exactly_one_of_a_runs_end_and_its_timed_out_caller_answers_for_it() {
+#[tokio::test]
+async fn exactly_one_of_a_runs_end_and_its_timed_out_caller_answers_for_it() {
     // The run ends first: its caller, still waiting, answers.
     let shared = RunShared::default();
-    assert!(!shared.ends_in_background());
-    assert!(!shared.move_to_background());
-    // The caller's wait runs out first: the run delivers its own end.
+    assert_eq!(shared.ends_by(), EndsBy::Caller);
+    assert!(shared.move_to_background().is_none());
+    // The caller's wait runs out first: the run delivers its own end, once
+    // the caller has set up its background run.
     let shared = RunShared::default();
-    assert!(shared.move_to_background());
-    assert!(shared.ends_in_background());
+    let done = shared.move_to_background().expect("it moves");
+    assert_eq!(shared.ends_by(), EndsBy::Moved);
+    let waiter = {
+        let moved = shared.moved.clone();
+        tokio::spawn(async move { moved.notified().await })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!waiter.is_finished(), "its end waits for the move");
+    drop(done);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the move's end wakes it")
+        .unwrap();
     // A background run always delivers its own end.
     let shared = RunShared::default();
     shared.starts_in_background();
-    assert!(shared.ends_in_background());
+    assert_eq!(shared.ends_by(), EndsBy::Background);
 }

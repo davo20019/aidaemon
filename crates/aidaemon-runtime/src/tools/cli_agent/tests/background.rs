@@ -1164,4 +1164,11 @@ async fn a_check_on_a_failed_background_run_reads_as_failed_with_why() {
         result.contains("failed after") && !result.contains("finished after"),
         "a failed run reads as failed: {result}"
     );
+    // And its outcome is a failure, not a successful check.
+    assert_eq!(
+        cli_agent_outcome("check", result, false, false, false)
+            .metadata
+            .outcome_status,
+        Some(ToolOutcomeStatus::FailedPermanent)
+    );
 }

@@ -729,7 +729,30 @@ impl RunStates {
         label: &str,
         on_end: Option<mpsc::UnboundedSender<RunEnded>>,
     ) -> RunState {
-        let state = self.begin_quiet(id, chat, label, on_end);
+        // A run its turn waited on that now goes on in the background keeps
+        // its record (its agent, what it was asked, its thread, its steps
+        // so far): only that it is a background run changes.
+        let promoted = {
+            let mut runs = self.lock();
+            match runs.get_mut(id) {
+                Some(held)
+                    if held.state.chat == chat
+                        && !held.state.background
+                        && !held.state.phase.is_terminal() =>
+                {
+                    held.state.background = true;
+                    if on_end.is_some() {
+                        held.on_end = on_end.clone();
+                    }
+                    Some(held.state.clone())
+                }
+                _ => None,
+            }
+        };
+        let state = match promoted {
+            Some(state) => state,
+            None => self.begin_quiet(id, chat, label, on_end),
+        };
         self.report(id, false);
         state
     }
@@ -1436,6 +1459,25 @@ mod tests {
     /// and a waited-on helper's view is not a background one.
     /// A turn's agents answered it only when every run it started is an
     /// agent's, succeeded, with a report its record bears out in full.
+    #[test]
+    fn a_waited_on_run_moved_to_the_background_keeps_its_record() {
+        let runs = RunStates::default();
+        runs.begin_waited(
+            "cli-agent-x",
+            "app:synthetic",
+            "Fix the slug",
+            Utc::now(),
+            None,
+        );
+        runs.set_agent("cli-agent-x", "Codex");
+        let moved = runs.begin("cli-agent-x", "app:synthetic", "Fix the slug", None);
+        assert!(moved.background);
+        assert_eq!(moved.agent.as_deref(), Some("Codex"));
+        // A new run under a new id starts afresh.
+        let fresh = runs.begin("cli-agent-y", "app:synthetic", "Other", None);
+        assert_eq!(fresh.agent, None);
+    }
+
     #[test]
     fn a_turn_s_agents_answered_it_only_when_every_report_is_borne_out() {
         use aidaemon_channels::turns::{RunClaims, RunMismatch, RunResult};

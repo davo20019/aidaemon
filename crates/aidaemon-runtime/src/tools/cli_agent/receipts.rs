@@ -43,6 +43,13 @@ pub(super) async fn list_backend_files(
 /// Most entries a run's write roots are read for its change receipt.
 pub(super) const CHANGE_RECEIPT_CAP: usize = 100_000;
 
+/// The daemon's own database files: a run in the folder that holds them
+/// (the daemon started from a checkout) did not change them, though the
+/// daemon writes them all the time.
+fn daemon_file(path: &str) -> bool {
+    crate::state::is_daemon_file(std::path::Path::new(path))
+}
+
 /// A receipt of what a run's write roots hold: how many entries, their
 /// total size and the newest change time. Two that differ show the run
 /// changed something there, whatever program it ran and whatever its reply
@@ -82,6 +89,7 @@ pub(super) async fn file_marks(
             Ok(meta) if meta.file_type == BackendFileType::Directory => {
                 queue.push_back(BackendPath::new(root))
             }
+            Ok(_) if daemon_file(root) => {}
             Ok(meta) => marks.push((root.clone(), Some((meta.len, meta.modified)))),
             Err(_) => marks.push((root.clone(), None)),
         }
@@ -100,6 +108,7 @@ pub(super) async fn file_marks(
                         queue.push_back(entry.path);
                     }
                 }
+                BackendFileType::File if daemon_file(&entry.path.to_string()) => {}
                 BackendFileType::File => marks.push((
                     entry.path.to_string(),
                     Some((entry.metadata.len, entry.metadata.modified)),
@@ -172,6 +181,11 @@ pub(super) async fn tree_receipt(
         for entry in entries {
             if receipt.entries >= CHANGE_RECEIPT_CAP {
                 return receipt;
+            }
+            if entry.metadata.file_type == BackendFileType::File
+                && daemon_file(&entry.path.to_string())
+            {
+                continue;
             }
             receipt.entries += 1;
             receipt.bytes = receipt.bytes.saturating_add(entry.metadata.len);

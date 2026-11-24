@@ -102,10 +102,16 @@ impl CliAgentTool {
         // failed, with why), else what its output says.
         let verdict = agent.verdict.get();
         let result = match verdict {
-            Some(verdict) => truncate_with_note(&verdict.text, 10000),
-            None => extract_meaningful_output(&stdout_output, 10000),
+            Some(verdict) => truncate_with_note(&verdict.text, agent.max_output),
+            None => extract_meaningful_output(&stdout_output, agent.max_output),
         };
+        // A failed run's result leads with the failure marker the outcome
+        // reads (`cli_agent_outcome`), as a failed run waited on does.
         let ended = match verdict {
+            Some(verdict) if !verdict.success => "ERROR: CLI agent",
+            _ => "CLI agent",
+        };
+        let how = match verdict {
             Some(verdict) if !verdict.success => "failed",
             _ => "finished",
         };
@@ -120,7 +126,7 @@ impl CliAgentTool {
         };
 
         let mut final_result = format!(
-            "CLI agent '{}' {ended} after {}s.\n\nResult:\n{}",
+            "{ended} '{}' {how} after {}s.\n\nResult:\n{}",
             agent.tool_name, elapsed, result
         );
         if let Some(diff) = diff_section {
@@ -464,8 +470,13 @@ impl CliAgentTool {
             self.release_working_dir_claim(dir, task_id);
         }
 
-        // Kill its process; a queued run never starts.
+        // Kill its process; a queued run never starts. What it waited for:
+        // another run to leave its folder, or a free slot.
         let queued = agent.process.is_queued();
+        let waited_for = match agent.waits_for_folder() {
+            Some(behind) => format!("{behind} to leave its folder"),
+            None => "a free slot".to_string(),
+        };
         agent.process.stop(&self.backend).await;
         mark_background_settled();
 
@@ -481,8 +492,8 @@ impl CliAgentTool {
 
         if queued {
             return Ok(format!(
-                "Cancelled CLI agent '{}' before it started: it waited {elapsed}s for a free \
-                 slot and never ran.",
+                "Cancelled CLI agent '{}' before it started: it waited {elapsed}s for \
+                 {waited_for} and never ran.",
                 agent.tool_name
             ));
         }

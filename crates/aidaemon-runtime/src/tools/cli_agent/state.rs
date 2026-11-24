@@ -86,6 +86,8 @@ pub(super) struct RunningCliAgent {
     pub(super) left_running: Arc<OnceLock<left_running::LeftRunning>>,
     /// How it ended, set before `finished` once its end was judged.
     pub(super) verdict: Arc<OnceLock<RunVerdict>>,
+    /// How much of its output a result shows (its tool's limit).
+    pub(super) max_output: usize,
     /// While it waits for another run to leave its folder: that run's
     /// agent ([`FolderWait`]).
     pub(super) folder_wait: FolderWaitOn,

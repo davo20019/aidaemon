@@ -256,6 +256,8 @@ pub(super) struct RunShared {
     /// Who answers for its end ([`Handoff`]): its waiting caller, or the
     /// run itself once it is a background run.
     handoff: Arc<std::sync::atomic::AtomicU8>,
+    /// Woken once a caller that moved it to the background is done.
+    pub(super) moved: Arc<tokio::sync::Notify>,
     diff_dir: Arc<OnceLock<super::prompt::DiffBase>>,
     process: Arc<RunProcess>,
     /// The agent it waits on to leave its folder, while it does.
@@ -273,6 +275,32 @@ mod handoff {
     pub(super) const BACKGROUND: u8 = 1;
     /// It ended while its caller still waited: the caller answers.
     pub(super) const ANSWERED: u8 = 2;
+    /// A foreground run its caller moved to the background: its end is
+    /// delivered to its chat once its background run is set up
+    /// ([`super::RunShared::moved`]).
+    pub(super) const MOVED: u8 = 3;
+}
+
+/// Who delivers a run's end, as its end found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EndsBy {
+    /// Its caller, still waiting: the end is its answer.
+    Caller,
+    /// The run itself, a background run from its start.
+    Background,
+    /// The run itself, moved to the background by its caller: it waits for
+    /// that move to finish first.
+    Moved,
+}
+
+/// Wakes a moved run's end once its caller set up its background run, or
+/// gave up doing so (its call was dropped): on drop, either way.
+pub(super) struct MoveDone(Arc<tokio::sync::Notify>);
+
+impl Drop for MoveDone {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 
 impl RunShared {
@@ -282,29 +310,34 @@ impl RunShared {
     }
 
     /// Its caller's wait ran out: it becomes a background run, unless it
-    /// already ended (false), when its caller answers for it after all.
-    pub(super) fn move_to_background(&self) -> bool {
+    /// already ended (`None`), when its caller answers for it after all.
+    /// Its end waits until the returned guard drops, so the caller sets up
+    /// its background run (its record, its turn's group) before the end
+    /// reads it, and only for a run that did move.
+    pub(super) fn move_to_background(&self) -> Option<MoveDone> {
         self.handoff
             .compare_exchange(
                 handoff::WAITED,
-                handoff::BACKGROUND,
+                handoff::MOVED,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .is_ok()
+            .ok()
+            .map(|_| MoveDone(self.moved.clone()))
     }
 
-    /// At its end: whether it delivers its end itself (a background run),
-    /// rather than a caller still waiting for it.
-    pub(super) fn ends_in_background(&self) -> bool {
-        self.handoff
-            .compare_exchange(
-                handoff::WAITED,
-                handoff::ANSWERED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_err()
+    /// At its end: who delivers it, decided with its caller in one step.
+    pub(super) fn ends_by(&self) -> EndsBy {
+        match self.handoff.compare_exchange(
+            handoff::WAITED,
+            handoff::ANSWERED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => EndsBy::Caller,
+            Err(handoff::MOVED) => EndsBy::Moved,
+            Err(_) => EndsBy::Background,
+        }
     }
 }
 
@@ -313,8 +346,6 @@ impl RunShared {
 pub(super) struct RunHandles {
     backend: SharedExecutionBackend,
     state: Arc<dyn CliAgentStore>,
-    tools: Arc<std::sync::RwLock<HashMap<String, CliToolEntry>>>,
-    tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     pub(super) runs: Arc<crate::run_state::RunStates>,
     hub: Option<Arc<dyn OutboundRouter>>,
     agent: Option<Arc<dyn ConversationRuntime>>,
@@ -350,6 +381,7 @@ fn tracked(
     shared: &RunShared,
     accepted_at: Instant,
     claim_dir: Option<String>,
+    max_output: usize,
 ) -> RunningCliAgent {
     RunningCliAgent {
         tool_name: call.tool_name.clone(),
@@ -367,6 +399,7 @@ fn tracked(
         claim_dir,
         left_running: shared.left_running.clone(),
         verdict: shared.verdict.clone(),
+        max_output,
         folder_wait: shared.folder_wait.clone(),
     }
 }
@@ -408,8 +441,6 @@ impl CliAgentTool {
         RunHandles {
             backend: self.backend.clone(),
             state: self.state.clone(),
-            tools: self.tools.clone(),
-            tool_names: self.tool_names.clone(),
             runs: self.runs.get_or_init(Default::default).clone(),
             hub: self.get_hub(),
             agent: self.get_agent(),
@@ -443,15 +474,16 @@ impl CliAgentTool {
         detached_judge: Option<Arc<crate::approvals::DetachedNestedJudge>>,
     ) -> anyhow::Result<String> {
         let task_id = Uuid::new_v4().to_string()[..8].to_string();
-        // A background launch in a conversation set to a coding agent is
-        // the owner's own message to it: one that finds its folder taken
-        // waits for it rather than being refused.
+        // A background launch in a conversation set to a coding agent, or a
+        // follow-up the owner wrote in a run's thread, is the owner's own
+        // message to it: one that finds its folder taken waits for it
+        // rather than being refused.
         let direct_agent = !session_id.trim().is_empty()
             && crate::session_model::get(self.state.as_ref(), session_id)
                 .await
                 .agent
                 .is_some();
-        let waits_for_folder = async_mode && direct_agent;
+        let waits_for_folder = async_mode && (direct_agent || spec.owner_follow_up);
         let mut prep = match self
             .prepare_run(
                 tool_name,
@@ -630,7 +662,13 @@ impl CliAgentTool {
 
         // For async_mode, return immediately with task_id
         if async_mode {
-            let agent = tracked(&call, &shared, started_at_instant, prep.working_dir.clone());
+            let agent = tracked(
+                &call,
+                &shared,
+                started_at_instant,
+                prep.working_dir.clone(),
+                prep.max_output,
+            );
             self.running.lock().await.insert(task_id.clone(), agent);
             // The reaper / cancel paths own the claim now (no await between
             // the insert above and this disarm, so no cancellation window).
@@ -655,33 +693,26 @@ impl CliAgentTool {
         let working_dir_owned = shared.diff_dir.get().cloned();
         let mut result = tokio::time::timeout(timeout, &mut completion_rx).await;
         if result.is_err() {
-            // Its wait ran out: it becomes a background run, its record and
-            // its run first, so its end finds them.
-            self.start_background_run(
-                &shared.run_slot,
-                &task_id,
-                session_id,
-                &run_label,
-                delegated_task_id,
-                status_tx.clone(),
-                run_began,
-            )
-            .await;
-            record_background(&self.state, &call).await;
-            if !shared.move_to_background() {
-                // It ended meanwhile, with its caller still answering for
-                // it: its answer is on its way, and the background run just
-                // started for it ends with it (a second end is a no-op).
-                forget_background(&self.state, &call).await;
-                if let (Some(run), Some(end)) = (
-                    shared.run_slot.get().cloned(),
-                    shared.end_record.get().cloned(),
-                ) {
-                    tokio::spawn(async move {
-                        run.finish(end.end, end.evidence).await;
-                    });
+            match shared.move_to_background() {
+                // Its wait ran out: it becomes a background run. Its end
+                // waits for `_done` to drop, so it finds its record and its
+                // place in its turn's group set up here.
+                Some(_done) => {
+                    self.start_background_run(
+                        &shared.run_slot,
+                        &task_id,
+                        session_id,
+                        &run_label,
+                        delegated_task_id,
+                        status_tx.clone(),
+                        run_began,
+                    )
+                    .await;
+                    record_background(&self.state, &call).await;
                 }
-                result = Ok((&mut completion_rx).await);
+                // It ended as the wait ran out: its caller answers for it,
+                // as if it had ended in time, and it never joins a group.
+                None => result = Ok((&mut completion_rx).await),
             }
         }
 
@@ -759,12 +790,9 @@ impl CliAgentTool {
                         );
                         let _ = tx.try_send(StatusUpdate::tool_complete(label, summary));
                     }
-                    Self::quarantine_unavailable_tool(
-                        &self.tools,
-                        &self.tool_names,
-                        tool_name,
-                        "authentication failed",
-                    );
+                    // Its run marked it not usable; it stays listed, so a
+                    // launch after the owner signs it in again asks it
+                    // again (`agent_mode::recheck`) and finds it ready.
                     return Err(CliAgentUnavailableError {
                         tool_name: tool_name.to_string(),
                         message: auth_msg,
@@ -900,7 +928,13 @@ impl CliAgentTool {
                 }
 
                 // Store the running agent for later checking/cancellation
-                let agent = tracked(&call, &shared, started_at_instant, prep.working_dir.clone());
+                let agent = tracked(
+                    &call,
+                    &shared,
+                    started_at_instant,
+                    prep.working_dir.clone(),
+                    prep.max_output,
+                );
                 self.running.lock().await.insert(task_id.clone(), agent);
                 // The reaper / cancel paths own the claim now (no await
                 // between the insert above and this disarm).
@@ -1384,7 +1418,13 @@ impl CliAgentTool {
                 .count();
             running.insert(
                 task_id.clone(),
-                tracked(&call, &shared, Instant::now(), prep.working_dir.clone()),
+                tracked(
+                    &call,
+                    &shared,
+                    Instant::now(),
+                    prep.working_dir.clone(),
+                    prep.max_output,
+                ),
             );
             ahead
         };
@@ -2399,14 +2439,9 @@ async fn watch_run(
         };
         let success =
             completion.success && run_phase.phase() == crate::run_state::RunPhase::Succeeded;
-        if completion.authentication_failed {
-            CliAgentTool::quarantine_unavailable_tool(
-                &handles.tools,
-                &handles.tool_names,
-                &tool_name_owned,
-                "authentication failed",
-            );
-        }
+        // A run that could not sign in marked its agent not usable above:
+        // it stays listed, so signing it in again makes it usable on the
+        // next launch's recheck, with no restart.
         // The agent's own report, then what it left running.
         let agent_report = completion.persisted_output;
         let persisted_output = match left.result_section() {
@@ -2466,7 +2501,11 @@ async fn watch_run(
         // Send proactive notification when no caller waits for completion
         // (async_mode, or a foreground run moved to background): decided
         // with the caller in one step, so exactly one of them answers.
-        if shared.ends_in_background() {
+        let ends_by = shared.ends_by();
+        if ends_by == EndsBy::Moved {
+            shared.moved.notified().await;
+        }
+        if ends_by != EndsBy::Caller {
             deliver_end(
                 &handles,
                 &call,
