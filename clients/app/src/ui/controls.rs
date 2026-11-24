@@ -1175,6 +1175,15 @@ pub fn corner_dot(tone: impl Fn() -> Tone + 'static) -> View {
 /// A count on an icon button's corner (a coding conversation's changed
 /// files): small, in the accent, ringed off what it sits on.
 pub fn corner_count(count: impl Fn() -> usize + 'static) -> View {
+    corner_count_toned(count, || Tone::Accent)
+}
+
+/// [`corner_count`] in a tone that says the state of what it counts
+/// (working, waiting on the owner, idle).
+pub fn corner_count_toned(
+    count: impl Fn() -> usize + 'static,
+    tone: impl Fn() -> Tone + 'static,
+) -> View {
     view()
         .absolute()
         .top(px(2.0))
@@ -1187,7 +1196,10 @@ pub fn corner_count(count: impl Fn() -> usize + 'static) -> View {
         .justify_center()
         .border(px(1.5))
         .border_color(colors::BACKGROUND)
-        .bg(colors::ACCENT)
+        .bg(move || match tone() {
+            Tone::Neutral => colors::FAINT,
+            tone => tone.color(),
+        })
         .accessibility_elements_hidden(true)
         .child(
             text(move || count().to_string())

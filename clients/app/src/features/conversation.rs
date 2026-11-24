@@ -1355,11 +1355,16 @@ fn header(store: Store, session: Option<String>) -> View {
         .child(when(
             move || store.has_participants(),
             move || {
+                // An icon like the bar's others: the count of agents on
+                // its corner, in the tone of the most pressing state (one
+                // waits on the owner, one works, all idle). The words are
+                // its label.
                 view().child(dynamic(move || {
                     let list = store.participants();
+                    let total = list.len();
                     let working = list.iter().filter(|p| p.working() && !p.waiting).count();
                     let waiting = list.iter().filter(|p| p.waiting).count();
-                    let mut label = match list.len() {
+                    let mut label = match total {
                         1 => "1 agent".to_string(),
                         n => format!("{n} agents"),
                     };
@@ -1369,11 +1374,21 @@ fn header(store: Store, session: Option<String>) -> View {
                     if working > 0 {
                         label.push_str(&format!(" · {working} working"));
                     }
+                    let tone = if waiting > 0 {
+                        ui::Tone::Warning
+                    } else if working > 0 {
+                        ui::Tone::Accent
+                    } else {
+                        ui::Tone::Neutral
+                    };
                     Some(untracked(move || {
-                        ui::btn(label, Variant::Ghost, Size::Sm, move || {
-                            store.show_detail(crate::store::AGENTS_TAB)
-                        })
-                        .into_element()
+                        view()
+                            .relative()
+                            .child(ui::icon_btn(Glyph::Work, label, Size::Md, move || {
+                                store.show_detail(crate::store::AGENTS_TAB)
+                            }))
+                            .child(ui::corner_count_toned(move || total, move || tone))
+                            .into_element()
                     }))
                 }))
             },

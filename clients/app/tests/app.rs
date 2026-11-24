@@ -874,8 +874,8 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.press("Back")?;
     app.wait_for("text:Fixed the slug.")?;
     // Its participants: one agent session, working, its two runs.
-    app.wait_for("text:1 agent · 1 working")?;
-    app.press("1 agent · 1 working")?;
+    app.wait_for("label:1 agent · 1 working")?;
+    app.press("label:1 agent · 1 working")?;
     app.wait_for("text:Codex >> nth=0")?;
     app.wait_for("text:working · 2 runs")?;
     // Its agent asks for an approval: the card names its run, and its row
@@ -884,7 +884,7 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
         r#"{"type":"event","seq":9,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"approval_requested","approval":{"id":"ap-thread","session_id":"app:synthetic-thread","kind":"command","risk":"medium","summary":"Run pytest","options":["approve_once","deny"],"requested_at_ms":4,"card":{"asked_by":"Codex","run":"cli-agent-t2","action":{"kind":"command","line":"pytest"}}}}}"#,
     )]);
     app.wait_for("text:waiting on you · 2 runs")?;
-    app.wait_for("text:1 agent · 1 waiting on you")?;
+    app.wait_for("label:1 agent · 1 waiting on you")?;
     feed([frame(
         r#"{"type":"event","seq":10,"at_ms":4,"session_id":"app:synthetic-thread","event":{"type":"approval_resolved","approval_id":"ap-thread","outcome":"approved"}}"#,
     )]);
@@ -907,7 +907,7 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.wait_for("text:pytest -q: said passed, but no run of it was seen")?;
     assert!(app.wait_for("text:pytest -q passed").is_err());
     app.press("Back")?;
-    app.press("1 agent")?;
+    app.press("label:1 agent")?;
     // The owner names it; the daemon keeps the name and every client shows it.
     app.press("Rename this agent")?;
     app.type_text("label:Agent name", "Designer")?;
