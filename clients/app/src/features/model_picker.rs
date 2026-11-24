@@ -133,6 +133,20 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         let session = session.clone();
         computed(move || store.model_of(session.as_deref()))
     };
+    // A new code conversation starts with who did the work in this
+    // device's last one.
+    if session.is_none() {
+        effect(move || {
+            if code.get()
+                && matches!(current.get().0, ModelChoice::Auto)
+                && let Some(agent) = store.last_code_agent()
+            {
+                untracked(|| {
+                    store.set_session_model(None, Some(ModelChoice::Agent { agent }), None)
+                });
+            }
+        });
+    }
     let label = computed(move || {
         let (model, effort) = current.get();
         let model = match model {
@@ -203,7 +217,11 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
                     },
                     pick: move |id: String| {
                         if let Some(model) = id.strip_prefix("model:") {
-                            store.set_session_model(session.as_deref(), Some(decode(model)), None);
+                            let model = decode(model);
+                            if code.get_untracked() {
+                                store.remember_code_worker(&model);
+                            }
+                            store.set_session_model(session.as_deref(), Some(model), None);
                         } else if let Some(effort) = id.strip_prefix("effort:") {
                             store.set_session_model(
                                 session.as_deref(),

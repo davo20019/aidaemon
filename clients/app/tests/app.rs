@@ -1746,6 +1746,14 @@ fn a_code_conversation_picks_who_does_the_work() -> Result<(), String> {
     // A chat has no folder for an agent: it goes back to AIDaemon's model.
     app.press("Chat")?;
     app.wait_for("Model and effort: Auto")?;
+    // Code again starts with the agent this device picked last.
+    app.press("Code")?;
+    app.wait_for("Who does the work: Codex")?;
+    // AIDaemon picked is remembered too.
+    app.press("Who does the work: Codex")?;
+    app.press("AIDaemon")?;
+    app.wait_for("Who does the work: AIDaemon")?;
+    app.press("Chat")?;
     app.press("Code")?;
     app.wait_for("Who does the work: AIDaemon")?;
     Ok(())

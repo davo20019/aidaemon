@@ -233,6 +233,10 @@ pub enum SidebarView {
 const NO_DETAILS: &str = "Each reply lists the tools it used under it";
 
 const LAST_PROJECT_KEY: &str = "aidaemon.last_project";
+/// Who did the work in this device's last code conversation: `auto`
+/// (AIDaemon) or a coding agent's id. A new code conversation starts with
+/// it.
+const LAST_WORKER_KEY: &str = "aidaemon.last_code_worker";
 const ACTIVITY_KEY: &str = "aidaemon.activity";
 const AUTOMATIONS_SEEN_KEY: &str = "aidaemon.automations-seen";
 const ENTER_QUEUES_KEY: &str = "aidaemon.enter-queues";
@@ -1522,6 +1526,30 @@ impl Store {
         effort: Option<aidaemon_client_protocol::Effort>,
     ) {
         self.act(|c| c.set_session_model(session, model, effort));
+    }
+
+    /// Remember who does the work in code conversations on this device
+    /// (the owner's pick in a code conversation's picker).
+    pub fn remember_code_worker(&self, model: &aidaemon_client_protocol::ModelChoice) {
+        let value = match model {
+            aidaemon_client_protocol::ModelChoice::Agent { agent } => agent.clone(),
+            _ => "auto".to_owned(),
+        };
+        let _ = nsh_core::storage::Storage::set_item(LAST_WORKER_KEY, value);
+    }
+
+    /// The coding agent this device last picked in a code conversation,
+    /// when it is still ready on the daemon's computer; `None`: AIDaemon.
+    pub fn last_code_agent(&self) -> Option<String> {
+        let last = nsh_core::storage::Storage::get_item(LAST_WORKER_KEY)?;
+        match self.model_options() {
+            Read::Ready(options) => options
+                .agents
+                .iter()
+                .any(|agent| agent.id == last)
+                .then_some(last),
+            _ => None,
+        }
     }
 
     pub fn automations(&self) -> AutomationsRead {
