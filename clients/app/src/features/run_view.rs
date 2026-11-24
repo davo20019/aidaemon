@@ -27,7 +27,8 @@ pub fn run_view(store: Store, id: String) -> View {
         computed(move || thread_of(&store.all_runs(), &id))
     };
     let latest = computed(move || thread.with(|runs| runs.last().cloned()));
-    // Who it is: the owner's name for it, and which agent.
+    // Who it is: its name ("Codex 2", or the owner's "Designer"), how it
+    // is headed ("Designer · Codex"), and whether it waits on the owner.
     let who = computed(move || {
         let Some(first) = thread.with(|runs| runs.first().cloned()) else {
             return (String::new(), String::new(), false);
@@ -37,12 +38,12 @@ pub fn run_view(store: Store, id: String) -> View {
             .participants()
             .into_iter()
             .find(|p| p.thread == first.id);
-        let name = person
-            .as_ref()
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| agent.clone());
+        let (name, title) = person.as_ref().map_or_else(
+            || (agent.clone(), agent.clone()),
+            |p| (p.name.clone(), p.title()),
+        );
         let waiting = person.is_some_and(|p| p.waiting);
-        (name, agent, waiting)
+        (name, title, waiting)
     });
     let ready = computed(move || matches!(store.run_view(), Read::Ready(_)));
     let scroller = element_ref();
@@ -86,18 +87,10 @@ pub fn run_view(store: Store, id: String) -> View {
                         .flex_1()
                         .min_w(px(0.0))
                         .child(
-                            text(move || {
-                                who.with(|(name, agent, _)| {
-                                    if name == agent || name.is_empty() {
-                                        agent.clone()
-                                    } else {
-                                        format!("{name} · {agent}")
-                                    }
-                                })
-                            })
-                            .number_of_lines(1)
-                            .text_size(px(ui::fit::body()))
-                            .font_weight(FontWeight::SEMIBOLD),
+                            text(move || who.with(|(_, title, _)| title.clone()))
+                                .number_of_lines(1)
+                                .text_size(px(ui::fit::body()))
+                                .font_weight(FontWeight::SEMIBOLD),
                         )
                         .child(
                             text(move || {

@@ -840,8 +840,10 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     ]);
     settle(&mut app)?;
     app.press("Fix the synthetic slug >> nth=0")?;
-    app.wait_for("text:Fix the slug · Codex")?;
-    app.press("Fix the slug · Codex, show what it did")?;
+    app.wait_for("text:Codex")?;
+    // The agent is named by its kind; its run's task heads the card's body.
+    app.wait_for("text:Fix the slug")?;
+    app.press("Codex, show what it did")?;
     let id = wait_sent("get_run")?;
     feed([frame(&format!(
         r#"{{"type":"ack","request_id":"{id}","result":{{"type":"run","run":{{"run_id":"cli-agent-t1","can_continue":true,"task":"Fix the slug","steps":[{{"words":"Editing slug.py","state":"done"}}]}}}}}}"#
@@ -858,7 +860,7 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     app.press("Send to the agent")?;
     wait_sent_new("send_message", before)?;
     app.wait_for("text:Also add a test")?;
-    app.wait_for("text:Sending to Fix the slug…")?;
+    app.wait_for("text:Sending to Codex…")?;
     // The run that takes it starts: the view moves to it.
     let before = sent("get_run");
     feed([frame(
@@ -874,7 +876,7 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     // Its participants: one agent session, working, its two runs.
     app.wait_for("text:1 agent · 1 working")?;
     app.press("1 agent · 1 working")?;
-    app.wait_for("text:Codex · Fix the slug")?;
+    app.wait_for("text:Codex >> nth=0")?;
     app.wait_for("text:working · 2 runs")?;
     // Its agent asks for an approval: the card names its run, and its row
     // says it waits on the owner until answered.
@@ -895,7 +897,7 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     // shows the first run's message and its reply count, which opens the
     // thread at the newest reply (what it said, its checks, and the claim
     // the record doesn't bear out).
-    app.wait_for("text:Fix the slug · Codex")?;
+    app.wait_for("text:Fixed the slug.")?;
     assert!(app.wait_for("text:Added a test for the slug.").is_err());
     let before = sent("get_run");
     app.press("1 reply, open the thread")?;
@@ -915,10 +917,10 @@ fn a_finished_agent_takes_a_follow_up_in_its_own_thread() -> Result<(), String> 
     feed([frame(
         r#"{"type":"event","seq":12,"at_ms":5,"session_id":"app:synthetic-thread","event":{"type":"agent_renamed","session_id":"app:synthetic-thread","thread":"cli-agent-t1","name":"Designer"}}"#,
     )]);
-    app.wait_for("text:Codex · Designer")?;
+    app.wait_for("text:Designer · Codex")?;
     // Its row opens its latest run, where a follow-up goes to it.
     let before = sent("get_run");
-    app.press("Codex · Designer, can continue · 2 runs · now, open its thread")?;
+    app.press("Designer · Codex, can continue · 2 runs · now, open its thread")?;
     wait_sent_new("get_run", before)?;
     Ok(())
 }

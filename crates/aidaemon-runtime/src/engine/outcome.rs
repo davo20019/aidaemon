@@ -139,6 +139,22 @@ fn finishing_call_output(outcome: &sdk::RunOutcome, tool: &str) -> Option<String
         .filter(|text| !text.trim().is_empty())
 }
 
+/// The run's last dispatched call launched a coding agent: nothing the
+/// model did came after the agent's answer. Read from the call's receipt,
+/// whose tool is the dispatched tool's own name.
+fn agent_run_was_last(outcome: &sdk::RunOutcome) -> bool {
+    outcome
+        .state
+        .receipts
+        .iter()
+        .rev()
+        .find(|receipt| receipt.stage == sdk::InvocationStage::Dispatched)
+        .is_some_and(|receipt| receipt.tool == CLI_AGENT_TOOL)
+}
+
+/// The coding-agent launcher's tool name, as its receipts carry it.
+const CLI_AGENT_TOOL: &str = "cli_agent";
+
 /// What a run settled, beyond its kernel status, that decides the turn's
 /// final status and outcome. Shared with run-end hooks (memory writers), so
 /// they judge a run exactly as the turn does.
@@ -163,8 +179,11 @@ pub struct TurnVerdict {
     /// verdict on unfinished work.
     pub handoff_reply: std::sync::Mutex<Option<String>>,
     /// The coding agents this turn started answered it themselves
-    /// ([`crate::run_state::RunStates::agents_answered`]) and the model added
-    /// nothing: the turn ships no reply of its own.
+    /// ([`crate::run_state::RunStates::agents_answered`]). When the model
+    /// did nothing after them, the turn ships no reply of its own: each
+    /// agent's message, its report checked, is the answer, and the model's
+    /// closing words would only repeat it (live 2026-11-23: told not to, it
+    /// restated a clean result two runs of two).
     pub answered_by_agents: std::sync::atomic::AtomicBool,
 }
 
@@ -233,10 +252,10 @@ impl TurnVerdict {
                 Some(answer) if reply.trim().is_empty() => answer,
                 _ => reply,
             };
-            if reply.trim().is_empty()
-                && self
-                    .answered_by_agents
-                    .load(std::sync::atomic::Ordering::Relaxed)
+            if self
+                .answered_by_agents
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && (reply.trim().is_empty() || agent_run_was_last(outcome))
             {
                 String::new()
             } else {
@@ -329,5 +348,50 @@ impl TurnVerdict {
         } else {
             (reply, status, task_outcome)
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_answer_tests {
+    use super::*;
+
+    fn receipt(tool: &str) -> sdk::Receipt {
+        serde_json::from_value(serde_json::json!({
+            "run_id": "00000000-0000-0000-0000-000000000001", "call_id": format!("call-{tool}"), "tool": tool,
+            "arguments": {}, "turn": 1, "stage": "dispatched", "status": "succeeded",
+            "read_only": false, "duration_ms": 1,
+        }))
+        .expect("a receipt")
+    }
+
+    fn outcome(tools: &[&str]) -> sdk::RunOutcome {
+        let mut state = sdk::RunState::new("aidaemon", "s", "make the note");
+        state
+            .receipts
+            .extend(tools.iter().map(|tool| receipt(tool)));
+        sdk::RunOutcome {
+            status: sdk::RunStatus::Completed,
+            final_text: Some("Codex created the note.".into()),
+            state,
+        }
+    }
+
+    /// A turn its agents answered ships no closing words when the agent's
+    /// run was the last thing it did; work after the agent keeps them, and
+    /// so does a turn whose agents' records don't bear them out.
+    #[test]
+    fn a_turn_its_agents_answered_ships_no_restatement() {
+        let private = aidaemon_core::ChannelVisibility::Private;
+        let answered = TurnVerdict::default();
+        answered
+            .answered_by_agents
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reply, ..) = answered.final_reply(&outcome(&["terminal", "cli_agent"]), &[], private);
+        assert_eq!(reply, "");
+        let (reply, ..) = answered.final_reply(&outcome(&["cli_agent", "terminal"]), &[], private);
+        assert_eq!(reply, "Codex created the note.");
+        let (reply, ..) =
+            TurnVerdict::default().final_reply(&outcome(&["cli_agent"]), &[], private);
+        assert_eq!(reply, "Codex created the note.");
     }
 }

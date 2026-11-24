@@ -113,7 +113,7 @@ fn shown(store: Store, p: ReadSignal<Participant>, editing: Signal<bool>) -> Vie
             _ => (Glyph::Check, colors::MUTED),
         })
     });
-    let title = computed(move || p.with(|p| format!("{} · {}", p.agent, p.name)));
+    let title = computed(move || p.with(Participant::title));
     let detail = computed(move || {
         store.tick();
         p.with(|p| {

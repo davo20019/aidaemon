@@ -748,20 +748,23 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             return String::new();
         };
         let thread = r.thread.clone().unwrap_or_else(|| r.id.clone());
-        let name = store
+        let title = store
             .participants()
             .into_iter()
             .find(|p| p.thread == thread)
-            .map(|p| p.name)
+            .map(|p| p.title())
+            .or_else(|| r.agent.clone())
             .unwrap_or_else(|| r.label.clone());
-        let agent = r.agent.clone().unwrap_or_default();
         let state = match r.phase {
             RunPhase::Failed => " · failed",
             RunPhase::Stopped => " · stopped",
             _ => "",
         };
-        format!("{name} · {agent}{state}")
+        format!("{title}{state}")
     });
+    // What this run was for: the agent's name stays, its task changes.
+    let task =
+        computed(move || run.with(|r| r.as_ref().map(|r| r.label.clone()).unwrap_or_default()));
     let open = id.clone();
     let body = move || {
         let Some(r) = run.get() else {
@@ -859,6 +862,12 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
                                 .text_size(px(type_scale::XS))
                                 .text_color(colors::FAINT),
                             ),
+                    )
+                    .child(
+                        text(move || task.get())
+                            .number_of_lines(1)
+                            .text_size(px(type_scale::XS))
+                            .text_color(colors::FAINT),
                     )
                     .child(dynamic(move || Some(untracked(body)))),
             ),

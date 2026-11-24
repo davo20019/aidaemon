@@ -16,8 +16,10 @@ pub struct Participant {
     pub thread: String,
     /// Its coding agent ("Claude Code").
     pub agent: String,
-    /// Its name: the one the owner gave it ("Designer"), else what it was
-    /// first started for (its first run's name).
+    /// Its name: the one the owner gave it ("Designer"), else its agent,
+    /// numbered when the conversation has several of that agent ("Codex",
+    /// "Codex 2"), in the order they started. A task's title would go
+    /// stale on the agent's next task.
     pub name: String,
     /// The owner named it.
     pub named: bool,
@@ -32,6 +34,16 @@ pub struct Participant {
 }
 
 impl Participant {
+    /// How a client heads it: its name and agent ("Designer · Codex"), or
+    /// its numbered agent alone ("Codex 2") when the owner didn't name it.
+    pub fn title(&self) -> String {
+        if self.named {
+            format!("{} · {}", self.name, self.agent)
+        } else {
+            self.name.clone()
+        }
+    }
+
     /// It is working now.
     pub fn working(&self) -> bool {
         self.latest.phase == RunPhase::Running
@@ -62,7 +74,7 @@ pub fn participants(
             None => threads.push((thread, vec![run])),
         }
     }
-    let mut out: Vec<Participant> = threads
+    let mut out: Vec<(u64, Participant)> = threads
         .into_iter()
         .filter_map(|(thread, mut list)| {
             list.sort_by_key(|run| run.started_at_ms);
@@ -77,18 +89,34 @@ pub fn participants(
                 .unwrap_or(0);
             let given = names.get(&thread);
             let waiting = list.iter().any(|run| asking.contains(&run.id));
-            Some(Participant {
-                agent: first.agent.clone().unwrap_or_default(),
-                name: given.cloned().unwrap_or_else(|| first.label.clone()),
-                named: given.is_some(),
-                waiting,
-                runs: list.len(),
-                thread,
-                latest,
-                last_activity_ms,
-            })
+            let agent = first.agent.clone().unwrap_or_default();
+            Some((
+                first.started_at_ms,
+                Participant {
+                    name: given.cloned().unwrap_or_else(|| agent.clone()),
+                    agent,
+                    named: given.is_some(),
+                    waiting,
+                    runs: list.len(),
+                    thread,
+                    latest,
+                    last_activity_ms,
+                },
+            ))
         })
         .collect();
+    // Each agent's sessions numbered in the order they started, the first
+    // plain: "Codex", "Codex 2".
+    out.sort_by(|(a, pa), (b, pb)| a.cmp(b).then(pa.thread.cmp(&pb.thread)));
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (_, p) in &mut out {
+        let n = seen.entry(p.agent.clone()).or_default();
+        *n += 1;
+        if !p.named && *n > 1 {
+            p.name = format!("{} {n}", p.agent);
+        }
+    }
+    let mut out: Vec<Participant> = out.into_iter().map(|(_, p)| p).collect();
     out.sort_by(|a, b| {
         b.waiting
             .cmp(&a.waiting)
@@ -147,13 +175,24 @@ mod tests {
         assert!(list[0].waiting && !list[1].waiting);
         let list = participants(&runs, &names, &Default::default());
         assert_eq!(list[0].thread, "a", "then the working one");
-        assert_eq!(list[0].name, "label a", "named by its first run");
+        assert_eq!(list[0].name, "Claude Code", "named by its agent");
+        assert_eq!(list[0].title(), "Claude Code");
         assert_eq!(list[0].latest.id, "a2");
         assert_eq!(list[0].runs, 2);
         assert!(list[0].working() && !list[0].can_continue());
         assert_eq!(list[1].thread, "b");
         assert!(list[1].can_continue());
         assert_eq!(list[1].name, "Designer", "the owner's name wins");
+        assert_eq!(list[1].title(), "Designer · Claude Code");
         assert!(list[1].named && !list[0].named);
+        // Unnamed, the second session of the same agent is numbered.
+        let list = participants(&runs, &Default::default(), &Default::default());
+        let named = |thread: &str| {
+            list.iter()
+                .find(|p| p.thread == thread)
+                .map(|p| p.name.clone())
+        };
+        assert_eq!(named("a").as_deref(), Some("Claude Code"));
+        assert_eq!(named("b").as_deref(), Some("Claude Code 2"));
     }
 }

@@ -535,20 +535,21 @@ impl TurnEngine<'_> {
         final_text: &str,
     ) -> sdk::StopDecision {
         // The coding agents this turn started answered it, each shown to the
-        // owner as its own message with its record-checked report: a model
-        // that adds nothing ends the turn with no reply, not a repeat. From
-        // the runs' typed records, never the reply.
-        if final_text.trim().is_empty()
-            && self
-                .running_children()
-                .runs()
-                .agents_answered(scope.task_id)
+        // owner as its own message with its record-checked report. From the
+        // runs' typed records, never the reply: what ships is settled in
+        // `TurnVerdict::final_reply`, and an empty reply needs no repair.
+        if self
+            .running_children()
+            .runs()
+            .agents_answered(scope.task_id)
         {
             scope
                 .verdict
                 .answered_by_agents
                 .store(true, Ordering::Relaxed);
-            return sdk::StopDecision::Accept;
+            if final_text.trim().is_empty() {
+                return sdk::StopDecision::Accept;
+            }
         }
         let latest = scope
             .latest_tool_output
