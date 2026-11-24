@@ -284,8 +284,12 @@ pub(super) struct StartedRun {
     run_tag: String,
     invocation_id: i64,
     started_at: Instant,
-    /// Its write roots and what they held when it started.
+    /// Its write roots and what they held when it started: the paths it
+    /// was given to write, or its whole folder when it may write anywhere
+    /// in it.
     watched: Vec<String>,
+    /// It was given paths to write: sent to change them.
+    sent_to_write: bool,
     receipt_before: TreeReceipt,
     /// Its file write roots' marks when it started ([`file_marks`]).
     files_before: Vec<FileMark>,
@@ -1640,10 +1644,15 @@ impl RunHandles {
         }
         // What its write roots hold now: its end is judged by whether they
         // changed. A read-only run changes nothing by contract.
-        let watched = if prep.workspace_mode == CliWorkspaceMode::ReadWrite {
-            prep.write_paths.clone()
-        } else {
-            Vec::new()
+        // A run that may write anywhere in its folder (no write paths given,
+        // as in a conversation set to the agent) is watched over that whole
+        // folder, so the files it changes are seen.
+        let sent_to_write =
+            prep.workspace_mode == CliWorkspaceMode::ReadWrite && !prep.write_paths.is_empty();
+        let watched = match prep.workspace_mode {
+            CliWorkspaceMode::ReadWrite if sent_to_write => prep.write_paths.clone(),
+            CliWorkspaceMode::ReadWrite => prep.working_dir.iter().cloned().collect(),
+            CliWorkspaceMode::ReadOnly => Vec::new(),
         };
         let receipt_before = tree_receipt(&self.backend, &watched).await;
         let files_before = file_marks(&self.backend, &watched).await;
@@ -1869,6 +1878,7 @@ impl RunHandles {
             invocation_id,
             started_at,
             watched,
+            sent_to_write,
             receipt_before,
             files_before,
             diff_dir,
@@ -1906,6 +1916,7 @@ async fn watch_run(
         invocation_id,
         started_at: invocation_started_at,
         watched: watched_for_task,
+        sent_to_write,
         receipt_before: receipt_before_for_task,
         files_before: files_before_for_task,
         diff_dir: notify_working_dir,
@@ -1923,7 +1934,7 @@ async fn watch_run(
     // A run given paths to write was sent to change them, so ending with
     // nothing changed is ending short. The owner's own follow-up is given
     // its folder as leave to write, not as work: it may only answer.
-    let expects_change = !watched_for_task.is_empty() && !call.owner_follow_up;
+    let expects_change = sent_to_write && !call.owner_follow_up;
     let auth_failed_for_task = shared.auth_failed.clone();
     let task_context = call.label.clone();
     let coding_agent_for_task = coding_agent;

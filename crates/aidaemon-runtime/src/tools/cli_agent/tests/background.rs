@@ -1051,3 +1051,92 @@ async fn a_sync_cli_run_that_changed_nothing_is_a_failed_call() {
         Some(ToolOutcomeStatus::FailedPermanent)
     );
 }
+
+/// A run's answer is what its agent's adapter read from its typed final
+/// event: Claude Code's report in `structured_output`, as the report's
+/// text, never the JSON it also writes as `result`.
+#[tokio::test]
+async fn a_runs_answer_is_its_adapters_typed_report() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(TestStore::open(db.path().to_str().unwrap()).await);
+    let runs = Arc::new(crate::run_state::RunStates::default());
+    runs.begin("cli-agent-r2", "app:synthetic-report", "Claude Code", None);
+    let agent = aidaemon_coding_agents::CodingAgents::builtin().for_program("claude");
+    let mut recorder = crate::tools::cli_agent_events::AgentEventRecorder::new(
+        agent,
+        store.clone() as Arc<dyn CliAgentStore>,
+        8,
+        runs.clone(),
+        "cli-agent-r2".to_string(),
+    );
+    assert_eq!(recorder.reported_text(), None);
+    let report = serde_json::json!({
+        "summary": "Renamed the button to Send.",
+        "changed_files": ["form.html"],
+        "checks": [],
+        "open_questions": [],
+        "needs_owner": false,
+    });
+    let last = serde_json::json!({
+        "type": "result",
+        "result": report.to_string(),
+        "structured_output": report,
+    });
+    recorder.read(&last.to_string()).await;
+    assert_eq!(
+        recorder.reported_text().as_deref(),
+        Some("Renamed the button to Send.\n\nChanged files:\n- form.html")
+    );
+}
+
+/// A run that may write anywhere in its folder (no write paths, as in a
+/// conversation set to the agent) is watched over that folder: a file it
+/// writes is seen as its change, and one that only answers is not a run
+/// that fell short.
+#[tokio::test]
+#[cfg_attr(windows, ignore = "Unix shell agent; the typing is platform-neutral")]
+async fn a_whole_folder_run_is_watched_over_its_folder() {
+    let (tool, _db) = setup_bash_tool().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().to_string_lossy().to_string();
+    let wrote = json!({
+        "action": "run",
+        "tool": "bash-agent",
+        "prompt": format!("echo ok > {root}/heron.txt"),
+        "working_dir": root,
+        "workspace_mode": "read_write",
+    });
+    let outcome = tool
+        .outcome_with_facts(
+            &wrote.to_string(),
+            None,
+            false,
+            &aidaemon_tools::testing::call_facts("session-cli-whole"),
+        )
+        .await
+        .unwrap();
+    assert!(dir.path().join("heron.txt").exists(), "{}", outcome.output);
+    assert!(
+        outcome.metadata.semantics.mutates_state(),
+        "{}",
+        outcome.output
+    );
+
+    let answered = json!({
+        "action": "run",
+        "tool": "bash-agent",
+        "prompt": "echo 'Nothing to change.'",
+        "working_dir": root,
+        "workspace_mode": "read_write",
+    });
+    let outcome = tool
+        .outcome_with_facts(
+            &answered.to_string(),
+            None,
+            false,
+            &aidaemon_tools::testing::call_facts("session-cli-whole-answer"),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.output.starts_with("ERROR:"), "{}", outcome.output);
+}
