@@ -2622,11 +2622,7 @@ impl ClientGateway {
                 .collect();
             ended.sort_by_key(|run| run.started_at_ms);
             let skip = ended.len().saturating_sub(RECENT_RESULTS);
-            ended
-                .into_iter()
-                .skip(skip)
-                .filter_map(|run| run.result.as_ref().map(result_line))
-                .collect()
+            ended.into_iter().skip(skip).filter_map(run_line).collect()
         };
         aidaemon_client_protocol::participants::participants(&runs, &names, &asking)
             .into_iter()
@@ -2733,6 +2729,34 @@ fn internal(error: anyhow::Error) -> ProtocolError {
 
 /// A run's result in one short line for its conversation's turn: its reply,
 /// then its typed facts. Every part is from the typed result.
+/// One ended run as an agent's turn is told it: who asked it what (the
+/// owner directly, or the turn's own agent), how it ended when not well,
+/// then its result. From the run's typed record.
+fn run_line(run: &aidaemon_client_protocol::RunSummary) -> Option<String> {
+    use aidaemon_client_protocol::RunPhase;
+    let result = result_line(run.result.as_ref()?);
+    let asked = run.asked.as_ref().map(|asked| {
+        let what = aidaemon_channels::presentation::word_preview(&asked.text, 120);
+        if asked.by_owner {
+            format!("The owner asked it directly (not you): \"{what}\"")
+        } else {
+            format!("You asked: \"{what}\"")
+        }
+    });
+    let ended = match run.phase {
+        RunPhase::Failed => Some("It failed."),
+        RunPhase::Stopped => Some("It was stopped."),
+        _ => None,
+    };
+    let mut line = String::new();
+    for part in [asked.as_deref(), ended].into_iter().flatten() {
+        line.push_str(part);
+        line.push_str(" → ");
+    }
+    line.push_str(&result);
+    Some(line)
+}
+
 fn result_line(result: &aidaemon_client_protocol::RunResult) -> String {
     use aidaemon_client_protocol::RunMismatch;
     let mut line = aidaemon_channels::presentation::word_preview(&result.text, 240);
@@ -2784,6 +2808,36 @@ fn result_line(result: &aidaemon_client_protocol::RunResult) -> String {
         line.push_str(&format!(" Record disagrees: {}.", mismatches.join("; ")));
     }
     line
+}
+
+#[cfg(test)]
+mod run_line_tests {
+    use super::run_line;
+
+    /// An agent's turn reads who asked each run: the owner's direct
+    /// follow-up is never its own delegation.
+    #[test]
+    fn a_run_line_says_who_asked_and_how_it_ended() {
+        let run = |asked: serde_json::Value, phase: &str| {
+            serde_json::from_value::<aidaemon_client_protocol::RunSummary>(serde_json::json!({
+                "id": "cli-agent-1", "session_id": "app:synthetic", "label": "x",
+                "phase": phase, "background": true, "started_at_ms": 1,
+                "asked": asked, "result": {"text": "Appended a line."},
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            run_line(&run(serde_json::json!({"text": "What did you append?", "by_owner": true}), "succeeded")),
+            Some(
+                "The owner asked it directly (not you): \"What did you append?\" → Appended a line."
+                    .into()
+            )
+        );
+        assert_eq!(
+            run_line(&run(serde_json::json!({"text": "Fix the slug"}), "failed")),
+            Some("You asked: \"Fix the slug\" → It failed. → Appended a line.".into())
+        );
+    }
 }
 
 #[cfg(test)]

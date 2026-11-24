@@ -130,11 +130,16 @@ fn follow_up_script(
             // it. Typed state, never the call's words.
             runs.for_chat(&chat)
                 .into_iter()
-                .find(|run| run.continues.as_deref() == Some(earlier.as_str()) && run.started_at >= since)
+                .find(|run| {
+                    run.continues.as_deref() == Some(earlier.as_str()) && run.started_at >= since
+                })
                 .map(|run| {
                     let agent = run.agent.unwrap_or_else(|| "The agent".to_string());
+                    // The owner's own message to the agent, not this agent's
+                    // delegation: said so, for every later turn reading it.
                     format!(
-                        "Passed on to {agent}: it goes on in its own session, and its work shows in its thread."
+                        "You sent this to {agent} directly, in its thread; I didn't delegate it. \
+                         Its answer shows in that thread."
                     )
                 })
         },
