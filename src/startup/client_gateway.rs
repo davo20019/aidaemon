@@ -436,7 +436,9 @@ fn shown_input(arguments: &serde_json::Value) -> String {
 fn shown_result(m: &crate::traits::Message) -> String {
     shown_output(&aidaemon_runtime::background_run::owner_call_result(
         m.content.as_deref().unwrap_or_default(),
-        &m.effective_annotations(),
+        // As stored; none stored: read from the result once its receipt
+        // line is off.
+        &m.annotations,
     ))
 }
 
@@ -1779,8 +1781,14 @@ mod tests {
         let launch =
             aidaemon_runtime::background_run::started_in_background("synthetic coding agent");
         let mut stored = crate::traits::Message::new_runtime("m1", "app:s1", "tool");
+        // As history rebuilds it: the receipt line for the model comes first.
         stored.content = Some(format!(
-            "{}\n\n[SYSTEM] A background task is now running. Do NOT call additional tools.",
+            "[Tool receipt v7: stage=Dispatched; outcome=backgrounded; dispatched=true; \
+             background_started=true; detached=false; exit_code=none; bytes_returned=228; \
+             denial=none; result_id=sha256:synthetic; source=tool_output; model_view=complete; \
+             durable_view=complete; requested_range=not_applicable; \
+             returned_range=not_applicable]\n\
+             {}\n\n[SYSTEM] A background task is now running. Do NOT call additional tools.",
             aidaemon_policies::wrap_untrusted(
                 "cli_agent",
                 &format!(

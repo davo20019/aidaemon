@@ -55,7 +55,8 @@ pub fn is_launch_line(text: &str) -> bool {
 }
 
 /// What the owner's app shows of a call's result: its own content (the
-/// daemon's untrusted-data frame and the notices it appends taken off, by
+/// receipt line history puts before it for the model, the daemon's
+/// untrusted-data frame and the notices it appends taken off, by
 /// `annotations`, inferred from the text when empty) and, of a call that
 /// started a background run, its launch line alone: what follows it is the
 /// model's instructions for checking on the run.
@@ -63,6 +64,7 @@ pub fn owner_call_result(
     content: &str,
     annotations: &[aidaemon_events::traits::MessageAnnotation],
 ) -> String {
+    let content = aidaemon_events::payloads::ToolReceiptV1::without_context_header(content);
     let primary = aidaemon_events::traits::extract_primary_message_content(content, annotations);
     match primary.lines().next() {
         // Machine marker: the launch line this module writes.

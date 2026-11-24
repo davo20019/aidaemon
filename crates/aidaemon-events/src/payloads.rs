@@ -528,8 +528,7 @@ impl ToolReceiptV1 {
     /// text does not start with one. This reads the daemon's own machine
     /// line, never the result's words.
     pub fn outcome_in_context_header(text: &str) -> Option<ToolOutcomeStatus> {
-        let line = text.trim_start().lines().next()?;
-        let fields = line.strip_prefix("[Tool receipt v")?.strip_suffix(']')?;
+        let fields = Self::context_header_fields(text)?;
         let (_, fields) = fields.split_once(": ")?;
         let value = fields
             .split("; ")
@@ -544,6 +543,25 @@ impl ToolReceiptV1 {
         ]
         .into_iter()
         .find(|status| status.as_str() == value)
+    }
+
+    /// The fields of the receipt line [`Self::context_header`] wrote at the
+    /// start of `text`, or `None` when it does not start with one.
+    fn context_header_fields(text: &str) -> Option<&str> {
+        let line = text.trim_start().lines().next()?;
+        // Machine marker: the line `context_header` writes.
+        line.strip_prefix("[Tool receipt v")?.strip_suffix(']')
+    }
+
+    /// A reconstructed tool result without the receipt line
+    /// [`Self::context_header`] put before it for the model; the text as it
+    /// is when it starts with none.
+    pub fn without_context_header(text: &str) -> &str {
+        if Self::context_header_fields(text).is_none() {
+            return text;
+        }
+        let text = text.trim_start();
+        text.split_once('\n').map_or("", |(_, rest)| rest)
     }
 
     /// Compact trusted control-plane header prepended when a durable tool
