@@ -774,13 +774,20 @@ fn agent_message(store: Store, id: String, row: ReadSignal<WorkRow>) -> View {
             return view();
         };
         let mut body = view().gap_1();
-        if !result.text.is_empty() {
-            body = body.child(
-                text(result.text.clone())
-                    .selectable(true)
-                    .text_size(px(ui::fit::body()))
-                    .text_color(colors::TEXT),
-            );
+        // In a conversation set to a coding agent, the agent's whole reply
+        // follows as the conversation's answer: the card does not repeat
+        // it, shortened.
+        let direct = untracked(|| {
+            store.selected().is_some_and(|session| {
+                matches!(
+                    store.model_of(Some(&session)).0,
+                    aidaemon_client_protocol::ModelChoice::Agent { .. }
+                )
+            })
+        });
+        if !result.text.is_empty() && !direct {
+            let reply = result.text.clone();
+            body = body.child(markdown(move || reply.clone().into(), || false));
         }
         let fact = |glyph: Glyph, tone: ui::Tone, words: String| {
             view()
@@ -2300,7 +2307,7 @@ fn note(content: impl Fn() -> String + 'static) -> View {
 
 /// A reply, as the agent's Markdown. HTML in it is shown as text: what the
 /// model writes never becomes markup.
-fn markdown(
+pub(crate) fn markdown(
     content: impl Fn() -> SharedString + 'static,
     streaming: impl Fn() -> bool + 'static,
 ) -> impl IntoElement {

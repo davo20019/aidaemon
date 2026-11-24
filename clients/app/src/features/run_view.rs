@@ -237,12 +237,12 @@ fn answer(store: Store, run: &RunSummary) -> View {
         .filter(|text| !text.is_empty());
     match (&reply, run.phase) {
         (Some(reply), _) => {
-            said = said.child(
-                text(reply.clone())
-                    .selectable(true)
-                    .text_size(px(ui::fit::body()))
-                    .text_color(colors::TEXT),
-            );
+            // The agent's reply is Markdown, as a model's is.
+            let reply = reply.clone();
+            said = said.child(super::conversation::markdown(
+                move || reply.clone().into(),
+                || false,
+            ));
         }
         (None, RunPhase::Failed | RunPhase::Stopped) => {
             let why = run.reason.clone().unwrap_or_else(|| match run.phase {
