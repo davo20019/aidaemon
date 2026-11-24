@@ -1760,6 +1760,34 @@ fn a_code_conversation_picks_who_does_the_work() -> Result<(), String> {
 }
 
 #[test]
+fn a_phone_starts_a_new_conversation_in_the_project_on_screen() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start_at(390.0, 844.0);
+    app.wait_for("What can I help you with?")?;
+    feed([
+        Update::Connected,
+        frame(
+            r#"{"type":"ack","request_id":"r0","result":{"type":"projects","projects":[{"id":"project-acme","name":"Acme site","path":"/home/synthetic/acme-site"}]}}"#,
+        ),
+        frame(
+            r#"{"type":"ack","request_id":"r1","result":{"type":"sessions","sessions":[{"id":"app:synthetic-p1","channel":"app","title":"Contact form copy","writable":true,"project_id":"project-acme"}]}}"#,
+        ),
+    ]);
+    app.press("label:Conversations")?;
+    app.wait_for("Contact form copy")?;
+    app.press("Contact form copy >> nth=0")?;
+    app.wait_for_gone("Search conversations", std::time::Duration::from_secs(2))?;
+    app.wait_for("Acme site · /home/synthetic/acme-site")?;
+    // The drawer's pencil, from a conversation in a project: a new one on
+    // code in that project's folder.
+    app.press("label:Conversations")?;
+    app.press("label:New conversation >> nth=0")?;
+    app.wait_for("Which project is this for?")?;
+    app.wait_for("/home/synthetic/acme-site")?;
+    Ok(())
+}
+
+#[test]
 fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed()
 -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());

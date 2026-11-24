@@ -546,7 +546,12 @@ fn top_line(store: Store, query: Signal<String>, status_shown: Signal<bool>) -> 
 fn new_here(store: Store) {
     match untracked(|| store.sidebar_view()) {
         SidebarView::Project(id) => store.new_in_project(Some(id)),
-        _ => store.with_keyboard(|| store.select(None)),
+        // From a conversation in a project: a new one on code in the same
+        // project's folder.
+        _ => match untracked(|| store.current_project()) {
+            Some(project) => store.new_in_project(Some(project)),
+            None => store.with_keyboard(|| store.select(None)),
+        },
     }
 }
 
