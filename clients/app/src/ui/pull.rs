@@ -94,11 +94,13 @@ where
         if !released {
             up.set(pull.max(0.0));
         } else if pull >= ARMED {
-            spinning.set(true);
+            // The least spin and the reads first: the effect below ends a
+            // refresh as soon as `spinning` is set without them.
             least.set(true);
             set_timeout(LEAST_SPIN, move || least.set(false));
-            settle(PULL_HEIGHT);
             refresh();
+            settle(PULL_HEIGHT);
+            spinning.set(true);
         } else {
             settle(0.0);
         }
@@ -148,9 +150,17 @@ where
         list
     };
     let shown = computed(move || spinning.get());
+    // The list rises with the pull, as it moves down at the top, leaving
+    // the chip room at its end.
     view()
         .flex_1()
-        .child(refreshable(list, refreshing, refresh))
+        .overflow_hidden()
+        .child(
+            view()
+                .flex_1()
+                .bind_translate_y(&up.interpolate(&[0.0, PULL_HEIGHT], &[0.0, -PULL_HEIGHT]))
+                .child(refreshable(list, refreshing, refresh)),
+        )
         .child(indicator_at(up, shown, Edge::Bottom))
 }
 
