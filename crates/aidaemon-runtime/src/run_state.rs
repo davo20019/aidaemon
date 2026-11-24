@@ -1225,6 +1225,20 @@ impl RunStates {
             })
     }
 
+    /// The files the runs chat turn `request` started changed, by their
+    /// records.
+    pub fn edited_for(&self, request: &str) -> Vec<String> {
+        let runs = self.lock();
+        let mut edited: Vec<String> = runs
+            .values()
+            .filter(|entry| entry.state.request.as_deref() == Some(request))
+            .flat_map(|entry| entry.state.edited.iter().cloned())
+            .collect();
+        edited.sort();
+        edited.dedup();
+        edited
+    }
+
     /// The chat's runs, oldest first.
     pub fn for_chat(&self, chat: &str) -> Vec<RunState> {
         let runs = self.lock();

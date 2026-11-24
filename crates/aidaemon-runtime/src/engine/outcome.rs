@@ -139,17 +139,40 @@ fn finishing_call_output(outcome: &sdk::RunOutcome, tool: &str) -> Option<String
         .filter(|text| !text.trim().is_empty())
 }
 
-/// The run's last dispatched call launched a coding agent: nothing the
-/// model did came after the agent's answer. Read from the call's receipt,
-/// whose tool is the dispatched tool's own name.
-fn agent_run_was_last(outcome: &sdk::RunOutcome) -> bool {
+/// The run's last dispatched call launched a coding agent, but for reads
+/// of files that agent changed (`edited`, its record's): nothing the model
+/// did after the agent's answer was work of its own. Read from the calls'
+/// receipts, whose tool is the dispatched tool's own name.
+fn agent_run_was_last(outcome: &sdk::RunOutcome, edited: &[String]) -> bool {
     outcome
         .state
         .receipts
         .iter()
         .rev()
-        .find(|receipt| receipt.stage == sdk::InvocationStage::Dispatched)
+        .filter(|receipt| receipt.stage == sdk::InvocationStage::Dispatched)
+        .find(|receipt| !reads_an_edited_file(receipt, edited))
         .is_some_and(|receipt| receipt.tool == CLI_AGENT_TOOL)
+}
+
+/// A read-only call whose `path` argument names one of `edited`.
+fn reads_an_edited_file(receipt: &sdk::Receipt, edited: &[String]) -> bool {
+    // Machine format: the call's JSON `path` argument, a file path, matched
+    // as a path (whole trailing components), never as prose.
+    let Some(path) = receipt
+        .read_only
+        .then(|| receipt.arguments.get("path"))
+        .flatten()
+    else {
+        return false;
+    };
+    let Some(path) = path.as_str() else {
+        return false;
+    };
+    let path = path.trim_start_matches("~/").trim_start_matches("./");
+    !path.is_empty()
+        && edited
+            .iter()
+            .any(|file| file == path || file.ends_with(&format!("/{path}")))
 }
 
 /// The coding-agent launcher's tool name, as its receipts carry it.
@@ -185,6 +208,9 @@ pub struct TurnVerdict {
     /// closing words would only repeat it (live 2026-11-23: told not to, it
     /// restated a clean result two runs of two).
     pub answered_by_agents: std::sync::atomic::AtomicBool,
+    /// The files those agents' runs changed, by their records: reading them
+    /// back after the agents is no work of the turn's own.
+    pub agents_edited: std::sync::Mutex<Vec<String>>,
 }
 
 impl TurnVerdict {
@@ -255,7 +281,14 @@ impl TurnVerdict {
             if self
                 .answered_by_agents
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && (reply.trim().is_empty() || agent_run_was_last(outcome))
+                && (reply.trim().is_empty() || {
+                    let edited = self
+                        .agents_edited
+                        .lock()
+                        .map(|edited| edited.clone())
+                        .unwrap_or_default();
+                    agent_run_was_last(outcome, &edited)
+                })
             {
                 String::new()
             } else {
@@ -356,10 +389,15 @@ mod agent_answer_tests {
     use super::*;
 
     fn receipt(tool: &str) -> sdk::Receipt {
+        read(tool, serde_json::json!({}), false)
+    }
+
+    fn read(tool: &str, arguments: serde_json::Value, read_only: bool) -> sdk::Receipt {
         serde_json::from_value(serde_json::json!({
-            "run_id": "00000000-0000-0000-0000-000000000001", "call_id": format!("call-{tool}"), "tool": tool,
-            "arguments": {}, "turn": 1, "stage": "dispatched", "status": "succeeded",
-            "read_only": false, "duration_ms": 1,
+            "run_id": "00000000-0000-0000-0000-000000000001",
+            "call_id": format!("call-{tool}"), "tool": tool,
+            "arguments": arguments, "turn": 1, "stage": "dispatched", "status": "succeeded",
+            "read_only": read_only, "duration_ms": 1,
         }))
         .expect("a receipt")
     }
@@ -393,5 +431,27 @@ mod agent_answer_tests {
         let (reply, ..) =
             TurnVerdict::default().final_reply(&outcome(&["cli_agent"]), &[], private);
         assert_eq!(reply, "Codex created the note.");
+
+        // Reading back the file the agent changed is no work of its own.
+        *answered.agents_edited.lock().unwrap() = vec!["/home/synthetic/notes/robin.md".into()];
+        let mut read_back = outcome(&["cli_agent"]);
+        read_back.state.receipts.push(read(
+            "read_file",
+            serde_json::json!({"path": "~/notes/robin.md"}),
+            true,
+        ));
+        let (reply, ..) = answered.final_reply(&read_back, &[], private);
+        assert_eq!(reply, "", "a read-back of the agent's file");
+        let mut other = outcome(&["cli_agent"]);
+        other.state.receipts.push(read(
+            "read_file",
+            serde_json::json!({"path": "~/notes/other.md"}),
+            true,
+        ));
+        let (reply, ..) = answered.final_reply(&other, &[], private);
+        assert_eq!(
+            reply, "Codex created the note.",
+            "a read of another file is work"
+        );
     }
 }

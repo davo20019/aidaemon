@@ -547,6 +547,9 @@ impl TurnEngine<'_> {
                 .verdict
                 .answered_by_agents
                 .store(true, Ordering::Relaxed);
+            if let Ok(mut edited) = scope.verdict.agents_edited.lock() {
+                *edited = self.running_children().runs().edited_for(scope.task_id);
+            }
             if final_text.trim().is_empty() {
                 return sdk::StopDecision::Accept;
             }
