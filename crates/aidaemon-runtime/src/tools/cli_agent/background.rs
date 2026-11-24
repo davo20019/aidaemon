@@ -98,7 +98,17 @@ impl CliAgentTool {
                 Self::auth_error_message(&agent.tool_name)
             );
         }
-        let result = extract_meaningful_output(&stdout_output, 10000);
+        // Its end's verdict when it was judged (a run that failed reads as
+        // failed, with why), else what its output says.
+        let verdict = agent.verdict.get();
+        let result = match verdict {
+            Some(verdict) => truncate_with_note(&verdict.text, 10000),
+            None => extract_meaningful_output(&stdout_output, 10000),
+        };
+        let ended = match verdict {
+            Some(verdict) if !verdict.success => "failed",
+            _ => "finished",
+        };
 
         // Capture git diff for finished background tasks.
         let diff_section = if let Some(base) = agent.diff_dir.get() {
@@ -110,7 +120,7 @@ impl CliAgentTool {
         };
 
         let mut final_result = format!(
-            "CLI agent '{}' finished after {}s.\n\nResult:\n{}",
+            "CLI agent '{}' {ended} after {}s.\n\nResult:\n{}",
             agent.tool_name, elapsed, result
         );
         if let Some(diff) = diff_section {

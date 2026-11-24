@@ -39,6 +39,32 @@ impl WriteScope {
         }
     }
 
+    /// The absolute roots it may change, for a run in `dir`: the folder
+    /// itself when it may change anything there.
+    fn roots<'a>(&'a self, dir: &'a str) -> Vec<&'a str> {
+        match self {
+            Self::ReadOnly => Vec::new(),
+            Self::Whole => vec![dir],
+            Self::Paths(paths) => paths.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// Whether a run in `dir` with this scope could change a file that a
+    /// run in `other_dir` with `other` could. Runs in one folder compare
+    /// scopes ([`Self::overlaps`]); runs in different folders compare the
+    /// roots they may change, so a run over a whole repository collides
+    /// with one in its `src` folder, and two folders' runs given the same
+    /// write path collide.
+    pub(super) fn collides(&self, dir: &str, other: &Self, other_dir: &str) -> bool {
+        if dir == other_dir {
+            return self.overlaps(other);
+        }
+        let theirs = other.roots(other_dir);
+        self.roots(dir)
+            .iter()
+            .any(|a| theirs.iter().any(|b| holds(a, b) || holds(b, a)))
+    }
+
     /// The scope in words, for a refusal.
     fn words(&self) -> String {
         match self {
@@ -63,12 +89,22 @@ pub(super) struct WorkingDirClaim {
     pub(super) writes: WriteScope,
 }
 
-/// The running claim of `claims` that `writes` would collide with.
+/// The live claim, in any folder, that a run in `dir` with `writes` would
+/// collide with, and the folder it holds. `gone` names the tasks whose claim
+/// no longer counts: the run asking, and runs that already finished (the
+/// reaper releases their claims only at the tool's next call).
 pub(super) fn conflicting<'a>(
-    claims: &'a [WorkingDirClaim],
+    claims: &'a HashMap<String, Vec<WorkingDirClaim>>,
+    dir: &str,
     writes: &WriteScope,
-) -> Option<&'a WorkingDirClaim> {
-    claims.iter().find(|claim| claim.writes.overlaps(writes))
+    gone: impl Fn(&str) -> bool,
+) -> Option<(&'a str, &'a WorkingDirClaim)> {
+    claims.iter().find_map(|(held_dir, held)| {
+        held.iter()
+            .filter(|claim| !gone(&claim.task_id))
+            .find(|claim| claim.writes.collides(held_dir, writes, dir))
+            .map(|claim| (held_dir.as_str(), claim))
+    })
 }
 
 /// Why a run cannot start beside `claim` in `dir`.
@@ -139,12 +175,10 @@ pub(super) async fn try_take_folder(
         return FolderTurn::Waits(None);
     }
     let mut claims = lock_claims(claims_map);
-    let blocker = claims.get(&wait.dir).and_then(|held| {
-        held.iter()
-            .filter(|claim| claim.task_id != task_id && !finished(&claim.task_id))
-            .find(|claim| claim.writes.overlaps(&wait.writes))
-            .map(|claim| claim.tool_name.clone())
-    });
+    let blocker = conflicting(&claims, &wait.dir, &wait.writes, |id| {
+        id == task_id || finished(id)
+    })
+    .map(|(_, claim)| claim.tool_name.clone());
     if let Some(blocker) = blocker {
         return FolderTurn::Waits(Some(blocker));
     }

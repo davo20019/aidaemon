@@ -1140,3 +1140,28 @@ async fn a_whole_folder_run_is_watched_over_its_folder() {
         .unwrap();
     assert!(!outcome.output.starts_with("ERROR:"), "{}", outcome.output);
 }
+
+#[tokio::test]
+async fn a_check_on_a_failed_background_run_reads_as_failed_with_why() {
+    let (tool, _db) = setup_bash_tool().await;
+    let started = tool
+        .call(
+            r#"{"action":"run","tool":"bash-agent","prompt":"echo synthetic-failure-note >&2; exit 3","async_mode":true}"#,
+        )
+        .await
+        .unwrap();
+    let task_id = started_task_id(&started);
+    let check = format!(r#"{{"action":"check","task_id":"{task_id}"}}"#);
+    let mut result = String::new();
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        result = tool.call(&check).await.unwrap();
+        if !result.contains("still running") {
+            break;
+        }
+    }
+    assert!(
+        result.contains("failed after") && !result.contains("finished after"),
+        "a failed run reads as failed: {result}"
+    );
+}

@@ -496,3 +496,64 @@ async fn the_files_a_run_changed_in_its_folder_are_found() {
     expected.sort();
     assert_eq!(changed, expected);
 }
+
+#[test]
+fn runs_in_different_folders_collide_where_their_roots_meet() {
+    let paths = |p: &[&str]| WriteScope::Paths(p.iter().map(|p| p.to_string()).collect());
+    // A run over a whole repository and one in its src folder.
+    assert!(WriteScope::Whole.collides("/w/synthetic", &WriteScope::Whole, "/w/synthetic/src"));
+    assert!(paths(&["/w/synthetic/src"]).collides(
+        "/w/synthetic",
+        &paths(&["/w/synthetic/src/lib.rs"]),
+        "/w/synthetic/src"
+    ));
+    // Two folders' runs given the same write path.
+    assert!(paths(&["/w/shared/out.md"]).collides(
+        "/w/synthetic-a",
+        &paths(&["/w/shared/out.md"]),
+        "/w/synthetic-b"
+    ));
+    // Sibling folders, and a read-only run, do not.
+    assert!(!WriteScope::Whole.collides("/w/synthetic-a", &WriteScope::Whole, "/w/synthetic-b"));
+    assert!(!WriteScope::ReadOnly.collides("/w/synthetic", &WriteScope::Whole, "/w/synthetic/src"));
+}
+
+#[test]
+fn a_claim_in_an_enclosing_folder_conflicts_unless_its_run_is_gone() {
+    let mut claims: HashMap<String, Vec<WorkingDirClaim>> = HashMap::new();
+    claims.insert(
+        "/w/synthetic".to_string(),
+        vec![WorkingDirClaim {
+            task_id: "outer-run".to_string(),
+            tool_name: "bash-agent".to_string(),
+            prompt_summary: "refactor".to_string(),
+            writes: WriteScope::Whole,
+        }],
+    );
+    let (dir, claim) =
+        conflicting(&claims, "/w/synthetic/src", &WriteScope::Whole, |_| false).unwrap();
+    assert_eq!((dir, claim.task_id.as_str()), ("/w/synthetic", "outer-run"));
+    // A run that already finished holds its claim until the reaper runs:
+    // it no longer counts.
+    assert!(
+        conflicting(&claims, "/w/synthetic/src", &WriteScope::Whole, |id| id
+            == "outer-run")
+        .is_none()
+    );
+}
+
+#[test]
+fn exactly_one_of_a_runs_end_and_its_timed_out_caller_answers_for_it() {
+    // The run ends first: its caller, still waiting, answers.
+    let shared = RunShared::default();
+    assert!(!shared.ends_in_background());
+    assert!(!shared.move_to_background());
+    // The caller's wait runs out first: the run delivers its own end.
+    let shared = RunShared::default();
+    assert!(shared.move_to_background());
+    assert!(shared.ends_in_background());
+    // A background run always delivers its own end.
+    let shared = RunShared::default();
+    shared.starts_in_background();
+    assert!(shared.ends_in_background());
+}

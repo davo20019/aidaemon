@@ -42,6 +42,15 @@ pub(super) fn changed_locally_semantics(changed: bool) -> ToolCallSemantics {
     }
 }
 
+/// How a run ended, as its end judged it: whether it did its work, and its
+/// answer (its report, or why it failed with what it said). What a check or
+/// the reaper reports of a finished background run.
+#[derive(Debug, Clone)]
+pub(super) struct RunVerdict {
+    pub(super) success: bool,
+    pub(super) text: String,
+}
+
 /// A running CLI agent being tracked.
 pub(super) struct RunningCliAgent {
     pub(super) tool_name: String,
@@ -75,6 +84,8 @@ pub(super) struct RunningCliAgent {
     pub(super) claim_dir: Option<String>,
     /// What the agent left running, set once it has exited.
     pub(super) left_running: Arc<OnceLock<left_running::LeftRunning>>,
+    /// How it ended, set before `finished` once its end was judged.
+    pub(super) verdict: Arc<OnceLock<RunVerdict>>,
     /// While it waits for another run to leave its folder: that run's
     /// agent ([`FolderWait`]).
     pub(super) folder_wait: FolderWaitOn,

@@ -249,15 +249,63 @@ pub(super) struct RunShared {
     auth_failed: Arc<AtomicBool>,
     left_running: Arc<OnceLock<left_running::LeftRunning>>,
     end_record: Arc<OnceLock<CliRunEnd>>,
+    /// How it ended, as its end judged it.
+    verdict: Arc<OnceLock<RunVerdict>>,
     /// Its background run, once it is one (see `start_background_run`).
     run_slot: Arc<OnceLock<Arc<BackgroundRun>>>,
-    /// Whether its end is delivered to its chat: a background run's is,
-    /// and a foreground one's once it moved to the background.
-    should_notify: Arc<AtomicBool>,
+    /// Who answers for its end ([`Handoff`]): its waiting caller, or the
+    /// run itself once it is a background run.
+    handoff: Arc<std::sync::atomic::AtomicU8>,
     diff_dir: Arc<OnceLock<super::prompt::DiffBase>>,
     process: Arc<RunProcess>,
     /// The agent it waits on to leave its folder, while it does.
     folder_wait: FolderWaitOn,
+}
+
+/// Who answers for a run's end. A foreground run's caller waits for it; if
+/// the wait runs out the caller moves it to the background, and then the
+/// run delivers its own end to its chat. The caller and the run's end race,
+/// so one compare-and-swap decides it: exactly one of them answers.
+mod handoff {
+    /// Its caller waits for it (the start of a foreground run).
+    pub(super) const WAITED: u8 = 0;
+    /// A background run: its end is delivered to its chat.
+    pub(super) const BACKGROUND: u8 = 1;
+    /// It ended while its caller still waited: the caller answers.
+    pub(super) const ANSWERED: u8 = 2;
+}
+
+impl RunShared {
+    /// It is a background run from its start.
+    pub(super) fn starts_in_background(&self) {
+        self.handoff.store(handoff::BACKGROUND, Ordering::SeqCst);
+    }
+
+    /// Its caller's wait ran out: it becomes a background run, unless it
+    /// already ended (false), when its caller answers for it after all.
+    pub(super) fn move_to_background(&self) -> bool {
+        self.handoff
+            .compare_exchange(
+                handoff::WAITED,
+                handoff::BACKGROUND,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// At its end: whether it delivers its end itself (a background run),
+    /// rather than a caller still waiting for it.
+    pub(super) fn ends_in_background(&self) -> bool {
+        self.handoff
+            .compare_exchange(
+                handoff::WAITED,
+                handoff::ANSWERED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+    }
 }
 
 /// The tool's handles a run keeps after its call returned.
@@ -318,6 +366,7 @@ fn tracked(
         diff_dir: shared.diff_dir.clone(),
         claim_dir,
         left_running: shared.left_running.clone(),
+        verdict: shared.verdict.clone(),
         folder_wait: shared.folder_wait.clone(),
     }
 }
@@ -501,7 +550,9 @@ impl CliAgentTool {
 
         let handles = self.run_handles();
         let shared = RunShared::default();
-        shared.should_notify.store(async_mode, Ordering::Relaxed);
+        if async_mode {
+            shared.starts_in_background();
+        }
         // prep's claim guard drops on an error return and releases the
         // claim.
         let started = handles.start_process(&call, &mut prep, &shared).await?;
@@ -516,7 +567,7 @@ impl CliAgentTool {
 
         // Create completion channel - includes loop detection info
         // Result: (exit_code, was_killed_for_loop, loop_repetition_count)
-        let (completion_tx, completion_rx) =
+        let (completion_tx, mut completion_rx) =
             tokio::sync::oneshot::channel::<(Option<i32>, bool, Option<usize>)>();
 
         // A run its turn waits on has the same record as a background one,
@@ -562,9 +613,9 @@ impl CliAgentTool {
             .keeps_session(&cli_run_id(&task_id), prep.keeps_session);
 
         // Read its output, emit progress, judge and deliver its end, and
-        // signal completion. `should_notify` starts as async_mode: a
-        // foreground run that times out and moves to the background flips
-        // it so its end is still delivered.
+        // signal completion. A background run delivers its end itself; a
+        // foreground run that times out and moves to the background does
+        // too ([`RunShared::move_to_background`]).
         tokio::spawn(watch_run(
             handles,
             call.clone(),
@@ -602,7 +653,37 @@ impl CliAgentTool {
         let display_buf = shared.display_buf.clone();
         let stdout_buf = shared.stdout_buf.clone();
         let working_dir_owned = shared.diff_dir.get().cloned();
-        let result = tokio::time::timeout(timeout, completion_rx).await;
+        let mut result = tokio::time::timeout(timeout, &mut completion_rx).await;
+        if result.is_err() {
+            // Its wait ran out: it becomes a background run, its record and
+            // its run first, so its end finds them.
+            self.start_background_run(
+                &shared.run_slot,
+                &task_id,
+                session_id,
+                &run_label,
+                delegated_task_id,
+                status_tx.clone(),
+                run_began,
+            )
+            .await;
+            record_background(&self.state, &call).await;
+            if !shared.move_to_background() {
+                // It ended meanwhile, with its caller still answering for
+                // it: its answer is on its way, and the background run just
+                // started for it ends with it (a second end is a no-op).
+                forget_background(&self.state, &call).await;
+                if let (Some(run), Some(end)) = (
+                    shared.run_slot.get().cloned(),
+                    shared.end_record.get().cloned(),
+                ) {
+                    tokio::spawn(async move {
+                        run.finish(end.end, end.evidence).await;
+                    });
+                }
+                result = Ok((&mut completion_rx).await);
+            }
+        }
 
         match result {
             Ok(Ok((exit_code, was_loop_killed, loop_count))) => {
@@ -809,26 +890,14 @@ impl CliAgentTool {
                     truncate_with_note(&buf, 1000)
                 };
 
-                // The caller got an early return: the agent is a background
-                // run now, and its completion is delivered.
-                self.start_background_run(
-                    &shared.run_slot,
-                    &task_id,
-                    session_id,
-                    &run_label,
-                    delegated_task_id,
-                    status_tx.clone(),
-                    run_began,
-                )
-                .await;
-                record_background(&self.state, &call).await;
+                // The caller gets an early return: the agent is a
+                // background run now, and it delivers its own end.
                 // Its process may have ended (and its record been cleared)
-                // just before the line above: its end is set before that
-                // clearing, so a record written after it is cleared here.
+                // just before its record was written: its end is set before
+                // that clearing, so a record written after it is cleared here.
                 if shared.end_record.get().is_some() {
                     forget_background(&self.state, &call).await;
                 }
-                shared.should_notify.store(true, Ordering::Relaxed);
 
                 // Store the running agent for later checking/cancellation
                 let agent = tracked(&call, &shared, started_at_instant, prep.working_dir.clone());
@@ -1109,29 +1178,41 @@ impl CliAgentTool {
         let mut folder_wait: Option<FolderWait> = None;
         if let Some(ref dir) = canonical_working_dir {
             let blocked_message: Option<String> = {
-                let _running_guard = self.running.lock().await;
+                let running = self.running.lock().await;
                 let mut claims = lock_claims(&self.working_dir_claims);
-
-                let held = claims.entry(dir.clone()).or_default();
-                if let Some(claim) = conflicting(held, &writes) {
+                // A run that already finished holds its claim until the
+                // reaper's next pass: it no longer counts.
+                let gone = |id: &str| {
+                    id == task_id
+                        || running
+                            .get(id)
+                            .is_some_and(|agent| agent.finished.load(Ordering::Acquire))
+                };
+                let conflict = conflicting(&claims, dir, &writes, gone).map(|(held_dir, claim)| {
+                    (conflict_message(held_dir, claim), claim.tool_name.clone())
+                });
+                if let Some((message, behind)) = conflict {
                     if waits_for_folder {
                         folder_wait = Some(FolderWait {
                             dir: dir.clone(),
                             writes: writes.clone(),
                             prompt_summary: short_summary.clone(),
-                            behind: claim.tool_name.clone(),
+                            behind,
                         });
                         None
                     } else {
-                        Some(conflict_message(dir, claim))
+                        Some(message)
                     }
                 } else {
-                    held.push(WorkingDirClaim {
-                        task_id: task_id.to_string(),
-                        tool_name: tool_name.to_string(),
-                        prompt_summary: short_summary.clone(),
-                        writes: writes.clone(),
-                    });
+                    claims
+                        .entry(dir.clone())
+                        .or_default()
+                        .push(WorkingDirClaim {
+                            task_id: task_id.to_string(),
+                            tool_name: tool_name.to_string(),
+                            prompt_summary: short_summary.clone(),
+                            writes: writes.clone(),
+                        });
                     None
                 }
             };
@@ -1246,7 +1327,7 @@ impl CliAgentTool {
         let task_id = call.task_id.clone();
         let run_id = cli_run_id(&task_id);
         let shared = RunShared::default();
-        shared.should_notify.store(true, Ordering::Relaxed);
+        shared.starts_in_background();
         self.start_background_run(
             &shared.run_slot,
             &task_id,
@@ -2280,8 +2361,10 @@ async fn watch_run(
     }
     // Its process ended: a restart from now on cuts off nothing of it.
     forget_background(&handles.state, &call).await;
-    // Persist completion even if the caller timed out and moved the task to background.
-    if invocation_id != 0 {
+    // Persist completion even if the caller timed out and moved the task to
+    // background. A launch whose invocation could not be logged (id 0) is
+    // still judged, persisted and delivered: only its log row is missing.
+    {
         let duration = invocation_started_at.elapsed().as_secs_f64();
         let completion = if loop_detected {
             CliCompletionResult {
@@ -2344,15 +2427,17 @@ async fn watch_run(
             )
         };
 
-        let _ = state_for_completion
-            .log_cli_agent_complete(
-                invocation_id,
-                exit_code,
-                &persisted_output,
-                success,
-                duration,
-            )
-            .await;
+        if invocation_id != 0 {
+            let _ = state_for_completion
+                .log_cli_agent_complete(
+                    invocation_id,
+                    exit_code,
+                    &persisted_output,
+                    success,
+                    duration,
+                )
+                .await;
+        }
 
         if let Some(ref delegated_task_id) = delegated_task_id_for_completion {
             CliAgentTool::persist_delegated_cli_result_with_state(
@@ -2364,14 +2449,24 @@ async fn watch_run(
             .await;
         }
 
+        // What a check or the reaper reports of it: its end's verdict.
+        let _ = shared.verdict.set(RunVerdict {
+            success,
+            text: match &structured_error {
+                Some(error) => error.clone(),
+                None => persisted_output.clone(),
+            },
+        });
+
         // Durable state is authoritative for completion. Publish the
         // finished flag before optional chat delivery, which may be
         // slow, but never before the delegated task update above.
         finished_for_task.store(true, Ordering::Release);
 
-        // Send proactive notification when the caller won't necessarily be waiting
-        // for completion (async_mode or sync->timeout moved to background).
-        if call.async_mode || shared.should_notify.load(Ordering::Relaxed) {
+        // Send proactive notification when no caller waits for completion
+        // (async_mode, or a foreground run moved to background): decided
+        // with the caller in one step, so exactly one of them answers.
+        if shared.ends_in_background() {
             deliver_end(
                 &handles,
                 &call,
@@ -2836,6 +2931,10 @@ async fn end_unstarted(
         BUFFER_CAP,
     );
     forget_background(&handles.state, call).await;
+    let _ = shared.verdict.set(RunVerdict {
+        success: false,
+        text: report.to_string(),
+    });
     // Finished before its chat hears of it, as a run that ran is.
     shared.finished.store(true, Ordering::Release);
     deliver_end(
