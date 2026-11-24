@@ -18,6 +18,7 @@ impl CliAgentTool {
         tool_name: &str,
         task_id: &str,
         prompt: &str,
+        task_prompt: &str,
         working_dir: Option<&str>,
         session_id: &str,
         delegated_task_id: Option<&str>,
@@ -259,7 +260,7 @@ impl CliAgentTool {
             keeps_session,
         } = plan;
         let writes = WriteScope::of(workspace_mode, &canonical_write_paths);
-        let short_summary: String = prompt.chars().take(50).collect();
+        let short_summary: String = task_prompt.chars().take(50).collect();
 
         // Claim the working directory (or the first explicit write path when
         // working_dir was omitted) and perform conflict checks.
@@ -335,7 +336,7 @@ impl CliAgentTool {
             }
         }
 
-        let task = prompt.trim().to_string();
+        let task = task_prompt.trim().to_string();
         let prompt_with_rules = if coding_agent.launch_arguments().is_some() {
             format!(
                 "{}\n\n{}",

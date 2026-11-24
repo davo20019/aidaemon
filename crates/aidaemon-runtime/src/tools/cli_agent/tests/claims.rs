@@ -734,14 +734,18 @@ async fn single_pass_snapshot_skips_unmarked_dirs_consistently() {
     let root = dir.path().to_string_lossy().to_string();
     std::fs::create_dir(dir.path().join(".git")).unwrap();
     std::fs::create_dir(dir.path().join("target")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".nsh/out/app")).unwrap();
     std::fs::write(dir.path().join(".git/index"), "v1").unwrap();
     std::fs::write(dir.path().join("target/cache"), "v1").unwrap();
+    std::fs::write(dir.path().join(".nsh/out/app/nsh.js"), "v1").unwrap();
     std::fs::write(dir.path().join("lib.rs"), "fn main() {}\n").unwrap();
 
     let before = snapshot_roots(&tool.backend, std::slice::from_ref(&root)).await;
     // Mutate only unmarked directories.
     std::fs::write(dir.path().join(".git/index"), "v2-longer").unwrap();
     std::fs::write(dir.path().join("target/new_artifact"), "bytes").unwrap();
+    std::fs::write(dir.path().join(".nsh/out/app/nsh.js"), "v2-bundle").unwrap();
+    std::fs::write(dir.path().join(".nsh/out/app/_headers"), "/*").unwrap();
     let after_unmarked = snapshot_roots(&tool.backend, std::slice::from_ref(&root)).await;
     assert_eq!(
         before.receipt, after_unmarked.receipt,

@@ -438,6 +438,27 @@ fn is_owner_prompt(run: &RunSummary, direct: bool) -> bool {
     direct || run.asked.as_ref().is_some_and(|asked| asked.by_owner)
 }
 
+/// Daemon-written recovery preamble marker (`RunProgress::note`) prepended to
+/// prompts when resuming an interrupted run; stripped when rendering legacy
+/// persisted runs so the owner's bubble shows only what they actually wrote.
+const INTERRUPTED_MARKER: &str = "[Where your last turn stopped]";
+const INTERRUPTED_END: &str = "Check the current state of those files before redoing anything, then go on from there with the message below.";
+
+/// Remove daemon-written recovery preamble from persisted `asked` text so
+/// owner bubbles display only the user's own message.
+fn clean_asked_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix(INTERRUPTED_MARKER)
+        && let Some(idx) = rest.find(INTERRUPTED_END)
+    {
+        let after = rest[idx + INTERRUPTED_END.len()..].trim();
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 /// What it was asked: the owner's prompt or follow-up as a right-aligned
 /// bubble clearly attributed to "You"; aidaemon's delegation on the left in
 /// a recessed inset block labeled "aidaemon asked".
@@ -448,11 +469,12 @@ fn asked(store: Store, run: &RunSummary, this: bool, direct: bool) -> View {
         Read::Ready(detail) if this && !detail.task.is_empty() => Some(detail.task),
         _ => None,
     };
-    let words = run
+    let raw_words = run
         .asked
         .as_ref()
         .map(|asked| asked.text.clone())
         .unwrap_or_else(|| task.unwrap_or_else(|| run.label.clone()));
+    let words = clean_asked_text(&raw_words);
     if is_owner_prompt(run, direct) {
         let open = signal(false);
         let long = words.chars().count() > 420 || words.lines().count() > 6;
@@ -547,9 +569,13 @@ fn asked(store: Store, run: &RunSummary, this: bool, direct: bool) -> View {
         ))
 }
 
-/// What the agent answered: working while it runs; once ended, its changed
-/// files and checks up front in a compact summary card, then its reply
-/// (previewed and collapsible when verbose), then Copy / Read aloud.
+/// Most changed files listed directly under a reply before folding behind a
+/// collapsible disclosure so large edits never flood the pane.
+const INLINE_EDITED_MAX: usize = 3;
+
+/// What the agent answered: working while it runs; once ended, its reply
+/// first (previewed and collapsible when verbose), then Copy / Read aloud,
+/// then its checks/warnings and changed files (folded when more than 3).
 fn answer(store: Store, run: &RunSummary, this: bool) -> View {
     let mut said = view().gap_2();
     if run.phase == RunPhase::Running {
@@ -559,27 +585,6 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
             run.step.clone()
         };
         return said.child(ui::working(step));
-    }
-    let coding = store.is_coding(&run.session_id);
-    let facts: Vec<(Glyph, Tone, String)> =
-        run.result.as_ref().map(result_facts).unwrap_or_default();
-    if !run.edited.is_empty() || !facts.is_empty() {
-        let mut summary = view()
-            .w_full()
-            .rounded(px(ui::radius::CONTROL))
-            .bg(colors::SURFACE)
-            .border_1()
-            .border_color(colors::BORDER)
-            .px_3()
-            .py_2()
-            .gap_1();
-        for path in run.edited.clone() {
-            summary = summary.child(changed_file(store, path, coding));
-        }
-        for (glyph, tone, words) in facts {
-            summary = summary.child(line(glyph, tone, words, false));
-        }
-        said = said.child(summary);
     }
     let reply = run
         .result
@@ -687,7 +692,52 @@ fn answer(store: Store, run: &RunSummary, this: bool) -> View {
             said = said.child(note("It ended without a reply.".into()));
         }
     }
+    let coding = store.is_coding(&run.session_id);
+    let facts: Vec<(Glyph, Tone, String)> =
+        run.result.as_ref().map(result_facts).unwrap_or_default();
+    if !facts.is_empty() {
+        let mut checks = view()
+            .w_full()
+            .rounded(px(ui::radius::CONTROL))
+            .bg(colors::SURFACE)
+            .border_1()
+            .border_color(colors::BORDER)
+            .px_3()
+            .py_2()
+            .gap_1();
+        for (glyph, tone, words) in facts {
+            checks = checks.child(line(glyph, tone, words, false));
+        }
+        said = said.child(checks);
+    }
+    if !run.edited.is_empty() {
+        said = said.child(edited_files(store, run.edited.clone(), coding));
+    }
     said
+}
+
+/// Changed files under a reply: shown inline up to `INLINE_EDITED_MAX`, or
+/// folded behind a single `N files changed` disclosure when there are more.
+fn edited_files(store: Store, paths: Vec<String>, coding: bool) -> View {
+    if paths.len() <= INLINE_EDITED_MAX {
+        let mut list = view().gap_1();
+        for path in paths {
+            list = list.child(changed_file(store, path, coding));
+        }
+        return list;
+    }
+    let count = paths.len();
+    let open = signal(false);
+    view()
+        .gap_1()
+        .child(ui::quiet_disclosure(format!("{count} files changed"), open))
+        .child(ui::unfold(open, move || {
+            let mut list = view().gap_1().pl(px(8.0));
+            for path in paths.clone() {
+                list = list.child(changed_file(store, path, coding));
+            }
+            list
+        }))
 }
 
 /// Build a safe Markdown preview for verbose replies: returns `None` when
@@ -1225,7 +1275,7 @@ fn line(glyph: Glyph, tone: Tone, words: String, nested: bool) -> View {
 
 #[cfg(test)]
 mod tests {
-    use super::{FOCUSED_REPLY_BUDGET, is_owner_prompt, markdown_preview};
+    use super::{FOCUSED_REPLY_BUDGET, clean_asked_text, is_owner_prompt, markdown_preview};
     use aidaemon_client_protocol::{RunAsked, RunPhase, RunSummary};
 
     fn sample_run(asked: Option<RunAsked>) -> RunSummary {
@@ -1294,5 +1344,12 @@ mod tests {
             0,
             "code fence closed: {preview}"
         );
+    }
+
+    #[test]
+    fn clean_asked_text_strips_daemon_interrupted_recovery_note() {
+        let raw = "[Where your last turn stopped] Your previous turn in this session (run cli-agent-1) did not finish: a daemon restart stopped it part way.\n- Steps finished: 5.\nCheck the current state of those files before redoing anything, then go on from there with the message below.\n\nContinue";
+        assert_eq!(clean_asked_text(raw), "Continue");
+        assert_eq!(clean_asked_text("Fix the bug"), "Fix the bug");
     }
 }

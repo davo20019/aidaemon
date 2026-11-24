@@ -71,7 +71,18 @@ fn daemon_file(path: &str) -> bool {
 /// Folders never marked or counted in receipts: a repository's own records,
 /// and dependency and build trees a tool rewrites wholesale (folder names, a
 /// machine format).
-const UNMARKED: [&str; 5] = [".git", "node_modules", "target", ".venv", "__pycache__"];
+const UNMARKED: [&str; 10] = [
+    ".git",
+    "node_modules",
+    "target",
+    ".venv",
+    "__pycache__",
+    ".nsh",
+    ".next",
+    ".turbo",
+    ".parcel-cache",
+    ".svelte-kit",
+];
 
 /// Single-pass filesystem snapshot of a run's write roots: aggregate tree
 /// receipt plus per-file marks (up to `FILE_MARK_CAP`), skipping `UNMARKED`

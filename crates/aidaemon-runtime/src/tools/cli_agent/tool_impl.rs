@@ -932,6 +932,10 @@ impl CliAgentTool {
                     facts.grant_session.clone()
                 };
 
+                // Keep the original prompt (before daemon-added conversation
+                // context or restart-recovery notes) for the run's recorded
+                // task so the UI displays what was actually asked.
+                let raw_task = prompt.trim().to_string();
                 let prompt = if direct_agent_conversation && spec.continues.is_none() {
                     self.prepend_direct_conversation_context(&session_id, &prompt)
                         .await
@@ -957,6 +961,7 @@ impl CliAgentTool {
                         .handle_run(
                             &tool,
                             &prompt,
+                            &raw_task,
                             working_dir.as_deref(),
                             &session_id,
                             args.call_goal_id.as_deref(),
