@@ -197,6 +197,22 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         run: scripts/onnxruntime-intel-mac.sh "$RUNNER_TEMP/onnxruntime" >> "$GITHUB_ENV"
 
+      # The ARM runner was shut down mid-link of the v0.22.1 build (fat LTO
+      # with one codegen unit runs out of memory); swap lets it finish.
+      - name: Add swap (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile >/dev/null
+          sudo swapon /mnt/swapfile
+          free -h
+          df -h / /mnt
+
       - name: Build (native)
         if: '!matrix.cross'
         run: cargo build --release --target ${{ matrix.target }} --features "browser"
@@ -240,11 +256,21 @@ jobs:
         if: runner.os == 'macOS' && matrix.app
         run: |
           set -euo pipefail
+          # The two release builds leave the runner's disk nearly full and
+          # hdiutil needs room for the image (the v0.22.1 Intel Mac image
+          # failed with "No space left on device"): keep the binaries, drop
+          # the build directories.
+          bins="$RUNNER_TEMP/release-bins"
+          mkdir -p "$bins"
+          cp target/${{ matrix.target }}/release/aidaemon "$bins/"
+          cp clients/app/target/${{ matrix.target }}/release/aidaemon-app "$bins/"
+          rm -rf target clients/app/target
+          df -h .
           # Bundle versions are numeric: an rc tag's suffix is dropped.
           version="${GITHUB_REF_NAME#v}"
           scripts/package-macos-dmg.sh \
-            target/${{ matrix.target }}/release/aidaemon \
-            clients/app/target/${{ matrix.target }}/release/aidaemon-app \
+            "$bins/aidaemon" \
+            "$bins/aidaemon-app" \
             "${version%%-*}" "AIdaemon-${{ matrix.name }}.dmg"
           shasum -a 256 "AIdaemon-${{ matrix.name }}.dmg" > "AIdaemon-${{ matrix.name }}.dmg.sha256"
 

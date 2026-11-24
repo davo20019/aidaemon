@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-23
+
+### Fixed
+
+- **The Apple Silicon Mac download builds again.** Packaging its disk image failed on CI with no message, so 0.22.0 never shipped: `hdiutil` now shows what it reports and tries again a few times, and the packaging script says when the app is signed and verified. 0.22.1 carries everything listed under 0.22.0.
+
 ## [0.22.0] - 2026-11-22
 
 ### Added
