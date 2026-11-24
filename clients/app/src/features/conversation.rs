@@ -1729,10 +1729,11 @@ fn transcript(store: Store, session: String) -> View {
                 )
             },
         ))
-        .child(ui::refreshable(
+        .child(ui::refreshable_at_end(
             transcript_list(store, session, all, first_seen, last_seen, unfolding)
                 .element_ref(&list)
                 .flex_1(),
+            "transcript",
             move || store.pull_refreshing(),
             move || store.pull_refresh(),
         ))

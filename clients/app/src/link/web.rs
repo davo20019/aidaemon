@@ -72,6 +72,8 @@ extern "C" {
     fn page_visible() -> bool;
     #[wasm_bindgen(js_name = onWake)]
     fn on_wake(wake: &Closure<dyn FnMut()>);
+    #[wasm_bindgen(js_name = watchEndPull)]
+    fn watch_end_pull_js(test_id: &str, on_pull: &Closure<dyn FnMut(f32, bool)>);
 
     type MediaSocket;
     #[wasm_bindgen(constructor)]
@@ -169,6 +171,33 @@ pub fn transport() -> aidaemon_client_core::machine::Transport {
 
 pub fn download(url: &str, name: &str) {
     download_url_js(url, name);
+}
+
+/// A finger pulling the scroll view marked `test_id` past its bottom:
+/// how far, and whether it let go (the last report of a pull). The page
+/// watches once per mark; the latest receiver hears it, earlier ones end.
+pub fn end_pulls(test_id: &'static str) -> mpsc::UnboundedReceiver<(f32, bool)> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static PULLS: RefCell<HashMap<&'static str, mpsc::UnboundedSender<(f32, bool)>>> =
+            RefCell::new(HashMap::new());
+    }
+    let (tx, rx) = mpsc::unbounded();
+    let first = PULLS.with(|p| p.borrow_mut().insert(test_id, tx).is_none());
+    if first {
+        let on_pull = Closure::<dyn FnMut(f32, bool)>::new(move |pull: f32, released: bool| {
+            PULLS.with(|p| {
+                if let Some(tx) = p.borrow().get(test_id) {
+                    let _ = tx.unbounded_send((pull, released));
+                }
+            });
+        });
+        watch_end_pull_js(test_id, &on_pull);
+        // The page keeps watching for its whole life.
+        on_pull.forget();
+    }
+    rx
 }
 
 /// Whether the browser has a share sheet.

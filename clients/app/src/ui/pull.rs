@@ -6,9 +6,15 @@
 //! turns and its centre breathes; when it ends the list settles back and
 //! the chip leaves with it.
 //!
+//! A long conversation is read from its bottom, where a pull down cannot
+//! reach the top: [`refreshable_at_end`] also refreshes when it is pulled
+//! up past its end, with the same chip rising from the bottom.
+//!
 //! [`mark`] is the one part with a character: a mascot can take its place
 //! later without touching the chip's motion.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use nsh_core::prelude::*;
@@ -56,13 +62,120 @@ where
     view().flex_1().child(list).child(indicator(pull, shown))
 }
 
+/// As [`refreshable`], and pulled up past its end it refreshes too, the
+/// chip rising from the bottom. `test_id` marks the list: in a browser the
+/// page watches that pull itself (its scroll view has no bounce to read);
+/// on a phone or tablet the list's own bounce past its end is the pull.
+pub fn refreshable_at_end<S>(
+    list: S,
+    test_id: &'static str,
+    refreshing: impl Fn() -> bool + Copy + 'static,
+    refresh: impl Fn() + Copy + 'static,
+) -> View
+where
+    S: Scrollable + Interactive + IntoElement + 'static,
+{
+    let idiom = idiom();
+    if idiom == nsh_core::platform::Idiom::Terminal {
+        return refreshable(list, refreshing, refresh);
+    }
+    let up = animated_value(0.0);
+    // A refresh started from the end is out (and held for the least spin).
+    let spinning = signal(false);
+    let least = signal(false);
+    let settle = move |to: f32| {
+        let _ = Animation::timing(&up, to, Timing::new(250.0, Easing::EaseOut)).start();
+    };
+    // A pull reported at `pull`, `released` when the finger lifted.
+    let pulled = move |pull: f32, released: bool| {
+        if untracked(|| spinning.get()) {
+            return;
+        }
+        if !released {
+            up.set(pull.max(0.0));
+        } else if pull >= ARMED {
+            spinning.set(true);
+            least.set(true);
+            set_timeout(LEAST_SPIN, move || least.set(false));
+            settle(PULL_HEIGHT);
+            refresh();
+        } else {
+            settle(0.0);
+        }
+    };
+    effect(move || {
+        if spinning.get() && !least.get() && !refreshing() {
+            spinning.set(false);
+            settle(0.0);
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        use futures::StreamExt;
+        let mut pulls = crate::link::web::end_pulls(test_id);
+        spawn(async move {
+            while let Some((pull, released)) = pulls.next().await {
+                pulled(pull, released);
+            }
+        });
+    }
+    // Native scroll views bounce past their end while dragged: that
+    // overshoot is the pull. Only a drag counts, not a fling's bounce.
+    let touch = matches!(
+        idiom,
+        nsh_core::platform::Idiom::Phone | nsh_core::platform::Idiom::Pad
+    ) && !cfg!(target_arch = "wasm32");
+    let dragging = Rc::new(Cell::new(false));
+    let over = Rc::new(Cell::new(0.0_f32));
+    let list = list.test_id(test_id);
+    let list = if touch {
+        let (d1, d2, d3) = (dragging.clone(), dragging.clone(), dragging);
+        let (o1, o2) = (over.clone(), over);
+        list.on_scroll(move |e: &ScrollEvent| {
+            let end = e.content_size.height.max(e.size.height);
+            let past = (e.offset.y + e.size.height - end).0.max(0.0) * 0.5;
+            o1.set(past);
+            if d1.get() {
+                pulled(past, false);
+            }
+        })
+        .on_scroll_drag_start(move |_: &Point<Points>| d2.set(true))
+        .on_scroll_drag_end(move |_: &Point<Points>| {
+            d3.set(false);
+            pulled(o2.get(), true);
+        })
+    } else {
+        list
+    };
+    let shown = computed(move || spinning.get());
+    view()
+        .flex_1()
+        .child(refreshable(list, refreshing, refresh))
+        .child(indicator_at(up, shown, Edge::Bottom))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Edge {
+    Top,
+    Bottom,
+}
+
 /// The chip over the list's top, following `pull`.
 fn indicator(pull: AnimatedValue, refreshing: Memo<bool>) -> View {
+    indicator_at(pull, refreshing, Edge::Top)
+}
+
+/// The chip over the list's `edge`, following `pull` in from it.
+fn indicator_at(pull: AnimatedValue, refreshing: Memo<bool>, edge: Edge) -> View {
     let h = PULL_HEIGHT;
-    view()
-        .pointer_events(PointerEvents::None)
-        .absolute()
-        .top_0()
+    let away = if edge == Edge::Top { -30.0 } else { 30.0 };
+    let place = view().pointer_events(PointerEvents::None).absolute();
+    let place = if edge == Edge::Top {
+        place.top_0()
+    } else {
+        place.bottom_0()
+    };
+    place
         .left_0()
         .right_0()
         .h(px(h))
@@ -87,7 +200,7 @@ fn indicator(pull: AnimatedValue, refreshing: Memo<bool>) -> View {
                     ),
                 )
                 .bind_opacity(&pull.interpolate(&[0.0, 20.0], &[0.0, 1.0]))
-                .bind_translate_y(&pull.interpolate(&[0.0, h], &[-30.0, 0.0]))
+                .bind_translate_y(&pull.interpolate(&[0.0, h], &[away, 0.0]))
                 // Grows with the pull, pops as it arms, settles.
                 .bind_scale(
                     &pull.interpolate(&[0.0, ARMED - 8.0, ARMED, h * 1.4], &[0.5, 0.9, 1.1, 1.0]),

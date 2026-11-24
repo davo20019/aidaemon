@@ -13,7 +13,7 @@ pub mod time;
 
 pub use controls::*;
 pub use kit::*;
-pub use pull::refreshable;
+pub use pull::{refreshable, refreshable_at_end};
 pub use qr::qr_code;
 pub use rich::*;
 pub use theme::{Tone, colors, fit, radius, size, text as type_scale, touch};

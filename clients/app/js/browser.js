@@ -666,3 +666,44 @@ export class Speaker {
     this.finish();
   }
 }
+
+/** Pull past the end: the scroll view marked `data-testid=testId`, already
+ * at its bottom, dragged further up by a finger. `onPull(distance, released)`
+ * hears how far (half the finger's travel, as a rubber band) as it moves,
+ * then once more when the finger lifts. The page has no bounce there, so
+ * the touch is taken from the browser only while it pulls. */
+export function watchEndPull(testId, onPull) {
+  let start = null;
+  const atEnd = (el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+  document.addEventListener("touchstart", (e) => {
+    const el = e.touches.length === 1 && e.target instanceof Element
+      ? e.target.closest(`[data-testid="${testId}"]`)
+      : null;
+    start = el && atEnd(el) ? { el, y: e.touches[0].clientY, pull: 0 } : null;
+  }, { passive: true, capture: true });
+  document.addEventListener("touchmove", (e) => {
+    if (!start || e.touches.length !== 1) return;
+    const up = start.y - e.touches[0].clientY;
+    if (up <= 0 || !atEnd(start.el)) {
+      // Back down: the scroll is the browser's again.
+      if (start.pull > 0) onPull(0, false);
+      start = up <= 0 ? { ...start, y: e.touches[0].clientY, pull: 0 } : null;
+      return;
+    }
+    // Once the browser scrolls, the gesture is its own.
+    if (!e.cancelable) {
+      if (start.pull > 0) onPull(0, true);
+      start = null;
+      return;
+    }
+    e.preventDefault();
+    start.pull = up * 0.5;
+    onPull(start.pull, false);
+  }, { passive: false, capture: true });
+  const end = () => {
+    if (start?.pull > 0) onPull(start.pull, true);
+    start = null;
+  };
+  document.addEventListener("touchend", end, { capture: true });
+  document.addEventListener("touchcancel", end, { capture: true });
+}
