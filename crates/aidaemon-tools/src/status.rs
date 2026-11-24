@@ -125,9 +125,17 @@ pub enum StatusUpdate {
     },
     /// A step ended by handing its work to something that keeps running: a
     /// helper (`ActivityKind::Delegate`) or a background job. The work has
-    /// not finished, so the step must never read as finished.
+    /// not finished, so the step must never read as finished. Built with
+    /// [`StatusUpdate::step_handed_off`].
+    #[non_exhaustive]
     StepHandedOff {
         kind: aidaemon_core::card::ActivityKind,
+        /// The call's name as its [`Self::ToolStart`] gave it; empty when
+        /// there was no such update.
+        name: String,
+        /// The call's own result (its launch line) as an app shows it
+        /// ([`Self::showing_result`]); empty when there is none to show.
+        output: String,
     },
     /// How many lines a long-running command has printed so far, sent at
     /// most every few seconds while it runs. A helper's card line shows the
@@ -194,6 +202,19 @@ impl StatusUpdate {
         }
     }
 
+    /// A step that handed its work off ([`Self::StepHandedOff`]), named as
+    /// its call started; [`Self::showing_result`] adds its launch result.
+    pub fn step_handed_off(
+        name: impl Into<String>,
+        kind: aidaemon_core::card::ActivityKind,
+    ) -> Self {
+        Self::StepHandedOff {
+            kind,
+            name: name.into(),
+            output: String::new(),
+        }
+    }
+
     /// A started call that shows its raw JSON arguments the way history
     /// does ([`crate::shown::call_input`]). Other updates are unchanged.
     pub fn showing_arguments(mut self, arguments: &str) -> Self {
@@ -203,10 +224,10 @@ impl StatusUpdate {
         self
     }
 
-    /// A finished call that shows its raw result the way history does
-    /// ([`crate::shown::call_output`]). Other updates are unchanged.
+    /// A finished or handed-off call that shows its result the way history
+    /// does ([`crate::shown::call_output`]). Other updates are unchanged.
     pub fn showing_result(mut self, result: &str) -> Self {
-        if let Self::ToolComplete { output, .. } = &mut self {
+        if let Self::ToolComplete { output, .. } | Self::StepHandedOff { output, .. } = &mut self {
             *output = crate::shown::call_output(result);
         }
         self

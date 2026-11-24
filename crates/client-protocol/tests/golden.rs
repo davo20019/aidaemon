@@ -1848,6 +1848,8 @@ fn every_turn_status_round_trips() {
             chunk: "building".into(),
         },
         TurnStatus::tool_completed("terminal", "ok").with_detail("test result: ok"),
+        TurnStatus::tool_handed_off("Coding agent", "Working on in the background")
+            .with_detail("Started in the background: claude coding agent."),
         TurnStatus::PlanStep {
             step: 1,
             total: 3,

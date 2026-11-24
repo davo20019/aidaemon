@@ -257,9 +257,13 @@ fn status_of(update: &StatusUpdate) -> Option<TurnStatus> {
             name: name.clone(),
             chunk: tail.clone(),
         },
-        StatusUpdate::StepHandedOff { kind } => TurnStatus::Note {
-            text: aidaemon_core::card::Step::HandedOff(*kind).words(),
-        },
+        StatusUpdate::StepHandedOff {
+            kind, name, output, ..
+        } => TurnStatus::tool_handed_off(
+            name.clone(),
+            aidaemon_core::card::Step::HandedOff(*kind).words(),
+        )
+        .with_detail(output.clone()),
         _ => return None,
     })
 }
@@ -401,8 +405,10 @@ impl TurnObserver for GatewayObserver {
                         });
                     }
                     // The latest call of that name still running, as the
-                    // client marks it.
-                    TurnStatus::ToolCompleted { name, .. } => {
+                    // client marks it; one that handed its work off shows
+                    // its launch result.
+                    TurnStatus::ToolCompleted { name, .. }
+                    | TurnStatus::ToolHandedOff { name, .. } => {
                         if let Some(call) = state
                             .calls
                             .iter_mut()

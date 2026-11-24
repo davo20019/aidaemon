@@ -850,7 +850,7 @@ pub fn child_status_sender(
                 // child's progress, never the parent's own step (live
                 // 2026-11-13: "… goes on in the background" stood on the
                 // card as if the turn itself had handed off).
-                StatusUpdate::StepHandedOff { kind } => Some(Step::HandedOff(*kind)),
+                StatusUpdate::StepHandedOff { kind, .. } => Some(Step::HandedOff(*kind)),
                 // What the child's running command printed last is that
                 // child's progress line, as it runs.
                 StatusUpdate::CommandOutput { lines, .. } => Some(Step::Output { lines: *lines }),
@@ -2169,9 +2169,10 @@ mod tests {
             .await
             .unwrap();
         drupal
-            .send(StatusUpdate::StepHandedOff {
-                kind: ActivityKind::Run,
-            })
+            .send(StatusUpdate::step_handed_off(
+                "running the site installer",
+                ActivityKind::Run,
+            ))
             .await
             .unwrap();
         drop((wordpress, drupal));

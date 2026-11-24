@@ -404,7 +404,7 @@ impl LiveStatus {
                 self.note_activity(Step::Doing(*kind));
                 false
             }
-            StatusUpdate::StepHandedOff { kind } => {
+            StatusUpdate::StepHandedOff { kind, .. } => {
                 self.note_activity(Step::HandedOff(*kind));
                 true
             }
@@ -838,9 +838,10 @@ mod tests {
             Some(Step::Doing(ActivityKind::Run)),
         ))));
         assert!(!live.note(&StatusUpdate::tool_complete("reading a file", "done")));
-        assert!(live.note(&StatusUpdate::StepHandedOff {
-            kind: ActivityKind::Delegate,
-        }));
+        assert!(live.note(&StatusUpdate::step_handed_off(
+            "a helper",
+            ActivityKind::Delegate,
+        )));
         assert!(!live.note(&StatusUpdate::Thinking(3)));
         assert_eq!(
             live.preview().unwrap(),

@@ -210,7 +210,7 @@ pub fn status_text(status: &TurnStatus) -> String {
             ..
         } => format!("Step {} of {total}: {description}", step + 1),
         TurnStatus::Checklist { .. } => "Updated the plan".into(),
-        TurnStatus::Note { text } => text.clone(),
+        TurnStatus::Note { text } | TurnStatus::ToolHandedOff { text, .. } => text.clone(),
         TurnStatus::Unknown => "Working...".into(),
     }
 }
@@ -536,8 +536,10 @@ impl State {
                                 kind: *activity,
                             });
                         }
-                        // The latest call of that name still running.
-                        TurnStatus::ToolCompleted { name, .. } => {
+                        // The latest call of that name still running; one
+                        // that handed its work off shows its launch result.
+                        TurnStatus::ToolCompleted { name, .. }
+                        | TurnStatus::ToolHandedOff { name, .. } => {
                             if let Some(call) = live
                                 .calls
                                 .iter_mut()
@@ -1292,6 +1294,44 @@ mod tests {
         assert_eq!(calls[0].output, "Found 0 errors.");
         assert_eq!(calls[1].input, "src/synthetic.ts");
         assert!(calls[1].output.is_empty());
+    }
+
+    /// A call that started a background run shows its launch line as its
+    /// result, and the turn's line says the work goes on, not that the call
+    /// finished.
+    #[test]
+    fn a_handed_off_call_shows_its_launch_line() {
+        let mut state = State::default();
+        let status = |status: TurnStatus| {
+            event(
+                None,
+                Event::TurnStatus {
+                    turn_id: "t1".into(),
+                    status,
+                },
+            )
+        };
+        state.apply(event(
+            None,
+            Event::TurnStarted {
+                turn_id: "t1".into(),
+                session_id: "app:s1".into(),
+                origin: "app".into(),
+            },
+        ));
+        state.apply(status(TurnStatus::tool_started(
+            "Starting a coding agent",
+            "",
+            Some(aidaemon_client_protocol::ToolKind::Delegate),
+        )));
+        let launch = "Started in the background: synthetic coding agent.";
+        state.apply(status(
+            TurnStatus::tool_handed_off("Starting a coding agent", "Working on in the background")
+                .with_detail(launch),
+        ));
+        let live = state.sessions["app:s1"].live.as_ref().unwrap();
+        assert_eq!(live.calls[0].output, launch);
+        assert_eq!(live.status.as_deref(), Some("Working on in the background"));
     }
 
     /// History's full record of each call reaches the reply's activity line.

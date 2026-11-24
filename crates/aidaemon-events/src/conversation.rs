@@ -206,12 +206,15 @@ fn unwrap_untrusted_external_data<'a>(
         return Cow::Borrowed(content);
     }
 
+    // The frame's closing line ends its data: notices the daemon appended
+    // after the frame follow it, so it is the last such line, not always
+    // the text's last line.
     let mut body: Vec<&str> = lines.collect();
-    if body.last().is_some_and(|line| {
+    if let Some(end) = body.iter().rposition(|line| {
         line.trim_start()
             .starts_with(UNTRUSTED_EXTERNAL_DATA_SUFFIX)
     }) {
-        body.pop();
+        body.remove(end);
     }
 
     Cow::Owned(body.join("\n"))

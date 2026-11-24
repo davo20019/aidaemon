@@ -430,6 +430,16 @@ fn shown_input(arguments: &serde_json::Value) -> String {
     aidaemon_tools::shown::call_input(arguments)
 }
 
+/// A stored tool result as the owner's app shows it: its own content, as
+/// the live row showed it, never the daemon's frame, the notices it appends
+/// or the model's instructions for checking on a background run.
+fn shown_result(m: &crate::traits::Message) -> String {
+    shown_output(&aidaemon_runtime::background_run::owner_call_result(
+        m.content.as_deref().unwrap_or_default(),
+        &m.effective_annotations(),
+    ))
+}
+
 /// A call's result as the owner's app shows it (`aidaemon_tools::shown`).
 fn shown_output(content: &str) -> String {
     aidaemon_tools::shown::call_output(content)
@@ -1005,7 +1015,7 @@ impl ClientHost for DaemonClientHost {
                     .as_deref()
                     .and_then(|id| pending.iter_mut().rev().find(|c| c.id == id))
                 {
-                    call.info.output = shown_output(m.content.as_deref().unwrap_or_default());
+                    call.info.output = shown_result(&m);
                 }
                 continue;
             }
@@ -1635,8 +1645,8 @@ fn devices_text(devices: &[aidaemon_client_protocol::DeviceInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_hidden_history_message, outcome_words, run_outcome, session_ends, shown_output, snippet,
-        tool_calls,
+        is_hidden_history_message, outcome_words, run_outcome, session_ends, shown_output,
+        shown_result, snippet, tool_calls,
     };
     use aidaemon_tools::shown::CALL_OUTPUT_CHARS;
 
@@ -1759,6 +1769,27 @@ mod tests {
             shown.len()
         );
         assert!(shown.ends_with("(truncated)"));
+    }
+
+    /// A background launch's stored result, read back from history, shows
+    /// its launch line: the frame, the appended system notice and the
+    /// model's instruction to check on the run stay out.
+    #[test]
+    fn a_background_launch_shows_its_launch_line_from_history() {
+        let launch =
+            aidaemon_runtime::background_run::started_in_background("synthetic coding agent");
+        let mut stored = crate::traits::Message::new_runtime("m1", "app:s1", "tool");
+        stored.content = Some(format!(
+            "{}\n\n[SYSTEM] A background task is now running. Do NOT call additional tools.",
+            aidaemon_policies::wrap_untrusted(
+                "cli_agent",
+                &format!(
+                    "{launch}\nCLI agent 'synthetic' started in background (task_id=abc1). \
+                     Use action=\"check\" with task_id=\"abc1\" to see output when done."
+                ),
+            )
+        ));
+        assert_eq!(shown_result(&stored), launch);
     }
 
     #[test]

@@ -1502,7 +1502,7 @@ pub fn status_text(update: &StatusUpdate) -> Option<String> {
                 ..Default::default()
             },
         )?),
-        StatusUpdate::StepHandedOff { kind } => progress(Step::HandedOff(*kind).words()),
+        StatusUpdate::StepHandedOff { kind, .. } => progress(Step::HandedOff(*kind).words()),
         StatusUpdate::CommandOutput { lines, .. } => {
             progress(Step::Output { lines: *lines }.words())
         }
@@ -2240,9 +2240,10 @@ mod tests {
         );
 
         let log = run_card_turn(
-            vec![StatusUpdate::StepHandedOff {
-                kind: aidaemon_core::card::ActivityKind::Run,
-            }],
+            vec![StatusUpdate::step_handed_off(
+                "running the installer",
+                aidaemon_core::card::ActivityKind::Run,
+            )],
             "Started the install in the background.",
             BackgroundHandoff,
         )

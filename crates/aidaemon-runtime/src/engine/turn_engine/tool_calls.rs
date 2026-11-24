@@ -1278,10 +1278,21 @@ impl TurnEngine<'_> {
                 let mutates = metadata
                     .as_ref()
                     .is_some_and(|metadata| metadata.semantics.mutates_state());
+                // What the owner's app shows of the result: never the
+                // daemon's frame, its notices or the model's instructions.
+                let shown = crate::background_run::owner_call_result(&output, &[]);
                 Some(if handed_off {
-                    StatusUpdate::StepHandedOff {
-                        kind: step_kind(&facts, mutates),
-                    }
+                    // Named as its start was, so the app's row for the call
+                    // takes its launch line.
+                    let (name, _) = self.step_activity(
+                        scope,
+                        &request.name,
+                        arguments,
+                        (&facts, mutates),
+                        || crate::turn::tool_summary::summarize_tool_args(&request.name, arguments),
+                    );
+                    StatusUpdate::step_handed_off(name, step_kind(&facts, mutates))
+                        .showing_result(&shown)
                 } else {
                     let (name, summary) = self.step_activity(
                         scope,
@@ -1299,7 +1310,7 @@ impl TurnEngine<'_> {
                             }
                         },
                     );
-                    StatusUpdate::tool_complete(name, summary).showing_result(&output)
+                    StatusUpdate::tool_complete(name, summary).showing_result(&shown)
                 })
             };
             if let Some(update) = update {

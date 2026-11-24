@@ -8900,6 +8900,31 @@
           "type": "object"
         },
         {
+          "description": "A call ended by handing its work to something that keeps running (a\nhelper or a background run), built with [`TurnStatus::tool_handed_off`]\n(protocol 1.50). The work has not finished, so it never reads as a\nfinished call: `text` says the work goes on, and `output` is the\ncall's own result (its launch line) for the call's row.",
+          "properties": {
+            "kind": {
+              "const": "tool_handed_off",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "output": {
+              "description": "The call's result as history shows it, redacted and cut to size;\nempty when the daemon gave none.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "description": {
               "type": "string"

@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 49;
+pub const PROTOCOL_MINOR: u16 = 50;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2502,6 +2502,20 @@ pub enum TurnStatus {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         output: String,
     },
+    /// A call ended by handing its work to something that keeps running (a
+    /// helper or a background run), built with [`TurnStatus::tool_handed_off`]
+    /// (protocol 1.50). The work has not finished, so it never reads as a
+    /// finished call: `text` says the work goes on, and `output` is the
+    /// call's own result (its launch line) for the call's row.
+    #[non_exhaustive]
+    ToolHandedOff {
+        name: String,
+        text: String,
+        /// The call's result as history shows it, redacted and cut to size;
+        /// empty when the daemon gave none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        output: String,
+    },
     PlanStep {
         /// 0-based.
         step: u32,
@@ -2546,26 +2560,39 @@ impl TurnStatus {
         }
     }
 
-    /// A started call with its shown arguments, or a finished one with its
-    /// shown result. Other statuses are unchanged.
+    /// A call that handed its work off; [`Self::with_detail`] adds its
+    /// shown result.
+    pub fn tool_handed_off(name: impl Into<String>, text: impl Into<String>) -> Self {
+        TurnStatus::ToolHandedOff {
+            name: name.into(),
+            text: text.into(),
+            output: String::new(),
+        }
+    }
+
+    /// A started call with its shown arguments, or a finished or handed-off
+    /// one with its shown result. Other statuses are unchanged.
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         match &mut self {
             TurnStatus::ToolStarted { input: shown, .. }
-            | TurnStatus::ToolCompleted { output: shown, .. } => *shown = detail.into(),
+            | TurnStatus::ToolCompleted { output: shown, .. }
+            | TurnStatus::ToolHandedOff { output: shown, .. } => *shown = detail.into(),
             _ => {}
         }
         self
     }
 
     /// What a tool row shows for this status: a started call's arguments or
-    /// a completed call's result, else its summary when the daemon sent
-    /// none (an older daemon). `None` for a status that is not a call.
+    /// a completed or handed-off call's result, else its summary (a handed-off
+    /// call's words) when the daemon sent none (an older daemon). `None` for
+    /// a status that is not a call.
     pub fn call_detail(&self) -> Option<&str> {
         let (shown, summary) = match self {
             TurnStatus::ToolStarted { input, summary, .. } => (input, summary),
             TurnStatus::ToolCompleted {
                 output, summary, ..
             } => (output, summary),
+            TurnStatus::ToolHandedOff { output, text, .. } => (output, text),
             _ => return None,
         };
         Some(if shown.trim().is_empty() {

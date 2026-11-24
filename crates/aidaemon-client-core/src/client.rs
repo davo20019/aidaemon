@@ -1785,7 +1785,9 @@ impl Client {
                     TurnStatus::Checklist { text } => {
                         (ActivityKind::Plan, "Plan".into(), text.clone())
                     }
-                    TurnStatus::Note { text } => (ActivityKind::Note, "Note".into(), text.clone()),
+                    TurnStatus::Note { text } | TurnStatus::ToolHandedOff { text, .. } => {
+                        (ActivityKind::Note, "Note".into(), text.clone())
+                    }
                     TurnStatus::Unknown => return,
                 };
                 (turn_id, kind, title, detail)
@@ -2530,19 +2532,38 @@ impl Client {
         Ok(true)
     }
 
-    /// Follow up on run `run_id` of `session`: `text` goes to its coding
-    /// agent, which goes on in its own session (protocol 1.48, `in_run`).
-    /// While the conversation works it waits for a turn of its own.
-    pub fn follow_up(&mut self, session: &str, run_id: &str, text: &str) {
+    /// Follow up on run `run_id` of `session`: `text` (and any attached draft
+    /// files) goes to its coding agent, which goes on in its own session
+    /// (protocol 1.48, `in_run`). While the conversation works it waits for a
+    /// turn of its own.
+    pub fn follow_up(&mut self, session: &str, run_id: &str, text: &str) -> Result<bool, String> {
         let text = text.trim();
-        if text.is_empty() {
-            return;
+        if self
+            .draft_files
+            .iter()
+            .any(|f| matches!(f.state, DraftFileState::Uploading))
+        {
+            return Err("Wait for the files to finish attaching".into());
+        }
+        let attachments: Vec<AttachmentRef> = self
+            .draft_files
+            .iter()
+            .filter_map(|f| match &f.state {
+                DraftFileState::Ready(attachment) => Some(attachment.clone()),
+                _ => None,
+            })
+            .collect();
+        if text.is_empty() && attachments.is_empty() {
+            return Ok(false);
+        }
+        if !attachments.is_empty() {
+            self.draft_files.clear();
         }
         let queueing = self.is_running(session);
         let id = self.send(Command::SendMessage {
             session_id: Some(session.to_owned()),
             text: text.to_owned(),
-            attachments: Vec::new(),
+            attachments,
             mid_run: queueing.then_some(MidRun::Queue),
             project_id: None,
             model: None,
@@ -2552,6 +2573,7 @@ impl Client {
         if queueing {
             self.queue_sends.insert(id);
         }
+        Ok(true)
     }
 
     /// Say `text` in `session`, as if typed (a suggested prompt, Retry).
@@ -3440,18 +3462,49 @@ mod tests {
         let mut client = Client::new();
         client.update(Update::Connected, &cx(None));
         client.take_outgoing();
-        client.follow_up("app:s1", "cli-agent-1", "  also add tests ");
+        assert_eq!(
+            client.follow_up("app:s1", "cli-agent-1", "  also add tests "),
+            Ok(true)
+        );
         let sent = client.take_outgoing();
         assert!(matches!(
             &sent[..],
-            [(_, Command::SendMessage { in_run: Some(run), text, mid_run: None, .. })]
-                if run == "cli-agent-1" && text == "also add tests"
+            [(_, Command::SendMessage { in_run: Some(run), text, attachments, mid_run: None, .. })]
+                if run == "cli-agent-1" && text == "also add tests" && attachments.is_empty()
         ));
-        client.follow_up("app:s1", "cli-agent-1", "   ");
+        assert_eq!(client.follow_up("app:s1", "cli-agent-1", "   "), Ok(false));
         assert!(
             client.take_outgoing().is_empty(),
             "nothing to say sends nothing"
         );
+
+        // Attached files go with the follow-up too (even with no caption),
+        // and sending waits while an upload is still in flight.
+        client.draft_files.push(DraftFile {
+            number: 1,
+            name: "screen.png".into(),
+            state: DraftFileState::Uploading,
+            marked_from: None,
+        });
+        assert!(client.follow_up("app:s1", "cli-agent-1", "").is_err());
+        client.draft_files[0].state = DraftFileState::Ready(AttachmentRef {
+            id: "f1".into(),
+            name: "screen.png".into(),
+            mime: Some("image/png".into()),
+            size_bytes: Some(128),
+            url: Some("/client/v1/files/f1".into()),
+            width: None,
+            height: None,
+            marked_from: None,
+        });
+        assert_eq!(client.follow_up("app:s1", "cli-agent-1", ""), Ok(true));
+        let sent = client.take_outgoing();
+        assert!(matches!(
+            &sent[..],
+            [(_, Command::SendMessage { in_run: Some(run), text, attachments, .. })]
+                if run == "cli-agent-1" && text.is_empty() && attachments.len() == 1
+        ));
+        assert!(client.draft_files.is_empty());
     }
 
     /// "Send now" goes only to a daemon that knows it: an older one would
