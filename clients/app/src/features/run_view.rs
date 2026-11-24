@@ -18,10 +18,11 @@
 use aidaemon_client_protocol::{
     ModelChoice, RunDetail, RunPermissionOutcome, RunPhase, RunPlanStatus, RunStepState, RunSummary,
 };
-use nsh_base::button;
+use nsh_base::{button, input};
+use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
-use crate::store::{Read, Store};
+use crate::store::{DraftFileState, Read, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, type_scale};
 
 /// Verbosity thresholds for collapsing long agent replies so verbose CLI
@@ -457,25 +458,41 @@ fn is_owner_prompt(run: &RunSummary, direct: bool) -> bool {
     direct || run.asked.as_ref().is_some_and(|asked| asked.by_owner)
 }
 
-/// Daemon-written recovery preamble marker (`RunProgress::note`) prepended to
-/// prompts when resuming an interrupted run; stripped when rendering legacy
-/// persisted runs so the owner's bubble shows only what they actually wrote.
+/// Daemon-written recovery preamble marker (`RunProgress::note`) and prior
+/// conversation wrapper (`CliAgentTool::prepend_direct_conversation_context`)
+/// prepended to prompts for model continuity; stripped when rendering runs so
+/// owner bubbles show only what the user actually wrote.
 const INTERRUPTED_MARKER: &str = "[Where your last turn stopped]";
 const INTERRUPTED_END: &str = "Check the current state of those files before redoing anything, then go on from there with the message below.";
+const PRIOR_CONVERSATION_MARKER: &str = "## Prior conversation";
+const CURRENT_REQUEST_MARKER: &str = "## Current request";
 
-/// Remove daemon-written recovery preamble from persisted `asked` text so
-/// owner bubbles display only the user's own message.
+/// Remove daemon-written context wrappers and restart recovery preambles from
+/// persisted `asked` text so owner bubbles display only the user's message.
 fn clean_asked_text(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix(INTERRUPTED_MARKER)
-        && let Some(idx) = rest.find(INTERRUPTED_END)
-    {
-        let after = rest[idx + INTERRUPTED_END.len()..].trim();
-        if !after.is_empty() {
-            return after.to_string();
+    let mut text = raw.trim();
+    loop {
+        if text.starts_with(PRIOR_CONVERSATION_MARKER)
+            && let Some(idx) = text.find(CURRENT_REQUEST_MARKER)
+        {
+            let after = text[idx + CURRENT_REQUEST_MARKER.len()..].trim();
+            if !after.is_empty() {
+                text = after;
+                continue;
+            }
         }
+        if let Some(rest) = text.strip_prefix(INTERRUPTED_MARKER)
+            && let Some(idx) = rest.find(INTERRUPTED_END)
+        {
+            let after = rest[idx + INTERRUPTED_END.len()..].trim();
+            if !after.is_empty() {
+                text = after;
+                continue;
+            }
+        }
+        break;
     }
-    trimmed.to_string()
+    text.to_string()
 }
 
 /// What it was asked: the owner's prompt or follow-up as a right-aligned
@@ -1073,6 +1090,11 @@ fn follow_up(
     direct_agent: Memo<bool>,
 ) -> View {
     let draft = signal(String::new());
+    let sent_tick = signal(0u64);
+    let dragging = signal(false);
+    let touch = ui::touch();
+    let terminal = idiom() == Idiom::Terminal;
+    let height = signal(ui::fit::body_lh());
     // What was sent, and to which run, until a run continues it.
     let sent: Signal<Option<(String, String)>> = signal(None);
     let continued = computed(move || {
@@ -1104,9 +1126,24 @@ fn follow_up(
         })
     });
     let name = computed(move || who.with(|(name, _, _)| name.clone()));
+    let can_send = computed(move || {
+        let has_text = draft.with(|d| !d.trim().is_empty());
+        let files = store.draft_files();
+        let uploading = files
+            .iter()
+            .any(|f| matches!(f.state, DraftFileState::Uploading));
+        let has_ready_file = files
+            .iter()
+            .any(|f| matches!(f.state, DraftFileState::Ready(_)));
+        !uploading && (has_text || has_ready_file)
+    });
     let send = move || {
         let text = draft.get_untracked();
-        if text.trim().is_empty() {
+        let files = store.draft_files();
+        let has_ready_file = files
+            .iter()
+            .any(|f| matches!(f.state, DraftFileState::Ready(_)));
+        if text.trim().is_empty() && !has_ready_file {
             return;
         }
         let Some((session, run)) = latest.with_untracked(|run| {
@@ -1115,9 +1152,22 @@ fn follow_up(
         }) else {
             return;
         };
-        store.follow_up(&session, &run, &text);
-        draft.set(String::new());
-        sent.set(Some((text.trim().to_string(), run)));
+        let preview = if !text.trim().is_empty() {
+            text.trim().to_string()
+        } else {
+            let names: Vec<String> = files
+                .iter()
+                .filter(|f| matches!(f.state, DraftFileState::Ready(_)))
+                .map(|f| f.name.clone())
+                .collect();
+            format!("Sent {}", names.join(", "))
+        };
+        if store.follow_up(&session, &run, &text) {
+            draft.set(String::new());
+            height.set(ui::fit::body_lh());
+            sent_tick.update(|n| *n = n.saturating_add(1));
+            sent.set(Some((preview, run)));
+        }
     };
     view()
         .child(when(
@@ -1172,19 +1222,121 @@ fn follow_up(
                     .border_color(colors::LINE)
                     .child(
                         view()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
+                            .w_full()
+                            .rounded(px(ui::radius::SURFACE))
+                            .bg(colors::COMPOSER)
+                            .border_1()
+                            .border_color(move || {
+                                if dragging.get() {
+                                    colors::ACCENT
+                                } else {
+                                    colors::EDGE
+                                }
+                            })
+                            .px_2()
+                            .pt_1()
+                            .pb_1()
+                            .gap_1()
+                            .on_file_drag_enter(move |_: &FileDragEvent| {
+                                if store.takes_files() {
+                                    dragging.set(true);
+                                }
+                            })
+                            .on_file_drag_leave(move || dragging.set(false))
+                            .on_file_drop(move |drop: &FileDropEvent| {
+                                dragging.set(false);
+                                if store.takes_files() {
+                                    super::conversation::attach_dropped(
+                                        store,
+                                        drop.uris.clone(),
+                                        drop.mime_types.clone(),
+                                    );
+                                }
+                            })
+                            .child(when(
+                                move || dragging.get(),
+                                || {
+                                    text("Drop to attach")
+                                        .px_1()
+                                        .text_size(px(type_scale::XS))
+                                        .text_color(colors::ACCENT)
+                                },
+                            ))
+                            .child(super::conversation::draft_files(store))
                             .child(
-                                ui::field("Reply…", draft)
-                                    .label("Follow-up for the agent")
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .on_submit(move |_: &str| send()),
+                                input()
+                                    .on_paste(move |paste: &PasteEvent| {
+                                        if !store.takes_files() {
+                                            return;
+                                        }
+                                        for file in &paste.files {
+                                            store.attach_file(
+                                                file.name.clone(),
+                                                file.mime.clone(),
+                                                &file.data,
+                                            );
+                                        }
+                                    })
+                                    .value(move || draft.get())
+                                    .on_change(move |text: &str| draft.set(text.to_owned()))
+                                    .multiline(true)
+                                    .submit_behavior(if touch {
+                                        SubmitBehavior::Newline
+                                    } else {
+                                        SubmitBehavior::Submit
+                                    })
+                                    .on_submit(move |_: &str| send())
+                                    .placeholder(move || {
+                                        let files = store.draft_files();
+                                        if files.iter().any(|f| f.marked_from.is_some()) {
+                                            "Say what to do with the marked part"
+                                        } else if !files.is_empty() {
+                                            "Say what to do with it, or just send"
+                                        } else {
+                                            "Reply…"
+                                        }
+                                        .to_owned()
+                                    })
+                                    .placeholder_color(|| color(colors::FAINT))
+                                    .caret_color(|| color(colors::ACCENT))
+                                    .selection_color(|| color(colors::ACCENT))
+                                    .on_content_size_change(
+                                        move |size: &nsh_core::geometry::Size<Points>| {
+                                            height.set(
+                                                size.height.0.clamp(ui::fit::body_lh(), 140.0),
+                                            );
+                                        },
+                                    )
+                                    .h(move || px(height.get() + if touch { 8.0 } else { 12.0 }))
+                                    .px(px(6.0))
+                                    .py(px(if touch { 4.0 } else { 6.0 }))
+                                    .text_size(px(ui::fit::body()))
+                                    .line_height(px(ui::fit::body_lh()))
+                                    .text_color(colors::TEXT)
+                                    .label("Follow-up for the agent"),
                             )
                             .child(
-                                ui::icon_btn_primary(Glyph::Send, "Send to the agent", send)
-                                    .disabled(move || draft.with(|d| d.trim().is_empty())),
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(super::conversation::attach_button(store, terminal))
+                                    .child(super::conversation::dictation_for(
+                                        store,
+                                        terminal,
+                                        move || draft.get_untracked(),
+                                        move |text| draft.set(text),
+                                        move || sent_tick.get(),
+                                    ))
+                                    .child(view().flex_1())
+                                    .child(
+                                        ui::icon_btn_primary(
+                                            Glyph::Send,
+                                            "Send to the agent",
+                                            send,
+                                        )
+                                        .disabled(move || !can_send.get()),
+                                    ),
                             ),
                     )
             },
@@ -1381,5 +1533,17 @@ mod tests {
         let raw = "[Where your last turn stopped] Your previous turn in this session (run cli-agent-1) did not finish: a daemon restart stopped it part way.\n- Steps finished: 5.\nCheck the current state of those files before redoing anything, then go on from there with the message below.\n\nContinue";
         assert_eq!(clean_asked_text(raw), "Continue");
         assert_eq!(clean_asked_text("Fix the bug"), "Fix the bug");
+    }
+
+    #[test]
+    fn clean_asked_text_strips_prior_conversation_wrapper() {
+        let raw = "## Prior conversation\nuser: Yes, fix it\nassistant: Done.\n\n## Current request\nThe ux is not that great on desktop here.";
+        assert_eq!(
+            clean_asked_text(raw),
+            "The ux is not that great on desktop here."
+        );
+
+        let nested = "## Prior conversation\nuser: Check it\n\n## Current request\n[Where your last turn stopped] Partial run.\nCheck the current state of those files before redoing anything, then go on from there with the message below.\n\nContinue";
+        assert_eq!(clean_asked_text(nested), "Continue");
     }
 }

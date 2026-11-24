@@ -2579,7 +2579,7 @@ fn files(store: Store, attached: impl Fn() -> Vec<AttachmentRef> + 'static, mine
 
 /// The files attached to the message being written, each with a way to
 /// take it off.
-fn draft_files(store: Store) -> View {
+pub(crate) fn draft_files(store: Store) -> View {
     view().child(dynamic(move || {
         let files = store.draft_files();
         if files.is_empty() {
@@ -3063,22 +3063,7 @@ fn composer(store: Store, session: Option<String>) -> View {
                         .flex_row()
                         .items_center()
                         .gap_1()
-                        .child(when(
-                            move || !terminal && store.takes_files(),
-                            move || {
-                                let mut ways = Vec::new();
-                                if untracked(|| store.takes_pictures()) {
-                                    ways.push(ui::MenuAction::new("Take a picture", move || {
-                                        store.take_picture()
-                                    }));
-                                }
-                                ways.push(ui::MenuAction::new("Pictures", move || {
-                                    store.pick_pictures()
-                                }));
-                                ways.push(ui::MenuAction::new("Files", move || store.pick_files()));
-                                ui::press_menu(Glyph::Attach, "Attach", ways)
-                            },
-                        ))
+                        .child(attach_button(store, terminal))
                         .child(dictation(store, terminal))
                         // Model and effort, in the same row; a phone's row
                         // has no room for them beside the working hint.
@@ -3435,7 +3420,7 @@ fn slash_list(store: Store, matches: Memo<Vec<aidaemon_client_protocol::SlashCom
 /// each by its name, as the paperclip's are. Directories and files that
 /// cannot be read say so.
 #[cfg(not(target_arch = "wasm32"))]
-fn attach_dropped(store: Store, uris: Vec<String>, mimes: Vec<String>) {
+pub(crate) fn attach_dropped(store: Store, uris: Vec<String>, mimes: Vec<String>) {
     spawn(async move {
         let read = background(async move {
             uris.iter()
@@ -3474,9 +3459,29 @@ fn attach_dropped(store: Store, uris: Vec<String>, mimes: Vec<String>) {
     });
 }
 
+/// Paperclip menu for attaching camera photos, pictures, or files.
+pub(crate) fn attach_button(store: Store, terminal: bool) -> View {
+    view().child(when(
+        move || !terminal && store.takes_files(),
+        move || {
+            let mut ways = Vec::new();
+            if untracked(|| store.takes_pictures()) {
+                ways.push(ui::MenuAction::new("Take a picture", move || {
+                    store.take_picture()
+                }));
+            }
+            ways.push(ui::MenuAction::new("Pictures", move || {
+                store.pick_pictures()
+            }));
+            ways.push(ui::MenuAction::new("Files", move || store.pick_files()));
+            ui::press_menu(Glyph::Attach, "Attach", ways)
+        },
+    ))
+}
+
 /// The browser hands no paths: nothing to read.
 #[cfg(target_arch = "wasm32")]
-fn attach_dropped(_store: Store, _uris: Vec<String>, _mimes: Vec<String>) {}
+pub(crate) fn attach_dropped(_store: Store, _uris: Vec<String>, _mimes: Vec<String>) {}
 
 /// The local path of a `file:` URL, its `%XX` escapes decoded.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -3512,6 +3517,24 @@ fn file_path(uri: &str) -> String {
 /// stops listening (the last words are kept). Shown only where speech can
 /// be recognized: the platform's recognizer, or the browser's.
 fn dictation(store: Store, terminal: bool) -> View {
+    dictation_for(
+        store,
+        terminal,
+        move || store.draft(),
+        move |text| store.set_draft(text),
+        move || store.last_sent(),
+    )
+}
+
+/// Shared speech-to-text button bound to any composer's draft reader, writer,
+/// and send counter (so sending clears and stops an active dictation session).
+pub(crate) fn dictation_for(
+    store: Store,
+    terminal: bool,
+    read_draft: impl Fn() -> String + Copy + 'static,
+    write_draft: impl Fn(String) + Copy + 'static,
+    send_tick: impl Fn() -> u64 + Copy + 'static,
+) -> View {
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -3530,9 +3553,9 @@ fn dictation(store: Store, terminal: bool) -> View {
     // recognizer still reports is dropped, so it never refills the cleared
     // composer.
     let sent: Stored<Option<Rc<Cell<bool>>>> = stored(None);
-    let seen_send = Cell::new(untracked(|| store.last_sent()));
+    let seen_send = Cell::new(untracked(send_tick));
     effect(move || {
-        let at = store.last_sent();
+        let at = send_tick();
         if at == seen_send.replace(at) {
             return;
         }
@@ -3563,7 +3586,7 @@ fn dictation(store: Store, terminal: bool) -> View {
             });
             return;
         }
-        let before = store.draft();
+        let before = read_draft();
         let lead = if before.trim().is_empty() {
             String::new()
         } else {
@@ -3582,8 +3605,8 @@ fn dictation(store: Store, terminal: bool) -> View {
                     match event {
                         Some(SpeechEvent::Result { .. }) if dropped.get() => {}
                         Some(SpeechEvent::Result { text, .. }) => {
-                            let draft = dictated.write(&store.draft(), &text);
-                            store.set_draft(draft)
+                            let draft = dictated.write(&read_draft(), &text);
+                            write_draft(draft)
                         }
                         Some(SpeechEvent::End { error }) => {
                             if let Some(note) = error.and_then(speech_note) {

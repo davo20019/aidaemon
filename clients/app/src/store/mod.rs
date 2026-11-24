@@ -2368,10 +2368,17 @@ impl Store {
         self.act(|c| c.ask(session, text));
     }
 
-    /// Follow up on run `run` of `session`: `text` goes to its coding
-    /// agent, which goes on in its own session.
-    pub fn follow_up(&self, session: &str, run: &str, text: &str) {
-        self.act(|c| c.follow_up(session, run, text));
+    /// Follow up on run `run` of `session`: `text` and any attached draft
+    /// files go to its coding agent, which goes on in its own session.
+    /// Returns `true` when the follow-up was queued/sent.
+    pub fn follow_up(&self, session: &str, run: &str, text: &str) -> bool {
+        match self.act(|c| c.follow_up(session, run, text)) {
+            Ok(sent) => sent,
+            Err(note) => {
+                self.say(note);
+                false
+            }
+        }
     }
 
     pub fn needs_you(&self, id: &str) -> bool {
