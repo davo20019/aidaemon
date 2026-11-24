@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 48;
+pub const PROTOCOL_MINOR: u16 = 49;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -736,6 +736,11 @@ pub enum ModelChoice {
     Auto,
     /// This model of this provider (ids from `list_models`), every turn.
     Pinned { provider: String, model: String },
+    /// This coding agent (an id from `list_models`' `agents`), every turn
+    /// (protocol 1.49): each message goes straight to it in the
+    /// conversation's project folder, with no model call first. Only a
+    /// conversation in a project with a folder takes one.
+    Agent { agent: String },
     #[serde(other)]
     #[schemars(skip)]
     Unknown,
@@ -762,6 +767,19 @@ pub struct ModelOptions {
     /// The connected providers, the main one first, each listing only the
     /// models no earlier provider lists.
     pub providers: Vec<ModelProvider>,
+    /// The coding agents installed and ready on the daemon's computer, the
+    /// one it prefers first (protocol 1.49); an `agent` choice names one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentOption>,
+}
+
+/// A coding agent a code conversation can be set to (protocol 1.49).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct AgentOption {
+    /// What an `agent` choice names it by.
+    pub id: String,
+    /// In plain words ("Claude Code", "Codex").
+    pub name: String,
 }
 
 /// A connected provider, as a model picker lists it.

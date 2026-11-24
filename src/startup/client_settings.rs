@@ -1428,6 +1428,24 @@ fn agent_mode(
     }
 }
 
+/// The coding agents a code conversation can be set to: ready now, with a
+/// mode the owner allows. Preferred first, as delegation prefers them.
+pub(crate) async fn direct_agents(
+    permissions: &Permissions,
+) -> Vec<aidaemon_client_protocol::AgentOption> {
+    use aidaemon_runtime::tools::agent_mode;
+    agent_mode::ensure_checked().await;
+    agent_mode::agents()
+        .into_iter()
+        .filter(|info| agent_mode::readiness_of(&info.name).is_usable())
+        .filter(|info| permissions.agent_mode(&info.name, &*info.agent).is_some())
+        .map(|info| aidaemon_client_protocol::AgentOption {
+            name: info.agent.name().to_string(),
+            id: info.name,
+        })
+        .collect()
+}
+
 /// The coding agents the daemon can hand work to, each with its mode.
 /// The agent named `agent` and the model chosen for it (trimmed; `None`:
 /// its own default), when it can take one and, if it listed its models

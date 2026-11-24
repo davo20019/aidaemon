@@ -2227,7 +2227,20 @@ async fn deliver_end(
         .goal_id
         .as_deref()
         .is_some_and(|goal_id| !goal_id.is_empty());
-    if !goal_scoped && !notify_session_id.trim().is_empty() {
+    // A conversation set to a coding agent takes its result as it is: no
+    // model call follows the agent's run.
+    let direct = !notify_session_id.trim().is_empty()
+        && crate::session_model::get(handles.state.as_ref(), &notify_session_id)
+            .await
+            .agent
+            .is_some();
+    if direct {
+        info!(
+            session_id = %notify_session_id,
+            "Coding agent conversation: delivering the agent's result without a model turn"
+        );
+    }
+    if !direct && !goal_scoped && !notify_session_id.trim().is_empty() {
         let reengagement_allowed = {
             let mut log = handles.reengagements.lock().await;
             crate::tools::terminal::reengagement_allowed(

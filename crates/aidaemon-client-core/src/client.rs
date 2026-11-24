@@ -1840,12 +1840,14 @@ impl Client {
     }
 
     /// The efforts `model` takes besides automatic: a pinned model's own;
-    /// automatic, those of the main provider's first model.
+    /// automatic, those of the main provider's first model; a coding agent,
+    /// none (it keeps its own).
     pub fn efforts_of(&self, model: &ModelChoice) -> Vec<Effort> {
         let Some(options) = self.models.ready() else {
             return Vec::new();
         };
         match model {
+            ModelChoice::Agent { .. } => Vec::new(),
             ModelChoice::Pinned { provider, model } => options
                 .providers
                 .iter()

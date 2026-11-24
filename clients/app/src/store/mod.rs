@@ -1966,6 +1966,18 @@ impl Store {
         self.new_code.set(code);
         if !code {
             self.new_project.set(None);
+            // A coding agent works only in a project's folder: a chat
+            // goes back to AIDaemon.
+            if matches!(
+                self.model_of(None).0,
+                aidaemon_client_protocol::ModelChoice::Agent { .. }
+            ) {
+                self.set_session_model(
+                    None,
+                    Some(aidaemon_client_protocol::ModelChoice::Auto),
+                    None,
+                );
+            }
         } else if self.new_project.get_untracked().is_none() {
             let last = nsh_core::storage::Storage::get_item(LAST_PROJECT_KEY).filter(|id| {
                 self.reads

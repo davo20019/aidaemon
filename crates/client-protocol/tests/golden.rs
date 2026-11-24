@@ -1531,8 +1531,13 @@ fn server_samples() -> Vec<ServerFrame> {
                         }],
                     },
                 ],
+                agents: vec![AgentOption {
+                    id: "codex".into(),
+                    name: "Codex".into(),
+                }],
             },
         }),
+
         ack(CommandResult::SessionModel {
             session_model: SessionModel {
                 session_id: "app:6c1f".into(),

@@ -1042,6 +1042,15 @@ pub async fn run_bootstrap(
         Some("runtime_resume_uses_parent_contract")
     } else if agent.works_for_mandate() {
         Some("mandate_cycle_uses_only_budgeted_main_loop_calls")
+    } else if agent.depth() == 0
+        && crate::session_model::get(agent.settings(), session_id)
+            .await
+            .agent
+            .is_some()
+    {
+        // The message goes to the conversation's coding agent as it is:
+        // nothing is planned and no model reads it first.
+        Some("coding_agent_conversation_takes_the_message_as_is")
     } else {
         crate::turn::task_planning::planning_skip_reason(user_text, false)
     };

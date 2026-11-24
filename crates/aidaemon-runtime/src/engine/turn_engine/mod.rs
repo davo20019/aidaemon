@@ -1312,7 +1312,15 @@ impl TurnEngine<'_> {
             )
             .await;
         }
+        let direct_agent = if self.host.depth() == 0 && !internal_continuation {
+            crate::session_model::get(self.host.settings(), session_id)
+                .await
+                .agent
+        } else {
+            None
+        };
         let scope = TurnScope {
+            direct_agent,
             daemon_paths: self.daemon_paths(),
             execution_backend: &*self.execution_backend_handle(),
             run_id,

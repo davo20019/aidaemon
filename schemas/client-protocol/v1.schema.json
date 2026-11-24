@@ -78,6 +78,24 @@
       ],
       "type": "object"
     },
+    "AgentOption": {
+      "description": "A coding agent a code conversation can be set to (protocol 1.49).",
+      "properties": {
+        "id": {
+          "description": "What an `agent` choice names it by.",
+          "type": "string"
+        },
+        "name": {
+          "description": "In plain words (\"Claude Code\", \"Codex\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
     "AgentReadiness": {
       "description": "Whether a coding agent can do work now (protocol 1.38).",
       "oneOf": [
@@ -4980,6 +4998,23 @@
             "model"
           ],
           "type": "object"
+        },
+        {
+          "description": "This coding agent (an id from `list_models`' `agents`), every turn\n(protocol 1.49): each message goes straight to it in the\nconversation's project folder, with no model call first. Only a\nconversation in a project with a folder takes one.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "mode": {
+              "const": "agent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "agent"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -5005,6 +5040,13 @@
     "ModelOptions": {
       "description": "What a conversation can be set to answer with (protocol 1.16).",
       "properties": {
+        "agents": {
+          "description": "The coding agents installed and ready on the daemon's computer, the\none it prefers first (protocol 1.49); an `agent` choice names one.",
+          "items": {
+            "$ref": "#/$defs/AgentOption"
+          },
+          "type": "array"
+        },
         "providers": {
           "description": "The connected providers, the main one first, each listing only the\nmodels no earlier provider lists.",
           "items": {

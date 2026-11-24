@@ -37,11 +37,16 @@ pub struct SessionModelSetting {
     /// One of [`EFFORTS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// A coding agent (a registry name, "claude", "codex") that takes each
+    /// message directly, with no model call; set, `pinned` and `effort`
+    /// are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl SessionModelSetting {
     pub fn is_auto(&self) -> bool {
-        self.pinned.is_none() && self.effort.is_none()
+        self.pinned.is_none() && self.effort.is_none() && self.agent.is_none()
     }
 }
 
@@ -190,6 +195,7 @@ mod tests {
                 model: "synthetic-model-large".into(),
             }),
             effort: Some("high".into()),
+            agent: None,
         };
         set(&settings, "app:s1", &pinned).await.unwrap();
         assert_eq!(get(&settings, "app:s1").await, pinned);

@@ -2248,14 +2248,6 @@ impl ClientGateway {
                     .await;
             }
         };
-        // The model and effort this message sets apply from its own turn,
-        // so they are stored before it starts.
-        if model.is_some() || effort.is_some() {
-            self.host
-                .set_session_model(&session_id, model, effort)
-                .await
-                .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
-        }
         self.runner.register_session(&session_id, APP_CHANNEL).await;
         // A new conversation started inside a project is placed there
         // before its first turn, so that turn already works in its folder.
@@ -2272,6 +2264,15 @@ impl ClientGateway {
             },
             None => None,
         };
+        // The model and effort this message sets apply from its own turn,
+        // so they are stored before it starts (after its project: a coding
+        // agent needs the project's folder).
+        if model.is_some() || effort.is_some() {
+            self.host
+                .set_session_model(&session_id, model, effort)
+                .await
+                .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+        }
         // The turn this message starts may move the sender's view, and only
         // the sender's, when it declared the capability.
         self.views.message_from(&session_id, view_connection);

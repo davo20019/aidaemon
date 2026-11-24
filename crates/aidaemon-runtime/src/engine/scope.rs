@@ -115,6 +115,10 @@ pub struct TurnScope<'a> {
     /// Where calls without a directory run; refined by the model's own
     /// explicit directories (see `SdkTurnSetup::known_project_dir`).
     pub known_project_dir: Arc<std::sync::Mutex<Option<String>>>,
+    /// The coding agent this conversation is set to (root turns the owner
+    /// sent only): its model calls are answered without a model, the first
+    /// with the one `cli_agent` run that takes the owner's message.
+    pub direct_agent: Option<String>,
     /// Terminal calls in the canonical form the kernel's approval rules
     /// judged, by run and call id: the dispatcher executes exactly these,
     /// with the scope they were judged with.

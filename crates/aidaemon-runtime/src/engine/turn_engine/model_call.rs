@@ -252,6 +252,9 @@ impl TurnEngine<'_> {
         text: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Result<sdk::ModelResponse, sdk::ProviderError> {
         let iteration = scope.model_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(agent) = &scope.direct_agent {
+            return Ok(direct_agent_response(scope, agent, request, iteration));
+        }
         let snapshot = self.llm_runtime().snapshot();
         // A model that already failed over in this turn is not asked first
         // again: the call starts at the model that took over, and the usual
@@ -877,4 +880,52 @@ fn spent_nothing(error: &anyhow::Error) -> bool {
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::chat_bridge::ProviderError>())
         .is_some_and(|error| error.spent_nothing)
+}
+
+/// A model call of a conversation set to a coding agent, answered with no
+/// model: the first hands the owner's message, as it is, to that agent in
+/// the project's folder (the same `cli_agent` run the model would start,
+/// so the kernel judges it and its card and thread are the usual ones);
+/// any later one (the run finished in the turn, or a text-only retry)
+/// ends the turn with what the run returned.
+fn direct_agent_response(
+    scope: &TurnScope<'_>,
+    agent: &str,
+    request: &sdk::ModelRequest,
+    iteration: u64,
+) -> sdk::ModelResponse {
+    let offers_tools = request.tool_choice != sdk::ToolChoice::None;
+    if iteration == 1 && offers_tools {
+        let mut arguments = serde_json::json!({
+            "action": "run",
+            "tool": agent,
+            "prompt": scope.user_text,
+            "async_mode": true,
+        });
+        if let Some(root) = scope
+            .project
+            .as_ref()
+            .and_then(|project| project.root.as_ref())
+        {
+            arguments["working_dir"] = serde_json::Value::String(root.display().to_string());
+        }
+        return sdk::ModelResponse {
+            tool_calls: vec![sdk::ToolCall::new(
+                format!("direct-agent-{}", scope.turn_id),
+                "cli_agent",
+                arguments,
+            )],
+            ..sdk::ModelResponse::default()
+        };
+    }
+    let output = scope
+        .latest_tool_output
+        .lock()
+        .ok()
+        .and_then(|output| output.clone())
+        .filter(|output| !output.trim().is_empty());
+    sdk::ModelResponse {
+        text: output.unwrap_or_else(|| format!("Sent to {agent}.")),
+        ..sdk::ModelResponse::default()
+    }
 }

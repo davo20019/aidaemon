@@ -1,6 +1,8 @@
 //! The composer's model and effort: what this conversation (or the next
 //! new one) answers with. Only the app's own conversations show it; a chat
-//! bot's conversations answer with that chat's model.
+//! bot's conversations answer with that chat's model. A conversation on
+//! code picks who does the work instead: AIDaemon, or a coding agent that
+//! takes each message straight, with no model call.
 
 use aidaemon_client_protocol::{Effort, ModelChoice, ModelOptions};
 use nsh_core::prelude::*;
@@ -8,15 +10,22 @@ use nsh_core::prelude::*;
 use crate::store::{Read, Store};
 use crate::ui;
 
-/// A model choice as a list value: `auto`, or provider and model.
+/// A model choice as a list value: `auto`, provider and model, or
+/// `agent` and the agent.
 fn encode(model: &ModelChoice) -> String {
     match model {
         ModelChoice::Pinned { provider, model } => format!("{provider}\n{model}"),
+        ModelChoice::Agent { agent } => format!("{AGENT}\t{agent}"),
         _ => "auto".to_owned(),
     }
 }
 
 fn decode(value: &str) -> ModelChoice {
+    if let Some(agent) = value.strip_prefix(AGENT).and_then(|v| v.strip_prefix('\t')) {
+        return ModelChoice::Agent {
+            agent: agent.to_owned(),
+        };
+    }
     match value.split_once('\n') {
         Some((provider, model)) => ModelChoice::Pinned {
             provider: provider.to_owned(),
@@ -24,6 +33,18 @@ fn decode(value: &str) -> ModelChoice {
         },
         None => ModelChoice::Auto,
     }
+}
+
+/// The list value's mark for a coding agent (a provider id never has a tab).
+const AGENT: &str = "agent";
+
+/// The name the picker shows for coding agent `id` (the id when unknown).
+fn agent_name(options: &ModelOptions, id: &str) -> String {
+    options
+        .agents
+        .iter()
+        .find(|agent| agent.id == id)
+        .map_or_else(|| id.to_owned(), |agent| agent.name.clone())
 }
 
 fn effort_value(effort: Effort) -> &'static str {
@@ -85,6 +106,14 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
     if !untracked(|| store.can_pick_model(session.as_deref())) {
         return view();
     }
+    // On code, who does the work: AIDaemon or a coding agent.
+    let code = {
+        let session = session.clone();
+        computed(move || match &session {
+            Some(id) => store.is_coding(id),
+            None => store.new_is_code(),
+        })
+    };
     // Read the lists once online (again after a reconnect: the daemon's
     // providers may have changed).
     {
@@ -108,6 +137,11 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         let (model, effort) = current.get();
         let model = match model {
             ModelChoice::Pinned { model, .. } => model,
+            ModelChoice::Agent { agent } => match store.model_options() {
+                Read::Ready(options) => agent_name(&options, &agent),
+                _ => agent,
+            },
+            _ if code.get() => "AIDaemon".to_owned(),
             _ => "Auto".to_owned(),
         };
         match effort {
@@ -116,6 +150,9 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
         }
     });
     let shown = computed(move || match store.model_options() {
+        Read::Ready(options) if code.get() => {
+            !options.agents.is_empty() || matches!(current.get().0, ModelChoice::Agent { .. })
+        }
         Read::Ready(options) => {
             options
                 .providers
@@ -152,8 +189,18 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
             let session = pick_session.clone();
             ui::pick_list(
                 ui::Picker {
-                    title: "Model and effort",
-                    items: move || choices(store, current.get_untracked()),
+                    title: if code.get_untracked() {
+                        "Who does the work"
+                    } else {
+                        "Model and effort"
+                    },
+                    items: move || {
+                        if code.get_untracked() {
+                            agent_choices(store, current.get_untracked().0)
+                        } else {
+                            choices(store, current.get_untracked())
+                        }
+                    },
                     pick: move |id: String| {
                         if let Some(model) = id.strip_prefix("model:") {
                             store.set_session_model(session.as_deref(), Some(decode(model)), None);
@@ -167,7 +214,13 @@ pub fn model_picker(store: Store, session: Option<String>) -> View {
                     },
                     action: None,
                 },
-                move || format!("Model and effort: {}", label.get()),
+                move || {
+                    if code.get() {
+                        format!("Who does the work: {}", label.get())
+                    } else {
+                        format!("Model and effort: {}", label.get())
+                    }
+                },
                 chip.clone(),
                 false,
             )
@@ -182,6 +235,32 @@ fn effort_word(effort: Effort) -> &'static str {
         Effort::High => "High",
         _ => "Auto",
     }
+}
+
+/// AIDaemon (its own model, picked for each message), then each coding
+/// agent ready on the daemon's computer.
+fn agent_choices(store: Store, model: ModelChoice) -> Vec<ui::PickItem> {
+    let mut items = vec![
+        ui::PickItem::new("model:auto", "AIDaemon")
+            .detail("Plans and works with its own model")
+            .group("Agent")
+            .checked(!matches!(model, ModelChoice::Agent { .. })),
+    ];
+    if let Read::Ready(options) = untracked(|| store.model_options()) {
+        let current = encode(&model);
+        for agent in &options.agents {
+            let value = encode(&ModelChoice::Agent {
+                agent: agent.id.clone(),
+            });
+            items.push(
+                ui::PickItem::new(format!("model:{value}"), agent.name.clone())
+                    .detail("Each message goes straight to it")
+                    .group("Agent")
+                    .checked(value == current),
+            );
+        }
+    }
+    items
 }
 
 /// The models, then the efforts the current model takes.
@@ -231,6 +310,10 @@ mod tests {
         };
         assert_eq!(decode(&encode(&pinned)), pinned);
         assert_eq!(decode(&encode(&ModelChoice::Auto)), ModelChoice::Auto);
+        let agent = ModelChoice::Agent {
+            agent: "codex".into(),
+        };
+        assert_eq!(decode(&encode(&agent)), agent);
         for effort in [Effort::Auto, Effort::Low, Effort::Medium, Effort::High] {
             assert_eq!(effort_of(effort_value(effort)), effort);
         }

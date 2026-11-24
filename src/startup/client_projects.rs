@@ -161,6 +161,23 @@ pub(crate) async fn place(
     }
 }
 
+/// The folder `session_id`'s project works in, when it is in one that has
+/// a folder.
+pub(crate) async fn session_folder(state: &dyn StateStore, session_id: &str) -> Option<PathBuf> {
+    let project_id = state.get_session_work_project(session_id).await.ok()?;
+    if project_id == DEFAULT_PROJECT_ID {
+        return None;
+    }
+    state
+        .list_work_projects()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|project| project.id == project_id)?
+        .path
+        .map(PathBuf::from)
+}
+
 /// `/project` in a chat: which project the chat works in, or (the owner)
 /// put it in one by name, or in none.
 pub(crate) struct ProjectCommand {

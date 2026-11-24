@@ -1721,6 +1721,37 @@ fn the_composer_picks_a_model_and_an_effort_on_a_phone() -> Result<(), String> {
 }
 
 #[test]
+fn a_code_conversation_picks_who_does_the_work() -> Result<(), String> {
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = start();
+    app.wait_for("What can I help you with?")?;
+    let before = sent("list_models");
+    feed([Update::Connected]);
+    let id = wait_sent_new("list_models", before)?;
+    feed([frame(&format!(
+        r#"{{"type":"ack","request_id":"{id}","result":{{"type":"models","options":{{"providers":[
+            {{"id":"main","name":"Anthropic","billing":"per_token","models":[{{"id":"synthetic-claude"}},{{"id":"synthetic-claude-small"}}]}}
+        ],"agents":[{{"id":"claude","name":"Claude Code"}},{{"id":"codex","name":"Codex"}}]}}}}}}"#
+    ))]);
+    app.wait_for("Model and effort: Auto")?;
+    // On code the composer names who does the work instead of a model:
+    // AIDaemon, or a coding agent ready on the daemon's computer.
+    app.press("Code")?;
+    app.wait_for("Who does the work: AIDaemon")?;
+    app.press("Who does the work: AIDaemon")?;
+    app.wait_for("Claude Code")?;
+    app.wait_for_gone("synthetic-claude-small", std::time::Duration::from_secs(2))?;
+    app.press("Codex")?;
+    app.wait_for("Who does the work: Codex")?;
+    // A chat has no folder for an agent: it goes back to AIDaemon's model.
+    app.press("Chat")?;
+    app.wait_for("Model and effort: Auto")?;
+    app.press("Code")?;
+    app.wait_for("Who does the work: AIDaemon")?;
+    Ok(())
+}
+
+#[test]
 fn archived_conversations_wait_under_archived_and_queued_messages_can_be_removed()
 -> Result<(), String> {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());

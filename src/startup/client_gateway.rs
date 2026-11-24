@@ -664,10 +664,12 @@ impl ClientHost for DaemonClientHost {
     }
 
     async fn model_options(&self) -> anyhow::Result<aidaemon_client_protocol::ModelOptions> {
-        Ok(super::client_models::named(
+        let mut options = super::client_models::named(
             super::client_models::options(&self.llm),
             self.config_table().as_ref(),
-        ))
+        );
+        options.agents = super::client_settings::direct_agents(&self.settings.permissions).await;
+        Ok(options)
     }
 
     async fn session_model(
@@ -683,6 +685,22 @@ impl ClientHost for DaemonClientHost {
         model: Option<aidaemon_client_protocol::ModelChoice>,
         effort: Option<aidaemon_client_protocol::Effort>,
     ) -> Result<aidaemon_client_protocol::SessionModel, String> {
+        if let Some(aidaemon_client_protocol::ModelChoice::Agent { agent }) = &model {
+            let agents = super::client_settings::direct_agents(&self.settings.permissions).await;
+            if !agents.iter().any(|option| option.id == *agent) {
+                return Err(format!(
+                    "{agent} is not a coding agent ready on this computer; check Settings, Coding agents"
+                ));
+            }
+            let project =
+                super::client_projects::session_folder(self.state.as_ref(), session_id).await;
+            if project.is_none() {
+                return Err(
+                    "A coding agent works in a project's folder: start this conversation in Code"
+                        .to_string(),
+                );
+            }
+        }
         super::client_models::set(self.state.as_ref(), &self.llm, session_id, model, effort).await
     }
 

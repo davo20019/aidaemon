@@ -23,6 +23,7 @@ async fn a_pinned_conversation_answers_with_its_model_and_effort() {
                 model: "smart-model".into(),
             }),
             effort: Some("high".into()),
+            agent: None,
         },
     )
     .await
@@ -69,6 +70,7 @@ async fn a_pin_the_runtime_lost_answers_automatically() {
                 model: "removed-model".into(),
             }),
             effort: None,
+            agent: None,
         },
     )
     .await
@@ -111,6 +113,7 @@ async fn a_pin_beats_a_daemon_wide_model() {
                 model: "primary-model".into(),
             }),
             effort: None,
+            agent: None,
         },
     )
     .await
@@ -132,4 +135,67 @@ async fn a_pin_beats_a_daemon_wide_model() {
     let calls = harness.provider.call_log.lock().await.clone();
     assert_eq!(calls[0].model, "primary-model");
     assert_eq!(calls[1].model, "smart-model");
+}
+
+/// A conversation set to a coding agent hands each message, as it is, to
+/// that agent through the usual `cli_agent` run, and no model is called:
+/// not for the turn, and not to plan it first.
+#[tokio::test]
+async fn a_coding_agent_conversation_takes_the_message_with_no_model_call() {
+    use aidaemon_runtime::session_model::{self, SessionModelSetting};
+    let provider = MockProvider::with_responses(vec![MockProvider::text_response(
+        "A model answered.",
+    )]);
+    let extra_tools = vec![
+        Arc::new(MockTool::new("cli_agent", "delegation tool", "Codex finished the change."))
+            as Arc<dyn crate::traits::Tool>,
+    ];
+    let harness = setup_test_agent_root_with_extra_tools_and_llm_timeout(provider, extra_tools, None)
+        .await
+        .unwrap();
+    session_model::set(
+        harness.state.as_ref(),
+        "app:direct",
+        &SessionModelSetting {
+            agent: Some("codex".into()),
+            ..SessionModelSetting::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let reply = harness
+        .agent
+        .handle_message(
+            "app:direct",
+            "Rename the contact form's submit button to Send",
+            None,
+            UserRole::Owner,
+            ChannelContext::private("app"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let calls = harness.provider.call_log.lock().await.clone();
+    assert!(calls.is_empty(), "no model call expected: {calls:?}");
+    assert_eq!(reply, "Codex finished the change.");
+    let history = harness.state.get_history("app:direct", 20).await.unwrap();
+    let launched = history.iter().any(|message| {
+        message.tool_calls_json.as_deref().is_some_and(|calls| {
+            let calls: serde_json::Value = serde_json::from_str(calls).unwrap_or_default();
+            calls.as_array().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    let args = call
+                        .get("arguments")
+                        .and_then(|a| a.as_str().map(|s| serde_json::from_str(s).unwrap_or_default()).or_else(|| Some(a.clone())))
+                        .unwrap_or_default();
+                    call.get("name").and_then(|n| n.as_str()) == Some("cli_agent")
+                        && args["tool"] == "codex"
+                        && args["prompt"] == "Rename the contact form's submit button to Send"
+                })
+            })
+        })
+    });
+    assert!(launched, "the message should go to codex as it is: {history:?}");
 }

@@ -55,6 +55,7 @@ pub(crate) fn options(llm: &SharedLlmRuntime) -> ModelOptions {
             .filter(|provider| !provider.models.is_empty())
             .map(option_of)
             .collect(),
+        agents: Vec::new(),
     }
 }
 
@@ -208,6 +209,9 @@ pub(crate) async fn slash(
                             provider_name(&named(options(llm), config), &provider).to_owned();
                         format!("This conversation uses `{model}` ({provider}).")
                     }
+                    ModelChoice::Agent { agent } => {
+                        format!("Each message in this conversation goes straight to `{agent}`.")
+                    }
                     _ => "This conversation uses automatic model routing.".to_string(),
                 });
             }
@@ -271,6 +275,13 @@ pub(crate) async fn current(
     let kind = pinned
         .as_ref()
         .map_or(snapshot.provider_kind(), |(_, provider)| provider.kind);
+    if let Some(agent) = setting.agent {
+        return SessionModel {
+            session_id: session_id.to_string(),
+            model: ModelChoice::Agent { agent },
+            effort: Effort::Auto,
+        };
+    }
     SessionModel {
         session_id: session_id.to_string(),
         model: match pinned {
@@ -302,8 +313,24 @@ pub(crate) async fn set(
     let mut setting: SessionModelSetting = session_model::get(settings, session_id).await;
     match model {
         None => {}
-        Some(ModelChoice::Auto) => setting.pinned = None,
+        Some(ModelChoice::Auto) => {
+            setting.pinned = None;
+            setting.agent = None;
+        }
+        // The caller checked the agent is ready and the conversation has
+        // a folder; it keeps its own model and effort.
+        Some(ModelChoice::Agent { agent }) => {
+            setting = SessionModelSetting {
+                agent: Some(agent),
+                ..SessionModelSetting::default()
+            };
+            session_model::set(settings, session_id, &setting)
+                .await
+                .map_err(|error| format!("Could not save the conversation's agent: {error}"))?;
+            return Ok(current(settings, llm, session_id).await);
+        }
         Some(ModelChoice::Pinned { provider, model }) => {
+            setting.agent = None;
             let pin = PinnedModel { provider, model };
             if session_model::resolve(&snapshot, &pin).is_none() {
                 return Err(format!(
@@ -314,6 +341,12 @@ pub(crate) async fn set(
             setting.pinned = Some(pin);
         }
         Some(ModelChoice::Unknown) => return Err("Unknown model choice".to_string()),
+    }
+    if setting.agent.is_some() {
+        if matches!(effort, Some(Effort::Low | Effort::Medium | Effort::High)) {
+            return Err("A coding agent keeps its own effort".to_string());
+        }
+        return Ok(current(settings, llm, session_id).await);
     }
     let kind = setting
         .pinned
@@ -494,7 +527,10 @@ mod tests {
         );
         assert_eq!(suggested_model("unrelated", &choices), None);
         assert_eq!(
-            available_models(&ModelOptions { providers: vec![] }),
+            available_models(&ModelOptions {
+                providers: vec![],
+                agents: vec![]
+            }),
             "No models are available."
         );
     }
