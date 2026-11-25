@@ -793,15 +793,18 @@ mod tests {
                     "insufficient_evidence": "skip_run"
                 })
                 .to_string(),
+                // The owner approved the change on its card; the policy
+                // check still refuses it.
                 crate::traits::ToolCallContext {
                     user_role: Some(crate::types::UserRole::Owner),
+                    kernel_approved: Some(aidaemon_tools::semantics::ApprovalScope::Call),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        assert!(result.contains("Conflicting run policy"));
+        assert!(result.contains("Conflicting run policy"), "{result}");
         assert_eq!(
             state.get_goal(&goal.id).await.unwrap().unwrap().description,
             goal.description
