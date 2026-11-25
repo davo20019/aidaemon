@@ -15,9 +15,9 @@ pub(crate) struct ConfinedCapabilities {
 
 /// Paths inside a write root that an unattended confined run may not write:
 /// what is there runs later on its own (git hooks, git configuration that
-/// names helpers and hooks, husky hooks). Only the macOS profile can deny
-/// a path inside a write root.
-#[cfg(target_os = "macos")]
+/// names helpers and hooks, husky hooks). Seatbelt denies them by rule;
+/// bubblewrap mounts them read-only over the writable root; the Codex
+/// adapter gets them as read entries nested in the write grant.
 pub(super) const PERSISTENCE_SUBPATHS: &[&str] = &[".git/hooks", ".git/config", ".husky"];
 
 pub(crate) async fn confined_terminal_execution_request(
@@ -1527,7 +1527,7 @@ pub(super) fn bubblewrap_sandbox_args(
     capabilities: ConfinedCapabilities,
     confined: &[String],
 ) -> Vec<String> {
-    aidaemon_tools::BubblewrapSandbox::scoped_args(
+    let mut args = aidaemon_tools::BubblewrapSandbox::scoped_args(
         &aidaemon_tools::BubblewrapScope {
             cwd: cwd.to_string(),
             read_paths: read_paths.to_vec(),
@@ -1535,7 +1535,38 @@ pub(super) fn bubblewrap_sandbox_args(
             allow_network: capabilities.network,
         },
         confined,
-    )
+    );
+    if capabilities.protect_persistence {
+        // bwrap applies mounts in order, so a read-only bind of each
+        // persistence path placed after the writable roots (before the
+        // namespace flags) wins over the write grant, like seatbelt's
+        // trailing deny. `-try` skips a path that does not exist.
+        let protected = persistence_paths(write_paths)
+            .into_iter()
+            .flat_map(|path| ["--ro-bind-try".to_string(), path.clone(), path]);
+        // `--unshare-pid` is the first flag scoped_args emits after its
+        // mounts (an exact argv token, not prose).
+        let at = args
+            .iter()
+            .position(|arg| arg == "--unshare-pid")
+            .unwrap_or(args.len());
+        args.splice(at..at, protected);
+    }
+    args
+}
+
+/// The persistence paths ([`PERSISTENCE_SUBPATHS`]) inside each write root.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(super) fn persistence_paths(write_paths: &[String]) -> Vec<String> {
+    write_paths
+        .iter()
+        .flat_map(|root| {
+            let root = root.trim_end_matches('/');
+            PERSISTENCE_SUBPATHS
+                .iter()
+                .map(move |sub| format!("{root}/{sub}"))
+        })
+        .collect()
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
@@ -1564,6 +1595,15 @@ pub(super) fn codex_sandbox_state_json(
             "access": "write"
         })
     }));
+    if capabilities.protect_persistence {
+        // A more specific entry overrides the write grant that contains it.
+        filesystem_entries.extend(persistence_paths(write_paths).into_iter().map(|path| {
+            json!({
+                "path": { "type": "path", "path": path },
+                "access": "read"
+            })
+        }));
+    }
     let sandbox_cwd = reqwest::Url::from_file_path(cwd)
         .map_err(|_| anyhow::anyhow!("sandbox working directory must be an absolute local path"))?;
     Ok(serde_json::to_string(&json!({

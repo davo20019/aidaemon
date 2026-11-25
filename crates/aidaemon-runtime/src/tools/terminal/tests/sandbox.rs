@@ -1011,6 +1011,63 @@ fn bubblewrap_fallback_gets_the_codex_manifest() {
 }
 
 #[test]
+fn linux_sandboxes_keep_persistence_paths_read_only_in_write_roots() {
+    let confined = vec!["/bin/true".to_string()];
+    let protect = ConfinedCapabilities {
+        protect_persistence: true,
+        ..ConfinedCapabilities::default()
+    };
+    let args = bubblewrap_sandbox_args(
+        "/work/repo",
+        &[],
+        &["/work/repo".to_string()],
+        protect,
+        &confined,
+    );
+    let joined = args.join(" ");
+    let writable = joined
+        .find("--bind-try /work/repo /work/repo")
+        .expect("write root bound");
+    for sub in PERSISTENCE_SUBPATHS {
+        let mount = format!("--ro-bind-try /work/repo/{sub} /work/repo/{sub}");
+        let at = joined
+            .find(&mount)
+            .unwrap_or_else(|| panic!("{mount}: {joined}"));
+        // Later mounts win: the read-only bind must follow the write root
+        // and precede the namespace flags.
+        assert!(at > writable, "{joined}");
+        assert!(at < joined.find("--unshare-pid").unwrap(), "{joined}");
+    }
+    let unprotected = bubblewrap_sandbox_args(
+        "/work/repo",
+        &[],
+        &["/work/repo".to_string()],
+        ConfinedCapabilities::default(),
+        &confined,
+    )
+    .join(" ");
+    assert!(!unprotected.contains(".git/hooks"), "{unprotected}");
+
+    let state = codex_sandbox_state_json("/work/repo", &[], &["/work/repo".to_string()], protect)
+        .expect("sandbox state");
+    let state: Value = serde_json::from_str(&state).expect("valid JSON");
+    let entries = state
+        .pointer("/permissionProfile/file_system/entries")
+        .and_then(Value::as_array)
+        .expect("filesystem entries");
+    for sub in PERSISTENCE_SUBPATHS {
+        let path = format!("/work/repo/{sub}");
+        assert!(
+            entries.iter().any(|entry| {
+                entry.pointer("/path/path").and_then(Value::as_str) == Some(path.as_str())
+                    && entry.get("access").and_then(Value::as_str) == Some("read")
+            }),
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn native_sandbox_state_preserves_exact_dotted_and_split_paths() {
     let state = codex_sandbox_state_json(
         "/synthetic/work.tree",
