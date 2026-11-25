@@ -14,8 +14,8 @@ categories = ["network-programming"]
 exclude = ["tests/"]
 
 [dependencies]
-aidaemon-client-protocol = { version = "0.22.2", path = "../client-protocol" }
-aidaemon-remote = { version = "0.22.2", path = "../aidaemon-remote", default-features = false, optional = true }
+aidaemon-client-protocol = { version = "0.23.0", path = "../client-protocol" }
+aidaemon-remote = { version = "0.23.0", path = "../aidaemon-remote", default-features = false, optional = true }
 anyhow = "1"
 dirs = { version = "6", optional = true }
 base64 = "0.23"

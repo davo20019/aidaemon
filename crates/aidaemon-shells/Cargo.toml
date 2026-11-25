@@ -18,8 +18,8 @@ categories = ["asynchronous", "command-line-interface"]
 tool = ["dep:aidaemon-core", "dep:aidaemon-tools", "dep:anyhow", "dep:async-trait", "dep:serde", "dep:serde_json", "tokio/time"]
 
 [dependencies]
-aidaemon-core = { version = "0.22.2", path = "../aidaemon-core", optional = true }
-aidaemon-tools = { version = "0.22.2", path = "../aidaemon-tools", optional = true }
+aidaemon-core = { version = "0.23.0", path = "../aidaemon-core", optional = true }
+aidaemon-tools = { version = "0.23.0", path = "../aidaemon-tools", optional = true }
 anyhow = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 portable-pty = "0.9"

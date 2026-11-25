@@ -18,7 +18,7 @@ exclude = ["tests/", "benches/"]
 
 [dependencies]
 dunce = "1.0"
-aidaemon-core = { version = "0.22.2", path = "../aidaemon-core" }
+aidaemon-core = { version = "0.23.0", path = "../aidaemon-core" }
 async-trait = "0.1"
 regex = "1"
 serde = "1"

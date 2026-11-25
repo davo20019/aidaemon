@@ -12,7 +12,7 @@ stability promise.
 
 ## [Unreleased]
 
-## [0.22.2] - 2026-11-25
+## [0.23.0] - 2026-11-25
 
 ### Added
 - `aidaemon-coding-agents`: typed agent events (`AgentEvent`: session, steps, plan, usage, turn end) read from Claude Code's stream-json, Codex's app server and ACP; typed reports (`Report`); peer coordination over a scoped local MCP server (`peer`), with private run files under `~/.aidaemon/run`.

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.22.2] - 2026-11-25
+## [0.23.0] - 2026-11-25
 
 ### Added
 
@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Self-update installs only signed releases.** Release archives are signed with the project's ed25519 key (`scripts/release-signing-key.pub.pem`); the updater refuses an unsigned or mis-signed release and never runs as root, and `install.sh` checks the signature. The legacy Linux `install-service` unit runs as the sudo user.
 - **The daemon reads its config from `AIDAEMON_HOME`, then `~/.aidaemon` when it holds a `config.toml`, then the current directory.** `memory-export` no longer walks parent directories for a `.env`.
 - **The database key moves to the keychain** after the encrypted database opens, where a keychain is available; plaintext copies left by the encryption migration are deleted once the encrypted database verifies.
-- **Challenge sign-in names the daemon it is meant for** (client protocol 1.51). Apps older than 0.22.2 need an update before signing in from another device by challenge; socket sign-in over iroh is unchanged.
+- **Challenge sign-in names the daemon it is meant for** (client protocol 1.51). Apps older than 0.23.0 need an update before signing in from another device by challenge; socket sign-in over iroh is unchanged.
 - Large modules are split by concern (the terminal tool, the terminal bridge, the mandate store, the cli_agent tool), and tests moved beside the code they test.
 
 ### Security
