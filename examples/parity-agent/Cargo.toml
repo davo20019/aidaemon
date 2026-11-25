@@ -13,3 +13,4 @@ aidaemon-sdk = { path = "../../crates/aidaemon-sdk", features = ["testing", "cha
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
