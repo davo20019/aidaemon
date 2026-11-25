@@ -21,7 +21,10 @@ frame by hand.
 `workspace-hack/` (cargo-hakari) unifies third-party features so `-p` and
 feature-flag builds reuse one build of each dependency. After adding,
 removing or re-featuring a dependency run `cargo hakari generate` and
-`cargo hakari manage-deps` (CI's `hakari` job checks it). Target dirs only
+`cargo hakari manage-deps`; after changing which features one workspace
+crate asks of another run `scripts/dev/unify-dev-features.py` (it gives each
+crate's dev-dependencies the workspace build's feature sets, so
+`cargo test -p` reuses that build). CI's `hakari` job checks both. Target dirs only
 grow; `scripts/dev/target-gc.sh` prunes every checkout's to a budget
 (`scripts/dev/install-target-gc.sh` runs it daily).
 

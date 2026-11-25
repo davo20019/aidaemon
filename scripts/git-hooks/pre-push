@@ -107,6 +107,10 @@ if touches 'Cargo\.(toml|lock)$|^\.config/hakari\.toml$'; then
     fi
 fi
 
+if touches 'Cargo\.toml$'; then
+    run_whole "dev-dependency features" 'Cargo\.toml$' python3 scripts/dev/unify-dev-features.py --check
+fi
+
 # Rustdoc -D warnings for each changed SDK crate (private intra-doc links).
 doc_args=()
 for c in "${sdk_crates[@]}"; do
@@ -158,6 +162,7 @@ if ((${#failed[@]})); then
     echo "  Goldens: UPDATE_TOOL_GOLDENS=1 cargo test --all-features --lib catalog_"
     echo "  Core API: scripts/check-core-api.sh --bless"
     echo "  workspace-hack: cargo hakari generate && cargo hakari manage-deps"
+    echo "  Dev features: scripts/dev/unify-dev-features.py"
     echo "  A failure in a file with someone else's uncommitted edits is theirs;"
     echo "  then push with AIDAEMON_SKIP_PREPUSH=1."
     exit 1

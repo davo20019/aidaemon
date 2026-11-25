@@ -199,9 +199,12 @@ dependencies = [
 name = "aidaemon-channel-discord"
 version = "0.24.0"
 dependencies = [
+ "aidaemon-channel-discord",
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -223,9 +226,12 @@ dependencies = [
 name = "aidaemon-channel-slack"
 version = "0.24.0"
 dependencies = [
+ "aidaemon-channel-slack",
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -250,9 +256,12 @@ dependencies = [
 name = "aidaemon-channel-telegram"
 version = "0.24.0"
 dependencies = [
+ "aidaemon-channel-telegram",
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -282,6 +291,8 @@ dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -349,7 +360,9 @@ dependencies = [
  "aidaemon-client-protocol",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
  "aidaemon-remote",
+ "aidaemon-secrets",
  "aidaemon-shells",
  "aidaemon-store-sqlite",
  "aidaemon-surfaces",
@@ -397,8 +410,12 @@ dependencies = [
 name = "aidaemon-coding-agents"
 version = "0.24.0"
 dependencies = [
+ "aidaemon-coding-agents",
  "aidaemon-core",
  "aidaemon-mcp",
+ "aidaemon-policies",
+ "aidaemon-secrets",
+ "aidaemon-tools",
  "async-trait",
  "dirs 7.0.0",
  "serde",
@@ -449,11 +466,22 @@ dependencies = [
 name = "aidaemon-eval"
 version = "0.24.0"
 dependencies = [
+ "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-decisions",
  "aidaemon-eval",
+ "aidaemon-events",
+ "aidaemon-exposure",
+ "aidaemon-mcp",
+ "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-runtime",
+ "aidaemon-secrets",
+ "aidaemon-shells",
+ "aidaemon-surfaces",
+ "aidaemon-tools",
+ "aidaemon-work",
  "async-trait",
  "futures",
  "serde",
@@ -468,7 +496,10 @@ dependencies = [
 name = "aidaemon-events"
 version = "0.24.0"
 dependencies = [
+ "aidaemon-core",
+ "aidaemon-events",
  "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -521,6 +552,7 @@ version = "0.24.0"
 dependencies = [
  "aidaemon-core",
  "aidaemon-mcp",
+ "aidaemon-policies",
  "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
@@ -542,6 +574,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-memory",
  "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -592,6 +625,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-events",
  "aidaemon-node-protocol",
+ "aidaemon-policies",
  "aidaemon-secrets",
  "aidaemon-tools",
  "aidaemon-work",
@@ -627,7 +661,22 @@ dependencies = [
 name = "aidaemon-parity-agent"
 version = "0.0.0"
 dependencies = [
+ "aidaemon-channels",
+ "aidaemon-decisions",
+ "aidaemon-events",
+ "aidaemon-exposure",
+ "aidaemon-mcp",
+ "aidaemon-memory",
+ "aidaemon-policies",
+ "aidaemon-providers",
+ "aidaemon-runtime",
  "aidaemon-sdk",
+ "aidaemon-secrets",
+ "aidaemon-shells",
+ "aidaemon-store-sqlite",
+ "aidaemon-surfaces",
+ "aidaemon-tools",
+ "aidaemon-work",
  "async-trait",
  "serde_json",
  "tokio",
@@ -639,6 +688,7 @@ name = "aidaemon-policies"
 version = "0.24.0"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-policies",
  "async-trait",
  "dunce",
  "opentelemetry",
@@ -659,6 +709,7 @@ name = "aidaemon-providers"
 version = "0.24.0"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-providers",
  "aidaemon-secrets",
  "anyhow",
  "async-trait",
@@ -717,7 +768,9 @@ dependencies = [
  "aidaemon-nodes",
  "aidaemon-policies",
  "aidaemon-providers",
+ "aidaemon-runtime",
  "aidaemon-secrets",
+ "aidaemon-shells",
  "aidaemon-skills",
  "aidaemon-store-sqlite",
  "aidaemon-surfaces",
@@ -770,15 +823,19 @@ dependencies = [
  "aidaemon-channels",
  "aidaemon-coding-agents",
  "aidaemon-core",
+ "aidaemon-decisions",
  "aidaemon-eval",
  "aidaemon-events",
+ "aidaemon-exposure",
  "aidaemon-macros",
  "aidaemon-mcp",
  "aidaemon-memory",
  "aidaemon-policies",
  "aidaemon-providers",
  "aidaemon-runtime",
+ "aidaemon-sdk",
  "aidaemon-secrets",
+ "aidaemon-shells",
  "aidaemon-store-sqlite",
  "aidaemon-surfaces",
  "aidaemon-tools",
@@ -816,6 +873,8 @@ name = "aidaemon-shells"
 version = "0.24.0"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-shells",
  "aidaemon-tools",
  "anyhow",
@@ -838,6 +897,8 @@ version = "0.24.0"
 dependencies = [
  "aidaemon-core",
  "aidaemon-memory",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -862,6 +923,11 @@ version = "0.24.0"
 dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
+ "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
+ "aidaemon-store-sqlite",
+ "aidaemon-tools",
  "async-trait",
  "serde_json",
  "sqlx",
@@ -876,6 +942,8 @@ name = "aidaemon-surfaces"
 version = "0.24.0"
 dependencies = [
  "aidaemon-core",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-surfaces",
  "aidaemon-tools",
  "anyhow",
@@ -895,6 +963,8 @@ name = "aidaemon-terminal-bridge"
 version = "0.24.0"
 dependencies = [
  "aes-gcm 0.11.1",
+ "aidaemon-core",
+ "aidaemon-policies",
  "aidaemon-secrets",
  "aidaemon-tools",
  "anyhow",
@@ -930,7 +1000,10 @@ dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-surfaces",
+ "aidaemon-tool-browser",
  "aidaemon-tools",
  "anyhow",
  "async-trait",
@@ -959,6 +1032,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-policies",
  "aidaemon-secrets",
+ "aidaemon-tools",
  "anyhow",
  "async-trait",
  "axum",
@@ -1003,7 +1077,10 @@ dependencies = [
  "aidaemon-channels",
  "aidaemon-core",
  "aidaemon-events",
+ "aidaemon-policies",
+ "aidaemon-secrets",
  "aidaemon-tools",
+ "aidaemon-work",
  "anyhow",
  "async-imap",
  "async-trait",

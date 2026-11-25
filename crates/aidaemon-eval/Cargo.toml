@@ -33,13 +33,24 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 aidaemon-eval = { path = ".", features = ["examples"] }
-aidaemon-policies = { path = "../aidaemon-policies" }
+aidaemon-policies = { path = "../aidaemon-policies", features = ["otel"]}
 aidaemon-providers = { path = "../aidaemon-providers" }
 # The daemon's context budgeting, for `live_budgeters`.
-aidaemon-runtime = { path = "../aidaemon-runtime" }
+aidaemon-runtime = { path = "../aidaemon-runtime", features = ["encryption", "testing"]}
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # The shipped scenarios against a live model, one policy on at a time.
+aidaemon-channels = { path = "../aidaemon-channels", default-features = false, features = ["checkpoints", "conformance", "http", "testing"] }
+aidaemon-decisions = { path = "../aidaemon-decisions", default-features = false, features = ["gemini", "testing", "typesafe"] }
+aidaemon-events = { path = "../aidaemon-events", default-features = false, features = ["testing"] }
+aidaemon-exposure = { path = "../aidaemon-exposure", default-features = false, features = ["testing"] }
+aidaemon-mcp = { path = "../aidaemon-mcp", default-features = false, features = ["registry", "test-server"] }
+aidaemon-memory = { path = "../aidaemon-memory", features = ["conformance", "fastembed"] }
+aidaemon-secrets = { path = "../aidaemon-secrets", features = ["keychain"] }
+aidaemon-shells = { path = "../aidaemon-shells", default-features = false, features = ["tool"] }
+aidaemon-surfaces = { path = "../aidaemon-surfaces", default-features = false, features = ["testing", "tool"] }
+aidaemon-tools = { path = "../aidaemon-tools", default-features = false, features = ["checkpoints", "docker", "oauth", "testing"] }
+aidaemon-work = { path = "../aidaemon-work", default-features = false, features = ["email-trigger", "testing"] }
 [[example]]
 name = "live_policies"
 required-features = ["examples"]

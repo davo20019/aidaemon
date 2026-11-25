@@ -14,3 +14,21 @@ async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+aidaemon-channels = { path = "../../crates/aidaemon-channels", default-features = false, features = ["checkpoints", "conformance", "http", "testing"] }
+aidaemon-events = { path = "../../crates/aidaemon-events", default-features = false, features = ["testing"] }
+aidaemon-memory = { path = "../../crates/aidaemon-memory", features = ["conformance", "fastembed"] }
+aidaemon-policies = { path = "../../crates/aidaemon-policies", default-features = false, features = ["otel"] }
+aidaemon-providers = { path = "../../crates/aidaemon-providers", default-features = false, features = ["chatgpt-login"] }
+aidaemon-sdk = { path = "../../crates/aidaemon-sdk", features = ["agents", "channels", "macros", "memory", "policies", "providers", "runtime", "secrets", "sqlite", "testing", "tools"] }
+aidaemon-secrets = { path = "../../crates/aidaemon-secrets", features = ["keychain"] }
+aidaemon-store-sqlite = { path = "../../crates/aidaemon-store-sqlite", default-features = false, features = ["client-events"] }
+aidaemon-tools = { path = "../../crates/aidaemon-tools", default-features = false, features = ["checkpoints", "docker", "oauth", "testing"] }
+aidaemon-decisions = { path = "../../crates/aidaemon-decisions", default-features = false, features = ["gemini", "testing", "typesafe"] }
+aidaemon-exposure = { path = "../../crates/aidaemon-exposure", default-features = false, features = ["testing"] }
+aidaemon-mcp = { path = "../../crates/aidaemon-mcp", default-features = false, features = ["registry", "test-server"] }
+aidaemon-runtime = { path = "../../crates/aidaemon-runtime", default-features = false, features = ["encryption", "testing"] }
+aidaemon-shells = { path = "../../crates/aidaemon-shells", default-features = false, features = ["tool"] }
+aidaemon-surfaces = { path = "../../crates/aidaemon-surfaces", default-features = false, features = ["testing", "tool"] }
+aidaemon-work = { path = "../../crates/aidaemon-work", default-features = false, features = ["email-trigger", "testing"] }

@@ -88,6 +88,23 @@ tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tempfile = "3"
 chrono = "0.4"
+aidaemon-core = { path = "../aidaemon-core", default-features = false, features = ["testing"] }
+aidaemon-memory = { path = "../aidaemon-memory", features = ["conformance", "fastembed"] }
+aidaemon-policies = { path = "../aidaemon-policies", default-features = false, features = ["otel"] }
+aidaemon-providers = { path = "../aidaemon-providers", default-features = false, features = ["chatgpt-login"] }
+aidaemon-sdk = { path = ".", features = ["agents", "channels", "macros", "memory", "policies", "providers", "runtime", "secrets", "sqlite", "testing", "tools"] }
+aidaemon-secrets = { path = "../aidaemon-secrets", features = ["keychain"] }
+aidaemon-store-sqlite = { path = "../aidaemon-store-sqlite", default-features = false, features = ["client-events"] }
+aidaemon-tools = { path = "../aidaemon-tools", default-features = false, features = ["checkpoints", "docker", "oauth", "testing"] }
+aidaemon-channels = { path = "../aidaemon-channels", default-features = false, features = ["checkpoints", "conformance", "http", "testing"] }
+aidaemon-decisions = { path = "../aidaemon-decisions", default-features = false, features = ["gemini", "testing", "typesafe"] }
+aidaemon-events = { path = "../aidaemon-events", default-features = false, features = ["testing"] }
+aidaemon-exposure = { path = "../aidaemon-exposure", default-features = false, features = ["testing"] }
+aidaemon-mcp = { path = "../aidaemon-mcp", default-features = false, features = ["registry", "test-server"] }
+aidaemon-runtime = { path = "../aidaemon-runtime", default-features = false, features = ["encryption", "testing"] }
+aidaemon-shells = { path = "../aidaemon-shells", default-features = false, features = ["tool"] }
+aidaemon-surfaces = { path = "../aidaemon-surfaces", default-features = false, features = ["testing", "tool"] }
+aidaemon-work = { path = "../aidaemon-work", default-features = false, features = ["email-trigger", "testing"] }
 
 [[test]]
 name = "store_secrets_redacted"
@@ -96,14 +113,6 @@ required-features = ["secrets", "testing"]
 [[test]]
 name = "web_fetch_egress"
 required-features = ["tools", "policies", "testing"]
-
-[[example]]
-name = "coding_agent"
-required-features = ["providers", "tools", "policies", "sqlite"]
-
-[[example]]
-name = "support_triage"
-required-features = ["providers", "policies", "testing"]
 
 [[test]]
 name = "tool_macro"
@@ -116,6 +125,17 @@ required-features = ["testing"]
 [[test]]
 name = "preset"
 required-features = ["macros", "testing", "tools", "sqlite"]
+
+[[test]]
+name = "behavior"
+required-features = ["testing", "macros", "agents", "channels", "memory"]
+[[example]]
+name = "coding_agent"
+required-features = ["providers", "tools", "policies", "sqlite"]
+
+[[example]]
+name = "support_triage"
+required-features = ["providers", "policies", "testing"]
 
 [[example]]
 name = "quickstart"
@@ -165,6 +185,3 @@ required-features = ["macros", "testing", "otel"]
 name = "peer_cli_coordination"
 required-features = ["coding-agents", "mcp"]
 
-[[test]]
-name = "behavior"
-required-features = ["testing", "macros", "agents", "channels", "memory"]

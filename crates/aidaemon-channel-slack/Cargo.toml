@@ -55,7 +55,11 @@ tracing = "0.1"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
-aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-channels = { path = "../aidaemon-channels", features = ["checkpoints", "conformance", "http", "testing"] }
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
-aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["checkpoints", "docker", "oauth", "testing"] }
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "net", "io-util"] }
+aidaemon-channel-slack = { path = ".", default-features = false, features = ["bot"] }
+aidaemon-events = { path = "../aidaemon-events", default-features = false, features = ["testing"] }
+aidaemon-policies = { path = "../aidaemon-policies", default-features = false, features = ["otel"] }
+aidaemon-secrets = { path = "../aidaemon-secrets", features = ["keychain"] }

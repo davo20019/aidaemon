@@ -36,6 +36,10 @@ tracing = "0.1"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
-aidaemon-tools = { path = "../aidaemon-tools", features = ["testing"] }
+aidaemon-tools = { path = "../aidaemon-tools", features = ["checkpoints", "docker", "oauth", "testing"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+aidaemon-core = { path = "../aidaemon-core", default-features = false, features = ["testing"] }
+aidaemon-memory = { path = "../aidaemon-memory", features = ["conformance", "fastembed"] }
+aidaemon-policies = { path = "../aidaemon-policies", default-features = false, features = ["otel"] }
+aidaemon-secrets = { path = "../aidaemon-secrets", features = ["keychain"] }

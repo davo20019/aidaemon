@@ -221,14 +221,14 @@ strip = true
 [dev-dependencies]
 aidaemon-core = { path = "crates/aidaemon-core", features = ["testing"] }
 aidaemon-surfaces = { path = "crates/aidaemon-surfaces", features = ["testing", "tool"] }
-aidaemon-channels = { path = "crates/aidaemon-channels", features = ["testing"] }
-aidaemon-eval = { path = "crates/aidaemon-eval" }
+aidaemon-channels = { path = "crates/aidaemon-channels", features = ["checkpoints", "conformance", "http", "testing"] }
+aidaemon-eval = { path = "crates/aidaemon-eval", features = ["examples"]}
 aidaemon-events = { path = "crates/aidaemon-events", features = ["testing"] }
 aidaemon-work = { path = "crates/aidaemon-work", features = ["testing"] }
 aidaemon-tools = { path = "crates/aidaemon-tools", features = ["testing"] }
 aidaemon-decisions = { path = "crates/aidaemon-decisions", features = ["gemini", "typesafe", "testing"] }
 aidaemon-runtime = { path = "crates/aidaemon-runtime", features = ["testing"] }
-aidaemon-memory = { path = "crates/aidaemon-memory", features = ["fastembed"] }
+aidaemon-memory = { path = "crates/aidaemon-memory", features = ["conformance", "fastembed"] }
 tempfile = "3"
 proptest = "1"
 assert_cmd = "2"
@@ -242,6 +242,9 @@ p256 = { version = "0.14", features = ["ecdsa"] }
 
 # libsqlite3-sys is never named in code: the `encryption` feature turns on its
 # bundled SQLCipher build under sqlx.
+aidaemon-exposure = { path = "crates/aidaemon-exposure", default-features = false, features = ["testing"] }
+aidaemon-mcp = { path = "crates/aidaemon-mcp", default-features = false, features = ["registry", "test-server"] }
+aidaemon-sdk = { path = "crates/aidaemon-sdk", features = ["agents", "channels", "macros", "memory", "policies", "providers", "runtime", "secrets", "sqlite", "testing", "tools"] }
 [package.metadata.cargo-machete]
 ignored = ["libsqlite3-sys"]
 

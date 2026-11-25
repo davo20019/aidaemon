@@ -74,3 +74,4 @@ browser-random = ["dep:getrandom", "getrandom/wasm_js"]
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
+aidaemon-remote = { path = "../aidaemon-remote", features = ["server"] }

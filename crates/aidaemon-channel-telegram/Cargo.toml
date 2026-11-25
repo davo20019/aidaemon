@@ -67,7 +67,12 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 proptest = "1"
-aidaemon-channels = { path = "../aidaemon-channels", features = ["conformance"] }
+aidaemon-channels = { path = "../aidaemon-channels", features = ["checkpoints", "conformance", "http", "testing"] }
 aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 axum = "0.8"
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "net"] }
+aidaemon-channel-telegram = { path = ".", default-features = false, features = ["bot", "terminal", "webhook"] }
+aidaemon-events = { path = "../aidaemon-events", default-features = false, features = ["testing"] }
+aidaemon-policies = { path = "../aidaemon-policies", default-features = false, features = ["otel"] }
+aidaemon-tools = { path = "../aidaemon-tools", default-features = false, features = ["checkpoints", "docker", "oauth", "testing"] }
+aidaemon-secrets = { path = "../aidaemon-secrets", features = ["keychain"] }

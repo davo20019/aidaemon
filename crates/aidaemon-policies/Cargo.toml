@@ -40,3 +40,4 @@ aidaemon-core = { path = "../aidaemon-core", features = ["testing"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+aidaemon-policies = { path = ".", default-features = false, features = ["otel"] }
