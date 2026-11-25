@@ -80,13 +80,13 @@ impl BrowserSessionState {
 #[derive(Default)]
 pub struct BrowserSessionRegistry {
     sessions: Mutex<HashMap<String, BrowserSessionState>>,
-    /// Per-session approval flag. `true` once the user granted session-level
-    /// approval (AllowSession/AllowAlways) for ordinary navigation/mutation, so
-    /// later ordinary actions in that session skip the prompt. Point-of-action
-    /// approvals (execute_js, consequential click/fill) NEVER set this — they
-    /// are re-prompted every call. Kept in its own map so it survives even when a
-    /// session's last tab is closed.
-    approvals: Mutex<HashMap<String, bool>>,
+    /// Per-session sites (origins) the owner granted session-level approval
+    /// (AllowSession/AllowAlways) for ordinary mutation on, so later ordinary
+    /// actions on that site in that session skip the prompt; another site
+    /// asks again. Point-of-action approvals (execute_js, consequential
+    /// click/fill) NEVER set this — they are re-prompted every call. Kept in
+    /// its own map so it survives even when a session's last tab is closed.
+    approvals: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// Sites on this computer the owner let each session open, by
     /// `policy::local_site_key`; `None` lasts until the session is evicted.
     local_sites: Mutex<HashMap<String, HashMap<String, Option<Instant>>>>,
@@ -165,18 +165,37 @@ impl BrowserSessionRegistry {
             .unwrap_or_else(|| session_id.to_string())
     }
 
-    pub async fn is_session_approved(&self, session_id: &str) -> bool {
+    /// Whether the owner approved ordinary mutation on `site` (an origin)
+    /// for this session.
+    pub async fn is_session_approved(&self, session_id: &str, site: &str) -> bool {
         let key = self.grant_key(session_id);
-        *self.approvals.lock().await.get(&key).unwrap_or(&false)
-    }
-
-    /// Mark this session approved for ordinary navigation/mutation, so later
-    /// ordinary actions in this session don't re-prompt.
-    pub async fn mark_session_approved(&self, session_id: &str) {
         self.approvals
             .lock()
             .await
-            .insert(self.grant_key(session_id), true);
+            .get(&key)
+            .is_some_and(|sites| sites.contains(site))
+    }
+
+    /// Mark this session approved for ordinary mutation on `site` (an
+    /// origin), so later ordinary actions on that site don't re-prompt.
+    pub async fn mark_session_approved(&self, session_id: &str, site: &str) {
+        self.approvals
+            .lock()
+            .await
+            .entry(self.grant_key(session_id))
+            .or_default()
+            .insert(site.to_string());
+    }
+
+    /// Whether this session holds any ordinary-mutation approval.
+    #[cfg(test)]
+    pub async fn has_session_approval_for_test(&self, session_id: &str) -> bool {
+        let key = self.grant_key(session_id);
+        self.approvals
+            .lock()
+            .await
+            .get(&key)
+            .is_some_and(|sites| !sites.is_empty())
     }
 
     /// Whether the owner has let this session open the local site `key`.
@@ -681,9 +700,15 @@ impl BrowserSessionRegistry {
             self.approvals
                 .lock()
                 .await
-                .insert(session_id.to_string(), true);
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(Self::TEST_APPROVED_SITE.to_string());
         }
     }
+
+    /// Test-only: the site a seeded approval covers.
+    #[cfg(test)]
+    pub const TEST_APPROVED_SITE: &'static str = "https://mock.example";
 
     /// Test-only: whether a session entry currently exists in the registry.
     #[cfg(test)]
@@ -733,11 +758,25 @@ mod grant_session_tests {
     async fn a_sub_agent_inherits_its_chats_browser_approvals() {
         let registry = BrowserSessionRegistry::new();
         registry
-            .mark_session_approved("telegram:synthetic-user-1")
+            .mark_session_approved("telegram:synthetic-user-1", "https://app.test")
             .await;
         registry.bind_grant_session("specialist:child", "telegram:synthetic-user-1");
-        assert!(registry.is_session_approved("specialist:child").await);
-        assert!(!registry.is_session_approved("specialist:other").await);
+        assert!(
+            registry
+                .is_session_approved("specialist:child", "https://app.test")
+                .await
+        );
+        assert!(
+            !registry
+                .is_session_approved("specialist:child", "https://other.test")
+                .await,
+            "an approval on one site never covers another"
+        );
+        assert!(
+            !registry
+                .is_session_approved("specialist:other", "https://app.test")
+                .await
+        );
 
         registry
             .approve_local_site("specialist:child", "https://app.test".to_string(), None)

@@ -2674,6 +2674,12 @@ async fn observations_never_prompt() {
 async fn session_approval_suppresses_second_ordinary_mutation_prompt() {
     let (tool, backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://mock.example/"}).to_string(),
+        aidaemon_tools::testing::call_facts("sess-a"),
+    )
+    .await
+    .unwrap();
 
     tool.call_with(
         &json!({ "action": "click", "selector": "#menu"}).to_string(),
@@ -2816,7 +2822,7 @@ async fn ordinary_mutation_approval_is_session_only() {
 /// session approval must NOT suppress execute_js prompts. Also proves the prompt
 /// never contains the script body.
 #[tokio::test]
-async fn execute_js_prompts_every_call_and_hides_script() {
+async fn execute_js_prompts_every_call_and_shows_script() {
     let (tool, backend, recorder) =
         approving_tool(MockBackend::new(), ApprovalResponse::AllowSession);
 
@@ -2847,11 +2853,11 @@ async fn execute_js_prompts_every_call_and_hides_script() {
         "execute_js approvals must be explicitly one-time"
     );
 
-    // The prompt must NOT leak the script body / sentinel.
+    // The card shows the script the owner approves.
     for cmd in recorder.commands().await {
         assert!(
-            !cmd.contains(sentinel),
-            "execute_js prompt must not contain the script body: {cmd}"
+            cmd.contains(sentinel),
+            "execute_js card must show the script it approves: {cmd}"
         );
     }
 
@@ -4393,9 +4399,9 @@ async fn evict_idle_removes_stale_sessions_and_disposes_resources() {
 
     // Approval for evicted sessions is dropped (safe-default re-approve); the
     // fresh session keeps its approval.
-    assert!(!registry.is_session_approved("idle-a").await);
-    assert!(!registry.is_session_approved("idle-b").await);
-    assert!(registry.is_session_approved("fresh").await);
+    assert!(!registry.has_session_approval_for_test("idle-a").await);
+    assert!(!registry.has_session_approval_for_test("idle-b").await);
+    assert!(registry.has_session_approval_for_test("fresh").await);
 
     // The caller disposes the returned resources via the backend.
     for ev in &evicted {
@@ -5188,7 +5194,7 @@ async fn local_site_card_lets_the_session_open_that_site_only() {
     assert_eq!(recorder.count().await, 2, "another local port asks");
 
     assert!(
-        !tool.sessions.is_session_approved("sess-a").await,
+        !tool.sessions.has_session_approval_for_test("sess-a").await,
         "a local-site answer must not approve page mutations"
     );
 }
@@ -5604,7 +5610,9 @@ async fn a_target_that_changed_after_judgment_is_refused_before_the_click() {
     )
     .await
     .unwrap();
-    tool.sessions.mark_session_approved("sess-swap").await;
+    tool.sessions
+        .mark_session_approved("sess-swap", "https://mock.example")
+        .await;
     let page = tool.sessions.active_target_id("sess-swap").await.unwrap();
     let page = tool.sessions.tab("sess-swap", &page).await.unwrap().page;
     // Judged ordinary (the default target is a link) ...
@@ -5616,6 +5624,7 @@ async fn a_target_that_changed_after_judgment_is_refused_before_the_click() {
             script: None,
             tab_id: None,
             value: None,
+            source_path: None,
             session_id: "sess-swap",
             trusted_session: false,
         })
@@ -5789,5 +5798,107 @@ async fn a_button_approval_does_not_follow_the_page_to_another_site() {
             .await
             .unwrap_err();
         assert!(err.contains("not approved buttons"), "{err}");
+    }
+}
+
+/// A card names the page the action acts on, read live, never a `url`
+/// argument the action does not use; an ordinary-mutation session approval
+/// covers the site it was given on, not another.
+#[tokio::test]
+async fn cards_name_the_live_page_and_session_approval_is_per_site() {
+    let backend = MockBackend::new();
+    let (tool, mock, recorder) = approving_tool(backend, ApprovalResponse::AllowSession);
+    let facts = || aidaemon_tools::testing::call_facts("sess-site");
+    tool.call_with(
+        &json!({ "action": "navigate", "url": "https://mock.example/"}).to_string(),
+        facts(),
+    )
+    .await
+    .unwrap();
+    tool.call_with(
+        &json!({
+            "action": "execute_js",
+            "script": "return 1;",
+            "url": "https://docs.example.org/"
+        })
+        .to_string(),
+        facts(),
+    )
+    .await
+    .unwrap();
+    let card = recorder.commands().await.last().cloned().unwrap();
+    assert!(card.contains("https://mock.example"), "{card}");
+    assert!(!card.contains("docs.example.org"), "{card}");
+
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        facts(),
+    )
+    .await
+    .unwrap();
+    let after_first_click = recorder.count().await;
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#more"}).to_string(),
+        facts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorder.count().await,
+        after_first_click,
+        "same site: no new card"
+    );
+    mock.set_page_url("https://other.example/").await;
+    tool.call_with(
+        &json!({ "action": "click", "selector": "#menu"}).to_string(),
+        facts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorder.count().await,
+        after_first_click + 1,
+        "another site asks again"
+    );
+}
+
+/// A page that loads only its own folder's files renders without asking;
+/// one with a script, a frame, a handler, a remote or `file:` URL, or a
+/// path out of its folder asks the owner first.
+#[tokio::test]
+async fn render_pdf_asks_when_the_page_reaches_beyond_its_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = aidaemon_tools::testing::active_execution_backend();
+    let write = |name: &str, html: &str| {
+        let path = temp.path().join(name);
+        std::fs::write(&path, html).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let plain = write(
+        "plain.html",
+        "<!doctype html><link rel=stylesheet href=\"style.css\"><img src='img/logo.png' srcset=\"a.png 1x, b.png 2x\"><style>body{background:url(bg.png)}</style><a href=\"#top\">x</a>",
+    );
+    assert_eq!(super::render_source_reach(&backend, &plain), None);
+    for (name, html) in [
+        ("script.html", "<script>fetch('/x')</script>"),
+        ("frame.html", "<iframe src=\"page.html\"></iframe>"),
+        ("handler.html", "<img src=x.png onerror=\"alert(1)\">"),
+        ("remote.html", "<img src=\"https://example.invalid/p.png\">"),
+        ("file.html", "<img src=\"file:///etc/hosts\">"),
+        ("up.html", "<img src=\"../secret.png\">"),
+        (
+            "abs.html",
+            "<link href=\"/Users/synthetic/.zshrc\" rel=stylesheet>",
+        ),
+        (
+            "css.html",
+            "<style>@import 'https://example.invalid/x.css';</style>",
+        ),
+    ] {
+        let path = write(name, html);
+        assert!(
+            super::render_source_reach(&backend, &path).is_some(),
+            "{name}"
+        );
     }
 }

@@ -331,6 +331,8 @@ struct ActionArgs<'a> {
     script: Option<&'a str>,
     tab_id: Option<&'a str>,
     value: Option<&'a str>,
+    /// `render_pdf`'s local HTML source.
+    source_path: Option<&'a str>,
     session_id: &'a str,
     /// Runtime-injected proof that this call belongs to owner-confirmed
     /// scheduled automation. The dispatcher strips model-supplied underscore
@@ -394,8 +396,161 @@ fn redact_url_for_display(url: &str) -> String {
     url[..cut].to_string()
 }
 
+const RENDER_REACHES_BEYOND: &str = "Rendering runs the page in the browser: its scripts run, \
+and it can load files on this computer and from the internet. The rendered PDF and preview \
+come back to the agent.";
+
+/// What a `render_pdf` source page reaches beyond its own folder's files,
+/// in words for the card, or `None` when it reaches nothing else: no
+/// script or inline handler, no frame/object/embed, no remote or `file:`
+/// URL, and no relative reference that leaves its folder. Read from the
+/// HTML's own markup (a machine format), the same file the render opens.
+/// A source that cannot be read reaches unknown things.
+fn render_source_reach(
+    backend: &aidaemon_tools::backend::SharedExecutionBackend,
+    raw_source: &str,
+) -> Option<String> {
+    let Ok(source) = aidaemon_tools::fs_utils::validate_path(&**backend, raw_source) else {
+        // `run_action` refuses it before rendering; nothing to approve.
+        return None;
+    };
+    let Ok(html) = std::fs::read_to_string(&source) else {
+        return Some("could not be read beforehand, so what it loads is unknown".to_string());
+    };
+    let lower = html.to_ascii_lowercase();
+    // Markup tags and attribute names: HTML is a machine format.
+    for (marker, what) in [
+        ("<script", "runs scripts"),
+        ("<iframe", "embeds other pages"),
+        ("<frame", "embeds other pages"),
+        ("<object", "embeds objects"),
+        ("<embed", "embeds objects"),
+        ("<link rel=\"import", "imports other pages"),
+        ("javascript:", "runs scripts"),
+        ("http-equiv=\"refresh", "redirects elsewhere"),
+    ] {
+        if lower.contains(marker) {
+            return Some(what.to_string());
+        }
+    }
+    if inline_handler(&lower) {
+        return Some("runs scripts".to_string());
+    }
+    for reference in html_references(&html) {
+        let reference = reference.trim();
+        let lower = reference.to_ascii_lowercase();
+        if reference.is_empty()
+            || reference.starts_with('#')
+            || lower.starts_with("data:")
+            || lower.starts_with("mailto:")
+        {
+            continue;
+        }
+        if lower.contains("://") || reference.starts_with("//") || lower.starts_with("file:") {
+            let origin = redact_origin(reference);
+            let shown = if origin.is_empty() {
+                reference.chars().take(60).collect::<String>()
+            } else {
+                origin
+            };
+            return Some(format!("loads {shown}"));
+        }
+        if reference.starts_with('/')
+            || reference.starts_with('\\')
+            || std::path::Path::new(reference)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Some(format!("loads a file outside its folder ({reference})"));
+        }
+    }
+    None
+}
+
+/// Whether the markup has an inline event handler attribute (`onload=`,
+/// `onerror=` ...).
+fn inline_handler(lower_html: &str) -> bool {
+    let bytes = lower_html.as_bytes();
+    lower_html.match_indices("on").any(|(at, _)| {
+        let before_ok = at > 0 && matches!(bytes[at - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
+        let rest = &lower_html[at + 2..];
+        let name_len = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+        before_ok && name_len > 0 && rest[name_len..].trim_start().starts_with('=')
+    })
+}
+
+/// The values of `src`, `href`, `srcset`, `poster`, `data`, `action` and
+/// `formaction` attributes and CSS `url(...)` / `@import` references.
+fn html_references(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    for attribute in [
+        "src",
+        "href",
+        "srcset",
+        "poster",
+        "data",
+        "action",
+        "formaction",
+        "xlink:href",
+    ] {
+        let needle = format!("{attribute}=");
+        for (at, _) in lower.match_indices(&needle) {
+            let before = lower[..at].chars().last();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':') {
+                continue;
+            }
+            let value = html[at + needle.len()..].trim_start();
+            let (quote, body) = match value.chars().next() {
+                Some(q @ ('"' | '\'')) => (Some(q), &value[1..]),
+                _ => (None, value),
+            };
+            let end = match quote {
+                Some(q) => body.find(q).unwrap_or(body.len()),
+                None => body
+                    .find(|c: char| c.is_whitespace() || c == '>')
+                    .unwrap_or(body.len()),
+            };
+            let value = &body[..end];
+            if attribute == "srcset" {
+                out.extend(
+                    value
+                        .split(',')
+                        .filter_map(|part| part.split_whitespace().next())
+                        .map(str::to_string),
+                );
+            } else {
+                out.push(value.to_string());
+            }
+        }
+    }
+    for (at, _) in lower.match_indices("url(") {
+        let body = &html[at + 4..];
+        let end = body.find(')').unwrap_or(body.len());
+        out.push(body[..end].trim().trim_matches(['"', '\'']).to_string());
+    }
+    for (at, _) in lower.match_indices("@import") {
+        let body = html[at + 7..].trim_start();
+        if let Some(rest) = body.strip_prefix(['"', '\'']) {
+            let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+            out.push(rest[..end].to_string());
+        }
+    }
+    out
+}
+
+/// Whether `action` goes where its `url` argument says (navigation).
+fn uses_url(action: &str) -> bool {
+    matches!(action, "navigate" | "new_tab")
+}
+
+/// How much of a script an `execute_js` card shows.
+const SCRIPT_PREVIEW_CHARS: usize = 600;
+
 /// User-facing description of a browser action for approval prompts.
-/// Never includes fill values or script bodies.
+/// Never includes fill values. An `execute_js` card shows the script the
+/// owner is approving (its first part when long), with its size and a
+/// digest binding the exact script.
 fn format_browser_approval_prompt(
     action: &str,
     origin: &str,
@@ -421,8 +576,14 @@ fn format_browser_approval_prompt(
             // A short digest distinguishes different same-sized scripts without
             // exposing their potentially sensitive contents in chat or logs.
             let digest = hex::encode(Sha256::digest(script.as_bytes()));
+            let mut preview: String = script.chars().take(SCRIPT_PREVIEW_CHARS).collect();
+            if preview.len() < script.len() {
+                preview.push_str("\n…");
+            }
+            // Fences inside the script cannot close the card's code block.
+            let preview = preview.replace("```", "`\u{200b}``");
             format!(
-                "Run JavaScript on {origin} ({bytes} bytes, id {})",
+                "Run JavaScript on {origin} ({bytes} bytes, id {}):\n```js\n{preview}\n```",
                 &digest[..12]
             )
         }
@@ -860,9 +1021,11 @@ impl BrowserTool {
         args: &ActionArgs<'_>,
         risk: &policy::BrowserActionRisk,
     ) -> String {
-        // Origin: for url-bearing actions use the url arg; otherwise the active
-        // tab's last-known origin (or "current page" when unknown).
-        let origin = match args.url {
+        // Origin: navigation shows where it goes (the url arg); every other
+        // action shows the page it acts on, read live from the active tab
+        // (never a url argument the action does not use, nor a cached one
+        // when the live page answers).
+        let origin = match args.url.filter(|_| uses_url(args.action)) {
             Some(u) => {
                 let r = redact_origin(u);
                 if r.is_empty() {
@@ -871,10 +1034,13 @@ impl BrowserTool {
                     r
                 }
             }
-            None => self
-                .active_origin_for_prompt(args.session_id)
-                .await
-                .unwrap_or_else(|| "current page".to_string()),
+            None => match self.active_site(args.session_id).await {
+                Some(site) => site,
+                None => self
+                    .active_origin_for_prompt(args.session_id)
+                    .await
+                    .unwrap_or_else(|| "current page".to_string()),
+            },
         };
 
         format_browser_approval_prompt(
@@ -926,6 +1092,32 @@ impl BrowserTool {
         }
 
         let risk = policy::classify(args.action);
+
+        // Rendering a page loads what the page names: a script, a remote
+        // resource or a local file outside its own folder reaches beyond
+        // the HTML the call hands over, so the owner sees it first.
+        if args.action == "render_pdf"
+            && let Some(reach) = args
+                .source_path
+                .and_then(|path| render_source_reach(&self.execution_backend, path))
+        {
+            let summary = format!(
+                "Render {} to PDF? The page {reach}.",
+                args.source_path.unwrap_or_default()
+            );
+            return BrowserApproval::Ask {
+                request: aidaemon_core::OwnerApprovalRequest {
+                    card: None,
+                    effects: Vec::new(),
+                    subject: Self::call_subject(args, &summary),
+                    summary,
+                    risk: aidaemon_core::ApprovalRisk::High,
+                    warnings: vec![RENDER_REACHES_BEYOND.to_string()],
+                },
+                point_of_action: true,
+                button_site: None,
+            };
+        }
 
         // Free actions: never ask. Navigation reaches this point only after
         // its requested URL has passed the shared public-network preflight in
@@ -985,9 +1177,17 @@ impl BrowserTool {
             };
         }
 
-        // Session-level fast path: an already-approved session skips the card
-        // for ordinary mutation — but NEVER for point-of-action.
-        if !point_of_action && self.sessions.is_session_approved(args.session_id).await {
+        // Session-level fast path: a session approved on this site skips the
+        // card for ordinary mutation there — but NEVER for point-of-action,
+        // and never on another site or a page with no origin.
+        let page_site = self.active_site(args.session_id).await;
+        if !point_of_action
+            && let Some(site) = &page_site
+            && self
+                .sessions
+                .is_session_approved(args.session_id, site)
+                .await
+        {
             return BrowserApproval::NotNeeded;
         }
 
@@ -1034,6 +1234,7 @@ impl BrowserTool {
             args.script,
             args.tab_id,
             args.value,
+            args.source_path,
         ])
         .to_string();
         let digest = hex::encode(Sha256::digest(exact.as_bytes()));
@@ -1186,11 +1387,18 @@ impl BrowserTool {
     ) -> Option<ActionArgs<'a>> {
         Some(ActionArgs {
             action: args.get("action").and_then(|v| v.as_str())?,
-            url: args.get("url").and_then(|v| v.as_str()),
+            // Only navigation uses a url; for any other action it is ignored,
+            // so it can never name the page a card shows.
+            url: args.get("url").and_then(|v| v.as_str()).filter(|_| {
+                args.get("action")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(uses_url)
+            }),
             selector: args.get("selector").and_then(|v| v.as_str()),
             script: args.get("script").and_then(|v| v.as_str()),
             tab_id: args.get("tab_id").and_then(|v| v.as_str()),
             value: args.get("value").and_then(|v| v.as_str()),
+            source_path: args.get("source_path").and_then(|v| v.as_str()),
             session_id,
             trusted_session,
         })
@@ -2737,11 +2945,16 @@ impl BrowserTool {
 
         let action_args = ActionArgs {
             action,
-            url: args.get("url").and_then(|v| v.as_str()),
+            // As the kernel judged it (`action_args`): only navigation's url.
+            url: args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|_| uses_url(action)),
             selector: args.get("selector").and_then(|v| v.as_str()),
             script: args.get("script").and_then(|v| v.as_str()),
             tab_id: args.get("tab_id").and_then(|v| v.as_str()),
             value: args.get("value").and_then(|v| v.as_str()),
+            source_path: args.get("source_path").and_then(|v| v.as_str()),
             session_id,
             trusted_session: facts.trusted_session,
         };
@@ -2837,6 +3050,7 @@ impl Tool for BrowserTool {
             return;
         };
         let session_id = facts.session_id.as_str();
+        let page_site = self.active_site(session_id).await;
         match (response, button_site) {
             // A site-scoped click's session approval covers buttons on that
             // site (origin) for the browser session, nothing else.
@@ -2846,9 +3060,12 @@ impl Tool for BrowserTool {
                 self.sessions.approve_button_site(session_id, site).await;
             }
             (ApprovalResponse::AllowSession | ApprovalResponse::AllowAlways, None)
-                if !point_of_action =>
+                if !point_of_action && page_site.is_some() =>
             {
-                self.sessions.mark_session_approved(session_id).await;
+                // Covers ordinary mutation on the page's site only.
+                if let Some(site) = &page_site {
+                    self.sessions.mark_session_approved(session_id, site).await;
+                }
             }
             _ => self.owner_answers.approve(session_id, &request.subject),
         }
@@ -3382,19 +3599,42 @@ mod prompt_tests {
         assert!(!prompt.contains("[risk:"));
     }
 
+    /// The owner approves the script they can read: the card shows it (the
+    /// first part of a long one), and a fence in it cannot close the block.
     #[test]
-    fn execute_js_prompt_hides_script_body() {
+    fn execute_js_prompt_shows_the_script() {
         let prompt = format_browser_approval_prompt(
             "execute_js",
             "https://example.com",
             None,
             None,
-            Some("SECRET_SCRIPT_BODY"),
+            Some("document.title = 'x'"),
             &sample_risk(),
         );
-        assert!(prompt.starts_with("Run JavaScript on https://example.com (18 bytes, id "));
-        assert!(prompt.ends_with(')'));
-        assert!(!prompt.contains("SECRET_SCRIPT_BODY"));
+        assert!(prompt.starts_with("Run JavaScript on https://example.com (20 bytes, id "));
+        assert!(
+            prompt.contains("```js\ndocument.title = 'x'\n```"),
+            "{prompt}"
+        );
+        let long = "a".repeat(super::SCRIPT_PREVIEW_CHARS + 50);
+        let prompt = format_browser_approval_prompt(
+            "execute_js",
+            "https://example.com",
+            None,
+            None,
+            Some(&long),
+            &sample_risk(),
+        );
+        assert!(prompt.contains('…') && !prompt.contains(&long));
+        let fenced = format_browser_approval_prompt(
+            "execute_js",
+            "https://example.com",
+            None,
+            None,
+            Some("x``` trailing"),
+            &sample_risk(),
+        );
+        assert_eq!(fenced.matches("```").count(), 2, "{fenced}");
     }
 
     #[test]
