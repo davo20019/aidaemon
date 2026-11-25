@@ -251,19 +251,7 @@ pub struct TurnScope<'a> {
     pub after_helper: std::sync::Mutex<Option<AfterHelper>>,
 }
 
-/// The run's work after a helper it waited on ended, from typed records:
-/// when the helper ended, its name, and whether the run then changed
-/// anything itself (a later call that succeeded and was not read-only).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AfterHelper {
-    pub since: chrono::DateTime<chrono::Utc>,
-    /// The name the owner reads for the helper.
-    pub helper: String,
-    /// The run finished work itself after the helper.
-    pub did_work: bool,
-    /// How many helpers the run has waited on so far, this one included.
-    pub helpers: usize,
-}
+pub use crate::run_state::timing::AfterHelper;
 
 /// Whether a file a run wrote is code its project can build or test: not
 /// prose (documentation, notes, plain text), and inside a git repository.

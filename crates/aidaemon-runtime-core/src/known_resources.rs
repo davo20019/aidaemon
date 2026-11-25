@@ -26,8 +26,6 @@ use aidaemon_events::EventStore;
 use aidaemon_events::run_aggregate::RunAggregate;
 use aidaemon_tools::semantics::{ToolOutcomeStatus, ToolTargetHint, ToolTargetHintKind};
 
-use crate::authority::InheritedAuthority;
-
 /// How many runs, and how deep a spawn tree, one handoff reads.
 const MAX_HANDOFF_TASKS: usize = 24;
 
@@ -201,6 +199,20 @@ fn exact_identity(hint: &ToolTargetHint) -> Option<ToolTargetHint> {
     }
 }
 
+/// What an agent inherited from the run that spawned it, as resources and
+/// handoff read it (built by `InheritedAuthority::handoff`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Inherited<'a> {
+    /// The files or directories the child declared it will change.
+    pub declared_scope: &'a [String],
+    /// What the parent's work had reached.
+    pub known: &'a [ToolTargetHint],
+    /// The owner's own request, when the root request was owner-authored.
+    pub origin_request: Option<&'a str>,
+    /// Missions delegated from the root down to this agent, outermost first.
+    pub lineage: &'a [String],
+}
+
 /// What the work so far has reached, for a turn's context or for a child it
 /// spawns: the child's own declared scope first, then the current run
 /// (`current_task`), then the tasks of the earlier turns projected into this
@@ -209,18 +221,18 @@ fn exact_identity(hint: &ToolTargetHint) -> Option<ToolTargetHint> {
 /// inherited (`inherited`).
 pub async fn known_resources(
     events: &EventStore,
-    inherited: Option<&InheritedAuthority>,
+    inherited: Option<Inherited<'_>>,
     session_id: &str,
     current_task: Option<&str>,
     projected_turn_ids: &[String],
 ) -> KnownResources {
     let mut known = KnownResources::default();
-    if let Some(declaration) = inherited.and_then(|inherited| inherited.child_declaration.as_ref())
+    for path in inherited
+        .map(|inherited| inherited.declared_scope)
+        .unwrap_or_default()
     {
-        for path in &declaration.scope {
-            if let Some(hint) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
-                known.push(&hint);
-            }
+        if let Some(hint) = ToolTargetHint::new(ToolTargetHintKind::Path, path) {
+            known.push(&hint);
         }
     }
     let started = std::time::Instant::now();
@@ -257,7 +269,7 @@ pub async fn known_resources(
         "Handoff resources read"
     );
     if let Some(inherited) = inherited {
-        known.extend(inherited.known_resources.as_slice());
+        known.extend(inherited.known);
     }
     known
 }
@@ -301,17 +313,15 @@ async fn handoff_runs(
 /// working directory and resources the work has reached.
 pub async fn handoff_section(
     events: &EventStore,
-    inherited: Option<&InheritedAuthority>,
+    inherited: Option<Inherited<'_>>,
     session_id: &str,
     projected_turn_ids: &[String],
 ) -> Option<String> {
     let resources = known_resources(events, inherited, session_id, None, projected_turn_ids).await;
     Handoff {
-        origin_request: inherited
-            .filter(|inherited| inherited.origin_trusted)
-            .and_then(|inherited| inherited.origin_request.as_deref()),
+        origin_request: inherited.and_then(|inherited| inherited.origin_request),
         lineage: inherited
-            .map(|inherited| inherited.lineage.as_slice())
+            .map(|inherited| inherited.lineage)
             .unwrap_or_default(),
         resources: &resources,
     }

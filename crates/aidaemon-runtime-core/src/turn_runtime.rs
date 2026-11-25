@@ -12,9 +12,9 @@ use tokio::sync::RwLock;
 use crate::eval::{HarnessEvalAccumulator, HarnessEvalConfig};
 use crate::policy::trust_tier::{ModelTrustTier, TrustTierSetting, classify_model_trust};
 use crate::prompt::core::CachedCore;
+use crate::render::RenderOptions;
+use crate::render::cache::CachedRender;
 use crate::settings::{AudioConfig, ContextWindowConfig, PolicyConfig, SttConfig, VisionConfig};
-use crate::turn::turn_render::RenderOptions;
-use crate::turn::turn_render_cache::CachedRender;
 
 /// Per-session core-prompt cache: `session_id` -> last rendered
 /// [`CachedCore`]. On a hit the cached bytes are reused verbatim; on a miss

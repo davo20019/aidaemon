@@ -146,6 +146,17 @@ impl CompletionContract {
     pub fn belongs_to_task(&self, task_id: &str) -> bool {
         self.scope_task_id.as_deref() == Some(task_id)
     }
+
+    /// What the harness score reads from this contract.
+    pub fn eval_expectations(&self) -> crate::eval::ContractExpectations {
+        crate::eval::ContractExpectations {
+            expects_mutation: self.expects_mutation,
+            requires_observation: self.requires_observation,
+            verification_required: self.explicit_verification_requested
+                || self.requires_reverification_after_mutation,
+            evidence_requirements_total: self.evidence_requirements.len() as u32,
+        }
+    }
 }
 
 pub fn persistable_completion_contract(contract: &CompletionContract) -> RequestCompletionContract {

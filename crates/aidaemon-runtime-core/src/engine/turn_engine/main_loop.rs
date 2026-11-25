@@ -884,7 +884,7 @@ impl TurnEngine<'_> {
                 .map(|mode| mode.as_str().to_string()),
         );
         harness_eval.record_completion_contract(
-            &turn_context.completion_contract,
+            turn_context.completion_contract.eval_expectations(),
             resolved_authority.authority.level == aidaemon_core::AccessLevel::ReadOnly,
         );
         if self.turn_runtime().harness_eval_enabled() {

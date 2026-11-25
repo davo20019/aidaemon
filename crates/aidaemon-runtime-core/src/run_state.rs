@@ -1972,7 +1972,7 @@ mod tests {
             outcome < body && body < evidence && evidence < sent && sent < failed,
             "{result}"
         );
-        let measured = at(crate::turn::sliding_window::MEASURED_TIMING_MARK);
+        let measured = at(aidaemon_tools::internal_markers::MEASURED_TIMING_MARK);
         assert!(failed < measured, "{result}");
         assert!(!result.starts_with("Its report"), "{result}");
     }

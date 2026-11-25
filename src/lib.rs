@@ -76,6 +76,8 @@ mod contract_shape_tests;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
+mod layering_tests;
+#[cfg(test)]
 mod live_e2e_tests;
 #[cfg(test)]
 mod testing;

@@ -9,7 +9,7 @@ use tracing::warn;
 use crate::settings::VisionConfig;
 use aidaemon_events::conversation::{AttachmentProvenance, MessageAttachment};
 
-use crate::turn::turn_render::RenderMode;
+use crate::render::RenderMode;
 
 pub const VISION_SKIPPED_SYSTEM_HINT: &str = "[SYSTEM] User attached image(s) saved to disk; vision is disabled, unsupported, or the file could not be read — acknowledge receipt and explain you cannot view the image directly.";
 

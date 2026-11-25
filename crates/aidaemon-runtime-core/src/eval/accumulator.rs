@@ -1,5 +1,4 @@
 use crate::policy::execution::ModelProfile;
-use crate::turn::completion_contract::CompletionContract;
 use aidaemon_events::{
     HarnessEvalSnapshot, HarnessScoresPayload, QualityEvalPayload, RoutingEvalPayload,
     TaskEfficiencyData, TaskOutcome,
@@ -75,6 +74,15 @@ pub struct ProgressSnapshot {
     pub context_drops: u32,
     pub deferred_no_tool_events: u32,
     pub budget_extensions: u32,
+}
+
+/// What the turn's completion contract expects, as the score reads it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContractExpectations {
+    pub expects_mutation: bool,
+    pub requires_observation: bool,
+    pub verification_required: bool,
+    pub evidence_requirements_total: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,15 +233,14 @@ impl HarnessEvalAccumulator {
     /// from the assessed contract, which is only a hint.
     pub fn record_completion_contract(
         &mut self,
-        contract: &CompletionContract,
+        expected: ContractExpectations,
         mutation_forbidden: bool,
     ) {
-        self.contract.expects_mutation = contract.expects_mutation;
+        self.contract.expects_mutation = expected.expects_mutation;
         self.contract.forbids_mutation = mutation_forbidden;
-        self.contract.requires_observation = contract.requires_observation;
-        self.contract.verification_required = contract.explicit_verification_requested
-            || contract.requires_reverification_after_mutation;
-        self.contract.evidence_requirements_total = contract.evidence_requirements.len() as u32;
+        self.contract.requires_observation = expected.requires_observation;
+        self.contract.verification_required = expected.verification_required;
+        self.contract.evidence_requirements_total = expected.evidence_requirements_total;
     }
 
     pub fn record_forbidden_mutation_attempt(&mut self) {
@@ -466,6 +473,7 @@ impl From<CostSnapshot> for aidaemon_events::CostEvalPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::completion_contract::CompletionContract;
     use aidaemon_events::{
         ContractFulfillmentPayload, CostEvalPayload, HarnessScoresPayload, ProgressEvalPayload,
         QualityEvalPayload, RoutingEvalPayload,
@@ -609,7 +617,7 @@ mod tests {
             ..Default::default()
         };
         let mut acc = HarnessEvalAccumulator::new(seed());
-        acc.record_completion_contract(&contract, false);
+        acc.record_completion_contract(contract.eval_expectations(), false);
         acc.contract.mutation_count = 1;
         let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
         assert!(!snap.quality.contract.forbids_mutation);
@@ -625,7 +633,7 @@ mod tests {
             ..Default::default()
         };
         let mut acc = HarnessEvalAccumulator::new(seed());
-        acc.record_completion_contract(&contract, true);
+        acc.record_completion_contract(contract.eval_expectations(), true);
         acc.record_forbidden_mutation_attempt();
         let snap = acc.finalize(TaskOutcome::Succeeded, 1, 1, None);
         assert!(snap.quality.contract.forbids_mutation);

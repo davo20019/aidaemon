@@ -4,7 +4,21 @@
 
 use std::time::Duration;
 
-use crate::turn::sliding_window::MEASURED_TIMING_MARK;
+use aidaemon_tools::internal_markers::MEASURED_TIMING_MARK;
+
+/// The run's work after a helper it waited on ended, from typed records:
+/// when the helper ended, its name, and whether the run then changed
+/// anything itself (a later call that succeeded and was not read-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterHelper {
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// The name the owner reads for the helper.
+    pub helper: String,
+    /// The run finished work itself after the helper.
+    pub did_work: bool,
+    /// How many helpers the run has waited on so far, this one included.
+    pub helpers: usize,
+}
 
 /// A child's run as the daemon measured it: when it was started and when it
 /// finished, when its own steps (its tool calls) ran, apart from its
@@ -241,7 +255,7 @@ impl RequestFinished {
 /// whether the turn then changed anything itself) and `answered` (now).
 pub fn request_finished(
     requested: Option<chrono::DateTime<chrono::Utc>>,
-    after: &crate::engine::scope::AfterHelper,
+    after: &AfterHelper,
     answered: chrono::DateTime<chrono::Utc>,
 ) -> RequestFinished {
     RequestFinished {

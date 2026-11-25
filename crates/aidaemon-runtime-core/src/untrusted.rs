@@ -16,9 +16,9 @@ use aidaemon_core::ChannelVisibility;
 use aidaemon_tools::semantics::UserRole;
 use aidaemon_tools::services::SettingsStore;
 
-use crate::authority::OwnerLevel;
 use crate::llm::gateway::SideCallGateway;
 use crate::llm::side_calls::SideCall;
+use crate::owner_level::OwnerLevel;
 
 /// `Unrestricted` records egress after untrusted reads; every other level,
 /// Full access included (it runs commands unasked, not unchecked egress),
@@ -68,7 +68,7 @@ pub fn starts_tainted(facts: &TaintFacts<'_>) -> bool {
         || facts.instructions_untrusted
         || facts.user_role != UserRole::Owner
         || shared_chat(facts.visibility)
-        || crate::turn::loop_utils::is_trigger_session(facts.session_id)
+        || aidaemon_work::triggers::is_trigger_session(facts.session_id)
         || prefix_tainted
 }
 
@@ -341,7 +341,7 @@ fn verifier_schema() -> Value {
 /// and the turn was not started by a trigger (email and other events carry
 /// someone else's text).
 pub fn origin_is_owner_authored(user_role: UserRole, session_id: &str) -> bool {
-    user_role == UserRole::Owner && !crate::turn::loop_utils::is_trigger_session(session_id)
+    user_role == UserRole::Owner && !aidaemon_work::triggers::is_trigger_session(session_id)
 }
 
 /// What a mandate run's egress is judged against.

@@ -370,7 +370,8 @@ impl TurnEngine<'_> {
         // own parent already held: the child starts from these identities.
         let known_resources = crate::known_resources::known_resources(
             self.events(),
-            self.inherited_authority(),
+            self.inherited_authority()
+                .map(crate::authority::InheritedAuthority::handoff),
             scope.session_id,
             Some(scope.task_id),
             &scope.projected_source_turn_ids,

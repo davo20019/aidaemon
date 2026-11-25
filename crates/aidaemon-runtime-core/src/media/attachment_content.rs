@@ -7,7 +7,7 @@ use aidaemon_events::conversation::MessageAttachment;
 
 use crate::media::audio::build_audio_blocks;
 use crate::media::vision::build_image_blocks;
-use crate::turn::turn_render::RenderMode;
+use crate::render::RenderMode;
 
 /// Result of building wire-format user content for a message with attachments.
 pub struct AttachmentBuildResult {

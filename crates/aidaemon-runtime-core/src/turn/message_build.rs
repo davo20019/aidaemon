@@ -888,7 +888,7 @@ pub async fn build_turn_messages(
                     .iter()
                     .any(|message| message.role == "assistant" && message.id == id)
             });
-            let fp = crate::turn::turn_render_cache::content_fp(&turn.messages, terminal_state);
+            let fp = crate::render::cache::content_fp(&turn.messages, terminal_state);
             let prev = turn
                 .turn_id
                 .as_deref()
@@ -901,7 +901,7 @@ pub async fn build_turn_messages(
                     &render_options,
                 )
             };
-            let (cache_bytes, hit, reason) = crate::turn::turn_render_cache::render_cache_decision(
+            let (cache_bytes, hit, reason) = crate::render::cache::render_cache_decision(
                 prev,
                 &fp,
                 crate::turn::turn_render::RENDERER_VERSION,
@@ -1052,7 +1052,7 @@ pub async fn build_turn_messages(
             if let Some(tid) = r.turn_id.as_deref() {
                 session_cache.insert(
                     tid.to_string(),
-                    crate::turn::turn_render_cache::CachedRender {
+                    crate::render::cache::CachedRender {
                         content_fp: r.content_fp.clone(),
                         renderer_version: crate::turn::turn_render::RENDERER_VERSION,
                         mode_tag: "archived".to_string(),
@@ -1501,7 +1501,8 @@ pub async fn build_turn_messages(
     let known_resources = if ctx.share_known_resources {
         crate::known_resources::handoff_section(
             host.events(),
-            host.inherited_authority(),
+            host.inherited_authority()
+                .map(crate::authority::InheritedAuthority::handoff),
             session_id,
             &peek_projected_turn_ids(&messages),
         )
