@@ -1,6 +1,8 @@
 //! Plain-text fallbacks: Markdown read as plain text when Telegram rejects
 //! the HTML, and plain text split to Telegram's length.
 
+use aidaemon_channels::markdown::Inline;
+
 use crate::format::tg_len;
 
 /// Convert common LLM markdown to readable plain text for Telegram fallbacks.
@@ -43,101 +45,33 @@ pub fn markdown_to_plain_fallback(md: &str) -> String {
 }
 
 fn convert_inline_formatting_to_plain(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
+    let mut out = String::with_capacity(s.len());
+    render(&aidaemon_channels::markdown::parse(s), &mut out);
+    out
+}
 
-    while i < len {
-        if chars[i] == '`'
-            && let Some(end) = find_char(&chars, '`', i + 1)
-        {
-            result.extend(chars[i + 1..end].iter());
-            i = end + 1;
-            continue;
-        }
-
-        if i + 1 < len
-            && chars[i] == '*'
-            && chars[i + 1] == '*'
-            && let Some(end) = find_double_char(&chars, '*', i + 2)
-        {
-            result.extend(chars[i + 2..end].iter());
-            i = end + 2;
-            continue;
-        }
-
-        if chars[i] == '['
-            && let Some((text, url, end)) = parse_link(&chars, i)
-        {
-            result.push_str(&text);
-            if !url.is_empty() {
-                result.push_str(" (");
-                result.push_str(&url);
-                result.push(')');
+/// Plain text for the shared inline tree: marks dropped, a link as
+/// `text (url)`.
+fn render(inlines: &[Inline], out: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) | Inline::Code(text) => out.push_str(text),
+            Inline::Bold(inner) | Inline::Italic(inner) | Inline::Strike(inner) => {
+                render(inner, out)
             }
-            i = end;
-            continue;
+            Inline::Link { text, url } => {
+                render(text, out);
+                out.push_str(" (");
+                out.push_str(url);
+                out.push(')');
+            }
+            Inline::Angle(inner) => {
+                out.push('<');
+                out.push_str(inner);
+                out.push('>');
+            }
         }
-
-        // _italic_ only at word boundaries (as the HTML converter), so
-        // snake_case stays intact.
-        if chars[i] == '_'
-            && (i == 0 || !chars[i - 1].is_alphanumeric())
-            && let Some(end) = find_char(&chars, '_', i + 1)
-            && end > i + 1
-            && (end + 1 >= len || !chars[end + 1].is_alphanumeric())
-            && !chars[i + 1].is_whitespace()
-        {
-            result.extend(chars[i + 1..end].iter());
-            i = end + 1;
-            continue;
-        }
-
-        if chars[i] == '*'
-            && (i + 1 >= len || chars[i + 1] != '*')
-            && let Some(end) = find_single_star(&chars, i + 1)
-        {
-            result.extend(chars[i + 1..end].iter());
-            i = end + 1;
-            continue;
-        }
-
-        result.push(chars[i]);
-        i += 1;
     }
-    result
-}
-
-fn find_char(chars: &[char], c: char, start: usize) -> Option<usize> {
-    (start..chars.len()).find(|&j| chars[j] == c)
-}
-
-fn find_double_char(chars: &[char], c: char, start: usize) -> Option<usize> {
-    let mut j = start;
-    while j + 1 < chars.len() {
-        if chars[j] == c && chars[j + 1] == c {
-            return Some(j);
-        }
-        j += 1;
-    }
-    None
-}
-
-fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
-    (start..chars.len()).find(|&j| chars[j] == '*' && (j + 1 >= chars.len() || chars[j + 1] != '*'))
-}
-
-fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    // [text](url)
-    let close_bracket = find_char(chars, ']', start + 1)?;
-    if close_bracket + 1 >= chars.len() || chars[close_bracket + 1] != '(' {
-        return None;
-    }
-    let close_paren = find_char(chars, ')', close_bracket + 2)?;
-    let text: String = chars[start + 1..close_bracket].iter().collect();
-    let url: String = chars[close_bracket + 2..close_paren].iter().collect();
-    Some((text, url, close_paren + 1))
 }
 
 /// Split plain text for Telegram into parts of at most `max_units` UTF-16

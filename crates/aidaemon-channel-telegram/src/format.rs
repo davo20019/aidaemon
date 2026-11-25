@@ -5,6 +5,8 @@
 //! else. LLM output is loose Markdown, so the converter is deliberately
 //! forgiving: anything it does not recognise is passed through escaped.
 
+use aidaemon_channels::markdown::Inline;
+
 pub use crate::plain::{markdown_to_plain_fallback, split_text};
 
 /// Escape `<`, `>` and `&` for Telegram HTML text.
@@ -185,115 +187,48 @@ pub(crate) fn strip_heading(line: &str) -> Option<&str> {
 
 /// Inline formatting over already-escaped text.
 fn convert_inline(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    convert_inline_chars(&chars, &mut out);
+    render(&aidaemon_channels::markdown::parse(s), &mut out);
     out
 }
 
-fn convert_inline_chars(chars: &[char], out: &mut String) {
-    let len = chars.len();
-    let mut i = 0;
-    while i < len {
-        let c = chars[i];
-
-        if c == '`'
-            && let Some(end) = find_char(chars, '`', i + 1)
-        {
-            out.push_str("<code>");
-            out.extend(&chars[i + 1..end]);
-            out.push_str("</code>");
-            i = end + 1;
-            continue;
-        }
-
-        if (c == '*' || c == '~')
-            && i + 1 < len
-            && chars[i + 1] == c
-            && let Some(end) = find_double(chars, c, i + 2)
-            && end > i + 2
-        {
-            let tag = if c == '*' { "b" } else { "s" };
-            out.push('<');
-            out.push_str(tag);
-            out.push('>');
-            convert_inline_chars(&chars[i + 2..end], out);
-            out.push_str("</");
-            out.push_str(tag);
-            out.push('>');
-            i = end + 2;
-            continue;
-        }
-
-        if c == '['
-            && let Some((text_end, url_start, url_end)) = parse_link(chars, i)
-        {
-            let url: String = chars[url_start..url_end].iter().collect();
-            out.push_str("<a href=\"");
-            out.push_str(&url.replace('"', "&quot;"));
-            out.push_str("\">");
-            convert_inline_chars(&chars[i + 1..text_end], out);
-            out.push_str("</a>");
-            i = url_end + 1;
-            continue;
-        }
-
-        // _italic_ only at word boundaries, so snake_case stays intact.
-        if c == '_'
-            && (i == 0 || !chars[i - 1].is_alphanumeric())
-            && let Some(end) = find_char(chars, '_', i + 1)
-        {
-            let boundary_after = end + 1 >= len || !chars[end + 1].is_alphanumeric();
-            if end > i + 1 && boundary_after && !chars[i + 1].is_whitespace() {
-                out.push_str("<i>");
-                convert_inline_chars(&chars[i + 1..end], out);
-                out.push_str("</i>");
-                i = end + 1;
-                continue;
+/// Telegram HTML for the shared inline tree (its text already escaped).
+fn render(inlines: &[Inline], out: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => out.push_str(text),
+            Inline::Code(code) => {
+                out.push_str("<code>");
+                out.push_str(code);
+                out.push_str("</code>");
+            }
+            Inline::Bold(inner) => tag(out, "b", inner),
+            Inline::Italic(inner) => tag(out, "i", inner),
+            Inline::Strike(inner) => tag(out, "s", inner),
+            Inline::Link { text, url } => {
+                out.push_str("<a href=\"");
+                out.push_str(&url.replace('"', "&quot;"));
+                out.push_str("\">");
+                render(text, out);
+                out.push_str("</a>");
+            }
+            Inline::Angle(inner) => {
+                out.push('<');
+                out.push_str(inner);
+                out.push('>');
             }
         }
-
-        if c == '*'
-            && (i + 1 >= len || chars[i + 1] != '*')
-            && let Some(end) = find_single_star(chars, i + 1)
-            && end > i + 1
-            && !chars[i + 1].is_whitespace()
-        {
-            out.push_str("<i>");
-            convert_inline_chars(&chars[i + 1..end], out);
-            out.push_str("</i>");
-            i = end + 1;
-            continue;
-        }
-
-        out.push(c);
-        i += 1;
     }
 }
 
-fn find_char(chars: &[char], c: char, start: usize) -> Option<usize> {
-    (start..chars.len()).find(|&j| chars[j] == c)
-}
-
-fn find_double(chars: &[char], c: char, start: usize) -> Option<usize> {
-    (start..chars.len().saturating_sub(1)).find(|&j| chars[j] == c && chars[j + 1] == c)
-}
-
-fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
-    (start..chars.len()).find(|&j| chars[j] == '*' && (j + 1 >= chars.len() || chars[j + 1] != '*'))
-}
-
-/// `[text](url)` → (index of `]`, url start, index of `)`).
-fn parse_link(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
-    let close = find_char(chars, ']', start + 1)?;
-    if chars.get(close + 1) != Some(&'(') {
-        return None;
-    }
-    let paren = find_char(chars, ')', close + 2)?;
-    if paren == close + 2 || chars[close + 2..paren].iter().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    Some((close, close + 2, paren))
+fn tag(out: &mut String, name: &str, inner: &[Inline]) {
+    out.push('<');
+    out.push_str(name);
+    out.push('>');
+    render(inner, out);
+    out.push_str("</");
+    out.push_str(name);
+    out.push('>');
 }
 
 /// Turn Telegram HTML back into readable plain text (tags removed, entities

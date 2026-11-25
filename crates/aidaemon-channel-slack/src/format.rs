@@ -12,6 +12,8 @@ pub fn escape_mrkdwn(s: &str) -> String {
     out
 }
 
+use aidaemon_channels::markdown::Inline;
+
 fn push_escaped(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -104,107 +106,56 @@ fn strip_heading(line: &str) -> Option<&str> {
 }
 
 fn convert_inline(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let len = chars.len();
-    let mut i = 0;
+    render(
+        &aidaemon_channels::markdown::parse_with(s, is_preserved_token),
+        &mut out,
+    );
+    out
+}
 
-    while i < len {
-        let c = chars[i];
-
-        // Inline code: copy through, escaped.
-        if c == '`'
-            && let Some(end) = find_char(&chars, '`', i + 1)
-        {
-            out.push('`');
-            push_escaped(&mut out, &collect(&chars[i + 1..end]));
-            out.push('`');
-            i = end + 1;
-            continue;
-        }
-
-        // Bold: **x** or __x__ → *x*
-        if (c == '*' || c == '_')
-            && i + 1 < len
-            && chars[i + 1] == c
-            && let Some(end) = find_double(&chars, c, i + 2)
-            && end > i + 2
-        {
-            out.push('*');
-            out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
-            out.push('*');
-            i = end + 2;
-            continue;
-        }
-
-        // Strikethrough: ~~x~~ → ~x~
-        if c == '~'
-            && i + 1 < len
-            && chars[i + 1] == '~'
-            && let Some(end) = find_double(&chars, '~', i + 2)
-            && end > i + 2
-        {
-            out.push('~');
-            out.push_str(&convert_inline(&collect(&chars[i + 2..end])));
-            out.push('~');
-            i = end + 2;
-            continue;
-        }
-
-        // Italic: *x* → _x_ (opening star must touch a word).
-        if c == '*'
-            && i + 1 < len
-            && !chars[i + 1].is_whitespace()
-            && let Some(end) = find_single_star(&chars, i + 1)
-            && !chars[end - 1].is_whitespace()
-        {
-            out.push('_');
-            out.push_str(&convert_inline(&collect(&chars[i + 1..end])));
-            out.push('_');
-            i = end + 1;
-            continue;
-        }
-
-        // Link: [text](url) → <url|text>
-        if c == '['
-            && let Some((text, url, end)) = parse_link(&chars, i)
-        {
-            out.push('<');
-            push_escaped(&mut out, &sanitize_url(&url));
-            out.push('|');
-            push_escaped(&mut out, &text.replace('|', "/"));
-            out.push('>');
-            i = end;
-            continue;
-        }
-
-        // `<...>` tokens: autolinks and user/channel mentions survive.
-        if c == '<'
-            && let Some(end) = find_char(&chars, '>', i + 1)
-        {
-            let inner = collect(&chars[i + 1..end]);
-            if is_preserved_token(&inner) {
+/// mrkdwn for the shared inline tree: `*bold*`, `_italic_`, `~strike~`,
+/// `<url|text>`, text escaped.
+fn render(inlines: &[Inline], out: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => push_escaped(out, text),
+            Inline::Code(code) => {
+                out.push('`');
+                push_escaped(out, code);
+                out.push('`');
+            }
+            Inline::Bold(inner) => wrap(out, '*', inner),
+            Inline::Italic(inner) => wrap(out, '_', inner),
+            Inline::Strike(inner) => wrap(out, '~', inner),
+            Inline::Link { text, url } => {
+                out.push('<');
+                push_escaped(out, &sanitize_url(url));
+                out.push('|');
+                push_escaped(
+                    out,
+                    &aidaemon_channels::markdown::plain_text(text).replace('|', "/"),
+                );
+                out.push('>');
+            }
+            // Mentions and autolinks survive as Slack tokens.
+            Inline::Angle(inner) => {
                 out.push('<');
                 if inner.starts_with('@') || inner.starts_with('#') {
-                    out.push_str(&inner);
+                    out.push_str(inner);
                 } else {
-                    push_escaped(&mut out, &sanitize_url(&inner));
+                    push_escaped(out, &sanitize_url(inner));
                 }
                 out.push('>');
-                i = end + 1;
-                continue;
             }
         }
-
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            other => out.push(other),
-        }
-        i += 1;
     }
-    out
+}
+
+fn wrap(out: &mut String, mark: char, inner: &[Inline]) {
+    out.push(mark);
+    render(inner, out);
+    out.push(mark);
 }
 
 fn is_preserved_token(inner: &str) -> bool {
@@ -229,38 +180,6 @@ fn sanitize_url(url: &str) -> String {
     url.chars()
         .filter(|c| !matches!(c, '<' | '>' | '|') && !c.is_whitespace())
         .collect()
-}
-
-fn collect(chars: &[char]) -> String {
-    chars.iter().collect()
-}
-
-fn find_char(chars: &[char], c: char, start: usize) -> Option<usize> {
-    (start..chars.len()).find(|&j| chars[j] == c)
-}
-
-fn find_double(chars: &[char], c: char, start: usize) -> Option<usize> {
-    (start..chars.len().saturating_sub(1)).find(|&j| chars[j] == c && chars[j + 1] == c)
-}
-
-fn find_single_star(chars: &[char], start: usize) -> Option<usize> {
-    (start..chars.len()).find(|&j| {
-        chars[j] == '*' && (j + 1 >= chars.len() || chars[j + 1] != '*') && chars[j - 1] != '*'
-    })
-}
-
-fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    let close_bracket = find_char(chars, ']', start + 1)?;
-    if close_bracket + 1 >= chars.len() || chars[close_bracket + 1] != '(' {
-        return None;
-    }
-    let close_paren = find_char(chars, ')', close_bracket + 2)?;
-    let text = collect(&chars[start + 1..close_bracket]);
-    let url = collect(&chars[close_bracket + 2..close_paren]);
-    if url.is_empty() {
-        return None;
-    }
-    Some((text, url, close_paren + 1))
 }
 
 const FENCE: &str = "```";

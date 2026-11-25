@@ -40,6 +40,7 @@ pub use aidaemon_tools::tls;
 pub use inbound_files::write_private_file;
 pub mod latex;
 pub mod live_status;
+pub mod markdown;
 pub mod mid_run;
 pub mod names;
 pub mod outbound;
