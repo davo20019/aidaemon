@@ -1187,6 +1187,10 @@ impl ClientHost for DaemonClientHost {
         Ok(true)
     }
 
+    fn owner_only_command(&self, command: &str) -> bool {
+        DeviceCommands::changes_devices(&format!("/{command}"))
+    }
+
     async fn slash(&self, session_id: &str, command: &str, args: &str) -> Option<String> {
         if let Some(reply) = super::client_models::slash(
             self.state.as_ref(),
@@ -1514,6 +1518,15 @@ async fn start_remote(config: &ClientGatewayConfig, gateway: Arc<ClientGateway>)
 /// `/pair_device`, `/devices` and `/revoke_device <id>`: the owner's devices
 /// for the Client Gateway, from any chat.
 pub(crate) struct DeviceCommands;
+
+impl DeviceCommands {
+    /// The commands that change which devices may use the daemon (exact
+    /// command words): a paired device may not run them through the
+    /// gateway.
+    pub(crate) fn changes_devices(cmd: &str) -> bool {
+        matches!(cmd, "/pair_device" | "/revoke_device")
+    }
+}
 
 const GATEWAY_OFF: &str = "The Client Gateway is off. Set `[client_gateway] enabled = true` in \
 config.toml and restart to pair apps.";

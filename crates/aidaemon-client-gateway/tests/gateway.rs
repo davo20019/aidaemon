@@ -173,7 +173,14 @@ impl ClientHost for Host {
             .collect())
     }
     async fn slash(&self, _: &str, command: &str, _: &str) -> Option<String> {
-        (command == "clear").then(|| "Context cleared.".to_string())
+        match command {
+            "clear" => Some("Context cleared.".to_string()),
+            "pair_device" => Some("Pairing code 000000".to_string()),
+            _ => None,
+        }
+    }
+    fn owner_only_command(&self, command: &str) -> bool {
+        command == "pair_device"
     }
     /// Raising the permission level asks, as the daemon's Settings does.
     async fn settings_gate(&self, change: &SettingsChange) -> Result<SettingsGate, String> {
@@ -3334,6 +3341,37 @@ async fn only_the_daemons_own_computer_changes_what_a_device_may_do() {
         matches!(&changed, ServerFrame::Ack { result: CommandResult::Devices { devices, can_change: true }, .. }
             if !devices[0].scopes.contains(&Scope::Control)),
         "{changed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_paired_device_cannot_pair_or_unpair_devices_by_slash_command() {
+    let f = fixture(RiskLevel::Medium).await;
+    let phone = f.pair(Vec::new()).await;
+    let grant: AccessGrant = f.sign_in(&phone).await.json().await.unwrap();
+    let pair = command(
+        "s-1",
+        Command::RunSlash {
+            session_id: "app:synthetic".into(),
+            command: "/pair_device".into(),
+            args: String::new(),
+        },
+    );
+    let refused = f.post_as(&grant.access_token, &pair).await;
+    assert!(
+        matches!(&refused, ServerFrame::Error { error, .. } if error.code == ErrorCode::Forbidden),
+        "{refused:?}"
+    );
+    let owner = f.post(&[], &pair).await;
+    assert!(
+        matches!(
+            &owner,
+            ServerFrame::Ack {
+                result: CommandResult::Reply { .. },
+                ..
+            }
+        ),
+        "{owner:?}"
     );
 }
 

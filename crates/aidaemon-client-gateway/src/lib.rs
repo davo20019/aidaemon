@@ -113,6 +113,13 @@ pub trait ClientHost: Send + Sync {
     /// Run slash command `command` (without the slash) as the owner; `None`
     /// when there is no such command.
     async fn slash(&self, session_id: &str, command: &str, args: &str) -> Option<String>;
+    /// Whether slash command `command` (without the slash) changes who may
+    /// use the daemon (pairing or unpairing a device): only the owner's
+    /// local token runs it here, never a paired device, which may not
+    /// change what it or another device may do.
+    fn owner_only_command(&self, _command: &str) -> bool {
+        false
+    }
     fn owner(&self) -> OwnerInfo {
         OwnerInfo::default()
     }
@@ -1236,6 +1243,15 @@ impl ClientGateway {
                 // level, so it takes the same check (and card) as Settings.
                 if command == "trustall" && args.trim().eq_ignore_ascii_case("on") {
                     return self.trust_all_on(caller).await;
+                }
+                if !caller.principal.is_owner() && self.host.owner_only_command(&command) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "/{command} pairs or unpairs devices: run it on the machine \
+                             AIDaemon runs on, or in a chat with it, not from a paired device."
+                        ),
+                    ));
                 }
                 self.slash(&session_id, &command, &args).await
             }
