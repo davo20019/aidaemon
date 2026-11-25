@@ -209,11 +209,12 @@ impl Tool for RememberFactTool {
     async fn execute(
         &self,
         arguments: &str,
-        _facts: &aidaemon_tools::semantics::ToolCallContext,
+        call: &aidaemon_tools::semantics::ToolCallContext,
     ) -> anyhow::Result<aidaemon_tools::semantics::ToolCallOutcome> {
         let output: anyhow::Result<String> = async move {
             let args: RememberArgs = serde_json::from_str(arguments)?;
-            let channel_id = self.current_channel_id.read().await.clone();
+            let set_channel = self.current_channel_id.read().await.clone();
+            let (fact_privacy, channel_id) = write_access(call, set_channel);
 
             let mut results = Vec::new();
 
@@ -260,7 +261,7 @@ impl Tool for RememberFactTool {
             // On a turn in a project, what belongs to the project becomes
             // its notes and never reaches the fact store, so it cannot
             // replace or merge with any of the owner's facts.
-            let project = self.project(_facts);
+            let project = self.project(call);
             let mut project_indices = std::collections::BTreeSet::new();
             for (index, entry) in entries.iter().enumerate() {
                 let requested = match entry.scope.as_deref() {
@@ -444,7 +445,7 @@ impl Tool for RememberFactTool {
                         &entry.value,
                         "agent",
                         channel_id.as_deref(),
-                        FactPrivacy::Global,
+                        fact_privacy,
                     )
                     .await?;
                 results.push(format!(
@@ -516,6 +517,27 @@ async fn project_note(notes: Arc<ProjectNotes>, project: ProjectRef, entry: &Fac
 }
 
 /// Whether the call still sends people (a non-empty `personal_memory`).
+/// Who may later see a fact this call stores, from the dispatcher's typed
+/// channel facts: the owner's direct or internal conversation keeps it
+/// general (only the owner's own turns see `Global`), a shared channel keeps
+/// it in that channel, and a call with no known channel keeps it private.
+fn write_access(
+    facts: &aidaemon_tools::semantics::ToolCallContext,
+    set_channel: Option<String>,
+) -> (FactPrivacy, Option<String>) {
+    use aidaemon_core::ChannelVisibility;
+    let channel_id = facts.channel_id.clone().or(set_channel);
+    match (facts.channel_visibility, channel_id) {
+        (Some(ChannelVisibility::Private | ChannelVisibility::Internal), channel_id) => {
+            (FactPrivacy::Global, channel_id)
+        }
+        (Some(ChannelVisibility::PrivateGroup | ChannelVisibility::Public), Some(channel_id)) => {
+            (FactPrivacy::Channel, Some(channel_id))
+        }
+        (_, channel_id) => (FactPrivacy::Private, channel_id),
+    }
+}
+
 fn call_carries_people(arguments: &str) -> bool {
     serde_json::from_str::<RememberArgs>(arguments)
         .ok()
@@ -774,6 +796,38 @@ mod tests {
             !effects(json!({"key": "", "delete": true}))
                 .satisfies(ToolMutationEffects::DESTRUCTIVE)
         );
+    }
+
+    #[test]
+    fn stored_privacy_follows_the_channel() {
+        use aidaemon_core::ChannelVisibility;
+        use aidaemon_tools::semantics::ToolCallContext;
+        let ctx = |visibility, channel: Option<&str>| ToolCallContext {
+            channel_visibility: visibility,
+            channel_id: channel.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_access(&ctx(Some(ChannelVisibility::Private), None), None).0,
+            FactPrivacy::Global
+        );
+        assert_eq!(
+            write_access(
+                &ctx(
+                    Some(ChannelVisibility::PrivateGroup),
+                    Some("slack:C-synthetic")
+                ),
+                None
+            ),
+            (FactPrivacy::Channel, Some("slack:C-synthetic".to_string()))
+        );
+        // A shared channel without an id, or no channel facts at all, keeps
+        // the fact private rather than general.
+        assert_eq!(
+            write_access(&ctx(Some(ChannelVisibility::Public), None), None).0,
+            FactPrivacy::Private
+        );
+        assert_eq!(write_access(&ctx(None, None), None).0, FactPrivacy::Private);
     }
 
     mod project_scope {

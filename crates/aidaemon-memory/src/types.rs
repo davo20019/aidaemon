@@ -666,7 +666,10 @@ mod tests {
 
         let guest_dm = RecallAudience::new(V::Private, None, false);
         assert!(!guest_dm.may_see(Some(&FactAccess::private())));
-        assert!(guest_dm.may_see(Some(&FactAccess::global())));
+        assert!(
+            !guest_dm.may_see(Some(&FactAccess::global())),
+            "the owner's general facts never reach someone else's turn"
+        );
 
         assert!(RecallAudience::owner().sees_everything());
         assert!(RecallAudience::new(V::Internal, None, true).sees_everything());

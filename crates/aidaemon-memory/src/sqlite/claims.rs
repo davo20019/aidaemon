@@ -1267,7 +1267,12 @@ pub(crate) fn memory_visible(
     }
     match privacy {
         FactPrivacy::Private => false,
-        FactPrivacy::Global => !matches!(visibility, ChannelVisibility::Public),
+        // The owner's general facts reach the owner's own turns in a small
+        // group, never a guest's or a stranger's turn (whose reply goes to
+        // them), and never a public channel.
+        FactPrivacy::Global => {
+            requester_is_owner && !matches!(visibility, ChannelVisibility::Public)
+        }
         FactPrivacy::Channel => stored_channel
             .zip(current_channel)
             .is_some_and(|(stored, current)| channels.same_channel(stored, current)),
@@ -1303,6 +1308,36 @@ mod tests {
             None,
             ChannelVisibility::PublicExternal,
             true
+        ));
+    }
+
+    #[test]
+    fn global_facts_reach_only_the_owner() {
+        for visibility in [ChannelVisibility::Private, ChannelVisibility::PrivateGroup] {
+            assert!(!memory_visible(
+                &ExactChannelIds,
+                FactPrivacy::Global,
+                None,
+                Some("telegram:synthetic-chat-1"),
+                visibility,
+                false
+            ));
+        }
+        assert!(memory_visible(
+            &ExactChannelIds,
+            FactPrivacy::Global,
+            None,
+            Some("telegram:synthetic-chat-1"),
+            ChannelVisibility::PrivateGroup,
+            true
+        ));
+        assert!(memory_visible(
+            &ExactChannelIds,
+            FactPrivacy::Channel,
+            Some("telegram:synthetic-chat-1"),
+            Some("telegram:synthetic-chat-1"),
+            ChannelVisibility::PrivateGroup,
+            false
         ));
     }
 

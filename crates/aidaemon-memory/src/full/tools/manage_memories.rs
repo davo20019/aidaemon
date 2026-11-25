@@ -275,6 +275,7 @@ impl ManageMemoriesTool {
     pub async fn run(&self, arguments: &str, facts: &ToolCallContext) -> anyhow::Result<String> {
         let args: ManageArgs = serde_json::from_str(arguments)?;
         let trusted_session = facts.trusted_session;
+        let audience = call_audience(facts);
 
         match args.action.as_str() {
             "health" => {
@@ -303,6 +304,9 @@ impl ManageMemoriesTool {
                                     .contains(&canonical_personal_display_key(&fact.key))
                         }),
                 );
+                // The same visibility rule recall applies: what this turn's
+                // audience may not see is never listed into its reply.
+                facts.retain(|fact| audience.may_see(Some(&fact_access(fact))));
                 if facts.is_empty() {
                     return Ok("No memories stored.".to_string());
                 }
@@ -515,10 +519,13 @@ impl ManageMemoriesTool {
                 }
 
                 let limit = args.limit.unwrap_or(10).clamp(1, 200);
-                let report = self
+                let mut report = self
                     .store
                     .search_facts(query, limit, &crate::search::FactSearchConfig::default())
                     .await?;
+                report
+                    .hits
+                    .retain(|hit| audience.may_see(Some(&fact_access(&hit.fact))));
                 if report.hits.is_empty() {
                     return Ok(format!("No memories matching '{}'.", query));
                 }
@@ -673,6 +680,25 @@ impl ManageMemoriesTool {
     }
 }
 
+/// Who the call's reply reaches, from the dispatcher's typed facts: the
+/// owner (or a trusted scheduled session) in its own conversation sees all of
+/// its memory; anyone else sees only what was learned in their channel.
+fn call_audience(facts: &ToolCallContext) -> crate::types::RecallAudience {
+    let visibility = facts
+        .channel_visibility
+        .unwrap_or(ChannelVisibility::Internal);
+    let owner =
+        matches!(facts.user_role, Some(aidaemon_core::UserRole::Owner)) || facts.trusted_session;
+    crate::types::RecallAudience::new(visibility, facts.channel_id.clone(), owner)
+}
+
+fn fact_access(fact: &Fact) -> crate::types::FactAccess {
+    crate::types::FactAccess {
+        privacy: fact.privacy,
+        channel_id: fact.channel_id.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +728,48 @@ mod tests {
             .await
             .unwrap();
         (store.clone(), ManageMemoriesTool::new(store))
+    }
+
+    #[tokio::test]
+    async fn list_and_search_hide_what_the_audience_may_not_see() {
+        use crate::stores::FactStore as _;
+        let (store, tool) = tool_with_channel_fact().await;
+        store
+            .upsert_fact(
+                "preference",
+                "home_city",
+                "Lisbon",
+                "owner",
+                None,
+                FactPrivacy::Global,
+            )
+            .await
+            .unwrap();
+        let guest = ToolCallContext {
+            channel_visibility: Some(ChannelVisibility::PrivateGroup),
+            channel_id: Some("telegram:synthetic-channel-2".to_string()),
+            user_role: Some(aidaemon_core::UserRole::Guest),
+            ..Default::default()
+        };
+        let listed = tool.run(r#"{"action":"list"}"#, &guest).await.unwrap();
+        assert!(!listed.contains("Lisbon"), "{listed}");
+        assert!(!listed.contains("Alice Rivera"), "{listed}");
+        let found = tool
+            .run(r#"{"action":"search","query":"Lisbon"}"#, &guest)
+            .await
+            .unwrap();
+        assert!(!found.contains("home_city"), "{found}");
+
+        let owner = ToolCallContext {
+            channel_visibility: Some(ChannelVisibility::Private),
+            user_role: Some(aidaemon_core::UserRole::Owner),
+            ..Default::default()
+        };
+        let listed = tool.run(r#"{"action":"list"}"#, &owner).await.unwrap();
+        assert!(
+            listed.contains("Lisbon") && listed.contains("Alice Rivera"),
+            "{listed}"
+        );
     }
 
     async fn privacy_of(store: &crate::sqlite::SqliteMemory) -> FactPrivacy {
