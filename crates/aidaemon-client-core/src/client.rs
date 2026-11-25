@@ -654,7 +654,23 @@ impl Client {
             let run_id = id.clone();
             self.run_view_request = Some(self.send(Command::GetRun { run_id }));
         }
+        // A conversation set to a coding agent is listed by the agent's
+        // name, which the model list holds: read it once one is listed.
+        let names_agent = match &frame {
+            ServerFrame::Ack {
+                result: CommandResult::Sessions { sessions, .. },
+                ..
+            } => sessions.iter().any(|s| s.agent.is_some()),
+            ServerFrame::Event {
+                event: Event::SessionCreated { session } | Event::SessionUpdated { session },
+                ..
+            } => session.agent.is_some(),
+            _ => false,
+        };
         self.state.apply(frame);
+        if names_agent && matches!(self.models, Read::NotYet) {
+            self.refresh_models();
+        }
         if let Some(request) = self.state.take_view_request() {
             effects.push(Effect::View(request));
         }
@@ -1975,6 +1991,24 @@ impl Client {
             .get(session)
             .and_then(|v| v.summary.as_ref())
             .and_then(|summary| summary.project_id.clone())
+    }
+
+    /// The name of the coding agent `session` is set to (protocol 1.52):
+    /// its name from the daemon's agents, else its id until they are read.
+    /// `None`: AIDaemon answers it.
+    pub fn session_agent(&self, session: &str) -> Option<String> {
+        let id = self
+            .state
+            .sessions
+            .get(session)
+            .and_then(|v| v.summary.as_ref())
+            .and_then(|summary| summary.agent.clone())?;
+        Some(
+            self.models
+                .ready()
+                .and_then(|options| options.agents.iter().find(|a| a.id == id))
+                .map_or(id, |agent| agent.name.clone()),
+        )
     }
 
     /// The project whose folder holds `folder` (the innermost).
@@ -4562,6 +4596,43 @@ mod tests {
             client.take_outgoing().pop(),
             Some((_, Command::SendMessage { .. }))
         ));
+    }
+
+    #[test]
+    fn a_conversation_set_to_a_coding_agent_is_listed_by_the_agents_name() {
+        let mut client = Client::new();
+        client.update(
+            frame(
+                r#"{"type":"event","seq":1,"at_ms":1,"session_id":"app:a","event":{"type":"session_updated","session":{"id":"app:a","channel":"app","writable":true,"agent":"synthetic-cli"}}}"#,
+            ),
+            &cx(None),
+        );
+        // The id until the agents are read, and they are asked for.
+        assert_eq!(
+            client.session_agent("app:a").as_deref(),
+            Some("synthetic-cli")
+        );
+        let (id, command) = client.take_outgoing().pop().unwrap();
+        assert_eq!(command, Command::ListModels);
+        client.update(
+            frame(&format!(
+                r#"{{"type":"ack","request_id":"{id}","result":{{"type":"models","options":{{"providers":[],"agents":[{{"id":"synthetic-cli","name":"Synthetic CLI"}}]}}}}}}"#
+            )),
+            &cx(None),
+        );
+        assert_eq!(
+            client.session_agent("app:a").as_deref(),
+            Some("Synthetic CLI")
+        );
+        // Back to AIDaemon: no agent, and the agents are not read again.
+        client.update(
+            frame(
+                r#"{"type":"event","seq":2,"at_ms":2,"session_id":"app:a","event":{"type":"session_updated","session":{"id":"app:a","channel":"app","writable":true}}}"#,
+            ),
+            &cx(None),
+        );
+        assert_eq!(client.session_agent("app:a"), None);
+        assert!(client.take_outgoing().is_empty());
     }
 
     #[test]

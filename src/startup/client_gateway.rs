@@ -622,6 +622,7 @@ impl ClientHost for DaemonClientHost {
         .into_iter()
         .collect();
         let marks = super::client_sessions::marks(&self.system.pool).await;
+        let agents = super::client_sessions::agents(&self.system.pool).await;
         let projects: std::collections::HashMap<String, String> = self
             .state
             .session_work_projects()
@@ -658,6 +659,7 @@ impl ClientHost for DaemonClientHost {
                     project_id: projects.get(&id).cloned(),
                     group: shared.contains(&id),
                     archived,
+                    agent: agents.get(&id).cloned(),
                     id,
                     channel,
                     title,

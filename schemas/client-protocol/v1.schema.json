@@ -6806,6 +6806,13 @@
     },
     "SessionSummary": {
       "properties": {
+        "agent": {
+          "description": "The coding agent it is set to (protocol 1.52): an id from\n`list_models`' `agents`; each message goes straight to it\n([`ModelChoice::Agent`]). `None`: AIDaemon answers. A change comes\nas `session_updated`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "archived": {
           "description": "The owner archived it (protocol 1.17): lists show it apart.",
           "type": "boolean"

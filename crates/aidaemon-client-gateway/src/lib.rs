@@ -1169,13 +1169,14 @@ impl ClientGateway {
                         "Only the app's own conversations can be set to a model",
                     ));
                 }
-                Ok(CommandResult::SessionModel {
-                    session_model: self
-                        .host
-                        .set_session_model(&session_id, model, effort)
-                        .await
-                        .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?,
-                })
+                let session_model = self
+                    .host
+                    .set_session_model(&session_id, model, effort)
+                    .await
+                    .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+                // Lists show who answers it (protocol 1.52).
+                self.publish_session(&session_id).await;
+                Ok(CommandResult::SessionModel { session_model })
             }
             Command::StopTurn { session_id } => {
                 let report = stop::stop(
@@ -1940,6 +1941,7 @@ impl ClientGateway {
                     writable: true,
                     project_id: None,
                     group: false,
+                    agent: None,
                 },
             },
         );
@@ -2296,11 +2298,20 @@ impl ClientGateway {
         // The model and effort this message sets apply from its own turn,
         // so they are stored before it starts (after its project: a coding
         // agent needs the project's folder).
+        let mut agent = None;
         if model.is_some() || effort.is_some() {
-            self.host
+            let set = self
+                .host
                 .set_session_model(&session_id, model, effort)
                 .await
                 .map_err(|why| ProtocolError::new(ErrorCode::Invalid, why))?;
+            if let aidaemon_client_protocol::ModelChoice::Agent { agent: id } = set.model {
+                agent = Some(id);
+            }
+            // A conversation already listed shows who answers it now.
+            if !new_session {
+                self.publish_session(&session_id).await;
+            }
         }
         // The turn this message starts may move the sender's view, and only
         // the sender's, when it declared the capability.
@@ -2325,6 +2336,7 @@ impl ClientGateway {
                         writable: true,
                         project_id,
                         group: false,
+                        agent,
                     },
                 },
             );

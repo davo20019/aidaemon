@@ -202,10 +202,11 @@ fn session_row(store: Store, id: String, dated: bool) -> View {
 /// Under a conversation's row, while it has agents at work: what waits on
 /// the owner (an approval, answered here), else a failure, else how many
 /// agents of each kind and how far along ("1 of 3 done · Claude Code ×2,
-/// Codex"). Steps stay in the conversation.
+/// Codex"). Steps stay in the conversation; a tap opens its agents.
 fn work_line(store: Store, id: String) -> View {
     let ask_id = id.clone();
     let asking = computed(move || store.approvals_for(&ask_id).into_iter().next());
+    let open_id = id.clone();
     let work_id = id;
     let work = computed(move || store.agent_work(&work_id));
     view().child(dynamic(move || {
@@ -213,33 +214,45 @@ fn work_line(store: Store, id: String) -> View {
             return Some(untracked(move || ask_line(store, approval)));
         }
         let work = work.get()?;
+        let open_id = open_id.clone();
         Some(untracked(move || {
             let (words, color) = work_words(&work);
             let began = work.began_at_ms;
-            view()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .pl(px(WORK_INDENT))
-                .pr_2()
-                .pb_1()
-                .child(
-                    text(words)
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .number_of_lines(1)
-                        .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                        .text_color(color),
-                )
-                .child(
-                    text(move || {
-                        store.tick();
-                        ui::time::span(now_ms().saturating_sub(began) / 1000)
-                    })
-                    .tabular_nums()
-                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
-                    .text_color(colors::FAINT),
-                )
+            let label = format!("{words}, open its agents");
+            view().child(
+                nsh_base::button()
+                    .accessibility_label(label)
+                    .rounded(px(ui::radius::CONTROL))
+                    .hover(|s| s.bg(colors::HOVER))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(colors::ACCENT))
+                    .on_press(move || store.open_agents(open_id.clone()))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pl(px(WORK_INDENT))
+                            .pr_2()
+                            .pb_1()
+                            .child(
+                                text(words)
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .number_of_lines(1)
+                                    .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                                    .text_color(color),
+                            )
+                            .child(
+                                text(move || {
+                                    store.tick();
+                                    ui::time::span(now_ms().saturating_sub(began) / 1000)
+                                })
+                                .tabular_nums()
+                                .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
+                                .text_color(colors::FAINT),
+                            ),
+                    ),
+            )
         }))
     }))
 }
@@ -1596,9 +1609,13 @@ fn row_tag(store: Store, id: &str) -> String {
 
 fn row_place(store: Store, id: &str) -> String {
     if let Some(project) = store.session_project(id).and_then(|p| store.project(&p)) {
-        return match store.sidebar_view() {
-            SidebarView::Project(_) => String::new(),
-            _ => project.name,
+        // A conversation set to a coding agent says which: messages there
+        // go straight to it.
+        let agent = store.session_agent(id);
+        return match (store.sidebar_view(), agent) {
+            (SidebarView::Project(_), agent) => agent.unwrap_or_default(),
+            (_, Some(agent)) => format!("{} · {agent}", project.name),
+            (_, None) => project.name,
         };
     }
     match source_glyph(store.source(id)) {

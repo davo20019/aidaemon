@@ -18,8 +18,12 @@ pub const MAIN_PROVIDER: &str = "main";
 /// The efforts the daemon sends, lowest first.
 pub const EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
+/// What a conversation's setting is stored under, before its id (a key
+/// the daemon writes).
+pub const KEY_PREFIX: &str = "session_model:";
+
 fn key(session_id: &str) -> String {
-    format!("session_model:{session_id}")
+    format!("{KEY_PREFIX}{session_id}")
 }
 
 /// What a reply a coding agent wrote is recorded under, in place of a model

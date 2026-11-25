@@ -64,6 +64,7 @@ fn session() -> SessionSummary {
     SessionSummary {
         group: Default::default(),
         archived: false,
+        agent: None,
         id: "app:6c1f".into(),
         channel: "app".into(),
         title: Some("Synthetic report for Alice Rivera".into()),

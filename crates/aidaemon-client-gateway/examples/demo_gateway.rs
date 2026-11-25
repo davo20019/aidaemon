@@ -353,6 +353,7 @@ impl ClientHost for Host {
         Ok([
             SessionSummary {
                 archived: false,
+                agent: None,
                 id: "app:plan".into(),
                 channel: "app".into(),
                 title: Some("Plan for Acme Corp".into()),
@@ -363,6 +364,7 @@ impl ClientHost for Host {
             },
             SessionSummary {
                 archived: false,
+                agent: None,
                 id: "telegram:synthetic-user-1".into(),
                 channel: "telegram:synthetic_coding_bot".into(),
                 title: Some("Fix the contact form".into()),
@@ -373,6 +375,7 @@ impl ClientHost for Host {
             },
             SessionSummary {
                 archived: false,
+                agent: None,
                 id: "telegram:synthetic-group-1".into(),
                 channel: "telegram:synthetic_coding_bot".into(),
                 title: Some("Release notes for the team".into()),
@@ -386,6 +389,7 @@ impl ClientHost for Host {
         // A busy day and older days, so the sidebar's long lists show.
         .chain((1..=12).map(|n| SessionSummary {
             archived: false,
+            agent: None,
             id: format!("app:busy-{n}"),
             channel: "app".into(),
             title: Some(format!("Synthetic task {n} for Acme Corp")),
@@ -396,6 +400,7 @@ impl ClientHost for Host {
         }))
         .chain((3..=8).map(|days| SessionSummary {
             archived: false,
+            agent: None,
             id: format!("app:older-{days}"),
             channel: "app".into(),
             title: Some(format!("Notes from {days} days ago")),

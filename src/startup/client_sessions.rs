@@ -26,6 +26,30 @@ pub(crate) async fn marks(pool: &sqlx::SqlitePool) -> HashMap<String, (Option<St
     .collect()
 }
 
+/// The coding agent each conversation set to one answers with, by
+/// conversation id, read in one go for the lists (protocol 1.52).
+pub(crate) async fn agents(pool: &sqlx::SqlitePool) -> HashMap<String, String> {
+    use aidaemon_runtime::session_model::{KEY_PREFIX, SessionModelSetting};
+    // The key prefix is one the daemon writes (`session_model::key`).
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?",
+    )
+    .bind(i64::try_from(KEY_PREFIX.len()).unwrap_or(i64::MAX))
+    .bind(KEY_PREFIX)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|(key, value)| {
+        let id = key.strip_prefix(KEY_PREFIX)?.to_string();
+        let agent = serde_json::from_str::<SessionModelSetting>(&value)
+            .ok()?
+            .agent?;
+        Some((id, agent))
+    })
+    .collect()
+}
+
 /// Name conversation `id` (`None` or blank: back to the name taken from
 /// what was said). `Err`: there is no such conversation.
 pub(crate) async fn rename(

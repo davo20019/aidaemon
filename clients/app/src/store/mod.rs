@@ -321,6 +321,8 @@ struct RowFacts {
     background: bool,
     archived: bool,
     project: Option<String>,
+    /// The coding agent it is set to, by name.
+    agent: Option<String>,
     last_activity: Option<u64>,
 }
 
@@ -336,6 +338,7 @@ impl RowFacts {
             background: c.in_background(id),
             archived: c.is_archived(id),
             project: c.session_project(id),
+            agent: c.session_agent(id),
             last_activity: c.last_activity(id),
         }
     }
@@ -1863,6 +1866,12 @@ impl Store {
         self.row(session, |r| r.project.clone())
     }
 
+    /// The name of the coding agent `session` is set to; `None`: AIDaemon
+    /// answers it.
+    pub fn session_agent(&self, session: &str) -> Option<String> {
+        self.row(session, |r| r.agent.clone())
+    }
+
     /// The project of what is on screen: the selected conversation's, or
     /// the one a new conversation will start in.
     pub fn current_project(&self) -> Option<String> {
@@ -2828,6 +2837,18 @@ impl Store {
         self.inspector.set(true);
         // A medium window has no details beside the page: they slide in.
         self.details_drawer.set(true);
+    }
+
+    /// Open conversation `session` on its agents (the work line under its
+    /// row): the Agents tab once it shows one, else the conversation.
+    pub fn open_agents(&self, session: String) {
+        let store = *self;
+        self.leave_drawer(move || {
+            store.select(Some(session));
+            if untracked(|| store.has_participants()) {
+                store.show_detail(AGENTS_TAB);
+            }
+        });
     }
 
     /// A medium window's details drawer is open ([`Self::show_detail`]).

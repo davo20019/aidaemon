@@ -778,6 +778,7 @@ impl State {
         match summary {
             Some(SessionSummary {
                 archived: false,
+                agent: None,
                 title: Some(title),
                 ..
             }) => title.clone(),

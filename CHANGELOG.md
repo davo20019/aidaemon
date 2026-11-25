@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`render_pdf` renders a private copy of the approved bytes,** so nothing can swap the file between the check and the render.
 - **Approval buttons wait again whenever the card moves under the pointer,** and the settings dialog and command palette are armed the same way.
 
+### Changed
+
+- **The app's conversation list names the coding agent a conversation is set to** (`project · Claude Code`; just the agent inside a project), so a conversation whose messages go straight to a CLI stands apart. A conversation's agents line under its row opens its Agents tab.
+
 ## [0.24.0] - 2026-11-25
 
 ### Security

@@ -39,7 +39,7 @@ pub mod shell;
 /// The major version this crate speaks.
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// The minor version this crate speaks.
-pub const PROTOCOL_MINOR: u16 = 51;
+pub const PROTOCOL_MINOR: u16 = 52;
 
 /// A protocol version. Same major: compatible.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -2872,6 +2872,12 @@ pub struct SessionSummary {
     /// The owner archived it (protocol 1.17): lists show it apart.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// The coding agent it is set to (protocol 1.52): an id from
+    /// `list_models`' `agents`; each message goes straight to it
+    /// ([`ModelChoice::Agent`]). `None`: AIDaemon answers. A change comes
+    /// as `session_updated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// A message waiting for its session's running work to end (protocol

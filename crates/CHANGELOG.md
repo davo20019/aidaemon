@@ -15,6 +15,8 @@ stability promise.
 ### Changed
 - `aidaemon-client-gateway`: `FileStore::rotate_key`; revoking a device rotates the file-link key.
 - `aidaemon-client-core`: `Client::resign_files` takes the current time and re-reads at most once a minute; `Client::resign_project_file`.
+- `aidaemon-client-protocol` 1.52: `SessionSummary::agent`, the coding agent a conversation is set to; the gateway publishes `session_updated` when it changes.
+- `aidaemon-client-core`: `Client::session_agent`; the model list is read once a listed conversation names an agent.
 
 ## [0.24.0] - 2026-11-25
 
