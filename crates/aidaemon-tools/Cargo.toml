@@ -20,7 +20,9 @@ exclude = ["tests/", "benches/"]
 # Helpers for calling tools directly from tests.
 testing = []
 # Local workspace checkpoints (shadow-Git snapshots with their SQLite tables).
-checkpoints = ["dep:sqlx"]
+checkpoints = ["sqlite"]
+# Additive SQLite schema upgrades (`sqlite_schema`).
+sqlite = ["dep:sqlx"]
 # The persistent Docker container execution backend.
 docker = []
 # OAuth connections (`services::oauth`): flows, token refresh, tokens in a

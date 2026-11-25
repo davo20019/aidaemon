@@ -367,35 +367,41 @@ pub async fn migrate_work_tables(
         .await?;
 
         // 5) Ensure new columns exist on renamed goals table.
-        let _ = sqlx::query(
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
             "ALTER TABLE goals ADD COLUMN domain TEXT NOT NULL DEFAULT 'orchestration'",
         )
-        .execute(&mut *tx)
-        .await;
-        let _ = sqlx::query(
+        .await?;
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
             "ALTER TABLE goals ADD COLUMN tokens_used_day TEXT NOT NULL DEFAULT '1970-01-01'",
         )
-        .execute(&mut *tx)
-        .await;
-        let _ = sqlx::query(
+        .await?;
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
             "ALTER TABLE goals ADD COLUMN notification_attempts INTEGER NOT NULL DEFAULT 0",
         )
-        .execute(&mut *tx)
-        .await;
-        let _ = sqlx::query(
+        .await?;
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
             "ALTER TABLE goals ADD COLUMN dispatch_failures INTEGER NOT NULL DEFAULT 0",
         )
-        .execute(&mut *tx)
-        .await;
-        let _ = sqlx::query("ALTER TABLE goals ADD COLUMN progress_notes TEXT")
-            .execute(&mut *tx)
-            .await;
-        let _ = sqlx::query("ALTER TABLE goals ADD COLUMN source_episode_id INTEGER")
-            .execute(&mut *tx)
-            .await;
-        let _ = sqlx::query("ALTER TABLE goals ADD COLUMN legacy_int_id INTEGER")
-            .execute(&mut *tx)
-            .await;
+        .await?;
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
+            "ALTER TABLE goals ADD COLUMN progress_notes TEXT",
+        )
+        .await?;
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
+            "ALTER TABLE goals ADD COLUMN source_episode_id INTEGER",
+        )
+        .await?;
+        aidaemon_tools::sqlite_schema::add_column_if_missing_on(
+            &mut tx,
+            "ALTER TABLE goals ADD COLUMN legacy_int_id INTEGER",
+        )
+        .await?;
 
         // 6) Create clean indexes (drop potential collisions first).
         let _ = sqlx::query("DROP INDEX IF EXISTS idx_goals_status")
@@ -804,11 +810,11 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE scheduled_run_state ADD COLUMN health_json TEXT NOT NULL DEFAULT '{}'",
     )
-    .execute(pool)
-    .await;
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS scheduled_recovery_state (
             goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
@@ -825,17 +831,17 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
     // Additive columns for automatic post-escalation recovery attempts.
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE scheduled_recovery_state
             ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0",
     )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE scheduled_recovery_state ADD COLUMN last_recovery_attempt_at TEXT",
     )
-    .execute(pool)
-    .await;
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS goal_run_recovery_links (
             failed_run_id TEXT NOT NULL REFERENCES goal_runs(id) ON DELETE CASCADE,
@@ -861,33 +867,41 @@ pub async fn migrate_work_tables(
     .await?;
 
     // Columns on goals added via ALTER for older migrated databases.
-    let _ =
-        sqlx::query("ALTER TABLE goals ADD COLUMN domain TEXT NOT NULL DEFAULT 'orchestration'")
-            .execute(pool)
-            .await;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE goals ADD COLUMN domain TEXT NOT NULL DEFAULT 'orchestration'",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE goals ADD COLUMN tokens_used_day TEXT NOT NULL DEFAULT '1970-01-01'",
     )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE goals ADD COLUMN notification_attempts INTEGER NOT NULL DEFAULT 0",
     )
-    .execute(pool)
-    .await;
-    let _ =
-        sqlx::query("ALTER TABLE goals ADD COLUMN dispatch_failures INTEGER NOT NULL DEFAULT 0")
-            .execute(pool)
-            .await;
-    let _ = sqlx::query("ALTER TABLE goals ADD COLUMN progress_notes TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE goals ADD COLUMN source_episode_id INTEGER")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE goals ADD COLUMN legacy_int_id INTEGER")
-        .execute(pool)
-        .await;
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE goals ADD COLUMN dispatch_failures INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE goals ADD COLUMN progress_notes TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE goals ADD COLUMN source_episode_id INTEGER",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE goals ADD COLUMN legacy_int_id INTEGER",
+    )
+    .await?;
 
     // Durable collaborative-work model. The default project keeps existing
     // installations behaviorally unchanged while making project scope explicit.
@@ -904,9 +918,11 @@ pub async fn migrate_work_tables(
     .await?;
     // A project's folder (any folder: a repository, a site, designs);
     // conversations in the project work there.
-    let _ = sqlx::query("ALTER TABLE work_projects ADD COLUMN path TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE work_projects ADD COLUMN path TEXT",
+    )
+    .await?;
     sqlx::query(
         "INSERT OR IGNORE INTO work_projects (id, name, description)
          VALUES ('default', 'Default', 'Default Aidaemon work project')",
@@ -935,9 +951,11 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE goals ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE goals ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'",
+    )
+    .await?;
     sqlx::query(
         "UPDATE goals SET project_id = 'default' WHERE project_id IS NULL OR project_id = ''",
     )
@@ -1004,16 +1022,22 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN owner_principal_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN objective_control_json TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN owner_principal_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN objective_control_json TEXT",
+    )
+    .await?;
     // The owner-given name (nullable: mandates created before it have none).
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN name TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN name TEXT",
+    )
+    .await?;
     sqlx::query(
         "UPDATE mandates SET owner_principal_id = 'principal:' || id
          WHERE owner_principal_id IS NULL OR trim(owner_principal_id) = ''",
@@ -1117,18 +1141,18 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandates ADD COLUMN autonomy_mode TEXT NOT NULL DEFAULT 'bounded'
          CHECK (autonomy_mode IN ('bounded', 'autopilot'))",
     )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandates ADD COLUMN review_effort TEXT NOT NULL DEFAULT 'balanced'
          CHECK (review_effort IN ('efficient', 'balanced', 'thorough', 'legacy_custom'))",
     )
-    .execute(pool)
-    .await;
+    .await?;
 
     // One immutable aggregate budget per autonomous decision cycle. The
     // short-lived call lease serializes lead/executor model calls so they
@@ -1156,17 +1180,17 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_run_token_budgets
          ADD COLUMN call_dispatched INTEGER NOT NULL DEFAULT 0 CHECK (call_dispatched IN (0, 1))",
     )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_run_token_budgets ADD COLUMN call_tokens_used_before INTEGER",
     )
-    .execute(pool)
-    .await;
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS mandate_decision_cycles (
@@ -1198,54 +1222,67 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN owner_alert TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandate_decision_cycles ADD COLUMN owner_alert TEXT",
+    )
+    .await?;
 
     // Pre-release development databases may already contain the first mandate
     // draft. Keep startup migration idempotent while backfilling the durable
     // wake/lease and policy-version columns added before the first release.
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN next_review_at TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN review_lease_token TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN review_lease_expires_at TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN confirmed_at TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN strategy_json TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandates ADD COLUMN suspension_json TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN next_review_at TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN review_lease_token TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN review_lease_expires_at TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN confirmed_at TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN strategy_json TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandates ADD COLUMN suspension_json TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_decision_cycles
          ADD COLUMN evidence_receipt_ids_json TEXT NOT NULL DEFAULT '[]'",
     )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query(
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_decision_cycles
          ADD COLUMN activity_level TEXT NOT NULL DEFAULT 'quiet'
          CHECK (activity_level IN ('quiet', 'active', 'urgent'))",
     )
-    .execute(pool)
-    .await;
+    .await?;
     // Who wrote a decision was once read from its rationale text; existing
     // runtime-written rows are recognised by the two texts the runtime used.
-    let origin_added = sqlx::query(
+    let origin_added = aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_decision_cycles
          ADD COLUMN origin TEXT NOT NULL DEFAULT 'deliberator'
          CHECK (origin IN ('deliberator', 'runtime_fallback'))",
     )
-    .execute(pool)
-    .await
-    .is_ok();
+    .await?;
     if origin_added {
         sqlx::query(
             "UPDATE mandate_decision_cycles SET origin = 'runtime_fallback'
@@ -1260,12 +1297,16 @@ pub async fn migrate_work_tables(
         .execute(pool)
         .await?;
     }
-    let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN termination_kind TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE mandate_decision_cycles ADD COLUMN termination_match TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandate_decision_cycles ADD COLUMN termination_kind TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE mandate_decision_cycles ADD COLUMN termination_match TEXT",
+    )
+    .await?;
     sqlx::query(
         "UPDATE mandates
          SET next_review_at = COALESCE(next_review_at, updated_at, created_at, datetime('now'))",
@@ -1306,13 +1347,12 @@ pub async fn migrate_work_tables(
     )
     .execute(pool)
     .await?;
-    let added_mandate_version = sqlx::query(
+    let added_mandate_version = aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_decision_cycles
          ADD COLUMN mandate_version INTEGER NOT NULL DEFAULT 1",
     )
-    .execute(pool)
-    .await
-    .is_ok();
+    .await?;
     if added_mandate_version {
         sqlx::query(
             "UPDATE mandate_decision_cycles
@@ -1349,9 +1389,11 @@ pub async fn migrate_work_tables(
     // Existing installations may have the pre-value-contract intentions
     // table. Historical rows remain nullable and readable; every new
     // value-contract ACT is validated before insertion.
-    let _ = sqlx::query("ALTER TABLE intentions ADD COLUMN value_criterion TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE intentions ADD COLUMN value_criterion TEXT",
+    )
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS mandate_learning_notes (
@@ -1487,13 +1529,12 @@ pub async fn migrate_work_tables(
     // Development and upgrade databases may already have the v1 ledger from
     // an earlier build. Duplicate-column is the expected no-op on fresh/newer
     // schemas; a successful ALTER upgrades the old table in place.
-    let _added_dispatch_claim = sqlx::query(
+    let _added_dispatch_claim = aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE mandate_mutation_attempts
          ADD COLUMN dispatch_claimed_at TEXT",
     )
-    .execute(pool)
-    .await
-    .is_ok();
+    .await?;
 
     // SQLite cannot widen an inline CHECK constraint in place. Rebuild the
     // pre-release ledger once so invalidated reservations that never crossed
@@ -1603,36 +1644,51 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN goal_run_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN current_attempt_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN worker_profile_id TEXT")
-        .execute(pool)
-        .await;
-    let _ =
-        sqlx::query("ALTER TABLE tasks ADD COLUMN workspace_policy TEXT NOT NULL DEFAULT 'shared'")
-            .execute(pool)
-            .await;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN goal_run_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN current_attempt_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN worker_profile_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN workspace_policy TEXT NOT NULL DEFAULT 'shared'",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE tasks ADD COLUMN workspace_policy_explicit INTEGER NOT NULL DEFAULT 0",
     )
-    .execute(pool)
-    .await;
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'work'")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal'")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE tasks ADD COLUMN updated_at TEXT")
-        .execute(pool)
-        .await;
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'work'",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN visibility TEXT NOT NULL DEFAULT 'internal'",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE tasks ADD COLUMN updated_at TEXT",
+    )
+    .await?;
     sqlx::query(
         "UPDATE tasks
          SET updated_at = COALESCE(updated_at, completed_at, started_at, created_at)",
@@ -1885,9 +1941,11 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE scheduled_run_state ADD COLUMN goal_run_id TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE scheduled_run_state ADD COLUMN goal_run_id TEXT",
+    )
+    .await?;
     sqlx::query(
         "UPDATE scheduled_run_state
          SET goal_run_id = COALESCE(
@@ -1939,17 +1997,21 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN task_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN action_token TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE notification_queue ADD COLUMN task_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE notification_queue ADD COLUMN action_token TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE notification_queue ADD COLUMN untrusted INTEGER NOT NULL DEFAULT 0",
     )
-    .execute(pool)
-    .await;
+    .await?;
 
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_goals_project_status
@@ -2089,17 +2151,21 @@ pub async fn migrate_work_tables(
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN task_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE notification_queue ADD COLUMN action_token TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query(
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE notification_queue ADD COLUMN task_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE notification_queue ADD COLUMN action_token TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
         "ALTER TABLE notification_queue ADD COLUMN untrusted INTEGER NOT NULL DEFAULT 0",
     )
-    .execute(pool)
-    .await;
+    .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_notification_queue_pending

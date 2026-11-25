@@ -39,7 +39,7 @@ aidaemon-policies = { version = "0.25.0", path = "../aidaemon-policies" }
 aidaemon-skills = { version = "0.25.0", path = "../aidaemon-skills" }
 aidaemon-providers = { version = "0.25.0", path = "../aidaemon-providers", features = ["chatgpt-login"] }
 aidaemon-store-sqlite = { version = "0.25.0", path = "../aidaemon-store-sqlite" }
-aidaemon-tools = { version = "0.25.0", path = "../aidaemon-tools", features = ["oauth"] }
+aidaemon-tools = { version = "0.25.0", path = "../aidaemon-tools", features = ["oauth", "sqlite"] }
 aidaemon-secrets = { version = "0.25.0", path = "../aidaemon-secrets", default-features = false }
 aidaemon-work = { version = "0.25.0", path = "../aidaemon-work" }
 anyhow = "1"

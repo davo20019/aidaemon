@@ -84,6 +84,8 @@ pub mod semantics;
 pub mod services;
 mod shell;
 pub mod shown;
+#[cfg(feature = "sqlite")]
+pub mod sqlite_schema;
 pub mod status;
 pub mod stt_setup;
 pub mod system;

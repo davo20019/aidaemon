@@ -264,15 +264,21 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("ALTER TABLE token_usage ADD COLUMN cached_input_tokens INTEGER")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE token_usage ADD COLUMN cache_creation_input_tokens INTEGER")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE token_usage ADD COLUMN call_id TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE token_usage ADD COLUMN cached_input_tokens INTEGER",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE token_usage ADD COLUMN cache_creation_input_tokens INTEGER",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE token_usage ADD COLUMN call_id TEXT",
+    )
+    .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_token_usage_call_id
@@ -338,17 +344,23 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
     // Whether other people are in the chat (a group or a workspace
     // channel), as its latest message said; NULL until a message says.
-    let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN shared INTEGER")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE session_channels ADD COLUMN shared INTEGER",
+    )
+    .await?;
     // The owner's own name for the conversation (from an app), over the
     // one taken from what was said; and whether they archived it.
-    let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN title TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE session_channels ADD COLUMN archived INTEGER")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE session_channels ADD COLUMN title TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE session_channels ADD COLUMN archived INTEGER",
+    )
+    .await?;
 
     // Non-destructive `/clear` boundary: hides events at or before
     // `cleared_after_id` from CONTEXT retrieval without deleting them, so the
@@ -375,10 +387,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     // Migration: add resources_json column if missing
-    sqlx::query("ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'")
-        .execute(pool)
-        .await
-        .ok();
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE dynamic_skills ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
 
     // Skill drafts table - stores auto-promoted skill drafts pending user review
     sqlx::query(
@@ -448,9 +461,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query("ALTER TABLE cli_agent_invocations ADD COLUMN task_id TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE cli_agent_invocations ADD COLUMN task_id TEXT",
+    )
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_cli_agent_invocations_task_id
          ON cli_agent_invocations(task_id)",
@@ -467,7 +482,7 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
         "ALTER TABLE cli_agent_invocations ADD COLUMN keeps_session INTEGER",
         "ALTER TABLE cli_agent_invocations ADD COLUMN thread_id TEXT",
     ] {
-        let _ = sqlx::query(statement).execute(pool).await;
+        aidaemon_tools::sqlite_schema::add_column_if_missing(pool, statement).await?;
     }
     // Each ended run as the owner's apps were last told of it (a protocol
     // `RunSummary`, as JSON): what a conversation shows of its runs past a
@@ -538,9 +553,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     // Stable remote identity bound after an authenticated read-only proof.
     // Existing OAuth connections remain intentionally unbound until the owner
     // verifies them; never infer identity from the service or username.
-    let _ = sqlx::query("ALTER TABLE oauth_connections ADD COLUMN account_id TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE oauth_connections ADD COLUMN account_id TEXT",
+    )
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS pending_oauth_flows (
@@ -618,9 +635,11 @@ pub(crate) async fn migrate_state(pool: &SqlitePool) -> anyhow::Result<()> {
     // Legacy summaries were cursorless and could end in the middle of a tool
     // exchange. A NULL cursor makes that state explicit so the summarizer can
     // rebuild it once from canonical whole turns.
-    let _ = sqlx::query("ALTER TABLE conversation_summaries ADD COLUMN last_turn_seq INTEGER")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE conversation_summaries ADD COLUMN last_turn_seq INTEGER",
+    )
+    .await?;
 
     // Rendered system-prompt snapshots, deduplicated by content hash.
     // Written insert-or-ignore from the instructions-snapshot path so any past

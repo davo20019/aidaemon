@@ -23,15 +23,21 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     // --- Human-Like Memory System Migrations ---
     // 5. Add new columns to facts table for supersession and recall tracking
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN superseded_at TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN recall_count INTEGER DEFAULT 0")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN last_recalled_at TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN superseded_at TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN recall_count INTEGER DEFAULT 0",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN last_recalled_at TEXT",
+    )
+    .await?;
 
     // 6. Create episodes table (episodic memory)
     sqlx::query(
@@ -237,12 +243,16 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     // --- Channel-Scoped Memory Migrations ---
     // Add channel_id and privacy columns to facts table
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN channel_id TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN privacy TEXT DEFAULT 'global'")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN channel_id TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN privacy TEXT DEFAULT 'global'",
+    )
+    .await?;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_facts_channel ON facts(channel_id)")
         .execute(pool)
         .await;
@@ -250,17 +260,23 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(pool)
         .await;
     // Add channel_id column to episodes table
-    let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN channel_id TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE episodes ADD COLUMN channel_id TEXT",
+    )
+    .await?;
     // Stable canonical bounds avoid timestamp-tie duplication when creating
     // multiple episodes for a long-running session.
-    let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN start_event_id INTEGER")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE episodes ADD COLUMN end_event_id INTEGER")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE episodes ADD COLUMN start_event_id INTEGER",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE episodes ADD COLUMN end_event_id INTEGER",
+    )
+    .await?;
     let _ = sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_episodes_session_end_event
          ON episodes(session_id, end_event_id)",
@@ -270,18 +286,24 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     // --- Binary Embedding Storage Migration ---
     // Add embedding column to facts table for pre-computed embeddings
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN embedding BLOB")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN embedding BLOB",
+    )
+    .await?;
 
     // --- Provenance Capture Migrations ---
     // Add first_seen_at and source_excerpt to facts table
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN first_seen_at TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN source_excerpt TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN first_seen_at TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN source_excerpt TEXT",
+    )
+    .await?;
 
     // Backfill legacy source values: facts with an unknown source are marked
     // "inferred". The allowlist MUST contain every source value live writers
@@ -305,12 +327,16 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     // or a copy the row that carries its knowledge on. Added after the
     // legacy rebuild, which copies a fixed column list. NULL on rows retired
     // before this column existed.
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN superseded_reason TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE facts ADD COLUMN folded_into INTEGER")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN superseded_reason TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE facts ADD COLUMN folded_into INTEGER",
+    )
+    .await?;
 
     // Migration: deduplicate people entries and add unique index on LOWER(name).
     // Keeps the row with the lowest id for each name, merging interaction counts.
@@ -359,12 +385,16 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
-    let _ = sqlx::query("ALTER TABLE memory_spans ADD COLUMN observed_from TEXT")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE memory_spans ADD COLUMN observed_to TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE memory_spans ADD COLUMN observed_from TEXT",
+    )
+    .await?;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE memory_spans ADD COLUMN observed_to TEXT",
+    )
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS memory_claims (
@@ -415,7 +445,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         "ALTER TABLE memory_entities ADD COLUMN merged_into_entity_id INTEGER",
         "ALTER TABLE memory_entities ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0",
     ] {
-        let _ = sqlx::query(statement).execute(pool).await;
+        aidaemon_tools::sqlite_schema::add_column_if_missing(pool, statement).await?;
     }
 
     // Entity-aware personal memory. These tables extend the rolling canonical

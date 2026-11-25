@@ -33,9 +33,11 @@ pub async fn migrate_events(pool: &SqlitePool) -> anyhow::Result<()> {
     // it from CREATE TABLE above, where this ALTER harmlessly reports a
     // duplicate column and is discarded). On a large existing events table the
     // one-time index build below is a startup stall on first run after upgrade.
-    let _ = sqlx::query("ALTER TABLE events ADD COLUMN turn_id TEXT")
-        .execute(pool)
-        .await;
+    aidaemon_tools::sqlite_schema::add_column_if_missing(
+        pool,
+        "ALTER TABLE events ADD COLUMN turn_id TEXT",
+    )
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_events_turn
          ON events(session_id, turn_id, id)",
