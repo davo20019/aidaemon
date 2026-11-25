@@ -5632,7 +5632,8 @@ async fn a_target_that_changed_after_judgment_is_refused_before_the_click() {
         super::GateDecision::Allow {
             clearance: super::Clearance {
                 point_of_action: false,
-                button_site: None
+                button_site: None,
+                render_source: None,
             }
         }
     ));
@@ -5652,6 +5653,7 @@ async fn a_target_that_changed_after_judgment_is_refused_before_the_click() {
     let cleared = super::Clearance {
         point_of_action: true,
         button_site: None,
+        render_source: None,
     };
     assert!(
         tool.recheck_target(&*page, "sess-swap", "click", "#swap", &cleared)
@@ -5782,6 +5784,7 @@ async fn a_button_approval_does_not_follow_the_page_to_another_site() {
     let once = super::Clearance {
         point_of_action: false,
         button_site: Some("https://mock.example".to_string()),
+        render_source: None,
     };
     assert!(
         tool.recheck_target(&*page, "sess-moved", "click", "#add-to-cart", &once)
@@ -5901,4 +5904,63 @@ async fn render_pdf_asks_when_the_page_reaches_beyond_its_folder() {
             "{name}"
         );
     }
+}
+
+/// `render_pdf` is approved for a file's content, not its path: the card's
+/// subject changes with the content, and a file changed after the gate
+/// judged it is not rendered.
+#[tokio::test]
+async fn render_pdf_binds_its_approval_to_the_source_content() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("brief.html");
+    std::fs::write(&source, "<h1>Synthetic brief</h1><script>1</script>").unwrap();
+    let source_path = source.to_string_lossy().into_owned();
+    let backend = Arc::new(MockBackend::new());
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let tool = BrowserTool::with_backend(backend.clone(), media_tx);
+    let args = super::ActionArgs {
+        action: "render_pdf",
+        url: None,
+        selector: None,
+        script: None,
+        tab_id: None,
+        value: None,
+        source_path: Some(&source_path),
+        session_id: "sess-render",
+        trusted_session: false,
+    };
+    let subject = |need: super::BrowserApproval| match need {
+        super::BrowserApproval::Ask { request, .. } => request.subject,
+        super::BrowserApproval::NotNeeded => panic!("a page with a script asks"),
+    };
+    let first = subject(tool.approval_need(&args).await);
+    std::fs::write(&source, "<h1>Swapped</h1><script>2</script>").unwrap();
+    let second = subject(tool.approval_need(&args).await);
+    assert_ne!(first, second, "the approval names the content");
+
+    // A clean page is cleared for its content ...
+    std::fs::write(&source, "<h1>Synthetic brief</h1>").unwrap();
+    let clearance = match tool.approval_gate(&args).await {
+        super::GateDecision::Allow { clearance } => clearance,
+        super::GateDecision::Deny(reason) => panic!("{reason}"),
+    };
+    assert!(clearance.render_source.is_some());
+    // ... and refused once the file is something else.
+    std::fs::write(&source, "<h1>Swapped</h1><script>fetch('x')</script>").unwrap();
+    let error = match tool
+        .action_render_pdf(&json!({ "source_path": source_path }), &clearance)
+        .await
+    {
+        Err(super::ActionError::Failed(error)) => error,
+        other => panic!("rendered changed content: {:?}", other.is_ok()),
+    };
+    assert_eq!(error, super::RENDER_SOURCE_CHANGED);
+    assert!(
+        !backend
+            .calls()
+            .lock()
+            .await
+            .iter()
+            .any(|call| matches!(call, MockCall::RenderPdf))
+    );
 }

@@ -250,6 +250,10 @@ struct Clearance {
     /// The site (origin) whose button the owner approved this exact click
     /// on, once.
     button_site: Option<String>,
+    /// `render_pdf`: the digest of the source file's content the gate
+    /// judged (and the owner approved, when it asked). The render refuses
+    /// any other content.
+    render_source: Option<String>,
 }
 
 /// The card for letting the browser open a site on this computer. It names
@@ -399,6 +403,22 @@ fn redact_url_for_display(url: &str) -> String {
 const RENDER_REACHES_BEYOND: &str = "Rendering runs the page in the browser: its scripts run, \
 and it can load files on this computer and from the internet. The rendered PDF and preview \
 come back to the agent.";
+
+/// `render_pdf` refuses a source file whose content is not the one judged.
+const RENDER_SOURCE_CHANGED: &str = "The HTML source changed after it was checked (or approved), \
+so it was not rendered. Run render_pdf again to have the current file checked.";
+
+/// The SHA-256 of a `render_pdf` source file's content, `None` when it
+/// cannot be read. The approval card and the render are bound to it, so a
+/// file swapped after the card was shown is not the file that renders.
+fn render_source_digest(
+    backend: &aidaemon_tools::backend::SharedExecutionBackend,
+    raw_source: &str,
+) -> Option<String> {
+    let source = aidaemon_tools::fs_utils::validate_path(&**backend, raw_source).ok()?;
+    let bytes = std::fs::read(source).ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
+}
 
 /// What a `render_pdf` source page reaches beyond its own folder's files,
 /// in words for the card, or `None` when it reaches nothing else: no
@@ -1105,11 +1125,21 @@ impl BrowserTool {
                 "Render {} to PDF? The page {reach}.",
                 args.source_path.unwrap_or_default()
             );
+            // The approval covers this content of the file, not its path:
+            // a file changed after the card no longer matches it.
+            let content = args
+                .source_path
+                .and_then(|path| render_source_digest(&self.execution_backend, path))
+                .unwrap_or_default();
             return BrowserApproval::Ask {
                 request: aidaemon_core::OwnerApprovalRequest {
                     card: None,
                     effects: Vec::new(),
-                    subject: Self::call_subject(args, &summary),
+                    subject: format!(
+                        "{} [content {}]",
+                        Self::call_subject(args, &summary),
+                        content.get(..16).unwrap_or("unreadable")
+                    ),
                     summary,
                     risk: aidaemon_core::ApprovalRisk::High,
                     warnings: vec![RENDER_REACHES_BEYOND.to_string()],
@@ -1346,11 +1376,27 @@ impl BrowserTool {
     /// when the action needs no owner approval or the kernel delivered the
     /// owner's approval of this exact call; it never asks the owner itself.
     async fn approval_gate(&self, args: &ActionArgs<'_>) -> GateDecision {
-        match self.approval_need(args).await {
+        // `render_pdf` is judged from the file's content: read its digest
+        // before and after judging, so the verdict is for one content.
+        let source_digest = || {
+            (args.action == "render_pdf")
+                .then(|| {
+                    args.source_path
+                        .and_then(|path| render_source_digest(&self.execution_backend, path))
+                })
+                .flatten()
+        };
+        let render_source = source_digest();
+        let need = self.approval_need(args).await;
+        if render_source != source_digest() {
+            return GateDecision::Deny(RENDER_SOURCE_CHANGED.to_string());
+        }
+        match need {
             BrowserApproval::NotNeeded => GateDecision::Allow {
                 clearance: Clearance {
                     point_of_action: args.trusted_session,
                     button_site: None,
+                    render_source,
                 },
             },
             BrowserApproval::Ask {
@@ -1363,6 +1409,7 @@ impl BrowserTool {
                         clearance: Clearance {
                             point_of_action: point_of_action || args.trusted_session,
                             button_site,
+                            render_source,
                         },
                     }
                 } else {
@@ -1847,7 +1894,11 @@ impl BrowserTool {
     /// shells out to optional Ghostscript, and Quick Look can wait forever. CDP
     /// gives us one deterministic renderer, a hard timeout, print backgrounds,
     /// and CSS `@page` sizing in a single operation.
-    async fn action_render_pdf(&self, args: &Value) -> Result<DispatchResult, ActionError> {
+    async fn action_render_pdf(
+        &self,
+        args: &Value,
+        clearance: &Clearance,
+    ) -> Result<DispatchResult, ActionError> {
         if self.execution_backend.kind() != aidaemon_tools::backend::BackendKind::Local {
             return Err(ActionError::Failed(
                 "render_pdf is only available with local execution".to_string(),
@@ -1892,6 +1943,17 @@ impl BrowserTool {
 
         let source_url = reqwest::Url::from_file_path(&source)
             .map_err(|_| "Could not convert source_path to a local file URL".to_string())?;
+        // Only the content the gate judged renders: the file read now, and
+        // again once Chromium has loaded it, must be that content.
+        let content_now = || {
+            std::fs::read(&source)
+                .ok()
+                .map(|bytes| hex::encode(Sha256::digest(&bytes)))
+        };
+        let judged = clearance.render_source.as_deref();
+        if judged.is_none() || content_now().as_deref() != judged {
+            return Err(ActionError::Failed(RENDER_SOURCE_CHANGED.to_string()));
+        }
 
         // Use a disposable page/context so rendering never navigates away from
         // the session's active tab or destroys in-progress browser state.
@@ -1908,6 +1970,12 @@ impl BrowserTool {
         .await;
 
         let pdf_bytes = match render {
+            Ok(Ok(_)) if content_now().as_deref() != judged => {
+                self.backend
+                    .dispose_session(std::slice::from_ref(&target_id), &context_ids)
+                    .await;
+                return Err(ActionError::Failed(RENDER_SOURCE_CHANGED.to_string()));
+            }
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
                 self.backend
@@ -2503,7 +2571,7 @@ impl BrowserTool {
                 .await
                 .map(DispatchResult::text_only),
             "screenshot" => self.action_screenshot(args, session_id, files).await,
-            "render_pdf" => return self.action_render_pdf(args).await,
+            "render_pdf" => return self.action_render_pdf(args, clearance).await,
             "click" => self.action_click(args, session_id, clearance).await,
             "fill" => self
                 .action_fill(args, session_id, clearance)
