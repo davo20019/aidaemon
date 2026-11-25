@@ -154,6 +154,12 @@ pub fn local_address() -> Option<IpAddr> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArrivedOnLocalNetwork;
 
+/// The address a request through the local-network listener came from (a
+/// request extension): what the Gateway counts requests made before
+/// signing in against, so one machine cannot spend another's budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanPeer(pub IpAddr);
+
 /// Where the local-network listener is, for the Nodes: its origin now and
 /// the CA that vouches for it.
 pub struct LanEndpoint {
@@ -245,7 +251,7 @@ pub async fn serve_on(
         });
     }
     loop {
-        let (tcp, _) = match listener.accept().await {
+        let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
                 tracing::debug!(%error, "local Node Gateway could not accept");
@@ -260,7 +266,7 @@ pub async fn serve_on(
             Ok(c) => c.1.clone(),
             Err(_) => continue,
         };
-        let app = app.clone();
+        let app = app.clone().layer(axum::Extension(LanPeer(peer.ip())));
         tokio::spawn(async move {
             let tls = match tokio_rustls::TlsAcceptor::from(config).accept(tcp).await {
                 Ok(tls) => tls,

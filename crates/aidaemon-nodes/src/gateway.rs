@@ -32,12 +32,26 @@ pub struct NodeGatewayState {
 /// Per-minute budgets. Nodes that signed in are counted by their id in a
 /// map of their own; what anyone can send before signing in (offer and
 /// credential ids it names itself) is counted apart, so names made up in
-/// bulk never touch a signed-in Node's budget. A full map makes room by
-/// dropping its oldest window, never by refusing everyone.
+/// bulk never touch a signed-in Node's budget. Before signing in, each
+/// source address has budgets of its own: per id it names, and in all
+/// (`UNAUTHENTICATED_IDS_PER_SOURCE` times one id's), so one machine making
+/// up names can neither go past its budget nor push another machine's
+/// windows out. A full map makes room by dropping its oldest window, never
+/// by refusing everyone.
 #[derive(Default)]
 pub struct NodeRateLimiter {
     windows: tokio::sync::Mutex<HashMap<(String, &'static str), RateWindow>>,
-    unauthenticated: tokio::sync::Mutex<HashMap<(String, &'static str), RateWindow>>,
+    unauthenticated: tokio::sync::Mutex<HashMap<std::net::IpAddr, SourceWindows>>,
+}
+
+/// One source address's windows before signing in.
+#[derive(Default)]
+struct SourceWindows {
+    /// Everything this source sent, per bucket.
+    total: HashMap<&'static str, RateWindow>,
+    /// Per id it named, per bucket.
+    ids: HashMap<(String, &'static str), RateWindow>,
+    last_seen: Option<Instant>,
 }
 
 struct RateWindow {
@@ -58,33 +72,26 @@ impl NodeRateLimiter {
     ) -> Result<(), GatewayError> {
         Self::take(
             &mut *self.windows.lock().await,
-            identity,
-            bucket,
+            (identity.to_string(), bucket),
             units,
             limit,
+            Self::MAX_WINDOWS,
         )
     }
+
+    /// Source addresses tracked before signing in.
+    const MAX_SOURCES: usize = 1024;
+    /// Ids one source may name in a minute, per bucket, as a multiple of
+    /// one id's budget: its budget in all. Also bounds the ids one source
+    /// keeps windows for.
+    const UNAUTHENTICATED_IDS_PER_SOURCE: u64 = 4;
 
     /// Count `units` against a name a request made before signing in gives
-    /// itself (an offer or credential id).
+    /// itself (an offer or credential id), from `source` (the address it
+    /// came from).
     async fn consume_unauthenticated(
         &self,
-        identity: &str,
-        bucket: &'static str,
-        units: u64,
-        limit: u64,
-    ) -> Result<(), GatewayError> {
-        Self::take(
-            &mut *self.unauthenticated.lock().await,
-            identity,
-            bucket,
-            units,
-            limit,
-        )
-    }
-
-    fn take(
-        windows: &mut HashMap<(String, &'static str), RateWindow>,
+        source: std::net::IpAddr,
         identity: &str,
         bucket: &'static str,
         units: u64,
@@ -93,10 +100,62 @@ impl NodeRateLimiter {
         if limit == 0 {
             return Err(GatewayError::rate_limited());
         }
+        let mut sources = self.unauthenticated.lock().await;
+        if sources.len() >= Self::MAX_SOURCES && !sources.contains_key(&source) {
+            let stale = |s: &SourceWindows| {
+                s.last_seen
+                    .is_none_or(|seen| seen.elapsed() >= Duration::from_secs(60))
+            };
+            sources.retain(|_, s| !stale(s));
+            if sources.len() >= Self::MAX_SOURCES
+                && let Some(oldest) = sources
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_seen)
+                    .map(|(ip, _)| *ip)
+            {
+                sources.remove(&oldest);
+            }
+        }
+        let windows = sources.entry(source).or_default();
+        windows.last_seen = Some(Instant::now());
+        let total_limit = limit.saturating_mul(Self::UNAUTHENTICATED_IDS_PER_SOURCE);
+        // Check both before spending either.
         let key = (identity.to_string(), bucket);
-        if windows.len() >= Self::MAX_WINDOWS && !windows.contains_key(&key) {
+        let fresh = |w: Option<&RateWindow>| {
+            w.filter(|w| w.started.elapsed() < Duration::from_secs(60))
+                .map_or(0, |w| w.units)
+        };
+        if fresh(windows.total.get(bucket)).saturating_add(units) > total_limit
+            || fresh(windows.ids.get(&key)).saturating_add(units) > limit
+        {
+            return Err(GatewayError::rate_limited());
+        }
+        let id_cap = usize::try_from(total_limit).unwrap_or(usize::MAX).max(1);
+        Self::take(
+            &mut windows.total,
+            bucket,
+            units,
+            total_limit,
+            Self::MAX_WINDOWS,
+        )?;
+        Self::take(&mut windows.ids, key, units, limit, id_cap)
+    }
+
+    /// Spend `units` of `key`'s window in `windows` (at most `max` of
+    /// them: a full map drops its oldest window).
+    fn take<K: Clone + Eq + std::hash::Hash>(
+        windows: &mut HashMap<K, RateWindow>,
+        key: K,
+        units: u64,
+        limit: u64,
+        max: usize,
+    ) -> Result<(), GatewayError> {
+        if limit == 0 {
+            return Err(GatewayError::rate_limited());
+        }
+        if windows.len() >= max && !windows.contains_key(&key) {
             windows.retain(|_, window| window.started.elapsed() < Duration::from_secs(60));
-            if windows.len() >= Self::MAX_WINDOWS
+            if windows.len() >= max
                 && let Some(oldest) = windows
                     .iter()
                     .min_by_key(|(_, window)| window.started)
@@ -119,6 +178,28 @@ impl NodeRateLimiter {
         window.units = window.units.saturating_add(units);
         Ok(())
     }
+}
+
+/// The address a request made before signing in is counted against: the
+/// local-network peer, or the visitor Cloudflare's edge names for a request
+/// through the tunnel (it sets `cf-connecting-ip` itself, an HTTP header
+/// name), or else this computer (a loopback request).
+fn request_source(
+    lan_peer: Option<&axum::Extension<crate::lan::LanPeer>>,
+    headers: &HeaderMap,
+) -> std::net::IpAddr {
+    if let Some(peer) = lan_peer {
+        return peer.0.0;
+    }
+    if headers.contains_key("cf-ray")
+        && let Some(ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+    {
+        return ip;
+    }
+    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
 }
 
 async fn rate_limit_authenticated_request(
@@ -262,11 +343,19 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
 
 async fn redeem(
     State(state): State<NodeGatewayState>,
+    lan_peer: Option<axum::Extension<crate::lan::LanPeer>>,
+    headers: HeaderMap,
     Json(request): Json<RedeemEnrollmentRequest>,
 ) -> Result<Json<RedeemEnrollmentResponse>, GatewayError> {
     state
         .rate_limiter
-        .consume_unauthenticated(&request.offer_id, "enrollment", 1, 10)
+        .consume_unauthenticated(
+            request_source(lan_peer.as_ref(), &headers),
+            &request.offer_id,
+            "enrollment",
+            1,
+            10,
+        )
         .await?;
     state
         .service
@@ -278,11 +367,19 @@ async fn redeem(
 
 async fn challenge(
     State(state): State<NodeGatewayState>,
+    lan_peer: Option<axum::Extension<crate::lan::LanPeer>>,
+    headers: HeaderMap,
     Json(request): Json<SessionChallengeRequest>,
 ) -> Result<Json<SessionChallengeResponse>, GatewayError> {
     state
         .rate_limiter
-        .consume_unauthenticated(&request.credential_id, "authentication", 1, 30)
+        .consume_unauthenticated(
+            request_source(lan_peer.as_ref(), &headers),
+            &request.credential_id,
+            "authentication",
+            1,
+            30,
+        )
         .await?;
     state
         .service
@@ -294,11 +391,19 @@ async fn challenge(
 
 async fn open_session(
     State(state): State<NodeGatewayState>,
+    lan_peer: Option<axum::Extension<crate::lan::LanPeer>>,
+    headers: HeaderMap,
     Json(request): Json<OpenSessionRequest>,
 ) -> Result<Json<OpenSessionResponse>, GatewayError> {
     state
         .rate_limiter
-        .consume_unauthenticated(&request.credential_id, "authentication", 1, 30)
+        .consume_unauthenticated(
+            request_source(lan_peer.as_ref(), &headers),
+            &request.credential_id,
+            "authentication",
+            1,
+            30,
+        )
         .await?;
     state
         .service
@@ -881,16 +986,83 @@ mod tests {
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
 
         limiter.consume("node-2", "requests", 1, 10).await.unwrap();
+        let attacker: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let node: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+        // The node starts signing in.
+        limiter
+            .consume_unauthenticated(node, "cred-real", "authentication", 1, 30)
+            .await
+            .unwrap();
+        // One address making up names in bulk runs out of its own budget
+        // (4 ids' worth) and keeps windows for no more than that.
+        let mut allowed = 0;
         for index in 0..NodeRateLimiter::MAX_WINDOWS + 100 {
+            if limiter
+                .consume_unauthenticated(
+                    attacker,
+                    &format!("untrusted-{index}"),
+                    "authentication",
+                    1,
+                    30,
+                )
+                .await
+                .is_ok()
+            {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 120);
+        {
+            let sources = limiter.unauthenticated.lock().await;
+            assert!(sources[&attacker].ids.len() <= 120);
+            assert_eq!(sources.len(), 2);
+        }
+        // The node's budget is its own.
+        for _ in 0..29 {
             limiter
-                .consume_unauthenticated(&format!("untrusted-{index}"), "authentication", 1, 30)
+                .consume_unauthenticated(node, "cred-real", "authentication", 1, 30)
+                .await
+                .unwrap();
+        }
+        // Each id keeps its own budget too.
+        assert!(
+            limiter
+                .consume_unauthenticated(node, "cred-real", "authentication", 1, 30)
+                .await
+                .is_err()
+        );
+        // Many addresses: the map stays bounded, and makes room.
+        for index in 0..NodeRateLimiter::MAX_SOURCES + 50 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000u32 + index as u32));
+            limiter
+                .consume_unauthenticated(ip, "x", "authentication", 1, 30)
                 .await
                 .expect("a full map makes room, it never refuses everyone");
         }
-        assert!(limiter.unauthenticated.lock().await.len() <= NodeRateLimiter::MAX_WINDOWS);
+        assert!(limiter.unauthenticated.lock().await.len() <= NodeRateLimiter::MAX_SOURCES);
         // Names made up before signing in never touch a signed-in Node's.
         assert_eq!(limiter.windows.lock().await.len(), 2);
         limiter.consume("node-2", "requests", 1, 10).await.unwrap();
+    }
+
+    #[test]
+    fn requests_before_sign_in_are_counted_by_where_they_came_from() {
+        let mut headers = HeaderMap::new();
+        let local = request_source(None, &headers);
+        assert!(local.is_loopback());
+        // Without Cloudflare's own header the visitor header is not believed.
+        headers.insert("cf-connecting-ip", "198.51.100.4".parse().unwrap());
+        assert!(request_source(None, &headers).is_loopback());
+        headers.insert("cf-ray", "abc".parse().unwrap());
+        assert_eq!(
+            request_source(None, &headers),
+            "198.51.100.4".parse::<std::net::IpAddr>().unwrap()
+        );
+        let peer = axum::Extension(crate::lan::LanPeer("192.168.1.9".parse().unwrap()));
+        assert_eq!(
+            request_source(Some(&peer), &headers),
+            "192.168.1.9".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     /// A Node that observes `gateway.trust` learns the local listener and
