@@ -107,7 +107,7 @@ impl OwnerClaim {
     }
 
     /// Judges one direct message to the unowned bot. After
-    /// [`MAX_WRONG_ATTEMPTS`] wrong codes a new code replaces the old one
+    /// five wrong codes a new code replaces the old one
     /// and is announced in the log.
     pub fn attempt(&self, text: &str) -> ClaimAttempt {
         let presented = presented_code(text);
