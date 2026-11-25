@@ -3607,7 +3607,10 @@ mod tests {
             c,
             Command::ReadProjectFile { path, .. } if path == "docs/plan.pdf"
         )));
-        assert!(matches!(client.files_file, Read::Ready(_)), "keeps what shows");
+        assert!(
+            matches!(client.files_file, Read::Ready(_)),
+            "keeps what shows"
+        );
         let (request, _) = sent.last().expect("read sent").clone();
         client.update(
             Update::Frame(ServerFrame::Ack {
@@ -3629,7 +3632,10 @@ mod tests {
     #[test]
     fn a_failed_file_link_reads_the_history_again_once_per_batch() {
         let mut client = Client::new();
-        assert!(!client.resign_files("app:s1", 1_000), "offline: nothing to read");
+        assert!(
+            !client.resign_files("app:s1", 1_000),
+            "offline: nothing to read"
+        );
         client.update(Update::Connected, &cx(None));
         client.take_outgoing();
         assert!(client.resign_files("app:s1", 1_000));
