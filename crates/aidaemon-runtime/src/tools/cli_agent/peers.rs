@@ -974,23 +974,25 @@ async fn git_cmd(
     cwd: &str,
     args: Vec<String>,
 ) -> Result<String, String> {
-    // The repository is one agents write to: its config and hooks are not
-    // the daemon's to run. No hooks, no fsmonitor command, no signing
-    // program the repository names.
-    let mut full: Vec<String> = [
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "commit.gpgSign=false",
-        "-c",
-        "tag.gpgSign=false",
-        "-C",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect();
+    // The repository is one agents write to: its config, hooks and the
+    // drivers its attributes select are not the daemon's to run (see
+    // `aidaemon_tools::git_guard`). Reading the driver list runs nothing.
+    let mut listing_args = vec!["-C".to_string(), cwd.to_string()];
+    listing_args.extend(
+        aidaemon_tools::git_guard::DRIVER_LISTING_ARGS
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
+    let listing = backend
+        .execute(
+            ExecutionRequest::argv("git", listing_args),
+            Duration::from_secs(30),
+        )
+        .await
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    let mut full = aidaemon_tools::git_guard::untrusted_repo_config_args(&listing)?;
+    full.push("-C".to_string());
     full.push(cwd.to_string());
     full.extend(args);
     let output = backend

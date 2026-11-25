@@ -365,26 +365,24 @@ impl CliAgentTool {
         }
 
         // Check for uncommitted changes first
-        let diff_stat = aidaemon_tools::fs_utils::run_cmd_backend(
-            backend.as_ref(),
-            "git diff --stat",
-            Some(&directory),
+        let diff_stat = Self::guarded_git(
+            backend,
+            &directory,
+            &["diff".into(), "--no-ext-diff".into(), "--stat".into()],
             10,
         )
-        .await
-        .ok()?;
+        .await?;
         let stat_output = diff_stat.stdout;
 
         if !stat_output.trim().is_empty() {
             // There are uncommitted changes — capture them
-            let diff = aidaemon_tools::fs_utils::run_cmd_backend(
-                backend.as_ref(),
-                "git diff",
-                Some(&directory),
+            let diff = Self::guarded_git(
+                backend,
+                &directory,
+                &["diff".into(), "--no-ext-diff".into()],
                 10,
             )
-            .await
-            .ok()?;
+            .await?;
             let diff_text = diff.stdout;
             if !diff_text.trim().is_empty() {
                 return Some(truncate_with_note(&diff_text, MAX_DIFF_SIZE));
@@ -398,25 +396,27 @@ impl CliAgentTool {
         if now == start {
             return None;
         }
-        let log = aidaemon_tools::fs_utils::run_cmd_backend(
-            backend.as_ref(),
-            &format!("git log --format=%s {start}..HEAD"),
-            Some(&directory),
+        let log = Self::guarded_git(
+            backend,
+            &directory,
+            &["log".into(), "--format=%s".into(), format!("{start}..HEAD")],
             10,
         )
-        .await
-        .ok()?;
+        .await?;
         let log_output = log.stdout;
 
         if !log_output.trim().is_empty() {
-            let committed_diff = aidaemon_tools::fs_utils::run_cmd_backend(
-                backend.as_ref(),
-                &format!("git diff {start}..HEAD"),
-                Some(&directory),
+            let committed_diff = Self::guarded_git(
+                backend,
+                &directory,
+                &[
+                    "diff".into(),
+                    "--no-ext-diff".into(),
+                    format!("{start}..HEAD"),
+                ],
                 10,
             )
-            .await
-            .ok()?;
+            .await?;
             let committed_text = committed_diff.stdout;
             if !committed_text.trim().is_empty() {
                 return Some(format!(
@@ -430,6 +430,42 @@ impl CliAgentTool {
         None
     }
 
+    /// Run git in `directory` (argv, no shell) with the overrides that keep
+    /// the repository's own hooks and drivers from running
+    /// (`aidaemon_tools::git_guard`): the agent wrote to this repository.
+    /// `None` when git could not run, or a driver cannot be turned off.
+    async fn guarded_git(
+        backend: &SharedExecutionBackend,
+        directory: &BackendPath,
+        args: &[String],
+        timeout_secs: u64,
+    ) -> Option<aidaemon_tools::fs_utils::CommandOutput> {
+        let run = |argv: Vec<String>| {
+            let mut request = ExecutionRequest::argv("git", argv);
+            request.cwd = Some(directory.clone());
+            backend.execute(request, Duration::from_secs(timeout_secs))
+        };
+        let listing = run(aidaemon_tools::git_guard::DRIVER_LISTING_ARGS
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect())
+        .await
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+        let mut argv = aidaemon_tools::git_guard::untrusted_repo_config_args(&listing).ok()?;
+        argv.extend(args.iter().cloned());
+        let output = run(argv).await.ok()?;
+        if output.timed_out {
+            return None;
+        }
+        Some(aidaemon_tools::fs_utils::CommandOutput {
+            exit_code: output.exit_code,
+            stdout: output.stdout_lossy(),
+            stderr: output.stderr_lossy(),
+            duration_ms: output.duration_ms,
+        })
+    }
+
     /// Return the number of tracked or untracked entries in an existing Git
     /// worktree. A non-repository (or an unavailable backend) is not classified
     /// as dirty here; normal CLI-agent approval and execution policy still apply.
@@ -438,14 +474,17 @@ impl CliAgentTool {
         working_dir: &str,
     ) -> Option<usize> {
         let directory = BackendPath::new(working_dir);
-        let status = aidaemon_tools::fs_utils::run_cmd_backend(
-            backend.as_ref(),
-            "git status --porcelain=v1 --untracked-files=all",
-            Some(&directory),
+        let status = Self::guarded_git(
+            backend,
+            &directory,
+            &[
+                "status".into(),
+                "--porcelain=v1".into(),
+                "--untracked-files=all".into(),
+            ],
             10,
         )
-        .await
-        .ok()?;
+        .await?;
         if status.exit_code != 0 {
             return None;
         }

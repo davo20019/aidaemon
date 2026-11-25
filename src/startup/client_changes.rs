@@ -549,11 +549,22 @@ pub(crate) async fn revert_file(
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    // Agents wrote to this repository: none of the programs its own
+    // configuration names runs here (`aidaemon_tools::git_guard`).
+    let listing = run_git(dir, &[], aidaemon_tools::git_guard::DRIVER_LISTING_ARGS)
+        .await
+        .unwrap_or_default();
+    let guard = aidaemon_tools::git_guard::untrusted_repo_config_args(&listing).ok()?;
+    run_git(dir, &guard, args).await
+}
+
+async fn run_git(dir: &Path, guard: &[String], args: &[&str]) -> Option<Vec<u8>> {
     let mut command = tokio::process::Command::new("git");
     command
         .arg("-C")
         .arg(dir)
         .args(["-c", "core.quotepath=false"])
+        .args(guard)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

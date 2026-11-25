@@ -60,6 +60,7 @@ pub mod execution;
 pub mod file_delivery;
 mod fs;
 pub mod fs_utils;
+pub mod git_guard;
 pub mod http_request;
 pub mod internal_markers;
 pub mod local_backend;

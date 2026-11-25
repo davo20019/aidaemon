@@ -415,10 +415,22 @@ fn parse_status(out: &str) -> BTreeMap<String, FileStatus> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    // A project folder's repository is not the daemon's: none of the
+    // programs its own configuration names runs here
+    // (`aidaemon_tools::git_guard`).
+    let listing = run_git(dir, &[], aidaemon_tools::git_guard::DRIVER_LISTING_ARGS)
+        .map(String::into_bytes)
+        .unwrap_or_default();
+    let guard = aidaemon_tools::git_guard::untrusted_repo_config_args(&listing).ok()?;
+    run_git(dir, &guard, args)
+}
+
+fn run_git(dir: &Path, guard: &[String], args: &[&str]) -> Option<String> {
     let out = Process::new("git")
         .arg("-C")
         .arg(dir)
         .args(["-c", "core.quotepath=false"])
+        .args(guard)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
