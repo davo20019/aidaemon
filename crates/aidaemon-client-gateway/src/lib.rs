@@ -509,6 +509,16 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// The device an answer is attributed to: its paired name first, since
+    /// the name a client declares is its own say and would let one device
+    /// answer as another.
+    pub fn answering_device(&self) -> Option<String> {
+        self.principal
+            .device_name
+            .clone()
+            .or_else(|| self.device.clone())
+    }
+
     /// The owner at the machine, with nothing else known.
     pub fn owner() -> Self {
         Self {
@@ -1205,10 +1215,7 @@ impl ClientGateway {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };
-                let device = caller
-                    .device
-                    .clone()
-                    .or_else(|| caller.principal.device_name.clone());
+                let device = caller.answering_device();
                 // Who answered: a card that goes away is traceable to the
                 // client and device that answered it.
                 tracing::info!(
@@ -2876,5 +2883,34 @@ mod public_url_tests {
         assert_eq!(url.get(), "https://app.example.com");
         publisher.set(None);
         assert_eq!(url.get(), "http://127.0.0.1:8788");
+    }
+}
+
+#[cfg(test)]
+mod caller_tests {
+    use super::{Caller, Principal};
+
+    #[test]
+    fn an_answer_is_attributed_to_the_paired_name_not_the_declared_one() {
+        let mut principal = Principal::owner();
+        principal.device_id = Some("device-1".into());
+        principal.device_name = Some("Synthetic Phone".into());
+        let caller = Caller {
+            device: Some("Synthetic Laptop".into()),
+            principal,
+            ..Caller::owner()
+        };
+        assert_eq!(
+            caller.answering_device().as_deref(),
+            Some("Synthetic Phone")
+        );
+        let local = Caller {
+            device: Some("Synthetic Laptop".into()),
+            ..Caller::owner()
+        };
+        assert_eq!(
+            local.answering_device().as_deref(),
+            Some("Synthetic Laptop")
+        );
     }
 }
