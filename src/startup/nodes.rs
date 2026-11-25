@@ -86,9 +86,8 @@ pub async fn start(
         )?);
     }
     let lan_authority = if config.nodes.gateway.lan.enabled {
-        let path = dirs::home_dir()
+        let path = aidaemon_secrets::daemon_home()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".aidaemon")
             .join("node-lan-ca.key");
         match crate::nodes::lan::LanAuthority::load_or_create(&path) {
             Ok(authority) => Some(Arc::new(authority)),

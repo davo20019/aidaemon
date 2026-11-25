@@ -24,6 +24,7 @@ keychain = ["dep:keyring"]
 [dependencies]
 aidaemon-core = { version = "0.24.0", path = "../aidaemon-core" }
 anyhow = "1"
+dirs = "7"
 dotenvy = "0.15"
 tracing = "0.1"
 zeroize = "1"

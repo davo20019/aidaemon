@@ -369,9 +369,7 @@ pub fn install_service() -> anyhow::Result<()> {
 
 /// Where a per-user install keeps its config, database and logs.
 pub fn default_home() -> anyhow::Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("no home directory"))?
-        .join(".aidaemon"))
+    aidaemon_secrets::daemon_home().ok_or_else(|| anyhow::anyhow!("no home directory"))
 }
 
 fn run_quiet(program: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {

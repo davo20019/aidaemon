@@ -543,14 +543,11 @@ fn handle_browser_command(
             #[cfg(feature = "browser")]
             {
                 let config = config::AppConfig::load(config_path)?;
-                let profile_dir = config.browser.user_data_dir.unwrap_or_else(|| {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| PathBuf::from(".").to_path_buf())
-                        .join(".aidaemon")
-                        .join("chrome-profile")
-                        .to_string_lossy()
-                        .into_owned()
-                });
+                let profile_dir = config
+                    .browser
+                    .user_data_dir
+                    .or_else(config::default_browser_user_data_dir)
+                    .unwrap_or_else(|| "chrome-profile".to_string());
                 let expanded = shellexpand::tilde(&profile_dir).into_owned();
 
                 // Ensure profile directory exists

@@ -37,8 +37,9 @@ fn quoted(value: &str) -> String {
 }
 
 fn expand_home(path: &str) -> String {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest).display().to_string(),
+    // `dirs::home_dir`, not `$HOME`: Windows does not set `HOME`.
+    match (path.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest).display().to_string(),
         _ => path.to_string(),
     }
 }

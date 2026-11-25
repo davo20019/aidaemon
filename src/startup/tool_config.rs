@@ -36,7 +36,7 @@ pub(crate) fn daemon_file_policy(paths: DaemonPaths) -> Arc<dyn FilePolicy> {
 
 #[cfg(not(test))]
 pub(crate) fn file_backup_root() -> Option<std::path::PathBuf> {
-    Some(dirs::home_dir()?.join(".aidaemon").join("file-backups"))
+    Some(aidaemon_secrets::daemon_home()?.join("file-backups"))
 }
 
 #[cfg(test)]

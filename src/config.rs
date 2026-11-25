@@ -422,7 +422,7 @@ impl MemoryConfig {
                     std::path::PathBuf::from(dir)
                 }
             }
-            _ => dirs::home_dir()?.join(".aidaemon").join("projects"),
+            _ => aidaemon_secrets::daemon_home()?.join("projects"),
         };
         Some(std::sync::Arc::new(
             aidaemon_memory::project::ProjectNotes::new(root),
@@ -1759,13 +1759,8 @@ impl BrowserConfig {
     }
 }
 
-fn default_browser_user_data_dir() -> Option<String> {
-    dirs::home_dir().map(|h| {
-        h.join(".aidaemon")
-            .join("chrome-profile")
-            .to_string_lossy()
-            .into_owned()
-    })
+pub(crate) fn default_browser_user_data_dir() -> Option<String> {
+    aidaemon_secrets::daemon_home().map(|h| h.join("chrome-profile").to_string_lossy().into_owned())
 }
 
 fn default_headless() -> bool {

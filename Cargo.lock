@@ -524,6 +524,7 @@ dependencies = [
  "aidaemon-core",
  "aidaemon-exposure",
  "async-trait",
+ "dirs 7.0.0",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -916,6 +917,7 @@ version = "0.24.0"
 dependencies = [
  "aidaemon-core",
  "anyhow",
+ "dirs 7.0.0",
  "dotenvy",
  "keyring",
  "tempfile",

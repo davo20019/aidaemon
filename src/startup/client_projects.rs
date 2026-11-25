@@ -342,9 +342,13 @@ fn folder(path: &str, create: bool) -> Result<String, ProtocolError> {
     let home = || {
         dirs::home_dir().ok_or_else(|| refused("This computer has no home folder to start from"))
     };
-    let expanded: PathBuf = match path.strip_prefix("~/").or(path.strip_prefix("~")) {
-        Some(rest) => home()?.join(rest.trim_start_matches('/')),
-        None => PathBuf::from(path),
+    // Only `~` and `~/…` are the owner's home; `~bob/x` is not `$HOME/bob/x`.
+    let expanded: PathBuf = if path == "~" {
+        home()?
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home()?.join(rest.trim_start_matches('/'))
+    } else {
+        PathBuf::from(path)
     };
     if !expanded.is_absolute() {
         return Err(refused(format!(

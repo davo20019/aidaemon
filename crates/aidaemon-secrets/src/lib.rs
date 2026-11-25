@@ -549,6 +549,24 @@ fn encode_env_value(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
+/// The daemon's own folder for state that is not in its config: the
+/// `AIDAEMON_HOME` folder when that is set (a second instance keeps its own
+/// keys, tokens and caches), else `~/.aidaemon`. `None` only when neither is
+/// set and there is no home directory.
+pub fn daemon_home() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("AIDAEMON_HOME").filter(|v| !v.is_empty()) {
+        let explicit = PathBuf::from(explicit);
+        if explicit.is_absolute() {
+            return Some(explicit);
+        }
+        return std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(&explicit))
+            .or(Some(explicit));
+    }
+    dirs::home_dir().map(|home| home.join(".aidaemon"))
+}
+
 /// Write `content` to `path`, owner-only (0600) from the first byte, and
 /// atomically: it goes to a fresh sibling file created 0600 (a unique name,
 /// so concurrent writers never share one) and is renamed over `path`. A

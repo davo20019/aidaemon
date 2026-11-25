@@ -44,11 +44,22 @@ pub fn local_token() -> Option<String> {
     }
     let path = std::env::var_os("AIDAEMON_CLIENT_TOKEN_FILE")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".aidaemon").join("client-token")))?;
+        .or_else(|| daemon_home().map(|home| home.join("client-token")))?;
     std::fs::read_to_string(path)
         .ok()
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty())
+}
+
+/// The local daemon's folder, where it keeps the owner's copy of the client
+/// token: `AIDAEMON_HOME`, else `~/.aidaemon` (as
+/// `aidaemon_secrets::daemon_home`, which this crate cannot depend on: it
+/// also builds for the web).
+fn daemon_home() -> Option<PathBuf> {
+    match std::env::var_os("AIDAEMON_HOME").filter(|v| !v.is_empty()) {
+        Some(explicit) => Some(PathBuf::from(explicit)),
+        None => dirs::home_dir().map(|home| home.join(".aidaemon")),
+    }
 }
 
 /// Set by an app with a data directory of its own (a phone's sandbox).

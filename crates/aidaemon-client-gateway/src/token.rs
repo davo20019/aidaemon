@@ -57,9 +57,8 @@ use crate::ClientGatewayConfig;
 pub fn token_file(config: &ClientGatewayConfig) -> PathBuf {
     match config.token_file.as_deref().map(str::trim) {
         Some(path) if !path.is_empty() => PathBuf::from(shellexpand::tilde(path).into_owned()),
-        _ => dirs::home_dir()
+        _ => aidaemon_tools::config_file::daemon_home()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".aidaemon")
             .join("client-gateway-token.sha256"),
     }
 }

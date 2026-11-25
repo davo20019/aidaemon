@@ -53,9 +53,8 @@ pub fn endpoints(config: &AppConfig) -> GatewayEndpoints {
 
 /// Where adapters keep generated tunnel configs and child pid files.
 fn state_dir() -> PathBuf {
-    dirs::home_dir()
+    aidaemon_secrets::daemon_home()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".aidaemon")
         .join("exposure")
 }
 

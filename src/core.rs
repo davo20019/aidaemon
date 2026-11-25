@@ -153,9 +153,9 @@ pub async fn run(
     // Paths in the configured file inbox are shown to the owner by name.
     aidaemon_tools::internal_markers::register_inbox_dir(&config.files.inbox_dir);
     // The owner's own instructions for every project, beside the config.
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = aidaemon_secrets::daemon_home() {
         aidaemon_runtime::turn::project_instructions::set_user_instructions_file(
-            home.join(".aidaemon").join("AGENTS.md"),
+            home.join("AGENTS.md"),
         );
     }
 
@@ -251,7 +251,7 @@ pub async fn run(
         .subagents
         .specialists_override_dir
         .clone()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".aidaemon").join("specialists")));
+        .or_else(|| aidaemon_secrets::daemon_home().map(|h| h.join("specialists")));
     let specialists = std::sync::Arc::new(crate::agent::specialists::SpecialistRegistry::load(
         specialists_dir.as_deref(),
     ));

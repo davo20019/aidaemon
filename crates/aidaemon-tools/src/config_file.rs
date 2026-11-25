@@ -122,6 +122,9 @@ fn backup_paths(path: &Path) -> [PathBuf; 3] {
 /// atomically (a fresh sibling file renamed over `path`).
 pub use aidaemon_secrets::write_owner_only;
 
+/// The daemon's own folder: `AIDAEMON_HOME`, else `~/.aidaemon`.
+pub use aidaemon_secrets::daemon_home;
+
 /// Owner-only read/write (0600) on Unix, best effort.
 #[cfg(unix)]
 pub fn set_owner_only_permissions(path: &Path) {

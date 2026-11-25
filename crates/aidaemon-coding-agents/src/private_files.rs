@@ -7,11 +7,12 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// `~/.aidaemon/run`, created owner-only (and narrowed if it was wider).
-/// Falls back to the temp directory only when there is no home directory.
+/// `run` in the daemon's folder (`AIDAEMON_HOME`, else `~/.aidaemon`),
+/// created owner-only (and narrowed if it was wider). Falls back to the temp
+/// directory only when there is no home directory.
 pub fn run_dir() -> std::io::Result<PathBuf> {
-    let base = dirs::home_dir()
-        .map(|home| home.join(".aidaemon").join("run"))
+    let base = aidaemon_secrets::daemon_home()
+        .map(|home| home.join("run"))
         .unwrap_or_else(|| std::env::temp_dir().join("aidaemon-run"));
     private_dir(&base)?;
     Ok(base)
