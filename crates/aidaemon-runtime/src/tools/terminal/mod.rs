@@ -78,12 +78,16 @@ pub struct TerminalTool {
     backend: SharedExecutionBackend,
     /// Permanently allowed prefixes (from config + DB)
     allowed_prefixes: Arc<RwLock<Vec<String>>>,
-    /// Session-only allowed prefixes (cleared on restart)
-    session_approved: Arc<RwLock<HashSet<String>>>,
+    /// Session-only allowed prefixes (cleared on restart), per chat
+    /// session (`TerminalTrust::grant_session`): an "allow for session" in
+    /// one chat covers that chat and its child agents, never another chat.
+    session_approved: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Elevated capabilities granted per command key (`network`,
-    /// `read:<path>`, `write:<path>`). Session grants live here only;
-    /// Allow-Always grants are also persisted.
+    /// `read:<path>`, `write:<path>`), persisted by Allow-Always.
     capability_grants: Arc<RwLock<HashSet<(String, String)>>>,
+    /// Elevated capabilities granted for one chat session only:
+    /// (grant session, command key, capability).
+    session_capability_grants: Arc<RwLock<HashSet<(String, String, String)>>>,
     /// AIdaemon's permission level: at Full access every command is
     /// allowed (the owner's `/trustall`). The daemon's shared value once
     /// [`Self::set_permissions`] wires it; until then this terminal's own.

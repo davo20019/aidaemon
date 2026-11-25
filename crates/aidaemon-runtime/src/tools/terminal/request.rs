@@ -243,6 +243,9 @@ pub(super) struct TerminalArgs {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TerminalTrust {
     pub session_id: String,
+    /// The chat session whose "allow for session" grants cover this call
+    /// (a child agent works for the chat that started it).
+    pub grant_session: String,
     /// The turn's user is the owner (an unknown caller is not).
     pub owner: bool,
     /// A trusted scheduled session: runs without asking, never detached.
@@ -259,6 +262,7 @@ impl TerminalTrust {
     pub(super) fn for_approval(ctx: &ToolCallContext) -> Self {
         Self {
             session_id: ctx.session_id.clone(),
+            grant_session: grant_session_of(&ctx.session_id, ctx),
             owner: ctx.user_role == Some(aidaemon_tools::semantics::UserRole::Owner),
             trusted_session: ctx.trusted_session,
             untrusted_source: ctx.untrusted_source,
@@ -269,12 +273,57 @@ impl TerminalTrust {
     pub(super) fn from_execution_context(session_id: &str, ctx: &ToolCallContext) -> Self {
         Self {
             session_id: session_id.to_string(),
+            grant_session: grant_session_of(session_id, ctx),
             owner: ctx.user_role == Some(aidaemon_tools::semantics::UserRole::Owner),
             trusted_session: ctx.trusted_session,
             untrusted_source: ctx.untrusted_source,
             scope_escalation: ctx.scope_escalation.clone().filter(|e| !e.is_empty()),
         }
     }
+}
+
+/// The chat session a call's "allow for session" grants are kept under:
+/// the dispatcher's grant session, else the call's own session.
+fn grant_session_of(session_id: &str, ctx: &ToolCallContext) -> String {
+    let grant = ctx.grant_session.trim();
+    if grant.is_empty() {
+        session_id.to_string()
+    } else {
+        grant.to_string()
+    }
+}
+
+/// The key an "allow for session" on a simple command is kept under: the
+/// program and, when the next word is not an option, its subcommand or
+/// first operand (`git status`, `npm run`, `python3 tool.py`), so allowing
+/// `git status` never covers `git push`.
+pub(super) fn session_grant_key(command: &str) -> String {
+    let trimmed = command.trim();
+    let words = shell_words::split(trimmed).unwrap_or_else(|_| {
+        trimmed
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    match words.as_slice() {
+        [] => trimmed.to_string(),
+        [program] => program.clone(),
+        [program, next, ..] if next.starts_with('-') => program.clone(),
+        [program, next, ..] => format!("{program} {next}"),
+    }
+}
+
+/// Whether `command`'s words start with the words of a session grant key.
+pub(super) fn covered_by_session_key(command: &str, key: &str) -> bool {
+    let split = |text: &str| {
+        shell_words::split(text.trim()).unwrap_or_else(|_| {
+            text.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+    };
+    let (words, key) = (split(command), split(key));
+    !key.is_empty() && words.len() >= key.len() && words[..key.len()] == key[..]
 }
 
 /// What the owner is asked to approve before a run.
