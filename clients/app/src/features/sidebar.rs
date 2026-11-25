@@ -9,7 +9,7 @@
 
 use nsh_core::prelude::*;
 
-use crate::store::{Felt, Page, SearchRead, SidebarView, Source, Store, now_ms};
+use crate::store::{AnswerSurface, Felt, Page, SearchRead, SidebarView, Source, Store, now_ms};
 use crate::ui::{self, Glyph, Tone, colors, icon, row, section_label, status, type_scale};
 use aidaemon_client_core::machine::DropKind;
 use aidaemon_client_protocol::{Approval, ApprovalDecision};
@@ -301,7 +301,7 @@ fn ask_line(store: Store, approval: Approval) -> View {
                 .text_size(px(if ui::touch() { 12.0 } else { type_scale::XS }))
                 .text_color(colors::WARNING),
         );
-    store.card_shown(&approval.id);
+    store.answer_shown(AnswerSurface::Line, &approval.id);
     for (decision, label, variant) in [
         (ApprovalDecision::ApproveOnce, "Allow", ui::Variant::Primary),
         (ApprovalDecision::Deny, "Deny", ui::Variant::Ghost),
@@ -309,7 +309,7 @@ fn ask_line(store: Store, approval: Approval) -> View {
         if approval.options.contains(&decision) {
             let id = approval.id.clone();
             line = line.child(ui::btn(label, variant, ui::Size::Sm, move || {
-                store.resolve_clicked(&id, decision)
+                store.resolve_clicked(AnswerSurface::Line, &id, decision);
             }));
         }
     }

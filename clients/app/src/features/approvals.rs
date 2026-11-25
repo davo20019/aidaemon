@@ -8,7 +8,7 @@ use nsh_core::prelude::*;
 use aidaemon_client_core::client::key_for_approval;
 use nsh_core::platform::Idiom;
 
-use crate::store::{Store, now_ms};
+use crate::store::{AnswerSurface, Store, now_ms};
 use crate::ui::{self, Glyph, Size, Tone, Variant, badge, btn, code, colors, radius, type_scale};
 
 fn risk(risk: Risk) -> (&'static str, Tone) {
@@ -180,7 +180,7 @@ pub fn card(store: Store, approval: Approval) -> View {
         store.approvals_taught();
     }
     let id = approval.id.clone();
-    store.card_shown(&id);
+    store.answer_shown(AnswerSurface::Card, &id);
     ui::surface()
         .border_color(risk_tone.color())
         // The card a view move brought up stands out until answered.
@@ -275,7 +275,7 @@ pub fn card(store: Store, approval: Approval) -> View {
                 // What an answer covers, in words and for screen readers.
                 let resolve_id = id.clone();
                 let button = btn(label, variant, Size::Sm, move || {
-                    store.resolve_clicked(&resolve_id, d)
+                    store.resolve_clicked(AnswerSurface::Card, &resolve_id, d);
                 })
                 .accessibility_label(scope(d));
                 // The terminal answers the card its keys reach with one key

@@ -10,7 +10,7 @@ use nsh_core::platform::Idiom;
 use nsh_core::prelude::*;
 
 use crate::features::{conversation, inspector::inspector, sidebar::sidebar};
-use crate::store::{Connection, Store};
+use crate::store::{AnswerSurface, Connection, Store};
 use crate::ui::{self, colors, radius, size, type_scale};
 
 pub fn shell(store: Store) -> View {
@@ -515,6 +515,9 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
     }
     // Every waiting approval, answerable from the keyboard.
     for approval in store.approvals() {
+        // Listed now: Enter on it arms from here, not from when its card
+        // was first drawn (it may have just appeared under the selection).
+        untracked(|| store.answer_shown(AnswerSurface::Palette, &approval.id));
         let what = approval.summary.clone();
         items.push(
             CommandItem::new(
@@ -607,7 +610,11 @@ fn palette_dialog(store: Store, open: Signal<bool>) -> impl IntoElement {
                                     if let Some(session) = other.strip_prefix("go:") {
                                         store.select(Some(session.to_owned()));
                                     } else if let Some(id) = other.strip_prefix("approve:") {
-                                        store.resolve(id, ApprovalDecision::ApproveOnce);
+                                        store.resolve_clicked(
+                                            AnswerSurface::Palette,
+                                            id,
+                                            ApprovalDecision::ApproveOnce,
+                                        );
                                     } else if let Some(id) = other.strip_prefix("deny:") {
                                         store.resolve(id, ApprovalDecision::Deny);
                                     } else if let Some(id) = other.strip_prefix("show:") {

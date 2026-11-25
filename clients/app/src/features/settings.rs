@@ -14,7 +14,7 @@ use std::rc::Rc;
 use nsh_core::prelude::*;
 
 use crate::features::settings_general;
-use crate::store::{SettingsRead, SettingsTab, Store};
+use crate::store::{AnswerSurface, SettingsRead, SettingsTab, Store};
 use crate::ui::{self, Glyph, Size, Tone, Variant, colors, section_label, size, type_scale};
 
 /// The page's tabs.
@@ -92,20 +92,27 @@ fn ask_approvals_in_place(store: Store) {
                 detail.push_str(warning);
             }
             let id = approval.id.clone();
-            untracked(move || {
-                ui::yes_or_no("Allow this change?", detail, "Allow", "Deny", move |yes| {
-                    store.resolve(
-                        &id,
-                        if yes {
-                            ApprovalDecision::ApproveOnce
-                        } else {
-                            ApprovalDecision::Deny
-                        },
-                    )
-                })
-            });
+            untracked(move || ask_approval(store, id, detail));
         }
     });
+}
+
+/// One approval's dialog. Allow pressed before the dialog has been up for
+/// the arming delay (it may have opened under a click or key aimed at
+/// something else) answers nothing and asks again.
+fn ask_approval(store: Store, id: String, detail: String) {
+    store.answer_shown(AnswerSurface::Dialog, &id);
+    let again = detail.clone();
+    ui::yes_or_no("Allow this change?", detail, "Allow", "Deny", move |yes| {
+        let decision = if yes {
+            ApprovalDecision::ApproveOnce
+        } else {
+            ApprovalDecision::Deny
+        };
+        if !store.resolve_clicked(AnswerSurface::Dialog, &id, decision) {
+            ask_approval(store, id, again);
+        }
+    })
 }
 
 fn offer_restart_when_needed(store: Store) {

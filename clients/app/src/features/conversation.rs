@@ -2120,108 +2120,125 @@ fn transcript_list(
                 })
             });
             let session = session.clone();
-            view().items_center().child(dynamic(move || {
-                let kind = kind.get()?;
-                let session = session.clone();
-                Some(untracked(move || {
-                    let column = view().w_full().max_w(px(size::COLUMN)).px_4().py_2();
-                    let content = move || {
-                        row.with(|r| match r {
-                            Some(
-                                Row::User(t, ..)
-                                | Row::Assistant(t, ..)
-                                | Row::Note(t)
-                                | Row::Day(t),
-                            ) => t.clone(),
-                            _ => String::new(),
-                        })
-                    };
-                    let at = move || {
-                        row.with(|r| match r.as_ref() {
-                            Some(Row::User(_, at, _) | Row::Assistant(_, at, ..)) => *at,
-                            _ => 0,
-                        })
-                    };
-                    let attached = move || {
-                        row.with(|r| match r {
-                            Some(Row::User(_, _, files) | Row::Assistant(_, _, files, ..)) => {
-                                files.clone()
-                            }
-                            _ => Vec::new(),
-                        })
-                    };
-                    match kind {
-                        0 => column
-                            .items_end()
-                            .gap_1()
-                            .child(files(store, attached, true))
-                            .child(when(
-                                move || !content().trim().is_empty(),
-                                move || user_bubble(content),
-                            ))
-                            .child(message_footer(store, session, content, attached, at)),
-                        1 => column
-                            .gap_1()
-                            .child(when(
-                                move || !content().trim().is_empty(),
-                                move || markdown(move || content().into(), || false),
-                            ))
-                            .child(files(store, attached, false))
-                            .child(when(
+            view()
+                .items_center()
+                // A row at or above a waiting card that changes size or
+                // place moves the card on screen: its allowing buttons
+                // wait again (`Store::transcript_moved`).
+                .on_layout(move |_: &Bounds<Points>| {
+                    let index = at.index();
+                    let card_below = all.with_untracked(|rows| {
+                        rows.iter()
+                            .skip(index)
+                            .any(|row| matches!(row, Row::Approval(_)))
+                    });
+                    if card_below {
+                        store.transcript_moved();
+                    }
+                })
+                .child(dynamic(move || {
+                    let kind = kind.get()?;
+                    let session = session.clone();
+                    Some(untracked(move || {
+                        let column = view().w_full().max_w(px(size::COLUMN)).px_4().py_2();
+                        let content = move || {
+                            row.with(|r| match r {
+                                Some(
+                                    Row::User(t, ..)
+                                    | Row::Assistant(t, ..)
+                                    | Row::Note(t)
+                                    | Row::Day(t),
+                                ) => t.clone(),
+                                _ => String::new(),
+                            })
+                        };
+                        let at = move || {
+                            row.with(|r| match r.as_ref() {
+                                Some(Row::User(_, at, _) | Row::Assistant(_, at, ..)) => *at,
+                                _ => 0,
+                            })
+                        };
+                        let attached = move || {
+                            row.with(|r| match r {
+                                Some(Row::User(_, _, files) | Row::Assistant(_, _, files, ..)) => {
+                                    files.clone()
+                                }
+                                _ => Vec::new(),
+                            })
+                        };
+                        match kind {
+                            0 => column
+                                .items_end()
+                                .gap_1()
+                                .child(files(store, attached, true))
+                                .child(when(
+                                    move || !content().trim().is_empty(),
+                                    move || user_bubble(content),
+                                ))
+                                .child(message_footer(store, session, content, attached, at)),
+                            1 => column
+                                .gap_1()
+                                .child(when(
+                                    move || !content().trim().is_empty(),
+                                    move || markdown(move || content().into(), || false),
+                                ))
+                                .child(files(store, attached, false))
+                                .child(when(
+                                    move || {
+                                        row.with(|r| {
+                                            matches!(r, Some(Row::Assistant(_, _, _, _, true, _)))
+                                        })
+                                    },
+                                    move || {
+                                        let served = move || {
+                                            row.with(|r| match r {
+                                                Some(Row::Assistant(.., served)) => served.clone(),
+                                                _ => None,
+                                            })
+                                        };
+                                        reply_footer(store, content, at, served)
+                                    },
+                                )),
+                            9 => column.child(handed_off(content)),
+                            2 => column.child(note(content)),
+                            5 => column.child(day_break(content)),
+                            3 => column.child(live(store, session)),
+                            6 => column.child(activity(
+                                store,
                                 move || {
-                                    row.with(|r| {
-                                        matches!(r, Some(Row::Assistant(_, _, _, _, true, _)))
+                                    row.with(|r| match r {
+                                        Some(Row::Activity(tools, secs, calls)) => {
+                                            (tools.clone(), *secs, calls.clone())
+                                        }
+                                        _ => (Vec::new(), 0, Vec::new()),
                                     })
                                 },
-                                move || {
-                                    let served = move || {
-                                        row.with(|r| match r {
-                                            Some(Row::Assistant(.., served)) => served.clone(),
-                                            _ => None,
-                                        })
-                                    };
-                                    reply_footer(store, content, at, served)
-                                },
+                                false,
                             )),
-                        9 => column.child(handed_off(content)),
-                        2 => column.child(note(content)),
-                        5 => column.child(day_break(content)),
-                        3 => column.child(live(store, session)),
-                        6 => column.child(activity(
-                            store,
-                            move || {
-                                row.with(|r| match r {
-                                    Some(Row::Activity(tools, secs, calls)) => {
-                                        (tools.clone(), *secs, calls.clone())
-                                    }
-                                    _ => (Vec::new(), 0, Vec::new()),
-                                })
-                            },
-                            false,
-                        )),
-                        7 => column.child(retry(store, session)),
-                        8 => column.child(ui::working(
-                            "Working in the background · the result comes here",
-                        )),
-                        10 => column.py_1().child(dynamic(move || {
-                            let (key, headed) = row.with(|r| match r {
-                                Some(Row::Runs { key, headed }) => Some((key.clone(), *headed)),
-                                _ => None,
-                            })?;
-                            let session = session.clone();
-                            Some(untracked(move || run_group(store, session, key, headed)))
-                        })),
-                        _ => column.child(dynamic(move || {
-                            let id = row.with(|r| match r {
-                                Some(Row::Approval(id)) => Some(id.clone()),
-                                _ => None,
-                            })?;
-                            let approval = store.approvals().into_iter().find(|a| a.id == id)?;
-                            Some(untracked(|| approvals::card(store, approval)))
-                        })),
-                    }
+                            7 => column.child(retry(store, session)),
+                            8 => column.child(ui::working(
+                                "Working in the background · the result comes here",
+                            )),
+                            10 => column.py_1().child(dynamic(move || {
+                                let (key, headed) = row.with(|r| match r {
+                                    Some(Row::Runs { key, headed }) => Some((key.clone(), *headed)),
+                                    _ => None,
+                                })?;
+                                let session = session.clone();
+                                Some(untracked(move || run_group(store, session, key, headed)))
+                            })),
+                            _ => column.child(dynamic(move || {
+                                let id = row.with(|r| match r {
+                                    Some(Row::Approval(id)) => Some(id.clone()),
+                                    _ => None,
+                                })?;
+                                let approval =
+                                    store.approvals().into_iter().find(|a| a.id == id)?;
+                                Some(untracked(|| approvals::card(store, approval)))
+                            })),
+                        }
+                    }))
                 }))
-            }))
         },
     )
     .keys(move || {
@@ -2238,6 +2255,8 @@ fn transcript_list(
             last_seen.set(last);
         }
     })
+    // Scrolling moves every card on screen (`Store::transcript_moved`).
+    .on_scroll(move |_: &ScrollEvent| store.transcript_moved())
     .estimated_item_size(px(96.0))
     // At the newest message, kept there while the rows in view are
     // measured: an index scroll landed by estimated heights, short of the

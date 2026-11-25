@@ -564,8 +564,9 @@ pub struct Store {
     /// The terminal's approval keys: when the card they answer came into
     /// view, and a first press of the key that allows for the session.
     key_arming: Stored<KeyArming>,
-    /// The approval buttons' arming: when each card was first drawn and
-    /// when the view last moved (see [`Store::resolve_clicked`]).
+    /// The approval answers' arming: when each was first shown where it is
+    /// answered, and when the view or transcript last moved (see
+    /// [`Store::resolve_clicked`]).
     click_arming: Stored<ClickArming>,
     /// The live view's frame socket, and which opening it belongs to.
     media: Stored<Option<MediaLink>>,
@@ -3572,36 +3573,53 @@ impl Store {
         self.act(|c| c.resolve(approval, decision));
     }
 
-    /// An approval card (or its sidebar line) is being drawn: its buttons
-    /// arm [`KEYS_ARM_AFTER_MS`] after the first time.
-    pub fn card_shown(&self, approval: &str) {
+    /// An approval is being drawn on `surface` (its card, its sidebar line,
+    /// the settings dialog, the command palette): its allowing answers
+    /// there arm [`KEYS_ARM_AFTER_MS`] after the first time.
+    pub fn answer_shown(&self, surface: AnswerSurface, approval: &str) {
         let waiting: BTreeSet<String> = self
             .client
             .with_untracked(|c| c.state.approvals.keys().cloned().collect());
         let mut arming = self.click_arming.get();
-        arming.cards.retain(|id, _| waiting.contains(id));
+        arming.shown.retain(|(_, id), _| waiting.contains(id));
         arming
-            .cards
-            .entry(approval.to_owned())
+            .shown
+            .entry((surface, approval.to_owned()))
             .or_insert_with(now_ms);
         self.click_arming.replace(arming);
     }
 
-    /// Answer an approval from a button. Allowing waits until the card has
-    /// been drawn, and the view still, for [`KEYS_ARM_AFTER_MS`]: a card
-    /// that appears, or that an agent's view move shifts, under a click
-    /// aimed at something else answers nothing. Denying is never held.
-    pub fn resolve_clicked(&self, approval: &str, decision: ApprovalDecision) {
+    /// The transcript on screen moved under its cards: it scrolled, or a row
+    /// at or above a waiting card changed size or place. Cards' allowing
+    /// buttons wait again, as after an agent's view move.
+    pub fn transcript_moved(&self) {
+        let mut arming = self.click_arming.get();
+        arming.transcript_moved_at = now_ms();
+        self.click_arming.replace(arming);
+    }
+
+    /// Answer an approval from `surface`; whether it was answered. Allowing
+    /// waits until the approval has been shown there, and the view still,
+    /// for [`KEYS_ARM_AFTER_MS`]: an approval that appears, or that the
+    /// agent's view move or the transcript moving shifts, under a click or
+    /// key aimed at something else answers nothing. Denying is never held.
+    pub fn resolve_clicked(
+        &self,
+        surface: AnswerSurface,
+        approval: &str,
+        decision: ApprovalDecision,
+    ) -> bool {
         if decision != ApprovalDecision::Deny {
             let mut arming = self.click_arming.get();
-            let armed = click_armed(&mut arming, approval, now_ms());
+            let armed = click_armed(&mut arming, surface, approval, now_ms());
             self.click_arming.replace(arming);
             if !armed {
-                self.say("The approval just appeared: read it, then click again to answer it");
-                return;
+                self.say("The approval just appeared or moved: read it, then answer it again");
+                return false;
             }
         }
         self.resolve(approval, decision);
+        true
     }
 
     /// The approval of the conversation on screen that single keys answer
@@ -3740,20 +3758,43 @@ struct KeyArming {
     session_key: Option<(String, u64)>,
 }
 
-/// See [`Store::card_shown`] and [`Store::resolve_clicked`].
-#[derive(Clone, Default)]
-struct ClickArming {
-    /// Each waiting approval's card: when it was first drawn.
-    cards: BTreeMap<String, u64>,
-    /// When the agent last moved the view.
-    view_moved_at: u64,
+/// Where an approval is answered by a click or a chosen command (see
+/// [`Store::resolve_clicked`]): each place arms on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AnswerSurface {
+    /// Its card in the transcript, which moves with the transcript.
+    Card,
+    /// Its line in the sidebar.
+    Line,
+    /// The settings page's dialog asking it.
+    Dialog,
+    /// Its entry in the command palette.
+    Palette,
 }
 
-/// Whether a click on an allowing button of `approval` answers it at `now`.
-/// A card not seen drawn yet is being drawn now.
-fn click_armed(arming: &mut ClickArming, approval: &str, now: u64) -> bool {
-    let shown = *arming.cards.entry(approval.to_owned()).or_insert(now);
-    now.saturating_sub(shown.max(arming.view_moved_at)) >= KEYS_ARM_AFTER_MS
+/// See [`Store::answer_shown`] and [`Store::resolve_clicked`].
+#[derive(Clone, Default)]
+struct ClickArming {
+    /// Each waiting approval on each surface: when it was first shown.
+    shown: BTreeMap<(AnswerSurface, String), u64>,
+    /// When the agent last moved the view.
+    view_moved_at: u64,
+    /// When the transcript on screen last moved under its cards.
+    transcript_moved_at: u64,
+}
+
+/// Whether an allowing answer to `approval` from `surface` counts at `now`.
+/// An approval not seen shown there yet is being shown now.
+fn click_armed(arming: &mut ClickArming, surface: AnswerSurface, approval: &str, now: u64) -> bool {
+    let shown = *arming
+        .shown
+        .entry((surface, approval.to_owned()))
+        .or_insert(now);
+    let mut since = shown.max(arming.view_moved_at);
+    if surface == AnswerSurface::Card {
+        since = since.max(arming.transcript_moved_at);
+    }
+    now.saturating_sub(since) >= KEYS_ARM_AFTER_MS
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3864,23 +3905,53 @@ mod key_press_tests {
 
 #[cfg(test)]
 mod click_arming_tests {
-    use super::{ClickArming, click_armed};
+    use super::{AnswerSurface, ClickArming, click_armed};
+
+    const CARD: AnswerSurface = AnswerSurface::Card;
 
     #[test]
     fn approval_buttons_wait_for_the_card_and_the_view_to_settle() {
         let mut arming = ClickArming::default();
-        arming.cards.insert("a1".into(), 10_000);
+        arming.shown.insert((CARD, "a1".into()), 10_000);
         // A click the moment the card is drawn answers nothing.
-        assert!(!click_armed(&mut arming, "a1", 10_400));
-        assert!(click_armed(&mut arming, "a1", 11_000));
+        assert!(!click_armed(&mut arming, CARD, "a1", 10_400));
+        assert!(click_armed(&mut arming, CARD, "a1", 11_000));
         // The agent moves the view: the card may now sit under the
         // pointer, so its buttons wait again.
         arming.view_moved_at = 20_000;
-        assert!(!click_armed(&mut arming, "a1", 20_300));
-        assert!(click_armed(&mut arming, "a1", 21_000));
+        assert!(!click_armed(&mut arming, CARD, "a1", 20_300));
+        assert!(click_armed(&mut arming, CARD, "a1", 21_000));
         // A card never seen drawn is being drawn now.
-        assert!(!click_armed(&mut arming, "a2", 30_000));
-        assert!(click_armed(&mut arming, "a2", 31_000));
+        assert!(!click_armed(&mut arming, CARD, "a2", 30_000));
+        assert!(click_armed(&mut arming, CARD, "a2", 31_000));
+    }
+
+    #[test]
+    fn a_card_waits_again_when_the_transcript_moves_under_it() {
+        let mut arming = ClickArming::default();
+        arming.shown.insert((CARD, "a1".into()), 10_000);
+        arming
+            .shown
+            .insert((AnswerSurface::Line, "a1".into()), 10_000);
+        assert!(click_armed(&mut arming, CARD, "a1", 12_000));
+        // New text above the card pushes it down (or the list scrolls).
+        arming.transcript_moved_at = 15_000;
+        assert!(!click_armed(&mut arming, CARD, "a1", 15_500));
+        assert!(click_armed(&mut arming, CARD, "a1", 16_000));
+        // The sidebar line does not move with the transcript.
+        assert!(click_armed(&mut arming, AnswerSurface::Line, "a1", 15_500));
+    }
+
+    #[test]
+    fn each_surface_arms_from_when_it_showed_the_approval() {
+        let mut arming = ClickArming::default();
+        arming.shown.insert((CARD, "a1".into()), 10_000);
+        // Long seen as a card, it just appeared in the palette (or a
+        // dialog): Enter there the same moment answers nothing.
+        for surface in [AnswerSurface::Palette, AnswerSurface::Dialog] {
+            assert!(!click_armed(&mut arming, surface, "a1", 20_000));
+            assert!(click_armed(&mut arming, surface, "a1", 21_000));
+        }
     }
 }
 
