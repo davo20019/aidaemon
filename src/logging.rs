@@ -280,7 +280,7 @@ fn mentions_key_pragma(text: &str) -> bool {
     words
         .windows(2)
         .any(|pair| pair[0] == "pragma" && is_key(pair[1]))
-        || (lower.contains("attach") && words.iter().any(|word| *word == "key"))
+        || (lower.contains("attach") && words.contains(&"key"))
 }
 
 impl tracing::field::Visit for KeyPragmaVisitor {
