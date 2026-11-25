@@ -403,10 +403,7 @@ fn truncate_body(body: &str) -> String {
         return body.to_string();
     }
     // Find a valid UTF-8 char boundary at or before MAX_LEN
-    let mut end = MAX_LEN;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = body.floor_char_boundary(MAX_LEN);
     format!("{}...", &body[..end])
 }
 

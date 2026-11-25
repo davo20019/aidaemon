@@ -138,10 +138,7 @@ pub fn graceful_budget_response(learning_ctx: &LearningContext, tokens_used: u64
     );
     // Cap to avoid bloating conversation history while preserving key context.
     if summary.len() > 1500 {
-        let mut t = 1500;
-        while t > 0 && !summary.is_char_boundary(t) {
-            t -= 1;
-        }
+        let t = summary.floor_char_boundary(1500);
         summary.truncate(t);
         summary.push('…');
     }
@@ -164,10 +161,7 @@ pub fn graceful_scheduled_run_budget_response(
         tokens_used, budget_per_check, activity,
     );
     if summary.len() > 1500 {
-        let mut t = 1500;
-        while t > 0 && !summary.is_char_boundary(t) {
-            t -= 1;
-        }
+        let t = summary.floor_char_boundary(1500);
         summary.truncate(t);
         summary.push('…');
     }

@@ -359,10 +359,7 @@ async fn repo_changes(root: &Path, written: &BTreeSet<String>) -> Option<RepoCha
     }
     let truncated = patch.len() > MAX_PATCH_BYTES;
     if truncated {
-        let mut cut = MAX_PATCH_BYTES;
-        while !patch.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        let mut cut = patch.floor_char_boundary(MAX_PATCH_BYTES);
         // End on a whole line.
         cut = patch[..cut].rfind('\n').map_or(cut, |at| at + 1);
         patch.truncate(cut);

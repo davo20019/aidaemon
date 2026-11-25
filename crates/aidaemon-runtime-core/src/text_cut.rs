@@ -40,19 +40,10 @@ pub fn keep_head_and_tail_marked(
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    let floor = |at: usize| {
-        let mut at = at.min(text.len());
-        while at > 0 && !text.is_char_boundary(at) {
-            at -= 1;
-        }
-        at
-    };
+    let floor = |at: usize| text.floor_char_boundary(at);
     if max_bytes <= marker_len * 2 {
         // Too small for a marker: the end alone.
-        let mut start = text.len() - max_bytes;
-        while start < text.len() && !text.is_char_boundary(start) {
-            start += 1;
-        }
+        let mut start = text.ceil_char_boundary(text.len() - max_bytes);
         if start == text.len() {
             // A limit smaller than the last character: show that character.
             start = text.char_indices().last().map_or(0, |(at, _)| at);
@@ -67,10 +58,7 @@ pub fn keep_head_and_tail_marked(
         .filter(|at| *at >= head_end * 2 / 3)
         .map_or(head_end, |at| at + 1);
     let tail_len = budget - head_end;
-    let mut tail_start = text.len() - tail_len;
-    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let tail_start = text.ceil_char_boundary(text.len() - tail_len);
     // Prefer starting the tail on a fresh line in its first third.
     let window_end = floor(tail_start + tail_len / 3);
     let tail_start = text[tail_start..window_end]

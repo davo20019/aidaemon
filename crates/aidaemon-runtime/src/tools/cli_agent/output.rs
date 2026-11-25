@@ -24,20 +24,14 @@ pub(super) fn append_bounded_line(buffer: &mut String, prefix: &str, line: &str,
     }
 
     if cap <= BUFFER_TRUNCATION_MARKER.len() {
-        let mut tail_start = buffer.len().saturating_sub(cap);
-        while tail_start < buffer.len() && !buffer.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
+        let tail_start = buffer.ceil_char_boundary(buffer.len().saturating_sub(cap));
         *buffer = buffer[tail_start..].to_string();
         return;
     }
 
     let head_end = floor_char_boundary(buffer, cap / 4);
     let tail_budget = cap - head_end - BUFFER_TRUNCATION_MARKER.len();
-    let mut tail_start = buffer.len().saturating_sub(tail_budget);
-    while tail_start < buffer.len() && !buffer.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
+    let tail_start = buffer.ceil_char_boundary(buffer.len().saturating_sub(tail_budget));
 
     let mut retained = String::with_capacity(cap);
     retained.push_str(&buffer[..head_end]);

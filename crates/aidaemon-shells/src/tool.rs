@@ -146,10 +146,7 @@ fn plain(raw: &str) -> String {
     let text = parser.screen().contents();
     let text = text.trim_end();
     let cut = text.len().saturating_sub(MAX_OUTPUT_CHARS);
-    let mut start = cut;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
+    let start = text.ceil_char_boundary(cut);
     text[start..].to_string()
 }
 

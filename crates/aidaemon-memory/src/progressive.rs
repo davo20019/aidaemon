@@ -687,10 +687,7 @@ fn truncate_for_extraction(text: &str, max_len: usize) -> &str {
     if text.len() <= max_len {
         text
     } else {
-        let mut end = max_len;
-        while !text.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
+        let end = text.floor_char_boundary(max_len);
         &text[..end]
     }
 }

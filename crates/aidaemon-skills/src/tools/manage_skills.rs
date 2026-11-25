@@ -670,10 +670,7 @@ impl ManageSkillsTool {
         if trimmed.len() <= max_chars {
             return trimmed.to_string();
         }
-        let mut end = max_chars;
-        while end > 0 && !trimmed.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = trimmed.floor_char_boundary(max_chars);
         let clipped = trimmed[..end].trim_end();
         format!("{}...", clipped)
     }

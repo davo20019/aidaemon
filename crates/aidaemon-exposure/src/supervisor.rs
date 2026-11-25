@@ -96,10 +96,7 @@ fn bounded(reason: &str) -> String {
     if reason.len() <= MAX_REASON {
         return reason.to_string();
     }
-    let mut end = MAX_REASON;
-    while !reason.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = reason.floor_char_boundary(MAX_REASON);
     format!("{}…", &reason[..end])
 }
 

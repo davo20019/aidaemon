@@ -476,10 +476,7 @@ fn snippet(text: &str, words: &[String]) -> String {
         .min()
         .unwrap_or(0);
     // Back up to a char boundary about a third of the span before the match.
-    let mut start = at.saturating_sub(SPAN / 3);
-    while start > 0 && !flat.is_char_boundary(start) {
-        start -= 1;
-    }
+    let start = flat.floor_char_boundary(at.saturating_sub(SPAN / 3));
     let body: String = flat[start..].chars().take(SPAN).collect();
     let mut out = String::new();
     if start > 0 {

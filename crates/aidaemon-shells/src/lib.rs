@@ -272,10 +272,9 @@ impl Output {
         if self.backlog.len() > self.limit {
             // Cut at a line start so the replay never begins inside an
             // escape sequence (which ends before a line does).
-            let mut cut = self.backlog.len() - self.limit;
-            while !self.backlog.is_char_boundary(cut) {
-                cut += 1;
-            }
+            let cut = self
+                .backlog
+                .ceil_char_boundary(self.backlog.len() - self.limit);
             let cut = self.backlog[cut..]
                 .find('\n')
                 .map(|at| cut + at + 1)
