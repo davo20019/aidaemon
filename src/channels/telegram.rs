@@ -454,34 +454,20 @@ impl Cx<'_> {
             info!("Persisted allowed_user_ids to the connected bot's record");
             return Ok(());
         }
-        let content = tokio::fs::read_to_string(&self.config_path).await?;
-        let mut doc: toml::Table = content.parse()?;
-
         let ids_toml = toml::Value::Array(
             ids.iter()
                 .map(|&id| toml::Value::Integer(id as i64))
                 .collect(),
         );
-
-        // Update whichever config format exists: [telegram] or [[telegram_bots]]
-        let mut updated = false;
-        if let Some(telegram) = doc.get_mut("telegram").and_then(|v| v.as_table_mut()) {
-            telegram.insert("allowed_user_ids".to_string(), ids_toml.clone());
-            updated = true;
-        }
-        if let Some(bots) = doc.get_mut("telegram_bots").and_then(|v| v.as_array_mut())
-            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
-        {
-            first.insert("allowed_user_ids".to_string(), ids_toml);
-            updated = true;
-        }
-
-        if !updated {
-            anyhow::bail!("No [telegram] or [[telegram_bots]] section found in config");
-        }
-
-        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        tokio::fs::write(&self.config_path, &new_content).await?;
+        super::claim_config::save_allowed_ids(
+            &self.config_path,
+            "telegram",
+            "telegram_bots",
+            &self.bot_token,
+            ids_toml,
+            |_| Ok(()),
+        )
+        .await?;
         info!("Persisted allowed_user_ids to config.toml");
         Ok(())
     }

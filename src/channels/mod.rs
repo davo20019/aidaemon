@@ -2,6 +2,7 @@
 pub(crate) use aidaemon_channels::approval_render;
 #[cfg(test)]
 pub(crate) use aidaemon_channels::attachments;
+pub(crate) mod claim_config;
 pub(crate) mod commands;
 pub(crate) mod connect;
 #[cfg(feature = "discord")]

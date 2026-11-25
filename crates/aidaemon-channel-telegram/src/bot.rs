@@ -307,13 +307,14 @@ impl TelegramBot {
         &self.owner_claim
     }
 
-    /// Writes the claim code to the log when nobody is allowed yet.
+    /// Writes the claim code to the log when nobody is allowed or owns it.
     pub fn announce_claim_if_unowned(&self) {
         let unowned = self
             .allowed_user_ids
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty();
+            .is_empty()
+            && self.owner_user_ids.is_empty();
         if unowned {
             self.owner_claim.announce();
         }
@@ -1243,7 +1244,15 @@ impl TelegramBot {
                 .allowed_user_ids
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if allowed.is_empty() {
+            if allowed.is_empty() && !self.owner_user_ids.is_empty() {
+                // Owners are configured (`users.owner_ids.telegram`): the bot
+                // is not up for claiming, and its owners may use it.
+                if self.owner_user_ids.contains(&user_id) {
+                    AuthResult::Authorized
+                } else {
+                    AuthResult::Unauthorized
+                }
+            } else if allowed.is_empty() {
                 if is_private {
                     // Only the one-time claim code makes a sender the owner:
                     // a stranger who finds the bot first gets nothing.

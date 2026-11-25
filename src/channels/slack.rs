@@ -8,8 +8,7 @@ use std::sync::Arc;
 pub use aidaemon_channel_slack::bot::{SlackBot as SlackChannel, spawn_slack_channel};
 use aidaemon_channel_slack::bot::{SlackBotSettings, SlackHost, WorkspaceGrantMutation};
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::channels::ChannelRuntimeDeps;
 use crate::types::{UserRole, WorkspaceGrant};
@@ -41,15 +40,10 @@ pub(crate) fn new_slack_bot(
     )
 }
 
-/// Serialize config mutations across every Slack bot in this process. Without
-/// one shared lock, simultaneous grants/auto-claims could overwrite each other.
-static SLACK_CONFIG_WRITE_LOCK: std::sync::LazyLock<Mutex<()>> =
-    std::sync::LazyLock::new(|| Mutex::new(()));
-
 async fn load_workspace_grants_from_config(
     config_path: &std::path::Path,
 ) -> anyhow::Result<Vec<WorkspaceGrant>> {
-    let _read_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
+    let _read_guard = super::claim_config::CONFIG_WRITE_LOCK.lock().await;
     let content = tokio::fs::read_to_string(config_path).await?;
     let doc: toml::Table = content.parse()?;
     let grants = doc
@@ -69,19 +63,6 @@ struct DaemonSlackHost {
     /// Which bot this is, to find its record when it was connected at
     /// runtime.
     bot_token: String,
-}
-
-impl DaemonSlackHost {
-    #[cfg(unix)]
-    fn restrict_config_permissions(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            warn!(%error, "Could not enforce owner-only config permissions");
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_config_permissions(_path: &std::path::Path) {}
 }
 
 #[async_trait]
@@ -114,7 +95,6 @@ impl SlackHost for DaemonSlackHost {
         allowed_ids: &[String],
         owner_ids: &[String],
     ) -> anyhow::Result<()> {
-        let _write_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
         // A bot connected at runtime lives in the database: its claim is
         // saved on its own row (with no owner ids, its allowlist holds its
         // owners), never in the config, where it would be lost or would
@@ -136,55 +116,42 @@ impl SlackHost for DaemonSlackHost {
             info!("Persisted Slack access IDs to the connected bot's record");
             return Ok(());
         }
-        let content = tokio::fs::read_to_string(&self.runtime.config_path).await?;
-        let mut doc: toml::Table = content.parse()?;
-
         let ids_toml = toml::Value::Array(
             allowed_ids
                 .iter()
                 .map(|id| toml::Value::String(id.clone()))
                 .collect(),
         );
-
-        let mut updated = false;
-        if let Some(slack) = doc.get_mut("slack").and_then(|v| v.as_table_mut()) {
-            slack.insert("allowed_user_ids".to_string(), ids_toml.clone());
-            updated = true;
-        }
-        if let Some(bots) = doc.get_mut("slack_bots").and_then(|v| v.as_array_mut())
-            && let Some(first) = bots.first_mut().and_then(|v| v.as_table_mut())
-        {
-            first.insert("allowed_user_ids".to_string(), ids_toml);
-            updated = true;
-        }
-
-        if !updated {
-            anyhow::bail!("No [slack] or [[slack_bots]] section found in config");
-        }
-
-        let users = doc
-            .entry("users".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("[users] must be a TOML table"))?;
-        let owner_table = users
-            .entry("owner_ids".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("[users.owner_ids] must be a TOML table"))?;
-        owner_table.insert(
-            "slack".to_string(),
-            toml::Value::Array(
-                owner_ids
-                    .iter()
-                    .map(|id| toml::Value::String(id.clone()))
-                    .collect(),
-            ),
-        );
-
-        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        tokio::fs::write(&self.runtime.config_path, &new_content).await?;
-        Self::restrict_config_permissions(&self.runtime.config_path);
+        super::claim_config::save_allowed_ids(
+            &self.runtime.config_path,
+            "slack",
+            "slack_bots",
+            &self.bot_token,
+            ids_toml,
+            |doc| {
+                let users = doc
+                    .entry("users".to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| anyhow::anyhow!("[users] must be a TOML table"))?;
+                let owner_table = users
+                    .entry("owner_ids".to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .ok_or_else(|| anyhow::anyhow!("[users.owner_ids] must be a TOML table"))?;
+                owner_table.insert(
+                    "slack".to_string(),
+                    toml::Value::Array(
+                        owner_ids
+                            .iter()
+                            .map(|id| toml::Value::String(id.clone()))
+                            .collect(),
+                    ),
+                );
+                Ok(())
+            },
+        )
+        .await?;
         info!("Persisted Slack access IDs to config.toml");
         Ok(())
     }
@@ -197,7 +164,7 @@ impl SlackHost for DaemonSlackHost {
         &self,
         mutation: WorkspaceGrantMutation,
     ) -> anyhow::Result<(Vec<WorkspaceGrant>, bool)> {
-        let _write_guard = SLACK_CONFIG_WRITE_LOCK.lock().await;
+        let _write_guard = super::claim_config::CONFIG_WRITE_LOCK.lock().await;
         let content = tokio::fs::read_to_string(&self.runtime.config_path).await?;
         let mut doc: toml::Table = content.parse()?;
         let users = doc
@@ -247,9 +214,9 @@ impl SlackHost for DaemonSlackHost {
             toml::Value::try_from(&grants)?,
         );
 
-        let new_content = toml::to_string_pretty(&toml::Value::Table(doc))?;
-        tokio::fs::write(&self.runtime.config_path, &new_content).await?;
-        Self::restrict_config_permissions(&self.runtime.config_path);
+        crate::config::config_file(&self.runtime.config_path)
+            .save_table(&doc)
+            .await?;
         info!(count = grants.len(), "Persisted Slack workspace grants");
         Ok((grants, affected))
     }
